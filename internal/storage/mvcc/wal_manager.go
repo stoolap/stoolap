@@ -622,9 +622,10 @@ func (wm *WALManager) AppendEntryLocked(entry WALEntry) (uint64, error) {
 	// Assign LSN atomically
 	entry.LSN = wm.currentLSN.Add(1)
 
+	buf := common.GetBufferPool()
+	defer common.PutBufferPool(buf)
 	// Serialize entry directly without goroutine
-	data, err := wm.serializeEntry(entry)
-	if err != nil {
+	if err := encodeEntry(buf, entry); err != nil {
 		return 0, fmt.Errorf("failed to serialize WAL entry: %w", err)
 	}
 
@@ -634,7 +635,7 @@ func (wm *WALManager) AppendEntryLocked(entry WALEntry) (uint64, error) {
 	}
 
 	// For small entries, we batch them
-	if len(data) < int(wm.flushTrigger) {
+	if buf.Len() < int(wm.flushTrigger) {
 		// Check for buffer
 		if wm.walBuffer == nil {
 			return 0, fmt.Errorf("WAL buffer has been released")
@@ -642,13 +643,13 @@ func (wm *WALManager) AppendEntryLocked(entry WALEntry) (uint64, error) {
 
 		// Write to the buffer with explicit byte counting for better diagnostic
 		beforeLen := wm.walBuffer.Len()
-		wm.walBuffer.Write(data)
+		wm.walBuffer.Write(buf.Bytes())
 		afterLen := wm.walBuffer.Len()
 
 		// Ensure all bytes were written
-		if afterLen-beforeLen != len(data) {
+		if afterLen-beforeLen != buf.Len() {
 			return 0, fmt.Errorf("failed to write all bytes to WAL buffer (%d of %d written)",
-				afterLen-beforeLen, len(data))
+				afterLen-beforeLen, buf.Len())
 		}
 
 		needsFlush := wm.walBuffer.Len() >= int(wm.flushTrigger)
@@ -703,8 +704,7 @@ func (wm *WALManager) AppendEntryLocked(entry WALEntry) (uint64, error) {
 	}
 
 	// Large entries written directly
-	err = wm.writeToFile(data)
-	if err != nil {
+	if err := wm.writeToFile(buf.Bytes()); err != nil {
 		return 0, fmt.Errorf("failed to write large WAL entry to file: %w", err)
 	}
 
@@ -1027,48 +1027,30 @@ func (wm *WALManager) Replay(fromLSN uint64, callback func(WALEntry) error) (uin
 
 // Helper method to determine if a sync is needed
 func (wm *WALManager) shouldSync(opType WALOperationType) bool {
+	// Batched sync logic for commits/rollbacks
+	now := time.Now().UnixNano()
+	last := wm.lastSyncTimeNano.Load()
 	switch wm.syncMode {
 	case SyncNone:
 		return false
 	case SyncNormal:
-		// Check if it's a commit/rollback or DDL operation
-		isCommitOrRollback := opType == WALCommit || opType == WALRollback
-		isDDL := opType == WALCreateTable || opType == WALDropTable ||
-			opType == WALAlterTable || opType == WALCreateIndex ||
-			opType == WALDropIndex
-
-		// Always sync DDL operations immediately
-		if isDDL {
+		// Immediate sync for all DDL operations
+		switch opType {
+		case WALCreateTable, WALDropTable, WALAlterTable, WALCreateIndex, WALDropIndex:
 			return true
-		}
-
-		// For commits/rollbacks, use batched sync logic
-		if isCommitOrRollback {
-			// Get current counts and timestamps
-			pendingCommits := wm.pendingCommits.Load()
-			now := time.Now().UnixNano()
-			lastSync := wm.lastSyncTimeNano.Load()
-
+		case WALCommit, WALRollback:
 			// Determine if we should sync based on:
 			// 1. Reached batch size threshold
 			// 2. Time interval since last sync exceeded
-			shouldSyncNow := pendingCommits >= wm.commitBatchSize ||
-				now-lastSync >= wm.syncIntervalNano
-
-			if shouldSyncNow {
-				// Reset counter and update last sync time
+			if wm.pendingCommits.Load() >= wm.commitBatchSize ||
+				now-last >= wm.syncIntervalNano {
 				wm.pendingCommits.Store(0)
 				wm.lastSyncTimeNano.Store(now)
 				return true
 			}
-
-			// Skip this sync - not enough commits or too soon
-			return false
 		}
-
-		// For other operations, don't sync
+		// Everything else in SyncNormal is not synced immediately
 		return false
-
 	case SyncFull:
 		// In SyncFull mode, we sync ALL operations
 		return true
