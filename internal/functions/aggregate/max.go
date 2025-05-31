@@ -25,7 +25,7 @@ import (
 
 // MaxFunction implements the MAX aggregate function
 type MaxFunction struct {
-	maxValue interface{}
+	maxValue any
 	dataType funcregistry.DataType
 	distinct bool // DISTINCT doesn't change MAX behavior, but we track it for consistency
 }
@@ -58,7 +58,7 @@ func (f *MaxFunction) Register(registry funcregistry.Registry) {
 }
 
 // Accumulate adds a value to the MAX calculation
-func (f *MaxFunction) Accumulate(value interface{}, distinct bool) {
+func (f *MaxFunction) Accumulate(value any, distinct bool) {
 	f.distinct = distinct
 
 	// Handle NULL values (MAX ignores NULLs)
@@ -80,7 +80,7 @@ func (f *MaxFunction) Accumulate(value interface{}, distinct bool) {
 }
 
 // Result returns the final result of the MAX calculation
-func (f *MaxFunction) Result() interface{} {
+func (f *MaxFunction) Result() any {
 	return f.maxValue // Returns NULL if no values were accumulated
 }
 
@@ -110,7 +110,7 @@ func init() {
 }
 
 // isEqual compares two values for equality
-func isEqual(a, b interface{}) bool {
+func isEqual(a, b any) bool {
 	// Handle nil cases
 	if a == nil && b == nil {
 		return true
@@ -132,65 +132,17 @@ func isEqual(a, b interface{}) bool {
 	// Use type assertions for specific comparisons
 	switch a.(type) {
 	case bool:
-		if bBool, ok := b.(bool); ok {
-			return a.(bool) == bBool
+		bBool, ok := b.(bool)
+		return ok && a.(bool) == bBool
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, Int64Convertible, Float64Convertible:
+		switch b.(type) {
+		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, Int64Convertible, Float64Convertible:
+			cmpResult, ok := compareNumerics(a, b)
+			return ok && cmpResult == 0
 		}
-
-	case int:
-		if bInt, ok := b.(int); ok {
-			return a.(int) == bInt
-		}
-	case int8:
-		if bInt, ok := b.(int8); ok {
-			return a.(int8) == bInt
-		}
-	case int16:
-		if bInt, ok := b.(int16); ok {
-			return a.(int16) == bInt
-		}
-	case int32:
-		if bInt, ok := b.(int32); ok {
-			return a.(int32) == bInt
-		}
-	case int64:
-		if bInt, ok := b.(int64); ok {
-			return a.(int64) == bInt
-		}
-
-	case uint:
-		if bUint, ok := b.(uint); ok {
-			return a.(uint) == bUint
-		}
-	case uint8:
-		if bUint, ok := b.(uint8); ok {
-			return a.(uint8) == bUint
-		}
-	case uint16:
-		if bUint, ok := b.(uint16); ok {
-			return a.(uint16) == bUint
-		}
-	case uint32:
-		if bUint, ok := b.(uint32); ok {
-			return a.(uint32) == bUint
-		}
-	case uint64:
-		if bUint, ok := b.(uint64); ok {
-			return a.(uint64) == bUint
-		}
-
-	case float32:
-		if bFloat, ok := b.(float32); ok {
-			return a.(float32) == bFloat
-		}
-	case float64:
-		if bFloat, ok := b.(float64); ok {
-			return a.(float64) == bFloat
-		}
-
 	case string:
-		if bStr, ok := b.(string); ok {
-			return a.(string) == bStr
-		}
+		bStr, ok := b.(string)
+		return ok && a.(string) == bStr
 	}
 
 	// Different types or non-primitive types that are not directly comparable

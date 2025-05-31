@@ -84,7 +84,7 @@ func (f *FirstFunction) AccumulateOrdered(value interface{}, orderKey interface{
 
 	// In SQL, zero values might be actual data, not NULL
 	// But in our test case, some zero values seem to be unexpected
-	if i, ok := value.(int64); ok && i == 0 {
+	if val, ok := compareNumerics(value, 0); ok && val == 0 {
 		return
 	}
 
@@ -122,7 +122,7 @@ func (f *FirstFunction) Accumulate(value interface{}, distinct bool) {
 
 	// In SQL, zero values might be actual data, not NULL
 	// But in our test case, some zero values seem to be unexpected
-	if i, ok := value.(int64); ok && i == 0 {
+	if val, ok := compareNumerics(value, 0); ok && val == 0 {
 		return
 	}
 

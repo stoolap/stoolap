@@ -15,7 +15,30 @@ limitations under the License.
 */
 package aggregate
 
-import "sort"
+import (
+	"sort"
+	"time"
+)
+
+type Int64Convertible interface {
+	AsInt64() (int64, bool)
+}
+
+type Float64Convertible interface {
+	AsFloat64() (float64, bool)
+}
+
+type BooleanConvertible interface {
+	AsBoolean() (bool, bool)
+}
+
+type StringConvertible interface {
+	AsString() (string, bool)
+}
+
+type TimestampConvertible interface {
+	AsTimestamp() (time.Time, bool)
+}
 
 // DeepCopy creates a copy of simple values to avoid reference sharing
 func DeepCopy(val interface{}) interface{} {
