@@ -16,8 +16,6 @@ limitations under the License.
 package aggregate
 
 import (
-	"fmt"
-
 	"github.com/stoolap/stoolap/internal/functions/contract"
 	"github.com/stoolap/stoolap/internal/functions/registry"
 	"github.com/stoolap/stoolap/internal/parser/funcregistry"
@@ -59,7 +57,7 @@ func (f *AvgFunction) Register(registry funcregistry.Registry) {
 }
 
 // Accumulate adds a value to the AVG calculation
-func (f *AvgFunction) Accumulate(value interface{}, distinct bool) {
+func (f *AvgFunction) Accumulate(value any, distinct bool) {
 	f.distinct = distinct
 
 	// Handle NULL values (AVG ignores NULLs)
@@ -69,45 +67,26 @@ func (f *AvgFunction) Accumulate(value interface{}, distinct bool) {
 
 	// First try direct type conversion for performance
 	var numericValue float64
-	var err error
 
 	// Handle direct numeric types
 	switch v := value.(type) {
-	case float64:
-		numericValue = v
-	case float32:
-		numericValue = float64(v)
-	case int:
-		numericValue = float64(v)
-	case int64:
-		numericValue = float64(v)
-	case int32:
-		numericValue = float64(v)
-	default:
-		// Handle storage engine types with AsXXX methods
-		if fVal, ok := value.(interface{ AsFloat64() (float64, bool) }); ok {
-			if f64, ok := fVal.AsFloat64(); ok {
-				numericValue = f64
-				err = nil
-			} else {
-				err = fmt.Errorf("AsFloat64 method failed")
-			}
-		} else if iVal, ok := value.(interface{ AsInt64() (int64, bool) }); ok {
-			if i64, ok := iVal.AsInt64(); ok {
-				numericValue = float64(i64)
-				err = nil
-			} else {
-				err = fmt.Errorf("AsInt64 method failed")
-			}
-		} else {
-			// Fall back to reflection for other types
-			numericValue, err = toFloat64(value)
+	case float32, float64, Float64Convertible:
+		var ok bool
+		if numericValue, ok = toFloat64(v); !ok {
+			return
 		}
-	}
-
-	if err != nil {
-		// Skip non-numeric values
-		return
+	case uint, uint8, uint16, uint32, uint64:
+		if v, ok := toUint64(v); ok {
+			numericValue = float64(v)
+		} else {
+			return
+		}
+	case int, int8, int16, int32, int64, Int64Convertible:
+		if v, ok := toInt64(v); ok {
+			numericValue = float64(v)
+		} else {
+			return
+		}
 	}
 
 	// Handle DISTINCT case
@@ -115,22 +94,18 @@ func (f *AvgFunction) Accumulate(value interface{}, distinct bool) {
 		if f.values == nil {
 			f.values = make(map[float64]struct{})
 		}
-
-		// Only add values we haven't seen before
-		if _, exists := f.values[numericValue]; !exists {
-			f.values[numericValue] = struct{}{}
-			f.sum += numericValue
-			f.count++
+		if _, exists := f.values[numericValue]; exists {
+			return // Already seen, skip
 		}
-	} else {
-		// Regular AVG
-		f.sum += numericValue
-		f.count++
+		f.values[numericValue] = struct{}{}
 	}
+
+	f.sum += numericValue
+	f.count++
 }
 
 // Result returns the final result of the AVG calculation
-func (f *AvgFunction) Result() interface{} {
+func (f *AvgFunction) Result() any {
 	if f.count == 0 {
 		return nil // Return NULL for empty sets
 	}
