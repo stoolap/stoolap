@@ -951,6 +951,9 @@ func (p *Parser) parseWithClause() *WithClause {
 		withClause.CTEs = append(withClause.CTEs, cte)
 	}
 
+	// Advance to the next token after the WITH clause
+	p.nextToken()
+
 	return withClause
 }
 
@@ -3250,6 +3253,9 @@ func (p *Parser) parseKeyword() Expression {
 		// If not followed by a string, handle as an error
 		p.addError(fmt.Sprintf("expected string literal after %s keyword at %s", p.curToken.Literal, p.curToken.Position))
 		return nil
+	case "EXISTS":
+		// EXISTS is handled as a special expression
+		return p.parseExistsExpression()
 	default:
 		p.addError(fmt.Sprintf("unexpected keyword: %s at %s", p.curToken.Literal, p.curToken.Position))
 		return nil

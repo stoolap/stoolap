@@ -103,6 +103,50 @@ FROM customers c
 LEFT JOIN orders o ON c.id = o.customer_id;
 ```
 
+#### Subqueries
+
+Using subqueries in WHERE clause:
+
+```sql
+-- Find customers who have placed orders
+SELECT * FROM customers 
+WHERE id IN (
+    SELECT DISTINCT customer_id FROM orders
+);
+
+-- Find products with above-average price
+SELECT * FROM products 
+WHERE price > (
+    SELECT AVG(price) FROM products
+);
+```
+
+#### Common Table Expressions (CTEs)
+
+Using WITH clause to define temporary named result sets:
+
+```sql
+-- Simple CTE
+WITH high_value_orders AS (
+    SELECT * FROM orders WHERE total > 1000
+)
+SELECT * FROM high_value_orders;
+
+-- Multiple CTEs
+WITH 
+customer_totals AS (
+    SELECT customer_id, SUM(total) as total_spent
+    FROM orders
+    GROUP BY customer_id
+),
+vip_customers AS (
+    SELECT * FROM customer_totals WHERE total_spent > 10000
+)
+SELECT c.name, ct.total_spent
+FROM customers c
+JOIN vip_customers ct ON c.id = ct.customer_id;
+```
+
 ### INSERT
 
 The INSERT statement adds new rows to a table.
@@ -208,6 +252,24 @@ UPDATE settings
 SET last_updated = NOW();
 ```
 
+Update using a subquery:
+
+```sql
+-- Apply discount to products in premium categories
+UPDATE products 
+SET discount = 0.15 
+WHERE category IN (
+    SELECT name FROM categories WHERE is_premium = true
+);
+
+-- Reset prices for discontinued items
+UPDATE products 
+SET price = 0, status = 'discontinued'
+WHERE id NOT IN (
+    SELECT product_id FROM active_inventory
+);
+```
+
 ### DELETE
 
 The DELETE statement removes rows from a table.
@@ -242,6 +304,22 @@ Delete all rows:
 
 ```sql
 DELETE FROM temporary_logs;
+```
+
+Delete using a subquery:
+
+```sql
+-- Delete orders from inactive customers
+DELETE FROM orders 
+WHERE customer_id IN (
+    SELECT id FROM customers WHERE status = 'inactive'
+);
+
+-- Delete orphaned records
+DELETE FROM order_items 
+WHERE order_id NOT IN (
+    SELECT id FROM orders
+);
 ```
 
 ## Data Definition Language (DDL)

@@ -26,7 +26,13 @@ import (
 )
 
 // ExecuteJoin executes a JOIN operation between two table sources
-func ExecuteJoin(ctx context.Context, joinSource *parser.JoinTableSource, engine storage.Engine,
+func (e *Executor) ExecuteJoin(ctx context.Context, joinSource *parser.JoinTableSource,
+	evaluator *Evaluator, params map[string]interface{}) (storage.Result, error) {
+	return e.ExecuteJoinWithRegistry(ctx, joinSource, evaluator, params)
+}
+
+// ExecuteJoinWithRegistry executes a JOIN operation with CTE registry
+func (e *Executor) ExecuteJoinWithRegistry(ctx context.Context, joinSource *parser.JoinTableSource,
 	evaluator *Evaluator, params map[string]interface{}) (storage.Result, error) {
 
 	// Execute the left side of the join
@@ -34,7 +40,7 @@ func ExecuteJoin(ctx context.Context, joinSource *parser.JoinTableSource, engine
 	if leftSource == nil {
 		return nil, fmt.Errorf("left side of JOIN is not a valid table source")
 	}
-	leftResult, leftAlias, err := executeTableSource(ctx, leftSource, engine, evaluator, params)
+	leftResult, leftAlias, err := e.executeTableSourceWithRegistry(ctx, leftSource, evaluator, params)
 	if err != nil {
 		return nil, fmt.Errorf("error executing left side of JOIN: %w", err)
 	}
@@ -44,7 +50,7 @@ func ExecuteJoin(ctx context.Context, joinSource *parser.JoinTableSource, engine
 	if rightSource == nil {
 		return nil, fmt.Errorf("right side of JOIN is not a valid table source")
 	}
-	rightResult, rightAlias, err := executeTableSource(ctx, rightSource, engine, evaluator, params)
+	rightResult, rightAlias, err := e.executeTableSourceWithRegistry(ctx, rightSource, evaluator, params)
 	if err != nil {
 		leftResult.Close()
 		return nil, fmt.Errorf("error executing right side of JOIN: %w", err)
@@ -94,18 +100,29 @@ func ExecuteJoin(ctx context.Context, joinSource *parser.JoinTableSource, engine
 	return joinResult, nil
 }
 
-// executeTableSource executes a table source and returns the result
-// Returns the result, the table alias (if any), and any error
-func executeTableSource(ctx context.Context, tableSource parser.TableSource,
-	engine storage.Engine, evaluator *Evaluator, params map[string]interface{}) (storage.Result, string, error) {
+// executeTableSourceWithRegistry executes a table source with CTE registry
+func (e *Executor) executeTableSourceWithRegistry(ctx context.Context, tableSource parser.TableSource,
+	evaluator *Evaluator, params map[string]interface{}) (storage.Result, string, error) {
 
 	switch source := tableSource.(type) {
 	case *parser.SimpleTableSource:
 		// Simple table source (table name)
 		tableName := source.Name.Value
 
+		// Check if this is a CTE reference
+		if cteResult, isCTE := e.resolveCTETable(ctx, nil, tableName); isCTE {
+			// Use the table alias if provided, otherwise use the CTE name
+			tableAlias := tableName
+			if source.Alias != nil {
+				tableAlias = source.Alias.Value
+			}
+
+			return cteResult, tableAlias, nil
+		}
+
+		// Not a CTE, proceed with regular table
 		// Start a transaction to get the table
-		tx, err := engine.BeginTx(ctx, sql.LevelReadCommitted)
+		tx, err := e.engine.BeginTx(ctx, sql.LevelReadCommitted)
 		if err != nil {
 			return nil, "", fmt.Errorf("error beginning transaction: %w", err)
 		}
@@ -144,7 +161,7 @@ func executeTableSource(ctx context.Context, tableSource parser.TableSource,
 
 	case *parser.JoinTableSource:
 		// Nested JOIN
-		joinResult, err := ExecuteJoin(ctx, source, engine, evaluator, params)
+		joinResult, err := e.ExecuteJoinWithRegistry(ctx, source, evaluator, params)
 		if err != nil {
 			return nil, "", fmt.Errorf("error executing nested JOIN: %w", err)
 		}
@@ -163,7 +180,13 @@ func executeTableSource(ctx context.Context, tableSource parser.TableSource,
 }
 
 // ExecuteJoinQuery executes a SELECT query that contains JOINs
-func ExecuteJoinQuery(ctx context.Context, stmt *parser.SelectStatement, engine storage.Engine,
+func (e *Executor) ExecuteJoinQuery(ctx context.Context, stmt *parser.SelectStatement,
+	evaluator *Evaluator, params map[string]interface{}) (storage.Result, error) {
+	return e.ExecuteJoinQueryWithRegistry(ctx, stmt, evaluator, params)
+}
+
+// ExecuteJoinQueryWithRegistry executes a SELECT query with JOINs and CTE registry
+func (e *Executor) ExecuteJoinQueryWithRegistry(ctx context.Context, stmt *parser.SelectStatement,
 	evaluator *Evaluator, params map[string]interface{}) (storage.Result, error) {
 
 	// Get the joined result
@@ -172,7 +195,7 @@ func ExecuteJoinQuery(ctx context.Context, stmt *parser.SelectStatement, engine 
 		return nil, fmt.Errorf("FROM clause is not a JOIN")
 	}
 
-	joinResult, err := ExecuteJoin(ctx, joinSource, engine, evaluator, params)
+	joinResult, err := e.ExecuteJoinWithRegistry(ctx, joinSource, evaluator, params)
 	if err != nil {
 		return nil, err
 	}

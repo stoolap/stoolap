@@ -497,3 +497,13 @@ func scanValue(value storage.ColumnValue, dest interface{}) error {
 func SortInt64s(a []int64) {
 	SIMDSortInt64s(a)
 }
+
+// ScanValue is the exported version of scanValue for use in other packages
+func ScanValue(value storage.ColumnValue, dest interface{}) error {
+	return scanValue(value, dest)
+}
+
+// ScanNull is the exported version of scanNull for use in other packages
+func ScanNull(dest interface{}) error {
+	return scanNull(dest)
+}

@@ -52,6 +52,14 @@ func (e *Executor) executeCountStar(ctx context.Context, tx storage.Transaction,
 		return e.executeSelectWithAggregation(ctx, tx, stmt)
 	}
 
+	// First check if this is a CTE
+	if tableName != "" {
+		if _, isCTE := e.resolveCTETable(ctx, tx, tableName); isCTE {
+			// For CTEs, we can't use the fast path, so use the regular aggregation path
+			return e.executeSelectWithAggregation(ctx, tx, stmt)
+		}
+	}
+
 	// Check if the table exists
 	exists, err := e.engine.TableExists(tableName)
 	if err != nil {
@@ -200,6 +208,22 @@ func (e *Executor) executeCountStar(ctx context.Context, tx storage.Transaction,
 // This is the main entry point for SELECT query execution and contains
 // the decision logic for when to use vectorized execution
 func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Transaction, stmt *parser.SelectStatement) (storage.Result, error) {
+	// Handle CTEs if present
+	if stmt.With != nil {
+		registry := NewCTERegistry()
+		if err := registry.Execute(ctx, e, tx, stmt.With); err != nil {
+			return nil, err
+		}
+
+		// Store current registry and restore after execution
+		oldRegistry := e.cteRegistry
+		e.cteRegistry = registry
+		defer func() {
+			e.cteRegistry = oldRegistry
+		}()
+	}
+	// Note: If stmt.With is nil, we keep the current CTE registry from the parent query
+	// This allows subqueries to access CTEs defined in the parent query
 	// Check if we should use vectorized execution for this query
 	// This calls into the decision-making logic in executor.go
 	useVectorized := e.shouldUseVectorizedExecution(stmt)
@@ -237,6 +261,15 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 		// 2. Delegate execution to the engine
 		// 3. Return a vectorized.VectorizedResult that implements storage.Result
 		return e.executeWithVectorizedEngine(ctx, tx, stmt)
+	}
+
+	// Process subqueries in SELECT expressions first
+	if containsSubqueries(stmt.Columns) {
+		processedColumns, err := e.processSelectSubqueries(ctx, tx, stmt.Columns)
+		if err != nil {
+			return nil, fmt.Errorf("error processing SELECT subqueries: %w", err)
+		}
+		stmt.Columns = processedColumns
 	}
 
 	// Handle special case for queries without a table (like "SELECT 1" or "SELECT 1 + 1")
@@ -320,10 +353,42 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 		}, nil
 	}
 
+	// First, extract table name to check if it's a CTE
+	var tableName string
+	var temporalContext *TemporalContext
+
+	// Handle different types of table expressions
+	switch tableExpr := stmt.TableExpr.(type) {
+	case *parser.Identifier:
+		// Simple table name
+		tableName = tableExpr.Value
+	case *parser.SimpleTableSource:
+		// Table with optional alias and AS OF clause
+		tableName = tableExpr.Name.Value
+
+		// Extract temporal context if present
+		if temporal, err := extractTemporalContext(tableExpr); err != nil {
+			return nil, fmt.Errorf("error parsing AS OF clause: %w", err)
+		} else {
+			temporalContext = temporal
+		}
+	default:
+		// For other types of table expressions, we'll need to handle JOIN later
+		tableName = "" // Will be handled by join logic
+	}
+
+	// Check if this is a CTE (do this before any other special processing)
+	if tableName != "" {
+		if cteResult, isCTE := e.resolveCTETable(ctx, tx, tableName); isCTE {
+			// For CTEs, we need to process them like virtual tables
+			return e.processCTESelect(ctx, tx, cteResult, stmt)
+		}
+	}
+
 	// Check if the query has aggregations
 	hasAggregation := false
 	for _, col := range stmt.Columns {
-		if containsAggregateFunction(col) {
+		if ContainsAggregateFunction(col) {
 			hasAggregation = true
 			break
 		}
@@ -350,13 +415,13 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 		}
 	}
 
-	// Special case for handling aggregations
-	if hasAggregation {
+	// Special case for handling aggregations or GROUP BY
+	if hasAggregation || stmt.GroupBy != nil {
 		return e.executeSelectWithAggregation(ctx, tx, stmt)
 	}
 
 	// Special case for handling joins
-	if hasJoins {
+	if hasJoins || tableName == "" {
 		return e.executeSelectWithJoins(ctx, tx, stmt)
 	}
 
@@ -377,31 +442,7 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 		return e.executeSelectWithScalarFunctions(ctx, tx, stmt)
 	}
 
-	// Extract table name and temporal context from the table expression
-	var tableName string
-	var temporalContext *TemporalContext
-
-	// Handle different types of table expressions
-	switch tableExpr := stmt.TableExpr.(type) {
-	case *parser.Identifier:
-		// Simple table name
-		tableName = tableExpr.Value
-	case *parser.SimpleTableSource:
-		// Table with optional alias and AS OF clause
-		tableName = tableExpr.Name.Value
-
-		// Extract temporal context if present
-		if temporal, err := extractTemporalContext(tableExpr); err != nil {
-			return nil, fmt.Errorf("error parsing AS OF clause: %w", err)
-		} else {
-			temporalContext = temporal
-		}
-	default:
-		// For other types of table expressions, we'll need to handle JOIN
-		return e.executeSelectWithJoins(ctx, tx, stmt)
-	}
-
-	// Check if the table exists
+	// Check if the table exists in storage
 	exists, err := e.engine.TableExists(tableName)
 	if err != nil {
 		return nil, err
@@ -418,7 +459,7 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 		return nil, err
 	}
 
-	if len(stmt.Columns) == 1 && isAsterisk(stmt.Columns[0]) {
+	if len(stmt.Columns) == 1 && IsAsterisk(stmt.Columns[0]) {
 		// For SELECT *, get all columns from the schema
 		columns = make([]string, len(schema.Columns))
 		for i, col := range schema.Columns {
@@ -432,6 +473,9 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 			if colRef, ok := col.(*parser.Identifier); ok {
 				// Normalize column name to lowercase
 				columns[i] = strings.ToLower(colRef.Value)
+			} else if qualRef, ok := col.(*parser.QualifiedIdentifier); ok {
+				// For qualified identifiers like s.region, use just the column name
+				columns[i] = strings.ToLower(qualRef.Name.Value)
 			} else if aliased, ok := col.(*parser.AliasedExpression); ok {
 				// For aliased expressions, use the alias name
 				columns[i] = aliased.Alias.Value
@@ -444,9 +488,34 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 
 	// Execute the query based on the expression type
 	var result storage.Result
+	extraColumnsAdded := false // Track if we added WHERE columns not in SELECT
 
 	// Extract column aliases from the SELECT clause
 	columnAliases := ExtractColumnAliases(stmt.Columns)
+
+	// Create a mapping of which columns in the original SELECT are literals or expressions
+	literalColumns := make(map[int]parser.Expression)
+	for i, col := range stmt.Columns {
+		switch expr := col.(type) {
+		case *parser.IntegerLiteral, *parser.FloatLiteral, *parser.StringLiteral,
+			*parser.BooleanLiteral, *parser.NullLiteral:
+			// This is a literal expression
+			literalColumns[i] = expr
+		case *parser.AliasedExpression:
+			// Check if the inner expression is a literal
+			switch innerExpr := expr.Expression.(type) {
+			case *parser.IntegerLiteral, *parser.FloatLiteral, *parser.StringLiteral,
+				*parser.BooleanLiteral, *parser.NullLiteral:
+				literalColumns[i] = innerExpr
+			case *parser.Identifier, *parser.QualifiedIdentifier:
+				// This is a simple column reference, don't add to literalColumns
+			default:
+				// For all other expressions (comparisons, arithmetic, functions, etc.)
+				// we need to evaluate them, so add them to literalColumns
+				literalColumns[i] = expr.Expression
+			}
+		}
+	}
 
 	// DECISION POINT 3: Optimize WHERE clause filtering with vectorized execution
 	// Determine if we should use vectorized execution for WHERE processing
@@ -460,11 +529,70 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 		return e.executeWithVectorizedEngine(ctx, tx, stmt)
 	} else if stmt.Where != nil {
 		// Traditional row-based execution for WHERE clause
-		columnsToFetch := make([]string, len(columns))
-		copy(columnsToFetch, columns)
+		// Build columnsToFetch with only actual table columns, not literals
+		columnsToFetch := make([]string, 0, len(columns))
+
+		// First, add actual column references from the SELECT clause
+		// Special case for SELECT *
+		if len(stmt.Columns) == 1 && IsAsterisk(stmt.Columns[0]) {
+			// For SELECT *, fetch all columns
+			columnsToFetch = append(columnsToFetch, columns...)
+		} else {
+			// Process individual column references
+			for i, col := range stmt.Columns {
+				if _, ok := col.(*parser.Identifier); ok {
+					// This is an actual column reference
+					columnsToFetch = append(columnsToFetch, columns[i])
+				} else if _, ok := col.(*parser.QualifiedIdentifier); ok {
+					// This is a qualified column reference like s.region
+					columnsToFetch = append(columnsToFetch, columns[i])
+				} else if aliased, ok := col.(*parser.AliasedExpression); ok {
+					// Debug logging for aliased expressions
+					// TODO: Add proper debug flag to Executor
+					// fmt.Printf("[DEBUG] Processing aliased expression: alias=%s, expr_type=%T\n", aliased.Alias.Value, aliased.Expression)
+
+					// Check if the aliased expression references a column
+					if innerCol, ok := aliased.Expression.(*parser.Identifier); ok {
+						columnsToFetch = append(columnsToFetch, strings.ToLower(innerCol.Value))
+						// fmt.Printf("[DEBUG] Aliased identifier: %s\n", innerCol.Value)
+					} else if qualCol, ok := aliased.Expression.(*parser.QualifiedIdentifier); ok {
+						columnsToFetch = append(columnsToFetch, strings.ToLower(qualCol.Name.Value))
+						// fmt.Printf("[DEBUG] Aliased qualified identifier: %s\n", qualCol.Name.Value)
+					} else {
+						// For more complex expressions (like comparisons), extract all referenced columns
+						// This handles cases like "value > 15 as above_15"
+						referencedCols := getColumnsFromWhereClause(aliased.Expression)
+						// fmt.Printf("[DEBUG] Aliased complex expression: extracted columns=%v\n", referencedCols)
+						for _, refCol := range referencedCols {
+							columnsToFetch = append(columnsToFetch, strings.ToLower(refCol))
+						}
+					}
+				}
+				// Skip literals and other expressions - they don't need to be fetched from the table
+			}
+		}
 
 		// Get columns referenced in the WHERE clause
 		whereColumns := getColumnsFromWhereClause(stmt.Where)
+
+		// Debug logging for column collection
+		// TODO: Add proper debug flag to Executor
+		// fmt.Printf("[DEBUG] After SELECT processing: columnsToFetch=%v\n", columnsToFetch)
+		// fmt.Printf("[DEBUG] WHERE columns: %v\n", whereColumns)
+
+		// When we have literals in SELECT, we need special handling
+		// If all columns are literals AND we need columns for WHERE evaluation,
+		// we still need to fetch something to iterate rows
+		if len(columnsToFetch) == 0 && len(whereColumns) > 0 && len(schema.Columns) > 0 {
+			// We already have WHERE columns, so we'll fetch those
+			// This case shouldn't happen as whereColumns should be in columnsToFetch
+		} else if len(columnsToFetch) == 0 && len(literalColumns) == len(stmt.Columns) && len(schema.Columns) > 0 {
+			// All columns in SELECT are literals, but we still need to iterate rows
+			// Don't fetch any columns - we'll handle this in ProjectedResult
+			// Actually, we do need to fetch at least one column to iterate
+			// But this should only apply to the main query, not subqueries
+			// For now, don't add any columns here
+		}
 
 		// Add any missing columns needed by the WHERE clause
 		for _, whereCol := range whereColumns {
@@ -478,16 +606,42 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 
 			if !found {
 				columnsToFetch = append(columnsToFetch, whereCol)
+				extraColumnsAdded = true
 			}
 		}
+
+		// fmt.Printf("[DEBUG] Final columnsToFetch after WHERE processing: %v\n", columnsToFetch)
 
 		// Determine if we need additional filtering based on storage capabilities
 		needsFiltering := true
 		var whereExpr storage.Expression
+		var processedWhere parser.Expression
 
 		if stmt.Where != nil {
+			// First, process any subqueries in the WHERE clause
+			var err error
+			processedWhere, err = e.processWhereSubqueries(ctx, tx, stmt.Where)
+			if err != nil {
+				return nil, fmt.Errorf("error processing subqueries in WHERE clause: %w", err)
+			}
+
+			// Check if the processed WHERE is a boolean literal
+			if boolLit, ok := processedWhere.(*parser.BooleanLiteral); ok {
+				// Handle constant boolean WHERE clauses
+				if !boolLit.Value {
+					// WHERE false - return empty result
+					return &ExecResult{
+						columns:  columns,
+						rows:     [][]interface{}{},
+						isMemory: true,
+					}, nil
+				}
+				// WHERE true - fetch all rows (set processedWhere to nil)
+				processedWhere = nil
+			}
+
 			// Convert the WHERE clause to a storage expression
-			whereExpr = createWhereExpression(ctx, stmt.Where, e.functionRegistry)
+			whereExpr = createWhereExpression(ctx, processedWhere, e.functionRegistry)
 
 			// Check if the WHERE clause can be pushed down to storage
 			if whereExpr != nil {
@@ -512,12 +666,12 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 						}
 					}
 
-					result, err = tx.SelectAsOf(tableName, columns, whereExpr, temporalContext.Type, temporalValue)
+					result, err = tx.SelectAsOf(tableName, columnsToFetch, whereExpr, temporalContext.Type, temporalValue)
 					if err != nil {
 						return nil, err
 					}
 				} else {
-					result, err = tx.SelectWithAliases(tableName, columns, whereExpr, columnAliases)
+					result, err = tx.SelectWithAliases(tableName, columnsToFetch, whereExpr, columnAliases)
 					if err != nil {
 						return nil, err
 					}
@@ -549,6 +703,7 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 
 				result, err = tx.SelectAsOf(tableName, columnsToFetch, nil, temporalContext.Type, temporalValue)
 			} else {
+				// Don't remove this comment - needed for debugging
 				result, err = tx.SelectWithAliases(tableName, columnsToFetch, nil, columnAliases)
 			}
 			if err != nil {
@@ -562,7 +717,7 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 
 			result = &FilteredResult{
 				result:       result,
-				whereExpr:    stmt.Where,
+				whereExpr:    processedWhere,
 				evaluator:    evaluator,
 				currentRow:   nil,
 				currentValid: false,
@@ -571,6 +726,41 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 		}
 	} else {
 		// No WHERE clause, just fetch the columns directly
+		// Build columnsToFetch with only actual table columns, not literals or aliases
+		columnsToFetch := make([]string, 0, len(columns))
+
+		// Special case for SELECT *
+		if len(stmt.Columns) == 1 && IsAsterisk(stmt.Columns[0]) {
+			// For SELECT *, fetch all columns
+			columnsToFetch = append(columnsToFetch, columns...)
+		} else {
+			// Process individual column references
+			for i, col := range stmt.Columns {
+				if _, ok := col.(*parser.Identifier); ok {
+					// This is an actual column reference
+					columnsToFetch = append(columnsToFetch, columns[i])
+				} else if _, ok := col.(*parser.QualifiedIdentifier); ok {
+					// This is a qualified column reference like s.region
+					columnsToFetch = append(columnsToFetch, columns[i])
+				} else if aliased, ok := col.(*parser.AliasedExpression); ok {
+					// Check if the aliased expression references a column
+					if innerCol, ok := aliased.Expression.(*parser.Identifier); ok {
+						columnsToFetch = append(columnsToFetch, strings.ToLower(innerCol.Value))
+					} else if qualCol, ok := aliased.Expression.(*parser.QualifiedIdentifier); ok {
+						columnsToFetch = append(columnsToFetch, strings.ToLower(qualCol.Name.Value))
+					} else {
+						// For more complex expressions (like comparisons), extract all referenced columns
+						// This handles cases like "value > 15 as above_15"
+						referencedCols := getColumnsFromWhereClause(aliased.Expression)
+						for _, refCol := range referencedCols {
+							columnsToFetch = append(columnsToFetch, strings.ToLower(refCol))
+						}
+					}
+				}
+				// Skip literals and other expressions - they don't need to be fetched from the table
+			}
+		}
+
 		// Check if we have temporal context
 		if temporalContext != nil {
 			// Convert timestamp to nanoseconds if needed
@@ -590,13 +780,18 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 				}
 			}
 
-			result, err = tx.SelectAsOf(tableName, columns, nil, temporalContext.Type, temporalValue)
+			result, err = tx.SelectAsOf(tableName, columnsToFetch, nil, temporalContext.Type, temporalValue)
 		} else {
-			result, err = tx.SelectWithAliases(tableName, columns, nil, columnAliases)
+			result, err = tx.SelectWithAliases(tableName, columnsToFetch, nil, columnAliases)
 		}
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// If we have literal columns or added extra columns for WHERE, wrap the result to project
+	if len(literalColumns) > 0 || extraColumnsAdded {
+		result = NewProjectedResult(result, columns, stmt.Columns, e.functionRegistry)
 	}
 
 	// Apply DISTINCT if specified - must be after filtering but before ordering
@@ -615,8 +810,8 @@ func (e *Executor) executeSelectWithContext(ctx context.Context, tx storage.Tran
 	return result, nil
 }
 
-// isAsterisk checks if an expression is the * wildcard
-func isAsterisk(expr parser.Expression) bool {
+// IsAsterisk checks if an expression is a * wildcard
+func IsAsterisk(expr parser.Expression) bool {
 	if ident, ok := expr.(*parser.Identifier); ok {
 		return ident.Value == "*"
 	}
@@ -634,7 +829,7 @@ func (e *Executor) executeSelectWithJoins(ctx context.Context, tx storage.Transa
 	params := make(map[string]interface{})
 
 	// Execute the JoinQuery using the executor implementation
-	return ExecuteJoinQuery(ctx, stmt, e.engine, evaluator, params)
+	return e.ExecuteJoinQuery(ctx, stmt, evaluator, params)
 }
 
 // applyOrderByLimitOffset applies ORDER BY, LIMIT, and OFFSET clauses to a result set
@@ -715,8 +910,41 @@ func applyOrderByLimitOffset(ctx context.Context, result storage.Result, stmt *p
 	return result, nil
 }
 
-// containsAggregateFunction checks if an expression contains an aggregate function
-func containsAggregateFunction(expr parser.Expression) bool {
+// containsSubqueries checks if any expression contains a subquery
+func containsSubqueries(expressions []parser.Expression) bool {
+	for _, expr := range expressions {
+		if containsSubquery(expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsSubquery checks if an expression contains a subquery
+func containsSubquery(expr parser.Expression) bool {
+	switch e := expr.(type) {
+	case *parser.ScalarSubquery:
+		return true
+	case *parser.AliasedExpression:
+		return containsSubquery(e.Expression)
+	case *parser.InfixExpression:
+		return containsSubquery(e.Left) || containsSubquery(e.Right)
+	case *parser.PrefixExpression:
+		return containsSubquery(e.Right)
+	case *parser.FunctionCall:
+		for _, arg := range e.Arguments {
+			if containsSubquery(arg) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// ContainsAggregateFunction checks if an expression contains an aggregate function
+func ContainsAggregateFunction(expr parser.Expression) bool {
 	if expr == nil {
 		return false
 	}
@@ -730,15 +958,15 @@ func containsAggregateFunction(expr parser.Expression) bool {
 
 	case *parser.InfixExpression:
 		// Check both sides
-		return containsAggregateFunction(e.Left) || containsAggregateFunction(e.Right)
+		return ContainsAggregateFunction(e.Left) || ContainsAggregateFunction(e.Right)
 
 	case *parser.PrefixExpression:
 		// Check the operand
-		return containsAggregateFunction(e.Right)
+		return ContainsAggregateFunction(e.Right)
 
 	case *parser.AliasedExpression:
 		// Check the expression
-		return containsAggregateFunction(e.Expression)
+		return ContainsAggregateFunction(e.Expression)
 
 	default:
 		// Other expressions don't contain aggregate functions

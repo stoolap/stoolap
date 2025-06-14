@@ -98,6 +98,24 @@ func (e *Evaluator) WithTableAliases(aliases map[string]string) *Evaluator {
 	return e
 }
 
+// EvaluateWithRow evaluates an expression with a simple row context
+func (e *Evaluator) EvaluateWithRow(expr parser.Expression, row map[string]interface{}) (storage.ColumnValue, error) {
+	// Convert row to storage.ColumnValue format
+	columnValueRow := common.GetColumnValueMap(len(row))
+	defer common.PutColumnValueMap(columnValueRow, len(row))
+
+	for col, val := range row {
+		columnValueRow[col] = storage.GetPooledColumnValue(val)
+	}
+
+	// Set the row and evaluate
+	oldRow := e.row
+	e.row = columnValueRow
+	defer func() { e.row = oldRow }()
+
+	return e.Evaluate(expr)
+}
+
 // Evaluate evaluates an expression and returns its storage.ColumnValue
 func (e *Evaluator) Evaluate(expr parser.Expression) (storage.ColumnValue, error) {
 	if expr == nil {
@@ -433,6 +451,15 @@ func (e *Evaluator) Evaluate(expr parser.Expression) (storage.ColumnValue, error
 		// As a fallback, try just the column name
 		if val, exists := e.row[columnName]; exists {
 			return val, nil
+		}
+
+		// Additional fallback for CTE aliases - try without any table prefix
+		// This handles cases where CTEs are accessed with table aliases
+		for colName, colVal := range e.row {
+			// Check if this column matches what we're looking for
+			if colName == columnName {
+				return colVal, nil
+			}
 		}
 
 		return storage.StaticNullUnknown, fmt.Errorf("column '%s.%s' not found in row", tableName, columnName)
@@ -1083,6 +1110,12 @@ func (e *Evaluator) Evaluate(expr parser.Expression) (storage.ColumnValue, error
 	case *parser.AliasedExpression:
 		// For evaluation purposes, we just evaluate the underlying expression
 		return e.Evaluate(expr.Expression)
+
+	case *parser.ScalarSubquery:
+		// Scalar subqueries need to be evaluated by the executor
+		// This is a placeholder - the actual evaluation should be done by processWhereSubqueries
+		// before the expression reaches the evaluator
+		return storage.StaticNullUnknown, fmt.Errorf("scalar subquery should have been processed before evaluation")
 
 	default:
 		return storage.StaticNullUnknown, fmt.Errorf("unsupported expression type: %T", expr)

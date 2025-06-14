@@ -50,14 +50,14 @@ func TestDirtyWriteBatchPrevention(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// Create table
-			_, err = db.Exec(ctx, "CREATE TABLE test (id INTEGER PRIMARY KEY, value INTEGER)")
+			// Create table with unique name to avoid conflicts
+			_, err = db.Exec(ctx, "CREATE TABLE dirty_batch_test (id INTEGER PRIMARY KEY, value INTEGER)")
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			// Insert initial rows
-			_, err = db.Exec(ctx, "INSERT INTO test (id, value) VALUES (1, 100), (2, 200), (3, 300)")
+			_, err = db.Exec(ctx, "INSERT INTO dirty_batch_test (id, value) VALUES (1, 100), (2, 200), (3, 300)")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -74,14 +74,14 @@ func TestDirtyWriteBatchPrevention(t *testing.T) {
 			}
 
 			// Tx1 updates row 2 but doesn't commit
-			_, err = tx1.ExecContext(ctx, "UPDATE test SET value = 250 WHERE id = 2")
+			_, err = tx1.ExecContext(ctx, "UPDATE dirty_batch_test SET value = 250 WHERE id = 2")
 			if err != nil {
 				t.Fatal(err)
 			}
 			fmt.Printf("[%s] Tx1 updated row 2 to 250 (not committed)\n", tc.name)
 
 			// Tx2 tries to insert multiple rows, including one that would update row 2
-			_, err = tx2.ExecContext(ctx, "INSERT INTO test (id, value) VALUES (2, 999), (4, 400), (5, 500)")
+			_, err = tx2.ExecContext(ctx, "INSERT INTO dirty_batch_test (id, value) VALUES (2, 999), (4, 400), (5, 500)")
 			if err != nil {
 				fmt.Printf("[%s] Tx2 batch insert blocked/failed as expected: %v\n", tc.name, err)
 			} else {
@@ -108,14 +108,14 @@ func TestDirtyWriteBatchUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create table
-	_, err = db.Exec(ctx, "CREATE TABLE test (id INTEGER PRIMARY KEY, value INTEGER)")
+	// Create table with unique name to avoid conflicts
+	_, err = db.Exec(ctx, "CREATE TABLE dirty_batch_update_test (id INTEGER PRIMARY KEY, value INTEGER)")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Insert initial rows
-	_, err = db.Exec(ctx, "INSERT INTO test (id, value) VALUES (1, 100), (2, 200), (3, 300), (4, 400), (5, 500)")
+	_, err = db.Exec(ctx, "INSERT INTO dirty_batch_update_test (id, value) VALUES (1, 100), (2, 200), (3, 300), (4, 400), (5, 500)")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,14 +132,14 @@ func TestDirtyWriteBatchUpdate(t *testing.T) {
 	}
 
 	// Tx1 updates rows 2 and 3 but doesn't commit
-	_, err = tx1.ExecContext(ctx, "UPDATE test SET value = value + 1000 WHERE id IN (2, 3)")
+	_, err = tx1.ExecContext(ctx, "UPDATE dirty_batch_update_test SET value = value + 1000 WHERE id IN (2, 3)")
 	if err != nil {
 		t.Fatal(err)
 	}
 	fmt.Println("Tx1 updated rows 2,3 (not committed)")
 
 	// Tx2 tries to update rows 3,4,5 (row 3 conflicts)
-	_, err = tx2.ExecContext(ctx, "UPDATE test SET value = value + 2000 WHERE id IN (3, 4, 5)")
+	_, err = tx2.ExecContext(ctx, "UPDATE dirty_batch_update_test SET value = value + 2000 WHERE id IN (3, 4, 5)")
 	if err != nil {
 		fmt.Printf("Tx2 batch update failed as expected: %v\n", err)
 	} else {
@@ -186,21 +186,21 @@ func TestDirtyWriteBatchTransfer(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// Create table with two accounts
-			_, err = db.Exec(ctx, "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+			// Create table with two accounts - use unique name to avoid conflicts
+			_, err = db.Exec(ctx, "CREATE TABLE batch_test_accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			// Insert two accounts with 1000 each
-			_, err = db.Exec(ctx, "INSERT INTO accounts (id, balance) VALUES (1, 1000), (2, 1000)")
+			_, err = db.Exec(ctx, "INSERT INTO batch_test_accounts (id, balance) VALUES (1, 1000), (2, 1000)")
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			// Verify initial state
 			var totalBalance int
-			rows, _ := db.Query(ctx, "SELECT SUM(balance) FROM accounts")
+			rows, _ := db.Query(ctx, "SELECT SUM(balance) FROM batch_test_accounts")
 			if rows.Next() {
 				rows.Scan(&totalBalance)
 				rows.Close()
@@ -234,7 +234,7 @@ func TestDirtyWriteBatchTransfer(t *testing.T) {
 
 					// Deduct from account 1
 					_, err = tx.ExecContext(ctx,
-						"UPDATE accounts SET balance = balance - ? WHERE id = ?",
+						"UPDATE batch_test_accounts SET balance = balance - ? WHERE id = ?",
 						driver.NamedValue{Ordinal: 1, Value: 100},
 						driver.NamedValue{Ordinal: 2, Value: 1})
 					if err != nil {
@@ -248,7 +248,7 @@ func TestDirtyWriteBatchTransfer(t *testing.T) {
 					// Add to account 2
 					if success {
 						_, err = tx.ExecContext(ctx,
-							"UPDATE accounts SET balance = balance + ? WHERE id = ?",
+							"UPDATE batch_test_accounts SET balance = balance + ? WHERE id = ?",
 							driver.NamedValue{Ordinal: 1, Value: 100},
 							driver.NamedValue{Ordinal: 2, Value: 2})
 						if err != nil {
@@ -282,7 +282,7 @@ func TestDirtyWriteBatchTransfer(t *testing.T) {
 			wg.Wait()
 
 			// Check final balance
-			rows, _ = db.Query(ctx, "SELECT SUM(balance) FROM accounts")
+			rows, _ = db.Query(ctx, "SELECT SUM(balance) FROM batch_test_accounts")
 			if rows.Next() {
 				rows.Scan(&totalBalance)
 				rows.Close()
@@ -290,12 +290,12 @@ func TestDirtyWriteBatchTransfer(t *testing.T) {
 
 			// Check individual balances
 			var bal1, bal2 int
-			rows, _ = db.Query(ctx, "SELECT balance FROM accounts WHERE id = 1")
+			rows, _ = db.Query(ctx, "SELECT balance FROM batch_test_accounts WHERE id = 1")
 			if rows.Next() {
 				rows.Scan(&bal1)
 				rows.Close()
 			}
-			rows, _ = db.Query(ctx, "SELECT balance FROM accounts WHERE id = 2")
+			rows, _ = db.Query(ctx, "SELECT balance FROM batch_test_accounts WHERE id = 2")
 			if rows.Next() {
 				rows.Scan(&bal2)
 				rows.Close()

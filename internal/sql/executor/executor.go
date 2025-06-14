@@ -41,6 +41,9 @@ type Executor struct {
 
 	// Connection-level default isolation level
 	defaultIsolationLevel storage.IsolationLevel
+
+	// CTE registry for the current query execution
+	cteRegistry *CTERegistry
 }
 
 // parameterContextKey is the context key for parameter

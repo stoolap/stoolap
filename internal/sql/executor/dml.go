@@ -829,12 +829,29 @@ func (e *Executor) executeUpdateWithContext(ctx context.Context, tx storage.Tran
 	// Create a storage-level expression from the SQL WHERE clause
 	var updateExpr storage.Expression
 	if stmt.Where != nil {
-		// Convert the SQL WHERE expression to a storage-level expression
-		updateExpr = createWhereExpression(ctx, stmt.Where, e.functionRegistry)
-		if updateExpr == nil {
-			return 0, fmt.Errorf("unsupported WHERE clause in UPDATE statement: %T", stmt.Where)
+		// First, process any subqueries in the WHERE clause
+		processedWhere, err := e.processWhereSubqueries(ctx, tx, stmt.Where)
+		if err != nil {
+			return 0, fmt.Errorf("error processing subqueries in WHERE clause: %w", err)
 		}
-		updateExpr.PrepareForSchema(schema)
+
+		// Check if the processed WHERE is a boolean literal
+		if boolLit, ok := processedWhere.(*parser.BooleanLiteral); ok {
+			// Handle constant boolean WHERE clauses
+			if !boolLit.Value {
+				// WHERE false - update no rows
+				return 0, nil
+			}
+			// WHERE true - update all rows (set updateExpr to nil)
+			updateExpr = nil
+		} else {
+			// Convert the SQL WHERE expression to a storage-level expression
+			updateExpr = createWhereExpression(ctx, processedWhere, e.functionRegistry)
+			if updateExpr == nil {
+				return 0, fmt.Errorf("unsupported WHERE clause in UPDATE statement: %T", processedWhere)
+			}
+			updateExpr.PrepareForSchema(schema)
+		}
 	} else {
 		// If no WHERE clause, update all rows - use a simple expression that always returns true
 		updateExpr = nil
@@ -887,12 +904,29 @@ func (e *Executor) executeDeleteWithContext(ctx context.Context, tx storage.Tran
 	// Create a WHERE expression directly from the SQL WHERE clause
 	var deleteExpr storage.Expression
 	if stmt.Where != nil {
-		// Convert the SQL WHERE expression to a storage-level expression
-		deleteExpr = createWhereExpression(ctx, stmt.Where, e.functionRegistry)
-		if deleteExpr == nil {
-			return 0, fmt.Errorf("unsupported WHERE clause in DELETE statement: %T", stmt.Where)
+		// First, process any subqueries in the WHERE clause
+		processedWhere, err := e.processWhereSubqueries(ctx, tx, stmt.Where)
+		if err != nil {
+			return 0, fmt.Errorf("error processing subqueries in WHERE clause: %w", err)
 		}
-		deleteExpr.PrepareForSchema(schema)
+
+		// Check if the processed WHERE is a boolean literal
+		if boolLit, ok := processedWhere.(*parser.BooleanLiteral); ok {
+			// Handle constant boolean WHERE clauses
+			if !boolLit.Value {
+				// WHERE false - delete no rows
+				return 0, nil
+			}
+			// WHERE true - delete all rows (set deleteExpr to nil)
+			deleteExpr = nil
+		} else {
+			// Convert the SQL WHERE expression to a storage-level expression
+			deleteExpr = createWhereExpression(ctx, processedWhere, e.functionRegistry)
+			if deleteExpr == nil {
+				return 0, fmt.Errorf("unsupported WHERE clause in DELETE statement: %T", processedWhere)
+			}
+			deleteExpr.PrepareForSchema(schema)
+		}
 	} else {
 		// If no WHERE clause, delete all rows - use a simple expression that always returns true
 		deleteExpr = nil
@@ -910,9 +944,17 @@ func (e *Executor) executeDeleteWithContext(ctx context.Context, tx storage.Tran
 
 // createWhereExpression creates a storage.Expression from a parser.Expression
 func createWhereExpression(ctx context.Context, expr parser.Expression, registry contract.FunctionRegistry) storage.Expression {
+	return CreateWhereExpression(ctx, expr, registry)
+}
+
+// CreateWhereExpression converts a parser expression to a storage expression
+func CreateWhereExpression(ctx context.Context, expr parser.Expression, registry contract.FunctionRegistry) storage.Expression {
 	if expr == nil {
 		return nil
 	}
+
+	// Debug: print what we're converting
+	// fmt.Printf("DEBUG createWhereExpression: converting %T: %s\n", expr, expr.String())
 
 	// Handle NOT expressions (implemented as PrefixExpression with operator "NOT")
 	if prefixExpr, ok := expr.(*parser.PrefixExpression); ok && prefixExpr.Operator == "NOT" {
@@ -1346,7 +1388,7 @@ func extractColumnFromLeft(expr *parser.InfixExpression) bool {
 // isLiteral checks if an expression is a literal value
 func isLiteral(expr parser.Expression) bool {
 	switch expr.(type) {
-	case *parser.IntegerLiteral, *parser.FloatLiteral, *parser.StringLiteral, *parser.BooleanLiteral, *parser.Parameter:
+	case *parser.IntegerLiteral, *parser.FloatLiteral, *parser.StringLiteral, *parser.BooleanLiteral, *parser.NullLiteral, *parser.Parameter:
 		return true
 	default:
 		return false
@@ -1461,6 +1503,8 @@ func getLiteralValue(ctx context.Context, expr parser.Expression) interface{} {
 		return e.Value
 	case *parser.BooleanLiteral:
 		return e.Value
+	case *parser.NullLiteral:
+		return nil
 	case *parser.Parameter:
 		// Extract parameter just once if we need it
 		ps := getParameterFromContext(ctx)

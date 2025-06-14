@@ -212,6 +212,31 @@ FROM products
 GROUP BY category;
 ```
 
+## Working with Common Table Expressions (CTEs)
+
+CTEs make complex queries more readable:
+
+```sql
+-- Find top products by category
+WITH category_stats AS (
+    SELECT 
+        category,
+        AVG(price) as avg_price,
+        MAX(price) as max_price
+    FROM products
+    GROUP BY category
+)
+SELECT 
+    p.name,
+    p.price,
+    cs.avg_price,
+    ROUND((p.price / cs.avg_price - 1) * 100, 2) as pct_above_avg
+FROM products p
+JOIN category_stats cs ON p.category = cs.category
+WHERE p.price > cs.avg_price
+ORDER BY pct_above_avg DESC;
+```
+
 ## Next Steps
 
 Now that you've learned the basics, you might want to explore:

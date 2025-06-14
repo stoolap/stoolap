@@ -23,7 +23,97 @@ import (
 	"strconv"
 
 	"github.com/stoolap/stoolap/internal/storage"
+	"github.com/stoolap/stoolap/internal/storage/mvcc"
 )
+
+// MaterializedResult wraps materialized rows as a Result
+type MaterializedResult struct {
+	columns []string
+	rows    []map[string]storage.ColumnValue
+	current int
+}
+
+// Columns returns the column names
+func (r *MaterializedResult) Columns() []string {
+	return r.columns
+}
+
+// Next advances to the next row
+func (r *MaterializedResult) Next() bool {
+	r.current++
+	return r.current < len(r.rows)
+}
+
+// Scan copies column values to the provided destinations
+func (r *MaterializedResult) Scan(dest ...interface{}) error {
+	if r.current < 0 || r.current >= len(r.rows) {
+		return fmt.Errorf("no current row")
+	}
+
+	row := r.rows[r.current]
+	if len(dest) != len(r.columns) {
+		return fmt.Errorf("scan column count mismatch: %d != %d", len(dest), len(r.columns))
+	}
+
+	for i, col := range r.columns {
+		if val, ok := row[col]; ok {
+			if err := mvcc.ScanValue(val, dest[i]); err != nil {
+				return err
+			}
+		} else {
+			// Column not found, scan NULL
+			if err := mvcc.ScanNull(dest[i]); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// Row returns the current row as storage.Row
+func (r *MaterializedResult) Row() storage.Row {
+	if r.current < 0 || r.current >= len(r.rows) {
+		return nil
+	}
+
+	row := r.rows[r.current]
+	result := make([]storage.ColumnValue, len(r.columns))
+	for i, col := range r.columns {
+		if val, ok := row[col]; ok {
+			result[i] = val
+		} else {
+			result[i] = storage.NewDirectValueFromInterface(nil)
+		}
+	}
+	return result
+}
+
+// Close closes the result
+func (r *MaterializedResult) Close() error {
+	return nil
+}
+
+// RowsAffected returns 0 for SELECT
+func (r *MaterializedResult) RowsAffected() int64 {
+	return 0
+}
+
+// LastInsertID returns 0 for SELECT
+func (r *MaterializedResult) LastInsertID() int64 {
+	return 0
+}
+
+// Context returns the context
+func (r *MaterializedResult) Context() context.Context {
+	return context.Background()
+}
+
+// WithAliases returns a new result with column aliases
+func (r *MaterializedResult) WithAliases(aliases map[string]string) storage.Result {
+	// For now, just return self - aliases are handled elsewhere
+	return r
+}
 
 // ExecResult represents an execution result
 type ExecResult struct {
@@ -36,6 +126,16 @@ type ExecResult struct {
 	rows       [][]interface{}
 	currentRow int
 	isMemory   bool
+}
+
+// IsMemory returns true if this is an in-memory result (for testing)
+func (r *ExecResult) IsMemory() bool {
+	return r.isMemory
+}
+
+// GetRows returns the raw rows (for testing)
+func (r *ExecResult) GetRows() [][]interface{} {
+	return r.rows
 }
 
 // NewExecMemoryResult creates a new in-memory result set

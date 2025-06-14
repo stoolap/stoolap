@@ -181,11 +181,18 @@ Stoolap supports two storage modes:
 
 - **DDL**: CREATE/ALTER/DROP TABLE, CREATE/DROP INDEX, CREATE/DROP VIEW
 - **DML**: SELECT, INSERT, UPDATE, DELETE, MERGE
-- **Queries**: JOINs, GROUP BY, ORDER BY, LIMIT, OFFSET, subqueries, CTE (WITH), DISTINCT
+- **Queries**: JOINs, GROUP BY, ORDER BY, LIMIT, OFFSET, DISTINCT
+- **Subqueries**: Scalar subqueries, IN/NOT IN, EXISTS/NOT EXISTS, correlated subqueries
+- **Common Table Expressions (CTEs)**: WITH clause for recursive and non-recursive CTEs
+  - Single and multiple CTEs in one query
+  - CTEs with column aliases
+  - CTEs in JOINs and subqueries
+  - CTEs with aggregations and HAVING clauses
+  - Nested CTEs (CTEs referencing other CTEs)
 - **Temporal Queries**: AS OF TRANSACTION/TIMESTAMP for time travel queries
 - **Transactions**: BEGIN/COMMIT/ROLLBACK with isolation levels
 - **Indexing**: CREATE INDEX, unique constraints, primary keys, multi-column indexes
-- **Functions**: Aggregate and scalar functions
+- **Functions**: Aggregate (SUM, AVG, COUNT, MIN, MAX) and scalar functions
 
 ### Transaction Isolation
 

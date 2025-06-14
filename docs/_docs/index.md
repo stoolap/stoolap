@@ -18,6 +18,7 @@ Stoolap is a Hybrid Transactional/Analytical Processing (HTAP) database engine t
 * [Quick Start Tutorial](getting-started/quickstart) - A step-by-step guide to your first Stoolap database
 * [Connection String Reference](getting-started/connection-strings) - Understanding and using Stoolap connection strings
 * [API Reference](getting-started/api-reference) - Complete API documentation for the Stoolap package
+* [Subqueries Quick Start](getting-started/subqueries-quickstart) - Learn to use subqueries in SQL statements
 
 ### SQL Reference
 * [Data Types](data-types/data-types) - All supported data types and their behaviors
@@ -26,6 +27,8 @@ Stoolap is a Hybrid Transactional/Analytical Processing (HTAP) database engine t
 * [Scalar Functions](functions/scalar-functions) - Built-in scalar functions
 * [Window Functions](sql-features/window-functions) - Row-based analytical functions
 * [Temporal Queries (AS OF)](sql-features/temporal-queries) - Time travel queries with AS OF syntax
+* [Subqueries](sql-features/subqueries) - Using nested queries in SQL statements
+* [Common Table Expressions (CTEs)](sql-features/common-table-expressions) - WITH clause for readable complex queries
 * [CAST Operations](sql-features/cast-operations) - Type conversion capabilities
 * [NULL Handling](sql-features/null-handling) - Working with NULL values
 * [JOIN Operations](sql-features/join-operations) - Combining data from multiple tables
