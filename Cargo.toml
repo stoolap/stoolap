@@ -1,0 +1,109 @@
+[package]
+name = "stoolap"
+version = "0.1.0"
+edition = "2021"
+authors = ["Stoolap Contributors"]
+description = "High-performance embedded SQL database with MVCC, time-travel queries, and full ACID compliance"
+license = "Apache-2.0"
+repository = "https://github.com/stoolap/stoolap"
+homepage = "https://stoolap.io"
+documentation = "https://stoolap.io/docs/"
+readme = "README.md"
+keywords = ["database", "sql", "embedded", "mvcc", "acid"]
+categories = ["database", "database-implementations"]
+
+[lib]
+name = "stoolap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stoolap"
+path = "src/bin/stoolap.rs"
+required-features = ["cli"]
+
+# PG server will be enabled once implemented
+# [[bin]]
+# name = "stoolap-pgserver"
+# path = "src/bin/pgserver.rs"
+# required-features = ["pg-server"]
+
+[dependencies]
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Concurrency
+parking_lot = "0.12"
+dashmap = "5.5"
+crossbeam = "0.8"
+rayon = "1.8"
+
+# Async (for pg-server)
+tokio = { version = "1.35", features = ["full"], optional = true }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI (optional)
+clap = { version = "4.4", features = ["derive"], optional = true }
+rustyline = { version = "14.0", optional = true }
+comfy-table = { version = "7.1", optional = true }
+dirs = { version = "5.0", optional = true }
+
+# Checksums for data integrity
+crc32fast = "1.4"
+
+# Compression
+lz4_flex = "0.11"
+
+# Utilities
+bytes = "1.5"
+smallvec = "1.11"
+ordered-float = "4.2"
+indexmap = "2.1"
+rustc-hash = "1.1"
+memchr = "2.6"
+regex = "1.10"
+radsort = "0.1"  # Radix sort - O(n) for integer keys
+rand = "0.9"  # Random number generation for RANDOM() function
+ahash = "0.8"  # Fast hash for hash indexes (~30 GB/s, DOS-resistant)
+roaring = "0.10"  # Compressed bitmap indexes (used by Lucene, Druid, Spark)
+
+# Platform-specific file locking
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.4"
+tempfile = "3.9"
+#rusqlite = { version = "0.32", features = ["bundled"] }
+#duckdb = { version = "1.1", features = ["bundled"] }
+
+[features]
+default = ["cli"]
+cli = ["clap", "rustyline", "comfy-table", "dirs"]
+pg-server = ["tokio"]
+simd = []  # Enable SIMD optimizations
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+debug = true  # Enable debug symbols for profiling
+
+[profile.bench]
+lto = true
+codegen-units = 1

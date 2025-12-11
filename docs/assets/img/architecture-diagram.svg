@@ -1,0 +1,299 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="100%" height="100%" viewBox="0 0 1000 750" fill="none" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
+  <style>
+    text {
+      font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+    }
+    .title {
+      font-size: 24px;
+      font-weight: 600;
+      fill: #1e293b;
+    }
+    .layer-title {
+      font-size: 13px;
+      font-weight: 600;
+      fill: #ffffff;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    .component-title {
+      font-size: 13px;
+      font-weight: 600;
+      fill: #e2e8f0;
+    }
+    .sub-label {
+      font-size: 10px;
+      fill: #94a3b8;
+    }
+    .layer-box {
+      fill: #1e293b;
+      stroke: none;
+      stroke-width: 0;
+    }
+    .component-box {
+      fill: #334155;
+      stroke: #475569;
+      stroke-width: 1;
+    }
+    .sub-box {
+      fill: #1e293b;
+      stroke: #475569;
+      stroke-width: 1;
+    }
+    .accent-green {
+      fill: #1e293b;
+      stroke: #22c55e;
+      stroke-width: 2;
+    }
+    .accent-blue {
+      fill: #1e293b;
+      stroke: #3b82f6;
+      stroke-width: 2;
+    }
+    .accent-purple {
+      fill: #1e293b;
+      stroke: #8b5cf6;
+      stroke-width: 2;
+    }
+    .accent-orange {
+      fill: #1e293b;
+      stroke: #f59e0b;
+      stroke-width: 2;
+    }
+    .connector {
+      stroke: #64748b;
+      stroke-width: 2;
+      fill: none;
+    }
+    .flow-line {
+      stroke: #22c55e;
+      stroke-width: 2;
+      stroke-dasharray: 6 3;
+      fill: none;
+    }
+    .flow-label {
+      font-size: 11px;
+      fill: #22c55e;
+      font-weight: 500;
+    }
+
+    /* Light mode overrides */
+    @media (prefers-color-scheme: light) {
+      .title { fill: #1e293b; }
+    }
+    [data-theme="light"] .title { fill: #1e293b; }
+
+    /* Dark mode is default, these ensure consistency */
+    @media (prefers-color-scheme: dark) {
+      .title { fill: #f1f5f9; }
+    }
+    [data-theme="dark"] .title { fill: #f1f5f9; }
+  </style>
+
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#64748b" />
+    </marker>
+    <marker id="arrow-green" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#22c55e" />
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="500" y="40" text-anchor="middle" class="title">Stoolap Architecture</text>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!-- API LAYER -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <g transform="translate(30, 65)">
+    <rect x="0" y="0" width="880" height="90" rx="8" class="layer-box accent-green" />
+    <text x="20" y="25" class="layer-title">API Layer</text>
+
+    <!-- Database API -->
+    <rect x="20" y="40" width="180" height="40" rx="6" class="component-box" />
+    <text x="110" y="65" text-anchor="middle" class="component-title">Database API</text>
+
+    <!-- SQL Parser -->
+    <rect x="220" y="40" width="180" height="40" rx="6" class="component-box" />
+    <text x="310" y="65" text-anchor="middle" class="component-title">SQL Parser</text>
+
+    <!-- CLI -->
+    <rect x="420" y="40" width="180" height="40" rx="6" class="component-box" />
+    <text x="510" y="65" text-anchor="middle" class="component-title">CLI Interface</text>
+
+    <!-- Connection Manager -->
+    <rect x="620" y="40" width="240" height="40" rx="6" class="component-box" />
+    <text x="740" y="65" text-anchor="middle" class="component-title">Connection Manager</text>
+  </g>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!-- QUERY PROCESSING LAYER -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <g transform="translate(30, 175)">
+    <rect x="0" y="0" width="880" height="140" rx="8" class="layer-box accent-blue" />
+    <text x="20" y="25" class="layer-title">Query Processing</text>
+
+    <!-- Query Optimizer -->
+    <g transform="translate(20, 40)">
+      <rect x="0" y="0" width="260" height="90" rx="6" class="component-box" />
+      <text x="130" y="22" text-anchor="middle" class="component-title">Cost-Based Optimizer</text>
+      <rect x="10" y="32" width="72" height="28" rx="4" class="sub-box" />
+      <text x="46" y="50" text-anchor="middle" class="sub-label">Statistics</text>
+      <rect x="92" y="32" width="72" height="28" rx="4" class="sub-box" />
+      <text x="128" y="50" text-anchor="middle" class="sub-label">Join Order</text>
+      <rect x="174" y="32" width="72" height="28" rx="4" class="sub-box" />
+      <text x="210" y="50" text-anchor="middle" class="sub-label">Adaptive</text>
+      <rect x="50" y="65" width="72" height="22" rx="4" class="sub-box" />
+      <text x="86" y="80" text-anchor="middle" class="sub-label">Cardinality</text>
+      <rect x="132" y="65" width="78" height="22" rx="4" class="sub-box" />
+      <text x="171" y="80" text-anchor="middle" class="sub-label">Bloom Filter</text>
+    </g>
+
+    <!-- Query Executor -->
+    <g transform="translate(300, 40)">
+      <rect x="0" y="0" width="260" height="90" rx="6" class="component-box" />
+      <text x="130" y="22" text-anchor="middle" class="component-title">Query Executor</text>
+      <rect x="10" y="32" width="72" height="28" rx="4" class="sub-box" />
+      <text x="46" y="50" text-anchor="middle" class="sub-label">DML</text>
+      <rect x="92" y="32" width="72" height="28" rx="4" class="sub-box" />
+      <text x="128" y="50" text-anchor="middle" class="sub-label">DDL</text>
+      <rect x="174" y="32" width="72" height="28" rx="4" class="sub-box" />
+      <text x="210" y="50" text-anchor="middle" class="sub-label">Parallel</text>
+      <rect x="50" y="65" width="72" height="22" rx="4" class="sub-box" />
+      <text x="86" y="80" text-anchor="middle" class="sub-label">Aggregate</text>
+      <rect x="132" y="65" width="78" height="22" rx="4" class="sub-box" />
+      <text x="171" y="80" text-anchor="middle" class="sub-label">Window Fn</text>
+    </g>
+
+    <!-- Semantic Cache -->
+    <g transform="translate(580, 40)">
+      <rect x="0" y="0" width="280" height="90" rx="6" class="component-box" />
+      <text x="140" y="22" text-anchor="middle" class="component-title">Semantic Cache</text>
+      <rect x="10" y="32" width="120" height="28" rx="4" class="sub-box" />
+      <text x="70" y="50" text-anchor="middle" class="sub-label">Predicate Match</text>
+      <rect x="140" y="32" width="130" height="28" rx="4" class="sub-box" />
+      <text x="205" y="50" text-anchor="middle" class="sub-label">Result Subsumption</text>
+      <rect x="50" y="65" width="70" height="22" rx="4" class="sub-box" />
+      <text x="85" y="80" text-anchor="middle" class="sub-label">LRU</text>
+      <rect x="130" y="65" width="100" height="22" rx="4" class="sub-box" />
+      <text x="180" y="80" text-anchor="middle" class="sub-label">Invalidation</text>
+    </g>
+  </g>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!-- STORAGE ENGINE LAYER -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <g transform="translate(30, 335)">
+    <rect x="0" y="0" width="880" height="140" rx="8" class="layer-box accent-purple" />
+    <text x="20" y="25" class="layer-title">Storage Engine</text>
+
+    <!-- MVCC -->
+    <g transform="translate(20, 40)">
+      <rect x="0" y="0" width="195" height="90" rx="6" class="component-box" />
+      <text x="97" y="22" text-anchor="middle" class="component-title">MVCC Engine</text>
+      <rect x="10" y="32" width="82" height="28" rx="4" class="sub-box" />
+      <text x="51" y="50" text-anchor="middle" class="sub-label">Transaction</text>
+      <rect x="102" y="32" width="82" height="28" rx="4" class="sub-box" />
+      <text x="143" y="50" text-anchor="middle" class="sub-label">Version Store</text>
+      <rect x="25" y="65" width="65" height="22" rx="4" class="sub-box" />
+      <text x="57" y="80" text-anchor="middle" class="sub-label">Snapshot</text>
+      <rect x="100" y="65" width="65" height="22" rx="4" class="sub-box" />
+      <text x="132" y="80" text-anchor="middle" class="sub-label">Registry</text>
+    </g>
+
+    <!-- Row Storage -->
+    <g transform="translate(235, 40)">
+      <rect x="0" y="0" width="195" height="90" rx="6" class="component-box" />
+      <text x="97" y="22" text-anchor="middle" class="component-title">Row Storage</text>
+      <rect x="10" y="32" width="82" height="28" rx="4" class="sub-box" />
+      <text x="51" y="50" text-anchor="middle" class="sub-label">Table</text>
+      <rect x="102" y="32" width="82" height="28" rx="4" class="sub-box" />
+      <text x="143" y="50" text-anchor="middle" class="sub-label">Schema</text>
+      <rect x="25" y="65" width="65" height="22" rx="4" class="sub-box" />
+      <text x="57" y="80" text-anchor="middle" class="sub-label">Scanner</text>
+      <rect x="100" y="65" width="75" height="22" rx="4" class="sub-box" />
+      <text x="137" y="80" text-anchor="middle" class="sub-label">Expression</text>
+    </g>
+
+    <!-- Indexes -->
+    <g transform="translate(450, 40)">
+      <rect x="0" y="0" width="195" height="90" rx="6" class="component-box" />
+      <text x="97" y="22" text-anchor="middle" class="component-title">Index Manager</text>
+      <rect x="10" y="32" width="55" height="28" rx="4" class="sub-box" />
+      <text x="37" y="50" text-anchor="middle" class="sub-label">B-tree</text>
+      <rect x="72" y="32" width="55" height="28" rx="4" class="sub-box" />
+      <text x="99" y="50" text-anchor="middle" class="sub-label">Hash</text>
+      <rect x="134" y="32" width="55" height="28" rx="4" class="sub-box" />
+      <text x="161" y="50" text-anchor="middle" class="sub-label">Bitmap</text>
+      <rect x="50" y="65" width="95" height="22" rx="4" class="sub-box" />
+      <text x="97" y="80" text-anchor="middle" class="sub-label">Multi-Column</text>
+    </g>
+
+    <!-- Functions -->
+    <g transform="translate(665, 40)">
+      <rect x="0" y="0" width="195" height="90" rx="6" class="component-box" />
+      <text x="97" y="22" text-anchor="middle" class="component-title">Functions (101+)</text>
+      <rect x="10" y="32" width="82" height="28" rx="4" class="sub-box" />
+      <text x="51" y="50" text-anchor="middle" class="sub-label">Scalar</text>
+      <rect x="102" y="32" width="82" height="28" rx="4" class="sub-box" />
+      <text x="143" y="50" text-anchor="middle" class="sub-label">Aggregate</text>
+      <rect x="25" y="65" width="65" height="22" rx="4" class="sub-box" />
+      <text x="57" y="80" text-anchor="middle" class="sub-label">Window</text>
+      <rect x="100" y="65" width="65" height="22" rx="4" class="sub-box" />
+      <text x="132" y="80" text-anchor="middle" class="sub-label">JSON</text>
+    </g>
+  </g>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!-- PERSISTENCE LAYER -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <g transform="translate(30, 495)">
+    <rect x="0" y="0" width="880" height="90" rx="8" class="layer-box accent-orange" />
+    <text x="20" y="25" class="layer-title">Persistence</text>
+
+    <!-- WAL -->
+    <rect x="20" y="40" width="195" height="40" rx="6" class="component-box" />
+    <text x="117" y="65" text-anchor="middle" class="component-title">Write-Ahead Log</text>
+
+    <!-- Snapshots -->
+    <rect x="235" y="40" width="195" height="40" rx="6" class="component-box" />
+    <text x="332" y="65" text-anchor="middle" class="component-title">Snapshots</text>
+
+    <!-- Recovery -->
+    <rect x="450" y="40" width="195" height="40" rx="6" class="component-box" />
+    <text x="547" y="65" text-anchor="middle" class="component-title">Crash Recovery</text>
+
+    <!-- File Lock -->
+    <rect x="665" y="40" width="195" height="40" rx="6" class="component-box" />
+    <text x="762" y="65" text-anchor="middle" class="component-title">File Lock</text>
+  </g>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!-- CONNECTION ARROWS -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!-- API to Query Processing -->
+  <path d="M470 155 L470 175" class="connector" marker-end="url(#arrow)" />
+
+  <!-- Query Processing to Storage -->
+  <path d="M470 315 L470 335" class="connector" marker-end="url(#arrow)" />
+
+  <!-- Storage to Persistence -->
+  <path d="M470 475 L470 495" class="connector" marker-end="url(#arrow)" />
+
+  <!-- Data flow return path (inside viewBox now) -->
+  <path d="M910 540 L930 540 L930 110 L910 110" class="flow-line" marker-end="url(#arrow-green)" />
+
+  <!-- Results label -->
+  <text x="945" y="330" class="flow-label" transform="rotate(90 945 330)">Results</text>
+
+  <!-- Feature highlights -->
+  <g transform="translate(30, 615)">
+    <text x="0" y="20" class="sub-label" style="font-weight: 600; fill: #475569;">Key Features:</text>
+    <text x="95" y="20" class="sub-label">ACID Transactions</text>
+    <text x="220" y="20" class="sub-label">MVCC Isolation</text>
+    <text x="340" y="20" class="sub-label">Cost-Based Optimizer</text>
+    <text x="495" y="20" class="sub-label">Parallel Execution</text>
+    <text x="635" y="20" class="sub-label">Semantic Caching</text>
+    <text x="775" y="20" class="sub-label">Time-Travel (AS OF)</text>
+  </g>
+</svg>

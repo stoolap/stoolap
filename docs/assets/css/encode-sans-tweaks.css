@@ -1,0 +1,79 @@
+/**
+ * Encode Sans Font Tweaks
+ * 
+ * These tweaks optimize Encode Sans specifically for technical documentation
+ */
+
+/* Adjust Encode Sans for body text */
+body {
+  /* Slightly tighter tracking for Encode Sans */
+  letter-spacing: -0.01em;
+  /* Optimal line height for Encode Sans */
+  line-height: 1.65;
+}
+
+/* Technical terms with semantic meaning */
+.technical-term {
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+/* Code tags within headings */
+h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  font-size: 0.9em;
+}
+
+/* Special handling for navigation with Encode Sans */
+.docs-nav {
+  letter-spacing: 0;
+}
+
+.docs-nav-toggle {
+  letter-spacing: 0;
+  font-weight: 600;
+}
+
+/* Better font for numbers in Encode Sans */
+.numeric {
+  font-feature-settings: "tnum" on;
+  font-weight: 500;
+}
+
+/* Table adjustments for Encode Sans */
+th {
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+/* Performance improvements for Encode Sans */
+@media (min-width: 768px) {
+  /* Optimize font loading by setting explicit font-display */
+  @font-face {
+    font-family: 'Encode Sans';
+    font-display: swap;
+  }
+  
+  /* Slightly larger main font size on larger screens */
+  body {
+    font-size: 1.05rem;
+  }
+}
+
+/* Better differentiation of section titles with Encode Sans */
+h2 {
+  font-weight: 700;
+}
+
+h3 {
+  font-weight: 600;
+  color: var(--color-heading);
+}
+
+/* Create better distinction between navigation levels */
+.docs-nav ul a {
+  font-weight: 400;
+}
+
+.docs-nav ul a[aria-current="page"] {
+  font-weight: 600;
+}

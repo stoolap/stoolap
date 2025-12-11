@@ -1,0 +1,257 @@
+/**
+ * Enhanced Syntax Highlighting for Stoolap Documentation
+ * 
+ * Focused on improving SQL and Go syntax highlighting in both light and dark modes
+ */
+
+/* Restore language badges but position them to avoid conflicting with copy button */
+div.highlighter-rouge::before {
+  content: attr(data-lang);
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 0.3em 0.6em;
+  font-size: 0.75em;
+  border-radius: 0 4px 0 4px;
+  background-color: var(--color-primary);
+  color: white;
+  font-weight: bold;
+  z-index: 1;
+}
+
+div.language-sql::before {
+  content: "SQL";
+  background-color: #e76f00;
+}
+
+div.language-go::before {
+  content: "Go";
+  background-color: #00ADD8;
+}
+
+/* Light theme enhancements */
+:root {
+  /* SQL-specific colors */
+  --sql-keyword: #0033B3;
+  --sql-function: #7A3E9D;
+  --sql-table: #008800;
+  --sql-number: #1750EB;
+  --sql-string: #067D17;
+  --sql-comment: #8D8D8D;
+  --sql-operator: #0033B3;
+  --sql-identifier: #000000;
+  
+  /* Go-specific colors */
+  --go-keyword: #0033B3;
+  --go-function: #7A3E9D;
+  --go-type: #00627A;
+  --go-string: #067D17;
+  --go-number: #1750EB;
+  --go-comment: #8D8D8D;
+  --go-builtin: #0033B3;
+  --go-package: #00627A;
+  --go-identifier: #000000;
+  
+  /* Code block styling */
+  --code-bg: #F6F8FA;
+  --code-border: #E1E4E8;
+}
+
+/* Dark theme enhancements */
+[data-theme="dark"] {
+  /* SQL-specific colors */
+  --sql-keyword: #CC7832;
+  --sql-function: #FFC66D;
+  --sql-table: #6A8759;
+  --sql-number: #6897BB;
+  --sql-string: #6A8759;
+  --sql-comment: #808080;
+  --sql-operator: #CC7832;
+  --sql-identifier: #A9B7C6;
+  
+  /* Go-specific colors */
+  --go-keyword: #CC7832;
+  --go-function: #FFC66D;
+  --go-type: #A9B7C6;
+  --go-string: #6A8759;
+  --go-number: #6897BB;
+  --go-comment: #808080;
+  --go-builtin: #CC7832;
+  --go-package: #9876AA;
+  --go-identifier: #A9B7C6;
+  
+  /* Code block styling */
+  --code-bg: #2B2B2B;
+  --code-border: #3E3E3E;
+}
+
+/* Core code block styling */
+div.highlighter-rouge {
+  background-color: var(--code-bg);
+  border: 1px solid var(--code-border);
+  padding: 0.75em 1em;
+  margin: 1.5em 0;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+}
+
+/* Line number styling */
+.highlight .lineno {
+  color: #888888;
+  border-right: 1px solid var(--code-border);
+  padding-right: 0.8em;
+  margin-right: 0.8em;
+  text-align: right;
+  min-width: 1.5em;
+}
+
+/*
+ * SQL Syntax Highlighting Overrides
+ */
+.language-sql .highlight .k,
+.language-sql .highlight .kc,
+.language-sql .highlight .kd,
+.language-sql .highlight .kn,
+.language-sql .highlight .kp,
+.language-sql .highlight .kr,
+.language-sql .highlight .kt {
+  color: var(--sql-keyword);
+  font-weight: bold;
+}
+
+/* SQL Keywords with uppercase styling */
+.language-sql .highlight .k {
+  text-transform: uppercase;
+}
+
+/* SQL Identifiers (table names, field names) */
+.language-sql .highlight .n, 
+.language-sql .highlight .mi {
+  color: var(--sql-identifier);
+}
+
+/* SQL Functions */
+.language-sql .highlight .nf,
+.language-sql .highlight .nb {
+  color: var(--sql-function);
+  font-weight: normal;
+}
+
+/* SQL Strings */
+.language-sql .highlight .s,
+.language-sql .highlight .s1,
+.language-sql .highlight .s2 {
+  color: var(--sql-string);
+}
+
+/* SQL Numbers */
+.language-sql .highlight .mi,
+.language-sql .highlight .mf {
+  color: var(--sql-number);
+}
+
+/* SQL Operators */
+.language-sql .highlight .o,
+.language-sql .highlight .ow {
+  color: var(--sql-operator);
+}
+
+/* SQL Comments */
+.language-sql .highlight .c,
+.language-sql .highlight .c1,
+.language-sql .highlight .cm {
+  color: var(--sql-comment);
+  font-style: italic;
+}
+
+/*
+ * Go Syntax Highlighting Overrides
+ */
+.language-go .highlight .kd,
+.language-go .highlight .k {
+  color: var(--go-keyword);
+  font-weight: bold;
+}
+
+/* Go Functions */
+.language-go .highlight .nf,
+.language-go .highlight .nx {
+  color: var(--go-function);
+}
+
+/* Go Types */
+.language-go .highlight .kt {
+  color: var(--go-type);
+}
+
+/* Go Strings */
+.language-go .highlight .s,
+.language-go .highlight .s1,
+.language-go .highlight .s2 {
+  color: var(--go-string);
+}
+
+/* Go Numbers */
+.language-go .highlight .mi,
+.language-go .highlight .mf {
+  color: var(--go-number);
+}
+
+/* Go Comments */
+.language-go .highlight .c,
+.language-go .highlight .c1,
+.language-go .highlight .cm {
+  color: var(--go-comment);
+  font-style: italic;
+}
+
+/* Go Builtin Functions */
+.language-go .highlight .nb {
+  color: var(--go-builtin);
+}
+
+/* Go Package Names */
+.language-go .highlight .nn {
+  color: var(--go-package);
+}
+
+/* Go Identifiers */
+.language-go .highlight .n {
+  color: var(--go-identifier);
+}
+
+/* Special enhancements for SQL keywords commonly used in Stoolap */
+.language-sql .highlight .k[data-content="SELECT"],
+.language-sql .highlight .k[data-content="INSERT"],
+.language-sql .highlight .k[data-content="UPDATE"],
+.language-sql .highlight .k[data-content="DELETE"],
+.language-sql .highlight .k[data-content="FROM"],
+.language-sql .highlight .k[data-content="WHERE"],
+.language-sql .highlight .k[data-content="JOIN"],
+.language-sql .highlight .k[data-content="GROUP BY"],
+.language-sql .highlight .k[data-content="ORDER BY"],
+.language-sql .highlight .k[data-content="HAVING"] {
+  font-weight: bold;
+}
+
+/* Removed code block hover effect */
+
+/* Enhance code block appearance */
+pre.highlight {
+  margin: 0;
+  padding: 1em 0;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+
+/* Simplified scrolling for code blocks without hover effects */
+
+/* Visual distinction for SQL table names */
+.language-sql .table-name {
+  color: var(--sql-table);
+  font-weight: bold;
+}
+
+/* Better styling for table aliases */
+.language-sql .alias {
+  font-style: italic;
+}

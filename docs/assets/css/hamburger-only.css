@@ -1,0 +1,66 @@
+/**
+ * Hamburger Button Implementation
+ * A clean implementation of the hamburger-to-X animation
+ */
+
+/* Hide the default mobile menu toggle */
+.mobile-menu-toggle {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  outline: none;
+  margin-left: 10px;
+}
+
+/* Create hamburger bars */
+.mobile-menu-toggle span {
+  display: block;
+  position: absolute;
+  width: 24px;
+  height: 2px;
+  background-color: var(--color-text);
+  left: 3px;
+  transition: transform 0.3s ease, opacity 0.3s ease;
+}
+
+/* Position the three bars */
+.mobile-menu-toggle span:nth-child(1) {
+  top: 8px;
+}
+
+.mobile-menu-toggle span:nth-child(2) {
+  top: 14px;
+}
+
+.mobile-menu-toggle span:nth-child(3) {
+  top: 20px;
+}
+
+/* Transform into X when active */
+.mobile-menu-toggle.active span:nth-child(1) {
+  transform: translateY(6px) rotate(45deg);
+}
+
+.mobile-menu-toggle.active span:nth-child(2) {
+  opacity: 0;
+}
+
+.mobile-menu-toggle.active span:nth-child(3) {
+  transform: translateY(-6px) rotate(-45deg);
+}
+
+/* Mobile menu adjustments */
+@media (max-width: 768px) {
+  .mobile-menu-toggle {
+    display: block;
+  }
+  
+  .header-actions {
+    display: flex;
+    align-items: center;
+  }
+}

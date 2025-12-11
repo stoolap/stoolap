@@ -1,0 +1,684 @@
+//! Fair database benchmark comparison
+//!
+//! Run with: cargo run --release --example comparison
+//!
+//! Compares: SQLite, DuckDB, Stoolap-Rust
+
+use chrono::{DateTime, NaiveDateTime, Utc};
+use duckdb::Connection as DuckDBConnection;
+use rand::Rng;
+use rusqlite::Connection as SqliteConnection;
+use std::time::{Duration, Instant};
+use stoolap::Database;
+
+const ROW_COUNT: usize = 10_000;
+const ITERATIONS: usize = 100;
+const WARMUP_ITERATIONS: usize = 10;
+
+// ============================================================================
+// Benchmark Result
+// ============================================================================
+
+#[derive(Clone)]
+struct BenchResult {
+    name: String,
+    avg_us: f64,
+    min_us: f64,
+    max_us: f64,
+    ops_per_sec: f64,
+}
+
+impl BenchResult {
+    fn new(name: &str, times: &[Duration]) -> Self {
+        let times_us: Vec<f64> = times
+            .iter()
+            .map(|d| d.as_secs_f64() * 1_000_000.0)
+            .collect();
+        let avg_us = times_us.iter().sum::<f64>() / times_us.len() as f64;
+        let min_us = times_us.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_us = times_us.iter().cloned().fold(0.0, f64::max);
+        let ops_per_sec = 1_000_000.0 / avg_us;
+
+        BenchResult {
+            name: name.to_string(),
+            avg_us,
+            min_us,
+            max_us,
+            ops_per_sec,
+        }
+    }
+}
+
+// ============================================================================
+// Data Generation
+// ============================================================================
+
+fn generate_user(
+    id: i64,
+    rng: &mut impl Rng,
+) -> (i64, String, String, i64, f64, bool, DateTime<Utc>) {
+    let name = format!("User_{}", id);
+    let email = format!("user{}@example.com", id);
+    let age = rng.gen_range(18..80);
+    let balance = rng.gen_range(0.0..100000.0);
+    let active = rng.gen_bool(0.7);
+    let created_at = NaiveDateTime::parse_from_str(
+        &format!(
+            "2024-{:02}-{:02} {:02}:{:02}:{:02}",
+            rng.gen_range(1..=12),
+            rng.gen_range(1..=28),
+            rng.gen_range(0..24),
+            rng.gen_range(0..60),
+            rng.gen_range(0..60)
+        ),
+        "%Y-%m-%d %H:%M:%S",
+    )
+    .unwrap()
+    .and_utc();
+    (id, name, email, age, balance, active, created_at)
+}
+
+// ============================================================================
+// SQLite Benchmarks
+// ============================================================================
+
+fn setup_sqlite() -> SqliteConnection {
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            age INTEGER NOT NULL,
+            balance REAL NOT NULL,
+            active INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_users_age ON users(age);
+        CREATE INDEX idx_users_active ON users(active);",
+    )
+    .unwrap();
+    conn
+}
+
+fn populate_sqlite(conn: &SqliteConnection, count: usize) {
+    let mut rng = rand::thread_rng();
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO users (id, name, email, age, balance, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .unwrap();
+
+    for i in 1..=count {
+        let (id, name, email, age, balance, active, created_at) = generate_user(i as i64, &mut rng);
+        let created_at_str = created_at.format("%Y-%m-%d %H:%M:%S").to_string();
+        stmt.execute(rusqlite::params![
+            id,
+            name,
+            email,
+            age,
+            balance,
+            active as i32,
+            created_at_str
+        ])
+        .unwrap();
+    }
+}
+
+fn bench_sqlite() -> Vec<BenchResult> {
+    let mut results = Vec::new();
+    let mut rng = rand::thread_rng();
+
+    // Setup
+    let conn = setup_sqlite();
+    populate_sqlite(&conn, ROW_COUNT);
+
+    // Warmup
+    for _ in 0..WARMUP_ITERATIONS {
+        let id = rng.gen_range(1..=ROW_COUNT as i64);
+        let mut stmt = conn
+            .prepare_cached("SELECT * FROM users WHERE id = ?")
+            .unwrap();
+        let _ = stmt.query([id]).unwrap();
+    }
+
+    // 1. SELECT by ID (point lookup)
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let id = rng.gen_range(1..=ROW_COUNT as i64);
+        let start = Instant::now();
+        let mut stmt = conn
+            .prepare_cached("SELECT * FROM users WHERE id = ?")
+            .unwrap();
+        let mut rows = stmt.query([id]).unwrap();
+        let _ = rows.next().unwrap();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("SELECT by ID", &times));
+
+    // 2. SELECT complex
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let mut stmt = conn.prepare_cached(
+            "SELECT name, email, balance FROM users WHERE age >= 30 AND age <= 50 AND active = 1 ORDER BY balance DESC LIMIT 100"
+        ).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(_) = rows.next().unwrap() {}
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("SELECT complex", &times));
+
+    // 3. SELECT all (full scan)
+    let mut times = Vec::with_capacity(ITERATIONS / 10);
+    for _ in 0..ITERATIONS / 10 {
+        let start = Instant::now();
+        let mut stmt = conn.prepare_cached("SELECT * FROM users").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(_) = rows.next().unwrap() {}
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("SELECT * (full scan)", &times));
+
+    // 4. UPDATE by ID
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let id = rng.gen_range(1..=ROW_COUNT as i64);
+        let new_balance = rng.gen_range(0.0..100000.0);
+        let start = Instant::now();
+        conn.execute(
+            "UPDATE users SET balance = ? WHERE id = ?",
+            rusqlite::params![new_balance, id],
+        )
+        .unwrap();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("UPDATE by ID", &times));
+
+    // 5. UPDATE complex
+    let mut times = Vec::with_capacity(ITERATIONS / 10);
+    for _ in 0..ITERATIONS / 10 {
+        let new_balance = rng.gen_range(0.0..100000.0);
+        let start = Instant::now();
+        conn.execute(
+            "UPDATE users SET balance = ? WHERE age >= 25 AND age <= 45 AND active = 1",
+            [new_balance],
+        )
+        .unwrap();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("UPDATE complex", &times));
+
+    // 6. INSERT single row
+    let mut times = Vec::with_capacity(ITERATIONS);
+    let mut next_id = ROW_COUNT as i64 + 1;
+    for _ in 0..ITERATIONS {
+        let (_, name, email, age, balance, active, created_at) = generate_user(next_id, &mut rng);
+        let created_at_str = created_at.format("%Y-%m-%d %H:%M:%S").to_string();
+        let start = Instant::now();
+        conn.execute(
+            "INSERT INTO users (id, name, email, age, balance, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![next_id, name, email, age, balance, active as i32, created_at_str]
+        ).unwrap();
+        times.push(start.elapsed());
+        next_id += 1;
+    }
+    results.push(BenchResult::new("INSERT single", &times));
+
+    // 7. DELETE by ID
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for i in 0..ITERATIONS {
+        let id = (ROW_COUNT as i64 + 1) + i as i64; // Delete the rows we just inserted
+        let start = Instant::now();
+        conn.execute("DELETE FROM users WHERE id = ?", [id])
+            .unwrap();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("DELETE by ID", &times));
+
+    // 8. Aggregation
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let mut stmt = conn.prepare_cached(
+            "SELECT active, COUNT(*), AVG(balance), SUM(balance), MIN(age), MAX(age) FROM users GROUP BY active"
+        ).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(_) = rows.next().unwrap() {}
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("Aggregation (GROUP BY)", &times));
+
+    results
+}
+
+// ============================================================================
+// DuckDB Benchmarks
+// ============================================================================
+
+fn setup_duckdb() -> DuckDBConnection {
+    let conn = DuckDBConnection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            name VARCHAR NOT NULL,
+            email VARCHAR NOT NULL,
+            age INTEGER NOT NULL,
+            balance DOUBLE NOT NULL,
+            active BOOLEAN NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        );
+        CREATE INDEX idx_users_age ON users(age);
+        CREATE INDEX idx_users_active ON users(active);",
+    )
+    .unwrap();
+    conn
+}
+
+fn populate_duckdb(conn: &DuckDBConnection, count: usize) {
+    let mut rng = rand::thread_rng();
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO users (id, name, email, age, balance, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .unwrap();
+
+    for i in 1..=count {
+        let (id, name, email, age, balance, active, created_at) = generate_user(i as i64, &mut rng);
+        let created_at_str = created_at.format("%Y-%m-%d %H:%M:%S").to_string();
+        stmt.execute(duckdb::params![
+            id,
+            name,
+            email,
+            age,
+            balance,
+            active,
+            created_at_str
+        ])
+        .unwrap();
+    }
+}
+
+fn bench_duckdb() -> Vec<BenchResult> {
+    let mut results = Vec::new();
+    let mut rng = rand::thread_rng();
+
+    // Setup
+    let conn = setup_duckdb();
+    populate_duckdb(&conn, ROW_COUNT);
+
+    // Verify data was inserted
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        count, ROW_COUNT as i64,
+        "DuckDB should have {} rows",
+        ROW_COUNT
+    );
+
+    // Warmup
+    for _ in 0..WARMUP_ITERATIONS {
+        let id = rng.gen_range(1..=ROW_COUNT as i64);
+        let mut stmt = conn
+            .prepare_cached("SELECT * FROM users WHERE id = ?")
+            .unwrap();
+        let _ = stmt.query([id]).unwrap();
+    }
+
+    // 1. SELECT by ID
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let id = rng.gen_range(1..=ROW_COUNT as i64);
+        let start = Instant::now();
+        let mut stmt = conn
+            .prepare_cached("SELECT * FROM users WHERE id = ?")
+            .unwrap();
+        let mut rows = stmt.query([id]).unwrap();
+        let _ = rows.next().unwrap();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("SELECT by ID", &times));
+
+    // 2. SELECT complex
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let mut stmt = conn.prepare_cached(
+            "SELECT name, email, balance FROM users WHERE age >= 30 AND age <= 50 AND active = true ORDER BY balance DESC LIMIT 100"
+        ).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(_) = rows.next().unwrap() {}
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("SELECT complex", &times));
+
+    // 3. SELECT all
+    let mut times = Vec::with_capacity(ITERATIONS / 10);
+    for _ in 0..ITERATIONS / 10 {
+        let start = Instant::now();
+        let mut stmt = conn.prepare_cached("SELECT * FROM users").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(_) = rows.next().unwrap() {}
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("SELECT * (full scan)", &times));
+
+    // 4. UPDATE by ID
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let id = rng.gen_range(1..=ROW_COUNT as i64);
+        let new_balance = rng.gen_range(0.0..100000.0);
+        let start = Instant::now();
+        conn.execute(
+            "UPDATE users SET balance = ? WHERE id = ?",
+            duckdb::params![new_balance, id],
+        )
+        .unwrap();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("UPDATE by ID", &times));
+
+    // 5. UPDATE complex
+    let mut times = Vec::with_capacity(ITERATIONS / 10);
+    for _ in 0..ITERATIONS / 10 {
+        let new_balance = rng.gen_range(0.0..100000.0);
+        let start = Instant::now();
+        conn.execute(
+            "UPDATE users SET balance = ? WHERE age >= 25 AND age <= 45 AND active = true",
+            [new_balance],
+        )
+        .unwrap();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("UPDATE complex", &times));
+
+    // 6. INSERT single
+    let mut times = Vec::with_capacity(ITERATIONS);
+    let mut next_id = ROW_COUNT as i64 + 1;
+    for _ in 0..ITERATIONS {
+        let (_, name, email, age, balance, active, created_at) = generate_user(next_id, &mut rng);
+        let created_at_str = created_at.format("%Y-%m-%d %H:%M:%S").to_string();
+        let start = Instant::now();
+        conn.execute(
+            "INSERT INTO users (id, name, email, age, balance, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            duckdb::params![next_id, name, email, age, balance, active, created_at_str]
+        ).unwrap();
+        times.push(start.elapsed());
+        next_id += 1;
+    }
+    results.push(BenchResult::new("INSERT single", &times));
+
+    // 7. DELETE by ID
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for i in 0..ITERATIONS {
+        let id = (ROW_COUNT as i64 + 1) + i as i64;
+        let start = Instant::now();
+        conn.execute("DELETE FROM users WHERE id = ?", [id])
+            .unwrap();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("DELETE by ID", &times));
+
+    // 8. Aggregation
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let mut stmt = conn.prepare_cached(
+            "SELECT active, COUNT(*), AVG(balance), SUM(balance), MIN(age), MAX(age) FROM users GROUP BY active"
+        ).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(_) = rows.next().unwrap() {}
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("Aggregation (GROUP BY)", &times));
+
+    results
+}
+
+// ============================================================================
+// Stoolap-Rust Benchmarks
+// ============================================================================
+
+fn setup_stoolap() -> Database {
+    let db = Database::open("memory://").unwrap();
+    db.execute(
+        "CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            age INTEGER NOT NULL,
+            balance FLOAT NOT NULL,
+            active BOOLEAN NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_users_age ON users(age)", ())
+        .unwrap();
+    db.execute("CREATE INDEX idx_users_active ON users(active)", ())
+        .unwrap();
+    db
+}
+
+fn populate_stoolap(db: &Database, count: usize) {
+    let mut rng = rand::thread_rng();
+    let insert_stmt = db
+        .prepare("INSERT INTO users (id, name, email, age, balance, active, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+        .unwrap();
+
+    for i in 1..=count {
+        let (id, name, email, age, balance, active, created_at) = generate_user(i as i64, &mut rng);
+        insert_stmt
+            .execute((id, &name, &email, age, balance, active, created_at))
+            .unwrap();
+    }
+}
+
+fn bench_stoolap() -> Vec<BenchResult> {
+    let mut results = Vec::new();
+    let mut rng = rand::thread_rng();
+
+    // Setup
+    let db = setup_stoolap();
+    populate_stoolap(&db, ROW_COUNT);
+
+    // Warmup using prepared statement
+    let select_by_id = db.prepare("SELECT * FROM users WHERE id = $1").unwrap();
+    for _ in 0..WARMUP_ITERATIONS {
+        let id = rng.gen_range(1..=ROW_COUNT as i64);
+        let _ = select_by_id.query((id,)).unwrap();
+    }
+
+    // 1. SELECT by ID (using prepared statement)
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let id = rng.gen_range(1..=ROW_COUNT as i64);
+        let start = Instant::now();
+        let rows = select_by_id.query((id,)).unwrap();
+        let _ = rows.into_iter().next();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("SELECT by ID", &times));
+
+    // 2. SELECT complex (using prepared statement for fair comparison)
+    let select_complex = db
+        .prepare("SELECT name, email, balance FROM users WHERE age >= 30 AND age <= 50 AND active = true ORDER BY balance DESC LIMIT 100")
+        .unwrap();
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = select_complex.query(()).unwrap();
+        for _ in rows {}
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("SELECT complex", &times));
+
+    // 3. SELECT all (using prepared statement for fair comparison)
+    let select_all = db.prepare("SELECT * FROM users").unwrap();
+    let mut times = Vec::with_capacity(ITERATIONS / 10);
+    for _ in 0..ITERATIONS / 10 {
+        let start = Instant::now();
+        let rows = select_all.query(()).unwrap();
+        for _ in rows {}
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("SELECT * (full scan)", &times));
+
+    // 4. UPDATE by ID (using prepared statement)
+    let update_by_id = db
+        .prepare("UPDATE users SET balance = $1 WHERE id = $2")
+        .unwrap();
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let id = rng.gen_range(1..=ROW_COUNT as i64);
+        let new_balance = rng.gen_range(0.0..100000.0);
+        let start = Instant::now();
+        update_by_id.execute((new_balance, id)).unwrap();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("UPDATE by ID", &times));
+
+    // 5. UPDATE complex (using prepared statement for fair comparison)
+    let update_complex = db
+        .prepare("UPDATE users SET balance = $1 WHERE age >= 25 AND age <= 45 AND active = true")
+        .unwrap();
+    let mut times = Vec::with_capacity(ITERATIONS / 10);
+    for _ in 0..ITERATIONS / 10 {
+        let new_balance = rng.gen_range(0.0..100000.0);
+        let start = Instant::now();
+        update_complex.execute((new_balance,)).unwrap();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("UPDATE complex", &times));
+
+    // 6. INSERT single (using prepared statement for fair comparison)
+    let insert_stmt = db
+        .prepare("INSERT INTO users (id, name, email, age, balance, active, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+        .unwrap();
+    let mut times = Vec::with_capacity(ITERATIONS);
+    let mut next_id = ROW_COUNT as i64 + 1;
+    for _ in 0..ITERATIONS {
+        let (_, name, email, age, balance, active, created_at) = generate_user(next_id, &mut rng);
+        let start = Instant::now();
+        insert_stmt
+            .execute((next_id, &name, &email, age, balance, active, created_at))
+            .unwrap();
+        times.push(start.elapsed());
+        next_id += 1;
+    }
+    results.push(BenchResult::new("INSERT single", &times));
+
+    // 7. DELETE by ID (using prepared statement)
+    let delete_by_id = db.prepare("DELETE FROM users WHERE id = $1").unwrap();
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for i in 0..ITERATIONS {
+        let id = (ROW_COUNT as i64 + 1) + i as i64;
+        let start = Instant::now();
+        delete_by_id.execute((id,)).unwrap();
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("DELETE by ID", &times));
+
+    // 8. Aggregation (using prepared statement for fair comparison)
+    let agg_stmt = db
+        .prepare("SELECT active, COUNT(*), AVG(balance), SUM(balance), MIN(age), MAX(age) FROM users GROUP BY active")
+        .unwrap();
+    let mut times = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = agg_stmt.query(()).unwrap();
+        for _ in rows {}
+        times.push(start.elapsed());
+    }
+    results.push(BenchResult::new("Aggregation (GROUP BY)", &times));
+
+    results
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+fn print_results(sqlite: &[BenchResult], duckdb: &[BenchResult], stoolap: &[BenchResult]) {
+    println!("\n{}", "=".repeat(100));
+    println!("DATABASE BENCHMARK COMPARISON (10,000 rows, 100 iterations, in-memory)");
+    println!("{}", "=".repeat(100));
+    println!();
+    println!(
+        "{:<25} | {:>12} | {:>12} | {:>12} | {:>12} | {:>12}",
+        "Operation", "SQLite (μs)", "DuckDB (μs)", "Stoolap (μs)", "Best", "Stoolap vs Best"
+    );
+    println!("{}", "-".repeat(100));
+
+    for i in 0..sqlite.len() {
+        let s = &sqlite[i];
+        let d = &duckdb[i];
+        let st = &stoolap[i];
+
+        let min_time = s.avg_us.min(d.avg_us).min(st.avg_us);
+        let best = if min_time == s.avg_us {
+            "SQLite"
+        } else if min_time == d.avg_us {
+            "DuckDB"
+        } else {
+            "Stoolap"
+        };
+
+        let ratio = if best == "Stoolap" {
+            "1.00x".to_string()
+        } else {
+            format!("{:.2}x", st.avg_us / min_time)
+        };
+
+        println!(
+            "{:<25} | {:>12.1} | {:>12.1} | {:>12.1} | {:>12} | {:>12}",
+            s.name, s.avg_us, d.avg_us, st.avg_us, best, ratio
+        );
+    }
+
+    println!("{}", "-".repeat(100));
+    println!();
+
+    // Summary
+    println!("THROUGHPUT (operations/second):");
+    println!("{}", "-".repeat(100));
+    println!(
+        "{:<25} | {:>12} | {:>12} | {:>12}",
+        "Operation", "SQLite", "DuckDB", "Stoolap-Rust"
+    );
+    println!("{}", "-".repeat(100));
+
+    for i in 0..sqlite.len() {
+        let s = &sqlite[i];
+        let d = &duckdb[i];
+        let st = &stoolap[i];
+
+        println!(
+            "{:<25} | {:>12.0} | {:>12.0} | {:>12.0}",
+            s.name, s.ops_per_sec, d.ops_per_sec, st.ops_per_sec
+        );
+    }
+    println!("{}", "=".repeat(100));
+}
+
+fn main() {
+    println!("Starting database benchmark comparison...");
+    println!(
+        "Configuration: {} rows, {} iterations per test",
+        ROW_COUNT, ITERATIONS
+    );
+    println!();
+
+    println!("Benchmarking SQLite...");
+    let sqlite_results = bench_sqlite();
+
+    println!("Benchmarking DuckDB...");
+    let duckdb_results = bench_duckdb();
+
+    println!("Benchmarking Stoolap-Rust...");
+    let stoolap_results = bench_stoolap();
+
+    print_results(&sqlite_results, &duckdb_results, &stoolap_results);
+}

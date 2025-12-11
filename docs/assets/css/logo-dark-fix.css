@@ -1,0 +1,38 @@
+/**
+ * Logo Dark Mode Fix
+ * Provides styling for the SVG logo in both light and dark modes
+ */
+
+/* Default colors for light mode */
+.ft1 {
+  fill: #000000;
+}
+
+.ft2 {
+  fill: #0b4328;
+}
+
+/* Dark mode via data-theme attribute */
+[data-theme="dark"] .ft1 {
+  fill: #ffffff;
+}
+
+[data-theme="dark"] .ft2 {
+  fill: #95b746;
+}
+
+/* 
+ * We're now using data-theme attribute exclusively for theme switching,
+ * so the media query approach is disabled
+ */
+/*
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .ft1 {
+    fill: #ffffff;
+  }
+  
+  :root:not([data-theme="light"]) .ft2 {
+    fill: #95b746;
+  }
+}
+*/

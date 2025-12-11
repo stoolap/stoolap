@@ -1,0 +1,227 @@
+/**
+ * Stoolap Documentation - Syntax Highlighting
+ * 
+ * This file contains syntax highlighting styling for code blocks
+ * in both light and dark modes using the data-theme approach.
+ */
+
+/* Base code styles for all themes */
+code, pre {
+  font-family: 'Menlo', 'Monaco', 'Consolas', 'Courier New', monospace;
+  font-size: 0.9em;
+  border-radius: 5px;
+}
+
+/* Standalone pre blocks */
+pre:not(.highlight) {
+  padding: 1em;
+  overflow-x: auto;
+  line-height: 1.5;
+  background-color: var(--color-bg-code);
+  border: 1px solid var(--color-border);
+}
+
+/* Inline code outside of pre blocks */
+:not(pre) > code {
+  padding: 0.2em 0.4em;
+  background-color: var(--color-bg-code);
+  border: 1px solid var(--color-border);
+}
+
+/* Light theme syntax highlighting (default) */
+:root {
+  --syntax-background: #f8f9fa;
+  --syntax-comment: #6c7680;
+  --syntax-keyword: #7636c3;
+  --syntax-function: #0a6aba;
+  --syntax-string: #03822d;
+  --syntax-number: #c74026;
+  --syntax-class: #b96601;
+  --syntax-variable: #0a6aba;
+  --syntax-operator: #676b79;
+  --syntax-punctuation: #4c566a;
+  --syntax-property: #b96601;
+  --syntax-definition: #0a6aba;
+  --syntax-builtin: #7636c3;
+  --syntax-namespace: #b96601;
+}
+
+/* Dark theme syntax highlighting */
+[data-theme="dark"] {
+  --syntax-background: #1c1c1c;
+  --syntax-comment: #6a6c70;
+  --syntax-keyword: #c792ea;
+  --syntax-function: #82aaff;
+  --syntax-string: #c3e88d;
+  --syntax-number: #f78c6c;
+  --syntax-class: #ffcb6b;
+  --syntax-variable: #82aaff;
+  --syntax-operator: #89ddff;
+  --syntax-punctuation: #89ddff;
+  --syntax-property: #ffcb6b;
+  --syntax-definition: #82aaff;
+  --syntax-builtin: #c792ea;
+  --syntax-namespace: #ffcb6b;
+}
+
+/* Code block container - only style the outer container */
+div.highlighter-rouge {
+  margin-bottom: 1.5em;
+  position: relative;
+  border-radius: 5px;
+  border: 1px solid var(--color-border);
+  background-color: var(--syntax-background);
+}
+
+/* The div.highlight is inside div.highlighter-rouge, so remove its styling */
+div.highlighter-rouge > div.highlight {
+  background: transparent;
+  border: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Make sure pre inside highlight doesn't have a border */
+div.highlighter-rouge pre.highlight,
+div.highlight pre {
+  background: transparent;
+  border: none;
+  margin: 0;
+  padding: 1em;
+  overflow-x: auto;
+}
+
+/* Code inside pre should be unstyled */
+div.highlighter-rouge code,
+div.highlight code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+/* Base styles for all syntax tokens */
+.highlight .c,
+.highlight .c1,
+.highlight .cm { color: var(--syntax-comment); font-style: italic; }
+.highlight .k,
+.highlight .kc,
+.highlight .kd,
+.highlight .kn,
+.highlight .kp,
+.highlight .kr,
+.highlight .kt { color: var(--syntax-keyword); font-weight: bold; }
+.highlight .o,
+.highlight .ow { color: var(--syntax-operator); }
+.highlight .p { color: var(--syntax-punctuation); }
+.highlight .err { color: inherit; background-color: transparent; }
+
+/* Literals */
+.highlight .s,
+.highlight .sb,
+.highlight .sc,
+.highlight .sd,
+.highlight .s2,
+.highlight .se,
+.highlight .sh,
+.highlight .si,
+.highlight .sx,
+.highlight .sr,
+.highlight .s1,
+.highlight .ss { color: var(--syntax-string); }
+.highlight .m,
+.highlight .mf,
+.highlight .mh,
+.highlight .mi,
+.highlight .il,
+.highlight .mo { color: var(--syntax-number); }
+
+/* Names */
+.highlight .n { color: inherit; }
+.highlight .na,
+.highlight .nb { color: var(--syntax-builtin); }
+.highlight .nc { color: var(--syntax-class); font-weight: bold; }
+.highlight .no { color: var(--syntax-namespace); }
+.highlight .nd { color: var(--syntax-definition); }
+.highlight .ni { color: var(--syntax-variable); font-weight: bold; }
+.highlight .ne { color: var(--syntax-function); font-weight: bold; }
+.highlight .nf,
+.highlight .fm { color: var(--syntax-function); }
+.highlight .nl { color: var(--syntax-property); }
+.highlight .nn { color: var(--syntax-namespace); }
+.highlight .nt { color: var(--syntax-keyword); }
+.highlight .nv,
+.highlight .vc,
+.highlight .vg,
+.highlight .vi,
+.highlight .vm { color: var(--syntax-variable); }
+
+/* Golang specific */
+.language-go .highlight .nx { color: var(--syntax-function); }
+.language-go .highlight .kd { color: var(--syntax-keyword); font-weight: bold; }
+.language-go .highlight .nb { color: var(--syntax-builtin); }
+.language-go .highlight .s { color: var(--syntax-string); }
+
+/* SQL specific */
+.language-sql .highlight .k,
+.language-sql .highlight .kc { color: var(--syntax-keyword); font-weight: bold; text-transform: uppercase; }
+.language-sql .highlight .nv { color: var(--syntax-variable); }
+.language-sql .highlight .o { color: var(--syntax-operator); }
+.language-sql .highlight .mi { color: var(--syntax-number); }
+.language-sql .highlight .s1,
+.language-sql .highlight .s2 { color: var(--syntax-string); }
+
+/* JSON specific */
+.language-json .highlight .p { color: var(--syntax-punctuation); }
+.language-json .highlight .s2 { color: var(--syntax-property); }
+.language-json .highlight .s1 { color: var(--syntax-string); }
+.language-json .highlight .mi { color: var(--syntax-number); }
+
+/* Terminal/Shell */
+.language-bash .highlight .nb { color: var(--syntax-keyword); }
+.language-bash .highlight .nv { color: var(--syntax-variable); }
+.language-bash .highlight .s1,
+.language-bash .highlight .s2 { color: var(--syntax-string); }
+
+/* Line numbers */
+.highlight .lineno {
+  color: var(--syntax-comment);
+  display: inline-block;
+  padding: 0 0.75em 0 0;
+  border-right: 1px solid var(--color-border);
+  margin-right: 0.5em;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+}
+
+/* Proper indentation for code blocks */
+pre {
+  tab-size: 2;
+  -moz-tab-size: 2;
+}
+
+/* Code tag within text */
+p code, li code, td code {
+  color: var(--color-text);
+  background-color: var(--color-bg-code);
+  padding: 0.1em 0.4em;
+  border-radius: 3px;
+  font-size: 0.9em;
+  border: 1px solid var(--color-border);
+}
+
+/* Override styles for Rouge highlighting */
+.highlight, div.highlighter-rouge, pre.highlight {
+  background-color: var(--syntax-background);
+  margin: 0;
+  border-radius: 5px;
+}
+
+.highlight pre code {
+  display: block;
+  overflow-x: auto;
+  color: var(--color-text);
+  -webkit-text-size-adjust: none;
+}

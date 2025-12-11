@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 600" preserveAspectRatio="xMidYMid slice">
+    <defs>
+        <!-- Background gradients -->
+        <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#0f172a" />
+            <stop offset="100%" stop-color="#1e293b" />
+        </linearGradient>
+
+        <!-- Accent color (Stoolap green) -->
+        <linearGradient id="accentGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#22c55e" stop-opacity="0.8" />
+            <stop offset="100%" stop-color="#16a34a" stop-opacity="0.4" />
+        </linearGradient>
+
+        <!-- Database icon gradient -->
+        <linearGradient id="dbGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#22c55e" stop-opacity="0.6" />
+            <stop offset="100%" stop-color="#16a34a" stop-opacity="0.2" />
+        </linearGradient>
+
+        <!-- Grid pattern -->
+        <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
+            <path d="M 50 0 L 0 0 0 50" fill="none" stroke="rgba(255, 255, 255, 0.03)" stroke-width="1"/>
+        </pattern>
+
+        <!-- Glow filter -->
+        <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur stdDeviation="3" result="blur" />
+            <feComposite in="SourceGraphic" in2="blur" operator="over" />
+        </filter>
+    </defs>
+
+    <!-- Background -->
+    <rect width="100%" height="100%" fill="url(#bgGradient)" />
+    <rect width="100%" height="100%" fill="url(#grid)" />
+
+    <!-- Subtle gradient orbs -->
+    <circle cx="15%" cy="40%" r="200" fill="rgba(34, 197, 94, 0.05)" />
+    <circle cx="85%" cy="60%" r="250" fill="rgba(34, 197, 94, 0.04)" />
+    <circle cx="50%" cy="30%" r="150" fill="rgba(34, 197, 94, 0.03)" />
+
+    <!-- Database Visualization - Central -->
+    <g transform="translate(600, 300)">
+        <!-- Outer ring - representing ACID transactions -->
+        <circle cx="0" cy="0" r="120" fill="none" stroke="rgba(34, 197, 94, 0.2)" stroke-width="1" stroke-dasharray="8 4">
+            <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="60s" repeatCount="indefinite"/>
+        </circle>
+
+        <!-- Middle ring - representing queries -->
+        <circle cx="0" cy="0" r="90" fill="none" stroke="rgba(34, 197, 94, 0.3)" stroke-width="1.5">
+            <animateTransform attributeName="transform" type="rotate" from="360" to="0" dur="45s" repeatCount="indefinite"/>
+        </circle>
+
+        <!-- Database cylinder representation -->
+        <g filter="url(#glow)">
+            <!-- Cylinder body -->
+            <ellipse cx="0" cy="30" rx="50" ry="15" fill="rgba(34, 197, 94, 0.15)" stroke="rgba(34, 197, 94, 0.4)" stroke-width="1.5"/>
+            <rect x="-50" y="-30" width="100" height="60" fill="rgba(34, 197, 94, 0.1)" />
+            <line x1="-50" y1="-30" x2="-50" y2="30" stroke="rgba(34, 197, 94, 0.4)" stroke-width="1.5"/>
+            <line x1="50" y1="-30" x2="50" y2="30" stroke="rgba(34, 197, 94, 0.4)" stroke-width="1.5"/>
+            <ellipse cx="0" cy="-30" rx="50" ry="15" fill="rgba(34, 197, 94, 0.2)" stroke="rgba(34, 197, 94, 0.5)" stroke-width="1.5"/>
+
+            <!-- Data rows inside cylinder -->
+            <line x1="-35" y1="-15" x2="35" y2="-15" stroke="rgba(255,255,255,0.2)" stroke-width="2" stroke-linecap="round"/>
+            <line x1="-35" y1="0" x2="35" y2="0" stroke="rgba(255,255,255,0.15)" stroke-width="2" stroke-linecap="round"/>
+            <line x1="-35" y1="15" x2="35" y2="15" stroke="rgba(255,255,255,0.1)" stroke-width="2" stroke-linecap="round"/>
+        </g>
+
+        <!-- Orbiting elements representing features -->
+        <!-- MVCC -->
+        <g>
+            <circle cx="0" cy="-90" r="8" fill="rgba(34, 197, 94, 0.6)">
+                <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="20s" repeatCount="indefinite"/>
+            </circle>
+        </g>
+
+        <!-- Index -->
+        <g>
+            <circle cx="0" cy="-90" r="6" fill="rgba(34, 197, 94, 0.5)">
+                <animateTransform attributeName="transform" type="rotate" from="120 0 0" to="480 0 0" dur="20s" repeatCount="indefinite"/>
+            </circle>
+        </g>
+
+        <!-- WAL -->
+        <g>
+            <circle cx="0" cy="-90" r="5" fill="rgba(34, 197, 94, 0.4)">
+                <animateTransform attributeName="transform" type="rotate" from="240 0 0" to="600 0 0" dur="20s" repeatCount="indefinite"/>
+            </circle>
+        </g>
+    </g>
+
+    <!-- Floating data particles -->
+    <g class="particles">
+        <!-- Left side particles -->
+        <circle r="2" fill="rgba(34, 197, 94, 0.6)">
+            <animate attributeName="cx" values="100;250;100" dur="15s" repeatCount="indefinite" />
+            <animate attributeName="cy" values="200;350;200" dur="15s" repeatCount="indefinite" />
+            <animate attributeName="opacity" values="0.6;0.2;0.6" dur="15s" repeatCount="indefinite" />
+        </circle>
+        <circle r="1.5" fill="rgba(34, 197, 94, 0.5)">
+            <animate attributeName="cx" values="150;300;150" dur="18s" repeatCount="indefinite" />
+            <animate attributeName="cy" values="400;250;400" dur="18s" repeatCount="indefinite" />
+            <animate attributeName="opacity" values="0.5;0.1;0.5" dur="18s" repeatCount="indefinite" />
+        </circle>
+
+        <!-- Right side particles -->
+        <circle r="2" fill="rgba(34, 197, 94, 0.6)">
+            <animate attributeName="cx" values="1100;950;1100" dur="16s" repeatCount="indefinite" />
+            <animate attributeName="cy" values="250;400;250" dur="16s" repeatCount="indefinite" />
+            <animate attributeName="opacity" values="0.6;0.2;0.6" dur="16s" repeatCount="indefinite" />
+        </circle>
+        <circle r="1.5" fill="rgba(34, 197, 94, 0.5)">
+            <animate attributeName="cx" values="1050;900;1050" dur="14s" repeatCount="indefinite" />
+            <animate attributeName="cy" values="350;200;350" dur="14s" repeatCount="indefinite" />
+            <animate attributeName="opacity" values="0.5;0.1;0.5" dur="14s" repeatCount="indefinite" />
+        </circle>
+
+        <!-- Top particles -->
+        <circle r="1" fill="rgba(34, 197, 94, 0.4)">
+            <animate attributeName="cx" values="400;500;400" dur="12s" repeatCount="indefinite" />
+            <animate attributeName="cy" values="100;150;100" dur="12s" repeatCount="indefinite" />
+        </circle>
+        <circle r="1" fill="rgba(34, 197, 94, 0.4)">
+            <animate attributeName="cx" values="700;800;700" dur="13s" repeatCount="indefinite" />
+            <animate attributeName="cy" values="120;170;120" dur="13s" repeatCount="indefinite" />
+        </circle>
+
+        <!-- Bottom particles -->
+        <circle r="1.5" fill="rgba(34, 197, 94, 0.3)">
+            <animate attributeName="cx" values="350;450;350" dur="17s" repeatCount="indefinite" />
+            <animate attributeName="cy" values="500;450;500" dur="17s" repeatCount="indefinite" />
+        </circle>
+        <circle r="1.5" fill="rgba(34, 197, 94, 0.3)">
+            <animate attributeName="cx" values="850;750;850" dur="19s" repeatCount="indefinite" />
+            <animate attributeName="cy" values="480;530;480" dur="19s" repeatCount="indefinite" />
+        </circle>
+    </g>
+
+    <!-- Subtle connection lines -->
+    <g stroke="rgba(34, 197, 94, 0.1)" stroke-width="1" fill="none">
+        <path d="M200,200 Q400,300 600,300" />
+        <path d="M1000,200 Q800,300 600,300" />
+        <path d="M200,400 Q400,300 600,300" />
+        <path d="M1000,400 Q800,300 600,300" />
+    </g>
+</svg>

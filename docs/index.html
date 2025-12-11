@@ -1,0 +1,844 @@
+---
+layout: default
+title: Stoolap - High-performance embedded SQL database in Rust
+---
+
+<section class="hero-section">
+  <!-- Database background with animated elements -->
+  <div class="hero-background">
+    <object type="image/svg+xml" data="{{ '/assets/img/hero-background.svg' | relative_url }}" class="hero-svg-bg" id="hero-background-svg"></object>
+  </div>
+
+
+  <div class="container">
+    <div class="hero-content">
+      <div class="hero-text">
+        <div class="hero-logo-container">
+           <img src="{{ '/assets/img/logo-horizontal.svg' | relative_url }}" alt="Stoolap" class="hero-logo" width="390" height="130">
+        </div>
+        <p class="hero-subtitle">A Modern Embedded SQL Database in Pure Rust</p>
+        <p class="hero-description">Full ACID transactions with MVCC, cost-based query optimizer, multiple index types (B-tree, Hash, Bitmap), parallel execution, and zero unsafe code.</p>
+        <div class="hero-cta">
+          <a href="{{ '/docs/getting-started/installation/' | relative_url }}" class="btn btn-primary">Get Started</a>
+          <a href="{{ site.github.repository_url }}" class="btn btn-secondary" target="_blank" rel="noopener">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path>
+            </svg>
+            GitHub
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="features-section">
+  <div class="container">
+    <div class="section-title">
+      <h2>Why Stoolap?</h2>
+      <p>Modern database design for today's application demands</p>
+    </div>
+    
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="4 14 10 14 10 20"></polyline>
+            <polyline points="20 10 14 10 14 4"></polyline>
+            <line x1="14" y1="10" x2="21" y2="3"></line>
+            <line x1="3" y1="21" x2="10" y2="14"></line>
+          </svg>
+        </div>
+        <h3>High Performance</h3>
+        <p>Row-based storage with multiple index types (B-tree, Hash, Bitmap) and parallel query execution deliver exceptional speed for analytical and transactional workloads.</p>
+      </div>
+      
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="4" y="4" width="16" height="16" rx="2"></rect>
+            <rect x="9" y="9" width="6" height="6"></rect>
+            <line x1="9" y1="1" x2="9" y2="4"></line>
+            <line x1="15" y1="1" x2="15" y2="4"></line>
+            <line x1="9" y1="20" x2="9" y2="23"></line>
+            <line x1="15" y1="20" x2="15" y2="23"></line>
+            <line x1="20" y1="9" x2="23" y2="9"></line>
+            <line x1="20" y1="14" x2="23" y2="14"></line>
+            <line x1="1" y1="9" x2="4" y2="9"></line>
+            <line x1="1" y1="14" x2="4" y2="14"></line>
+          </svg>
+        </div>
+        <h3>Memory-First</h3>
+        <p>Designed with in-memory operation in mind while providing optional persistence for durability. Ideal for both high-throughput and real-time applications.</p>
+      </div>
+      
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 3h18v18H3zM21 9H3M21 15H3M12 3v18"/>
+          </svg>
+        </div>
+        <h3>Cost-Based Optimizer</h3>
+        <p>PostgreSQL-style cost-based query optimizer with adaptive execution, cardinality feedback, and intelligent join ordering for optimal performance.</p>
+      </div>
+      
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="1" y="5" width="22" height="14" rx="7"></rect>
+            <circle cx="8" cy="12" r="3"></circle>
+            <circle cx="16" cy="12" r="3"></circle>
+          </svg>
+        </div>
+        <h3>Pure Rust</h3>
+        <p>Built entirely in Rust with zero unsafe code, providing memory safety guarantees and enabling simple deployment without runtime dependencies.</p>
+      </div>
+      
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="22 12 16 12 14 15 10 15 8 12 2 12"></polyline>
+            <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path>
+          </svg>
+        </div>
+        <h3>MVCC Transactions</h3>
+        <p>Multi-Version Concurrency Control provides high isolation with minimal locking. Optimistic concurrency enables high throughput for mixed workloads.</p>
+      </div>
+      
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path>
+          </svg>
+        </div>
+        <h3>SQL Standard</h3>
+        <p>Supports modern SQL including JOINs, window functions, and advanced query features. Built for compatibility with existing SQL knowledge and tools.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="code-demo-section">
+  <div class="container">
+    <div class="section-title">
+      <h2>Get Started in Minutes</h2>
+      <p>Simple to install, easy to use</p>
+    </div>
+    
+    <div class="code-preview">
+      <div class="code-header">
+        <div class="code-dots">
+          <div class="code-dot"></div>
+          <div class="code-dot"></div>
+          <div class="code-dot"></div>
+        </div>
+        <div class="code-title">terminal</div>
+      </div>
+      <div class="code-body"><div class="code-line"><span class="code-prompt">$</span> <span>cargo install stoolap</span></div><div class="code-line"><span class="code-prompt">$</span> <span>stoolap</span></div><div class="code-output">Stoolap SQL Database</div><div class="code-output">Connected to in-memory database</div><div class="code-line"><span class="code-prompt">stoolap></span> <span>CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);</span></div><div class="code-output">Table created.</div><div class="code-line"><span class="code-prompt">stoolap></span> <span>INSERT INTO users VALUES (1, 'John Doe');</span></div><div class="code-output">1 row inserted.</div><div class="code-line"><span class="code-prompt">stoolap></span> <span>SELECT * FROM users;</span></div><div class="code-output">+----+----------+
+| id | name     |
++----+----------+
+| 1  | John Doe |
++----+----------+
+1 row in set.</div></div>
+    </div>
+    
+    <div class="features-grid">
+      <div class="feature-card">
+        <h3>Easy to Install</h3>
+        <p>Just one command to install, no dependencies or complex setup required.</p>
+        <a href="{{ '/docs/getting-started/installation/' | relative_url }}" class="link-arrow">Installation Guide</a>
+      </div>
+      
+      <div class="feature-card">
+        <h3>Standard SQL</h3>
+        <p>Use familiar SQL syntax with powerful extensions for modern applications.</p>
+        <a href="{{ '/docs/sql-commands/sql-commands/' | relative_url }}" class="link-arrow">SQL Commands</a>
+      </div>
+      
+      <div class="feature-card">
+        <h3>Rust Integration</h3>
+        <p>First-class support for Rust applications with native library API.</p>
+        <a href="{{ '/docs/getting-started/quickstart/' | relative_url }}" class="link-arrow">Quick Start Tutorial</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="architecture-section">
+  <div class="container">
+    <div class="section-title">
+      <h2>Modern Architecture</h2>
+      <p>Designed for performance, scalability, and ease of use</p>
+    </div>
+    
+    <div class="architecture-diagram">
+      <div class="arch-diagram-container">
+        <object type="image/svg+xml" data="{{ '/assets/img/architecture-diagram.svg' | relative_url }}" class="arch-svg" id="architecture-svg"></object>
+      </div>
+      
+    </div>
+    
+    <div class="arch-details">
+      <div class="arch-detail-item">
+        <div class="arch-detail-icon client-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 14h6v6h-6z"></path>
+            <path d="M14 4h6v6h-6z"></path>
+            <path d="M14 17a3 3 0 0 0 0-6H7"></path>
+          </svg>
+        </div>
+        <div class="arch-detail-content">
+          <h4>Flexible Client Interface</h4>
+          <p>Command-line interface and Rust API - embed directly in your application with zero external dependencies.</p>
+        </div>
+      </div>
+      
+      <div class="arch-detail-item">
+        <div class="arch-detail-icon query-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+          </svg>
+        </div>
+        <div class="arch-detail-content">
+          <h4>Optimized Query Processing</h4>
+          <p>SQL parsing, cost-based query optimization, and parallel execution deliver exceptional performance for transactional workloads.</p>
+        </div>
+      </div>
+      
+      <div class="arch-detail-item">
+        <div class="arch-detail-icon storage-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 20h20"></path>
+            <path d="M5 20V8.2c0-3.4 2.8-6.2 6.2-6.2H13"></path>
+            <path d="M16 12V4"></path>
+            <path d="M16 4l4 4"></path>
+            <path d="M16 4l-4 4"></path>
+            <rect x="4" y="12" width="6" height="8"></rect>
+            <rect x="14" y="12" width="6" height="8"></rect>
+          </svg>
+        </div>
+        <div class="arch-detail-content">
+          <h4>MVCC Storage Engine</h4>
+          <p>Row-based version store with multiple index types (B-tree, Hash, Bitmap) provides transactional integrity with excellent query performance.</p>
+        </div>
+      </div>
+    </div>
+    
+    <div class="cta-wrapper">
+      <a href="{{ '/docs/architecture/architecture/' | relative_url }}" class="btn btn-primary">Explore Architecture</a>
+    </div>
+  </div>
+</section>
+
+<style>
+/* Architecture diagram styling */
+.arch-diagram-container {
+  width: 100%;
+  margin: 0 auto;
+  background-color: #f9fafb;
+  border-radius: 8px;
+  padding: 16px 12px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+  border: 1px solid var(--color-border);
+  overflow-x: auto; /* Allow horizontal scrolling for mobile */
+  position: relative;
+}
+
+@media (max-width: 768px) {
+  .arch-diagram-container {
+    padding: 8px 6px;
+    margin: 0 -10px; /* Extend slightly beyond container for more width */
+    width: calc(100% + 20px);
+    border-radius: 6px;
+  }
+  
+  .arch-diagram-container::after {
+    opacity: 1;
+    animation: fadeInOut 3s ease 1s forwards;
+  }
+  
+  @keyframes fadeInOut {
+    0%, 80% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+}
+
+[data-theme="dark"] .arch-diagram-container {
+  background-color: #1a1a1a;
+  border-color: #383838;
+}
+
+[data-theme="dark"] .arch-diagram-container::after {
+  background-color: rgba(255, 255, 255, 0.15);
+  color: white;
+}
+
+.arch-svg {
+  width: 100%;
+  height: auto;
+  margin: 0 auto;
+  display: block;
+  max-width: 900px;
+}
+
+@media (max-width: 768px) {
+  .arch-diagram-container {
+    padding: 10px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+.arch-details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 2rem;
+  margin-top: 3rem;
+}
+
+.arch-detail-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.arch-detail-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.client-icon {
+  background-color: rgba(76, 175, 80, 0.15);
+  color: #4CAF50;
+}
+
+.query-icon {
+  background-color: rgba(33, 150, 243, 0.15);
+  color: #2196F3;
+}
+
+.storage-icon {
+  background-color: rgba(156, 39, 176, 0.15);
+  color: #9C27B0;
+}
+
+.arch-detail-content h4 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 1.1rem;
+}
+
+.arch-detail-content p {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.95rem;
+}
+
+/* Dark mode support */
+[data-theme="dark"] .client-icon {
+  background-color: rgba(76, 175, 80, 0.2);
+}
+
+[data-theme="dark"] .query-icon {
+  background-color: rgba(33, 150, 243, 0.2);
+}
+
+[data-theme="dark"] .storage-icon {
+  background-color: rgba(156, 39, 176, 0.2);
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .arch-details {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+  
+  .arch-svg {
+    height: 500px;
+  }
+}
+</style>
+
+<section class="cta-section">
+  <div class="container">
+    <div class="cta-content">
+      <h2>Ready to Get Started?</h2>
+      <p>Explore Stoolap and transform your database experience.</p>
+      <div class="cta-buttons">
+        <a href="{{ '/docs/getting-started/installation/' | relative_url }}" class="btn btn-primary">Installation Guide</a>
+        <a href="{{ '/docs/getting-started/quickstart/' | relative_url }}" class="btn btn-secondary">Quick Start Tutorial</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="license-section">
+  <div class="container">
+    <div class="license-content">
+      <h2>Open Source License</h2>
+      <p>Stoolap is proudly open source, released under the Apache License 2.0.</p>
+      <div class="license-details">
+        <div class="license-feature">
+          <div class="license-icon">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+            </svg>
+          </div>
+          <div class="license-feature-content">
+            <h4>Patent Protection</h4>
+            <p>Includes explicit patent grant to protect users and contributors</p>
+          </div>
+        </div>
+        <div class="license-feature">
+          <div class="license-icon">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path>
+            </svg>
+          </div>
+          <div class="license-feature-content">
+            <h4>Community-Friendly</h4>
+            <p>Promotes collaboration while protecting contributions</p>
+          </div>
+        </div>
+        <div class="license-feature">
+          <div class="license-icon">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
+            </svg>
+          </div>
+          <div class="license-feature-content">
+            <h4>Enterprise-Ready</h4>
+            <p>Widely accepted in enterprise environments</p>
+          </div>
+        </div>
+      </div>
+      <div class="license-cta">
+        <a href="{{ site.github.repository_url }}/blob/main/LICENSE" class="btn license-btn-primary" target="_blank" rel="noopener">View License</a>
+        <a href="{{ site.github.repository_url }}/blob/main/CONTRIBUTING.md" class="btn btn-outline" target="_blank" rel="noopener">Contribution Guidelines</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+.license-section {
+  padding: var(--space-8) 0;
+  background-color: var(--color-bg);
+  border-top: 1px solid var(--color-border);
+}
+
+.license-content {
+  text-align: center;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.license-content h2 {
+  margin-bottom: var(--space-2);
+}
+
+.license-content > p {
+  margin-bottom: var(--space-6);
+  font-size: 1.1rem;
+}
+
+.license-details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: var(--space-6);
+  margin-bottom: var(--space-6);
+  text-align: left;
+}
+
+.license-feature {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.license-icon {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  background-color: rgba(var(--color-primary-rgb), 0.15);
+  color: var(--color-primary);
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.license-feature-content h4 {
+  margin: 0 0 var(--space-2);
+  font-size: 1rem;
+}
+
+.license-feature-content p {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.95rem;
+}
+
+.license-cta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  justify-content: center;
+}
+
+.license-btn-primary {
+  background-color: var(--color-primary);
+  color: white !important;
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-md);
+  font-weight: 500;
+  font-size: 0.95rem;
+  text-decoration: none;
+  transition: all 0.2s;
+}
+
+.license-btn-primary:hover {
+  background-color: var(--color-primary-dark);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+  text-decoration: none;
+}
+
+.btn-outline {
+  background-color: transparent;
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-md);
+  font-weight: 500;
+  font-size: 0.95rem;
+  text-decoration: none;
+  transition: all 0.2s;
+}
+
+.btn-outline:hover {
+  background-color: var(--color-bg-alt);
+  border-color: var(--color-text-muted);
+}
+
+@media (max-width: 768px) {
+  .license-details {
+    grid-template-columns: 1fr;
+    gap: var(--space-4);
+  }
+  
+  .license-cta {
+    flex-direction: column;
+    align-items: center;
+  }
+  
+  .license-cta .btn {
+    width: 100%;
+  }
+}
+</style>
+
+<script>
+/* Simple SVG theme sync script */
+document.addEventListener('DOMContentLoaded', function() {
+  // Function to sync theme with SVGs
+  function syncThemeWithSvgs() {
+    try {
+      // Get current theme
+      var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+      
+      // Architecture diagram
+      var archSvg = document.getElementById('architecture-svg');
+      if (archSvg && archSvg.contentDocument) {
+        var svgDoc = archSvg.contentDocument;
+        var svg = svgDoc.querySelector('svg');
+        if (svg) {
+          if (isDark) {
+            svg.setAttribute('data-theme', 'dark');
+          } else {
+            svg.removeAttribute('data-theme');
+          }
+        }
+      }
+      
+      // Hero background
+      var bgSvg = document.getElementById('hero-background-svg');
+      if (bgSvg && bgSvg.contentDocument) {
+        var bgSvgDoc = bgSvg.contentDocument;
+        var bgSvgEl = bgSvgDoc.querySelector('svg');
+        if (bgSvgEl) {
+          if (isDark) {
+            bgSvgEl.classList.add('dark-theme');
+          } else {
+            bgSvgEl.classList.remove('dark-theme');
+          }
+        }
+      }
+    } catch(e) {
+      // Ignore errors - don't crash the page
+    }
+  }
+  
+  // Apply on SVG load
+  var archSvg = document.getElementById('architecture-svg');
+  if (archSvg) {
+    archSvg.addEventListener('load', syncThemeWithSvgs);
+  }
+  
+  var bgSvg = document.getElementById('hero-background-svg');
+  if (bgSvg) {
+    bgSvg.addEventListener('load', function() {
+      syncThemeWithSvgs();
+      
+      // Add specific customization for the hero background
+      try {
+        var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+        var bgSvgDoc = bgSvg.contentDocument;
+        var bgSvgEl = bgSvgDoc.querySelector('svg');
+        
+        if (bgSvgEl) {
+          // Set theme class right away
+          if (isDark) {
+            bgSvgEl.classList.add('dark-theme');
+          } else {
+            bgSvgEl.classList.remove('dark-theme');
+          }
+          
+          // Improve visibility of certain elements in dark mode
+          if (isDark) {
+            var rows = bgSvgDoc.querySelectorAll('.row-element');
+            rows.forEach(function(row) {
+              row.setAttribute('opacity', '0.8');
+            });
+            
+            var cols = bgSvgDoc.querySelectorAll('.column-element');
+            cols.forEach(function(col) {
+              col.setAttribute('opacity', '0.8');
+            });
+          }
+        }
+      } catch(e) {
+        // Silent fail - don't crash the page
+      }
+    });
+  }
+  
+  // Apply on theme changes
+  var observer = new MutationObserver(function(mutations) {
+    mutations.forEach(function(mutation) {
+      if (mutation.attributeName === 'data-theme') {
+        syncThemeWithSvgs();
+      }
+    });
+  });
+  
+  observer.observe(document.documentElement, { attributes: true });
+  
+  // Initial application after a delay
+  setTimeout(syncThemeWithSvgs, 500);
+});
+</script>
+
+<style>
+/* Custom styles for the home page */
+.hero-wave {
+  position: absolute;
+  bottom: -1px;
+  left: 0;
+  width: 100%;
+  height: 60px;
+}
+
+.hero-logo {
+  max-width: 100%;
+  height: auto;
+  margin: 0 0 var(--space-4);
+  display: block;
+}
+
+/* Dark mode support for the hero SVG logo */
+[data-theme="dark"] .logo-icon rect[stroke="black"] {
+  stroke: #555;
+}
+
+/* Center and properly size the hero logo */
+.hero-logo-container {
+  display: flex;
+  justify-content: flex-start;
+  margin-bottom: var(--space-4);
+}
+
+/* Make the hero section more impactful */
+.hero-section {
+  position: relative;
+  overflow: hidden;
+  padding: var(--space-10) 0;
+}
+
+.db-illustration {
+  width: 300px;
+  height: 300px;
+  position: relative;
+}
+
+.db-top {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 180px;
+  height: 40px;
+  background-color: var(--color-accent);
+  border-radius: 8px 8px 0 0;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.db-body {
+  position: absolute;
+  top: 40px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 180px;
+  height: 220px;
+  background-color: rgba(255, 255, 255, 0.2);
+  border-radius: 0 0 8px 8px;
+  display: flex;
+  justify-content: space-around;
+  padding: 10px;
+  box-shadow: 0 6px 12px rgba(0, 0, 0, 0.1);
+  backdrop-filter: blur(5px);
+}
+
+.db-column {
+  width: 40px;
+  height: 100%;
+  background: linear-gradient(to bottom, var(--color-accent) 0%, var(--color-primary) 100%);
+  border-radius: 4px;
+  position: relative;
+  overflow: hidden;
+}
+
+.db-column::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.3) 0%,
+    rgba(255, 255, 255, 0.1) 20%,
+    rgba(255, 255, 255, 0.1) 80%,
+    rgba(255, 255, 255, 0.3) 100%
+  );
+  z-index: 1;
+}
+
+.link-arrow {
+  display: inline-flex;
+  align-items: center;
+  font-weight: 500;
+}
+
+.link-arrow::after {
+  content: '→';
+  margin-left: 6px;
+  transition: transform 0.2s;
+}
+
+.link-arrow:hover::after {
+  transform: translateX(4px);
+}
+
+.architecture-section {
+  padding: var(--space-8) 0;
+  background-color: var(--color-bg-alt);
+  margin: var(--space-10) 0;
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.architecture-diagram {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-6);
+}
+
+.arch-layer {
+  background-color: var(--color-bg);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  box-shadow: var(--shadow-sm);
+  border: 1px solid var(--color-border);
+}
+
+.client-layer {
+  border-top: 4px solid #4CAF50;
+}
+
+.query-layer {
+  border-top: 4px solid #2196F3;
+}
+
+.storage-layer {
+  border-top: 4px solid #9C27B0;
+}
+
+.arch-layer h3 {
+  margin-top: 0;
+  margin-bottom: var(--space-3);
+  font-size: 1.2rem;
+}
+
+.arch-components {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.arch-component {
+  background-color: var(--color-bg-alt);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-md);
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.cta-wrapper {
+  text-align: center;
+  margin-top: var(--space-6);
+}
+
+.code-demo-section {
+  margin: var(--space-10) 0;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .hero-image {
+    display: none;
+  }
+  
+  .architecture-diagram {
+    gap: var(--space-4);
+  }
+  
+  .arch-components {
+    gap: var(--space-2);
+  }
+  
+  .arch-component {
+    font-size: 0.8rem;
+    padding: var(--space-2) var(--space-3);
+  }
+}
+</style>

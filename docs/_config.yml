@@ -1,0 +1,52 @@
+title: Stoolap
+description: High-performance embedded SQL database written in pure Rust
+theme: jekyll-theme-minimal
+url: https://stoolap.io
+baseurl: "/"
+permalink: pretty
+logo: /assets/img/logo.svg
+github:
+  repository_url: https://github.com/stoolap/stoolap
+
+# Google Analytics
+google_analytics: 
+
+# Exclude from processing
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - .gitignore
+
+# Collections for documentation
+collections:
+  docs:
+    output: true
+    permalink: /:collection/:path/
+  posts:
+    output: true
+    permalink: /blog/:year/:month/:day/:title/
+
+# Default layouts
+defaults:
+  - scope:
+      path: ""
+      type: "docs"
+    values:
+      layout: "doc"
+  - scope:
+      path: ""
+    values:
+      layout: "default"
+
+plugins:
+  - jekyll-sitemap
+  - jekyll-seo-tag
+
+# Syntax highlighting with Rouge
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+  
+highlighter: rouge

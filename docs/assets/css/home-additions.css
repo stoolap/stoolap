@@ -1,0 +1,422 @@
+/**
+ * Stoolap Documentation - Home Page Styles
+ * Enhanced styling for the homepage with a modern, sleek appearance
+ */
+
+/* ==============================
+   Hero Section Redesign
+   ============================== */
+
+.hero-section {
+  position: relative;
+  color: #fff;
+  padding: 80px 0 60px;
+  margin-top: -32px;
+  overflow: hidden;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  min-height: 500px;
+  display: flex;
+  align-items: center;
+}
+
+/* SVG Background Styling */
+.hero-background {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 1; /* Increased z-index but still below content */
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(135deg, #1e3c51 0%, #2c5364 100%); /* Add gradient to background container */
+}
+
+.hero-svg-bg {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  min-height: 100%;
+  min-width: 100%;
+  opacity: 0.7; /* Make the SVG semi-transparent to show the gradient */
+  mix-blend-mode: soft-light; /* Blend with the background gradient */
+}
+
+/* Dark mode adjustments for hero tweaked to work with SVG background */
+@media (prefers-color-scheme: dark) {
+  .hero-background {
+    /* The gradient is already applied */
+  }
+}
+
+body.dark-theme .hero-background {
+  /* The gradient is already applied */
+}
+
+.hero-content {
+  position: relative;
+  z-index: 5; /* Higher z-index to ensure it appears above background */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+}
+
+.hero-text {
+  max-width: 720px;
+}
+
+.hero-logo-container {
+  margin-bottom: 30px;
+  background: none;
+  box-shadow: none;
+  padding: 0;
+  display: block;
+}
+
+.hero-logo {
+  max-width: 320px;
+  height: auto;
+  filter: drop-shadow(0 4px 8px rgba(0, 0, 0, 0.2));
+}
+
+.hero-subtitle {
+  font-size: 1.8rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  background: linear-gradient(90deg, #4cb37e, #c4e07b);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  letter-spacing: -0.01em;
+  font-family: 'Rubik', sans-serif;
+}
+
+.hero-description {
+  font-size: 1.25rem;
+  margin-bottom: 2.5rem;
+  opacity: 0.9;
+  line-height: 1.6;
+  max-width: 640px;
+  font-family: 'Rubik', sans-serif;
+  font-weight: 400;
+}
+
+
+.hero-cta {
+  display: flex;
+  gap: 20px;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+
+/* Button styling enhancements */
+.btn {
+  transition: all 0.3s ease;
+  font-weight: 600;
+  font-size: 1.05rem;
+  padding: 0.75rem 1.5rem;
+  border-radius: 6px;
+  font-family: 'Rubik', sans-serif;
+}
+
+.btn-primary {
+  background: linear-gradient(90deg, #2a9e69, #8cb23c);
+  border: none;
+  box-shadow: 0 4px 12px rgba(42, 158, 105, 0.3);
+  position: relative;
+  overflow: hidden;
+}
+
+.btn-primary::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.2) 50%, rgba(255,255,255,0) 100%);
+  transition: all 0.8s ease;
+}
+
+.btn-primary:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 6px 16px rgba(42, 158, 105, 0.4);
+}
+
+.btn-primary:hover::before {
+  left: 100%;
+}
+
+.btn-secondary {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.12);
+  transform: translateY(-3px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+}
+
+/* ==============================
+   Feature Cards Enhancement
+   ============================== */
+
+.features-section {
+  padding: 80px 0;
+}
+
+.feature-card {
+  transition: all 0.3s ease;
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  overflow: hidden;
+  padding: 30px;
+}
+
+.feature-card:hover {
+  transform: translateY(-8px);
+}
+
+.feature-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 4px;
+  background: linear-gradient(90deg, var(--color-primary), var(--color-accent));
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.feature-card:hover::before {
+  opacity: 1;
+}
+
+.feature-icon {
+  width: 60px;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 20px;
+  border-radius: 12px;
+  background-color: rgba(42, 158, 105, 0.1);
+  color: var(--color-primary);
+  transition: all 0.3s ease;
+}
+
+.feature-card:hover .feature-icon {
+  background-color: rgba(42, 158, 105, 0.2);
+  transform: scale(1.1);
+}
+
+/* ==============================
+   Code Preview Enhancement
+   ============================== */
+
+/* Terminal window - adaptive to light/dark mode */
+.code-preview {
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.15);
+  margin: 40px 0;
+  transition: all 0.3s ease;
+  background-color: var(--color-bg-code); /* Use theme variable instead of hardcoded dark color */
+  border: 1px solid var(--color-border);
+}
+
+.code-preview:hover {
+  box-shadow: 0 15px 35px rgba(0, 0, 0, 0.2);
+  transform: translateY(-5px);
+}
+
+.code-header {
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  background-color: var(--color-bg-alt); /* Use theme variable for header */
+  border-bottom: 1px solid var(--color-border);
+}
+
+.code-dot {
+  width: 12px;
+  height: 12px;
+  margin: 0 2px;
+  border-radius: 50%;
+}
+
+.code-dot:nth-child(1) { background-color: #ff5f56; }
+.code-dot:nth-child(2) { background-color: #ffbd2e; }
+.code-dot:nth-child(3) { background-color: #27c93f; }
+
+.code-body {
+  padding: 16px 20px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-text);
+}
+
+.code-body .code-line,
+.code-body .code-output {
+  margin: 0;
+  padding: 1px 0;
+}
+
+/* Terminal text colors */
+.code-prompt {
+  color: var(--color-primary);
+  margin-right: 8px;
+}
+
+.code-output {
+  color: var(--color-text-muted);
+}
+
+/* ==============================
+   Architecture Diagram Enhancement
+   ============================== */
+
+.architecture-section {
+  background-color: var(--color-bg-alt);
+  padding: 80px 0;
+  margin: 60px 0;
+}
+
+.architecture-diagram {
+  margin-top: 40px;
+}
+
+.arch-layer {
+  margin-bottom: 20px;
+  transition: all 0.3s ease;
+  border-radius: 12px;
+}
+
+.arch-layer:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
+}
+
+.arch-components {
+  margin-top: 15px;
+}
+
+.arch-component {
+  padding: 8px 16px;
+  margin: 5px;
+  border-radius: 20px;
+  transition: all 0.2s ease;
+}
+
+.arch-component:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.1);
+}
+
+.client-layer { border-top-color: #4CAF50; }
+.query-layer { border-top-color: #2196F3; }
+.storage-layer { border-top-color: #9C27B0; }
+
+/* ==============================
+   Call-to-Action Section Enhancement
+   ============================== */
+
+.cta-section {
+  padding: 80px 0;
+  background: linear-gradient(135deg, #1e3c51 0%, #2c5364 100%);
+  color: white;
+  text-align: center;
+}
+
+.cta-content {
+  max-width: 700px;
+  margin: 0 auto;
+}
+
+.cta-content h2 {
+  font-size: 2.5rem;
+  margin-bottom: 20px;
+  border-bottom: none;
+  color: white !important; /* Always keep heading white regardless of theme */
+  font-family: 'Rubik', sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.cta-content p {
+  font-size: 1.2rem;
+  margin-bottom: 30px;
+  opacity: 0.9;
+}
+
+.cta-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 20px;
+}
+
+/* ==============================
+   Responsive Adjustments
+   ============================== */
+
+@media (max-width: 1024px) {
+  .hero-subtitle {
+    font-size: 1.4rem;
+  }
+  
+  .hero-description {
+    font-size: 1.1rem;
+  }
+  
+  .db-illustration {
+    width: 280px;
+    height: 280px;
+  }
+}
+
+@media (max-width: 768px) {
+  .hero-section {
+    padding: 50px 0 40px;
+  }
+  
+  .hero-logo {
+    max-width: 260px;
+  }
+  
+  .hero-subtitle {
+    font-size: 1.5rem;
+  }
+  
+  .hero-description {
+    font-size: 1.1rem;
+    padding: 0 15px;
+  }
+  
+  .btn {
+    width: 100%;
+    margin: 0 10px;
+  }
+  
+  .feature-icon {
+    margin: 0 auto 20px;
+  }
+  
+  .architecture-diagram {
+    margin-top: 30px;
+  }
+  
+  .cta-content h2 {
+    font-size: 2rem;
+  }
+}

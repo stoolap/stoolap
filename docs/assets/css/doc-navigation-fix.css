@@ -1,0 +1,16 @@
+/**
+ * Simple styling for documentation navigation arrows
+ */
+
+/* Light & dark mode support for navigation arrows */
+.doc-navigation a,
+.doc-navigation a svg {
+  color: var(--color-text);
+  fill: var(--color-text);
+}
+
+.doc-navigation a:hover,
+.doc-navigation a:hover svg {
+  color: var(--color-primary);
+  fill: var(--color-primary);
+}

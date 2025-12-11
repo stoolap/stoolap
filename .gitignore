@@ -1,0 +1,39 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Profiling
+flamegraph*.svg
+profile.json
+*.json.gz
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test databases
+*.db
+*.sqlite
+
+# Coverage
+coverage.txt
+*.profraw
+*.profdata
+cobertura.xml
+tarpaulin-report.html
+
+# Local development
+.claude/settings.local.json
+CLAUDE.md
+TODO.md
+
+# Documentation build artifacts
+docs/_site/
+docs/.jekyll-cache/
+git_history_backup.log

@@ -1,0 +1,166 @@
+---
+layout: default
+title: Blog - Stoolap
+---
+
+<section class="blog-header">
+  <div class="container">
+    <h1>Stoolap Blog</h1>
+    <p class="lead">Updates, technical insights, and database engineering stories</p>
+  </div>
+</section>
+
+<section class="blog-list">
+  <div class="container">
+    <div class="blog-posts">
+      {% assign posts = site.posts | sort: 'date' | reverse %}
+      {% for post in posts %}
+      <article class="blog-post-card">
+        <div class="post-date">{{ post.date | date: "%B %d, %Y" }}</div>
+        <h2 class="post-title">
+          <a href="{{ post.url | relative_url }}">{{ post.title }}</a>
+        </h2>
+        <p class="post-excerpt">{{ post.excerpt | strip_html | truncate: 200 }}</p>
+        <div class="post-meta">
+          <span class="post-author">By {{ post.author }}</span>
+          <a href="{{ post.url | relative_url }}" class="read-more">Read more →</a>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+<style>
+.blog-header {
+  padding: 8rem 0 4rem;
+  background: linear-gradient(135deg, #659833 0%, #406021 100%);
+  margin-left: calc(-50vw + 50%);
+  margin-right: calc(-50vw + 50%);
+  margin-top: calc(var(--header-height) * -1);
+  padding-top: calc(var(--header-height) + 4rem);
+  margin-bottom: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.blog-header::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-image: 
+    radial-gradient(circle at 20% 80%, rgba(255,255,255,0.1) 0%, transparent 50%),
+    radial-gradient(circle at 80% 20%, rgba(255,255,255,0.1) 0%, transparent 50%),
+    radial-gradient(circle at 40% 40%, rgba(255,255,255,0.05) 0%, transparent 50%);
+  pointer-events: none;
+}
+
+.blog-header .container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 2rem;
+  position: relative;
+  z-index: 1;
+}
+
+.blog-header h1 {
+  font-size: 3rem;
+  font-weight: 700;
+  margin-bottom: 1rem;
+  color: white;
+  text-align: center;
+}
+
+.lead {
+  font-size: 1.25rem;
+  color: rgba(255, 255, 255, 0.9);
+  text-align: center;
+  max-width: 600px;
+  margin: 0 auto;
+}
+
+.blog-list {
+  padding: 4rem 0;
+  min-height: 60vh;
+  background: var(--color-bg);
+}
+
+.blog-posts {
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.blog-post-card {
+  background: var(--color-bg-alt);
+  border-radius: 12px;
+  padding: 2.5rem;
+  margin-bottom: 2rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);
+  transition: all 0.3s cubic-bezier(.25,.8,.25,1);
+  border: 1px solid var(--color-border);
+}
+
+[data-theme="dark"] .blog-post-card {
+  box-shadow: 0 1px 3px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.5);
+}
+
+.blog-post-card:hover {
+  box-shadow: 0 14px 28px rgba(0,0,0,0.25), 0 10px 10px rgba(0,0,0,0.22);
+  transform: translateY(-2px);
+}
+
+[data-theme="dark"] .blog-post-card:hover {
+  box-shadow: 0 14px 28px rgba(0,0,0,0.5), 0 10px 10px rgba(0,0,0,0.4);
+}
+
+.post-date {
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+  margin-bottom: 0.5rem;
+}
+
+.post-title {
+  font-size: 1.75rem;
+  margin-bottom: 1rem;
+}
+
+.post-title a {
+  color: var(--color-text);
+  text-decoration: none;
+  transition: color 0.3s ease;
+}
+
+.post-title a:hover {
+  color: var(--color-primary);
+}
+
+.post-excerpt {
+  color: var(--color-text-muted);
+  line-height: 1.6;
+  margin-bottom: 1rem;
+}
+
+.post-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.875rem;
+}
+
+.post-author {
+  color: var(--color-text-muted);
+}
+
+.read-more {
+  color: var(--color-primary);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.read-more:hover {
+  text-decoration: underline;
+}
+</style>

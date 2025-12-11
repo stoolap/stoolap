@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% if page.title %}{{ page.title }} - {% endif %}{{ site.title }}</title>
+  <meta name="description" content="{% if page.description %}{{ page.description }}{% else %}{{ site.description }}{% endif %}">
+  <link rel="stylesheet" href="{{ '/assets/css/main.css' | relative_url }}">
+  {% if page.url == '/' %}
+  <link rel="stylesheet" href="{{ '/assets/css/home-additions.css' | relative_url }}">
+  {% endif %}
+  <link rel="stylesheet" href="{{ '/assets/css/dark-mode-fix.css' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/assets/css/syntax-highlighting.css' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/assets/css/enhanced-code-highlighting.css' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/assets/css/code-interactions.css' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/assets/css/typography-enhancement.css' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/assets/css/doc-navigation-fix.css' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/assets/css/logo-dark-fix.css' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/assets/css/rubik-font.css' | relative_url }}">
+  <link rel="icon" href="{{ '/assets/img/stoolap_logo.png' | relative_url }}" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  {% seo %}
+  
+  <!-- Simple theme initialization -->
+  <script>
+    // Check for saved theme preference first
+    const storedTheme = localStorage.getItem('theme');
+    
+    // If no stored preference, use default theme (light)
+    // Only use system preference for initial setting if no explicit user choice has been made
+    if (storedTheme) {
+      // Use the user's explicitly chosen theme
+      document.documentElement.setAttribute('data-theme', storedTheme);
+    } else {
+      // If user hasn't made a choice yet, we can optionally use system preference
+      // For now, start with light mode to avoid the "always defaults to dark" problem
+      document.documentElement.setAttribute('data-theme', 'light');
+      
+      // If you want to respect system preferences for first-time visitors,
+      // uncomment this block instead:
+      /*
+      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.setAttribute('data-theme', prefersDark ? 'dark' : 'light');
+      */
+    }
+  </script>
+</head>
+<body class="preload">
+  <header class="site-header">
+    <div class="container">
+      <div class="header-wrapper">
+        <div class="logo">
+          <a href="{{ '/' | relative_url }}" aria-label="Stoolap homepage">
+            <svg class="logo-svg" height="52" width="200" viewBox="0 0 1200 400" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <radialGradient cx="0" cy="0" gradientTransform="matrix(251.841 4.50141e-14 -7.90388e-15 251.841 48.3588 217.481)" gradientUnits="userSpaceOnUse" id="RadialGradient" r="1">
+                  <stop offset="0" stop-color="#406021"/>
+                  <stop offset="0.451902" stop-color="#659833"/>
+                  <stop offset="0.572113" stop-color="#659833"/>
+                  <stop offset="1" stop-color="#406021"/>
+                </radialGradient>
+                <linearGradient gradientTransform="matrix(160.388 0 0 160.388 92.3433 290.154)" gradientUnits="userSpaceOnUse" id="LinearGradient" x1="0" x2="1" y1="0" y2="0">
+                  <stop offset="0" stop-color="#0b4328"/>
+                  <stop offset="0.451028" stop-color="#207e53"/>
+                  <stop offset="0.572707" stop-color="#207e53"/>
+                  <stop offset="1" stop-color="#0b4328"/>
+                </linearGradient>
+              </defs>
+              <g>
+                <path d="M49.294 124.434C49.2939 124.434 47.8593 225.222 48.544 276.527C48.8133 296.713 69.9408 303.121 84.5127 310.684C84.6665 278.929 84.3368 247.151 84.9815 215.402C85.0441 212.319 87.3538 211.292 89.8877 212.746C111.513 225.153 131.877 239.803 154.075 251.152C159.907 254.134 166.714 255.479 173.263 255.371C179.827 255.263 186.48 253.423 192.356 250.496C215.467 238.985 237.274 225.046 259.731 212.309C259.731 261.536 259.731 261.518 259.731 310.746C269.611 307.886 294.074 297.946 295.169 285.809C297.681 257.973 300.2 124.216 300.2 124.216L188.419 190.309C177.902 196.216 160.46 194.069 150.169 187.777L49.294 124.434Z" fill="url(#RadialGradient)"/>
+                <path d="M171.638 42.9337C164.992 42.9378 158.355 44.7217 152.45 48.2774L59.7119 106.994C51.1489 112.15 48.3588 115.084 49.2031 125.8C49.2031 125.8 90.1843 150.189 90.1843 150.189C90.246 150.08 89.5397 149.327 89.6052 149.221C80.5108 140.223 111.789 129.071 116.731 126.965C137.198 118.244 151.734 148.776 170.075 151.809C190.061 155.113 199.67 126.612 218.606 125.777C228.848 125.326 239.468 131.918 247.263 137.746C249.777 139.626 254.987 144.691 255.87 149.048C255.951 150.195 255.577 150.586 255.741 150.819L300.2 124.434C300.2 115.119 298.2 112.9 288.45 106.871C288.45 106.871 190.825 48.2462 190.825 48.2462C184.916 44.6976 178.284 42.9296 171.638 42.9337ZM174.263 91.6837C182.447 92.0156 190.005 100.919 197.2 105.809C210.462 114.82 188.074 123.994 182.169 127.559C170.137 134.822 162.159 128.861 151.263 121.621C131.853 108.724 155.395 96.4391 170.7 92.0899C171.896 91.7502 173.094 91.6363 174.263 91.6837Z" fill="#95b746"/>
+                <path d="M155.067 258.441C169.032 263.222 182.492 262.842 195.058 255.789C212.48 246.011 229.521 236.555 246.743 226.418C248.127 225.603 249.268 224.144 251.259 224.483C253.084 226.137 252.701 228.421 252.691 230.503C252.553 257.985 252.315 284.466 252.237 311.947C252.228 315.245 250.858 316.974 248.131 318.602C231.83 328.326 215.458 337.954 199.464 348.167C182.2 359.19 165.326 360.466 147.56 349.214C130.822 338.614 113.615 328.754 96.5639 318.653C94.0564 317.167 92.5692 315.484 92.5662 312.372C92.5385 283.386 92.4142 254.401 92.3433 225.415C92.3422 224.969 92.664 224.522 93.1545 223.242C99.7943 226.939 106.289 230.488 112.721 234.15C126.751 242.137 140.056 251.385 155.067 258.441M132.751 311.133C134.691 309.978 136.044 308.398 136.504 306.121C138.069 298.371 130.23 288.306 122.328 288.098C118.136 287.988 115.341 290.16 114.375 294.215C112.211 303.298 123 313.752 132.751 311.133Z" fill="url(#LinearGradient)"/>
+              </g>
+              <g>
+                <path d="M456.651 161.766C448.851 150.766 438.951 145.266 426.951 145.266C419.351 145.266 412.951 147.566 407.751 152.166C402.551 156.766 399.951 162.916 399.951 170.616C399.951 178.316 409.401 187.466 428.301 198.066C447.201 208.666 456.751 213.966 456.951 213.966C470.351 223.966 477.051 235.766 477.051 249.366C477.051 267.966 471.701 283.016 461.001 294.516C450.301 306.016 435.651 311.766 417.051 311.766C393.451 311.766 374.851 299.966 361.251 276.366L380.751 257.166C383.351 264.166 388.151 270.566 395.151 276.366C402.151 282.166 409.351 285.066 416.751 285.066C425.551 285.066 432.501 282.066 437.601 276.066C442.701 270.066 445.251 262.766 445.251 254.166C445.251 247.966 443.351 242.516 439.551 237.816C435.751 233.116 422.901 225.916 401.001 216.216C379.101 206.516 368.151 192.666 368.151 174.666C368.151 159.266 373.201 146.316 383.301 135.816C393.401 125.316 406.051 120.066 421.251 120.066C442.251 120.066 458.851 126.866 471.051 140.466L456.651 161.766Z" class="ft1"/>
+                <path d="M530.151 306.966L501.051 306.966L501.051 214.566L486.951 214.566L486.951 190.866L501.051 190.866L501.051 148.266L530.151 148.266L530.151 190.866L553.251 190.866L553.251 214.566L530.151 214.566L530.151 306.966Z" class="ft1"/>
+                <path d="M677.151 247.566C677.151 266.166 671.451 281.366 660.051 293.166C648.651 304.966 633.701 310.866 615.201 310.866C596.701 310.866 581.651 304.966 570.051 293.166C558.451 281.366 552.651 266.216 552.651 247.716C552.651 229.216 558.351 214.066 569.751 202.266C581.151 190.466 596.151 184.566 614.751 184.566C633.351 184.566 648.401 190.416 659.901 202.116C671.401 213.816 677.151 228.966 677.151 247.566ZM582.051 248.166C582.051 259.166 585.151 268.166 591.351 275.166C597.551 282.166 605.551 285.666 615.351 285.666C625.151 285.666 633.001 281.916 638.901 274.416C644.801 266.916 647.751 258.016 647.751 247.716C647.751 237.416 644.751 228.516 638.751 221.016C632.751 213.516 624.901 209.766 615.201 209.766C605.501 209.766 597.551 213.366 591.351 220.566C585.151 227.766 582.051 236.966 582.051 248.166Z" class="ft1"/>
+                <path d="M809.451 247.566C809.451 266.166 803.751 281.366 792.351 293.166C780.951 304.966 766.001 310.866 747.501 310.866C729.001 310.866 713.951 304.966 702.351 293.166C690.751 281.366 684.951 266.216 684.951 247.716C684.951 229.216 690.651 214.066 702.051 202.266C713.451 190.466 728.451 184.566 747.051 184.566C765.651 184.566 780.701 190.416 792.201 202.116C803.701 213.816 809.451 228.966 809.451 247.566ZM714.351 248.166C714.351 259.166 717.451 268.166 723.651 275.166C729.851 282.166 737.851 285.666 747.651 285.666C757.451 285.666 765.301 281.916 771.201 274.416C777.101 266.916 780.051 258.016 780.051 247.716C780.051 237.416 777.051 228.516 771.051 221.016C765.051 213.516 757.201 209.766 747.501 209.766C737.801 209.766 729.851 213.366 723.651 220.566C717.451 227.766 714.351 236.966 714.351 248.166Z" class="ft1"/>
+                <path d="M856.851 306.966L827.751 306.966L827.751 102.066L856.851 102.066L856.851 306.966Z" class="ft1"/>
+                <path d="M995.151 306.966L966.651 306.966L966.651 296.166C958.251 305.966 945.751 310.866 929.151 310.866C912.551 310.866 899.301 304.466 889.401 291.666C879.501 278.866 874.551 263.866 874.551 246.666C874.551 229.466 879.601 214.816 889.701 202.716C899.801 190.616 912.751 184.566 928.551 184.566C945.351 184.566 958.051 189.566 966.651 199.566L966.651 188.466L995.151 188.466L995.151 306.966ZM969.951 247.566C969.951 236.566 966.851 227.516 960.651 220.416C954.451 213.316 946.501 209.766 936.801 209.766C927.101 209.766 919.201 213.216 913.101 220.116C907.001 227.016 903.951 236.166 903.951 247.566C903.951 258.966 907.051 268.166 913.251 275.166C919.451 282.166 927.451 285.666 937.251 285.666C947.051 285.666 954.951 282.266 960.951 275.466C966.951 268.666 969.951 259.366 969.951 247.566Z" class="ft2"/>
+                <path d="M1048.55 199.266C1056.95 189.466 1069.45 184.566 1086.05 184.566C1101.65 184.566 1114.6 190.766 1124.9 203.166C1135.2 215.566 1140.35 230.166 1140.35 246.966C1140.35 265.166 1135.25 280.366 1125.05 292.566C1114.85 304.766 1101.65 310.866 1085.45 310.866C1068.05 310.866 1055.95 305.866 1049.15 295.866L1048.55 357.066L1019.45 357.066L1019.45 188.466L1048.55 188.466L1048.55 199.266ZM1110.65 247.566C1110.65 237.366 1107.75 228.516 1101.95 221.016C1096.15 213.516 1088.15 209.766 1077.95 209.766C1068.55 209.766 1060.75 213.566 1054.55 221.166C1048.35 228.766 1045.25 237.516 1045.25 247.416C1045.25 257.316 1048.55 266.166 1055.15 273.966C1061.75 281.766 1069.35 285.666 1077.95 285.666C1088.15 285.666 1096.15 282.066 1101.95 274.866C1107.75 267.666 1110.65 258.566 1110.65 247.566Z" class="ft1"/>
+              </g>
+            </svg>
+          </a>
+        </div>
+        
+        <nav class="main-nav" aria-label="Main">
+          <ul>
+            <li><a href="{{ '/' | relative_url }}" {% if page.url == '/' %}aria-current="page"{% endif %}>Home</a></li>
+            <li><a href="{{ '/docs/' | relative_url }}" {% if page.url contains '/docs/' %}aria-current="page"{% endif %}>Documentation</a></li>
+            <li><a href="{{ '/blog/' | relative_url }}" {% if page.url contains '/blog/' %}aria-current="page"{% endif %}>Blog</a></li>
+            <li>
+              <a href="{{ site.github.repository_url }}" target="_blank" rel="noopener" aria-label="GitHub repository">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor" style="vertical-align: middle;">
+                  <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                </svg>
+              </a>
+            </li>
+          </ul>
+        </nav>
+        
+        <div class="header-actions">
+          <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode">
+            <span class="theme-toggle-icon light">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">
+                <path d="M12 18C8.68629 18 6 15.3137 6 12C6 8.68629 8.68629 6 12 6C15.3137 6 18 8.68629 18 12C18 15.3137 15.3137 18 12 18ZM12 16C14.2091 16 16 14.2091 16 12C16 9.79086 14.2091 8 12 8C9.79086 8 8 9.79086 8 12C8 14.2091 9.79086 16 12 16ZM11 1H13V4H11V1ZM11 20H13V23H11V20ZM3.51472 4.92893L4.92893 3.51472L7.05025 5.63604L5.63604 7.05025L3.51472 4.92893ZM16.9497 18.364L18.364 16.9497L20.4853 19.0711L19.0711 20.4853L16.9497 18.364ZM19.0711 3.51472L20.4853 4.92893L18.364 7.05025L16.9497 5.63604L19.0711 3.51472ZM5.63604 16.9497L7.05025 18.364L4.92893 20.4853L3.51472 19.0711L5.63604 16.9497ZM23 11V13H20V11H23ZM4 11V13H1V11H4Z"></path>
+              </svg>
+            </span>
+            <span class="theme-toggle-icon dark">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">
+                <path d="M10 6C10 10.4183 13.5817 14 18 14C19.4386 14 20.7885 13.6203 21.9549 12.9556C21.4738 18.0302 17.2005 22 12 22C6.47715 22 2 17.5228 2 12C2 6.79948 5.9698 2.52616 11.0444 2.04507C10.3797 3.21152 10 4.56142 10 6ZM4 12C4 16.4183 7.58172 20 12 20C14.9654 20 17.5757 18.3788 18.9571 15.9546C18.6407 15.9848 18.3214 16 18 16C12.4772 16 8 11.5228 8 6C8 5.67863 8.01524 5.35933 8.04536 5.04293C5.62119 6.42426 4 9.03458 4 12Z"></path>
+              </svg>
+            </span>
+          </button>
+          
+          <button class="mobile-menu-toggle" aria-label="Toggle mobile menu" aria-expanded="false" aria-controls="mobile-menu">
+            <span></span>
+            <span></span>
+            <span></span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="site-content" id="main-content">
+    {% if page.layout == 'doc' %}
+    <div class="container docs-container">
+      <aside class="docs-sidebar">
+        <nav class="docs-nav" aria-label="Documentation">
+          <div class="docs-nav-section">
+            <button class="docs-nav-toggle" aria-expanded="true">Getting Started</button>
+            <ul>
+              <li><a href="{{ '/docs/getting-started/installation/' | relative_url }}" {% if page.url contains '/docs/getting-started/installation/' %}aria-current="page"{% endif %}>Installation Guide</a></li>
+              <li><a href="{{ '/docs/getting-started/quickstart/' | relative_url }}" {% if page.url contains '/docs/getting-started/quickstart/' %}aria-current="page"{% endif %}>Quick Start Tutorial</a></li>
+              <li><a href="{{ '/docs/getting-started/connection-strings/' | relative_url }}" {% if page.url contains '/docs/getting-started/connection-strings/' %}aria-current="page"{% endif %}>Connection Strings</a></li>
+              <li><a href="{{ '/docs/getting-started/api-reference/' | relative_url }}" {% if page.url contains '/docs/getting-started/api-reference/' %}aria-current="page"{% endif %}>API Reference</a></li>
+              <li><a href="{{ '/docs/getting-started/subqueries-quickstart/' | relative_url }}" {% if page.url contains '/docs/getting-started/subqueries-quickstart/' %}aria-current="page"{% endif %}>Subqueries Quick Start</a></li>
+            </ul>
+          </div>
+          
+          <div class="docs-nav-section">
+            <button class="docs-nav-toggle" aria-expanded="true">Architecture</button>
+            <ul>
+              <li><a href="{{ '/docs/architecture/' | relative_url }}" {% if page.url == '/docs/architecture/' %}aria-current="page"{% endif %}>Architecture Overview</a></li>
+              <li><a href="{{ '/docs/architecture/storage-engine/' | relative_url }}" {% if page.url contains '/docs/architecture/storage-engine/' %}aria-current="page"{% endif %}>Storage Engine</a></li>
+              <li><a href="{{ '/docs/architecture/hybrid-storage/' | relative_url }}" {% if page.url contains '/docs/architecture/hybrid-storage/' %}aria-current="page"{% endif %}>Hybrid Storage</a></li>
+              <li><a href="{{ '/docs/architecture/mvcc-implementation/' | relative_url }}" {% if page.url contains '/docs/architecture/mvcc-implementation/' %}aria-current="page"{% endif %}>MVCC Implementation</a></li>
+              <li><a href="{{ '/docs/architecture/transaction-isolation/' | relative_url }}" {% if page.url contains '/docs/architecture/transaction-isolation/' %}aria-current="page"{% endif %}>Transaction Isolation</a></li>
+              <li><a href="{{ '/docs/architecture/indexing/' | relative_url }}" {% if page.url contains '/docs/architecture/indexing/' %}aria-current="page"{% endif %}>Indexing</a></li>
+              <li><a href="{{ '/docs/architecture/unique-indexes/' | relative_url }}" {% if page.url contains '/docs/architecture/unique-indexes/' %}aria-current="page"{% endif %}>Unique Indexes</a></li>
+            </ul>
+          </div>
+          
+          <div class="docs-nav-section">
+            <button class="docs-nav-toggle" aria-expanded="true">Data Types</button>
+            <ul>
+              <li><a href="{{ '/docs/data-types/data-types/' | relative_url }}" {% if page.url contains '/docs/data-types/data-types/' %}aria-current="page"{% endif %}>Data Types Overview</a></li>
+              <li><a href="{{ '/docs/data-types/date-and-time/' | relative_url }}" {% if page.url contains '/docs/data-types/date-and-time/' %}aria-current="page"{% endif %}>Date and Time</a></li>
+              <li><a href="{{ '/docs/data-types/json-support/' | relative_url }}" {% if page.url contains '/docs/data-types/json-support/' %}aria-current="page"{% endif %}>JSON Support</a></li>
+            </ul>
+          </div>
+
+          <div class="docs-nav-section">
+            <button class="docs-nav-toggle" aria-expanded="true">SQL Commands</button>
+            <ul>
+              <li><a href="{{ '/docs/sql-commands/sql-commands/' | relative_url }}" {% if page.url contains '/docs/sql-commands/sql-commands/' %}aria-current="page"{% endif %}>SQL Commands Overview</a></li>
+              <li><a href="{{ '/docs/sql-commands/schema-management/' | relative_url }}" {% if page.url contains '/docs/sql-commands/schema-management/' %}aria-current="page"{% endif %}>Schema Management</a></li>
+              <li><a href="{{ '/docs/sql-commands/pragma-commands/' | relative_url }}" {% if page.url contains '/docs/sql-commands/pragma-commands/' %}aria-current="page"{% endif %}>PRAGMA Commands</a></li>
+            </ul>
+          </div>
+          
+          <div class="docs-nav-section">
+            <button class="docs-nav-toggle" aria-expanded="true">Functions</button>
+            <ul>
+              <li><a href="{{ '/docs/functions/sql-functions-reference/' | relative_url }}" {% if page.url contains '/docs/functions/sql-functions-reference/' %}aria-current="page"{% endif %}>Functions Overview</a></li>
+              <li><a href="{{ '/docs/functions/aggregate-functions/' | relative_url }}" {% if page.url contains '/docs/functions/aggregate-functions/' %}aria-current="page"{% endif %}>Aggregate Functions</a></li>
+              <li><a href="{{ '/docs/functions/scalar-functions/' | relative_url }}" {% if page.url contains '/docs/functions/scalar-functions/' %}aria-current="page"{% endif %}>Scalar Functions</a></li>
+            </ul>
+          </div>
+
+          <div class="docs-nav-section">
+            <button class="docs-nav-toggle" aria-expanded="true">SQL Features</button>
+            <ul>
+              <li><a href="{{ '/docs/sql-features/window-functions/' | relative_url }}" {% if page.url contains '/docs/sql-features/window-functions/' %}aria-current="page"{% endif %}>Window Functions</a></li>
+              <li><a href="{{ '/docs/sql-features/temporal-queries/' | relative_url }}" {% if page.url contains '/docs/sql-features/temporal-queries/' %}aria-current="page"{% endif %}>Temporal Queries (AS OF)</a></li>
+              <li><a href="{{ '/docs/sql-features/join-operations/' | relative_url }}" {% if page.url contains '/docs/sql-features/join-operations/' %}aria-current="page"{% endif %}>JOIN Operations</a></li>
+              <li><a href="{{ '/docs/sql-features/cast-operations/' | relative_url }}" {% if page.url contains '/docs/sql-features/cast-operations/' %}aria-current="page"{% endif %}>CAST Operations</a></li>
+              <li><a href="{{ '/docs/sql-features/distinct-operations/' | relative_url }}" {% if page.url contains '/docs/sql-features/distinct-operations/' %}aria-current="page"{% endif %}>DISTINCT Operations</a></li>
+              <li><a href="{{ '/docs/sql-features/null-handling/' | relative_url }}" {% if page.url contains '/docs/sql-features/null-handling/' %}aria-current="page"{% endif %}>NULL Handling</a></li>
+              <li><a href="{{ '/docs/sql-features/on-duplicate-key-update/' | relative_url }}" {% if page.url contains '/docs/sql-features/on-duplicate-key-update/' %}aria-current="page"{% endif %}>ON DUPLICATE KEY UPDATE</a></li>
+              <li><a href="{{ '/docs/sql-features/parameter-binding/' | relative_url }}" {% if page.url contains '/docs/sql-features/parameter-binding/' %}aria-current="page"{% endif %}>Parameter Binding</a></li>
+              <li><a href="{{ '/docs/sql-features/subqueries/' | relative_url }}" {% if page.url contains '/docs/sql-features/subqueries/' %}aria-current="page"{% endif %}>Subqueries</a></li>
+              <li><a href="{{ '/docs/sql-features/common-table-expressions/' | relative_url }}" {% if page.url contains '/docs/sql-features/common-table-expressions/' %}aria-current="page"{% endif %}>Common Table Expressions (CTEs)</a></li>
+            </ul>
+          </div>
+          
+          <div class="docs-nav-section">
+            <button class="docs-nav-toggle" aria-expanded="true">Performance</button>
+            <ul>
+              <li><a href="{{ '/docs/performance/query-execution/' | relative_url }}" {% if page.url contains '/docs/performance/query-execution/' %}aria-current="page"{% endif %}>Query Execution</a></li>
+              <li><a href="{{ '/docs/performance/vectorized-execution/' | relative_url }}" {% if page.url contains '/docs/performance/vectorized-execution/' %}aria-current="page"{% endif %}>Vectorized Execution</a></li>
+              <li><a href="{{ '/docs/performance/data-compression/' | relative_url }}" {% if page.url contains '/docs/performance/data-compression/' %}aria-current="page"{% endif %}>Data Compression</a></li>
+              <li><a href="{{ '/docs/performance/optimization/' | relative_url }}" {% if page.url contains '/docs/performance/optimization/' %}aria-current="page"{% endif %}>Optimization</a></li>
+              <li><a href="{{ '/docs/architecture/expression-pushdown/' | relative_url }}" {% if page.url contains '/docs/architecture/expression-pushdown/' %}aria-current="page"{% endif %}>Expression Pushdown</a></li>
+            </ul>
+          </div>
+          
+          <div class="docs-nav-section">
+            <button class="docs-nav-toggle" aria-expanded="true">External Resources</button>
+            <ul>
+              <li><a href="{{ site.github.repository_url }}" target="_blank" rel="noopener">GitHub Repository</a></li>
+              <li><a href="{{ site.github.repository_url }}/issues" target="_blank" rel="noopener">Issues</a></li>
+              <li><a href="{{ site.github.repository_url }}/releases" target="_blank" rel="noopener">Releases</a></li>
+            </ul>
+          </div>
+        </nav>
+      </aside>
+    {% endif %}
+      
+      <main class="main-content {% if page.layout == 'doc' %}with-sidebar{% endif %}">
+        {{ content }}
+      </main>
+    
+    {% if page.layout == 'doc' %}
+    </div>
+    {% endif %}
+  </div>
+  
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-content">
+        <div class="footer-brand">
+          <a href="{{ '/' | relative_url }}" aria-label="Stoolap homepage">
+            <svg class="logo-svg" height="60" width="225" viewBox="0 0 1200 400" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <radialGradient cx="0" cy="0" gradientTransform="matrix(251.841 4.50141e-14 -7.90388e-15 251.841 48.3588 217.481)" gradientUnits="userSpaceOnUse" id="FooterRadialGradient" r="1">
+                  <stop offset="0" stop-color="#406021"/>
+                  <stop offset="0.451902" stop-color="#659833"/>
+                  <stop offset="0.572113" stop-color="#659833"/>
+                  <stop offset="1" stop-color="#406021"/>
+                </radialGradient>
+                <linearGradient gradientTransform="matrix(160.388 0 0 160.388 92.3433 290.154)" gradientUnits="userSpaceOnUse" id="FooterLinearGradient" x1="0" x2="1" y1="0" y2="0">
+                  <stop offset="0" stop-color="#0b4328"/>
+                  <stop offset="0.451028" stop-color="#207e53"/>
+                  <stop offset="0.572707" stop-color="#207e53"/>
+                  <stop offset="1" stop-color="#0b4328"/>
+                </linearGradient>
+              </defs>
+              <g>
+                <path d="M49.294 124.434C49.2939 124.434 47.8593 225.222 48.544 276.527C48.8133 296.713 69.9408 303.121 84.5127 310.684C84.6665 278.929 84.3368 247.151 84.9815 215.402C85.0441 212.319 87.3538 211.292 89.8877 212.746C111.513 225.153 131.877 239.803 154.075 251.152C159.907 254.134 166.714 255.479 173.263 255.371C179.827 255.263 186.48 253.423 192.356 250.496C215.467 238.985 237.274 225.046 259.731 212.309C259.731 261.536 259.731 261.518 259.731 310.746C269.611 307.886 294.074 297.946 295.169 285.809C297.681 257.973 300.2 124.216 300.2 124.216L188.419 190.309C177.902 196.216 160.46 194.069 150.169 187.777L49.294 124.434Z" fill="url(#FooterRadialGradient)"/>
+                <path d="M171.638 42.9337C164.992 42.9378 158.355 44.7217 152.45 48.2774L59.7119 106.994C51.1489 112.15 48.3588 115.084 49.2031 125.8C49.2031 125.8 90.1843 150.189 90.1843 150.189C90.246 150.08 89.5397 149.327 89.6052 149.221C80.5108 140.223 111.789 129.071 116.731 126.965C137.198 118.244 151.734 148.776 170.075 151.809C190.061 155.113 199.67 126.612 218.606 125.777C228.848 125.326 239.468 131.918 247.263 137.746C249.777 139.626 254.987 144.691 255.87 149.048C255.951 150.195 255.577 150.586 255.741 150.819L300.2 124.434C300.2 115.119 298.2 112.9 288.45 106.871C288.45 106.871 190.825 48.2462 190.825 48.2462C184.916 44.6976 178.284 42.9296 171.638 42.9337ZM174.263 91.6837C182.447 92.0156 190.005 100.919 197.2 105.809C210.462 114.82 188.074 123.994 182.169 127.559C170.137 134.822 162.159 128.861 151.263 121.621C131.853 108.724 155.395 96.4391 170.7 92.0899C171.896 91.7502 173.094 91.6363 174.263 91.6837Z" fill="#95b746"/>
+                <path d="M155.067 258.441C169.032 263.222 182.492 262.842 195.058 255.789C212.48 246.011 229.521 236.555 246.743 226.418C248.127 225.603 249.268 224.144 251.259 224.483C253.084 226.137 252.701 228.421 252.691 230.503C252.553 257.985 252.315 284.466 252.237 311.947C252.228 315.245 250.858 316.974 248.131 318.602C231.83 328.326 215.458 337.954 199.464 348.167C182.2 359.19 165.326 360.466 147.56 349.214C130.822 338.614 113.615 328.754 96.5639 318.653C94.0564 317.167 92.5692 315.484 92.5662 312.372C92.5385 283.386 92.4142 254.401 92.3433 225.415C92.3422 224.969 92.664 224.522 93.1545 223.242C99.7943 226.939 106.289 230.488 112.721 234.15C126.751 242.137 140.056 251.385 155.067 258.441M132.751 311.133C134.691 309.978 136.044 308.398 136.504 306.121C138.069 298.371 130.23 288.306 122.328 288.098C118.136 287.988 115.341 290.16 114.375 294.215C112.211 303.298 123 313.752 132.751 311.133Z" fill="url(#FooterLinearGradient)"/>
+              </g>
+              <g>
+                <path d="M456.651 161.766C448.851 150.766 438.951 145.266 426.951 145.266C419.351 145.266 412.951 147.566 407.751 152.166C402.551 156.766 399.951 162.916 399.951 170.616C399.951 178.316 409.401 187.466 428.301 198.066C447.201 208.666 456.751 213.966 456.951 213.966C470.351 223.966 477.051 235.766 477.051 249.366C477.051 267.966 471.701 283.016 461.001 294.516C450.301 306.016 435.651 311.766 417.051 311.766C393.451 311.766 374.851 299.966 361.251 276.366L380.751 257.166C383.351 264.166 388.151 270.566 395.151 276.366C402.151 282.166 409.351 285.066 416.751 285.066C425.551 285.066 432.501 282.066 437.601 276.066C442.701 270.066 445.251 262.766 445.251 254.166C445.251 247.966 443.351 242.516 439.551 237.816C435.751 233.116 422.901 225.916 401.001 216.216C379.101 206.516 368.151 192.666 368.151 174.666C368.151 159.266 373.201 146.316 383.301 135.816C393.401 125.316 406.051 120.066 421.251 120.066C442.251 120.066 458.851 126.866 471.051 140.466L456.651 161.766Z" class="ft1"/>
+                <path d="M530.151 306.966L501.051 306.966L501.051 214.566L486.951 214.566L486.951 190.866L501.051 190.866L501.051 148.266L530.151 148.266L530.151 190.866L553.251 190.866L553.251 214.566L530.151 214.566L530.151 306.966Z" class="ft1"/>
+                <path d="M677.151 247.566C677.151 266.166 671.451 281.366 660.051 293.166C648.651 304.966 633.701 310.866 615.201 310.866C596.701 310.866 581.651 304.966 570.051 293.166C558.451 281.366 552.651 266.216 552.651 247.716C552.651 229.216 558.351 214.066 569.751 202.266C581.151 190.466 596.151 184.566 614.751 184.566C633.351 184.566 648.401 190.416 659.901 202.116C671.401 213.816 677.151 228.966 677.151 247.566ZM582.051 248.166C582.051 259.166 585.151 268.166 591.351 275.166C597.551 282.166 605.551 285.666 615.351 285.666C625.151 285.666 633.001 281.916 638.901 274.416C644.801 266.916 647.751 258.016 647.751 247.716C647.751 237.416 644.751 228.516 638.751 221.016C632.751 213.516 624.901 209.766 615.201 209.766C605.501 209.766 597.551 213.366 591.351 220.566C585.151 227.766 582.051 236.966 582.051 248.166Z" class="ft1"/>
+                <path d="M809.451 247.566C809.451 266.166 803.751 281.366 792.351 293.166C780.951 304.966 766.001 310.866 747.501 310.866C729.001 310.866 713.951 304.966 702.351 293.166C690.751 281.366 684.951 266.216 684.951 247.716C684.951 229.216 690.651 214.066 702.051 202.266C713.451 190.466 728.451 184.566 747.051 184.566C765.651 184.566 780.701 190.416 792.201 202.116C803.701 213.816 809.451 228.966 809.451 247.566ZM714.351 248.166C714.351 259.166 717.451 268.166 723.651 275.166C729.851 282.166 737.851 285.666 747.651 285.666C757.451 285.666 765.301 281.916 771.201 274.416C777.101 266.916 780.051 258.016 780.051 247.716C780.051 237.416 777.051 228.516 771.051 221.016C765.051 213.516 757.201 209.766 747.501 209.766C737.801 209.766 729.851 213.366 723.651 220.566C717.451 227.766 714.351 236.966 714.351 248.166Z" class="ft1"/>
+                <path d="M856.851 306.966L827.751 306.966L827.751 102.066L856.851 102.066L856.851 306.966Z" class="ft1"/>
+                <path d="M995.151 306.966L966.651 306.966L966.651 296.166C958.251 305.966 945.751 310.866 929.151 310.866C912.551 310.866 899.301 304.466 889.401 291.666C879.501 278.866 874.551 263.866 874.551 246.666C874.551 229.466 879.601 214.816 889.701 202.716C899.801 190.616 912.751 184.566 928.551 184.566C945.351 184.566 958.051 189.566 966.651 199.566L966.651 188.466L995.151 188.466L995.151 306.966ZM969.951 247.566C969.951 236.566 966.851 227.516 960.651 220.416C954.451 213.316 946.501 209.766 936.801 209.766C927.101 209.766 919.201 213.216 913.101 220.116C907.001 227.016 903.951 236.166 903.951 247.566C903.951 258.966 907.051 268.166 913.251 275.166C919.451 282.166 927.451 285.666 937.251 285.666C947.051 285.666 954.951 282.266 960.951 275.466C966.951 268.666 969.951 259.366 969.951 247.566Z" class="ft2"/>
+                <path d="M1048.55 199.266C1056.95 189.466 1069.45 184.566 1086.05 184.566C1101.65 184.566 1114.6 190.766 1124.9 203.166C1135.2 215.566 1140.35 230.166 1140.35 246.966C1140.35 265.166 1135.25 280.366 1125.05 292.566C1114.85 304.766 1101.65 310.866 1085.45 310.866C1068.05 310.866 1055.95 305.866 1049.15 295.866L1048.55 357.066L1019.45 357.066L1019.45 188.466L1048.55 188.466L1048.55 199.266ZM1110.65 247.566C1110.65 237.366 1107.75 228.516 1101.95 221.016C1096.15 213.516 1088.15 209.766 1077.95 209.766C1068.55 209.766 1060.75 213.566 1054.55 221.166C1048.35 228.766 1045.25 237.516 1045.25 247.416C1045.25 257.316 1048.55 266.166 1055.15 273.966C1061.75 281.766 1069.35 285.666 1077.95 285.666C1088.15 285.666 1096.15 282.066 1101.95 274.866C1107.75 267.666 1110.65 258.566 1110.65 247.566Z" class="ft1"/>
+              </g>
+            </svg>
+          </a>
+          <p class="footer-tagline">Modern Embedded SQL Database</p>
+          <p class="footer-description">High-performance SQL database with MVCC, multiple index types, and parallel execution. Written in pure Rust with zero unsafe code.</p>
+        </div>
+        
+        <div class="footer-links">
+          <div class="footer-column">
+            <h4>Documentation</h4>
+            <ul>
+              <li><a href="{{ '/docs/getting-started/installation/' | relative_url }}">Installation</a></li>
+              <li><a href="{{ '/docs/getting-started/quickstart/' | relative_url }}">Quick Start</a></li>
+              <li><a href="{{ '/docs/architecture/' | relative_url }}">Architecture</a></li>
+            </ul>
+          </div>
+          
+          <div class="footer-column">
+            <h4>Community</h4>
+            <ul>
+              <li><a href="{{ site.github.repository_url }}">GitHub</a></li>
+              <li><a href="{{ site.github.repository_url }}/issues">Issues</a></li>
+              <li><a href="{{ site.github.repository_url }}/discussions">Discussions</a></li>
+              <li><a href="{{ site.github.repository_url }}/releases">Releases</a></li>
+            </ul>
+          </div>
+          
+          <div class="footer-column">
+            <h4>Resources</h4>
+            <ul>
+              <li><a href="{{ '/docs/' | relative_url }}">Documentation</a></li>
+              <li><a href="{{ '/blog/' | relative_url }}">Blog</a></li>
+              <li><a href="{{ site.github.repository_url }}/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a></li>
+              <li><a href="{{ site.github.repository_url }}/blob/main/LICENSE" target="_blank" rel="noopener">License</a></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      
+      <div class="footer-bottom">
+        <p>&copy; {{ site.time | date: '%Y' }} Stoolap Contributors. Licensed under Apache License 2.0.</p>
+      </div>
+    </div>
+  </footer>
+  
+  <script src="{{ '/assets/js/main.js' | relative_url }}"></script>
+  <script src="{{ '/assets/js/code-highlighting.js' | relative_url }}"></script>
+</body>
+</html>

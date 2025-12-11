@@ -1,0 +1,143 @@
+/**
+ * Mobile Menu Fix for Stoolap
+ * Ensures proper hamburger to X animation
+ */
+
+/* Base hamburger button styles */
+.mobile-menu-toggle {
+  width: 40px;
+  height: 40px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.mobile-menu-toggle span {
+  display: block;
+  width: 24px;
+  height: 2px;
+  background-color: var(--color-text);
+  border-radius: 1px;
+  margin: 4px 0;
+  transition: all 0.3s ease;
+  transform-origin: center;
+}
+
+/* X animation for active state */
+.mobile-menu-toggle.active span:first-child {
+  transform: translateY(6px) rotate(45deg);
+}
+
+.mobile-menu-toggle.active span:nth-child(2) {
+  opacity: 0;
+}
+
+.mobile-menu-toggle.active span:last-child {
+  transform: translateY(-6px) rotate(-45deg);
+}
+
+/* Adjust the mobile nav appearance */
+@media (max-width: 768px) {
+  /* Override main.css default styles for mobile menu toggle */
+  .mobile-menu-toggle {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  
+  .mobile-menu-toggle.active span:first-child {
+    transform: translateY(6px) rotate(45deg);
+  }
+  
+  .mobile-menu-toggle.active span:nth-child(2) {
+    opacity: 0;
+  }
+  
+  .mobile-menu-toggle.active span:last-child {
+    transform: translateY(-6px) rotate(-45deg);
+  }
+
+  .main-nav {
+    position: fixed;
+    top: var(--header-height);
+    right: 0;
+    width: 300px;
+    height: 100vh;
+    background-color: var(--color-bg);
+    box-shadow: var(--shadow-lg);
+    padding: var(--space-5);
+    z-index: 100;
+    transform: translateX(100%);
+    transition: transform var(--transition-normal);
+    display: block;
+  }
+
+  .main-nav.active {
+    transform: translateX(0);
+    box-shadow: -5px 0 15px rgba(0, 0, 0, 0.1);
+  }
+}
+
+/* Mobile menu list styling */
+@media (max-width: 768px) {
+  .main-nav ul {
+    flex-direction: column;
+    width: 100%;
+    padding: 0;
+    margin: 0;
+  }
+  
+  .main-nav li {
+    margin: 0 0 1rem 0;
+    width: 100%;
+  }
+  
+  .main-nav a {
+    display: block;
+    padding: 0.75rem 1rem;
+    font-size: 1.1rem;
+    width: 100%;
+    border-radius: 6px;
+  }
+  
+  .main-nav a:hover {
+    background-color: var(--color-bg-alt);
+  }
+}
+
+/* Dark mode adjustments */
+[data-theme="dark"] .mobile-menu-toggle span {
+  background-color: var(--color-text);
+}
+
+[data-theme="dark"] .main-nav {
+  background-color: var(--color-bg);
+  border-left: 1px solid var(--color-border);
+}
+
+/* Add overlay for mobile menu */
+.menu-overlay {
+  display: none;
+  position: fixed;
+  top: var(--header-height);
+  left: 0;
+  width: 100%;
+  height: 100vh;
+  background-color: rgba(0, 0, 0, 0.5);
+  z-index: 99;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.main-nav.active + .menu-overlay {
+  display: block;
+  opacity: 1;
+}

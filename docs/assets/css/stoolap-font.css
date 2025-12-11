@@ -1,0 +1,140 @@
+/**
+ * Stoolap Custom Font Styles
+ * Based on the new Stoolap SVG logo
+ */
+
+/* Apply custom font to navbar and footer */
+.main-nav a,
+.site-footer h4,
+.footer-links a,
+.footer-bottom p,
+.theme-toggle {
+  font-family: 'Inter', 'Encode Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  letter-spacing: -0.02em;
+}
+
+/* Adjust header for larger logo */
+.header-wrapper {
+  display: flex;
+  align-items: center;
+  padding: 5px 0;
+  height: auto;
+  min-height: 70px;
+}
+
+/* Main navigation styles */
+.main-nav a {
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: -0.01em;
+}
+
+.main-nav a:hover {
+  color: var(--color-primary-light);
+}
+
+.main-nav a[aria-current="page"] {
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+/* Footer heading styles */
+.site-footer h4 {
+  font-weight: 600;
+  margin-bottom: 1rem;
+  font-size: 1.1rem;
+  letter-spacing: -0.01em;
+}
+
+/* Footer link styles */
+.footer-links a {
+  font-weight: 400;
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+
+.footer-links a:hover {
+  color: var(--color-primary-light);
+  text-decoration: underline;
+}
+
+/* Footer bottom text */
+.footer-bottom p {
+  font-size: 0.9rem;
+  color: var(--color-text-muted);
+}
+
+/* Logo brand text in footer */
+.footer-brand p {
+  font-family: 'Inter', 'Encode Sans', sans-serif;
+  font-size: 1rem;
+  margin-top: 0.5rem;
+  font-weight: 400;
+  color: var(--color-text-muted);
+}
+
+/* Update SVG logo */
+.logo-svg .ft1,
+.logo-svg .ft2 {
+  fill: var(--color-text);
+}
+
+/* Logo dark mode support */
+[data-theme="dark"] .logo-svg .ft1,
+[data-theme="dark"] .logo-svg .ft2 {
+  fill: var(--color-text);
+}
+
+/* Adjust logo sizes and alignment */
+.logo-svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.header-wrapper .logo-svg {
+  height: 52px;
+  width: auto;
+}
+
+.footer-brand .logo-svg {
+  height: 60px;
+  width: auto;
+  margin-bottom: 0.75rem;
+}
+
+/* Add proper spacing around logos */
+.logo {
+  padding: 8px 0;
+}
+
+.footer-brand {
+  margin-bottom: 1.5rem;
+}
+
+/* Update site heading elements to match logo typography */
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Inter', 'Encode Sans', sans-serif;
+  letter-spacing: -0.02em;
+  font-weight: 600;
+}
+
+/* Apply custom styling to main page hero section */
+.hero-subtitle,
+.hero-description,
+.section-title h2,
+.feature-card h3 {
+  font-family: 'Inter', 'Encode Sans', sans-serif;
+  letter-spacing: -0.015em;
+}
+
+/* Code section headers */
+.code-title {
+  font-family: 'Inter', 'Encode Sans', sans-serif;
+  font-size: 0.85rem;
+}
+
+/* Mobile menu toggle button */
+.mobile-menu-toggle {
+  font-family: 'Inter', 'Encode Sans', sans-serif;
+}

@@ -1,0 +1,260 @@
+---
+layout: default
+---
+
+<article class="blog-post">
+  <header class="post-header">
+    <div class="container">
+      <div class="post-meta">
+        <time datetime="{{ page.date | date_to_xmlschema }}">{{ page.date | date: "%B %d, %Y" }}</time>
+        <span class="post-author">by {{ page.author }}</span>
+      </div>
+      <h1 class="post-title">{{ page.title }}</h1>
+    </div>
+  </header>
+
+  <div class="post-content">
+    <div class="container">
+      <div class="content-wrapper">
+        {{ content }}
+      </div>
+    </div>
+  </div>
+
+  <footer class="post-footer">
+    <div class="container">
+      <div class="post-navigation">
+        {% if page.previous %}
+        <a href="{{ page.previous.url | relative_url }}" class="prev-post">
+          ← {{ page.previous.title }}
+        </a>
+        {% endif %}
+        
+        {% if page.next %}
+        <a href="{{ page.next.url | relative_url }}" class="next-post">
+          {{ page.next.title }} →
+        </a>
+        {% endif %}
+      </div>
+      
+      <div class="back-to-blog">
+        <a href="{{ '/blog/' | relative_url }}">← Back to Blog</a>
+      </div>
+    </div>
+  </footer>
+</article>
+
+<style>
+.blog-post {
+  min-height: 80vh;
+  background: var(--color-bg);
+}
+
+.post-header {
+  background: linear-gradient(135deg, #659833 0%, #406021 100%);
+  color: white;
+  padding: 8rem 0 4rem;
+  margin-left: calc(-50vw + 50%);
+  margin-right: calc(-50vw + 50%);
+  margin-top: calc(var(--header-height) * -1);
+  padding-top: calc(var(--header-height) + 4rem);
+  margin-bottom: 3rem;
+  position: relative;
+  overflow: hidden;
+}
+
+.post-header::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-image: 
+    radial-gradient(circle at 20% 80%, rgba(255,255,255,0.1) 0%, transparent 50%),
+    radial-gradient(circle at 80% 20%, rgba(255,255,255,0.1) 0%, transparent 50%),
+    radial-gradient(circle at 40% 40%, rgba(255,255,255,0.05) 0%, transparent 50%);
+  pointer-events: none;
+}
+
+.post-header .container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 2rem;
+  position: relative;
+  z-index: 1;
+}
+
+.post-meta {
+  font-size: 0.875rem;
+  opacity: 0.9;
+  margin-bottom: 1rem;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.post-title {
+  font-size: 2.5rem;
+  font-weight: 700;
+  line-height: 1.2;
+  margin: 0;
+  color: white;
+}
+
+.post-content {
+  padding-bottom: 4rem;
+}
+
+.content-wrapper {
+  max-width: 800px;
+  margin: 0 auto;
+  font-size: 1.125rem;
+  line-height: 1.7;
+  color: var(--color-text);
+}
+
+.content-wrapper h1 {
+  display: none; /* Hide duplicate title */
+}
+
+.content-wrapper h2 {
+  font-size: 1.875rem;
+  font-weight: 600;
+  margin-top: 3rem;
+  margin-bottom: 1rem;
+  color: var(--color-text);
+}
+
+.content-wrapper h3 {
+  font-size: 1.375rem;
+  font-weight: 600;
+  margin-top: 2rem;
+  margin-bottom: 1rem;
+  color: var(--color-text);
+}
+
+.content-wrapper p {
+  margin-bottom: 1.5rem;
+}
+
+.content-wrapper pre {
+  background: var(--color-bg-alt);
+  border-radius: 6px;
+  padding: 1rem;
+  overflow-x: auto;
+  margin: 1.5rem 0;
+  border: 1px solid var(--color-border);
+}
+
+.content-wrapper code {
+  background: var(--color-bg-alt);
+  padding: 0.2rem 0.4rem;
+  border-radius: 3px;
+  font-size: 0.875em;
+  color: var(--color-text);
+}
+
+.content-wrapper pre code {
+  background: none;
+  padding: 0;
+}
+
+.content-wrapper ul, .content-wrapper ol {
+  margin-bottom: 1.5rem;
+  padding-left: 2rem;
+}
+
+.content-wrapper li {
+  margin-bottom: 0.5rem;
+}
+
+.content-wrapper blockquote {
+  border-left: 4px solid var(--color-primary);
+  padding-left: 1rem;
+  margin: 1.5rem 0;
+  font-style: italic;
+  color: var(--color-text-muted);
+}
+
+.content-wrapper strong {
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.content-wrapper a {
+  color: var(--color-primary);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.3s ease;
+}
+
+.content-wrapper a:hover {
+  border-bottom-color: var(--color-primary);
+}
+
+.post-footer {
+  border-top: 1px solid var(--color-border);
+  padding: 2rem 0;
+  margin-top: 3rem;
+}
+
+.post-navigation {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 2rem;
+}
+
+.prev-post, .next-post {
+  color: var(--color-primary);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.prev-post:hover, .next-post:hover {
+  text-decoration: underline;
+}
+
+.back-to-blog {
+  text-align: center;
+}
+
+.back-to-blog a {
+  color: var(--color-text-muted);
+  text-decoration: none;
+}
+
+.back-to-blog a:hover {
+  color: var(--color-text);
+}
+
+/* Syntax highlighting adjustments */
+.highlight {
+  background: var(--color-bg-alt);
+  border-radius: 6px;
+  padding: 1rem;
+  margin: 1.5rem 0;
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+}
+
+.highlight pre {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .post-title {
+    font-size: 2rem;
+  }
+  
+  .content-wrapper {
+    font-size: 1rem;
+  }
+  
+  .post-navigation {
+    flex-direction: column;
+    gap: 1rem;
+  }
+}
+</style>

@@ -1,0 +1,116 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Stoolap - High-performance embedded SQL database
+//!
+//! Stoolap is an HTAP (Hybrid Transactional/Analytical Processing) database
+//! with MVCC support, B-tree indexing, and advanced query optimization.
+//!
+//! ## Modules
+//!
+//! - [`core`] - Core types (DataType, Value, Row, Schema, Error)
+//! - [`common`] - Utilities (BufferPool, Int64Map, version)
+//! - [`storage`] - Storage layer with MVCC, indexes, and expressions
+//! - [`parser`] - SQL parser
+//! - [`functions`] - SQL functions (scalar, aggregate, window)
+//! - [`executor`] - Query executor
+//! - [`optimizer`] - Cost-based query optimizer
+//! - [`api`] - Public database interface
+
+pub mod api;
+pub mod common;
+pub mod core;
+pub mod executor;
+pub mod functions;
+pub mod optimizer;
+pub mod parser;
+pub mod storage;
+
+// Re-export main types for convenience
+pub use core::{
+    DataType, Error, IndexEntry, IndexType, IsolationLevel, Operator, Result, Row, Schema,
+    SchemaBuilder, SchemaColumn, Value,
+};
+
+// Re-export common utilities
+pub use common::{
+    BufferPool, ConcurrentInt64Map, ConcurrentUInt64Map, ConcurrentUsizeMap, Int64Map, Int64Set,
+    PoolStats, SemVer, UInt64Map, UInt64Set, UsizeMap, UsizeSet,
+};
+
+// Re-export storage/expression types
+pub use storage::{
+    AndExpr, BetweenExpr, CastExpr, ComparisonExpr, CompoundExpr, Expression, InListExpr, NotExpr,
+    NullCheckExpr, OrExpr, RangeExpr,
+};
+
+// Re-export index types
+pub use storage::{BTree, Int64BTree};
+
+// Re-export config types
+pub use storage::{Config, PersistenceConfig, SyncMode};
+
+// Re-export storage traits
+pub use storage::{
+    EmptyResult, EmptyScanner, Engine, Index, MemoryResult, QueryResult, Scanner, Table,
+    TemporalType, Transaction, VecScanner,
+};
+
+// Re-export MVCC types
+pub use storage::{
+    BTreeIndex, MVCCEngine, MVCCScanner, MVCCTable, MvccError, MvccTransaction, RangeScanner,
+    RowVersion, SingleRowScanner, TransactionEngineOperations, TransactionRegistry,
+    TransactionState, TransactionVersionStore, VersionStore, VisibilityChecker, WriteSetEntry,
+    INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID,
+};
+
+// Re-export WAL types
+pub use storage::{
+    CheckpointMetadata, WALEntry, WALManager, WALOperationType, DEFAULT_WAL_BUFFER_SIZE,
+    DEFAULT_WAL_FLUSH_TRIGGER, DEFAULT_WAL_MAX_SIZE,
+};
+
+// Re-export Persistence types
+pub use storage::{
+    deserialize_row_version, deserialize_value, serialize_row_version, serialize_value,
+    IndexMetadata, PersistenceManager, PersistenceMeta, DEFAULT_KEEP_SNAPSHOTS,
+    DEFAULT_SNAPSHOT_INTERVAL,
+};
+
+// Re-export function types
+pub use functions::{
+    AggregateFunction, AvgFunction, CountFunction, FirstFunction, FunctionDataType, FunctionInfo,
+    FunctionRegistry, FunctionSignature, FunctionType, LastFunction, MaxFunction, MinFunction,
+    ScalarFunction, SumFunction, WindowFunction,
+};
+
+// Re-export specific function implementations
+pub use functions::{
+    AbsFunction, CeilingFunction, CoalesceFunction, ConcatFunction, DenseRankFunction,
+    FloorFunction, IfNullFunction, LagFunction, LeadFunction, LengthFunction, LowerFunction,
+    NowFunction, NtileFunction, NullIfFunction, RankFunction, RoundFunction, RowNumberFunction,
+    SubstringFunction, UpperFunction,
+};
+
+// Re-export executor types
+pub use executor::{
+    AccessPlan, CacheStats, CachedQueryPlan, ColumnStatsCache, ExecResult, ExecutionContext,
+    Executor, ExecutorMemoryResult, JoinPlan, QueryCache, QueryPlanner, StatsHealth,
+};
+
+// Re-export API types
+pub use api::{
+    Database, FromRow, FromValue, NamedParams, Params, ResultRow, Rows, Statement, ToParam,
+    Transaction as ApiTransaction,
+};

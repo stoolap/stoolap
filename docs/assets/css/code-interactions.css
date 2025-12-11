@@ -1,0 +1,95 @@
+/**
+ * Code Interactions CSS
+ * 
+ * Styling for code block interactions like the copy button
+ * and hover effects.
+ */
+
+/* Base styling for code blocks */
+div.highlighter-rouge {
+  position: relative;
+  /* Removed transition effect */
+}
+
+/* Copy button removed as requested */
+
+/* Special highlighting for SQL keywords */
+.language-sql .highlight .keyword-select,
+.language-sql .highlight .keyword-from,
+.language-sql .highlight .keyword-where,
+.language-sql .highlight .keyword-insert,
+.language-sql .highlight .keyword-update,
+.language-sql .highlight .keyword-delete,
+.language-sql .highlight .keyword-join {
+  font-weight: bold;
+  text-transform: uppercase;
+}
+
+/* Highlight table names in SQL queries */
+.language-sql .table-name {
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+
+/* Style SQL aliases */
+.language-sql .alias {
+  font-style: italic;
+  opacity: 0.9;
+}
+
+/* Function calls in Go */
+.language-go .function-call {
+  font-weight: normal;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+
+/* Dark mode adjustments removed with copy button */
+
+/* Add subtle line numbers */
+.with-line-numbers {
+  counter-reset: line;
+}
+
+.with-line-numbers code > span {
+  counter-increment: line;
+}
+
+.with-line-numbers code > span::before {
+  content: counter(line);
+  display: inline-block;
+  width: 1.5em;
+  margin-right: 1em;
+  padding-right: 0.5em;
+  color: #999;
+  border-right: 1px solid var(--color-border);
+  text-align: right;
+}
+
+/* Enhanced scrollbar for code blocks */
+.highlight pre::-webkit-scrollbar {
+  height: 6px;
+}
+
+.highlight pre::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: 3px;
+}
+
+.highlight pre::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 3px;
+}
+
+[data-theme="dark"] .highlight pre::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+[data-theme="dark"] .highlight pre::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+}

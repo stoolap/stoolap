@@ -1,0 +1,19 @@
+# Jekyll site
+_site/
+.sass-cache/
+.jekyll-cache/
+.jekyll-metadata
+vendor/
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# Ruby environment
+.bundle/
+vendor/bundle
+
+# Environment variables
+.env
