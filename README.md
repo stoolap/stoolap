@@ -1,9 +1,22 @@
-# Stoolap
+<div align="center">
+  <img src="logo.svg" alt="Stoolap Logo" width="360">
 
-An embedded SQL database written in Rust.
+  <p>An embedded SQL database written in Rust.</p>
 
-[![CI](https://github.com/stoolap/stoolap/actions/workflows/ci.yml/badge.svg)](https://github.com/stoolap/stoolap/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+  <p>
+    <a href="https://stoolap.io">Website</a> •
+    <a href="https://stoolap.io/docs">Docs</a> •
+    <a href="https://github.com/stoolap/stoolap/releases">Releases</a>
+  </p>
+
+  <p>
+    <a href="https://github.com/stoolap/stoolap/actions/workflows/ci.yml"><img src="https://github.com/stoolap/stoolap/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://codecov.io/gh/stoolap/stoolap"><img src="https://codecov.io/gh/stoolap/stoolap/branch/main/graph/badge.svg" alt="codecov"></a>
+    <a href="https://crates.io/crates/stoolap"><img src="https://img.shields.io/crates/v/stoolap.svg" alt="Crates.io"></a>
+    <a href="https://github.com/stoolap/stoolap/releases"><img src="https://img.shields.io/github/v/release/stoolap/stoolap" alt="GitHub release"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
+  </p>
+</div>
 
 ## Overview
 
