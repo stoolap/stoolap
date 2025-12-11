@@ -37,19 +37,19 @@
 //! use stoolap::api::Database;
 //!
 //! // Open in-memory database
-//! let db = Database::open(":memory:").unwrap();
+//! let db = Database::open_in_memory().unwrap();
 //!
 //! // Create a table
-//! db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)").unwrap();
+//! db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", ()).unwrap();
 //!
 //! // Insert data
-//! db.execute("INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25)").unwrap();
+//! db.execute("INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25)", ()).unwrap();
 //!
 //! // Query with window function
-//! let result = db.execute("
+//! let rows = db.query("
 //!     SELECT name, age, RANK() OVER (ORDER BY age DESC) as rank
 //!     FROM users
-//! ").unwrap();
+//! ", ()).unwrap();
 //! ```
 //!
 //! ## Modules
