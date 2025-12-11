@@ -107,3 +107,10 @@ debug = true  # Enable debug symbols for profiling
 [profile.bench]
 lto = true
 codegen-units = 1
+
+# CI test profile: faster compile, less disk usage
+[profile.ci]
+inherits = "release"
+lto = "thin"          # Much faster than full LTO
+codegen-units = 16    # Parallel codegen
+debug = false         # No debug symbols needed for tests

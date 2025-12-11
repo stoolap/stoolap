@@ -89,8 +89,8 @@ jobs:
       shell: bash
       run: cargo clean
 
-    - name: Run tests (release)
-      run: cargo test --release --verbose
+    - name: Run tests (release/CI profile)
+      run: cargo test --profile ci --verbose
 
   coverage:
     name: Code Coverage
