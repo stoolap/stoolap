@@ -12,21 +12,56 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Stoolap - High-performance embedded SQL database
+//! # Stoolap - High-performance embedded SQL database
 //!
-//! Stoolap is an HTAP (Hybrid Transactional/Analytical Processing) database
-//! with MVCC support, B-tree indexing, and advanced query optimization.
+//! Stoolap is a modern embedded SQL database written in pure Rust. It provides
+//! full ACID transactions with MVCC, a sophisticated cost-based query optimizer,
+//! and features that rival established databases like PostgreSQL and DuckDB.
+//!
+//! ## Key Features
+//!
+//! - **MVCC Transactions** - Full multi-version concurrency control with snapshot isolation
+//! - **Multiple Index Types** - B-tree, Hash, and Bitmap indexes (auto-selected by data type)
+//! - **Multi-Column Indexes** - Composite indexes for complex query patterns
+//! - **Cost-Based Optimizer** - PostgreSQL-style optimizer with adaptive execution
+//! - **Parallel Query Execution** - Automatic parallelization using Rayon
+//! - **Semantic Query Caching** - Intelligent result caching with predicate subsumption
+//! - **AS OF Temporal Queries** - Built-in time-travel queries
+//! - **Window Functions** - ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, NTILE, etc.
+//! - **CTEs** - Common Table Expressions including recursive CTEs
+//! - **101+ Built-in Functions** - String, math, date/time, JSON, aggregate, window
+//!
+//! ## Quick Start
+//!
+//! ```rust
+//! use stoolap::api::Database;
+//!
+//! // Open in-memory database
+//! let db = Database::open(":memory:").unwrap();
+//!
+//! // Create a table
+//! db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)").unwrap();
+//!
+//! // Insert data
+//! db.execute("INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25)").unwrap();
+//!
+//! // Query with window function
+//! let result = db.execute("
+//!     SELECT name, age, RANK() OVER (ORDER BY age DESC) as rank
+//!     FROM users
+//! ").unwrap();
+//! ```
 //!
 //! ## Modules
 //!
-//! - [`core`] - Core types (DataType, Value, Row, Schema, Error)
-//! - [`common`] - Utilities (BufferPool, Int64Map, version)
+//! - [`api`] - Public database interface ([`api::Database`])
+//! - [`core`] - Core types ([`DataType`], [`Value`], [`Row`], [`Schema`], [`Error`])
 //! - [`storage`] - Storage layer with MVCC, indexes, and expressions
 //! - [`parser`] - SQL parser
-//! - [`functions`] - SQL functions (scalar, aggregate, window)
-//! - [`executor`] - Query executor
-//! - [`optimizer`] - Cost-based query optimizer
-//! - [`api`] - Public database interface
+//! - [`functions`] - 101+ SQL functions (scalar, aggregate, window)
+//! - [`executor`] - Query executor with parallel execution
+//! - [`optimizer`] - Cost-based query optimizer with cardinality feedback
+//! - [`common`] - Utilities (BufferPool, Int64Map, version)
 
 pub mod api;
 pub mod common;

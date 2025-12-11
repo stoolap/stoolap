@@ -6,9 +6,15 @@ on:
   pull_request:
     branches: [ main ]
 
+# Cancel previous runs when new commits are pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
 
 jobs:
   lint:
@@ -22,16 +28,8 @@ jobs:
       with:
         components: rustfmt, clippy
 
-    - name: Cache cargo
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
 
     - name: Check formatting
       run: cargo fmt --all -- --check
@@ -55,42 +53,17 @@ jobs:
         sudo rm -rf /opt/ghc
         sudo rm -rf /opt/hostedtoolcache/CodeQL
         sudo docker image prune --all --force
-        df -h
-
-    - name: Free disk space (macOS)
-      if: runner.os == 'macOS'
-      run: |
-        sudo rm -rf ~/Library/Caches/*
-        df -h
 
     - uses: actions/checkout@v4
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Cache cargo
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Build
-      run: cargo build --verbose
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
 
     - name: Run tests
-      run: cargo test --verbose
-
-    - name: Clean debug artifacts before release build
-      shell: bash
-      run: cargo clean
-
-    - name: Run tests (release/CI profile)
-      run: cargo test --profile ci --verbose
+      run: cargo test
 
   coverage:
     name: Code Coverage
@@ -103,38 +76,28 @@ jobs:
         sudo rm -rf /opt/ghc
         sudo rm -rf /opt/hostedtoolcache/CodeQL
         sudo docker image prune --all --force
-        df -h
 
     - uses: actions/checkout@v4
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-
-    - name: Cache cargo
-      uses: actions/cache@v4
       with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
+        components: llvm-tools-preview
 
-    - name: Install cargo-tarpaulin
-      run: |
-        if ! command -v cargo-tarpaulin &> /dev/null; then
-          cargo install cargo-tarpaulin
-        fi
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
 
     - name: Generate coverage
-      run: cargo tarpaulin --skip-clean --all-features --workspace --timeout 300 --out xml
+      run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
-        files: cobertura.xml
+        files: lcov.info
         fail_ci_if_error: false
 
   license:
@@ -190,6 +153,11 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: ${{ matrix.target }}
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.target }}
 
     - name: Install cross-compilation tools (Linux ARM64)
       if: matrix.target == 'aarch64-unknown-linux-gnu'
