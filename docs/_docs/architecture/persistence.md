@@ -1,4 +1,5 @@
 ---
+layout: doc
 title: Persistence
 category: Architecture
 order: 7

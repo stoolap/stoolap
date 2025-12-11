@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Schema Management in Stoolap
 category: SQL Commands
-order: 1
+order: 2
 ---
 
 # Schema Management in Stoolap

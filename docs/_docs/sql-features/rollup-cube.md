@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: ROLLUP and CUBE
 category: SQL Features
-order: 12
+order: 5
 ---
 
 # ROLLUP and CUBE

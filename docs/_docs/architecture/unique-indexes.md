@@ -1,7 +1,8 @@
 ---
-title: Unique Indexes in Stoolap
+layout: doc
+title: Unique Indexes
 category: Architecture
-order: 1
+order: 8
 ---
 
 # Unique Indexes in Stoolap

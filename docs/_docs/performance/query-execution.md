@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Query Execution and Optimization in Stoolap
 category: Performance
-order: 1
+order: 4
 ---
 
 # Query Execution and Optimization in Stoolap

@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Expression Pushdown
 category: Architecture
-order: 1
+order: 6
 ---
 
 # Expression Pushdown

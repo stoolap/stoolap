@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Semantic Query Cache
 category: Performance
-order: 4
+order: 3
 ---
 
 # Semantic Query Cache

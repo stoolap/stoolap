@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Parameter Binding
 category: SQL Features
-order: 1
+order: 10
 ---
 
 # Parameter Binding

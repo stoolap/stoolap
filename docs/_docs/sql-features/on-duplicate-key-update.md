@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: ON DUPLICATE KEY UPDATE
 category: SQL Features
-order: 1
+order: 11
 ---
 
 # ON DUPLICATE KEY UPDATE

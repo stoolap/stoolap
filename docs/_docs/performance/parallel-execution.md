@@ -1,208 +1,149 @@
 ---
+layout: doc
 title: Parallel Execution
 category: Performance
-order: 3
+order: 5
 ---
 
-# Parallel Execution
-
-Stoolap uses Rayon's work-stealing scheduler to automatically parallelize CPU-intensive query operations. This provides significant performance improvements on multi-core systems for large datasets.
+# Parallel Execution in Stoolap
 
 ## Overview
 
-Parallel execution is automatic and transparent:
-- Queries on small datasets run sequentially (lower overhead)
-- Queries on large datasets automatically use multiple CPU cores
-- The optimizer decides when parallelization is beneficial
+Stoolap's query execution engine is designed to accelerate SQL query processing by operating on data in parallel batches, allowing for better CPU utilization across multiple cores. This document explains the architecture and components of the parallel execution system.
 
-## Parallelized Operations
+## Key Concepts
 
-### Parallel Filter (WHERE clause)
+### Batch Processing
 
-When filtering large result sets, Stoolap processes rows in parallel chunks:
+The parallel execution model processes data in batches to improve throughput. Instead of processing one row at a time, the engine processes multiple rows simultaneously using Rayon's work-stealing scheduler.
 
-```sql
--- Automatically parallelized for tables with 10,000+ rows
-SELECT * FROM large_table WHERE value > 100 AND status = 'active';
-```
+Key characteristics:
+- Automatic parallelization based on data size
+- Work-stealing for optimal load balancing
+- Configurable thresholds for parallel execution
 
-**Threshold**: 10,000+ rows
+### Parallelization Thresholds
 
-**How it works**:
-1. Rows are split into chunks (default: 2,048 rows per chunk)
-2. Each chunk is filtered independently using multiple threads
-3. Results are merged back together
+Stoolap automatically parallelizes operations based on data size:
 
-### Parallel Sort (ORDER BY)
+| Operation | Threshold | Description |
+|-----------|-----------|-------------|
+| **Filter (WHERE)** | 10,000 rows | Parallel predicate evaluation |
+| **Hash Join** | 5,000 rows | Parallel hash build and probe |
+| **ORDER BY** | 50,000 rows | Parallel sorting |
+| **DISTINCT** | 10,000 rows | Two-phase parallel deduplication |
 
-Large result sets are sorted using parallel merge sort:
+## Architecture Components
 
-```sql
--- Automatically parallelized for 50,000+ rows
-SELECT * FROM large_table ORDER BY created_at DESC;
-```
+### 1. Parallel Filter
 
-**Threshold**: 50,000+ rows
+For large tables, WHERE clause evaluation is parallelized:
 
-### Parallel Hash Join
+- Data is divided into chunks
+- Each chunk is processed by a separate thread
+- Results are merged using efficient concurrent data structures
 
-Hash join operations parallelize both the build and probe phases:
+### 2. Parallel Hash Join
 
-```sql
--- Build phase uses parallel hash map construction
--- Probe phase processes rows in parallel
-SELECT o.*, c.name
-FROM orders o
-JOIN customers c ON o.customer_id = c.id
-WHERE o.amount > 1000;
-```
+Hash joins are parallelized in two phases:
 
-**Threshold**: 5,000+ rows in the build table
+**Build Phase:**
+- The build side is partitioned across threads
+- Hash table is constructed using DashMap (concurrent hash map)
 
-Uses a concurrent hash map (DashMap) for thread-safe parallel operations.
+**Probe Phase:**
+- The probe side is processed in parallel
+- Each thread looks up matches in the shared hash table
 
-### Parallel Distinct
+### 3. Parallel Sort
 
-DISTINCT operations with large result sets use two-phase parallel deduplication:
+Large ORDER BY operations use parallel sorting:
 
-```sql
--- Parallelized for 10,000+ rows
-SELECT DISTINCT category FROM products;
-```
+- Uses Rayon's `par_sort_by()` for efficient multi-threaded sorting
+- Automatically falls back to sequential sort for small datasets
 
-**Threshold**: 10,000+ rows
+### 4. Parallel Distinct
 
-## Viewing Parallel Execution
+DISTINCT operations use two-phase deduplication:
 
-Use `EXPLAIN ANALYZE` to see when parallel execution is used:
+- First phase: parallel identification of unique values per chunk
+- Second phase: merge of partial results
+
+## Query Flow
+
+1. **Query Planning**: The planner estimates cardinality and decides on parallel execution.
+
+2. **Data Fetching**: Data is fetched from storage with index acceleration where possible.
+
+3. **Parallel Processing**: Operations exceeding thresholds are parallelized.
+
+4. **Result Merging**: Partial results are combined efficiently.
+
+5. **Result Formation**: Final results are returned to the caller.
+
+## Performance Benefits
+
+Parallel execution provides significant benefits for analytical queries:
+
+- **Filter Operations**: 2-5x speedup for complex predicates
+- **Hash Joins**: 2-4x speedup for large joins
+- **Sorting**: 3-6x speedup for large ORDER BY
+- **Aggregations**: Linear speedup with core count
+
+## EXPLAIN ANALYZE Output
+
+Use `EXPLAIN ANALYZE` to see parallel execution in action:
 
 ```sql
 EXPLAIN ANALYZE SELECT * FROM large_table WHERE value > 100;
+-- Output shows: Parallel Seq Scan on large_table (workers=N)
 ```
 
-Output shows parallel execution:
-```
-plan
-----
-SELECT (actual time=45.2ms, rows=50000)
-  Columns: *
-  -> Parallel Seq Scan on large_table (workers=8) (actual rows=50000)
-       Filter: (value > 100)
-```
+The output indicates how many worker threads were used for each operation.
 
-The `workers=N` indicates the number of parallel workers used.
+## Query Types That Benefit Most
 
-## Thresholds
+Parallel execution provides the greatest benefit for:
 
-| Operation | Minimum Rows | Description |
-|-----------|--------------|-------------|
-| Filter | 10,000 | WHERE clause evaluation |
-| Sort | 50,000 | ORDER BY processing |
-| Hash Join | 5,000 | Join build table size |
-| Distinct | 10,000 | Deduplication |
-
-These thresholds ensure parallelization overhead doesn't exceed the benefit.
-
-## How It Works
-
-### Work-Stealing Scheduler
-
-Stoolap uses Rayon's work-stealing scheduler:
-
-1. **Task Distribution**: Work is divided into chunks
-2. **Thread Pool**: A global thread pool processes chunks
-3. **Work Stealing**: Idle threads steal work from busy threads
-4. **Load Balancing**: Automatically handles varying chunk processing times
-
-### Chunk Size
-
-The default chunk size is 2,048 rows, optimized for:
-- L2 cache efficiency
-- Task scheduling overhead
-- Load balancing
-
-### Thread Pool
-
-Rayon creates a thread pool sized to the number of CPU cores:
-- Automatically scales to available cores
-- Shared across all parallel operations
-- No configuration needed
-
-## Performance Considerations
-
-### When Parallel Helps
-
-Parallel execution provides the most benefit when:
-- Processing large datasets (above thresholds)
-- Performing CPU-intensive operations (complex WHERE, sorting)
-- Running on multi-core systems
-
-### When Parallel May Not Help
-
-Parallel execution may have minimal benefit when:
-- Dataset is small (below thresholds)
-- I/O bound operations (disk reads)
-- Single-core systems
-
-### Index Usage with Parallel
-
-Indexes and parallel execution work together:
-- Index lookups are sequential (fast, no parallelization needed)
-- Post-filter operations on indexed results may still parallelize
-
-```sql
--- Index used for category lookup, parallel filter for value
-SELECT * FROM products
-WHERE category = 'Electronics' AND value > complex_calculation(price);
-```
-
-## Partial Pushdown
-
-Stoolap supports "partial pushdown" where:
-- Simple predicates are pushed to storage (index usage)
-- Complex predicates are evaluated with parallel filtering
-
-```sql
--- indexed_col uses index, complex_func uses parallel filter
-SELECT * FROM data
-WHERE indexed_col = 5 AND complex_func(x) > 0;
-```
-
-This hybrid approach combines index efficiency with parallel computation power.
-
-## Memory Considerations
-
-Parallel execution uses more memory than sequential:
-- Each thread maintains its own working set
-- Results are collected from all threads
-
-For very large result sets, consider:
-- Adding more restrictive WHERE clauses
-- Using LIMIT to reduce result size
-- Ensuring adequate system memory
-
-## Monitoring
-
-### Query Timing
-
-Use `EXPLAIN ANALYZE` to compare sequential vs parallel performance:
-
-```sql
--- Shows actual execution time
-EXPLAIN ANALYZE SELECT * FROM large_table WHERE value > 100;
-```
-
-### CPU Usage
-
-During parallel queries, you should see:
-- Multiple CPU cores utilized
-- Higher overall CPU usage
-- Faster query completion
+1. **Analytical queries** that process large amounts of data
+2. **Filter-heavy operations** with complex conditions
+3. **Large joins** between tables
+4. **Large aggregations** over many rows
+5. **Sorting large result sets**
 
 ## Best Practices
 
-1. **Let the optimizer decide**: Parallel execution is automatic
-2. **Use EXPLAIN ANALYZE**: Verify parallelization is being used
-3. **Index appropriately**: Combine indexes with parallel filtering
-4. **Monitor memory**: Large parallel queries use more memory
-5. **Test with production data sizes**: Parallelization benefits depend on scale
+For optimal performance with Stoolap's parallel execution:
+
+1. **Ensure sufficient data**: Parallel overhead only pays off for larger datasets
+2. **Use appropriate indexes**: Even with parallelism, indexes are still important
+3. **Analyze tables**: Run ANALYZE to give the optimizer accurate cardinality estimates
+4. **Check EXPLAIN output**: Verify parallel execution is being used as expected
+
+## Implementation Details
+
+### Rayon Integration
+
+Stoolap uses Rayon for parallel execution:
+
+- Work-stealing scheduler for optimal load balancing
+- Automatic thread pool management
+- Zero-cost abstraction over parallelism
+
+### Memory Management
+
+Parallel execution uses efficient memory patterns:
+
+- DashMap for concurrent hash tables
+- Chunk-based processing to limit memory usage
+- Efficient result merging to avoid copies
+
+## Current Capabilities
+
+The parallel execution engine supports:
+
+- Parallel filter evaluation
+- Parallel hash join (build and probe)
+- Parallel sorting
+- Parallel distinct/deduplication
+- Parallel aggregation

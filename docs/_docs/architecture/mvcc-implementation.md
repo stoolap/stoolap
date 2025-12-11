@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: MVCC Implementation
 category: Architecture
-order: 1
+order: 4
 ---
 
 # MVCC Implementation

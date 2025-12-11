@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Scalar Functions
 category: Functions
-order: 1
+order: 2
 ---
 
 # Scalar Functions

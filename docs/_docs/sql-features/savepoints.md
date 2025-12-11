@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Savepoints
 category: SQL Features
-order: 11
+order: 12
 ---
 
 # Savepoints

@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Quick Start Tutorial
 category: Getting Started
-order: 1
+order: 2
 ---
 
 # Quick Start Tutorial

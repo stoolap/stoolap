@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: EXPLAIN
 category: SQL Features
-order: 10
+order: 13
 ---
 
 # EXPLAIN

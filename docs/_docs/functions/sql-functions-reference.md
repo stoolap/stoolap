@@ -1,4 +1,5 @@
 ---
+layout: doc
 title: SQL Functions Reference
 category: Functions
 order: 1

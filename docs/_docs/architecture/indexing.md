@@ -1,8 +1,8 @@
 ---
 layout: doc
 title: Indexing
-description: How indexes work in Stoolap and when to use them
-permalink: /docs/indexing/
+category: Architecture
+order: 3
 ---
 
 # Indexing in Stoolap

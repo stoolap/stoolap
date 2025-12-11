@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: DISTINCT Operations
 category: SQL Features
-order: 1
+order: 8
 ---
 
 # DISTINCT Operations

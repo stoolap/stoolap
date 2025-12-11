@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Query Optimizer
 category: Performance
-order: 1
+order: 2
 ---
 
 # Query Optimizer

@@ -130,84 +130,21 @@
     <div class="container docs-container">
       <aside class="docs-sidebar">
         <nav class="docs-nav" aria-label="Documentation">
+          {% comment %} Dynamic sidebar generated from docs collection {% endcomment %}
+          {% for category in site.data.doc_categories %}
+            {% assign category_docs = site.docs | where: "category", category.name | sort: "order" %}
+            {% if category_docs.size > 0 %}
           <div class="docs-nav-section">
-            <button class="docs-nav-toggle" aria-expanded="true">Getting Started</button>
+            <button class="docs-nav-toggle" aria-expanded="true">{{ category.name }}</button>
             <ul>
-              <li><a href="{{ '/docs/getting-started/installation/' | relative_url }}" {% if page.url contains '/docs/getting-started/installation/' %}aria-current="page"{% endif %}>Installation Guide</a></li>
-              <li><a href="{{ '/docs/getting-started/quickstart/' | relative_url }}" {% if page.url contains '/docs/getting-started/quickstart/' %}aria-current="page"{% endif %}>Quick Start Tutorial</a></li>
-              <li><a href="{{ '/docs/getting-started/connection-strings/' | relative_url }}" {% if page.url contains '/docs/getting-started/connection-strings/' %}aria-current="page"{% endif %}>Connection Strings</a></li>
-              <li><a href="{{ '/docs/getting-started/api-reference/' | relative_url }}" {% if page.url contains '/docs/getting-started/api-reference/' %}aria-current="page"{% endif %}>API Reference</a></li>
-              <li><a href="{{ '/docs/getting-started/subqueries-quickstart/' | relative_url }}" {% if page.url contains '/docs/getting-started/subqueries-quickstart/' %}aria-current="page"{% endif %}>Subqueries Quick Start</a></li>
+              {% for doc in category_docs %}
+              <li><a href="{{ doc.url | relative_url }}" {% if page.url == doc.url %}aria-current="page"{% endif %}>{{ doc.title }}</a></li>
+              {% endfor %}
             </ul>
           </div>
-          
-          <div class="docs-nav-section">
-            <button class="docs-nav-toggle" aria-expanded="true">Architecture</button>
-            <ul>
-              <li><a href="{{ '/docs/architecture/' | relative_url }}" {% if page.url == '/docs/architecture/' %}aria-current="page"{% endif %}>Architecture Overview</a></li>
-              <li><a href="{{ '/docs/architecture/storage-engine/' | relative_url }}" {% if page.url contains '/docs/architecture/storage-engine/' %}aria-current="page"{% endif %}>Storage Engine</a></li>
-              <li><a href="{{ '/docs/architecture/hybrid-storage/' | relative_url }}" {% if page.url contains '/docs/architecture/hybrid-storage/' %}aria-current="page"{% endif %}>Hybrid Storage</a></li>
-              <li><a href="{{ '/docs/architecture/mvcc-implementation/' | relative_url }}" {% if page.url contains '/docs/architecture/mvcc-implementation/' %}aria-current="page"{% endif %}>MVCC Implementation</a></li>
-              <li><a href="{{ '/docs/architecture/transaction-isolation/' | relative_url }}" {% if page.url contains '/docs/architecture/transaction-isolation/' %}aria-current="page"{% endif %}>Transaction Isolation</a></li>
-              <li><a href="{{ '/docs/architecture/indexing/' | relative_url }}" {% if page.url contains '/docs/architecture/indexing/' %}aria-current="page"{% endif %}>Indexing</a></li>
-              <li><a href="{{ '/docs/architecture/unique-indexes/' | relative_url }}" {% if page.url contains '/docs/architecture/unique-indexes/' %}aria-current="page"{% endif %}>Unique Indexes</a></li>
-            </ul>
-          </div>
-          
-          <div class="docs-nav-section">
-            <button class="docs-nav-toggle" aria-expanded="true">Data Types</button>
-            <ul>
-              <li><a href="{{ '/docs/data-types/data-types/' | relative_url }}" {% if page.url contains '/docs/data-types/data-types/' %}aria-current="page"{% endif %}>Data Types Overview</a></li>
-              <li><a href="{{ '/docs/data-types/date-and-time/' | relative_url }}" {% if page.url contains '/docs/data-types/date-and-time/' %}aria-current="page"{% endif %}>Date and Time</a></li>
-              <li><a href="{{ '/docs/data-types/json-support/' | relative_url }}" {% if page.url contains '/docs/data-types/json-support/' %}aria-current="page"{% endif %}>JSON Support</a></li>
-            </ul>
-          </div>
+            {% endif %}
+          {% endfor %}
 
-          <div class="docs-nav-section">
-            <button class="docs-nav-toggle" aria-expanded="true">SQL Commands</button>
-            <ul>
-              <li><a href="{{ '/docs/sql-commands/sql-commands/' | relative_url }}" {% if page.url contains '/docs/sql-commands/sql-commands/' %}aria-current="page"{% endif %}>SQL Commands Overview</a></li>
-              <li><a href="{{ '/docs/sql-commands/schema-management/' | relative_url }}" {% if page.url contains '/docs/sql-commands/schema-management/' %}aria-current="page"{% endif %}>Schema Management</a></li>
-              <li><a href="{{ '/docs/sql-commands/pragma-commands/' | relative_url }}" {% if page.url contains '/docs/sql-commands/pragma-commands/' %}aria-current="page"{% endif %}>PRAGMA Commands</a></li>
-            </ul>
-          </div>
-          
-          <div class="docs-nav-section">
-            <button class="docs-nav-toggle" aria-expanded="true">Functions</button>
-            <ul>
-              <li><a href="{{ '/docs/functions/sql-functions-reference/' | relative_url }}" {% if page.url contains '/docs/functions/sql-functions-reference/' %}aria-current="page"{% endif %}>Functions Overview</a></li>
-              <li><a href="{{ '/docs/functions/aggregate-functions/' | relative_url }}" {% if page.url contains '/docs/functions/aggregate-functions/' %}aria-current="page"{% endif %}>Aggregate Functions</a></li>
-              <li><a href="{{ '/docs/functions/scalar-functions/' | relative_url }}" {% if page.url contains '/docs/functions/scalar-functions/' %}aria-current="page"{% endif %}>Scalar Functions</a></li>
-            </ul>
-          </div>
-
-          <div class="docs-nav-section">
-            <button class="docs-nav-toggle" aria-expanded="true">SQL Features</button>
-            <ul>
-              <li><a href="{{ '/docs/sql-features/window-functions/' | relative_url }}" {% if page.url contains '/docs/sql-features/window-functions/' %}aria-current="page"{% endif %}>Window Functions</a></li>
-              <li><a href="{{ '/docs/sql-features/temporal-queries/' | relative_url }}" {% if page.url contains '/docs/sql-features/temporal-queries/' %}aria-current="page"{% endif %}>Temporal Queries (AS OF)</a></li>
-              <li><a href="{{ '/docs/sql-features/join-operations/' | relative_url }}" {% if page.url contains '/docs/sql-features/join-operations/' %}aria-current="page"{% endif %}>JOIN Operations</a></li>
-              <li><a href="{{ '/docs/sql-features/cast-operations/' | relative_url }}" {% if page.url contains '/docs/sql-features/cast-operations/' %}aria-current="page"{% endif %}>CAST Operations</a></li>
-              <li><a href="{{ '/docs/sql-features/distinct-operations/' | relative_url }}" {% if page.url contains '/docs/sql-features/distinct-operations/' %}aria-current="page"{% endif %}>DISTINCT Operations</a></li>
-              <li><a href="{{ '/docs/sql-features/null-handling/' | relative_url }}" {% if page.url contains '/docs/sql-features/null-handling/' %}aria-current="page"{% endif %}>NULL Handling</a></li>
-              <li><a href="{{ '/docs/sql-features/on-duplicate-key-update/' | relative_url }}" {% if page.url contains '/docs/sql-features/on-duplicate-key-update/' %}aria-current="page"{% endif %}>ON DUPLICATE KEY UPDATE</a></li>
-              <li><a href="{{ '/docs/sql-features/parameter-binding/' | relative_url }}" {% if page.url contains '/docs/sql-features/parameter-binding/' %}aria-current="page"{% endif %}>Parameter Binding</a></li>
-              <li><a href="{{ '/docs/sql-features/subqueries/' | relative_url }}" {% if page.url contains '/docs/sql-features/subqueries/' %}aria-current="page"{% endif %}>Subqueries</a></li>
-              <li><a href="{{ '/docs/sql-features/common-table-expressions/' | relative_url }}" {% if page.url contains '/docs/sql-features/common-table-expressions/' %}aria-current="page"{% endif %}>Common Table Expressions (CTEs)</a></li>
-            </ul>
-          </div>
-          
-          <div class="docs-nav-section">
-            <button class="docs-nav-toggle" aria-expanded="true">Performance</button>
-            <ul>
-              <li><a href="{{ '/docs/performance/query-execution/' | relative_url }}" {% if page.url contains '/docs/performance/query-execution/' %}aria-current="page"{% endif %}>Query Execution</a></li>
-              <li><a href="{{ '/docs/performance/vectorized-execution/' | relative_url }}" {% if page.url contains '/docs/performance/vectorized-execution/' %}aria-current="page"{% endif %}>Vectorized Execution</a></li>
-              <li><a href="{{ '/docs/performance/data-compression/' | relative_url }}" {% if page.url contains '/docs/performance/data-compression/' %}aria-current="page"{% endif %}>Data Compression</a></li>
-              <li><a href="{{ '/docs/performance/optimization/' | relative_url }}" {% if page.url contains '/docs/performance/optimization/' %}aria-current="page"{% endif %}>Optimization</a></li>
-              <li><a href="{{ '/docs/architecture/expression-pushdown/' | relative_url }}" {% if page.url contains '/docs/architecture/expression-pushdown/' %}aria-current="page"{% endif %}>Expression Pushdown</a></li>
-            </ul>
-          </div>
-          
           <div class="docs-nav-section">
             <button class="docs-nav-toggle" aria-expanded="true">External Resources</button>
             <ul>
@@ -275,7 +212,7 @@
             <ul>
               <li><a href="{{ '/docs/getting-started/installation/' | relative_url }}">Installation</a></li>
               <li><a href="{{ '/docs/getting-started/quickstart/' | relative_url }}">Quick Start</a></li>
-              <li><a href="{{ '/docs/architecture/' | relative_url }}">Architecture</a></li>
+              <li><a href="{{ '/docs/architecture/architecture/' | relative_url }}">Architecture</a></li>
             </ul>
           </div>
           

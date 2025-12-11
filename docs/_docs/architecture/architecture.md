@@ -1,5 +1,6 @@
 ---
-title: Stoolap Architecture
+layout: doc
+title: Architecture Overview
 category: Architecture
 order: 1
 ---

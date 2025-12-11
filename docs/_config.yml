@@ -23,6 +23,7 @@ collections:
   docs:
     output: true
     permalink: /:collection/:path/
+    sort_by: order
   posts:
     output: true
     permalink: /blog/:year/:month/:day/:title/

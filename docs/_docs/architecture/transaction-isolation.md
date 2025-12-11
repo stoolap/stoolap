@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Transaction Isolation
 category: Architecture
-order: 1
+order: 5
 ---
 
 # Transaction Isolation in Stoolap

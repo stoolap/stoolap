@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Connection String Reference
 category: Getting Started
-order: 1
+order: 3
 ---
 
 # Connection String Reference

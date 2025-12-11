@@ -1,4 +1,5 @@
 ---
+layout: doc
 title: API Reference
 category: Getting Started
 order: 4

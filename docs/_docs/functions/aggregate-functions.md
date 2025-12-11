@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Aggregate Functions
 category: Functions
-order: 1
+order: 3
 ---
 
 # Aggregate Functions

@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Operators and Expressions
 category: SQL Features
-order: 14
+order: 6
 ---
 
 # Operators and Expressions

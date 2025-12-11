@@ -2,7 +2,7 @@
 layout: doc
 title: Common Table Expressions (CTEs)
 category: SQL Features
-order: 9
+order: 4
 ---
 
 # Common Table Expressions (CTEs)

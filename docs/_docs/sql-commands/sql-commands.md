@@ -1,4 +1,5 @@
 ---
+layout: doc
 title: SQL Commands
 category: SQL Commands
 order: 1

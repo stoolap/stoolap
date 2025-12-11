@@ -5,79 +5,37 @@ title: Stoolap Documentation
 
 <div class="docs-content">
   <h1>Stoolap Documentation</h1>
-  
+
   <p>Welcome to the Stoolap Documentation! This is your comprehensive guide to using and understanding Stoolap, a high-performance embedded SQL database written in pure Rust.</p>
 
   <h2>What is Stoolap?</h2>
 
   <p>Stoolap is a modern embedded SQL database that provides full ACID transactions with MVCC, a sophisticated cost-based query optimizer, and features that rival established databases like PostgreSQL and DuckDB. Built entirely in Rust with zero unsafe code, Stoolap features multiple index types (B-tree, Hash, Bitmap), parallel query execution, and comprehensive SQL support including window functions, CTEs, and temporal queries.</p>
-  
-  <h2>Key Documentation Sections</h2>
-  
-  <h3>Getting Started</h3>
+
+  <h2>Documentation Sections</h2>
+
+  {% comment %} Dynamic documentation index generated from docs collection {% endcomment %}
+  {% for category in site.data.doc_categories %}
+    {% assign category_docs = site.docs | where: "category", category.name | sort: "order" %}
+    {% if category_docs.size > 0 %}
+  <h3>{{ category.name }}</h3>
   <ul>
-    <li><a href="{{ site.baseurl }}/docs/getting-started/installation/">Installation Guide</a> - How to install and set up Stoolap</li>
-    <li><a href="{{ site.baseurl }}/docs/getting-started/quickstart/">Quick Start Tutorial</a> - A step-by-step guide to your first Stoolap database</li>
-    <li><a href="{{ site.baseurl }}/docs/getting-started/connection-strings/">Connection String Reference</a> - Understanding and using Stoolap connection strings</li>
-    <li><a href="{{ site.baseurl }}/docs/getting-started/api-reference/">API Reference</a> - Complete API documentation for the Stoolap package</li>
+      {% for doc in category_docs %}
+    <li><a href="{{ doc.url | relative_url }}">{{ doc.title }}</a></li>
+      {% endfor %}
   </ul>
-  
-  <h3>SQL Reference</h3>
-  <ul>
-    <li><a href="{{ site.baseurl }}/docs/data-types/data-types/">Data Types</a> - All supported data types and their behaviors</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-commands/sql-commands/">SQL Commands</a> - SQL syntax and command reference</li>
-    <li><a href="{{ site.baseurl }}/docs/functions/aggregate-functions/">Aggregate Functions</a> - Functions for data summarization</li>
-    <li><a href="{{ site.baseurl }}/docs/functions/scalar-functions/">Scalar Functions</a> - Built-in scalar functions</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/window-functions/">Window Functions</a> - Row-based analytical functions</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/temporal-queries/">Temporal Queries (AS OF)</a> - Time travel queries with AS OF syntax</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/cast-operations/">CAST Operations</a> - Type conversion capabilities</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/null-handling/">NULL Handling</a> - Working with NULL values</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/join-operations/">JOIN Operations</a> - Combining data from multiple tables</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/distinct-operations/">DISTINCT Operations</a> - Working with unique values</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/parameter-binding/">Parameter Binding</a> - Using parameters in SQL</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/subqueries/">Subqueries</a> - Using queries within queries</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/common-table-expressions/">Common Table Expressions (CTEs)</a> - WITH and WITH RECURSIVE</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/operators-expressions/">Operators and Expressions</a> - Arithmetic, comparison, logical, and bitwise operators</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/rollup-cube/">ROLLUP and CUBE</a> - Multi-dimensional aggregations</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/explain/">EXPLAIN</a> - Query execution plan analysis</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/savepoints/">Savepoints</a> - Transaction savepoints for partial rollback</li>
-  </ul>
-  
-  <h3>Architecture</h3>
-  <ul>
-    <li><a href="{{ site.baseurl }}/docs/architecture/storage-engine/">Storage Engine</a> - How data is stored and retrieved</li>
-    <li><a href="{{ site.baseurl }}/docs/architecture/hybrid-storage/">Storage Architecture</a> - Row-based storage with multiple index types</li>
-    <li><a href="{{ site.baseurl }}/docs/architecture/mvcc-implementation/">MVCC Implementation</a> - Multi-Version Concurrency Control details</li>
-    <li><a href="{{ site.baseurl }}/docs/architecture/transaction-isolation/">Transaction Isolation</a> - Transaction isolation levels</li>
-    <li><a href="{{ site.baseurl }}/docs/architecture/indexing/">Indexing</a> - How indexes work and when to use them</li>
-    <li><a href="{{ site.baseurl }}/docs/architecture/unique-indexes/">Unique Indexes</a> - Enforcing data uniqueness</li>
-    <li><a href="{{ site.baseurl }}/docs/architecture/expression-pushdown/">Expression Pushdown</a> - Filtering optimization</li>
-  </ul>
-  
-  <h3>Performance</h3>
-  <ul>
-    <li><a href="{{ site.baseurl }}/docs/performance/query-execution/">Query Execution</a> - Understanding query execution</li>
-    <li><a href="{{ site.baseurl }}/docs/performance/vectorized-execution/">Parallel Execution</a> - Multi-threaded query processing</li>
-    <li><a href="{{ site.baseurl }}/docs/performance/optimization/">Optimization</a> - Query optimization strategies</li>
-  </ul>
-  
-  <h3>Advanced Features</h3>
-  <ul>
-    <li><a href="{{ site.baseurl }}/docs/data-types/json-support/">JSON Support</a> - Working with JSON data</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-commands/pragma-commands/">PRAGMA Commands</a> - Database configuration options</li>
-    <li><a href="{{ site.baseurl }}/docs/data-types/date-and-time/">Date/Time Handling</a> - Working with temporal data</li>
-    <li><a href="{{ site.baseurl }}/docs/sql-features/on-duplicate-key-update/">ON DUPLICATE KEY UPDATE</a> - Handling duplicate key conflicts</li>
-  </ul>
-  
+    {% endif %}
+  {% endfor %}
+
   <h2>Need Help?</h2>
-  
+
   <p>If you can't find what you're looking for in the documentation, you can:</p>
   <ul>
     <li><a href="https://github.com/stoolap/stoolap/issues">Open an issue</a> on GitHub</li>
     <li><a href="https://github.com/stoolap/stoolap/discussions">Join the discussions</a> to ask questions</li>
   </ul>
-  
+
   <hr>
-  
+
   <p>This documentation is under active development. Contributions are welcome!</p>
 </div>

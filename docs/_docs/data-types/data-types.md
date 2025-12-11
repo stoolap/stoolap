@@ -1,4 +1,5 @@
 ---
+layout: doc
 title: Data Types in Stoolap
 category: Data Types
 order: 1

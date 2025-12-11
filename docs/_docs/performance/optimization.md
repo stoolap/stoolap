@@ -1,4 +1,5 @@
 ---
+layout: doc
 title: Performance Optimization
 category: Performance
 order: 1

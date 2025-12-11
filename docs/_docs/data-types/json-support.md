@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: JSON Support
 category: Data Types
-order: 1
+order: 3
 ---
 
 # JSON Support

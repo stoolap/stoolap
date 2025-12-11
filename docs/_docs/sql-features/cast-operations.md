@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: CAST Operations
 category: SQL Features
-order: 1
+order: 7
 ---
 
 # CAST Operations

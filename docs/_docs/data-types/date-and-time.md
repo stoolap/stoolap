@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Date and Time Handling
 category: Data Types
-order: 1
+order: 2
 ---
 
 # Date and Time Handling

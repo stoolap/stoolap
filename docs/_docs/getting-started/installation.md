@@ -1,4 +1,5 @@
 ---
+layout: doc
 title: Installation Guide
 category: Getting Started
 order: 1

@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Temporal Queries (AS OF)
 category: SQL Features
-order: 9
+order: 1
 ---
 
 # Temporal Queries (AS OF)

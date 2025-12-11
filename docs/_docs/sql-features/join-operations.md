@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: JOIN Operations
 category: SQL Features
-order: 1
+order: 2
 ---
 
 # JOIN Operations

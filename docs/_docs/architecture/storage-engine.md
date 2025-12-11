@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Storage Engine
 category: Architecture
-order: 1
+order: 2
 ---
 
 # Storage Engine

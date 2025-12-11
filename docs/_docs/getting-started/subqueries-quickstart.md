@@ -126,26 +126,53 @@ WHERE NOT EXISTS (
 );
 ```
 
+### 5. Correlated Subqueries
+
+```sql
+-- Find employees earning above their department average
+SELECT name, department, salary
+FROM employees e1
+WHERE salary > (
+    SELECT AVG(salary) FROM employees e2 WHERE e2.department = e1.department
+);
+
+-- Get each customer's total order amount
+SELECT
+    c.name,
+    (SELECT SUM(amount) FROM orders o WHERE o.customer_id = c.id) as total_spent
+FROM customers c;
+```
+
+### 6. Derived Tables (Subqueries in FROM)
+
+```sql
+-- Join with aggregated data
+SELECT c.name, stats.order_count, stats.total_spent
+FROM customers c
+JOIN (
+    SELECT customer_id, COUNT(*) as order_count, SUM(amount) as total_spent
+    FROM orders
+    GROUP BY customer_id
+) AS stats ON c.id = stats.customer_id;
+```
+
 ## Best Practices
 
 1. **Keep subqueries simple**: Complex subqueries can impact performance
 2. **Use indexes**: Ensure columns used in subquery WHERE clauses are indexed
 3. **Consider alternatives**: Sometimes a JOIN might be more efficient than a subquery
 
-## Current Support
+## Supported Features
 
-Stoolap currently supports:
+Stoolap fully supports:
 - ✅ IN and NOT IN subqueries
 - ✅ EXISTS and NOT EXISTS operators
 - ✅ Scalar subqueries (returning single values)
-- ✅ Non-correlated subqueries (independent of outer query)
+- ✅ Correlated subqueries (referencing outer query)
+- ✅ Derived tables (subqueries in FROM clause)
 - ✅ Subqueries in SELECT, UPDATE, and DELETE statements
-
-Coming soon:
-- ❌ Correlated subqueries (referencing outer query)
-- ❌ Subqueries in FROM clause
-- ❌ Subqueries in SET clause of UPDATE
-- ❌ ANY and ALL operators
+- ✅ Subqueries in UPDATE SET clause
+- ✅ ANY/SOME and ALL operators
 
 ## Next Steps
 

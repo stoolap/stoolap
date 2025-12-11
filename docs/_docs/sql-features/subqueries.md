@@ -2,7 +2,7 @@
 layout: doc
 title: Subqueries
 category: SQL Features
-order: 8
+order: 3
 ---
 
 # Subqueries in Stoolap

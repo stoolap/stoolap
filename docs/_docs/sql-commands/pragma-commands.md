@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: PRAGMA Commands
 category: SQL Commands
-order: 1
+order: 3
 ---
 
 # PRAGMA Commands

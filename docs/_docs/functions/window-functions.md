@@ -1,7 +1,8 @@
 ---
+layout: doc
 title: Window Functions
-category: SQL Features
-order: 1
+category: Functions
+order: 4
 ---
 
 # Window Functions
