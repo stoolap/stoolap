@@ -31,8 +31,7 @@ use stoolap::api::Database;
 
 /// Helper function to create an in-memory test database
 fn create_test_db() -> Database {
-    let db = Database::open_in_memory().expect("Failed to create in-memory database");
-    db
+    Database::open_in_memory().expect("Failed to create in-memory database")
 }
 
 /// Test basic semantic cache operations: insert and lookup

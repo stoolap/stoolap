@@ -74,7 +74,9 @@ fn test_query_cache_basic() {
     ];
 
     for q in query_strings {
-        let _rows = db.query(q, ()).expect(&format!("Query failed on '{}'", q));
+        let _rows = db
+            .query(q, ())
+            .unwrap_or_else(|_| panic!("Query failed on '{}'", q));
     }
 }
 
@@ -217,7 +219,9 @@ fn test_query_cache_whitespace_normalization() {
     ];
 
     for q in queries {
-        let rows = db.query(q, ()).expect(&format!("Query failed: '{}'", q));
+        let rows = db
+            .query(q, ())
+            .unwrap_or_else(|_| panic!("Query failed: '{}'", q));
         assert_eq!(rows.count(), 1, "Query '{}' should return 1 row", q);
     }
 }

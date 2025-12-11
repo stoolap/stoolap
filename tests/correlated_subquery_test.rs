@@ -516,6 +516,7 @@ fn test_multiple_scalar_subqueries_in_select() {
         )
         .expect("Failed to execute query");
 
+    #[allow(clippy::type_complexity)]
     let mut customers: Vec<(i64, String, i64, Option<f64>, Option<f64>)> = Vec::new();
     for r in result {
         let row = r.expect("Failed to get row");

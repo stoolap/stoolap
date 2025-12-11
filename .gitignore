@@ -32,6 +32,7 @@ tarpaulin-report.html
 .claude/settings.local.json
 CLAUDE.md
 TODO.md
+*.disabled
 
 # Documentation build artifacts
 docs/_site/

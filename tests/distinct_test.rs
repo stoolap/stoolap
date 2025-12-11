@@ -152,7 +152,7 @@ fn test_distinct_with_order_by() {
     }
 
     // Expected result should be ordered alphabetically
-    let expected = vec!["East", "North", "South", "West"];
+    let expected = ["East", "North", "South", "West"];
 
     assert_eq!(
         regions.len(),
@@ -251,7 +251,7 @@ fn test_complex_distinct() {
     }
 
     // Expected distinct symbols (ordered)
-    let expected = vec!["BTC-USD", "ETH-USD", "SOL-USD"];
+    let expected = ["BTC-USD", "ETH-USD", "SOL-USD"];
 
     assert_eq!(
         distinct_symbols.len(),
@@ -366,7 +366,7 @@ fn test_distinct_with_large_dataset() {
     );
 
     // Verify they match our expected categories (ordered)
-    let expected = vec!["A", "B", "C", "D", "E"];
+    let expected = ["A", "B", "C", "D", "E"];
     for (i, category) in distinct_categories.iter().enumerate() {
         assert_eq!(
             category, expected[i],

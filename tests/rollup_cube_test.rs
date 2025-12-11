@@ -175,9 +175,8 @@ fn test_cube_basic() {
             );
         } else if region.is_some() && product.is_none() {
             has_region_subtotal = true;
-        } else if region.is_none() && product.is_some() {
+        } else if let (None, Some(p)) = (&region, &product) {
             has_product_subtotal = true;
-            let p = product.unwrap();
             if p == "A" {
                 assert!(
                     (sum - 300.0).abs() < 0.01,

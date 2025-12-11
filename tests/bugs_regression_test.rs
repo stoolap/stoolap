@@ -1,3 +1,17 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Integration tests for all bugs tracked in BUGS.md
 // These tests ensure that fixed bugs don't regress
 
@@ -237,7 +251,7 @@ fn test_bug_06_order_by_arithmetic_expression() {
     let rows: Vec<_> = result.collect();
 
     // ORDER BY amount * -1 should give descending order: 1.50, 1.25, 0.75, 0.50
-    let expected_order = vec![1, 4, 2, 3];
+    let expected_order = [1, 4, 2, 3];
     for (i, row) in rows.iter().enumerate() {
         let row = row.as_ref().expect("Row should exist");
         let id: i64 = row.get(0).unwrap();
@@ -630,7 +644,7 @@ fn test_bug_15_dense_rank() {
     assert_eq!(rows.len(), 4);
 
     // Expected dense ranks: 1, 2, 2, 3 (not 1, 2, 2, 4 like RANK)
-    let expected_ranks = vec![1i64, 2, 2, 3];
+    let expected_ranks = [1i64, 2, 2, 3];
     for (i, row) in rows.iter().enumerate() {
         let row = row.as_ref().expect("Row should exist");
         let drank: i64 = row.get(2).unwrap();
@@ -3748,7 +3762,7 @@ fn test_bug_105_window_frame_shorthand() {
     let rows: Vec<_> = result.collect();
     assert_eq!(rows.len(), 5);
 
-    let expected_running = vec![10i64, 30, 60, 100, 150];
+    let expected_running = [10i64, 30, 60, 100, 150];
     for (i, row) in rows.iter().enumerate() {
         let row = row.as_ref().unwrap();
         let running: i64 = row.get(2).unwrap();
@@ -4176,7 +4190,7 @@ fn test_bugs2_01_order_by_with_rollup() {
         .expect("CUBE with ORDER BY should work");
 
     let rows: Vec<_> = result.collect();
-    assert!(rows.len() > 0, "CUBE with ORDER BY should return results");
+    assert!(!rows.is_empty(), "CUBE with ORDER BY should return results");
 }
 
 // =============================================================================

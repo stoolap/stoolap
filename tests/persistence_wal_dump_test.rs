@@ -1,9 +1,24 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::fs;
 use stoolap::Database;
 use tempfile::tempdir;
 
 // WAL constants from the new format
 const WAL_ENTRY_MAGIC: u32 = 0x454C4157; // "WALE" in little-endian
+#[allow(dead_code)]
 const WAL_HEADER_SIZE: u16 = 32;
 
 #[test]
@@ -39,7 +54,7 @@ fn test_persistence_wal_dump() {
     if wal_dir.exists() {
         for entry in fs::read_dir(&wal_dir).unwrap() {
             let entry = entry.unwrap();
-            let content = fs::read(&entry.path()).unwrap();
+            let content = fs::read(entry.path()).unwrap();
             eprintln!(
                 "\nWAL file: {:?} ({} bytes)",
                 entry.file_name(),

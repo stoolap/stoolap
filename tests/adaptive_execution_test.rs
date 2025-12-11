@@ -176,8 +176,7 @@ fn test_aqe_left_join() {
     }
 
     // Only some products have reviews
-    let mut review_id = 0;
-    for product_id in 0..25 {
+    for (review_id, product_id) in (0..25).enumerate() {
         // Only first 25 products have reviews
         db.execute(
             &format!(
@@ -189,7 +188,6 @@ fn test_aqe_left_join() {
             (),
         )
         .expect("Insert failed");
-        review_id += 1;
     }
 
     db.execute("ANALYZE products", ()).unwrap();
@@ -497,7 +495,7 @@ fn test_aqe_large_small_join() {
     for row in &result {
         let count: i64 = row.get(1).expect("Failed to get count");
         assert!(
-            count >= 333 && count <= 334,
+            (333..=334).contains(&count),
             "Each status should have ~333-334 transactions"
         );
     }

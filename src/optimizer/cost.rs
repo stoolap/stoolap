@@ -2442,7 +2442,7 @@ mod tests {
 
         if let JoinAlgorithm::AntiJoin { selectivity, .. } = algorithm {
             // Selectivity should be between 0 and 1
-            assert!(selectivity >= 0.0 && selectivity <= 1.0);
+            assert!((0.0..=1.0).contains(&selectivity));
         } else {
             panic!("Expected AntiJoin algorithm");
         }
@@ -2565,7 +2565,7 @@ mod tests {
 
         // Should be close to the more selective predicate
         assert!(
-            combined >= 0.0005 && combined <= 0.005,
+            (0.0005..=0.005).contains(&combined),
             "FD: combined should be near zip selectivity, got {}",
             combined
         );

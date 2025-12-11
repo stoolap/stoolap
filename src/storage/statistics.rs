@@ -1349,7 +1349,7 @@ mod tests {
 
         // Full overlap should produce ~100 rows (1:1 join on primary key)
         assert!(
-            cardinality >= 50 && cardinality <= 200,
+            (50..=200).contains(&cardinality),
             "Expected ~100 rows for full overlap join, got {}",
             cardinality
         );
@@ -1413,7 +1413,7 @@ mod tests {
 
         // ~50% overlap should produce ~50 rows
         assert!(
-            cardinality >= 20 && cardinality <= 100,
+            (20..=100).contains(&cardinality),
             "Expected ~50 rows for 50% overlap join, got {}",
             cardinality
         );

@@ -100,7 +100,7 @@ fn test_collate_nocase() {
         let id: i64 = row.get(0).unwrap();
 
         // Should match Apple, apple, and APPLE (ids 1, 2, 3)
-        assert!(id >= 1 && id <= 3, "Unexpected id: {}", id);
+        assert!((1..=3).contains(&id), "Unexpected id: {}", id);
         count += 1;
     }
 
@@ -129,7 +129,7 @@ fn test_collate_noaccent() {
         let id: i64 = row.get(0).unwrap();
 
         // Should match Café, cafe, CAFE (ids 7, 8, 9)
-        assert!(id >= 7 && id <= 9, "Unexpected id: {}", id);
+        assert!((7..=9).contains(&id), "Unexpected id: {}", id);
         count += 1;
     }
 
@@ -156,7 +156,7 @@ fn test_collate_combined_nocase_noaccent() {
         let id: i64 = row.get(0).unwrap();
 
         // Should match Nação, nacao, NACAO (ids 10, 11, 12)
-        assert!(id >= 10 && id <= 12, "Unexpected id: {}", id);
+        assert!((10..=12).contains(&id), "Unexpected id: {}", id);
         count += 1;
     }
 

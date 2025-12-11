@@ -542,7 +542,7 @@ impl<V: Clone + Debug> Int64BTree<V> {
             self.size -= 1;
             // If root is empty and has a child, make it the new root
             if self.root.key_count == 0 && !self.root.is_leaf {
-                self.root = Box::new(self.root.children.remove(0));
+                *self.root = self.root.children.remove(0);
             }
         }
         deleted

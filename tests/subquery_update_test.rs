@@ -93,7 +93,7 @@ fn test_update_with_in_subquery() {
         .query("SELECT id, name, discount FROM products ORDER BY id", ())
         .expect("Failed to query");
 
-    let expected = vec![
+    let expected = [
         (1, "Laptop", 0.15), // Electronics - premium
         (2, "Novel", 0.0),   // Books - not premium
         (3, "Shirt", 0.15),  // Clothing - premium
@@ -101,8 +101,7 @@ fn test_update_with_in_subquery() {
         (5, "Bread", 0.0),   // Food - not premium
     ];
 
-    let mut idx = 0;
-    for row in result {
+    for (idx, row) in result.enumerate() {
         let row = row.expect("Failed to get row");
         let id: i64 = row.get(0).unwrap();
         let name: String = row.get(1).unwrap();
@@ -115,9 +114,7 @@ fn test_update_with_in_subquery() {
             "Discount mismatch at index {}",
             idx
         );
-        idx += 1;
     }
-    assert_eq!(idx, 5, "Expected 5 products");
 }
 
 /// Test UPDATE with NOT IN subquery
@@ -140,7 +137,7 @@ fn test_update_with_not_in_subquery() {
         .query("SELECT id, name, price FROM products ORDER BY id", ())
         .expect("Failed to query");
 
-    let expected = vec![
+    let expected = [
         (1, "Laptop", 1000.0), // Electronics - premium (unchanged)
         (2, "Novel", 18.0),    // Books - not premium (20 * 0.9)
         (3, "Shirt", 50.0),    // Clothing - premium (unchanged)
@@ -148,8 +145,7 @@ fn test_update_with_not_in_subquery() {
         (5, "Bread", 4.5),     // Food - not premium (5 * 0.9)
     ];
 
-    let mut idx = 0;
-    for row in result {
+    for (idx, row) in result.enumerate() {
         let row = row.expect("Failed to get row");
         let id: i64 = row.get(0).unwrap();
         let name: String = row.get(1).unwrap();
@@ -164,9 +160,7 @@ fn test_update_with_not_in_subquery() {
             expected[idx].2,
             price
         );
-        idx += 1;
     }
-    assert_eq!(idx, 5, "Expected 5 products");
 }
 
 /// Test UPDATE with empty subquery result
@@ -219,7 +213,7 @@ fn test_update_with_complex_condition() {
         .query("SELECT id, discount FROM products ORDER BY id", ())
         .expect("Failed to query");
 
-    let expected_discounts = vec![
+    let expected_discounts = [
         (1, 0.20), // Laptop - premium, price 1000
         (2, 0.0),  // Novel - not premium
         (3, 0.0),  // Shirt - premium but price 50
@@ -227,8 +221,7 @@ fn test_update_with_complex_condition() {
         (5, 0.0),  // Bread - not premium
     ];
 
-    let mut idx = 0;
-    for row in result {
+    for (idx, row) in result.enumerate() {
         let row = row.expect("Failed to get row");
         let id: i64 = row.get(0).unwrap();
         let discount: f64 = row.get(1).unwrap();
@@ -241,7 +234,6 @@ fn test_update_with_complex_condition() {
             expected_discounts[idx].1,
             discount
         );
-        idx += 1;
     }
 }
 

@@ -1,3 +1,17 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Regression tests for Bug Batch 6
 // Tests for bugs #37, #38, #39 discovered during exploratory testing
 
@@ -37,7 +51,7 @@ fn test_bugs6_line_comment_after_semicolon_piped() {
     // Execute statements one by one (simulating what stoolap CLI does)
     for stmt in sql.lines().filter(|l| !l.trim().is_empty()) {
         db.execute(stmt, ())
-            .expect(&format!("Failed to execute: {}", stmt));
+            .unwrap_or_else(|_| panic!("Failed to execute: {}", stmt));
     }
 
     // Verify all inserts worked

@@ -407,6 +407,144 @@ pub struct BloomFilterStats {
     pub is_effective: bool,
 }
 
+// =============================================================================
+// BLOOM FILTER EFFECTIVENESS TRACKING FOR ADAPTIVE OPTIMIZATION
+// =============================================================================
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+/// Global bloom filter effectiveness tracker
+static BLOOM_EFFECTIVENESS: OnceLock<BloomEffectivenessTracker> = OnceLock::new();
+
+/// Tracks bloom filter effectiveness for adaptive optimization
+///
+/// This aggregates statistics across all bloom filter operations to help
+/// tune future bloom filters (e.g., adjusting false positive rate).
+pub struct BloomEffectivenessTracker {
+    /// Total bloom filter checks performed
+    total_checks: AtomicU64,
+    /// Total true negatives (correctly filtered out)
+    true_negatives: AtomicU64,
+    /// Total false positives (passed filter but didn't match)
+    false_positives: AtomicU64,
+    /// Total true positives (passed filter and matched)
+    true_positives: AtomicU64,
+}
+
+impl BloomEffectivenessTracker {
+    /// Create new stats tracker
+    fn new() -> Self {
+        Self {
+            total_checks: AtomicU64::new(0),
+            true_negatives: AtomicU64::new(0),
+            false_positives: AtomicU64::new(0),
+            true_positives: AtomicU64::new(0),
+        }
+    }
+
+    /// Get the global instance
+    pub fn global() -> &'static Self {
+        BLOOM_EFFECTIVENESS.get_or_init(Self::new)
+    }
+
+    /// Record a bloom filter check with its outcome
+    pub fn record_check(&self, passed_filter: bool, actually_matched: bool) {
+        self.total_checks.fetch_add(1, Ordering::Relaxed);
+
+        if !passed_filter {
+            // Filter said "definitely not present" - true negative
+            self.true_negatives.fetch_add(1, Ordering::Relaxed);
+        } else if actually_matched {
+            // Filter said "maybe present" and it was - true positive
+            self.true_positives.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Filter said "maybe present" but it wasn't - false positive
+            self.false_positives.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a true negative (bloom filter correctly rejected)
+    pub fn record_true_negative(&self) {
+        self.total_checks.fetch_add(1, Ordering::Relaxed);
+        self.true_negatives.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a bloom filter check that passed (may be true or false positive)
+    pub fn record_filter_passed(&self) {
+        self.total_checks.fetch_add(1, Ordering::Relaxed);
+        // We'll assume true positive - false positives are harder to track
+        // without expensive secondary verification
+        self.true_positives.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get the true negative rate (filter effectiveness)
+    pub fn true_negative_rate(&self) -> f64 {
+        let total = self.total_checks.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        let tn = self.true_negatives.load(Ordering::Relaxed);
+        tn as f64 / total as f64
+    }
+
+    /// Get the estimated false positive rate
+    pub fn estimated_false_positive_rate(&self) -> f64 {
+        let passed = self.false_positives.load(Ordering::Relaxed)
+            + self.true_positives.load(Ordering::Relaxed);
+        if passed == 0 {
+            return 0.0;
+        }
+        let fp = self.false_positives.load(Ordering::Relaxed);
+        fp as f64 / passed as f64
+    }
+
+    /// Get total number of checks
+    pub fn total_checks(&self) -> u64 {
+        self.total_checks.load(Ordering::Relaxed)
+    }
+
+    /// Get total true negatives
+    pub fn true_negatives(&self) -> u64 {
+        self.true_negatives.load(Ordering::Relaxed)
+    }
+
+    /// Recommend optimal false positive rate based on observed statistics
+    ///
+    /// Returns a suggested FP rate for new bloom filters based on:
+    /// - If true negative rate is high (> 50%), bloom filters are effective
+    /// - If true negative rate is low, we might want smaller filters or skip them
+    pub fn recommend_false_positive_rate(&self) -> f64 {
+        let tn_rate = self.true_negative_rate();
+        let total = self.total_checks.load(Ordering::Relaxed);
+
+        // Need sufficient samples to make a recommendation
+        if total < 1000 {
+            return 0.01; // Default 1%
+        }
+
+        if tn_rate > 0.7 {
+            // Bloom filters are very effective - can use tighter FP rate
+            0.005 // 0.5%
+        } else if tn_rate > 0.3 {
+            // Moderate effectiveness - default rate
+            0.01 // 1%
+        } else {
+            // Low effectiveness - use higher FP rate (smaller filter)
+            // or consider skipping bloom filters entirely
+            0.05 // 5%
+        }
+    }
+
+    /// Reset all statistics
+    pub fn reset(&self) {
+        self.total_checks.store(0, Ordering::Relaxed);
+        self.true_negatives.store(0, Ordering::Relaxed);
+        self.false_positives.store(0, Ordering::Relaxed);
+        self.true_positives.store(0, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,143 +729,5 @@ mod tests {
             source_table: "table".to_string(),
         };
         assert!(!runtime.is_effective());
-    }
-}
-
-// =============================================================================
-// BLOOM FILTER EFFECTIVENESS TRACKING FOR ADAPTIVE OPTIMIZATION
-// =============================================================================
-
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
-
-/// Global bloom filter effectiveness tracker
-static BLOOM_EFFECTIVENESS: OnceLock<BloomEffectivenessTracker> = OnceLock::new();
-
-/// Tracks bloom filter effectiveness for adaptive optimization
-///
-/// This aggregates statistics across all bloom filter operations to help
-/// tune future bloom filters (e.g., adjusting false positive rate).
-pub struct BloomEffectivenessTracker {
-    /// Total bloom filter checks performed
-    total_checks: AtomicU64,
-    /// Total true negatives (correctly filtered out)
-    true_negatives: AtomicU64,
-    /// Total false positives (passed filter but didn't match)
-    false_positives: AtomicU64,
-    /// Total true positives (passed filter and matched)
-    true_positives: AtomicU64,
-}
-
-impl BloomEffectivenessTracker {
-    /// Create new stats tracker
-    fn new() -> Self {
-        Self {
-            total_checks: AtomicU64::new(0),
-            true_negatives: AtomicU64::new(0),
-            false_positives: AtomicU64::new(0),
-            true_positives: AtomicU64::new(0),
-        }
-    }
-
-    /// Get the global instance
-    pub fn global() -> &'static Self {
-        BLOOM_EFFECTIVENESS.get_or_init(Self::new)
-    }
-
-    /// Record a bloom filter check with its outcome
-    pub fn record_check(&self, passed_filter: bool, actually_matched: bool) {
-        self.total_checks.fetch_add(1, Ordering::Relaxed);
-
-        if !passed_filter {
-            // Filter said "definitely not present" - true negative
-            self.true_negatives.fetch_add(1, Ordering::Relaxed);
-        } else if actually_matched {
-            // Filter said "maybe present" and it was - true positive
-            self.true_positives.fetch_add(1, Ordering::Relaxed);
-        } else {
-            // Filter said "maybe present" but it wasn't - false positive
-            self.false_positives.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Record a true negative (bloom filter correctly rejected)
-    pub fn record_true_negative(&self) {
-        self.total_checks.fetch_add(1, Ordering::Relaxed);
-        self.true_negatives.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record a bloom filter check that passed (may be true or false positive)
-    pub fn record_filter_passed(&self) {
-        self.total_checks.fetch_add(1, Ordering::Relaxed);
-        // We'll assume true positive - false positives are harder to track
-        // without expensive secondary verification
-        self.true_positives.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Get the true negative rate (filter effectiveness)
-    pub fn true_negative_rate(&self) -> f64 {
-        let total = self.total_checks.load(Ordering::Relaxed);
-        if total == 0 {
-            return 0.0;
-        }
-        let tn = self.true_negatives.load(Ordering::Relaxed);
-        tn as f64 / total as f64
-    }
-
-    /// Get the estimated false positive rate
-    pub fn estimated_false_positive_rate(&self) -> f64 {
-        let passed = self.false_positives.load(Ordering::Relaxed)
-            + self.true_positives.load(Ordering::Relaxed);
-        if passed == 0 {
-            return 0.0;
-        }
-        let fp = self.false_positives.load(Ordering::Relaxed);
-        fp as f64 / passed as f64
-    }
-
-    /// Get total number of checks
-    pub fn total_checks(&self) -> u64 {
-        self.total_checks.load(Ordering::Relaxed)
-    }
-
-    /// Get total true negatives
-    pub fn true_negatives(&self) -> u64 {
-        self.true_negatives.load(Ordering::Relaxed)
-    }
-
-    /// Recommend optimal false positive rate based on observed statistics
-    ///
-    /// Returns a suggested FP rate for new bloom filters based on:
-    /// - If true negative rate is high (> 50%), bloom filters are effective
-    /// - If true negative rate is low, we might want smaller filters or skip them
-    pub fn recommend_false_positive_rate(&self) -> f64 {
-        let tn_rate = self.true_negative_rate();
-        let total = self.total_checks.load(Ordering::Relaxed);
-
-        // Need sufficient samples to make a recommendation
-        if total < 1000 {
-            return 0.01; // Default 1%
-        }
-
-        if tn_rate > 0.7 {
-            // Bloom filters are very effective - can use tighter FP rate
-            0.005 // 0.5%
-        } else if tn_rate > 0.3 {
-            // Moderate effectiveness - default rate
-            0.01 // 1%
-        } else {
-            // Low effectiveness - use higher FP rate (smaller filter)
-            // or consider skipping bloom filters entirely
-            0.05 // 5%
-        }
-    }
-
-    /// Reset all statistics
-    pub fn reset(&self) {
-        self.total_checks.store(0, Ordering::Relaxed);
-        self.true_negatives.store(0, Ordering::Relaxed);
-        self.false_positives.store(0, Ordering::Relaxed);
-        self.true_positives.store(0, Ordering::Relaxed);
     }
 }

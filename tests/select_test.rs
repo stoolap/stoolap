@@ -376,7 +376,7 @@ fn test_select_limit() {
             .expect("Failed to insert");
     }
 
-    let count: i64 = db
+    let _count: i64 = db
         .query_one(
             "SELECT COUNT(*) FROM (SELECT * FROM limit_test LIMIT 5)",
             (),

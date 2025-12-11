@@ -860,7 +860,7 @@ fn test_default_values() {
     assert_eq!(rows_data[0].2, "No description");
     assert_eq!(rows_data[0].3, 0.0);
     assert_eq!(rows_data[0].4, 1);
-    assert_eq!(rows_data[0].5, true);
+    assert!(rows_data[0].5);
 
     // Row 2: some defaults
     assert_eq!(rows_data[1].0, 2);
@@ -868,7 +868,7 @@ fn test_default_values() {
     assert_eq!(rows_data[1].2, "No description");
     assert_eq!(rows_data[1].3, 29.99);
     assert_eq!(rows_data[1].4, 5);
-    assert_eq!(rows_data[1].5, true);
+    assert!(rows_data[1].5);
 
     // Row 3: no defaults
     assert_eq!(rows_data[2].0, 3);
@@ -876,7 +876,7 @@ fn test_default_values() {
     assert_eq!(rows_data[2].2, "A useful thing");
     assert_eq!(rows_data[2].3, 19.99);
     assert_eq!(rows_data[2].4, 10);
-    assert_eq!(rows_data[2].5, false);
+    assert!(!rows_data[2].5);
 }
 
 /// Test CHECK constraints in CREATE TABLE

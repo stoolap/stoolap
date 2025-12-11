@@ -205,7 +205,7 @@ fn test_integer_values() {
             "INSERT INTO int_test (id, value) VALUES (?, ?)",
             (i as i64 + 1, value),
         )
-        .expect(&format!("Failed to insert value {}", value));
+        .unwrap_or_else(|_| panic!("Failed to insert value {}", value));
     }
 
     // Verify all values
@@ -249,7 +249,7 @@ fn test_float_values() {
             "INSERT INTO float_test (id, value) VALUES (?, ?)",
             (i as i64 + 1, value),
         )
-        .expect(&format!("Failed to insert value {}", value));
+        .unwrap_or_else(|_| panic!("Failed to insert value {}", value));
     }
 
     // Verify all values
@@ -337,7 +337,7 @@ fn test_text_values() {
             "INSERT INTO text_test (id, value) VALUES (?, ?)",
             (i as i64 + 1, *value),
         )
-        .expect(&format!("Failed to insert value '{}'", value));
+        .unwrap_or_else(|_| panic!("Failed to insert value '{}'", value));
     }
 
     // Verify count
@@ -413,7 +413,7 @@ fn test_json_values() {
             "INSERT INTO json_test (id, value) VALUES (?, ?)",
             (i as i64 + 1, *value),
         )
-        .expect(&format!("Failed to insert JSON: {}", value));
+        .unwrap_or_else(|_| panic!("Failed to insert JSON: {}", value));
     }
 
     // Verify count

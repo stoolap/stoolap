@@ -109,7 +109,7 @@ fn test_nocase_collation() {
         let row = row.expect("Failed to get row");
         let id: i64 = row.get(0).unwrap();
         // Should match Apple, apple, APPLE (ids 1, 2, 3)
-        assert!(id >= 1 && id <= 3, "Unexpected id: {}", id);
+        assert!((1..=3).contains(&id), "Unexpected id: {}", id);
         count += 1;
     }
     assert_eq!(count, 3, "Expected 3 rows from NOCASE collation");
@@ -153,7 +153,7 @@ fn test_noaccent_collation() {
     for row in result {
         let row = row.expect("Failed to get row");
         let id: i64 = row.get(0).unwrap();
-        assert!(id >= 1 && id <= 3, "Unexpected id: {}", id);
+        assert!((1..=3).contains(&id), "Unexpected id: {}", id);
         count += 1;
     }
     assert_eq!(count, 3, "Expected 3 rows from NOACCENT collation");

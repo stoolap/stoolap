@@ -1476,7 +1476,7 @@ mod tests {
     fn test_typeof_float() {
         let f = TypeOfFunction;
         assert_eq!(
-            f.evaluate(&[Value::Float(3.14)]).unwrap(),
+            f.evaluate(&[Value::Float(3.5)]).unwrap(),
             Value::text("FLOAT")
         );
     }

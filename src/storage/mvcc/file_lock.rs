@@ -207,8 +207,13 @@ mod tests {
         assert!(db_path.join("db.lock").exists());
 
         // Lock file should contain our PID
-        let contents = fs::read_to_string(db_path.join("db.lock")).unwrap();
-        assert_eq!(contents, std::process::id().to_string());
+        // Note: On Windows, we can't read the file while it's exclusively locked,
+        // so we only verify the contents on Unix systems
+        #[cfg(unix)]
+        {
+            let contents = fs::read_to_string(db_path.join("db.lock")).unwrap();
+            assert_eq!(contents, std::process::id().to_string());
+        }
 
         drop(lock);
     }

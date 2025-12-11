@@ -547,7 +547,7 @@ mod tests {
 
         let optimal = calibrator.calculate_optimal_size();
         // Should be around 1024 (next power of 2 after ~1000)
-        assert!(optimal >= 1024 && optimal <= 2048);
+        assert!((1024..=2048).contains(&optimal));
     }
 
     #[test]

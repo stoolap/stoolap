@@ -2692,7 +2692,7 @@ mod tests {
         assert_eq!(loaded.wal_file, "wal-test.log");
         assert_eq!(loaded.previous_wal_file, Some("wal-prev.log".to_string()));
         assert_eq!(loaded.lsn, 12345);
-        assert_eq!(loaded.is_consistent, true);
+        assert!(loaded.is_consistent);
         assert_eq!(loaded.active_transactions, vec![1, 2, 3]);
         assert_eq!(loaded.committed_transactions.len(), 2);
         assert_eq!(loaded.committed_transactions[0].txn_id, 10);
@@ -2723,7 +2723,7 @@ mod tests {
         assert_eq!(loaded.wal_file, "wal-current.log");
         assert_eq!(loaded.previous_wal_file, None);
         assert_eq!(loaded.lsn, 999);
-        assert_eq!(loaded.is_consistent, false);
+        assert!(!loaded.is_consistent);
         assert!(loaded.active_transactions.is_empty());
         assert!(loaded.committed_transactions.is_empty());
     }

@@ -135,7 +135,7 @@ fn test_ntile_function() {
 
         // NTILE(3) should return values 1, 2, or 3
         assert!(
-            ntile_val >= 1 && ntile_val <= 3,
+            (1..=3).contains(&ntile_val),
             "NTILE(3) should return 1, 2, or 3, got {}",
             ntile_val
         );

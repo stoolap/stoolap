@@ -699,7 +699,7 @@ fn test_parallel_order_by_sql() {
 
     // ORDER BY should use parallel sort for large dataset
     let start = Instant::now();
-    let mut rows = db
+    let rows = db
         .query(
             "SELECT id, value FROM sort_test ORDER BY value ASC LIMIT 10",
             (),
@@ -707,7 +707,7 @@ fn test_parallel_order_by_sql() {
         .unwrap();
 
     let mut results = Vec::new();
-    while let Some(row) = rows.next() {
+    for row in rows {
         let row = row.unwrap();
         let value: i64 = row.get(1).unwrap();
         results.push(value);
@@ -766,11 +766,11 @@ fn test_parallel_distinct_sql() {
 
     // Also test SELECT DISTINCT
     let start = Instant::now();
-    let mut rows = db
+    let rows = db
         .query("SELECT DISTINCT category FROM distinct_test", ())
         .unwrap();
     let mut distinct_values = Vec::new();
-    while let Some(row) = rows.next() {
+    for row in rows {
         let row = row.unwrap();
         let cat: String = row.get(0).unwrap();
         distinct_values.push(cat);

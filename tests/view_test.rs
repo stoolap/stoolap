@@ -658,7 +658,7 @@ fn test_view_depth_limit() {
     for i in 1..35 {
         let sql = format!("CREATE VIEW v{} AS SELECT * FROM v{}", i, i - 1);
         db.execute(&sql, ())
-            .expect(&format!("Failed to create v{}", i));
+            .unwrap_or_else(|_| panic!("Failed to create v{}", i));
     }
 
     // Querying v34 should fail due to depth limit

@@ -1329,7 +1329,7 @@ mod tests {
         let entries = index.find(&[Value::Integer(3)]).unwrap();
         // Due to how BTreeMap works with Ord, Integer(3) and Float(3.0) are Equal
         // so they should be in the same entry
-        assert!(entries.len() >= 1); // At least row 3
+        assert!(!entries.is_empty()); // At least row 3
     }
 
     #[test]

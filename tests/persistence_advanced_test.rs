@@ -1276,7 +1276,7 @@ fn test_data_type_persistence() {
         // Insert row with all data types
         db.execute(
             "INSERT INTO all_types (id, int_val, float_val, text_val, bool_val, timestamp_val, date_val, time_val, json_val)
-             VALUES (1, 42, 3.14159, 'hello world', true, '2025-04-25 14:30:00', '2025-04-25', '14:30:00', '{\"key\": \"value\"}')",
+             VALUES (1, 42, 3.5, 'hello world', true, '2025-04-25 14:30:00', '2025-04-25', '14:30:00', '{\"key\": \"value\"}')",
             (),
         )
         .unwrap();
@@ -1321,7 +1321,7 @@ fn test_data_type_persistence() {
             .query_one("SELECT float_val FROM all_types WHERE id = 1", ())
             .unwrap();
         assert!(
-            (float_val - 3.14159).abs() < 0.00001,
+            (float_val - 3.5).abs() < 0.00001,
             "Float value mismatch: {}",
             float_val
         );

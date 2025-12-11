@@ -740,7 +740,7 @@ mod tests {
 
     fn make_int_lit(value: i64) -> Expression {
         Expression::IntegerLiteral(IntegerLiteral {
-            token: Token::new(TokenType::Integer, &value.to_string(), Position::default()),
+            token: Token::new(TokenType::Integer, value.to_string(), Position::default()),
             value,
         })
     }

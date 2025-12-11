@@ -480,7 +480,7 @@ mod tests {
                 i,
                 &[
                     ("id".to_string(), Value::Integer(i as i64)),
-                    ("name".to_string(), Value::text(&format!("row{}", i))),
+                    ("name".to_string(), Value::text(format!("row{}", i))),
                 ],
             );
         }

@@ -205,7 +205,7 @@ fn test_not_between() {
         let row = row.expect("Failed to get row");
         let price: f64 = row.get(3).unwrap();
         assert!(
-            price < 50.0 || price > 200.0,
+            !(50.0..=200.0).contains(&price),
             "Price should be < 50 or > 200: {}",
             price
         );

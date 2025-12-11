@@ -186,7 +186,7 @@ fn test_query_with_range_filter() {
         let id: i64 = row.get(0).unwrap();
         let value: f64 = row.get(1).unwrap();
         assert!(
-            value >= 30.0 && value <= 70.0,
+            (30.0..=70.0).contains(&value),
             "Value {} should be in range [30, 70]",
             value
         );
@@ -220,7 +220,7 @@ fn test_query_with_string_range_filter() {
         let row = row.expect("Failed to get row");
         let category: String = row.get(1).unwrap();
         assert!(
-            category >= "B".to_string() && category <= "C".to_string(),
+            category.as_str() >= "B" && category.as_str() <= "C",
             "Category {} should be in range ['B', 'C']",
             category
         );
