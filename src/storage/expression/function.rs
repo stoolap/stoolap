@@ -132,6 +132,26 @@ impl FunctionExpr {
         Self::new(function, arguments, Operator::Eq, Value::Boolean(true))
     }
 
+    /// Get the function name
+    pub fn function_name(&self) -> &str {
+        self.function.name()
+    }
+
+    /// Get the arguments
+    pub fn get_arguments(&self) -> &[FunctionArg] {
+        &self.arguments
+    }
+
+    /// Get the operator
+    pub fn get_operator(&self) -> Operator {
+        self.operator
+    }
+
+    /// Get the compare value
+    pub fn get_compare_value(&self) -> &Value {
+        &self.compare_value
+    }
+
     /// Evaluate a function argument to get its value
     #[allow(clippy::only_used_in_recursion)]
     fn evaluate_arg(

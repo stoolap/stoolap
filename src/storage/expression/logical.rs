@@ -15,6 +15,7 @@
 //! Logical expressions (AND, OR, NOT) for Stoolap
 //!
 
+use std::any::Any;
 use std::collections::HashMap;
 
 use super::Expression;
@@ -111,6 +112,10 @@ impl Expression for AndExpr {
 
     fn clone_box(&self) -> Box<dyn Expression> {
         Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -209,6 +214,10 @@ impl Expression for OrExpr {
     fn clone_box(&self) -> Box<dyn Expression> {
         Box::new(self.clone())
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// NOT expression - negates the result of the inner expression
@@ -234,6 +243,11 @@ impl NotExpr {
     /// Create a NOT expression (convenience)
     pub fn not(expr: Box<dyn Expression>) -> Self {
         Self::new(expr)
+    }
+
+    /// Get the inner expression (for expression compilation)
+    pub fn get_inner(&self) -> Option<&dyn Expression> {
+        Some(self.inner.as_ref())
     }
 }
 
@@ -280,6 +294,10 @@ impl Expression for NotExpr {
         // NOT(UNKNOWN) = UNKNOWN, so propagate from inner expression
         self.inner.is_unknown_due_to_null(row)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// Constant boolean expression - always returns true or false
@@ -306,6 +324,11 @@ impl ConstBoolExpr {
     pub fn false_expr() -> Self {
         Self::new(false)
     }
+
+    /// Get the constant boolean value (for expression compilation)
+    pub fn value(&self) -> bool {
+        self.value
+    }
 }
 
 impl Expression for ConstBoolExpr {
@@ -331,6 +354,10 @@ impl Expression for ConstBoolExpr {
 
     fn clone_box(&self) -> Box<dyn Expression> {
         Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

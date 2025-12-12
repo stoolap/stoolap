@@ -31,6 +31,7 @@
 pub mod between;
 pub mod cast;
 pub mod comparison;
+pub mod compiled;
 pub mod function;
 pub mod in_list;
 pub mod like;
@@ -48,6 +49,7 @@ use crate::core::{Operator, Result, Row, Schema, Value};
 pub use between::BetweenExpr;
 pub use cast::{CastExpr, CompoundExpr};
 pub use comparison::ComparisonExpr;
+pub use compiled::{CompiledFilter, CompiledPattern};
 pub use function::{EvalExpr, FunctionArg, FunctionExpr};
 pub use in_list::InListExpr;
 pub use like::LikeExpr;

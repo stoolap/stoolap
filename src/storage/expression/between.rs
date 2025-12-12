@@ -15,6 +15,7 @@
 //! BETWEEN expression for Stoolap
 //!
 
+use std::any::Any;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
@@ -99,6 +100,16 @@ impl BetweenExpr {
     /// Check if inclusive
     pub fn is_inclusive(&self) -> bool {
         self.inclusive
+    }
+
+    /// Get the bounds (for expression compilation)
+    pub fn get_bounds(&self) -> (&Value, &Value) {
+        (&self.lower_bound, &self.upper_bound)
+    }
+
+    /// Check if this is a NOT BETWEEN expression
+    pub fn is_negated(&self) -> bool {
+        self.not
     }
 
     /// Compare integers with bounds
@@ -314,6 +325,10 @@ impl Expression for BetweenExpr {
 
     fn clone_box(&self) -> Box<dyn Expression> {
         Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

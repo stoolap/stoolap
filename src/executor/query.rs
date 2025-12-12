@@ -111,6 +111,55 @@ impl ColumnKeyMapping {
     }
 }
 
+/// Check if an expression contains any Parameter nodes ($1, $2, etc.)
+/// Parameterized queries cannot be semantically cached because the cache
+/// stores results tied to specific parameter values, but the AST only
+/// contains parameter indices, not values.
+fn expression_has_parameters(expr: &Expression) -> bool {
+    match expr {
+        Expression::Parameter(_) => true,
+        Expression::Prefix(prefix) => expression_has_parameters(&prefix.right),
+        Expression::Infix(infix) => {
+            expression_has_parameters(&infix.left) || expression_has_parameters(&infix.right)
+        }
+        Expression::In(in_expr) => {
+            expression_has_parameters(&in_expr.left)
+                || match in_expr.right.as_ref() {
+                    Expression::List(list) => list.elements.iter().any(expression_has_parameters),
+                    Expression::ExpressionList(list) => {
+                        list.expressions.iter().any(expression_has_parameters)
+                    }
+                    other => expression_has_parameters(other),
+                }
+        }
+        Expression::Between(between) => {
+            expression_has_parameters(&between.expr)
+                || expression_has_parameters(&between.lower)
+                || expression_has_parameters(&between.upper)
+        }
+        Expression::Like(like) => {
+            expression_has_parameters(&like.left) || expression_has_parameters(&like.pattern)
+        }
+        Expression::Case(case) => {
+            case.value
+                .as_ref()
+                .is_some_and(|e| expression_has_parameters(e))
+                || case.when_clauses.iter().any(|wc| {
+                    expression_has_parameters(&wc.condition)
+                        || expression_has_parameters(&wc.then_result)
+                })
+                || case
+                    .else_value
+                    .as_ref()
+                    .is_some_and(|e| expression_has_parameters(e))
+        }
+        Expression::FunctionCall(func) => func.arguments.iter().any(expression_has_parameters),
+        Expression::Aliased(aliased) => expression_has_parameters(&aliased.expression),
+        Expression::Cast(cast) => expression_has_parameters(&cast.expr),
+        _ => false,
+    }
+}
+
 impl Executor {
     /// Execute a SELECT statement
     pub(crate) fn execute_select(
@@ -1136,6 +1185,17 @@ impl Executor {
             || !stmt.group_by.columns.is_empty();
         let has_subqueries_in_where = where_to_use.is_some_and(Self::has_subqueries);
 
+        // CRITICAL: Check if WHERE clause contains parameters ($1, $2, etc.)
+        // Parameterized queries CANNOT be cached because:
+        // 1. The cache stores results tied to specific parameter values
+        // 2. But the AST only has parameter indices ($1), not actual values
+        // 3. A cache "hit" would return wrong results for different parameter values
+        // This was causing 100x slowdown for SELECT by ID queries due to:
+        // - Cache misses on every lookup (unique predicates)
+        // - Streaming disabled for cache-eligible queries
+        // - Cache insertions (write locks) on every query execution
+        let has_parameters_in_where = where_to_use.is_some_and(expression_has_parameters);
+
         // Cache eligibility: We cache SELECT * queries because:
         // 1. The cache stores full table rows with their original column layout
         // 2. Subsumption detection works on full rows for filtering
@@ -1149,6 +1209,7 @@ impl Executor {
             && !has_aggregation_window_grouping
             && !has_outer_context
             && !has_subqueries_in_where
+            && !has_parameters_in_where // Parameters can't be cached (values not in AST)
             && stmt.order_by.is_empty()
             && !stmt.distinct
             && stmt.limit.is_none()
@@ -1355,9 +1416,14 @@ impl Executor {
         // For cache-eligible queries, we disable streaming ONLY if the table is small
         // enough to potentially benefit from caching. Large tables (>100K rows) would
         // exceed the cache limit anyway, so we allow streaming for them.
-        let table_row_count = table.row_count();
-        let should_disable_streaming_for_cache =
-            cache_eligible && table_row_count <= super::semantic_cache::DEFAULT_MAX_CACHED_ROWS;
+        //
+        // CRITICAL OPTIMIZATION: Only call row_count() when cache_eligible is true.
+        // row_count() is O(n) and was causing 100x slowdown for parameterized queries
+        // that don't even use the cache.
+        let should_disable_streaming_for_cache = cache_eligible && {
+            let table_row_count = table.row_count();
+            table_row_count <= super::semantic_cache::DEFAULT_MAX_CACHED_ROWS
+        };
 
         let can_use_streaming = stmt.order_by.is_empty()
             && stmt.group_by.columns.is_empty()
@@ -1457,26 +1523,44 @@ impl Executor {
             // Cache this result to avoid redundant traversal of the expression tree
             let has_subqueries = where_to_use.is_some_and(Self::has_subqueries);
 
-            // Prepare evaluator once for all rows (optimization)
-            // For correlated subqueries, don't pre-process - we'll process per-row
-            let processed_where = if let Some(where_expr) = where_to_use {
-                if has_correlated {
-                    // Keep original expression for correlated subqueries
-                    Some(where_expr.clone())
-                } else if has_subqueries {
-                    // Pre-process uncorrelated subqueries once (reuse cached has_subqueries)
-                    Some(self.process_where_subqueries(where_expr, ctx)?)
+            // SEMI-JOIN OPTIMIZATION: Try to optimize correlated EXISTS subqueries
+            // This transforms EXISTS (SELECT ... WHERE outer.col = inner.col AND ...)
+            // into: outer.col IN (SELECT DISTINCT inner_col FROM inner WHERE ...)
+            // This changes O(outer × inner) to O(inner + outer) - massive performance win!
+            let (processed_where, has_correlated) = if has_correlated {
+                if let Some(where_expr) = where_to_use {
+                    // Get outer table names for semi-join detection
+                    let outer_tables = Self::collect_outer_table_names(&stmt.table_expr);
+
+                    // Try semi-join optimization
+                    if let Ok(Some(optimized)) =
+                        self.try_optimize_exists_to_semi_join(where_expr, ctx, &outer_tables)
+                    {
+                        // Successfully transformed EXISTS to IN - no longer correlated!
+                        // The optimized expression uses a hash set lookup instead of per-row subquery
+                        (Some(optimized), false)
+                    } else {
+                        // Couldn't optimize - keep original for per-row processing
+                        (Some(where_expr.clone()), true)
+                    }
                 } else {
-                    Some(where_expr.clone())
+                    (None, false)
+                }
+            } else if let Some(where_expr) = where_to_use {
+                if has_subqueries {
+                    // Pre-process uncorrelated subqueries once
+                    (Some(self.process_where_subqueries(where_expr, ctx)?), false)
+                } else {
+                    (Some(where_expr.clone()), false)
                 }
             } else {
-                None
+                (None, false)
             };
 
             // Check if we can use the PARALLEL PATH:
             // For simple WHERE without subqueries, collect all rows first
             // then filter in parallel. This is much faster for large tables.
-            let use_parallel_path = !has_correlated && !has_subqueries && processed_where.is_some();
+            let use_parallel_path = !has_correlated && processed_where.is_some();
 
             if use_parallel_path {
                 let where_expr = processed_where.as_ref().unwrap();
@@ -1591,7 +1675,7 @@ impl Executor {
 
                             // Create context with outer row (cheap due to Arc)
                             // SAFETY: all_columns_arc is always Some when has_correlated is true
-                            let correlated_ctx = ctx.with_outer_row(
+                            let mut correlated_ctx = ctx.with_outer_row(
                                 std::mem::take(&mut outer_row_map),
                                 all_columns_arc.clone().unwrap(), // Arc clone = cheap
                             );
@@ -1600,17 +1684,16 @@ impl Executor {
                             let processed =
                                 self.process_correlated_where(where_expr, &correlated_ctx)?;
 
-                            // OPTIMIZATION: Reuse outer evaluator, just update outer_row
-                            evaluator.set_outer_row(correlated_ctx.outer_row());
+                            // OPTIMIZATION: Take ownership instead of cloning - avoids HashMap clone
+                            evaluator.set_outer_row_owned(
+                                correlated_ctx.outer_row.take().unwrap_or_default(),
+                            );
                             evaluator.set_row_array(&row);
 
                             let result = evaluator.evaluate_bool(&processed)?;
 
-                            // Take back the map for reuse
-                            outer_row_map = correlated_ctx.outer_row.unwrap_or_default();
-
-                            // Clear outer row from evaluator for next iteration
-                            evaluator.clear_outer_row();
+                            // Take back the map from evaluator for reuse (zero-copy transfer)
+                            outer_row_map = evaluator.take_outer_row();
 
                             if !result {
                                 continue;
@@ -5477,7 +5560,7 @@ impl Executor {
     /// Extract equality join keys and residual conditions
     /// Returns (left_indices, right_indices, residual_conditions) where residual
     /// contains non-equality conditions that must be applied after the hash join
-    fn extract_join_keys_and_residual(
+    pub(crate) fn extract_join_keys_and_residual(
         condition: &Expression,
         left_columns: &[String],
         right_columns: &[String],
@@ -5607,7 +5690,7 @@ impl Executor {
     /// For OUTER JOINs, we need special handling: rows with NULLs from the
     /// padded side should be preserved even if residual conditions fail.
     #[allow(clippy::too_many_arguments)]
-    fn apply_residual_conditions(
+    pub(crate) fn apply_residual_conditions(
         &self,
         rows: &mut Vec<Row>,
         residual: &[Expression],
@@ -5667,7 +5750,7 @@ impl Executor {
     ///
     /// Uses parallel execution when either side has >= 5000 rows.
     #[allow(clippy::too_many_arguments)]
-    fn execute_hash_join(
+    pub(crate) fn execute_hash_join(
         &self,
         left_rows: &[Row],
         right_rows: &[Row],

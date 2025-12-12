@@ -16,7 +16,9 @@
 //!
 //! This module defines the token types used by the SQL lexer and parser.
 
+use rustc_hash::FxHashSet;
 use std::fmt;
+use std::sync::LazyLock;
 
 /// Position represents a position in the input source
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -360,10 +362,40 @@ pub static KEYWORDS: &[&str] = &[
     "ONLY",
 ];
 
+/// Compiled keyword set for O(1) lookups
+/// Uses FxHashSet for fast hashing of short strings
+static KEYWORD_SET: LazyLock<FxHashSet<&'static str>> = LazyLock::new(|| {
+    let mut set = FxHashSet::with_capacity_and_hasher(KEYWORDS.len(), Default::default());
+    for kw in KEYWORDS {
+        set.insert(*kw);
+    }
+    set
+});
+
 /// Check if a string is an SQL keyword (case-insensitive)
+/// Uses a compiled HashSet for O(1) lookups instead of O(n) linear search
+#[inline]
 pub fn is_keyword(s: &str) -> bool {
-    let upper = s.to_uppercase();
-    KEYWORDS.iter().any(|&kw| kw == upper)
+    // Fast path: check if already uppercase and in set
+    if KEYWORD_SET.contains(s) {
+        return true;
+    }
+    // Slow path: uppercase and check (only for non-uppercase input)
+    // Use a stack buffer for small strings to avoid allocation
+    if s.len() <= 32 {
+        let mut buf = [0u8; 32];
+        let bytes = s.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            buf[i] = b.to_ascii_uppercase();
+        }
+        // SAFETY: We only uppercased ASCII bytes, result is valid UTF-8
+        let upper = unsafe { std::str::from_utf8_unchecked(&buf[..s.len()]) };
+        KEYWORD_SET.contains(upper)
+    } else {
+        // Very long identifiers (rare) - fall back to allocation
+        let upper = s.to_uppercase();
+        KEYWORD_SET.contains(upper.as_str())
+    }
 }
 
 /// SQL operators
@@ -377,9 +409,19 @@ pub static OPERATORS: &[&str] = &[
     "&", "|", "^", "~", "<<", ">>", // Bitwise operators
 ];
 
+/// Compiled operator set for O(1) lookups
+static OPERATOR_SET: LazyLock<FxHashSet<&'static str>> = LazyLock::new(|| {
+    let mut set = FxHashSet::with_capacity_and_hasher(OPERATORS.len(), Default::default());
+    for op in OPERATORS {
+        set.insert(*op);
+    }
+    set
+});
+
 /// Check if a string is an SQL operator
+#[inline]
 pub fn is_operator(s: &str) -> bool {
-    OPERATORS.contains(&s)
+    OPERATOR_SET.contains(s)
 }
 
 /// SQL punctuators

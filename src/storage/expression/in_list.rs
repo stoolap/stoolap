@@ -21,6 +21,7 @@
 //! we pre-compute HashSets at prepare time for O(1) lookup.
 //! This is the same optimization PostgreSQL uses for "hashed IN lists".
 
+use std::any::Any;
 use std::collections::HashMap;
 
 use rustc_hash::FxHashSet;
@@ -112,6 +113,11 @@ impl InListExpr {
 
     /// Get the values
     pub fn values(&self) -> &[Value] {
+        &self.values
+    }
+
+    /// Get the values (alias for values(), for expression compilation)
+    pub fn get_values(&self) -> &[Value] {
         &self.values
     }
 
@@ -403,6 +409,10 @@ impl Expression for InListExpr {
 
     fn clone_box(&self) -> Box<dyn Expression> {
         Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

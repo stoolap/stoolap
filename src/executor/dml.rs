@@ -598,6 +598,20 @@ impl Executor {
             let all_col_indices: Vec<usize> = (0..column_names_vec.len()).collect();
             let column_names_arc = Arc::new(column_names_vec.clone());
 
+            // OPTIMIZATION: Pre-compute lowercase and qualified column names once
+            let col_name_pairs: Vec<(String, String)> = column_names_vec
+                .iter()
+                .map(|col_name| {
+                    let col_lower = col_name.to_lowercase();
+                    let qualified = format!("{}.{}", table_name, col_lower);
+                    (col_lower, qualified)
+                })
+                .collect();
+
+            // Reusable outer_row_map - cleared and reused each iteration
+            let mut outer_row_map: FxHashMap<String, Value> =
+                FxHashMap::with_capacity_and_hasher(col_name_pairs.len() * 2, Default::default());
+
             // Scan all rows (WHERE filtering happens in the setter)
             let mut scanner = table.scan(&all_col_indices, None)?;
             while scanner.next() {
@@ -617,23 +631,19 @@ impl Executor {
                 // Get PK value for this row
                 let pk_value = row.get(pk_idx).cloned().unwrap_or(Value::null_unknown());
 
-                // Build outer row context from current row values
-                let mut outer_row_map: FxHashMap<String, Value> =
-                    FxHashMap::with_capacity_and_hasher(
-                        column_names_vec.len() * 2,
-                        Default::default(),
-                    );
-                for (i, col_name) in column_names_vec.iter().enumerate() {
+                // Build outer row context from current row values using pre-computed names
+                outer_row_map.clear();
+                for (i, (col_lower, qualified)) in col_name_pairs.iter().enumerate() {
                     if let Some(value) = row.get(i) {
-                        let col_lower = col_name.to_lowercase();
                         outer_row_map.insert(col_lower.clone(), value.clone());
-                        outer_row_map
-                            .insert(format!("{}.{}", table_name, col_lower), value.clone());
+                        outer_row_map.insert(qualified.clone(), value.clone());
                     }
                 }
 
                 // Create context with outer row for correlated subquery evaluation
-                let correlated_ctx = ctx.with_outer_row(outer_row_map, column_names_arc.clone());
+                // Move map into context, we'll take it back after
+                let mut correlated_ctx = ctx
+                    .with_outer_row(std::mem::take(&mut outer_row_map), column_names_arc.clone());
 
                 // Evaluate all update expressions
                 let mut new_values: Vec<(usize, Value)> = Vec::with_capacity(update_indices.len());
@@ -659,6 +669,9 @@ impl Executor {
                         new_values.push((*idx, new_value.into_coerce_to_type(*col_type)));
                     }
                 }
+
+                // Take back the map for reuse (zero-copy transfer)
+                outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
 
                 if !new_values.is_empty() {
                     precomputed.insert(pk_value, new_values);
@@ -877,6 +890,30 @@ impl Executor {
                 None
             };
 
+            // OPTIMIZATION: Pre-compute lowercase and qualified column names once
+            // Each entry: (col_lower, effective_qualified, optional_table_qualified)
+            let col_name_triples: Vec<(String, String, Option<String>)> = column_names_owned
+                .iter()
+                .map(|col_name| {
+                    let col_lower = col_name.to_lowercase();
+                    let effective_qualified = format!("{}.{}", effective_name, col_lower);
+                    let table_qualified = if effective_name != table_name {
+                        Some(format!("{}.{}", table_name, col_lower))
+                    } else {
+                        None
+                    };
+                    (col_lower, effective_qualified, table_qualified)
+                })
+                .collect();
+
+            // Reusable outer_row_map for correlated subqueries
+            let estimated_entries = col_name_triples.len() * 3; // up to 3 entries per column
+            let mut outer_row_map: rustc_hash::FxHashMap<String, Value> =
+                rustc_hash::FxHashMap::with_capacity_and_hasher(
+                    estimated_entries,
+                    Default::default(),
+                );
+
             while scanner.next() {
                 let row = scanner.row();
 
@@ -885,44 +922,46 @@ impl Executor {
                     evaluator.set_row_array(row);
                     if let Some(ref where_expr) = memory_where_clause {
                         if has_correlated {
-                            // For correlated subqueries, build outer row context and process per-row
-                            let mut outer_row_map: rustc_hash::FxHashMap<String, Value> =
-                                rustc_hash::FxHashMap::default();
-
-                            // Build outer row context with column values
-                            for (i, col_name) in column_names_owned.iter().enumerate() {
+                            // Build outer row context using pre-computed names
+                            outer_row_map.clear();
+                            for (i, (col_lower, effective_qualified, table_qualified)) in
+                                col_name_triples.iter().enumerate()
+                            {
                                 if let Some(value) = row.get(i) {
-                                    let col_lower = col_name.to_lowercase();
                                     outer_row_map.insert(col_lower.clone(), value.clone());
-                                    // Add with effective name prefix (alias if present, otherwise table name)
-                                    outer_row_map.insert(
-                                        format!("{}.{}", effective_name, col_lower),
-                                        value.clone(),
-                                    );
-                                    // Also add with table name prefix for cases where both are needed
-                                    if effective_name != table_name {
-                                        outer_row_map.insert(
-                                            format!("{}.{}", table_name, col_lower),
-                                            value.clone(),
-                                        );
+                                    outer_row_map
+                                        .insert(effective_qualified.clone(), value.clone());
+                                    if let Some(tq) = table_qualified {
+                                        outer_row_map.insert(tq.clone(), value.clone());
                                     }
                                 }
                             }
 
-                            // Create context with outer row
-                            let correlated_ctx = ctx
-                                .with_outer_row(outer_row_map, column_names_arc.clone().unwrap());
+                            // Create context with outer row (move map, take it back later)
+                            let mut correlated_ctx = ctx.with_outer_row(
+                                std::mem::take(&mut outer_row_map),
+                                column_names_arc.clone().unwrap(),
+                            );
 
                             // Process correlated subquery with outer context
                             match self.process_correlated_where(where_expr, &correlated_ctx) {
                                 Ok(processed) => {
-                                    evaluator.set_outer_row(correlated_ctx.outer_row());
+                                    // OPTIMIZATION: Take ownership instead of cloning
+                                    evaluator.set_outer_row_owned(
+                                        correlated_ctx.outer_row.take().unwrap_or_default(),
+                                    );
                                     let result =
                                         evaluator.evaluate_bool(&processed).unwrap_or(false);
-                                    evaluator.clear_outer_row();
+                                    // Take back map for reuse instead of clearing
+                                    outer_row_map = evaluator.take_outer_row();
                                     result
                                 }
-                                Err(_) => false,
+                                Err(_) => {
+                                    // Take back map from context even on error
+                                    outer_row_map =
+                                        correlated_ctx.outer_row.take().unwrap_or_default();
+                                    false
+                                }
                             }
                         } else {
                             matches!(evaluator.evaluate_bool(where_expr), Ok(true))

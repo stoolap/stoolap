@@ -201,11 +201,25 @@ impl Value {
             Value::Integer(v) => Some(*v != 0),
             Value::Float(v) => Some(*v != 0.0),
             Value::Text(s) => {
-                let lower = s.to_lowercase();
-                match lower.as_str() {
-                    "true" | "t" | "yes" | "y" | "1" => Some(true),
-                    "false" | "f" | "no" | "n" | "0" | "" => Some(false),
-                    _ => s.parse::<f64>().ok().map(|f| f != 0.0),
+                // OPTIMIZATION: Use eq_ignore_ascii_case to avoid allocation
+                let s_ref: &str = s.as_ref();
+                if s_ref.eq_ignore_ascii_case("true")
+                    || s_ref.eq_ignore_ascii_case("t")
+                    || s_ref.eq_ignore_ascii_case("yes")
+                    || s_ref.eq_ignore_ascii_case("y")
+                    || s_ref == "1"
+                {
+                    Some(true)
+                } else if s_ref.eq_ignore_ascii_case("false")
+                    || s_ref.eq_ignore_ascii_case("f")
+                    || s_ref.eq_ignore_ascii_case("no")
+                    || s_ref.eq_ignore_ascii_case("n")
+                    || s_ref == "0"
+                    || s_ref.is_empty()
+                {
+                    Some(false)
+                } else {
+                    s_ref.parse::<f64>().ok().map(|f| f != 0.0)
                 }
             }
             Value::Boolean(b) => Some(*b),
@@ -480,11 +494,24 @@ impl Value {
                     Value::Integer(v) => Value::Boolean(*v != 0),
                     Value::Float(v) => Value::Boolean(*v != 0.0),
                     Value::Text(s) => {
-                        let lower = s.to_lowercase();
-                        match lower.as_str() {
-                            "true" | "t" | "yes" | "y" | "1" => Value::Boolean(true),
-                            "false" | "f" | "no" | "n" | "0" => Value::Boolean(false),
-                            _ => Value::Null(target_type),
+                        // OPTIMIZATION: Use eq_ignore_ascii_case to avoid allocation
+                        let s_ref: &str = s.as_ref();
+                        if s_ref.eq_ignore_ascii_case("true")
+                            || s_ref.eq_ignore_ascii_case("t")
+                            || s_ref.eq_ignore_ascii_case("yes")
+                            || s_ref.eq_ignore_ascii_case("y")
+                            || s_ref == "1"
+                        {
+                            Value::Boolean(true)
+                        } else if s_ref.eq_ignore_ascii_case("false")
+                            || s_ref.eq_ignore_ascii_case("f")
+                            || s_ref.eq_ignore_ascii_case("no")
+                            || s_ref.eq_ignore_ascii_case("n")
+                            || s_ref == "0"
+                        {
+                            Value::Boolean(false)
+                        } else {
+                            Value::Null(target_type)
                         }
                     }
                     _ => Value::Null(target_type),
@@ -581,11 +608,24 @@ impl Value {
                 Value::Integer(v) => Value::Boolean(*v != 0),
                 Value::Float(v) => Value::Boolean(*v != 0.0),
                 Value::Text(s) => {
-                    let lower = s.to_lowercase();
-                    match lower.as_str() {
-                        "true" | "t" | "yes" | "y" | "1" => Value::Boolean(true),
-                        "false" | "f" | "no" | "n" | "0" => Value::Boolean(false),
-                        _ => Value::Null(target_type),
+                    // OPTIMIZATION: Use eq_ignore_ascii_case to avoid allocation
+                    let s_ref: &str = s.as_ref();
+                    if s_ref.eq_ignore_ascii_case("true")
+                        || s_ref.eq_ignore_ascii_case("t")
+                        || s_ref.eq_ignore_ascii_case("yes")
+                        || s_ref.eq_ignore_ascii_case("y")
+                        || s_ref == "1"
+                    {
+                        Value::Boolean(true)
+                    } else if s_ref.eq_ignore_ascii_case("false")
+                        || s_ref.eq_ignore_ascii_case("f")
+                        || s_ref.eq_ignore_ascii_case("no")
+                        || s_ref.eq_ignore_ascii_case("n")
+                        || s_ref == "0"
+                    {
+                        Value::Boolean(false)
+                    } else {
+                        Value::Null(target_type)
                     }
                 }
                 _ => Value::Null(target_type),

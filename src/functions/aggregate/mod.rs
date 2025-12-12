@@ -36,6 +36,7 @@
 
 mod array_agg;
 mod avg;
+pub mod compiled;
 mod count;
 mod first;
 mod last;
@@ -47,6 +48,7 @@ mod sum;
 
 pub use array_agg::ArrayAggFunction;
 pub use avg::AvgFunction;
+pub use compiled::CompiledAggregate;
 pub use count::CountFunction;
 pub use first::FirstFunction;
 pub use last::LastFunction;
@@ -80,7 +82,7 @@ fn value_to_distinct_key(value: &Value) -> Option<String> {
 }
 
 /// Helper struct for tracking distinct values
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct DistinctTracker {
     seen: HashSet<String>,
 }

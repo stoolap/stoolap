@@ -514,16 +514,63 @@ impl Executor {
         // Execute the JOIN
         let join_type = join_source.join_type.to_uppercase();
 
-        let result_rows = self.execute_nested_loop_join(
-            &left_rows,
-            &right_rows,
-            join_source.condition.as_deref(),
-            &all_columns,
-            &left_qualified,
-            &right_qualified,
-            &join_type,
-            ctx,
-        )?;
+        // Use hash join for better performance (O(n+m) instead of O(n*m))
+        let result_rows = if let Some(condition) = join_source.condition.as_deref() {
+            // Extract equality keys for hash join
+            let (left_key_indices, right_key_indices, residual) =
+                Self::extract_join_keys_and_residual(condition, &left_qualified, &right_qualified);
+
+            if !left_key_indices.is_empty() {
+                // Use hash join with equality keys
+                let mut rows = self.execute_hash_join(
+                    &left_rows,
+                    &right_rows,
+                    &left_key_indices,
+                    &right_key_indices,
+                    &join_type,
+                    left_qualified.len(),
+                    right_qualified.len(),
+                )?;
+
+                // Apply residual conditions (non-equality parts of ON clause)
+                if !residual.is_empty() {
+                    self.apply_residual_conditions(
+                        &mut rows,
+                        &residual,
+                        &all_columns,
+                        &join_type,
+                        left_qualified.len(),
+                        right_qualified.len(),
+                        ctx,
+                    );
+                }
+                rows
+            } else {
+                // Fall back to nested loop for non-equality joins
+                self.execute_nested_loop_join(
+                    &left_rows,
+                    &right_rows,
+                    Some(condition),
+                    &all_columns,
+                    &left_qualified,
+                    &right_qualified,
+                    &join_type,
+                    ctx,
+                )?
+            }
+        } else {
+            // CROSS JOIN (no condition)
+            self.execute_nested_loop_join(
+                &left_rows,
+                &right_rows,
+                None,
+                &all_columns,
+                &left_qualified,
+                &right_qualified,
+                &join_type,
+                ctx,
+            )?
+        };
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {

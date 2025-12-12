@@ -117,6 +117,11 @@ pub struct Evaluator<'a> {
     expression_aliases: FxHashMap<String, usize>,
     /// Current transaction ID for CURRENT_TRANSACTION_ID() function
     transaction_id: Option<u64>,
+    /// OPTIMIZATION: Cache for large IN list evaluations
+    /// Key: pointer to items slice (same expression list = same pointer)
+    /// Value: (HashSet of values, has_null flag)
+    /// Uses RefCell for interior mutability since evaluate() takes &self
+    in_list_cache: RefCell<FxHashMap<usize, (std::collections::HashSet<Value>, bool)>>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -141,6 +146,7 @@ impl<'a> Evaluator<'a> {
             outer_row_qualified: FxHashMap::default(),
             expression_aliases: FxHashMap::default(),
             transaction_id: None,
+            in_list_cache: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -163,6 +169,7 @@ impl<'a> Evaluator<'a> {
         self.outer_row_qualified.clear();
         self.expression_aliases.clear();
         self.transaction_id = None;
+        self.in_list_cache.borrow_mut().clear();
     }
 
     /// Set the current transaction ID for CURRENT_TRANSACTION_ID() function
@@ -1243,6 +1250,75 @@ impl<'a> Evaluator<'a> {
 
     /// Helper for evaluate_in - handles list with proper NULL semantics
     fn evaluate_in_list(&self, left: &Value, items: &[Expression], not: bool) -> Result<Value> {
+        // OPTIMIZATION: For large IN lists with literals, use cached HashSet for O(1) lookup
+        // This is critical for semi-join optimizations that transform EXISTS to IN
+        const HASHSET_THRESHOLD: usize = 16;
+
+        if items.len() >= HASHSET_THRESHOLD {
+            // Use items slice pointer as cache key (same expression list = same pointer)
+            let cache_key = items.as_ptr() as usize;
+
+            // Check cache first
+            {
+                let cache = self.in_list_cache.borrow();
+                if let Some((hash_set, has_null)) = cache.get(&cache_key) {
+                    // Cache hit - O(1) lookup
+                    let found = hash_set.contains(left);
+                    if found {
+                        return Ok(Value::Boolean(!not));
+                    }
+                    if *has_null {
+                        return Ok(Value::null_unknown());
+                    }
+                    return Ok(Value::Boolean(not));
+                }
+            }
+
+            // Cache miss - check if all items are literals
+            let all_literals = items.iter().all(|item| {
+                matches!(
+                    item,
+                    Expression::IntegerLiteral(_)
+                        | Expression::FloatLiteral(_)
+                        | Expression::StringLiteral(_)
+                        | Expression::BooleanLiteral(_)
+                        | Expression::NullLiteral(_)
+                )
+            });
+
+            if all_literals {
+                // Build HashSet and cache it
+                let mut hash_set = std::collections::HashSet::with_capacity(items.len());
+                let mut has_null = false;
+
+                for item in items {
+                    let val = self.evaluate(item)?;
+                    if val.is_null() {
+                        has_null = true;
+                    } else {
+                        hash_set.insert(val);
+                    }
+                }
+
+                // O(1) lookup
+                let found = hash_set.contains(left);
+
+                // Cache for future lookups
+                self.in_list_cache
+                    .borrow_mut()
+                    .insert(cache_key, (hash_set, has_null));
+
+                if found {
+                    return Ok(Value::Boolean(!not));
+                }
+                if has_null {
+                    return Ok(Value::null_unknown());
+                }
+                return Ok(Value::Boolean(not));
+            }
+        }
+
+        // Original linear scan for small lists or non-literal expressions
         let mut has_null = false;
 
         for item in items {

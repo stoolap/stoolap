@@ -180,8 +180,8 @@ impl MVCCTable {
         // Use the new get_comparison_info method (no downcasting required)
         let (col_name, operator, value) = expr.get_comparison_info()?;
 
-        // Check if it's an equality on the PK column
-        if col_name != pk_col.name || operator != Operator::Eq {
+        // Check if it's an equality on the PK column (case-insensitive comparison)
+        if !col_name.eq_ignore_ascii_case(&pk_col.name) || operator != Operator::Eq {
             return None;
         }
 
@@ -1461,8 +1461,26 @@ impl Table for MVCCTable {
         if let Some(expr) = where_expr {
             if let Some(pk_lookup) = self.try_pk_lookup(expr, &schema) {
                 // Direct O(1) lookup by primary key
-                let txn_versions = self.txn_versions.read().unwrap();
-                if let Some(row) = txn_versions.get(pk_lookup) {
+                // First check local transaction changes, then committed data
+                let row = {
+                    let txn_versions = self.txn_versions.read().unwrap();
+                    if let Some(row) = txn_versions.get(pk_lookup) {
+                        Some(row)
+                    } else if let Some(version) = self
+                        .version_store
+                        .get_visible_version(pk_lookup, self.txn_id)
+                    {
+                        if !version.is_deleted() {
+                            Some(version.data.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(row) = row {
                     // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
                     let row = self.normalize_row_to_schema(row, &schema);
                     let scanner = MVCCScanner::from_rows(
@@ -2211,7 +2229,7 @@ impl Table for MVCCTable {
             let pk_col = &schema.columns[pk_col_idx];
 
             if let Some((col_name, operator, value)) = expr.get_comparison_info() {
-                if col_name == pk_col.name && operator == Operator::Eq {
+                if col_name.eq_ignore_ascii_case(&pk_col.name) && operator == Operator::Eq {
                     return ScanPlan::PkLookup {
                         table: table_name,
                         pk_column: pk_col.name.clone(),

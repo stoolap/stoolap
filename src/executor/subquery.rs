@@ -26,6 +26,35 @@ use crate::parser::token::{Position, Token, TokenType};
 use super::context::ExecutionContext;
 use super::Executor;
 
+// ============================================================================
+// Semi-Join Optimization for EXISTS Subqueries
+// ============================================================================
+
+/// Information extracted from an EXISTS subquery for semi-join optimization.
+/// Example: EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > 500)
+/// - outer_column: "u.id" (or "id" with outer table "u")
+/// - inner_column: "o.user_id" (or "user_id")
+/// - inner_table: "orders"
+/// - inner_alias: Some("o")
+/// - non_correlated_where: Some("o.amount > 500")
+#[derive(Debug)]
+pub struct SemiJoinInfo {
+    /// The outer column referenced in the correlation (e.g., "id" from "u.id")
+    pub outer_column: String,
+    /// The outer table alias if qualified (e.g., "u" from "u.id")
+    pub outer_table: Option<String>,
+    /// The inner column used in the correlation (e.g., "user_id" from "o.user_id")
+    pub inner_column: String,
+    /// The inner table name
+    pub inner_table: String,
+    /// The inner table alias if present
+    pub inner_alias: Option<String>,
+    /// Non-correlated part of the WHERE clause (filters only on inner table)
+    pub non_correlated_where: Option<Expression>,
+    /// Whether this is NOT EXISTS
+    pub is_negated: bool,
+}
+
 /// Helper to create a dummy token for internal AST construction
 fn dummy_token(literal: &str, token_type: TokenType) -> Token {
     Token::new(token_type, literal, Position::new(0, 1, 1))
@@ -1325,5 +1354,530 @@ impl Executor {
             // For all other expression types, return as-is
             _ => Ok(expr.clone()),
         }
+    }
+
+    // ============================================================================
+    // Semi-Join Optimization Methods
+    // ============================================================================
+
+    /// Try to extract semi-join information from a correlated EXISTS subquery.
+    ///
+    /// For semi-join optimization, we need:
+    /// 1. A simple table source (no joins in subquery)
+    /// 2. A WHERE clause with `inner.col = outer.col` equality
+    /// 3. Optional additional non-correlated predicates
+    ///
+    /// Returns None if the subquery cannot be optimized as a semi-join.
+    pub fn try_extract_semi_join_info(
+        exists: &ExistsExpression,
+        is_negated: bool,
+        outer_tables: &[String],
+    ) -> Option<SemiJoinInfo> {
+        let subquery = &exists.subquery;
+
+        // 1. Check for simple table source (not a join)
+        let (inner_table, inner_alias) = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
+            Some(Expression::TableSource(ts)) => {
+                let alias = ts.alias.as_ref().map(|a| a.value.clone());
+                (ts.name.value.clone(), alias)
+            }
+            _ => return None, // Can't optimize subquery joins or derived tables
+        };
+
+        // 2. Parse WHERE clause to find correlation condition
+        let where_clause = subquery.where_clause.as_ref()?;
+
+        // Get inner table identifiers for distinguishing inner vs outer references
+        let inner_tables = vec![inner_alias
+            .clone()
+            .unwrap_or_else(|| inner_table.to_lowercase())
+            .to_lowercase()];
+
+        // Try to extract: outer.col = inner.col (or inner.col = outer.col)
+        let (outer_col, outer_tbl, inner_col, remaining) =
+            Self::extract_equality_correlation(where_clause, outer_tables, &inner_tables)?;
+
+        // IMPORTANT: Check if the remaining predicates reference outer tables.
+        // If they do, we cannot use semi-join optimization because those predicates
+        // cannot be evaluated on the inner table alone.
+        // Example: WHERE o.customer_id = c.id AND c.country = 'USA'
+        // The "c.country = 'USA'" references outer table and can't be pushed to inner query.
+        if let Some(ref rem) = remaining {
+            if Self::expression_references_outer_tables(rem, outer_tables, &inner_tables) {
+                return None;
+            }
+        }
+
+        Some(SemiJoinInfo {
+            outer_column: outer_col,
+            outer_table: outer_tbl,
+            inner_column: inner_col,
+            inner_table,
+            inner_alias,
+            non_correlated_where: remaining,
+            is_negated,
+        })
+    }
+
+    /// Extract an equality correlation from a WHERE clause.
+    ///
+    /// Looks for patterns like:
+    /// - `o.user_id = u.id` → inner_col="user_id", outer_col="id", outer_table="u"
+    /// - `o.user_id = u.id AND o.amount > 500` → same, with remaining predicate
+    ///
+    /// Returns: (outer_column, outer_table, inner_column, remaining_predicates)
+    fn extract_equality_correlation(
+        expr: &Expression,
+        outer_tables: &[String],
+        inner_tables: &[String],
+    ) -> Option<(String, Option<String>, String, Option<Expression>)> {
+        match expr {
+            // Direct equality: inner.col = outer.col
+            Expression::Infix(infix) if infix.operator == "=" => Self::try_extract_equality_pair(
+                &infix.left,
+                &infix.right,
+                outer_tables,
+                inner_tables,
+            )
+            .map(|(outer_col, outer_tbl, inner_col)| (outer_col, outer_tbl, inner_col, None)),
+
+            // AND expression: look for equality in one branch
+            Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("AND") => {
+                // Try left side first
+                if let Some((outer_col, outer_tbl, inner_col, left_remaining)) =
+                    Self::extract_equality_correlation(&infix.left, outer_tables, inner_tables)
+                {
+                    // Combine remaining from left with right
+                    let remaining =
+                        Self::combine_and_predicates(left_remaining, Some((*infix.right).clone()));
+                    return Some((outer_col, outer_tbl, inner_col, remaining));
+                }
+
+                // Try right side
+                if let Some((outer_col, outer_tbl, inner_col, right_remaining)) =
+                    Self::extract_equality_correlation(&infix.right, outer_tables, inner_tables)
+                {
+                    // Combine left with remaining from right
+                    let remaining =
+                        Self::combine_and_predicates(Some((*infix.left).clone()), right_remaining);
+                    return Some((outer_col, outer_tbl, inner_col, remaining));
+                }
+
+                None
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Try to extract an equality pair from two expressions.
+    /// One should reference outer table, one should reference inner table.
+    fn try_extract_equality_pair(
+        left: &Expression,
+        right: &Expression,
+        outer_tables: &[String],
+        inner_tables: &[String],
+    ) -> Option<(String, Option<String>, String)> {
+        // Try left=outer, right=inner
+        if let (Some((outer_col, outer_tbl)), Some(inner_col)) = (
+            Self::extract_outer_column(left, outer_tables, inner_tables),
+            Self::extract_inner_column(right, inner_tables),
+        ) {
+            return Some((outer_col, outer_tbl, inner_col));
+        }
+
+        // Try left=inner, right=outer
+        if let (Some(inner_col), Some((outer_col, outer_tbl))) = (
+            Self::extract_inner_column(left, inner_tables),
+            Self::extract_outer_column(right, outer_tables, inner_tables),
+        ) {
+            return Some((outer_col, outer_tbl, inner_col));
+        }
+
+        None
+    }
+
+    /// Extract column name if expression references outer table.
+    /// Returns (column_name, table_alias) where table_alias may be None.
+    fn extract_outer_column(
+        expr: &Expression,
+        outer_tables: &[String],
+        inner_tables: &[String],
+    ) -> Option<(String, Option<String>)> {
+        match expr {
+            Expression::QualifiedIdentifier(qid) => {
+                let table = qid.qualifier.value.to_lowercase();
+                // Must be in outer tables and NOT in inner tables
+                if outer_tables.iter().any(|t| t.eq_ignore_ascii_case(&table))
+                    && !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table))
+                {
+                    Some((qid.name.value.clone(), Some(qid.qualifier.value.clone())))
+                } else {
+                    None
+                }
+            }
+            // Simple identifier could be outer if not inner table column
+            // But we can't reliably determine this without schema info
+            _ => None,
+        }
+    }
+
+    /// Extract column name if expression references inner table.
+    fn extract_inner_column(expr: &Expression, inner_tables: &[String]) -> Option<String> {
+        match expr {
+            Expression::QualifiedIdentifier(qid) => {
+                let table = qid.qualifier.value.to_lowercase();
+                if inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table)) {
+                    Some(qid.name.value.clone())
+                } else {
+                    None
+                }
+            }
+            Expression::Identifier(id) => {
+                // Unqualified identifier - assume it's inner table column
+                // This is safe because outer refs should be qualified in correlated subqueries
+                Some(id.value.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if an expression references any outer tables.
+    /// Used to determine if a predicate can be pushed to the inner query in semi-join optimization.
+    fn expression_references_outer_tables(
+        expr: &Expression,
+        outer_tables: &[String],
+        inner_tables: &[String],
+    ) -> bool {
+        match expr {
+            Expression::QualifiedIdentifier(qid) => {
+                let table = qid.qualifier.value.to_lowercase();
+                // References outer if it's in outer_tables and NOT in inner_tables
+                outer_tables.iter().any(|t| t.eq_ignore_ascii_case(&table))
+                    && !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table))
+            }
+            Expression::Infix(infix) => {
+                Self::expression_references_outer_tables(&infix.left, outer_tables, inner_tables)
+                    || Self::expression_references_outer_tables(
+                        &infix.right,
+                        outer_tables,
+                        inner_tables,
+                    )
+            }
+            Expression::Prefix(prefix) => {
+                Self::expression_references_outer_tables(&prefix.right, outer_tables, inner_tables)
+            }
+            Expression::FunctionCall(func) => func.arguments.iter().any(|arg| {
+                Self::expression_references_outer_tables(arg, outer_tables, inner_tables)
+            }),
+            Expression::In(in_expr) => {
+                Self::expression_references_outer_tables(&in_expr.left, outer_tables, inner_tables)
+                    || Self::expression_references_outer_tables(
+                        &in_expr.right,
+                        outer_tables,
+                        inner_tables,
+                    )
+            }
+            Expression::Between(between) => {
+                Self::expression_references_outer_tables(&between.expr, outer_tables, inner_tables)
+                    || Self::expression_references_outer_tables(
+                        &between.lower,
+                        outer_tables,
+                        inner_tables,
+                    )
+                    || Self::expression_references_outer_tables(
+                        &between.upper,
+                        outer_tables,
+                        inner_tables,
+                    )
+            }
+            Expression::Case(case) => {
+                case.value.as_ref().is_some_and(|op| {
+                    Self::expression_references_outer_tables(
+                        op.as_ref(),
+                        outer_tables,
+                        inner_tables,
+                    )
+                }) || case.when_clauses.iter().any(|wc| {
+                    Self::expression_references_outer_tables(
+                        &wc.condition,
+                        outer_tables,
+                        inner_tables,
+                    ) || Self::expression_references_outer_tables(
+                        &wc.then_result,
+                        outer_tables,
+                        inner_tables,
+                    )
+                }) || case.else_value.as_ref().is_some_and(|el| {
+                    Self::expression_references_outer_tables(
+                        el.as_ref(),
+                        outer_tables,
+                        inner_tables,
+                    )
+                })
+            }
+            // Literals and other expressions don't reference tables
+            _ => false,
+        }
+    }
+
+    /// Combine two optional predicates with AND.
+    fn combine_and_predicates(
+        left: Option<Expression>,
+        right: Option<Expression>,
+    ) -> Option<Expression> {
+        match (left, right) {
+            (None, None) => None,
+            (Some(l), None) => Some(l),
+            (None, Some(r)) => Some(r),
+            (Some(l), Some(r)) => Some(Expression::Infix(InfixExpression::new(
+                dummy_token("AND", TokenType::Keyword),
+                Box::new(l),
+                "AND".to_string(),
+                Box::new(r),
+            ))),
+        }
+    }
+
+    /// Execute the semi-join optimization for an EXISTS subquery.
+    ///
+    /// Instead of executing the subquery for each outer row, we:
+    /// 1. Execute the inner query once with non-correlated predicates
+    /// 2. Collect all distinct values of the inner correlation column
+    /// 3. Return a HashSet for fast O(1) lookups
+    pub fn execute_semi_join_optimization(
+        &self,
+        info: &SemiJoinInfo,
+        ctx: &ExecutionContext,
+    ) -> Result<std::collections::HashSet<crate::core::Value>> {
+        // Build SELECT DISTINCT inner_column FROM inner_table WHERE non_correlated_predicates
+        let inner_col_expr = Expression::Identifier(Identifier {
+            token: dummy_token(&info.inner_column, TokenType::Identifier),
+            value: info.inner_column.clone(),
+            value_lower: info.inner_column.to_lowercase(),
+        });
+
+        let table_source = Expression::TableSource(SimpleTableSource {
+            token: dummy_token(&info.inner_table, TokenType::Identifier),
+            name: Identifier {
+                token: dummy_token(&info.inner_table, TokenType::Identifier),
+                value: info.inner_table.clone(),
+                value_lower: info.inner_table.to_lowercase(),
+            },
+            alias: info.inner_alias.as_ref().map(|a| Identifier {
+                token: dummy_token(a, TokenType::Identifier),
+                value: a.clone(),
+                value_lower: a.to_lowercase(),
+            }),
+            as_of: None,
+        });
+
+        let select_stmt = SelectStatement {
+            token: dummy_token("SELECT", TokenType::Keyword),
+            distinct: true, // DISTINCT to avoid duplicates
+            columns: vec![inner_col_expr],
+            with: None,
+            table_expr: Some(Box::new(table_source)),
+            where_clause: info.non_correlated_where.clone().map(Box::new),
+            group_by: GroupByClause {
+                columns: vec![],
+                modifier: GroupByModifier::None,
+            },
+            having: None,
+            window_defs: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            set_operations: vec![],
+        };
+
+        // Execute the query
+        let mut result = self.execute_select(&select_stmt, ctx)?;
+
+        // Collect values into HashSet
+        let mut hash_set = std::collections::HashSet::new();
+        while result.next() {
+            let row = result.row();
+            if !row.is_empty() {
+                if let Some(value) = row.get(0) {
+                    if !value.is_null() {
+                        hash_set.insert(value.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(hash_set)
+    }
+
+    /// Transform a WHERE clause with EXISTS into one using a pre-computed hash set.
+    ///
+    /// Replaces: EXISTS (SELECT ...) with: outer_col IN (hash_set_values)
+    pub fn transform_exists_to_in_list(
+        info: &SemiJoinInfo,
+        hash_set: &std::collections::HashSet<crate::core::Value>,
+    ) -> Expression {
+        // Build the outer column expression
+        let outer_col_expr = if let Some(ref tbl) = info.outer_table {
+            Expression::QualifiedIdentifier(QualifiedIdentifier {
+                token: dummy_token(&info.outer_column, TokenType::Identifier),
+                qualifier: Box::new(Identifier {
+                    token: dummy_token(tbl, TokenType::Identifier),
+                    value: tbl.clone(),
+                    value_lower: tbl.to_lowercase(),
+                }),
+                name: Box::new(Identifier {
+                    token: dummy_token(&info.outer_column, TokenType::Identifier),
+                    value: info.outer_column.clone(),
+                    value_lower: info.outer_column.to_lowercase(),
+                }),
+            })
+        } else {
+            Expression::Identifier(Identifier {
+                token: dummy_token(&info.outer_column, TokenType::Identifier),
+                value: info.outer_column.clone(),
+                value_lower: info.outer_column.to_lowercase(),
+            })
+        };
+
+        // Convert hash set to expression list
+        let value_exprs: Vec<Expression> = hash_set
+            .iter()
+            .map(|v| value_to_expression(v.clone()))
+            .collect();
+
+        // For empty hash set, return FALSE (no matches exist)
+        // For NOT EXISTS with empty set, return TRUE (nothing exists to negate)
+        if value_exprs.is_empty() {
+            return Expression::BooleanLiteral(BooleanLiteral {
+                token: dummy_token(
+                    if info.is_negated { "TRUE" } else { "FALSE" },
+                    TokenType::Keyword,
+                ),
+                value: info.is_negated,
+            });
+        }
+
+        Expression::In(InExpression {
+            token: dummy_token("IN", TokenType::Keyword),
+            left: Box::new(outer_col_expr),
+            right: Box::new(Expression::ExpressionList(ExpressionList {
+                token: dummy_token("(", TokenType::Punctuator),
+                expressions: value_exprs,
+            })),
+            not: info.is_negated,
+        })
+    }
+
+    /// Try to optimize correlated EXISTS subqueries to semi-join.
+    /// Returns Some(optimized_expression) if successful, None if not applicable.
+    pub fn try_optimize_exists_to_semi_join(
+        &self,
+        expr: &Expression,
+        ctx: &ExecutionContext,
+        outer_tables: &[String],
+    ) -> Result<Option<Expression>> {
+        match expr {
+            Expression::Exists(exists) => {
+                if let Some(info) = Self::try_extract_semi_join_info(exists, false, outer_tables) {
+                    let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
+                    return Ok(Some(Self::transform_exists_to_in_list(&info, &hash_set)));
+                }
+                Ok(None)
+            }
+
+            Expression::Prefix(prefix) if prefix.operator.eq_ignore_ascii_case("NOT") => {
+                if let Expression::Exists(exists) = prefix.right.as_ref() {
+                    if let Some(info) = Self::try_extract_semi_join_info(exists, true, outer_tables)
+                    {
+                        let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
+                        return Ok(Some(Self::transform_exists_to_in_list(&info, &hash_set)));
+                    }
+                }
+                Ok(None)
+            }
+
+            Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("AND") => {
+                // Try to optimize EXISTS in either branch of AND
+                let left_opt =
+                    self.try_optimize_exists_to_semi_join(&infix.left, ctx, outer_tables)?;
+                let right_opt =
+                    self.try_optimize_exists_to_semi_join(&infix.right, ctx, outer_tables)?;
+
+                match (left_opt, right_opt) {
+                    (Some(new_left), Some(new_right)) => {
+                        Ok(Some(Expression::Infix(InfixExpression {
+                            token: infix.token.clone(),
+                            left: Box::new(new_left),
+                            operator: infix.operator.clone(),
+                            op_type: infix.op_type,
+                            right: Box::new(new_right),
+                        })))
+                    }
+                    (Some(new_left), None) => Ok(Some(Expression::Infix(InfixExpression {
+                        token: infix.token.clone(),
+                        left: Box::new(new_left),
+                        operator: infix.operator.clone(),
+                        op_type: infix.op_type,
+                        right: infix.right.clone(),
+                    }))),
+                    (None, Some(new_right)) => Ok(Some(Expression::Infix(InfixExpression {
+                        token: infix.token.clone(),
+                        left: infix.left.clone(),
+                        operator: infix.operator.clone(),
+                        op_type: infix.op_type,
+                        right: Box::new(new_right),
+                    }))),
+                    (None, None) => Ok(None),
+                }
+            }
+
+            Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("OR") => {
+                // For OR, both branches must be optimizable for benefit
+                // But we can still optimize individual EXISTS clauses
+                let left_opt =
+                    self.try_optimize_exists_to_semi_join(&infix.left, ctx, outer_tables)?;
+                let right_opt =
+                    self.try_optimize_exists_to_semi_join(&infix.right, ctx, outer_tables)?;
+
+                match (left_opt, right_opt) {
+                    (Some(new_left), Some(new_right)) => {
+                        Ok(Some(Expression::Infix(InfixExpression {
+                            token: infix.token.clone(),
+                            left: Box::new(new_left),
+                            operator: infix.operator.clone(),
+                            op_type: infix.op_type,
+                            right: Box::new(new_right),
+                        })))
+                    }
+                    (Some(new_left), None) => Ok(Some(Expression::Infix(InfixExpression {
+                        token: infix.token.clone(),
+                        left: Box::new(new_left),
+                        operator: infix.operator.clone(),
+                        op_type: infix.op_type,
+                        right: infix.right.clone(),
+                    }))),
+                    (None, Some(new_right)) => Ok(Some(Expression::Infix(InfixExpression {
+                        token: infix.token.clone(),
+                        left: infix.left.clone(),
+                        operator: infix.operator.clone(),
+                        op_type: infix.op_type,
+                        right: Box::new(new_right),
+                    }))),
+                    (None, None) => Ok(None),
+                }
+            }
+
+            _ => Ok(None),
+        }
+    }
+
+    /// Get outer table names from a table expression (for semi-join optimization).
+    pub fn collect_outer_table_names(table_expr: &Option<Box<Expression>>) -> Vec<String> {
+        let mut tables = Vec::new();
+        if let Some(ref expr) = table_expr {
+            Self::collect_table_names_from_source(expr.as_ref(), &mut tables);
+        }
+        tables
     }
 }

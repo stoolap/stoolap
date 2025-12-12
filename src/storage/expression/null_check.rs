@@ -15,6 +15,7 @@
 //! NULL check expression for Stoolap
 //!
 
+use std::any::Any;
 use std::collections::HashMap;
 
 use super::{find_column_index, resolve_alias, Expression};
@@ -63,6 +64,11 @@ impl NullCheckExpr {
 
     /// Check if this is an IS NULL check (vs IS NOT NULL)
     pub fn checks_for_null(&self) -> bool {
+        self.is_null
+    }
+
+    /// Check if this is an IS NULL check (alias for checks_for_null, for expression compilation)
+    pub fn is_null_check(&self) -> bool {
         self.is_null
     }
 }
@@ -132,6 +138,10 @@ impl Expression for NullCheckExpr {
 
     fn clone_box(&self) -> Box<dyn Expression> {
         Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

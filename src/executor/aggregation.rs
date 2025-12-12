@@ -26,6 +26,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::core::{Result, Row, Value};
+use crate::functions::aggregate::CompiledAggregate;
 use crate::functions::AggregateFunction;
 use crate::parser::ast::*;
 use crate::storage::traits::QueryResult;
@@ -829,6 +830,31 @@ impl Executor {
             None
         };
 
+        // OPTIMIZATION: Pre-compute lowercase and qualified column names for correlated expressions
+        // This avoids repeated to_lowercase() and format!() allocations per row
+        let correlated_col_names: Option<Vec<(String, Option<String>)>> = if has_correlated_sources
+        {
+            Some(
+                agg_columns
+                    .iter()
+                    .map(|col_name| {
+                        let col_lower = col_name.to_lowercase();
+                        let qualified = table_alias
+                            .as_ref()
+                            .map(|alias| format!("{}.{}", alias, col_lower));
+                        (col_lower, qualified)
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        // Reusable map for correlated expressions
+        let estimated_entries = agg_columns.len() * 2;
+        let mut outer_row_map: FxHashMap<String, Value> =
+            FxHashMap::with_capacity_and_hasher(estimated_entries, Default::default());
+
         for row in agg_rows {
             let mut new_values = Vec::with_capacity(column_sources.len());
             evaluator.set_row_array(&row);
@@ -847,26 +873,27 @@ impl Executor {
                         evaluator.evaluate(expr).unwrap_or(Value::null_unknown())
                     }
                     ColumnSource::CorrelatedExpression(expr) => {
-                        // Build outer row context from the aggregated row
-                        // Include both unqualified and qualified column names
-                        let mut outer_row_map: FxHashMap<String, Value> = FxHashMap::default();
-                        for (idx, col_name) in agg_columns.iter().enumerate() {
-                            let val = row.get(idx).cloned().unwrap_or(Value::null_unknown());
-                            let col_lower = col_name.to_lowercase();
-                            // Add unqualified column name
-                            outer_row_map.insert(col_lower.clone(), val.clone());
-                            // Add qualified column name (e.g., t1.cat) for correlated subqueries
-                            if let Some(ref alias) = table_alias {
-                                outer_row_map.insert(format!("{}.{}", alias, col_lower), val);
+                        // Build outer row context using pre-computed column names
+                        outer_row_map.clear();
+                        if let Some(ref col_names) = correlated_col_names {
+                            for (idx, (col_lower, qualified)) in col_names.iter().enumerate() {
+                                let val = row.get(idx).cloned().unwrap_or(Value::null_unknown());
+                                outer_row_map.insert(col_lower.clone(), val.clone());
+                                if let Some(q) = qualified {
+                                    outer_row_map.insert(q.clone(), val);
+                                }
                             }
                         }
 
-                        // Create context with outer row for correlated subquery evaluation
-                        let correlated_ctx =
-                            ctx.with_outer_row(outer_row_map, outer_col_names.clone().unwrap());
+                        // Create context with outer row (move map, take it back after)
+                        let mut correlated_ctx = ctx.with_outer_row(
+                            std::mem::take(&mut outer_row_map),
+                            outer_col_names.clone().unwrap(),
+                        );
 
                         // Process the correlated expression with the outer row context
-                        match self.process_correlated_expression(expr, &correlated_ctx) {
+                        let result = match self.process_correlated_expression(expr, &correlated_ctx)
+                        {
                             Ok(processed_expr) => {
                                 // Evaluate the processed expression
                                 let mut corr_eval = Evaluator::new(&self.function_registry);
@@ -878,7 +905,11 @@ impl Executor {
                                     .unwrap_or(Value::null_unknown())
                             }
                             Err(_) => Value::null_unknown(),
-                        }
+                        };
+
+                        // Take back map for reuse
+                        outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
+                        result
                     }
                     ColumnSource::GroupingFlag(idx) => {
                         // Look up the grouping flag from the hidden __grouping_N__ columns
@@ -1679,140 +1710,206 @@ impl Executor {
             // Merge partial results
             self.merge_partial_aggregates(aggregations, partial_results)
         } else {
-            // SEQUENTIAL: Original algorithm for small datasets, DISTINCT, or expressions
-            let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
-                .iter()
-                .map(|agg| self.function_registry.get_aggregate(&agg.name))
-                .collect();
+            // SEQUENTIAL: Check if we can use the fast compiled path
+            // Fast path: no expressions, no filters, no order by on any aggregate
+            // NOTE: This is conservative - it could potentially be extended to handle:
+            // - Simple column expressions (not computed expressions)
+            // - STRING_AGG with extra_args (separator) by passing to CompiledAggregate
+            // For now, we keep it strict to ensure correctness.
+            let can_use_compiled = aggregations.iter().all(|agg| {
+                agg.expression.is_none()
+                    && agg.filter.is_none()
+                    && agg.order_by.is_empty()
+                    && agg.extra_args.is_empty()
+            });
 
-            // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
-            for (i, agg) in aggregations.iter().enumerate() {
-                if !agg.extra_args.is_empty() {
-                    if let Some(ref mut func) = agg_funcs[i] {
-                        func.configure(&agg.extra_args);
-                    }
-                }
-            }
+            if can_use_compiled {
+                // FAST PATH: Use CompiledAggregate for zero virtual dispatch
+                let mut compiled_aggs: Vec<CompiledAggregate> = aggregations
+                    .iter()
+                    .map(|agg| {
+                        let is_count_star = agg.name == "COUNT" && agg.column == "*";
+                        CompiledAggregate::compile(
+                            &agg.name,
+                            is_count_star,
+                            agg.distinct,
+                            self.function_registry.get_aggregate(&agg.name),
+                        )
+                        .unwrap_or_else(|| {
+                            // Fallback for unknown aggregates
+                            CompiledAggregate::dynamic(
+                                self.function_registry
+                                    .get_aggregate(&agg.name)
+                                    .unwrap_or_else(|| {
+                                        Box::new(
+                                            crate::functions::aggregate::CountFunction::default(),
+                                        )
+                                    }),
+                            )
+                        })
+                    })
+                    .collect();
 
-            // Configure ORDER BY for ordered-set aggregates (ARRAY_AGG, STRING_AGG, etc.)
-            for (i, agg) in aggregations.iter().enumerate() {
-                if !agg.order_by.is_empty() {
-                    if let Some(ref mut func) = agg_funcs[i] {
-                        let directions: Vec<bool> = agg
-                            .order_by
-                            .iter()
-                            .map(|o| o.ascending) // true = ASC, false = DESC
-                            .collect();
-                        func.set_order_by(directions);
-                    }
-                }
-            }
+                // Pre-create static Value for COUNT(*)
+                let count_star_value = Value::Integer(1);
 
-            // Pre-create static Value for COUNT(*)
-            let count_star_value = Value::Integer(1);
-
-            // Buffer for evaluated expression values (to avoid repeated allocation)
-            let mut expr_values: Vec<Value> = vec![Value::null_unknown(); aggregations.len()];
-
-            for row in rows {
-                // If we have an evaluator, set the current row
-                if let Some(ref mut eval) = expr_evaluator {
-                    eval.set_row_array(row);
-                }
-
-                for (i, agg) in aggregations.iter().enumerate() {
-                    if let Some(ref mut func) = agg_funcs[i] {
-                        // Check FILTER clause first - skip row if filter is false
-                        if let Some(ref filter) = agg.filter {
-                            if let Some(ref mut eval) = expr_evaluator {
-                                match eval.evaluate(filter) {
-                                    Ok(Value::Boolean(true)) => {} // Continue with accumulation
-                                    Ok(Value::Boolean(false)) | Ok(Value::Null(_)) => continue, // Skip this row
-                                    Ok(_) => continue, // Non-boolean treated as false
-                                    Err(_) => continue, // Error treated as false
-                                }
-                            } else {
-                                // Can't evaluate filter without evaluator - skip
-                                continue;
-                            }
-                        }
-
-                        // Get the value to accumulate
-                        let value = if let Some(ref expr) = agg.expression {
-                            // Evaluate the expression for this row
-                            if let Some(ref mut eval) = expr_evaluator {
-                                match eval.evaluate(expr) {
-                                    Ok(val) => {
-                                        expr_values[i] = val;
-                                        Some(&expr_values[i])
-                                    }
-                                    Err(e) => {
-                                        // Expression evaluation failed - skip row
-                                        #[cfg(debug_assertions)]
-                                        eprintln!(
-                                            "Warning: aggregate expression evaluation failed: {}",
-                                            e
-                                        );
-                                        let _ = e;
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            }
+                // Hot loop with compiled aggregates - zero virtual dispatch
+                for row in rows {
+                    for i in 0..compiled_aggs.len() {
+                        let value = if let Some(col_idx) = agg_col_indices[i] {
+                            row.get(col_idx)
                         } else {
-                            // Simple column reference or COUNT(*)
-                            if let Some(col_idx) = agg_col_indices[i] {
-                                row.get(col_idx)
-                            } else {
-                                Some(&count_star_value)
-                            }
+                            Some(&count_star_value) // COUNT(*)
                         };
 
                         if let Some(v) = value {
-                            // Check if this aggregate has ORDER BY and supports it
-                            if !agg.order_by.is_empty() && func.supports_order_by() {
-                                // Evaluate ORDER BY expressions to get sort keys
+                            compiled_aggs[i].accumulate(v);
+                        }
+                    }
+                }
+
+                // Collect results
+                compiled_aggs.iter().map(|agg| agg.result()).collect()
+            } else {
+                // SLOW PATH: Original algorithm with dynamic dispatch for complex aggregates
+                let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
+                    .iter()
+                    .map(|agg| self.function_registry.get_aggregate(&agg.name))
+                    .collect();
+
+                // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
+                for (i, agg) in aggregations.iter().enumerate() {
+                    if !agg.extra_args.is_empty() {
+                        if let Some(ref mut func) = agg_funcs[i] {
+                            func.configure(&agg.extra_args);
+                        }
+                    }
+                }
+
+                // Configure ORDER BY for ordered-set aggregates (ARRAY_AGG, STRING_AGG, etc.)
+                for (i, agg) in aggregations.iter().enumerate() {
+                    if !agg.order_by.is_empty() {
+                        if let Some(ref mut func) = agg_funcs[i] {
+                            let directions: Vec<bool> = agg
+                                .order_by
+                                .iter()
+                                .map(|o| o.ascending) // true = ASC, false = DESC
+                                .collect();
+                            func.set_order_by(directions);
+                        }
+                    }
+                }
+
+                // Pre-create static Value for COUNT(*)
+                let count_star_value = Value::Integer(1);
+
+                // Buffer for evaluated expression values (to avoid repeated allocation)
+                let mut expr_values: Vec<Value> = vec![Value::null_unknown(); aggregations.len()];
+
+                for row in rows {
+                    // If we have an evaluator, set the current row
+                    if let Some(ref mut eval) = expr_evaluator {
+                        eval.set_row_array(row);
+                    }
+
+                    for (i, agg) in aggregations.iter().enumerate() {
+                        if let Some(ref mut func) = agg_funcs[i] {
+                            // Check FILTER clause first - skip row if filter is false
+                            if let Some(ref filter) = agg.filter {
                                 if let Some(ref mut eval) = expr_evaluator {
-                                    let mut sort_keys = Vec::with_capacity(agg.order_by.len());
-                                    let mut all_ok = true;
-                                    for order_expr in &agg.order_by {
-                                        match eval.evaluate(&order_expr.expression) {
-                                            Ok(key) => sort_keys.push(key),
-                                            Err(_) => {
-                                                all_ok = false;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if all_ok {
-                                        func.accumulate_with_sort_key(v, sort_keys, agg.distinct);
+                                    match eval.evaluate(filter) {
+                                        Ok(Value::Boolean(true)) => {} // Continue with accumulation
+                                        Ok(Value::Boolean(false)) | Ok(Value::Null(_)) => continue, // Skip this row
+                                        Ok(_) => continue, // Non-boolean treated as false
+                                        Err(_) => continue, // Error treated as false
                                     }
                                 } else {
-                                    // No evaluator - fall back to regular accumulate
-                                    func.accumulate(v, agg.distinct);
+                                    // Can't evaluate filter without evaluator - skip
+                                    continue;
+                                }
+                            }
+
+                            // Get the value to accumulate
+                            let value = if let Some(ref expr) = agg.expression {
+                                // Evaluate the expression for this row
+                                if let Some(ref mut eval) = expr_evaluator {
+                                    match eval.evaluate(expr) {
+                                        Ok(val) => {
+                                            expr_values[i] = val;
+                                            Some(&expr_values[i])
+                                        }
+                                        Err(e) => {
+                                            // Expression evaluation failed - skip row
+                                            #[cfg(debug_assertions)]
+                                            eprintln!(
+                                                "Warning: aggregate expression evaluation failed: {}",
+                                                e
+                                            );
+                                            let _ = e;
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
                                 }
                             } else {
-                                func.accumulate(v, agg.distinct);
+                                // Simple column reference or COUNT(*)
+                                if let Some(col_idx) = agg_col_indices[i] {
+                                    row.get(col_idx)
+                                } else {
+                                    Some(&count_star_value)
+                                }
+                            };
+
+                            if let Some(v) = value {
+                                // Check if this aggregate has ORDER BY and supports it
+                                if !agg.order_by.is_empty() && func.supports_order_by() {
+                                    // Evaluate ORDER BY expressions to get sort keys
+                                    if let Some(ref mut eval) = expr_evaluator {
+                                        let mut sort_keys = Vec::with_capacity(agg.order_by.len());
+                                        let mut all_ok = true;
+                                        for order_expr in &agg.order_by {
+                                            match eval.evaluate(&order_expr.expression) {
+                                                Ok(key) => sort_keys.push(key),
+                                                Err(_) => {
+                                                    all_ok = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if all_ok {
+                                            func.accumulate_with_sort_key(
+                                                v,
+                                                sort_keys,
+                                                agg.distinct,
+                                            );
+                                        }
+                                    } else {
+                                        // No evaluator - fall back to regular accumulate
+                                        func.accumulate(v, agg.distinct);
+                                    }
+                                } else {
+                                    func.accumulate(v, agg.distinct);
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            aggregations
-                .iter()
-                .enumerate()
-                .map(|(i, agg)| {
-                    if let Some(ref func) = agg_funcs[i] {
-                        func.result()
-                    } else if agg.name == "COUNT" && agg.column == "*" {
-                        Value::Integer(rows.len() as i64)
-                    } else {
-                        Value::null_unknown()
-                    }
-                })
-                .collect()
+                aggregations
+                    .iter()
+                    .enumerate()
+                    .map(|(i, agg)| {
+                        if let Some(ref func) = agg_funcs[i] {
+                            func.result()
+                        } else if agg.name == "COUNT" && agg.column == "*" {
+                            Value::Integer(rows.len() as i64)
+                        } else {
+                            Value::null_unknown()
+                        }
+                    })
+                    .collect()
+            }
         };
 
         // Build result columns

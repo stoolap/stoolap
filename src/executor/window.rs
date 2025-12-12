@@ -30,9 +30,13 @@
 //! - OVER (ORDER BY col) - Order within partition
 
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use std::cmp::Ordering;
 
 use crate::core::{Error, Result, Row, Value};
+
+/// Type alias for partition keys - stack-allocated for common case (up to 4 columns)
+type PartitionKey = SmallVec<[Value; 4]>;
 use crate::functions::WindowFunction;
 use crate::parser::ast::*;
 use crate::storage::traits::QueryResult;
@@ -212,7 +216,10 @@ impl Executor {
                         if let Some(transformed_expr) = transformed_opt {
                             // Build extended row with ALL window function values (lazy, cached)
                             let ext_row = ext_row_cached.get_or_insert_with(|| {
-                                let mut ext_values: Vec<Value> = base_row.iter().cloned().collect();
+                                // OPTIMIZATION: Pre-allocate exact capacity to avoid reallocation
+                                let mut ext_values =
+                                    Vec::with_capacity(base_row.len() + added_wf_names.len());
+                                ext_values.extend(base_row.iter().cloned());
                                 // Add all window function values in the order they appear in added_wf_names
                                 for wf_name in &added_wf_names {
                                     let wf_value = window_value_map
@@ -774,11 +781,13 @@ impl Executor {
         }
 
         // Group rows by partition key
-        let mut partitions: FxHashMap<Vec<Value>, Vec<usize>> = FxHashMap::default();
+        // OPTIMIZATION: Use SmallVec for partition keys to avoid heap allocation
+        // for common cases (up to 4 partition columns)
+        let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
 
         // OPTIMIZATION: Pre-compute partition column indices to avoid to_lowercase() per row
         // Try both qualified (e.g., "l.grp") and unqualified (e.g., "grp") names
-        let partition_indices: Vec<Option<usize>> = wf_info
+        let partition_indices: SmallVec<[Option<usize>; 4]> = wf_info
             .partition_by
             .iter()
             .map(|part_col| {
@@ -795,7 +804,7 @@ impl Executor {
             .collect();
 
         for (i, row) in rows.iter().enumerate() {
-            let mut key = Vec::with_capacity(partition_indices.len());
+            let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
             for idx_opt in &partition_indices {
                 let value = if let Some(&idx) = idx_opt.as_ref() {
                     row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
@@ -1531,8 +1540,9 @@ impl Executor {
         };
 
         // Pre-compute partition column indices
+        // OPTIMIZATION: Use SmallVec to avoid heap allocation for common cases
         // Try both qualified (e.g., "l.grp") and unqualified (e.g., "grp") names
-        let partition_indices: Vec<Option<usize>> = wf_info
+        let partition_indices: SmallVec<[Option<usize>; 4]> = wf_info
             .partition_by
             .iter()
             .map(|part_col| {
@@ -1556,10 +1566,11 @@ impl Executor {
         };
 
         // Group rows by partition key
-        let mut partitions: FxHashMap<Vec<Value>, Vec<usize>> = FxHashMap::default();
+        // OPTIMIZATION: Use SmallVec for partition keys to avoid heap allocation
+        let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
 
         for (i, row) in rows.iter().enumerate() {
-            let mut key = Vec::with_capacity(partition_indices.len());
+            let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
             for idx_opt in &partition_indices {
                 let value = if let Some(&idx) = idx_opt.as_ref() {
                     row.get(idx).cloned().unwrap_or_else(Value::null_unknown)

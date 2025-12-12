@@ -146,6 +146,21 @@ impl LikeExpr {
             false
         }
     }
+
+    /// Get the pattern (for expression compilation)
+    pub fn get_pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    /// Check if case insensitive (for expression compilation)
+    pub fn is_case_insensitive(&self) -> bool {
+        self.case_insensitive
+    }
+
+    /// Check if negated (for expression compilation)
+    pub fn is_negated(&self) -> bool {
+        self.negated
+    }
 }
 
 impl fmt::Debug for LikeExpr {
