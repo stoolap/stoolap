@@ -43,7 +43,7 @@ cargo build --release
 ### As a Library
 
 ```rust
-use stoolap::Database;
+use stoolap::api::Database;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::open_in_memory()?;
@@ -183,11 +183,6 @@ GROUP BY ROLLUP(region, product);
 SELECT region, product, SUM(sales)
 FROM sales_data
 GROUP BY CUBE(region, product);
-
--- GROUPING SETS: Specific grouping combinations
-SELECT region, product, category, SUM(sales)
-FROM sales_data
-GROUP BY GROUPING SETS ((region, product), (category), ());
 ```
 
 ### Subqueries
@@ -234,8 +229,6 @@ WHERE c.country = 'US';
 | `TEXT` | UTF-8 string | `'hello'`, `'日本語'` |
 | `BOOLEAN` | true/false | `TRUE`, `FALSE` |
 | `TIMESTAMP` | Date and time | `'2024-01-15 10:30:00'` |
-| `DATE` | Date only | `'2024-01-15'` |
-| `TIME` | Time only | `'10:30:00'` |
 | `JSON` | JSON data | `'{"key": "value"}'` |
 
 ## Built-in Functions
