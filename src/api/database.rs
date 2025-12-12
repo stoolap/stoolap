@@ -141,7 +141,7 @@ impl Database {
         {
             let registry = DATABASE_REGISTRY
                 .read()
-                .map_err(|_| Error::internal("Failed to acquire registry read lock"))?;
+                .map_err(|_| Error::LockAcquisitionFailed("registry read".to_string()))?;
             if let Some(inner) = registry.get(dsn) {
                 return Ok(Database {
                     inner: Arc::clone(inner),
@@ -152,7 +152,7 @@ impl Database {
         // Need to create a new engine - acquire write lock
         let mut registry = DATABASE_REGISTRY
             .write()
-            .map_err(|_| Error::internal("Failed to acquire registry write lock"))?;
+            .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
 
         // Double-check after acquiring write lock
         if let Some(inner) = registry.get(dsn) {
@@ -400,7 +400,7 @@ impl Database {
             .inner
             .executor
             .lock()
-            .map_err(|_| Error::internal("Failed to acquire executor lock"))?;
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let param_values = params.into_params();
         let result = if param_values.is_empty() {
@@ -445,7 +445,7 @@ impl Database {
             .inner
             .executor
             .lock()
-            .map_err(|_| Error::internal("Failed to acquire executor lock"))?;
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let param_values = params.into_params();
         let result = if param_values.is_empty() {
@@ -471,7 +471,7 @@ impl Database {
         let row = self
             .query(sql, params)?
             .next()
-            .ok_or_else(|| Error::internal("Query returned no rows"))??;
+            .ok_or(Error::NoRowsReturned)??;
         row.get(0)
     }
 
@@ -542,7 +542,7 @@ impl Database {
             .inner
             .executor
             .lock()
-            .map_err(|_| Error::internal("Failed to acquire executor lock"))?;
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let result = executor.execute_with_named_params(sql, params.into_inner())?;
         Ok(result.rows_affected())
@@ -575,7 +575,7 @@ impl Database {
             .inner
             .executor
             .lock()
-            .map_err(|_| Error::internal("Failed to acquire executor lock"))?;
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let result = executor.execute_with_named_params(sql, params.into_inner())?;
         Ok(Rows::new(result))
@@ -598,7 +598,7 @@ impl Database {
         match rows.next() {
             Some(Ok(row)) => row.get(0),
             Some(Err(e)) => Err(e),
-            None => Err(Error::internal("Query returned no rows")),
+            None => Err(Error::NoRowsReturned),
         }
     }
 
@@ -703,7 +703,7 @@ impl Database {
             .inner
             .executor
             .lock()
-            .map_err(|_| Error::internal("Failed to acquire executor lock"))?;
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let tx = executor.begin_transaction_with_isolation(isolation)?;
         Ok(Transaction::new(
@@ -730,7 +730,7 @@ impl Database {
         // Remove from registry
         let mut registry = DATABASE_REGISTRY
             .write()
-            .map_err(|_| Error::internal("Failed to acquire registry write lock"))?;
+            .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
 
         registry.remove(&self.inner.dsn);
 
@@ -759,7 +759,7 @@ impl Database {
             .inner
             .executor
             .lock()
-            .map_err(|_| Error::internal("Failed to acquire executor lock"))?;
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
         executor.set_default_isolation_level(level);
         Ok(())
     }
@@ -800,7 +800,7 @@ impl Database {
             .inner
             .executor
             .lock()
-            .map_err(|_| Error::internal("Failed to acquire executor lock"))?;
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
         Ok(executor.semantic_cache_stats())
     }
 
@@ -813,7 +813,7 @@ impl Database {
             .inner
             .executor
             .lock()
-            .map_err(|_| Error::internal("Failed to acquire executor lock"))?;
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
         executor.clear_semantic_cache();
         Ok(())
     }

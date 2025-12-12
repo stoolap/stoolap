@@ -165,10 +165,92 @@ pub enum Error {
     #[error("index already exists")]
     IndexAlreadyExists,
 
+    /// Index already exists (with name)
+    #[error("index '{0}' already exists")]
+    IndexAlreadyExistsByName(String),
+
+    /// Index not found (with name)
+    #[error("index '{0}' not found")]
+    IndexNotFoundByName(String),
+
     /// Column for index not found
 
     #[error("index column not found")]
     IndexColumnNotFound,
+
+    /// Index is closed
+    #[error("index is closed")]
+    IndexClosed,
+
+    // =========================================================================
+    // Engine errors
+    // =========================================================================
+    /// Engine is not open
+    #[error("engine is not open")]
+    EngineNotOpen,
+
+    /// Engine is already open
+    #[error("engine is already open")]
+    EngineAlreadyOpen,
+
+    // =========================================================================
+    // View errors
+    // =========================================================================
+    /// View already exists
+    #[error("view '{0}' already exists")]
+    ViewAlreadyExists(String),
+
+    /// View not found
+    #[error("view '{0}' not found")]
+    ViewNotFound(String),
+
+    // =========================================================================
+    // Lock errors
+    // =========================================================================
+    /// Failed to acquire lock
+    #[error("failed to acquire lock: {0}")]
+    LockAcquisitionFailed(String),
+
+    // =========================================================================
+    // Query result errors
+    // =========================================================================
+    /// Query returned no rows
+    #[error("query returned no rows")]
+    NoRowsReturned,
+
+    /// No statements to execute
+    #[error("no statements to execute")]
+    NoStatementsToExecute,
+
+    /// Column index out of bounds
+    #[error("column index {index} out of bounds")]
+    ColumnIndexOutOfBounds { index: usize },
+
+    // =========================================================================
+    // WAL errors
+    // =========================================================================
+    /// WAL manager is not running
+    #[error("WAL manager is not running")]
+    WalNotRunning,
+
+    /// WAL file is closed
+    #[error("WAL file is closed")]
+    WalFileClosed,
+
+    /// WAL not initialized
+    #[error("WAL not initialized")]
+    WalNotInitialized,
+
+    // =========================================================================
+    // Database errors
+    // =========================================================================
+    /// Database is locked by another process
+    #[error("database is locked by another process")]
+    DatabaseLocked,
+
+    /// Cannot drop primary key column
+    #[error("cannot drop primary key column")]
+    CannotDropPrimaryKey,
 
     // =========================================================================
     // Comparison errors
@@ -231,6 +313,10 @@ pub enum Error {
     /// Table not found (with name)
     #[error("table '{0}' not found")]
     TableNotFoundByName(String),
+
+    /// Table or view not found (with name)
+    #[error("table or view '{0}' not found")]
+    TableOrViewNotFound(String),
 
     /// Column not found (with name) - for executor
     #[error("column '{0}' not found")]
@@ -359,6 +445,8 @@ impl Error {
                 | Error::IndexNotFound
                 | Error::IndexColumnNotFound
                 | Error::SegmentNotFound
+                | Error::ViewNotFound(_)
+                | Error::TableOrViewNotFound(_)
         )
     }
 

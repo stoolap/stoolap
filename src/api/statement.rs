@@ -73,7 +73,7 @@ impl Statement {
             let executor = db
                 .executor()
                 .lock()
-                .map_err(|_| Error::internal("Failed to acquire executor lock"))?;
+                .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
             // Just touch the cache to pre-parse
             let _ = executor.query_cache().get(&sql);

@@ -245,7 +245,7 @@ impl Index for BitmapIndex {
 
     fn add(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::internal("index is closed"));
+            return Err(Error::IndexClosed);
         }
 
         // Validate row_id is non-negative (can be safely converted to u64)
@@ -336,7 +336,7 @@ impl Index for BitmapIndex {
 
     fn remove(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::internal("index is closed"));
+            return Err(Error::IndexClosed);
         }
 
         // Validate row_id is non-negative
@@ -397,7 +397,7 @@ impl Index for BitmapIndex {
 
     fn find(&self, values: &[Value]) -> Result<Vec<IndexEntry>> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::internal("index is closed"));
+            return Err(Error::IndexClosed);
         }
 
         if values.len() != self.column_ids.len() {

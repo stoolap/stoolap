@@ -149,7 +149,7 @@ impl Transaction {
         let row = self
             .query(sql, params)?
             .next()
-            .ok_or_else(|| Error::internal("Query returned no rows"))??;
+            .ok_or(Error::NoRowsReturned)??;
         row.get(0)
     }
 
@@ -195,7 +195,7 @@ impl Transaction {
             last_result = Some(self.execute_statement(statement, &ctx)?);
         }
 
-        last_result.ok_or_else(|| Error::internal("No statements to execute"))
+        last_result.ok_or(Error::NoStatementsToExecute)
     }
 
     /// Execute a single statement

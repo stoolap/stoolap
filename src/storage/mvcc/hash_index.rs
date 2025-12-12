@@ -218,7 +218,7 @@ impl Index for HashIndex {
 
     fn add(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::internal("index is closed"));
+            return Err(Error::IndexClosed);
         }
 
         let num_cols = self.column_ids.len();
@@ -304,7 +304,7 @@ impl Index for HashIndex {
 
     fn remove(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::internal("index is closed"));
+            return Err(Error::IndexClosed);
         }
 
         let hash = hash_values(values);
@@ -370,7 +370,7 @@ impl Index for HashIndex {
 
     fn find(&self, values: &[Value]) -> Result<Vec<IndexEntry>> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::internal("index is closed"));
+            return Err(Error::IndexClosed);
         }
 
         // Hash index only supports exact matches on all columns

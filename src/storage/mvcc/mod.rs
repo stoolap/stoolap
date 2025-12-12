@@ -150,8 +150,8 @@ impl From<MvccError> for crate::core::Error {
             MvccError::TransactionClosed => {
                 crate::core::Error::internal("transaction already closed")
             }
-            MvccError::EngineNotOpen => crate::core::Error::internal("engine is not open"),
-            MvccError::EngineAlreadyOpen => crate::core::Error::internal("engine is already open"),
+            MvccError::EngineNotOpen => crate::core::Error::EngineNotOpen,
+            MvccError::EngineAlreadyOpen => crate::core::Error::EngineAlreadyOpen,
             MvccError::NotAcceptingTransactions => {
                 crate::core::Error::internal("not accepting new transactions")
             }

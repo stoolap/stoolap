@@ -285,7 +285,7 @@ impl Index for MultiColumnIndex {
 
     fn add(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::internal("index is closed"));
+            return Err(Error::IndexClosed);
         }
 
         let num_cols = self.column_ids.len();
@@ -395,7 +395,7 @@ impl Index for MultiColumnIndex {
 
     fn remove(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::internal("index is closed"));
+            return Err(Error::IndexClosed);
         }
 
         let key = CompositeKey(values.to_vec());
@@ -475,7 +475,7 @@ impl Index for MultiColumnIndex {
 
     fn find(&self, values: &[Value]) -> Result<Vec<IndexEntry>> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::internal("index is closed"));
+            return Err(Error::IndexClosed);
         }
 
         if values.is_empty() || values.len() > self.column_ids.len() {
@@ -517,7 +517,7 @@ impl Index for MultiColumnIndex {
         max_inclusive: bool,
     ) -> Result<Vec<IndexEntry>> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::internal("index is closed"));
+            return Err(Error::IndexClosed);
         }
 
         // LAZY build BTree if needed

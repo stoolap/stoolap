@@ -125,7 +125,7 @@ fn acquire_lock(file: &File) -> Result<()> {
     if result != 0 {
         let errno = std::io::Error::last_os_error();
         if errno.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            return Err(Error::internal("database is locked by another process"));
+            return Err(Error::DatabaseLocked);
         }
         return Err(Error::internal(format!(
             "failed to acquire lock: {}",
@@ -167,7 +167,7 @@ fn acquire_lock(file: &File) -> Result<()> {
     if result == 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
-            return Err(Error::internal("database is locked by another process"));
+            return Err(Error::DatabaseLocked);
         }
         return Err(Error::internal(format!(
             "failed to acquire lock: {}",

@@ -1145,7 +1145,7 @@ impl MVCCEngine {
     /// Creates a new table
     pub fn create_table(&self, schema: Schema) -> Result<Schema> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let table_name = schema.table_name_lower.clone();
@@ -1191,7 +1191,7 @@ impl MVCCEngine {
     /// Drops a table
     pub fn drop_table_internal(&self, name: &str) -> Result<()> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let table_name = name.to_lowercase();
@@ -1227,7 +1227,7 @@ impl MVCCEngine {
     /// Gets a version store for a table
     pub fn get_version_store(&self, name: &str) -> Result<Arc<VersionStore>> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let table_name = name.to_lowercase();
@@ -1245,7 +1245,7 @@ impl MVCCEngine {
         nullable: bool,
     ) -> Result<()> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let table_name_lower = table_name.to_lowercase();
@@ -1298,7 +1298,7 @@ impl MVCCEngine {
         default_expr: Option<String>,
     ) -> Result<()> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let table_name_lower = table_name.to_lowercase();
@@ -1346,7 +1346,7 @@ impl MVCCEngine {
     /// Drops a column from a table
     pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let table_name_lower = table_name.to_lowercase();
@@ -1360,7 +1360,7 @@ impl MVCCEngine {
         // Check if column is primary key
         if let Some((_, col)) = schema.find_column(column_name) {
             if col.primary_key {
-                return Err(Error::internal("cannot drop primary key column"));
+                return Err(Error::CannotDropPrimaryKey);
             }
         } else {
             return Err(Error::ColumnNotFound);
@@ -1382,7 +1382,7 @@ impl MVCCEngine {
     /// Renames a column in a table
     pub fn rename_column(&self, table_name: &str, old_name: &str, new_name: &str) -> Result<()> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let table_name_lower = table_name.to_lowercase();
@@ -1425,7 +1425,7 @@ impl MVCCEngine {
         nullable: bool,
     ) -> Result<()> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let table_name_lower = table_name.to_lowercase();
@@ -1457,7 +1457,7 @@ impl MVCCEngine {
     /// Renames a table
     pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let old_name_lower = old_name.to_lowercase();
@@ -1539,7 +1539,7 @@ impl MVCCEngine {
         use crate::storage::mvcc::wal_manager::WALOperationType;
 
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let name_lower = name.to_lowercase();
@@ -1550,7 +1550,7 @@ impl MVCCEngine {
             if if_not_exists {
                 return Ok(());
             }
-            return Err(Error::internal(format!("view '{}' already exists", name)));
+            return Err(Error::ViewAlreadyExists(name.to_string()));
         }
 
         // Check if a table with the same name exists
@@ -1582,7 +1582,7 @@ impl MVCCEngine {
         use crate::storage::mvcc::wal_manager::WALOperationType;
 
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let name_lower = name.to_lowercase();
@@ -1592,7 +1592,7 @@ impl MVCCEngine {
             if if_exists {
                 return Ok(());
             }
-            return Err(Error::internal(format!("view '{}' does not exist", name)));
+            return Err(Error::ViewNotFound(name.to_string()));
         }
 
         // Release the lock before recording to WAL
@@ -1614,7 +1614,7 @@ impl MVCCEngine {
     #[inline]
     pub fn view_exists_lowercase(&self, name_lower: &str) -> Result<bool> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let views = self.views.read().unwrap();
@@ -1632,7 +1632,7 @@ impl MVCCEngine {
     #[inline]
     pub fn get_view_lowercase(&self, name_lower: &str) -> Result<Option<Arc<ViewDefinition>>> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let views = self.views.read().unwrap();
@@ -1642,7 +1642,7 @@ impl MVCCEngine {
     /// List all view names
     pub fn list_views(&self) -> Result<Vec<String>> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let views = self.views.read().unwrap();
@@ -1665,7 +1665,7 @@ impl Engine for MVCCEngine {
 
     fn begin_transaction_with_level(&self, level: IsolationLevel) -> Result<Box<dyn Transaction>> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         // Begin transaction in registry
@@ -1701,7 +1701,7 @@ impl Engine for MVCCEngine {
 
     fn table_exists(&self, table_name: &str) -> Result<bool> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let schemas = self.schemas.read().unwrap();
@@ -1710,7 +1710,7 @@ impl Engine for MVCCEngine {
 
     fn index_exists(&self, index_name: &str, table_name: &str) -> Result<bool> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let store = self.get_version_store(table_name)?;
@@ -1719,7 +1719,7 @@ impl Engine for MVCCEngine {
 
     fn get_index(&self, table_name: &str, index_name: &str) -> Result<Box<dyn Index>> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let store = self.get_version_store(table_name)?;
@@ -1740,7 +1740,7 @@ impl Engine for MVCCEngine {
 
     fn get_table_schema(&self, table_name: &str) -> Result<Schema> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let schemas = self.schemas.read().unwrap();
@@ -1752,7 +1752,7 @@ impl Engine for MVCCEngine {
 
     fn list_table_indexes(&self, table_name: &str) -> Result<HashMap<String, String>> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         let store = self.get_version_store(table_name)?;
@@ -1765,7 +1765,7 @@ impl Engine for MVCCEngine {
 
     fn get_all_indexes(&self, table_name: &str) -> Result<Vec<Box<dyn Index>>> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         // Verify table exists
@@ -1781,7 +1781,7 @@ impl Engine for MVCCEngine {
 
     fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         self.registry.set_global_isolation_level(level);
@@ -1798,7 +1798,7 @@ impl Engine for MVCCEngine {
 
     fn create_snapshot(&self) -> Result<()> {
         if !self.is_open() {
-            return Err(Error::internal("engine is not open"));
+            return Err(Error::EngineNotOpen);
         }
 
         // Check if persistence is enabled

@@ -1612,7 +1612,7 @@ impl Table for MVCCTable {
 
         // Check if index with same name already exists
         if self.version_store.index_exists(name) {
-            return Err(Error::internal(format!("index already exists: {}", name)));
+            return Err(Error::IndexAlreadyExistsByName(name.to_string()));
         }
 
         // Check if an index already exists on the same column(s)
@@ -1768,7 +1768,7 @@ impl Table for MVCCTable {
     fn drop_index(&self, name: &str) -> Result<()> {
         // Check if index exists
         if !self.version_store.index_exists(name) {
-            return Err(Error::internal(format!("index not found: {}", name)));
+            return Err(Error::IndexNotFoundByName(name.to_string()));
         }
 
         // Remove from version store
@@ -1912,7 +1912,7 @@ impl Table for MVCCTable {
 
         // Check if index with same name already exists
         if self.version_store.index_exists(name) {
-            return Err(Error::internal(format!("index already exists: {}", name)));
+            return Err(Error::IndexAlreadyExistsByName(name.to_string()));
         }
 
         // Create the multi-column index

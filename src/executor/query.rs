@@ -1024,7 +1024,13 @@ impl Executor {
         // Get table from active transaction or create a new one
         let (table, _standalone_tx) = if let Some(ref tx_state) = *active_tx {
             // Use the active transaction - this allows seeing uncommitted changes
-            let table = tx_state.transaction.get_table(table_name)?;
+            let table = tx_state.transaction.get_table(table_name).map_err(|e| {
+                if matches!(e, Error::TableNotFound) {
+                    Error::TableOrViewNotFound(table_name.to_string())
+                } else {
+                    e
+                }
+            })?;
             drop(active_tx); // Release lock before doing work
             (table, None)
         } else {
@@ -1037,7 +1043,13 @@ impl Executor {
                 return self.execute_temporal_query(table_name, as_of, stmt, ctx, &*tx);
             }
 
-            let table = tx.get_table(table_name)?;
+            let table = tx.get_table(table_name).map_err(|e| {
+                if matches!(e, Error::TableNotFound) {
+                    Error::TableOrViewNotFound(table_name.to_string())
+                } else {
+                    e
+                }
+            })?;
             (table, Some(tx))
         };
 
@@ -4040,7 +4052,7 @@ impl Executor {
         let view_def = self
             .engine
             .get_view(view_name)?
-            .ok_or_else(|| Error::internal(format!("view '{}' does not exist", view_name)))?;
+            .ok_or_else(|| Error::ViewNotFound(view_name.to_string()))?;
 
         // Build CREATE VIEW statement
         let create_sql = format!(

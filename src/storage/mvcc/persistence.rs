@@ -369,10 +369,7 @@ impl PersistenceManager {
             return Ok(());
         }
 
-        let wal = self
-            .wal
-            .as_ref()
-            .ok_or_else(|| Error::internal("WAL not initialized"))?;
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
 
         let entry = WALEntry::new(
             DDL_TXN_ID, // DDL operations use special marker transaction ID
@@ -402,10 +399,7 @@ impl PersistenceManager {
             return Ok(());
         }
 
-        let wal = self
-            .wal
-            .as_ref()
-            .ok_or_else(|| Error::internal("WAL not initialized"))?;
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
 
         let entry = WALEntry::new(
             DDL_TXN_ID,
@@ -437,10 +431,7 @@ impl PersistenceManager {
             return Ok(());
         }
 
-        let wal = self
-            .wal
-            .as_ref()
-            .ok_or_else(|| Error::internal("WAL not initialized"))?;
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
 
         // Serialize row data
         let data = serialize_row_version(version)?;
@@ -459,10 +450,7 @@ impl PersistenceManager {
             return Ok(());
         }
 
-        let wal = self
-            .wal
-            .as_ref()
-            .ok_or_else(|| Error::internal("WAL not initialized"))?;
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
 
         // Use commit_marker to set COMMIT_MARKER flag for two-phase recovery
         wal.write_commit_marker(txn_id)?;
@@ -478,10 +466,7 @@ impl PersistenceManager {
             return Ok(());
         }
 
-        let wal = self
-            .wal
-            .as_ref()
-            .ok_or_else(|| Error::internal("WAL not initialized"))?;
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
 
         // Use abort_marker to set ABORT_MARKER flag for two-phase recovery
         wal.write_abort_marker(txn_id)?;
@@ -502,10 +487,7 @@ impl PersistenceManager {
     where
         F: FnMut(super::wal_manager::WALEntry) -> Result<()>,
     {
-        let wal = self
-            .wal
-            .as_ref()
-            .ok_or_else(|| Error::internal("WAL not initialized"))?;
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
 
         wal.replay_two_phase(from_lsn, callback)
     }
@@ -520,10 +502,7 @@ impl PersistenceManager {
             return Ok(0);
         }
 
-        let wal = self
-            .wal
-            .as_ref()
-            .ok_or_else(|| Error::internal("WAL not initialized"))?;
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
 
         let checkpoint_lsn = wal.create_checkpoint(active_transactions)?;
 

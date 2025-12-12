@@ -486,7 +486,7 @@ impl Executor {
             if stmt.if_exists {
                 return Ok(Box::new(ExecResult::empty()));
             }
-            return Err(Error::internal(format!("index not found: {}", index_name)));
+            return Err(Error::IndexNotFoundByName(index_name.to_string()));
         }
 
         // Get the table and drop the index

@@ -1236,7 +1236,7 @@ impl WALManager {
     /// Append a WAL entry
     pub fn append_entry(&self, mut entry: WALEntry) -> Result<u64> {
         if !self.running.load(Ordering::Acquire) {
-            return Err(Error::internal("WAL manager is not running"));
+            return Err(Error::WalNotRunning);
         }
 
         // Get previous LSN and assign new LSN atomically
@@ -1327,7 +1327,7 @@ impl WALManager {
             file.write_all(data)
                 .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e)))?;
         } else {
-            return Err(Error::internal("WAL file is closed"));
+            return Err(Error::WalFileClosed);
         }
 
         Ok(())
@@ -1336,7 +1336,7 @@ impl WALManager {
     /// Sync WAL to disk (assumes lock is held)
     fn sync_locked(&self) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
-            return Err(Error::internal("WAL manager is not running"));
+            return Err(Error::WalNotRunning);
         }
 
         let wal_file = self.wal_file.lock().unwrap();
@@ -1470,7 +1470,7 @@ impl WALManager {
     /// Public sync method
     pub fn sync(&self) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
-            return Err(Error::internal("WAL manager is not running"));
+            return Err(Error::WalNotRunning);
         }
 
         // First flush buffer
@@ -1483,7 +1483,7 @@ impl WALManager {
     /// Flush buffer to disk without syncing
     pub fn flush(&self) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
-            return Err(Error::internal("WAL manager is not running"));
+            return Err(Error::WalNotRunning);
         }
 
         let buffer_data = {
@@ -2033,7 +2033,7 @@ impl WALManager {
     pub fn truncate_wal(&self, up_to_lsn: u64) -> Result<()> {
         // Skip if not running or if up_to_lsn is zero (no valid checkpoint)
         if !self.running.load(Ordering::Acquire) {
-            return Err(Error::internal("WAL manager is not running"));
+            return Err(Error::WalNotRunning);
         }
 
         if up_to_lsn == 0 {

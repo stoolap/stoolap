@@ -128,7 +128,7 @@ impl ResultRow {
         let value = self
             .row
             .get(index)
-            .ok_or_else(|| Error::internal(format!("Column index {} out of bounds", index)))?;
+            .ok_or(Error::ColumnIndexOutOfBounds { index })?;
         T::from_value(value)
     }
 

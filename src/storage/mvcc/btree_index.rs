@@ -158,7 +158,7 @@ impl BTreeIndex {
     /// Check if the index is closed
     fn check_closed(&self) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::internal("index is closed"));
+            return Err(Error::IndexClosed);
         }
         Ok(())
     }
