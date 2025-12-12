@@ -20,6 +20,7 @@ use crate::core::{Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
 };
+use crate::validate_arg_count;
 
 // ============================================================================
 // COALESCE
@@ -132,12 +133,7 @@ impl ScalarFunction for NullIfFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "NULLIF requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "NULLIF", 2);
 
         // If both are equal, return NULL
         if args[0] == args[1] {
@@ -181,12 +177,7 @@ impl ScalarFunction for IfNullFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "IFNULL requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "IFNULL", 2);
 
         // If first argument is not NULL, return it
         if !args[0].is_null() {
@@ -334,12 +325,7 @@ impl ScalarFunction for IifFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 3 {
-            return Err(Error::invalid_argument(format!(
-                "IIF requires exactly 3 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "IIF", 3);
 
         let condition = &args[0];
         let true_value = &args[1];
@@ -395,12 +381,7 @@ impl ScalarFunction for JsonExtractFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "JSON_EXTRACT requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "JSON_EXTRACT", 2);
 
         // Handle NULL input
         if args[0].is_null() {
@@ -541,12 +522,7 @@ impl ScalarFunction for JsonArrayLengthFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.is_empty() || args.len() > 2 {
-            return Err(Error::invalid_argument(format!(
-                "JSON_ARRAY_LENGTH requires 1 or 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "JSON_ARRAY_LENGTH", 1, 2);
 
         // Handle NULL input
         if args[0].is_null() {
@@ -752,12 +728,7 @@ impl ScalarFunction for JsonTypeFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "JSON_TYPE requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "JSON_TYPE", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -852,12 +823,7 @@ impl ScalarFunction for JsonValidFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "JSON_VALID requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "JSON_VALID", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -903,12 +869,7 @@ impl ScalarFunction for JsonKeysFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "JSON_KEYS requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "JSON_KEYS", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -976,12 +937,7 @@ impl ScalarFunction for SleepFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "SLEEP requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "SLEEP", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -1035,12 +991,7 @@ impl ScalarFunction for TypeOfFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "TYPEOF requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "TYPEOF", 1);
 
         let type_name = match &args[0] {
             Value::Null(_) => "NULL",

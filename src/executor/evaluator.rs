@@ -2277,7 +2277,7 @@ mod tests {
 
         // Populate row_array and slice pointers
         let values = vec![Value::Integer(1), Value::Integer(2)];
-        let values2 = vec![Value::Integer(3), Value::Integer(4)];
+        let values2 = [Value::Integer(3), Value::Integer(4)];
         let row = crate::core::Row::from_values(values.clone());
         evaluator.row_array = Some(row);
         evaluator.row_slice_ptr = values.as_ptr();

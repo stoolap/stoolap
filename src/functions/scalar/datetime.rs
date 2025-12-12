@@ -20,6 +20,7 @@ use crate::core::{parse_timestamp, Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
 };
+use crate::validate_arg_count;
 
 // ============================================================================
 // DATE_TRUNC
@@ -61,12 +62,7 @@ impl ScalarFunction for DateTruncFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "DATE_TRUNC requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "DATE_TRUNC", 2);
 
         // First argument: unit (string)
         let unit = match &args[0] {
@@ -291,12 +287,7 @@ impl ScalarFunction for TimeTruncFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "TIME_TRUNC requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "TIME_TRUNC", 2);
 
         // First argument: duration string
         let duration_str = match &args[0] {
@@ -428,12 +419,7 @@ impl ScalarFunction for ExtractFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "EXTRACT requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "EXTRACT", 2);
 
         // First argument: field (string)
         let field = match &args[0] {
@@ -518,12 +504,7 @@ impl ScalarFunction for YearFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "YEAR requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "YEAR", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -568,12 +549,7 @@ impl ScalarFunction for MonthFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "MONTH requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "MONTH", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -618,12 +594,7 @@ impl ScalarFunction for DayFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "DAY requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "DAY", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -668,12 +639,7 @@ impl ScalarFunction for HourFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "HOUR requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "HOUR", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -718,12 +684,7 @@ impl ScalarFunction for MinuteFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "MINUTE requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "MINUTE", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -768,12 +729,7 @@ impl ScalarFunction for SecondFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "SECOND requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "SECOND", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -831,12 +787,7 @@ impl ScalarFunction for DateAddFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() < 2 || args.len() > 3 {
-            return Err(Error::invalid_argument(format!(
-                "DATE_ADD requires 2 or 3 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "DATE_ADD", 2, 3);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -982,12 +933,7 @@ impl ScalarFunction for DateSubFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() < 2 || args.len() > 3 {
-            return Err(Error::invalid_argument(format!(
-                "DATE_SUB requires 2 or 3 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "DATE_SUB", 2, 3);
 
         // Negate the interval and use DATE_ADD logic
         let mut modified_args = args.to_vec();
@@ -1033,12 +979,7 @@ impl ScalarFunction for DateDiffFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "DATEDIFF requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "DATEDIFF", 2);
 
         if args[0].is_null() || args[1].is_null() {
             return Ok(Value::null_unknown());
@@ -1272,12 +1213,7 @@ impl ScalarFunction for ToCharFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "TO_CHAR requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "TO_CHAR", 2);
 
         if args[0].is_null() || args[1].is_null() {
             return Ok(Value::null_unknown());

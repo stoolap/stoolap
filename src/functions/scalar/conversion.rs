@@ -25,6 +25,7 @@ use crate::core::{Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
 };
+use crate::validate_arg_count;
 
 /// CAST function for type conversion
 ///
@@ -57,12 +58,7 @@ impl ScalarFunction for CastFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "CAST requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "CAST", 2);
 
         let value = &args[0];
         let target_type = match &args[1] {
@@ -273,12 +269,7 @@ impl ScalarFunction for CollateFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "COLLATE requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "COLLATE", 2);
 
         // Handle NULL input
         if args[0].is_null() {
