@@ -20,6 +20,7 @@ use crate::core::{Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
 };
+use crate::validate_arg_count;
 
 use super::{value_to_i64, value_to_string};
 
@@ -46,12 +47,7 @@ impl ScalarFunction for UpperFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "UPPER requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "UPPER", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -89,12 +85,7 @@ impl ScalarFunction for LowerFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "LOWER requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "LOWER", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -132,12 +123,7 @@ impl ScalarFunction for LengthFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "LENGTH requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "LENGTH", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -228,12 +214,7 @@ impl ScalarFunction for SubstringFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() < 2 || args.len() > 3 {
-            return Err(Error::invalid_argument(format!(
-                "SUBSTRING requires 2 or 3 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "SUBSTRING", 2, 3);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -340,12 +321,7 @@ impl ScalarFunction for TrimFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "TRIM requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "TRIM", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -383,12 +359,7 @@ impl ScalarFunction for LtrimFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "LTRIM requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "LTRIM", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -426,12 +397,7 @@ impl ScalarFunction for RtrimFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "RTRIM requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "RTRIM", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -478,12 +444,7 @@ impl ScalarFunction for ReplaceFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 3 {
-            return Err(Error::invalid_argument(format!(
-                "REPLACE requires exactly 3 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "REPLACE", 3);
 
         // SQL standard: any NULL argument returns NULL
         if args[0].is_null() || args[1].is_null() || args[2].is_null() {
@@ -525,12 +486,7 @@ impl ScalarFunction for ReverseFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "REVERSE requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "REVERSE", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -574,12 +530,7 @@ impl ScalarFunction for LeftFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "LEFT requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "LEFT", 2);
 
         // SQL standard: any NULL argument returns NULL
         if args[0].is_null() || args[1].is_null() {
@@ -631,12 +582,7 @@ impl ScalarFunction for RightFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "RIGHT requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "RIGHT", 2);
 
         // SQL standard: any NULL argument returns NULL
         if args[0].is_null() || args[1].is_null() {
@@ -691,12 +637,7 @@ impl ScalarFunction for RepeatFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "REPEAT requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "REPEAT", 2);
 
         // SQL standard: any NULL argument returns NULL
         if args[0].is_null() || args[1].is_null() {
@@ -762,12 +703,7 @@ impl ScalarFunction for SplitPartFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 3 {
-            return Err(Error::invalid_argument(format!(
-                "SPLIT_PART requires exactly 3 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "SPLIT_PART", 3);
 
         // SQL standard: any NULL argument returns NULL
         if args[0].is_null() || args[1].is_null() || args[2].is_null() {
@@ -828,12 +764,7 @@ impl ScalarFunction for PositionFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "POSITION requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "POSITION", 2);
 
         if args[0].is_null() || args[1].is_null() {
             return Ok(Value::null_unknown());
@@ -882,12 +813,7 @@ impl ScalarFunction for InstrFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "INSTR requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "INSTR", 2);
 
         if args[0].is_null() || args[1].is_null() {
             return Ok(Value::null_unknown());
@@ -946,12 +872,7 @@ impl ScalarFunction for LocateFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() < 2 || args.len() > 3 {
-            return Err(Error::invalid_argument(format!(
-                "LOCATE requires 2 or 3 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "LOCATE", 2, 3);
 
         if args[0].is_null() || args[1].is_null() {
             return Ok(Value::null_unknown());
@@ -1044,12 +965,7 @@ impl ScalarFunction for LpadFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() < 2 || args.len() > 3 {
-            return Err(Error::invalid_argument(format!(
-                "LPAD requires 2 or 3 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "LPAD", 2, 3);
 
         // SQL standard: NULL in required args returns NULL
         if args[0].is_null() || args[1].is_null() {
@@ -1133,12 +1049,7 @@ impl ScalarFunction for RpadFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() < 2 || args.len() > 3 {
-            return Err(Error::invalid_argument(format!(
-                "RPAD requires 2 or 3 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "RPAD", 2, 3);
 
         // SQL standard: NULL in required args returns NULL
         if args[0].is_null() || args[1].is_null() {
@@ -1219,12 +1130,7 @@ impl ScalarFunction for CharFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "CHAR requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "CHAR", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -1277,12 +1183,7 @@ impl ScalarFunction for CharLengthFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "CHAR_LENGTH requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "CHAR_LENGTH", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -1377,12 +1278,7 @@ impl ScalarFunction for StrposFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "STRPOS requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "STRPOS", 2);
 
         if args[0].is_null() || args[1].is_null() {
             return Ok(Value::null_unknown());

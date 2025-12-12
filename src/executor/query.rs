@@ -61,6 +61,18 @@ use crate::optimizer::{BuildSide, JoinAlgorithm};
 /// For small build sides, the bloom filter overhead isn't worth it.
 const BLOOM_FILTER_MIN_BUILD_SIZE: usize = 100;
 
+/// Extract the base (unqualified) column name from a potentially qualified column name.
+/// For "table.column" returns "column", for "column" returns "column".
+/// The result is always lowercase for case-insensitive comparisons.
+#[inline]
+fn extract_base_column_name(col_name: &str) -> String {
+    if let Some(dot_idx) = col_name.rfind('.') {
+        col_name[dot_idx + 1..].to_lowercase()
+    } else {
+        col_name.to_lowercase()
+    }
+}
+
 /// Pre-computed column name mappings for correlated subqueries.
 /// Avoids repeated string allocations per row in the inner loop.
 struct ColumnKeyMapping {
@@ -1795,27 +1807,13 @@ impl Executor {
                 let left_base_cols: Vec<(usize, String)> = left_columns
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| {
-                        let base = if let Some(pos) = c.rfind('.') {
-                            c[pos + 1..].to_lowercase()
-                        } else {
-                            c.to_lowercase()
-                        };
-                        (i, base)
-                    })
+                    .map(|(i, c)| (i, extract_base_column_name(c)))
                     .collect();
 
                 let right_base_cols: Vec<(usize, String)> = right_columns
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| {
-                        let base = if let Some(pos) = c.rfind('.') {
-                            c[pos + 1..].to_lowercase()
-                        } else {
-                            c.to_lowercase()
-                        };
-                        (i, base)
-                    })
+                    .map(|(i, c)| (i, extract_base_column_name(c)))
                     .collect();
 
                 // Determine which columns to match

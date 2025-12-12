@@ -2260,4 +2260,149 @@ mod tests {
         });
         assert!(evaluator.evaluate_bool(&expr).unwrap());
     }
+
+    /// Test that clear() resets all state to be equivalent to a fresh Evaluator.
+    /// This test exists to catch bugs when new fields are added to Evaluator
+    /// but not reset in clear(). If this test fails after adding a field,
+    /// make sure to update clear() to reset the new field.
+    #[test]
+    fn test_clear_resets_all_state() {
+        // Create an evaluator and populate all its mutable state
+        let mut evaluator = Evaluator::with_defaults();
+
+        // Populate row_map
+        let mut row_map = FxHashMap::default();
+        row_map.insert("col1".to_string(), Value::Integer(42));
+        evaluator.row_map = row_map;
+
+        // Populate row_array and slice pointers
+        let values = vec![Value::Integer(1), Value::Integer(2)];
+        let values2 = vec![Value::Integer(3), Value::Integer(4)];
+        let row = crate::core::Row::from_values(values.clone());
+        evaluator.row_array = Some(row);
+        evaluator.row_slice_ptr = values.as_ptr();
+        evaluator.row_slice_len = values.len();
+        evaluator.row_slice_ptr2 = values2.as_ptr();
+        evaluator.row_slice_len2 = values2.len();
+        evaluator.first_row_cols = 1;
+
+        // Populate column_indices
+        evaluator.column_indices.insert("col1".to_string(), 0);
+
+        // Populate qualified_indices
+        let mut inner_map = FxHashMap::default();
+        inner_map.insert("col1".to_string(), 0);
+        evaluator
+            .qualified_indices
+            .insert("table1".to_string(), inner_map);
+
+        // Populate table_aliases
+        evaluator
+            .table_aliases
+            .insert("t".to_string(), "table1".to_string());
+
+        // Populate column_aliases
+        evaluator
+            .column_aliases
+            .insert("c".to_string(), "col1".to_string());
+
+        // Populate params
+        evaluator.params.push(Value::Integer(100));
+
+        // Populate named_params
+        evaluator
+            .named_params
+            .insert("param1".to_string(), Value::Integer(200));
+
+        // Populate outer_row
+        evaluator
+            .outer_row
+            .insert("outer_col".to_string(), Value::Integer(300));
+
+        // Populate outer_row_qualified
+        let mut outer_inner = FxHashMap::default();
+        outer_inner.insert("outer_col".to_string(), Value::Integer(400));
+        evaluator
+            .outer_row_qualified
+            .insert("outer_table".to_string(), outer_inner);
+
+        // Populate expression_aliases
+        evaluator.expression_aliases.insert("x + y".to_string(), 0);
+
+        // Populate transaction_id
+        evaluator.transaction_id = Some(12345);
+
+        // Clear should reset all state
+        evaluator.clear();
+
+        // Verify all state is reset (equivalent to new())
+        assert!(
+            evaluator.row_map.is_empty(),
+            "row_map should be empty after clear()"
+        );
+        assert!(
+            evaluator.row_array.is_none(),
+            "row_array should be None after clear()"
+        );
+        assert!(
+            evaluator.row_slice_ptr.is_null(),
+            "row_slice_ptr should be null after clear()"
+        );
+        assert_eq!(
+            evaluator.row_slice_len, 0,
+            "row_slice_len should be 0 after clear()"
+        );
+        assert!(
+            evaluator.row_slice_ptr2.is_null(),
+            "row_slice_ptr2 should be null after clear()"
+        );
+        assert_eq!(
+            evaluator.row_slice_len2, 0,
+            "row_slice_len2 should be 0 after clear()"
+        );
+        assert_eq!(
+            evaluator.first_row_cols, 0,
+            "first_row_cols should be 0 after clear()"
+        );
+        assert!(
+            evaluator.column_indices.is_empty(),
+            "column_indices should be empty after clear()"
+        );
+        assert!(
+            evaluator.qualified_indices.is_empty(),
+            "qualified_indices should be empty after clear()"
+        );
+        assert!(
+            evaluator.table_aliases.is_empty(),
+            "table_aliases should be empty after clear()"
+        );
+        assert!(
+            evaluator.column_aliases.is_empty(),
+            "column_aliases should be empty after clear()"
+        );
+        assert!(
+            evaluator.params.is_empty(),
+            "params should be empty after clear()"
+        );
+        assert!(
+            evaluator.named_params.is_empty(),
+            "named_params should be empty after clear()"
+        );
+        assert!(
+            evaluator.outer_row.is_empty(),
+            "outer_row should be empty after clear()"
+        );
+        assert!(
+            evaluator.outer_row_qualified.is_empty(),
+            "outer_row_qualified should be empty after clear()"
+        );
+        assert!(
+            evaluator.expression_aliases.is_empty(),
+            "expression_aliases should be empty after clear()"
+        );
+        assert!(
+            evaluator.transaction_id.is_none(),
+            "transaction_id should be None after clear()"
+        );
+    }
 }

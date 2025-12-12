@@ -77,6 +77,44 @@ pub use utility::{
 
 use crate::core::Value;
 
+/// Macro to validate argument count for scalar functions.
+///
+/// # Usage
+/// ```ignore
+/// // Exact count
+/// validate_arg_count!(args, "UPPER", 1);
+///
+/// // Range (min, max inclusive)
+/// validate_arg_count!(args, "SUBSTRING", 2, 3);
+/// ```
+#[macro_export]
+macro_rules! validate_arg_count {
+    // Exact count
+    ($args:expr, $name:expr, $exact:expr) => {
+        if $args.len() != $exact {
+            return Err($crate::core::Error::invalid_argument(format!(
+                "{} requires exactly {} argument{}, got {}",
+                $name,
+                $exact,
+                if $exact == 1 { "" } else { "s" },
+                $args.len()
+            )));
+        }
+    };
+    // Range (min to max inclusive)
+    ($args:expr, $name:expr, $min:expr, $max:expr) => {
+        if $args.len() < $min || $args.len() > $max {
+            return Err($crate::core::Error::invalid_argument(format!(
+                "{} requires {} to {} arguments, got {}",
+                $name,
+                $min,
+                $max,
+                $args.len()
+            )));
+        }
+    };
+}
+
 /// Convert a Value to a string representation
 pub fn value_to_string(value: &Value) -> String {
     if value.is_null() {

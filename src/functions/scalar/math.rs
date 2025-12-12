@@ -18,6 +18,7 @@ use crate::core::{Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
 };
+use crate::validate_arg_count;
 use rand::Rng;
 
 use super::{value_to_f64, value_to_i64};
@@ -45,12 +46,7 @@ impl ScalarFunction for AbsFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "ABS requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "ABS", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -102,12 +98,7 @@ impl ScalarFunction for RoundFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.is_empty() || args.len() > 2 {
-            return Err(Error::invalid_argument(format!(
-                "ROUND requires 1 or 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "ROUND", 1, 2);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -160,12 +151,7 @@ impl ScalarFunction for FloorFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "FLOOR requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "FLOOR", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -205,12 +191,7 @@ impl ScalarFunction for CeilingFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "CEILING requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "CEILING", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -250,12 +231,7 @@ impl ScalarFunction for CeilFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "CEIL requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "CEIL", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -300,12 +276,7 @@ impl ScalarFunction for ModFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "MOD requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "MOD", 2);
 
         if args[0].is_null() || args[1].is_null() {
             return Ok(Value::null_unknown());
@@ -365,12 +336,7 @@ impl ScalarFunction for PowerFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
-            return Err(Error::invalid_argument(format!(
-                "POWER requires exactly 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "POWER", 2);
 
         if args[0].is_null() || args[1].is_null() {
             return Ok(Value::null_unknown());
@@ -444,12 +410,7 @@ impl ScalarFunction for SqrtFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "SQRT requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "SQRT", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -498,12 +459,7 @@ impl ScalarFunction for LogFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.is_empty() || args.len() > 2 {
-            return Err(Error::invalid_argument(format!(
-                "LOG requires 1 or 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "LOG", 1, 2);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -562,12 +518,7 @@ impl ScalarFunction for Log10Function {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "LOG10 requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "LOG10", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -607,12 +558,7 @@ impl ScalarFunction for Log2Function {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "LOG2 requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "LOG2", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -656,12 +602,7 @@ impl ScalarFunction for LnFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "LN requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "LN", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -705,12 +646,7 @@ impl ScalarFunction for ExpFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "EXP requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "EXP", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -750,12 +686,7 @@ impl ScalarFunction for SignFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "SIGN requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "SIGN", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -808,12 +739,7 @@ impl ScalarFunction for TruncateFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.is_empty() || args.len() > 2 {
-            return Err(Error::invalid_argument(format!(
-                "TRUNCATE requires 1 or 2 arguments, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "TRUNCATE", 1, 2);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -975,12 +901,7 @@ impl ScalarFunction for SinFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "SIN requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "SIN", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -1020,12 +941,7 @@ impl ScalarFunction for CosFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "COS requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "COS", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -1065,12 +981,7 @@ impl ScalarFunction for TanFunction {
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "TAN requires exactly 1 argument, got {}",
-                args.len()
-            )));
-        }
+        validate_arg_count!(args, "TAN", 1);
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
