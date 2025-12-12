@@ -45,6 +45,63 @@ struct GroupingSet {
     active_columns: Vec<bool>,
 }
 
+/// Generate a canonical key for an expression for semantic matching.
+/// This ensures consistent matching regardless of token positions or formatting.
+/// All string-based keys are lowercased for case-insensitive matching.
+fn expression_canonical_key(expr: &Expression) -> String {
+    match expr {
+        Expression::Identifier(id) => id.value.to_lowercase(),
+        Expression::QualifiedIdentifier(qid) => {
+            format!("{}.{}", qid.qualifier.value, qid.name.value).to_lowercase()
+        }
+        Expression::IntegerLiteral(lit) => format!("$pos:{}", lit.value),
+        Expression::FloatLiteral(lit) => format!("$float:{}", lit.value),
+        Expression::StringLiteral(lit) => format!("$str:{}", lit.value.to_lowercase()),
+        Expression::BooleanLiteral(lit) => format!("$bool:{}", lit.value),
+        Expression::FunctionCall(func) => {
+            // For function calls, build a canonical form
+            let args: Vec<String> = func
+                .arguments
+                .iter()
+                .map(expression_canonical_key)
+                .collect();
+            format!("{}({})", func.function.to_lowercase(), args.join(","))
+        }
+        Expression::Infix(bin) => {
+            // For infix/binary operations, build a canonical form
+            format!(
+                "({} {} {})",
+                expression_canonical_key(&bin.left),
+                bin.operator.to_lowercase(),
+                expression_canonical_key(&bin.right)
+            )
+        }
+        Expression::Prefix(un) => {
+            // For prefix/unary operations
+            format!(
+                "({}{})",
+                un.operator.to_lowercase(),
+                expression_canonical_key(&un.right)
+            )
+        }
+        Expression::Aliased(aliased) => {
+            // For aliased expressions, use the underlying expression
+            expression_canonical_key(&aliased.expression)
+        }
+        // For other complex expressions, use Display but lowercase for consistency
+        _ => format!("{}", expr).to_lowercase(),
+    }
+}
+
+/// Generate a canonical key for a GroupByItem for semantic matching.
+fn group_by_item_canonical_key(item: &GroupByItem) -> String {
+    match item {
+        GroupByItem::Column(name) => name.to_lowercase(),
+        GroupByItem::Position(pos) => format!("$pos:{}", pos),
+        GroupByItem::Expression { expr, .. } => expression_canonical_key(expr),
+    }
+}
+
 /// Represents a GROUP BY item - either a column reference or an expression
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -1299,7 +1356,28 @@ impl Executor {
             })
             .collect();
 
-        for expr in &stmt.group_by.columns {
+        // For GROUPING SETS, extract all unique columns from all sets
+        let columns_to_parse: Vec<&Expression> =
+            if let GroupByModifier::GroupingSets(ref sets) = stmt.group_by.modifier {
+                // Collect all unique columns from all grouping sets
+                // Use canonical key for uniqueness (handles case-insensitivity and structural matching)
+                let mut seen = std::collections::HashSet::new();
+                let mut unique_cols = Vec::new();
+                for set in sets {
+                    for expr in set {
+                        let key = expression_canonical_key(expr);
+                        if seen.insert(key) {
+                            unique_cols.push(expr);
+                        }
+                    }
+                }
+                unique_cols
+            } else {
+                // Regular GROUP BY, ROLLUP, or CUBE - use columns directly
+                stmt.group_by.columns.iter().collect()
+            };
+
+        for expr in columns_to_parse {
             match expr {
                 Expression::Identifier(id) => {
                     // Check if this identifier is an alias defined in SELECT
@@ -2306,9 +2384,12 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<(Vec<String>, Vec<Row>)> {
         // Generate grouping sets based on modifier type
-        let grouping_sets = match stmt.group_by.modifier {
+        let grouping_sets = match &stmt.group_by.modifier {
             GroupByModifier::Rollup => Self::generate_rollup_sets(group_by_items.len()),
             GroupByModifier::Cube => Self::generate_cube_sets(group_by_items.len()),
+            GroupByModifier::GroupingSets(sets) => {
+                Self::generate_explicit_grouping_sets(sets, group_by_items)
+            }
             GroupByModifier::None => {
                 // Shouldn't happen, but handle it
                 vec![GroupingSet {
@@ -2634,6 +2715,42 @@ impl Executor {
         }
 
         sets
+    }
+
+    /// Generate grouping sets from explicit GROUPING SETS clause
+    /// GROUPING SETS ((a, b), (a), ()) generates exactly those three sets
+    fn generate_explicit_grouping_sets(
+        sets: &[Vec<Expression>],
+        group_by_items: &[GroupByItem],
+    ) -> Vec<GroupingSet> {
+        let num_columns = group_by_items.len();
+        let mut result = Vec::with_capacity(sets.len());
+
+        // Build a lookup from canonical key to group_by_items index
+        // Uses the same canonical key function for consistent matching
+        let item_to_index: FxHashMap<String, usize> = group_by_items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| (group_by_item_canonical_key(item), i))
+            .collect();
+
+        for set in sets {
+            let mut active_columns = vec![false; num_columns];
+
+            for expr in set {
+                // Get the canonical key for this expression
+                let key = expression_canonical_key(expr);
+
+                // Find the index in group_by_items
+                if let Some(&idx) = item_to_index.get(&key) {
+                    active_columns[idx] = true;
+                }
+            }
+
+            result.push(GroupingSet { active_columns });
+        }
+
+        result
     }
 
     /// Resolve GROUP BY column names for result (new version supporting GroupByItem)

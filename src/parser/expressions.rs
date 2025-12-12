@@ -1698,13 +1698,13 @@ impl Parser {
         list
     }
 
-    /// Parse a GROUP BY clause with optional ROLLUP/CUBE modifier
+    /// Parse a GROUP BY clause with optional ROLLUP/CUBE/GROUPING SETS modifier
     pub fn parse_group_by_clause(&mut self) -> GroupByClause {
         use crate::parser::ast::{GroupByClause, GroupByModifier};
 
         self.next_token();
 
-        // Check for ROLLUP or CUBE
+        // Check for ROLLUP, CUBE, or GROUPING SETS
         let modifier = if self.cur_token.token_type == TokenType::Identifier
             || self.cur_token.token_type == TokenType::Keyword
         {
@@ -1738,6 +1738,23 @@ impl Parser {
                     };
                 }
                 GroupByModifier::None
+            } else if upper == "GROUPING" {
+                // Check for GROUPING SETS
+                if self.peek_token.literal.to_uppercase() == "SETS" {
+                    self.next_token(); // consume GROUPING
+                    self.next_token(); // consume SETS
+                                       // Expect opening paren for the outer grouping sets list
+                    if self.cur_token.literal == "(" {
+                        self.next_token(); // consume (
+                        let sets = self.parse_grouping_sets();
+                        // cur_token should now be at )
+                        return GroupByClause {
+                            columns: Vec::new(),
+                            modifier: GroupByModifier::GroupingSets(sets),
+                        };
+                    }
+                }
+                GroupByModifier::None
             } else {
                 GroupByModifier::None
             }
@@ -1745,7 +1762,7 @@ impl Parser {
             GroupByModifier::None
         };
 
-        // Regular GROUP BY (no ROLLUP/CUBE)
+        // Regular GROUP BY (no ROLLUP/CUBE/GROUPING SETS)
         let mut columns = Vec::new();
         if let Some(expr) = self.parse_expression(Precedence::Lowest) {
             columns.push(expr);
@@ -1782,6 +1799,63 @@ impl Parser {
         if self.peek_token_is_punctuator(")") {
             self.next_token();
         }
+
+        columns
+    }
+
+    /// Parse GROUPING SETS content: ((col1, col2), (col1), ())
+    /// Returns a Vec of Vec<Expression>, where each inner Vec is one grouping set
+    fn parse_grouping_sets(&mut self) -> Vec<Vec<Expression>> {
+        let mut sets = Vec::new();
+
+        // Parse first set (must be there)
+        if self.cur_token.literal == "(" {
+            sets.push(self.parse_single_grouping_set());
+        }
+
+        // Parse additional sets separated by comma
+        while self.cur_token.literal == "," {
+            self.next_token(); // consume comma
+            if self.cur_token.literal == "(" {
+                sets.push(self.parse_single_grouping_set());
+            }
+        }
+
+        // cur_token should be at the closing ) of GROUPING SETS
+        sets
+    }
+
+    /// Parse a single grouping set: (col1, col2) or ()
+    fn parse_single_grouping_set(&mut self) -> Vec<Expression> {
+        let mut columns = Vec::new();
+
+        self.next_token(); // consume opening (
+
+        // Check for empty set ()
+        if self.cur_token.literal == ")" {
+            self.next_token(); // consume )
+            return columns;
+        }
+
+        // Parse first column
+        if let Some(expr) = self.parse_expression(Precedence::Lowest) {
+            columns.push(expr);
+        }
+
+        // Parse additional columns separated by comma within this set
+        while self.peek_token_is_punctuator(",") {
+            self.next_token(); // move to comma
+            self.next_token(); // move past comma to next expression
+            if let Some(expr) = self.parse_expression(Precedence::Lowest) {
+                columns.push(expr);
+            }
+        }
+
+        // Advance to the closing ) if not already there, then move past it
+        if self.peek_token_is_punctuator(")") {
+            self.next_token(); // move to )
+        }
+        self.next_token(); // move past )
 
         columns
     }

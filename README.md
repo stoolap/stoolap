@@ -183,6 +183,11 @@ GROUP BY ROLLUP(region, product);
 SELECT region, product, SUM(sales)
 FROM sales_data
 GROUP BY CUBE(region, product);
+
+-- GROUPING SETS: Explicit grouping combinations
+SELECT region, product, SUM(sales), GROUPING(region), GROUPING(product)
+FROM sales_data
+GROUP BY GROUPING SETS ((region, product), (region), ());
 ```
 
 ### Subqueries

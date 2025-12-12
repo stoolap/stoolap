@@ -1329,13 +1329,16 @@ pub struct SetOperation {
     pub right: Box<SelectStatement>,
 }
 
-/// Group by modifier (ROLLUP, CUBE, or none)
+/// Group by modifier (ROLLUP, CUBE, GROUPING SETS, or none)
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum GroupByModifier {
     #[default]
     None,
     Rollup,
     Cube,
+    /// GROUPING SETS - each inner Vec is one grouping set
+    /// e.g., GROUPING SETS ((a, b), (a), ()) has 3 sets
+    GroupingSets(Vec<Vec<Expression>>),
 }
 
 /// GROUP BY clause with optional ROLLUP/CUBE modifier
@@ -1347,14 +1350,28 @@ pub struct GroupByClause {
 
 impl fmt::Display for GroupByClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // GROUPING SETS uses its own column lists, not self.columns
+        if let GroupByModifier::GroupingSets(sets) = &self.modifier {
+            let sets_str: Vec<String> = sets
+                .iter()
+                .map(|set| {
+                    let cols: Vec<String> = set.iter().map(|c| c.to_string()).collect();
+                    format!("({})", cols.join(", "))
+                })
+                .collect();
+            return write!(f, "GROUPING SETS ({})", sets_str.join(", "));
+        }
+
+        // None, Rollup, Cube all use self.columns
         if self.columns.is_empty() {
             return Ok(());
         }
         let cols: Vec<String> = self.columns.iter().map(|c| c.to_string()).collect();
-        match self.modifier {
+        match &self.modifier {
             GroupByModifier::None => write!(f, "{}", cols.join(", ")),
             GroupByModifier::Rollup => write!(f, "ROLLUP({})", cols.join(", ")),
             GroupByModifier::Cube => write!(f, "CUBE({})", cols.join(", ")),
+            GroupByModifier::GroupingSets(_) => Ok(()), // Already handled above
         }
     }
 }

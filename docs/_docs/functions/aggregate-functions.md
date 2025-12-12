@@ -248,7 +248,48 @@ Result includes:
 - Subtotals for each category
 - Grand total
 
-See [ROLLUP and CUBE](../sql-features/rollup-cube) for detailed documentation.
+### GROUPING SETS
+
+Specifies exactly which grouping combinations to generate:
+
+```sql
+SELECT
+    region,
+    category,
+    SUM(sales) as total_sales
+FROM orders
+GROUP BY GROUPING SETS ((region, category), (region), ());
+```
+
+Result includes only the specified groupings:
+- Detail rows for each region/category combination
+- Subtotals for each region
+- Grand total
+
+GROUPING SETS provides full control over which aggregation levels appear in the result.
+
+### GROUPING() Function
+
+The GROUPING() function identifies super-aggregate rows (subtotals and grand totals):
+
+```sql
+SELECT
+    region,
+    category,
+    SUM(sales) as total_sales,
+    GROUPING(region) as is_region_agg,
+    GROUPING(category) as is_category_agg
+FROM orders
+GROUP BY ROLLUP(region, category);
+```
+
+Returns:
+- `0` if the column is part of the current grouping (normal grouped row)
+- `1` if the column is aggregated (super-aggregate row)
+
+Use GROUPING() to distinguish between actual NULL values and NULLs that indicate subtotal rows.
+
+See [ROLLUP, CUBE, and GROUPING SETS](../sql-features/rollup-cube) for detailed documentation.
 
 ## NULL Handling
 

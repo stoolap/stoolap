@@ -1,13 +1,13 @@
 ---
 layout: doc
-title: ROLLUP and CUBE
+title: ROLLUP, CUBE, and GROUPING SETS
 category: SQL Features
 order: 5
 ---
 
-# ROLLUP and CUBE
+# ROLLUP, CUBE, and GROUPING SETS
 
-ROLLUP and CUBE are extensions to GROUP BY that generate multiple levels of aggregation in a single query. They're useful for generating reports with subtotals and grand totals.
+ROLLUP, CUBE, and GROUPING SETS are extensions to GROUP BY that generate multiple levels of aggregation in a single query. They're useful for generating reports with subtotals and grand totals.
 
 ## ROLLUP
 
@@ -121,13 +121,143 @@ For `CUBE(region, category)`, it produces all 2^n combinations:
 3. `(NULL, category)` - totals by category
 4. `(NULL, NULL)` - grand total
 
-## ROLLUP vs CUBE
+## GROUPING SETS
 
-| Feature | ROLLUP | CUBE |
-|---------|--------|------|
-| Subtotals | Hierarchical only | All combinations |
-| Groupings | n + 1 | 2^n |
-| Use case | Hierarchical reports | Cross-tabulation |
+GROUPING SETS provides explicit control over which grouping combinations to generate, allowing you to specify exactly which aggregation levels you need.
+
+### Syntax
+
+```sql
+SELECT columns, aggregate_functions
+FROM table
+GROUP BY GROUPING SETS ((columns1), (columns2), ...);
+```
+
+### Example
+
+```sql
+-- Specify exact grouping combinations
+SELECT region, category, SUM(amount) as total
+FROM sales
+GROUP BY GROUPING SETS ((region, category), (region), ());
+```
+
+Result:
+```
+region | category    | total
+-------+-------------+-------
+East   | Clothing    | 50.0
+East   | Electronics | 250.0
+West   | Electronics | 200.0
+West   | Clothing    | 135.0
+East   | NULL        | 300.0    -- region subtotal
+West   | NULL        | 335.0    -- region subtotal
+NULL   | NULL        | 635.0    -- grand total
+```
+
+### How GROUPING SETS Works
+
+Each inner parentheses defines a grouping:
+- `(region, category)` - group by both columns (detail rows)
+- `(region)` - group by region only (region subtotals)
+- `()` - empty set produces grand total
+
+### Equivalence with ROLLUP and CUBE
+
+GROUPING SETS can express any ROLLUP or CUBE:
+
+```sql
+-- These are equivalent:
+GROUP BY ROLLUP(a, b)
+GROUP BY GROUPING SETS ((a, b), (a), ())
+
+-- These are equivalent:
+GROUP BY CUBE(a, b)
+GROUP BY GROUPING SETS ((a, b), (a), (b), ())
+```
+
+### Selective Subtotals
+
+Unlike ROLLUP and CUBE, GROUPING SETS lets you pick specific combinations:
+
+```sql
+-- Only region and category subtotals, no detail rows
+SELECT region, category, SUM(amount) as total
+FROM sales
+GROUP BY GROUPING SETS ((region), (category));
+```
+
+Result:
+```
+region | category    | total
+-------+-------------+-------
+East   | NULL        | 300.0    -- region subtotal
+West   | NULL        | 335.0    -- region subtotal
+NULL   | Clothing    | 185.0    -- category subtotal
+NULL   | Electronics | 450.0    -- category subtotal
+```
+
+## GROUPING() Function
+
+The GROUPING() function identifies whether a NULL value in the result represents an actual NULL in the data or indicates a super-aggregate row (subtotal/grand total).
+
+### Syntax
+
+```sql
+GROUPING(column)
+```
+
+Returns:
+- `0` if the column is part of the current grouping (normal row)
+- `1` if the column is aggregated (super-aggregate row)
+
+### Example
+
+```sql
+SELECT
+    region,
+    category,
+    SUM(amount) as total,
+    GROUPING(region) as is_region_aggregated,
+    GROUPING(category) as is_category_aggregated
+FROM sales
+GROUP BY GROUPING SETS ((region, category), (region), ());
+```
+
+Result:
+```
+region | category    | total | is_region_aggregated | is_category_aggregated
+-------+-------------+-------+----------------------+-----------------------
+East   | Clothing    | 50.0  | 0                    | 0
+East   | Electronics | 250.0 | 0                    | 0
+West   | Electronics | 200.0 | 0                    | 0
+West   | Clothing    | 135.0 | 0                    | 0
+East   | NULL        | 300.0 | 0                    | 1   -- category aggregated
+West   | NULL        | 335.0 | 0                    | 1   -- category aggregated
+NULL   | NULL        | 635.0 | 1                    | 1   -- both aggregated
+```
+
+### Distinguishing NULL Values
+
+Use GROUPING() to handle NULL values properly:
+
+```sql
+SELECT
+    CASE WHEN GROUPING(region) = 1 THEN '(All Regions)' ELSE COALESCE(region, 'Unknown') END as region,
+    CASE WHEN GROUPING(category) = 1 THEN '(All Categories)' ELSE COALESCE(category, 'Unknown') END as category,
+    SUM(amount) as total
+FROM sales
+GROUP BY ROLLUP(region, category);
+```
+
+## Comparison: ROLLUP vs CUBE vs GROUPING SETS
+
+| Feature | ROLLUP | CUBE | GROUPING SETS |
+|---------|--------|------|---------------|
+| Subtotals | Hierarchical only | All combinations | User-defined |
+| Groupings | n + 1 | 2^n | As specified |
+| Use case | Hierarchical reports | Cross-tabulation | Custom reports |
+| Flexibility | Low | Medium | High |
 
 ### Grouping Count Example
 
