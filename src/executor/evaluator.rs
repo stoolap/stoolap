@@ -568,6 +568,7 @@ impl<'a> Evaluator<'a> {
                 "ALL/ANY subquery should be evaluated in subquery context".to_string(),
             )),
             Expression::In(in_expr) => self.evaluate_in(in_expr),
+            Expression::InHashSet(in_hash) => self.evaluate_in_hashset(in_hash),
             Expression::Between(between) => self.evaluate_between(between),
             Expression::Like(like) => self.evaluate_like_expression(like),
             Expression::ScalarSubquery(_) => Err(Error::NotSupportedMessage(
@@ -1246,6 +1247,23 @@ impl<'a> Evaluator<'a> {
                 Ok(Value::Boolean(if in_expr.not { !matches } else { matches }))
             }
         }
+    }
+
+    /// Evaluate pre-computed IN HashSet expression - O(1) lookup
+    ///
+    /// This is the fast path for semi-join optimizations that pre-compute the HashSet.
+    /// No caching needed since the HashSet is already built and stored in Arc.
+    fn evaluate_in_hashset(&self, in_hash: &InHashSetExpression) -> Result<Value> {
+        let column_val = self.evaluate(&in_hash.column)?;
+
+        // If column is NULL, result is always NULL (UNKNOWN)
+        if column_val.is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        // O(1) HashSet lookup - no cache needed, Arc is shared across clones
+        let found = in_hash.values.contains(&column_val);
+        Ok(Value::Boolean(if in_hash.not { !found } else { found }))
     }
 
     /// Helper for evaluate_in - handles list with proper NULL semantics

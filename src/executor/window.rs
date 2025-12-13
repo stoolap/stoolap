@@ -29,6 +29,7 @@
 //! - OVER (PARTITION BY col) - Partition by column values
 //! - OVER (ORDER BY col) - Order within partition
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
@@ -817,26 +818,61 @@ impl Executor {
         }
 
         // Compute window function for each partition
-        let mut results = vec![Value::null_unknown(); rows.len()];
+        // Use parallel execution for large number of partitions
+        let partition_count = partitions.len();
+        let use_parallel = partition_count >= 10 && rows.len() >= 1000;
 
-        for (_key, row_indices) in partitions {
-            let (partition_results, sorted_indices) = self.compute_window_for_partition(
-                &*window_func,
-                wf_info,
-                rows,
-                row_indices,
-                columns,
-                col_index_map,
-                ctx,
-            )?;
+        if use_parallel {
+            // Parallel execution: process partitions concurrently
+            let results_values: std::sync::RwLock<Vec<Value>> =
+                std::sync::RwLock::new(vec![Value::null_unknown(); rows.len()]);
 
-            // Map results from sorted order back to original row indices
-            for (i, &orig_idx) in sorted_indices.iter().enumerate() {
-                results[orig_idx] = partition_results[i].clone();
+            let partitions_vec: Vec<_> = partitions.into_iter().collect();
+            partitions_vec
+                .par_iter()
+                .try_for_each(|(_key, row_indices)| -> Result<()> {
+                    let (partition_results, sorted_indices) = self.compute_window_for_partition(
+                        &*window_func,
+                        wf_info,
+                        rows,
+                        row_indices.clone(),
+                        columns,
+                        col_index_map,
+                        ctx,
+                    )?;
+
+                    // Map results from sorted order back to original row indices
+                    let mut results_guard = results_values.write().unwrap();
+                    for (i, &orig_idx) in sorted_indices.iter().enumerate() {
+                        results_guard[orig_idx] = partition_results[i].clone();
+                    }
+                    Ok(())
+                })?;
+
+            Ok(results_values.into_inner().unwrap())
+        } else {
+            // Sequential execution for small partition counts
+            let mut results = vec![Value::null_unknown(); rows.len()];
+
+            for (_key, row_indices) in partitions {
+                let (partition_results, sorted_indices) = self.compute_window_for_partition(
+                    &*window_func,
+                    wf_info,
+                    rows,
+                    row_indices,
+                    columns,
+                    col_index_map,
+                    ctx,
+                )?;
+
+                // Map results from sorted order back to original row indices
+                for (i, &orig_idx) in sorted_indices.iter().enumerate() {
+                    results[orig_idx] = partition_results[i].clone();
+                }
             }
-        }
 
-        Ok(results)
+            Ok(results)
+        }
     }
 
     /// Compute window function for a single partition

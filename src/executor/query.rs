@@ -160,6 +160,235 @@ fn expression_has_parameters(expr: &Expression) -> bool {
     }
 }
 
+/// Extract all table qualifiers (aliases) referenced in an expression.
+/// Returns a set of lowercase table names/aliases.
+fn collect_table_qualifiers(expr: &Expression) -> rustc_hash::FxHashSet<String> {
+    let mut qualifiers = rustc_hash::FxHashSet::default();
+    collect_table_qualifiers_impl(expr, &mut qualifiers);
+    qualifiers
+}
+
+fn collect_table_qualifiers_impl(
+    expr: &Expression,
+    qualifiers: &mut rustc_hash::FxHashSet<String>,
+) {
+    match expr {
+        Expression::QualifiedIdentifier(qi) => {
+            qualifiers.insert(qi.qualifier.value.to_lowercase());
+        }
+        Expression::Infix(infix) => {
+            collect_table_qualifiers_impl(&infix.left, qualifiers);
+            collect_table_qualifiers_impl(&infix.right, qualifiers);
+        }
+        Expression::Prefix(prefix) => {
+            collect_table_qualifiers_impl(&prefix.right, qualifiers);
+        }
+        Expression::In(in_expr) => {
+            collect_table_qualifiers_impl(&in_expr.left, qualifiers);
+            if let Expression::List(list) = in_expr.right.as_ref() {
+                for elem in &list.elements {
+                    collect_table_qualifiers_impl(elem, qualifiers);
+                }
+            }
+        }
+        Expression::Between(between) => {
+            collect_table_qualifiers_impl(&between.expr, qualifiers);
+            collect_table_qualifiers_impl(&between.lower, qualifiers);
+            collect_table_qualifiers_impl(&between.upper, qualifiers);
+        }
+        Expression::Like(like) => {
+            collect_table_qualifiers_impl(&like.left, qualifiers);
+            collect_table_qualifiers_impl(&like.pattern, qualifiers);
+        }
+        Expression::FunctionCall(func) => {
+            for arg in &func.arguments {
+                collect_table_qualifiers_impl(arg, qualifiers);
+            }
+        }
+        Expression::Aliased(aliased) => {
+            collect_table_qualifiers_impl(&aliased.expression, qualifiers);
+        }
+        Expression::Cast(cast) => {
+            collect_table_qualifiers_impl(&cast.expr, qualifiers);
+        }
+        _ => {}
+    }
+}
+
+/// Partition WHERE clause predicates for JOIN filter pushdown.
+/// Returns (left_filter, right_filter, cross_table_filter).
+/// - left_filter: predicates referencing only left table
+/// - right_filter: predicates referencing only right table
+/// - cross_table_filter: predicates referencing both tables (must be applied post-join)
+fn partition_where_for_join(
+    where_clause: &Expression,
+    left_alias: &str,
+    right_alias: &str,
+) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
+    let left_alias_lower = left_alias.to_lowercase();
+    let right_alias_lower = right_alias.to_lowercase();
+
+    // Collect AND-ed predicates
+    let predicates = flatten_and_predicates(where_clause);
+
+    let mut left_preds = Vec::new();
+    let mut right_preds = Vec::new();
+    let mut cross_preds = Vec::new();
+
+    for pred in predicates {
+        let qualifiers = collect_table_qualifiers(&pred);
+
+        let refs_left = qualifiers.contains(&left_alias_lower);
+        let refs_right = qualifiers.contains(&right_alias_lower);
+
+        if refs_left && refs_right {
+            // References both tables - must be applied post-join
+            cross_preds.push(pred);
+        } else if refs_left {
+            // Only references left table - push to left
+            left_preds.push(pred);
+        } else if refs_right {
+            // Only references right table - push to right
+            right_preds.push(pred);
+        } else {
+            // No table references (constants) - push to left arbitrarily
+            left_preds.push(pred);
+        }
+    }
+
+    (
+        combine_predicates_with_and(left_preds),
+        combine_predicates_with_and(right_preds),
+        combine_predicates_with_and(cross_preds),
+    )
+}
+
+/// Flatten AND predicates into a list
+fn flatten_and_predicates(expr: &Expression) -> Vec<Expression> {
+    match expr {
+        Expression::Infix(infix) if infix.operator.to_uppercase() == "AND" => {
+            let mut result = flatten_and_predicates(&infix.left);
+            result.extend(flatten_and_predicates(&infix.right));
+            result
+        }
+        _ => vec![expr.clone()],
+    }
+}
+
+/// Combine predicates with AND
+fn combine_predicates_with_and(preds: Vec<Expression>) -> Option<Expression> {
+    if preds.is_empty() {
+        return None;
+    }
+
+    let mut result = preds.into_iter();
+    let first = result.next().unwrap();
+
+    Some(result.fold(first, |acc, pred| {
+        Expression::Infix(InfixExpression::new(
+            Token::new(TokenType::Keyword, "AND", Position::default()),
+            Box::new(acc),
+            "AND".to_string(),
+            Box::new(pred),
+        ))
+    }))
+}
+
+/// Get table alias from a table expression
+fn get_table_alias_from_expr(expr: &Expression) -> Option<String> {
+    match expr {
+        Expression::TableSource(ts) => Some(
+            ts.alias
+                .as_ref()
+                .map(|a| a.value.clone())
+                .unwrap_or_else(|| ts.name.value.clone()),
+        ),
+        Expression::SubquerySource(ss) => ss.alias.as_ref().map(|a| a.value.clone()),
+        _ => None,
+    }
+}
+
+/// Strip table qualifier from an expression, replacing qualified identifiers
+/// with unqualified ones. Used when pushing filters to individual table scans.
+fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {
+    let alias_lower = table_alias.to_lowercase();
+
+    match expr {
+        Expression::QualifiedIdentifier(qi) if qi.qualifier.value.to_lowercase() == alias_lower => {
+            // Convert to simple identifier
+            Expression::Identifier(Identifier::new(
+                qi.name.token.clone(),
+                qi.name.value.clone(),
+            ))
+        }
+        Expression::Infix(infix) => Expression::Infix(InfixExpression::new(
+            infix.token.clone(),
+            Box::new(strip_table_qualifier(&infix.left, table_alias)),
+            infix.operator.clone(),
+            Box::new(strip_table_qualifier(&infix.right, table_alias)),
+        )),
+        Expression::Prefix(prefix) => Expression::Prefix(PrefixExpression::new(
+            prefix.token.clone(),
+            prefix.operator.clone(),
+            Box::new(strip_table_qualifier(&prefix.right, table_alias)),
+        )),
+        Expression::In(in_expr) => {
+            let new_left = strip_table_qualifier(&in_expr.left, table_alias);
+            let new_right = match in_expr.right.as_ref() {
+                Expression::List(list) => Expression::List(ListExpression {
+                    token: list.token.clone(),
+                    elements: list
+                        .elements
+                        .iter()
+                        .map(|e| strip_table_qualifier(e, table_alias))
+                        .collect(),
+                }),
+                other => strip_table_qualifier(other, table_alias),
+            };
+            Expression::In(InExpression {
+                token: in_expr.token.clone(),
+                left: Box::new(new_left),
+                right: Box::new(new_right),
+                not: in_expr.not,
+            })
+        }
+        Expression::Between(between) => Expression::Between(BetweenExpression {
+            token: between.token.clone(),
+            expr: Box::new(strip_table_qualifier(&between.expr, table_alias)),
+            lower: Box::new(strip_table_qualifier(&between.lower, table_alias)),
+            upper: Box::new(strip_table_qualifier(&between.upper, table_alias)),
+            not: between.not,
+        }),
+        Expression::Like(like) => Expression::Like(LikeExpression {
+            token: like.token.clone(),
+            left: Box::new(strip_table_qualifier(&like.left, table_alias)),
+            pattern: Box::new(strip_table_qualifier(&like.pattern, table_alias)),
+            operator: like.operator.clone(),
+            escape: like
+                .escape
+                .as_ref()
+                .map(|e| Box::new(strip_table_qualifier(e, table_alias))),
+        }),
+        Expression::FunctionCall(func) => Expression::FunctionCall(FunctionCall {
+            token: func.token.clone(),
+            function: func.function.clone(),
+            arguments: func
+                .arguments
+                .iter()
+                .map(|a| strip_table_qualifier(a, table_alias))
+                .collect(),
+            is_distinct: func.is_distinct,
+            order_by: func.order_by.clone(),
+            filter: func
+                .filter
+                .as_ref()
+                .map(|f| Box::new(strip_table_qualifier(f, table_alias))),
+        }),
+        // For other expressions, return as-is
+        _ => expr.clone(),
+    }
+}
+
 impl Executor {
     /// Execute a SELECT statement
     pub(crate) fn execute_select(
@@ -181,35 +410,7 @@ impl Executor {
             return self.execute_select_with_ctes(stmt, ctx);
         }
 
-        // Execute the main query
-        // The third return value indicates if LIMIT/OFFSET was already applied (by storage-level pushdown)
-        let (mut result, columns, limit_offset_applied) =
-            self.execute_select_internal(stmt, ctx)?;
-
-        // Apply set operations (UNION, INTERSECT, EXCEPT)
-        if !stmt.set_operations.is_empty() {
-            result = self.execute_set_operations(result, &stmt.set_operations, ctx)?;
-        }
-
-        // Count expected SELECT columns (before any extra ORDER BY columns)
-        let expected_columns = self.count_select_columns(stmt);
-
-        // Apply DISTINCT
-        // When ORDER BY references columns not in SELECT, we add extra columns for sorting.
-        // DISTINCT should only consider the original SELECT columns, not the extra ORDER BY columns.
-        if stmt.distinct {
-            if columns.len() > expected_columns && expected_columns > 0 {
-                // Extra ORDER BY columns present - only hash SELECT columns for distinctness
-                result = Box::new(DistinctResult::with_column_count(
-                    result,
-                    Some(expected_columns),
-                ));
-            } else {
-                result = Box::new(DistinctResult::new(result));
-            }
-        }
-
-        // Evaluate LIMIT/OFFSET early (needed for TOP-N optimization)
+        // Evaluate LIMIT/OFFSET early (needed for set operations optimization)
         let limit = if let Some(ref limit_expr) = stmt.limit {
             let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
             match evaluator.evaluate(limit_expr) {
@@ -223,7 +424,6 @@ impl Executor {
                     Some(l as usize)
                 }
                 Ok(Value::Float(f)) => {
-                    // Convert float to integer (truncate)
                     let l = f as i64;
                     if l < 0 {
                         return Err(Error::ParseError(format!(
@@ -258,7 +458,6 @@ impl Executor {
                     o as usize
                 }
                 Ok(Value::Float(f)) => {
-                    // Convert float to integer (truncate)
                     let o = f as i64;
                     if o < 0 {
                         return Err(Error::ParseError(format!(
@@ -280,7 +479,53 @@ impl Executor {
             0
         };
 
+        // Execute the main query
+        // The third return value indicates if LIMIT/OFFSET was already applied (by storage-level pushdown)
+        let (mut result, columns, limit_offset_applied) =
+            self.execute_select_internal(stmt, ctx)?;
+
+        // Apply set operations (UNION, INTERSECT, EXCEPT)
+        // Pass limit+offset to enable early termination for UNION ALL
+        let mut limit_offset_applied = limit_offset_applied;
+        if !stmt.set_operations.is_empty() {
+            // Only enable limit pushdown for pure UNION ALL (no dedup needed)
+            let all_union_all = stmt
+                .set_operations
+                .iter()
+                .all(|op| matches!(op.operation, SetOperationType::UnionAll));
+            let set_limit = if all_union_all && stmt.order_by.is_empty() && !stmt.distinct {
+                // Only push limit when there's no ORDER BY or DISTINCT that needs full result
+                limit.map(|l| l + offset)
+            } else {
+                None
+            };
+            result = self.execute_set_operations(result, &stmt.set_operations, ctx, set_limit)?;
+
+            // After set operations, reset limit_offset_applied since we have a new result
+            // For UNION ALL with limit, we've already incorporated the limit
+            limit_offset_applied = all_union_all && set_limit.is_some();
+        }
+
+        // Count expected SELECT columns (before any extra ORDER BY columns)
+        let expected_columns = self.count_select_columns(stmt);
+
+        // Apply DISTINCT
+        // When ORDER BY references columns not in SELECT, we add extra columns for sorting.
+        // DISTINCT should only consider the original SELECT columns, not the extra ORDER BY columns.
+        if stmt.distinct {
+            if columns.len() > expected_columns && expected_columns > 0 {
+                // Extra ORDER BY columns present - only hash SELECT columns for distinctness
+                result = Box::new(DistinctResult::with_column_count(
+                    result,
+                    Some(expected_columns),
+                ));
+            } else {
+                result = Box::new(DistinctResult::new(result));
+            }
+        }
+
         // Apply ORDER BY (with TOP-N optimization if LIMIT is present)
+        // Note: LIMIT/OFFSET was already evaluated earlier for set operations optimization
         if !stmt.order_by.is_empty() {
             // Helper to format aggregate function call as column name
             let format_agg_column = |func: &crate::parser::ast::FunctionCall| -> String {
@@ -753,20 +998,52 @@ impl Executor {
     }
 
     /// Execute set operations (UNION, INTERSECT, EXCEPT)
+    /// The limit parameter enables early termination for UNION ALL
     fn execute_set_operations(
         &self,
         left_result: Box<dyn QueryResult>,
         set_ops: &[SetOperation],
         ctx: &ExecutionContext,
+        limit: Option<usize>,
     ) -> Result<Box<dyn QueryResult>> {
         use rustc_hash::FxHashSet;
 
-        // Materialize the left result
+        // Materialize the left result (with limit for UNION ALL optimization)
         let columns = left_result.columns().to_vec();
-        let mut result_rows = Self::materialize_result(left_result)?;
+
+        // For UNION ALL with limit, we can take advantage of early termination
+        // Check if all operations are UNION ALL
+        let all_union_all = set_ops
+            .iter()
+            .all(|op| matches!(op.operation, SetOperationType::UnionAll));
+
+        let mut result_rows = if let (true, Some(lim)) = (all_union_all, limit) {
+            // Only materialize up to limit rows from left side
+            let mut rows = Vec::with_capacity(lim.min(1024));
+            let mut left_result = left_result;
+            while left_result.next() {
+                rows.push(left_result.take_row());
+                if rows.len() >= lim {
+                    return Ok(Box::new(ExecutorMemoryResult::new(columns, rows)));
+                }
+            }
+            rows
+        } else {
+            Self::materialize_result(left_result)?
+        };
 
         // Process each set operation in sequence
         for set_op in set_ops {
+            // For UNION ALL with limit, check if we already have enough rows
+            if matches!(set_op.operation, SetOperationType::UnionAll) {
+                if let Some(lim) = limit {
+                    if result_rows.len() >= lim {
+                        // Already have enough rows, skip remaining set operations
+                        break;
+                    }
+                }
+            }
+
             // Execute the right side query
             let right_result = self.execute_select(&set_op.right, ctx)?;
 
@@ -786,12 +1063,11 @@ impl Executor {
                 )));
             }
 
-            let right_rows = Self::materialize_result(right_result)?;
-
             // Apply the set operation
             match &set_op.operation {
                 SetOperationType::Union => {
                     // UNION: combine rows and remove duplicates
+                    let right_rows = Self::materialize_result(right_result)?;
                     let mut seen: FxHashSet<u64> = FxHashSet::default();
                     let mut unique_rows = Vec::new();
 
@@ -815,10 +1091,25 @@ impl Executor {
                 }
                 SetOperationType::UnionAll => {
                     // UNION ALL: just concatenate (keep all duplicates)
-                    result_rows.extend(right_rows);
+                    // With limit optimization, only take as many rows as needed
+                    if let Some(lim) = limit {
+                        let needed = lim.saturating_sub(result_rows.len());
+                        if needed > 0 {
+                            let mut right_result = right_result;
+                            let mut count = 0;
+                            while right_result.next() && count < needed {
+                                result_rows.push(right_result.take_row());
+                                count += 1;
+                            }
+                        }
+                    } else {
+                        let right_rows = Self::materialize_result(right_result)?;
+                        result_rows.extend(right_rows);
+                    }
                 }
                 SetOperationType::Intersect => {
                     // INTERSECT: keep only rows that exist in both (dedup)
+                    let right_rows = Self::materialize_result(right_result)?;
                     let right_hashes: FxHashSet<u64> =
                         right_rows.iter().map(Self::hash_row).collect();
 
@@ -830,6 +1121,7 @@ impl Executor {
                 }
                 SetOperationType::IntersectAll => {
                     // INTERSECT ALL: keep matching rows with multiplicity
+                    let right_rows = Self::materialize_result(right_result)?;
                     let mut right_counts: rustc_hash::FxHashMap<u64, usize> =
                         rustc_hash::FxHashMap::default();
                     for row in &right_rows {
@@ -849,6 +1141,7 @@ impl Executor {
                 }
                 SetOperationType::Except => {
                     // EXCEPT: keep left rows not in right (dedup)
+                    let right_rows = Self::materialize_result(right_result)?;
                     let right_hashes: FxHashSet<u64> =
                         right_rows.iter().map(Self::hash_row).collect();
 
@@ -860,6 +1153,7 @@ impl Executor {
                 }
                 SetOperationType::ExceptAll => {
                     // EXCEPT ALL: remove matching rows with multiplicity
+                    let right_rows = Self::materialize_result(right_result)?;
                     let mut right_counts: rustc_hash::FxHashMap<u64, usize> =
                         rustc_hash::FxHashMap::default();
                     for row in &right_rows {
@@ -1370,8 +1664,20 @@ impl Executor {
             let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
             let limit = if let Some(ref limit_expr) = stmt.limit {
                 match evaluator.evaluate(limit_expr) {
-                    Ok(Value::Integer(l)) => l as usize,
-                    Ok(Value::Float(f)) => f as usize,
+                    Ok(Value::Integer(l)) if l >= 0 => l as usize,
+                    Ok(Value::Integer(l)) => {
+                        return Err(Error::ParseError(format!(
+                            "LIMIT must be non-negative, got {}",
+                            l
+                        )));
+                    }
+                    Ok(Value::Float(f)) if f >= 0.0 => f as usize,
+                    Ok(Value::Float(f)) => {
+                        return Err(Error::ParseError(format!(
+                            "LIMIT must be non-negative, got {}",
+                            f
+                        )));
+                    }
                     _ => usize::MAX,
                 }
             } else {
@@ -1380,8 +1686,20 @@ impl Executor {
 
             let offset = if let Some(ref offset_expr) = stmt.offset {
                 match evaluator.evaluate(offset_expr) {
-                    Ok(Value::Integer(o)) => o as usize,
-                    Ok(Value::Float(f)) => f as usize,
+                    Ok(Value::Integer(o)) if o >= 0 => o as usize,
+                    Ok(Value::Integer(o)) => {
+                        return Err(Error::ParseError(format!(
+                            "OFFSET must be non-negative, got {}",
+                            o
+                        )));
+                    }
+                    Ok(Value::Float(f)) if f >= 0.0 => f as usize,
+                    Ok(Value::Float(f)) => {
+                        return Err(Error::ParseError(format!(
+                            "OFFSET must be non-negative, got {}",
+                            f
+                        )));
+                    }
                     _ => 0,
                 }
             } else {
@@ -1864,23 +2182,151 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
-        // Execute left side
-        let (left_result, left_columns) = self.execute_table_expression(&join_source.left, ctx)?;
+        // Get table aliases for filter pushdown
+        let left_alias = get_table_alias_from_expr(&join_source.left);
+        let right_alias = get_table_alias_from_expr(&join_source.right);
 
-        // Execute right side
-        let (right_result, right_columns) =
-            self.execute_table_expression(&join_source.right, ctx)?;
+        // Determine join type early for filter pushdown decisions
+        let join_type = join_source.join_type.to_uppercase();
 
-        // Materialize both sides
-        let left_rows = Self::materialize_result(left_result)?;
-        let right_rows = Self::materialize_result(right_result)?;
+        // Partition WHERE clause predicates for pushdown
+        // Note: For OUTER JOINs, we must be careful:
+        // - LEFT JOIN: Can push filters to left (preserved), but NOT to right (may have NULLs)
+        // - RIGHT JOIN: Can push filters to right (preserved), but NOT to left
+        // - FULL OUTER JOIN: Cannot push filters to either side
+        let (left_filter, right_filter, cross_filter) =
+            if let Some(ref where_clause) = stmt.where_clause {
+                if let (Some(left_a), Some(right_a)) = (&left_alias, &right_alias) {
+                    let (l, r, c) = partition_where_for_join(where_clause, left_a, right_a);
+
+                    // For OUTER JOINs, we can't push filters to the NULL-padded side
+                    // because rows that don't match need to appear with NULLs
+                    let can_push_left = !join_type.contains("RIGHT") && !join_type.contains("FULL");
+                    let can_push_right = !join_type.contains("LEFT") && !join_type.contains("FULL");
+
+                    let safe_left = if can_push_left {
+                        l.as_ref().map(|f| strip_table_qualifier(f, left_a))
+                    } else {
+                        None
+                    };
+
+                    let safe_right = if can_push_right {
+                        r.as_ref().map(|f| strip_table_qualifier(f, right_a))
+                    } else {
+                        None
+                    };
+
+                    // Any filters we couldn't push need to be applied post-join
+                    // If we pushed a filter, don't include it in remaining; otherwise include it
+                    let unpushed_left = if !can_push_left { l } else { None };
+                    let unpushed_right = if !can_push_right { r } else { None };
+
+                    let remaining = match (unpushed_left, unpushed_right, c) {
+                        (Some(l), Some(r), Some(c)) => combine_predicates_with_and(vec![l, r, c]),
+                        (Some(l), Some(r), None) => combine_predicates_with_and(vec![l, r]),
+                        (Some(l), None, Some(c)) => combine_predicates_with_and(vec![l, c]),
+                        (None, Some(r), Some(c)) => combine_predicates_with_and(vec![r, c]),
+                        (Some(l), None, None) => Some(l),
+                        (None, Some(r), None) => Some(r),
+                        (None, None, c) => c,
+                    };
+
+                    (safe_left, safe_right, remaining)
+                } else {
+                    (None, None, Some((**where_clause).clone()))
+                }
+            } else {
+                (None, None, None)
+            };
+
+        // Semi-join reduction optimization for LEFT JOIN + GROUP BY + LIMIT
+        // Pattern: LEFT JOIN + GROUP BY on left columns only + LIMIT N + no ORDER BY
+        // Optimization: limit left side first, filter right side with IN clause (uses index)
+        // This reduces materialization from O(L + R) to O(N + N*avg_matches)
+        let semijoin_limit = self.get_semijoin_reduction_limit(
+            &join_type,
+            stmt,
+            left_alias.as_deref(),
+            &join_source.condition,
+        );
+
+        let (left_rows, left_columns, right_rows, right_columns) =
+            if let Some((limit_n, left_key_col, right_key_col)) = semijoin_limit {
+                // Optimized path: semi-join reduction
+                // Step 1: Execute and materialize left side with limit
+                let (left_result, left_cols) = self.execute_table_expression_with_filter(
+                    &join_source.left,
+                    ctx,
+                    left_filter.as_ref(),
+                )?;
+                let mut left_rows = Self::materialize_result(left_result)?;
+                left_rows.truncate(limit_n);
+
+                // Step 2: Extract join key values from limited left rows
+                let left_key_idx = Self::find_column_index_by_name(&left_key_col, &left_cols);
+                let join_key_values: Vec<Value> = if let Some(idx) = left_key_idx {
+                    left_rows
+                        .iter()
+                        .filter_map(|row| row.get(idx).cloned())
+                        .filter(|v| !v.is_null())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Step 3: Build combined filter for right side with IN clause
+                let right_filter_with_in = if !join_key_values.is_empty() {
+                    // Create IN expression: right_key_col IN (v1, v2, ..., vN)
+                    let in_expr = self.build_in_filter_expression(&right_key_col, &join_key_values);
+                    // Combine with existing right filter if any
+                    match (right_filter.clone(), in_expr) {
+                        (Some(existing), Some(in_filter)) => {
+                            Some(Expression::Infix(InfixExpression::new(
+                                Token::new(TokenType::Keyword, "AND", Position::default()),
+                                Box::new(existing),
+                                "AND".to_string(),
+                                Box::new(in_filter),
+                            )))
+                        }
+                        (None, Some(in_filter)) => Some(in_filter),
+                        (existing, None) => existing,
+                    }
+                } else {
+                    right_filter.clone()
+                };
+
+                // Step 4: Execute right side with IN filter (uses index on right_key_col)
+                let (right_result, right_cols) = self.execute_table_expression_with_filter(
+                    &join_source.right,
+                    ctx,
+                    right_filter_with_in.as_ref(),
+                )?;
+                let right_rows = Self::materialize_result(right_result)?;
+
+                (left_rows, left_cols, right_rows, right_cols)
+            } else {
+                // Standard path: execute both sides normally
+                let (left_result, left_cols) = self.execute_table_expression_with_filter(
+                    &join_source.left,
+                    ctx,
+                    left_filter.as_ref(),
+                )?;
+
+                let (right_result, right_cols) = self.execute_table_expression_with_filter(
+                    &join_source.right,
+                    ctx,
+                    right_filter.as_ref(),
+                )?;
+
+                let left_rows = Self::materialize_result(left_result)?;
+                let right_rows = Self::materialize_result(right_result)?;
+
+                (left_rows, left_cols, right_rows, right_cols)
+            };
 
         // Combine column names (qualified with table aliases)
         let mut all_columns = left_columns.clone();
         all_columns.extend(right_columns.clone());
-
-        // Determine join type
-        let join_type = join_source.join_type.to_uppercase();
 
         // Handle NATURAL JOIN or USING clause by automatically finding common columns
         let natural_join_condition =
@@ -2077,6 +2523,37 @@ impl Executor {
                 AqeJoinDecision::SwitchToNestedLoop => RuntimeJoinAlgorithm::NestedLoop,
             };
 
+            // Compute safe LIMIT for pushdown to hash join
+            // LIMIT can only be pushed when:
+            // - It's an INNER JOIN, LEFT JOIN, or RIGHT JOIN (not FULL OUTER)
+            // - No residual conditions to apply after join
+            // - No ORDER BY (would need all rows to sort first)
+            // - No remaining cross-table WHERE conditions
+            // - No GROUP BY or aggregation (needs all rows to form correct groups)
+            // Note: LEFT/RIGHT JOINs can early-terminate because each probe row
+            // contributes to output (either matches or NULL-padded)
+            let has_group_by = !stmt.group_by.columns.is_empty();
+            let has_aggregation = self.has_aggregation(stmt);
+            let can_push_limit = !join_type.contains("FULL")
+                && residual.is_empty()
+                && stmt.order_by.is_empty()
+                && cross_filter.is_none()
+                && !has_group_by
+                && !has_aggregation;
+
+            let join_limit = if can_push_limit {
+                // Extract LIMIT value if present
+                stmt.limit.as_ref().and_then(|limit_expr| {
+                    let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+                    evaluator.evaluate(limit_expr).ok().and_then(|v| match v {
+                        Value::Integer(n) if n >= 0 => Some(n as u64),
+                        _ => None,
+                    })
+                })
+            } else {
+                None
+            };
+
             // Select join algorithm based on final decision (planner or AQE-overridden)
             match final_algorithm {
                 RuntimeJoinAlgorithm::HashJoin => {
@@ -2086,6 +2563,7 @@ impl Executor {
                     // - Build side optimization (smaller table as build)
                     // - Outer join restrictions (LEFT/RIGHT/FULL joins need specific build sides)
                     // - Bloom filter optimization
+                    // - Early termination when limit is pushed
                     let mut rows = self.execute_hash_join(
                         &left_rows,
                         &right_rows,
@@ -2094,6 +2572,7 @@ impl Executor {
                         &join_type,
                         left_columns.len(),
                         right_columns.len(),
+                        join_limit,
                     )?;
 
                     // Apply residual conditions (non-equality parts of ON clause)
@@ -2150,11 +2629,34 @@ impl Executor {
                         &right_columns,
                         &join_type,
                         ctx,
+                        join_limit,
                     )?
                 }
             }
         } else {
             // CROSS JOIN - no condition
+            // For CROSS JOIN, compute limit directly since we don't have join keys
+            // Don't push limit when there's aggregation (needs all rows for grouping)
+            let cross_has_group_by = !stmt.group_by.columns.is_empty();
+            let cross_has_aggregation = self.has_aggregation(stmt);
+            let cross_join_limit = if !join_type.contains("LEFT")
+                && !join_type.contains("RIGHT")
+                && !join_type.contains("FULL")
+                && stmt.order_by.is_empty()
+                && stmt.where_clause.is_none()
+                && !cross_has_group_by
+                && !cross_has_aggregation
+            {
+                stmt.limit.as_ref().and_then(|limit_expr| {
+                    let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+                    evaluator.evaluate(limit_expr).ok().and_then(|v| match v {
+                        Value::Integer(n) if n >= 0 => Some(n as u64),
+                        _ => None,
+                    })
+                })
+            } else {
+                None
+            };
             self.execute_nested_loop_join(
                 &left_rows,
                 &right_rows,
@@ -2164,17 +2666,27 @@ impl Executor {
                 &right_columns,
                 &join_type,
                 ctx,
+                cross_join_limit,
             )?
         };
 
-        // Build alias map and substitute aliases in WHERE clause
+        // Build alias map for alias substitution
         let alias_map = Self::build_alias_map(&stmt.columns);
+
+        // Apply remaining WHERE clause if present (after filter pushdown)
+        // Use cross_filter if we did pushdown, otherwise use the full WHERE clause
+        let effective_where = if cross_filter.is_some() {
+            cross_filter.clone()
+        } else {
+            stmt.where_clause.as_ref().map(|wc| (**wc).clone())
+        };
+
         let resolved_where_clause = if !alias_map.is_empty() {
-            stmt.where_clause
+            effective_where
                 .as_ref()
                 .map(|where_expr| Box::new(Self::substitute_aliases(where_expr, &alias_map)))
         } else {
-            stmt.where_clause.clone()
+            effective_where.map(Box::new)
         };
 
         // Apply WHERE clause if present
@@ -2952,6 +3464,17 @@ impl Executor {
         expr: &Expression,
         ctx: &ExecutionContext,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
+        self.execute_table_expression_with_filter(expr, ctx, None)
+    }
+
+    /// Execute a table expression with optional filter pushdown
+    /// This is used by JOIN to push WHERE predicates to individual table scans
+    fn execute_table_expression_with_filter(
+        &self,
+        expr: &Expression,
+        ctx: &ExecutionContext,
+        filter: Option<&Expression>,
+    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
         match expr {
             Expression::TableSource(ts) => {
                 // Check if this is a CTE from context (for subqueries referencing outer CTEs)
@@ -2967,8 +3490,27 @@ impl Executor {
                         .iter()
                         .map(|col| format!("{}.{}", table_alias, col))
                         .collect();
+
+                    // Apply filter to CTE data if present
+                    let filtered_rows = if let Some(filter_expr) = filter {
+                        let mut eval = Evaluator::new(&self.function_registry);
+                        eval = eval.with_context(ctx);
+                        eval.init_columns(columns);
+
+                        let mut result_rows = Vec::new();
+                        for row in rows {
+                            eval.set_row_array(row);
+                            if eval.evaluate_bool(filter_expr).unwrap_or(false) {
+                                result_rows.push(row.clone());
+                            }
+                        }
+                        result_rows
+                    } else {
+                        rows.clone()
+                    };
+
                     let result =
-                        super::result::ExecutorMemoryResult::new(columns.clone(), rows.clone());
+                        super::result::ExecutorMemoryResult::new(columns.clone(), filtered_rows);
                     return Ok((Box::new(result), qualified_columns));
                 }
 
@@ -3008,7 +3550,7 @@ impl Executor {
                     return Ok((result, qualified_columns));
                 }
 
-                // Create a simple SELECT * statement
+                // Create a SELECT * statement with optional WHERE clause
                 let select_all = SelectStatement {
                     token: dummy_token("SELECT", TokenType::Keyword),
                     distinct: false,
@@ -3017,7 +3559,7 @@ impl Executor {
                     })],
                     with: None,
                     table_expr: Some(Box::new(Expression::TableSource(ts.clone()))),
-                    where_clause: None,
+                    where_clause: filter.map(|f| Box::new(f.clone())),
                     group_by: GroupByClause::default(),
                     having: None,
                     window_defs: vec![],
@@ -5749,6 +6291,7 @@ impl Executor {
     /// Probe phase: Scan larger side and probe hash table
     ///
     /// Uses parallel execution when either side has >= 5000 rows.
+    /// Optional limit parameter enables early termination for INNER JOINs.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_hash_join(
         &self,
@@ -5759,6 +6302,7 @@ impl Executor {
         join_type: &str,
         left_col_count: usize,
         right_col_count: usize,
+        limit: Option<u64>,
     ) -> Result<Vec<Row>> {
         // Optimization: Build hash table on smaller side
         // For LEFT/FULL joins, we must build on right side to track unmatched rows correctly
@@ -5768,9 +6312,11 @@ impl Executor {
             && (join_type.contains("RIGHT") || left_rows.len() < right_rows.len());
 
         // Check if parallel execution would be beneficial
+        // Note: When limit is set, prefer sequential execution for early termination
         let parallel_config = ParallelConfig::default();
-        let use_parallel = parallel_config.should_parallel_join(left_rows.len())
-            || parallel_config.should_parallel_join(right_rows.len());
+        let use_parallel = limit.is_none()
+            && (parallel_config.should_parallel_join(left_rows.len())
+                || parallel_config.should_parallel_join(right_rows.len()));
 
         if use_parallel {
             // Use parallel hash join for large datasets
@@ -5805,7 +6351,7 @@ impl Executor {
             return Ok(result.rows);
         }
 
-        // Fall back to sequential execution for small datasets
+        // Fall back to sequential execution for small datasets or when limit is set
         if build_on_left {
             // Build on left, probe with right (swap roles)
             self.execute_hash_join_impl(
@@ -5817,6 +6363,7 @@ impl Executor {
                 right_col_count,
                 left_col_count,
                 true, // swapped = true
+                limit,
             )
         } else {
             // Build on right, probe with left (normal)
@@ -5829,12 +6376,14 @@ impl Executor {
                 left_col_count,
                 right_col_count,
                 false, // swapped = false
+                limit,
             )
         }
     }
 
     /// Core hash join implementation
     /// `swapped` indicates if left/right were swapped for build side optimization
+    /// `limit` enables early termination for INNER JOINs
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_impl(
         &self,
@@ -5846,6 +6395,7 @@ impl Executor {
         probe_col_count: usize,
         build_col_count: usize,
         swapped: bool,
+        limit: Option<u64>,
     ) -> Result<Vec<Row>> {
         use rustc_hash::FxHashMap;
 
@@ -5879,8 +6429,23 @@ impl Executor {
         let mut result_rows = Vec::new();
         let mut build_matched = vec![false; build_rows.len()];
 
+        // Early termination is safe when:
+        // 1. INNER JOIN: we can stop after `limit` output rows
+        // 2. LEFT JOIN (not swapped): probe side = left = outer side, each probe row contributes to output
+        // 3. RIGHT JOIN (swapped): probe side = right = outer side, each probe row contributes to output
+        // NOT safe when we need to emit unmatched build rows at the end (FULL, or the "other" outer join)
+        let is_inner_join = !join_type.contains("LEFT")
+            && !join_type.contains("RIGHT")
+            && !join_type.contains("FULL");
+        let is_left_not_swapped =
+            join_type.contains("LEFT") && !swapped && !join_type.contains("FULL");
+        let is_right_swapped =
+            join_type.contains("RIGHT") && swapped && !join_type.contains("FULL");
+        let can_early_terminate = is_inner_join || is_left_not_swapped || is_right_swapped;
+        let effective_limit = if can_early_terminate { limit } else { None };
+
         // Probe phase: Scan probe rows and lookup in hash table
-        for probe_row in probe_rows {
+        'probe: for probe_row in probe_rows {
             let mut matched = false;
             let hash = Self::hash_composite_key(probe_row, probe_key_indices);
 
@@ -5913,6 +6478,12 @@ impl Executor {
                             )
                         };
                         result_rows.push(Row::from_values(values));
+                        // Early termination check for OUTER join NULL rows
+                        if let Some(lim) = effective_limit {
+                            if result_rows.len() >= lim as usize {
+                                break 'probe;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -5951,6 +6522,13 @@ impl Executor {
                             )
                         };
                         result_rows.push(Row::from_values(combined));
+
+                        // Early termination: if we've reached the limit, stop probing
+                        if let Some(lim) = effective_limit {
+                            if result_rows.len() >= lim as usize {
+                                break 'probe;
+                            }
+                        }
                     }
                 }
             }
@@ -5986,6 +6564,12 @@ impl Executor {
                         )
                     };
                     result_rows.push(Row::from_values(values));
+                    // Early termination check for OUTER join NULL rows
+                    if let Some(lim) = effective_limit {
+                        if result_rows.len() >= lim as usize {
+                            break 'probe;
+                        }
+                    }
                 }
             }
         }
@@ -6166,7 +6750,14 @@ impl Executor {
         right_columns: &[String],
         join_type: &str,
         ctx: &ExecutionContext,
+        limit: Option<u64>,
     ) -> Result<Vec<Row>> {
+        // For INNER JOIN and CROSS JOIN, we can safely apply early termination
+        // For OUTER JOINs, we need all rows to compute NULL padding
+        let is_inner_or_cross = !join_type.contains("LEFT")
+            && !join_type.contains("RIGHT")
+            && !join_type.contains("FULL");
+        let effective_limit = if is_inner_or_cross { limit } else { None };
         // Create evaluator once and reuse for all join condition checks
         let mut eval = if condition.is_some() {
             let mut e = Evaluator::new(&self.function_registry);
@@ -6185,7 +6776,7 @@ impl Executor {
         let right_col_count = right_columns.len();
         let total_cols = left_col_count + right_col_count;
 
-        for left_row in left_rows {
+        'outer: for left_row in left_rows {
             let mut matched = false;
             let left_slice = left_row.as_slice();
 
@@ -6215,6 +6806,13 @@ impl Executor {
                     values.extend_from_slice(left_slice);
                     values.extend_from_slice(right_slice);
                     result_rows.push(Row::from_values(values));
+
+                    // Early termination if limit reached (for INNER/CROSS JOINs)
+                    if let Some(lim) = effective_limit {
+                        if result_rows.len() >= lim as usize {
+                            break 'outer;
+                        }
+                    }
                 }
             }
 
@@ -6726,6 +7324,230 @@ impl Executor {
             Expression::NullLiteral(_) => "NULL".to_string(),
             _ => "expr".to_string(),
         }
+    }
+
+    /// Check if semi-join reduction optimization can be applied and return parameters
+    /// Returns Some((limit_value, left_key_col, right_key_col)) if applicable, None otherwise
+    ///
+    /// Conditions for semi-join reduction:
+    /// 1. LEFT JOIN (preserved left side)
+    /// 2. GROUP BY references only left table columns
+    /// 3. LIMIT is present with no ORDER BY (or ORDER BY on left columns only)
+    /// 4. Single equality join condition (a.col = b.col)
+    fn get_semijoin_reduction_limit(
+        &self,
+        join_type: &str,
+        stmt: &SelectStatement,
+        left_alias: Option<&str>,
+        join_condition: &Option<Box<Expression>>,
+    ) -> Option<(usize, String, String)> {
+        // Only applies to LEFT JOIN
+        if !join_type.contains("LEFT") || join_type.contains("FULL") {
+            return None;
+        }
+
+        // Must have GROUP BY
+        if stmt.group_by.columns.is_empty() {
+            return None;
+        }
+
+        // Must have LIMIT with no ORDER BY (for correctness)
+        // Order of grouped results without ORDER BY is undefined, so early termination is safe
+        if stmt.limit.is_none() || !stmt.order_by.is_empty() {
+            return None;
+        }
+
+        // Check that GROUP BY references only left table columns
+        let left_alias = left_alias?;
+        for col in &stmt.group_by.columns {
+            if !self.column_references_table(col, left_alias) {
+                return None;
+            }
+        }
+
+        // Extract join key columns from simple equality condition: left.col = right.col
+        let condition = join_condition.as_ref()?;
+        let (left_key_col, right_key_col) = self.extract_simple_join_key(condition)?;
+
+        // Verify left key references the left table
+        let left_key_lower = left_key_col.to_lowercase();
+        if !left_key_lower.starts_with(&format!("{}.", left_alias.to_lowercase())) {
+            // Maybe it's right.col = left.col (swapped)
+            let right_key_lower = right_key_col.to_lowercase();
+            if !right_key_lower.starts_with(&format!("{}.", left_alias.to_lowercase())) {
+                return None;
+            }
+            // Swap the keys
+            let evaluator = Evaluator::new(&self.function_registry);
+            let limit_value = stmt.limit.as_ref().and_then(|e| {
+                evaluator.evaluate(e).ok().and_then(|v| match v {
+                    Value::Integer(n) if n > 0 => Some(n as usize),
+                    _ => None,
+                })
+            })?;
+            return Some((limit_value, right_key_col, left_key_col));
+        }
+
+        // Get LIMIT value
+        let evaluator = Evaluator::new(&self.function_registry);
+        let limit_value = stmt.limit.as_ref().and_then(|e| {
+            evaluator.evaluate(e).ok().and_then(|v| match v {
+                Value::Integer(n) if n > 0 => Some(n as usize),
+                _ => None,
+            })
+        })?;
+
+        Some((limit_value, left_key_col, right_key_col))
+    }
+
+    /// Check if a column expression references a specific table
+    fn column_references_table(&self, expr: &Expression, table_alias: &str) -> bool {
+        match expr {
+            Expression::QualifiedIdentifier(qid) => {
+                qid.qualifier.value.eq_ignore_ascii_case(table_alias)
+            }
+            Expression::Identifier(_) => {
+                // Unqualified column - could be from any table, assume it's from the expected table
+                // This is a conservative assumption
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Extract join key column names from a simple equality condition
+    /// Returns Some((left_col_qualified, right_col_qualified)) for patterns like a.id = b.user_id
+    fn extract_simple_join_key(&self, condition: &Expression) -> Option<(String, String)> {
+        match condition {
+            Expression::Infix(infix) if infix.op_type == InfixOperator::Equal => {
+                let left_col = self.extract_qualified_column_name(&infix.left)?;
+                let right_col = self.extract_qualified_column_name(&infix.right)?;
+                Some((left_col, right_col))
+            }
+            Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
+                // For AND conditions, try to extract the first simple equality
+                if let Some(result) = self.extract_simple_join_key(&infix.left) {
+                    return Some(result);
+                }
+                self.extract_simple_join_key(&infix.right)
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract qualified column name from an identifier expression
+    fn extract_qualified_column_name(&self, expr: &Expression) -> Option<String> {
+        match expr {
+            Expression::QualifiedIdentifier(qid) => {
+                Some(format!("{}.{}", qid.qualifier.value, qid.name.value))
+            }
+            Expression::Identifier(id) => Some(id.value.clone()),
+            _ => None,
+        }
+    }
+
+    /// Build an IN filter expression: column_name IN (v1, v2, ..., vN)
+    fn build_in_filter_expression(
+        &self,
+        column_name: &str,
+        values: &[Value],
+    ) -> Option<Expression> {
+        if values.is_empty() {
+            return None;
+        }
+
+        // Parse the column name to handle qualified names like "o.user_id"
+        let col_expr = if let Some(dot_pos) = column_name.find('.') {
+            let qualifier = &column_name[..dot_pos];
+            let name = &column_name[dot_pos + 1..];
+            Expression::QualifiedIdentifier(QualifiedIdentifier {
+                token: Token::new(TokenType::Identifier, qualifier, Position::default()),
+                qualifier: Box::new(Identifier::new(
+                    Token::new(TokenType::Identifier, qualifier, Position::default()),
+                    qualifier.to_string(),
+                )),
+                name: Box::new(Identifier::new(
+                    Token::new(TokenType::Identifier, name, Position::default()),
+                    name.to_string(),
+                )),
+            })
+        } else {
+            Expression::Identifier(Identifier::new(
+                Token::new(TokenType::Identifier, column_name, Position::default()),
+                column_name.to_string(),
+            ))
+        };
+
+        // Build list of value literals
+        let value_exprs: Vec<Expression> = values
+            .iter()
+            .map(|v| match v {
+                Value::Integer(i) => Expression::IntegerLiteral(IntegerLiteral {
+                    token: Token::new(TokenType::Integer, i.to_string(), Position::default()),
+                    value: *i,
+                }),
+                Value::Float(f) => Expression::FloatLiteral(FloatLiteral {
+                    token: Token::new(TokenType::Float, f.to_string(), Position::default()),
+                    value: *f,
+                }),
+                Value::Text(s) => Expression::StringLiteral(StringLiteral {
+                    token: Token::new(TokenType::String, s.to_string(), Position::default()),
+                    value: s.to_string(),
+                    type_hint: None,
+                }),
+                Value::Boolean(b) => Expression::BooleanLiteral(BooleanLiteral {
+                    token: Token::new(
+                        TokenType::Keyword,
+                        if *b { "true" } else { "false" },
+                        Position::default(),
+                    ),
+                    value: *b,
+                }),
+                _ => Expression::NullLiteral(NullLiteral {
+                    token: Token::new(TokenType::Keyword, "NULL", Position::default()),
+                }),
+            })
+            .collect();
+
+        // Create IN expression
+        Some(Expression::In(InExpression {
+            token: Token::new(TokenType::Keyword, "IN", Position::default()),
+            left: Box::new(col_expr),
+            right: Box::new(Expression::ExpressionList(ExpressionList {
+                token: Token::new(TokenType::Punctuator, "(", Position::default()),
+                expressions: value_exprs,
+            })),
+            not: false,
+        }))
+    }
+
+    /// Find column index by name (case-insensitive), supporting qualified names like "t.col"
+    fn find_column_index_by_name(col_name: &str, columns: &[String]) -> Option<usize> {
+        let col_lower = col_name.to_lowercase();
+        columns.iter().position(|c| {
+            let c_lower = c.to_lowercase();
+            // Exact match
+            if c_lower == col_lower {
+                return true;
+            }
+            // Match qualified to qualified: "t.col" matches "t.col"
+            // Match qualified to unqualified: "t.col" -> check if "col" matches
+            if let Some(dot_pos) = col_lower.rfind('.') {
+                let unqualified = &col_lower[dot_pos + 1..];
+                if c_lower.contains('.') {
+                    // Both qualified
+                    c_lower == col_lower
+                } else {
+                    // col_name is qualified, c is unqualified
+                    c_lower == unqualified
+                }
+            } else if let Some(c_dot) = c_lower.rfind('.') {
+                // col_name is unqualified, c is qualified
+                c_lower[c_dot + 1..] == *col_lower
+            } else {
+                false
+            }
+        })
     }
 }
 

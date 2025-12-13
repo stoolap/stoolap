@@ -950,15 +950,90 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Vec<Row> {
-        // Use the standard collect and apply limit/offset
-        // The early termination benefit is at the storage layer
-        let all_rows = self.collect_visible_rows(filter);
-        all_rows
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(_, row)| row)
-            .collect()
+        let txn_versions = self.txn_versions.read().unwrap();
+        let schema = &self.cached_schema;
+
+        // Check if we have local versions (uncommitted changes in this transaction)
+        let has_local = txn_versions.has_local_changes();
+
+        if !has_local {
+            // No local versions - use arena-based fetch with early termination
+            // Get all visible rows but stop early once we have enough
+            let raw_rows = if let Some(expr) = filter {
+                self.version_store
+                    .get_all_visible_rows_filtered(self.txn_id, expr)
+            } else {
+                self.version_store.get_all_visible_rows_arena(self.txn_id)
+            };
+
+            // Apply offset/limit with early termination
+            let mut result = Vec::with_capacity(limit);
+            for (idx, (_, row)) in raw_rows.into_iter().enumerate() {
+                if idx < offset {
+                    continue;
+                }
+                let row = self.normalize_row_to_schema(row, schema);
+                result.push(row);
+                if result.len() >= limit {
+                    break;
+                }
+            }
+            return result;
+        }
+
+        // Has local versions - use batch fetch then merge with early termination
+        let global_rows = self.version_store.get_all_visible_rows_arena(self.txn_id);
+
+        // Build set of local row IDs for quick lookup
+        let local_row_ids: Int64Set = txn_versions
+            .iter_local()
+            .map(|(row_id, _)| row_id)
+            .collect();
+
+        let mut result = Vec::with_capacity(limit);
+        let mut count = 0;
+
+        // Add global rows that don't have local overrides
+        for (row_id, row) in global_rows {
+            if local_row_ids.contains(&row_id) {
+                continue; // Local version takes precedence
+            }
+            let row = self.normalize_row_to_schema(row, schema);
+            if let Some(expr) = filter {
+                if !expr.evaluate_fast(&row) {
+                    continue;
+                }
+            }
+            if count >= offset {
+                result.push(row);
+                if result.len() >= limit {
+                    return result;
+                }
+            }
+            count += 1;
+        }
+
+        // Add local versions (both updates and inserts)
+        for (_, version) in txn_versions.iter_local() {
+            if version.is_deleted() {
+                continue;
+            }
+            let row = self.normalize_row_to_schema(version.data.clone(), schema);
+            if let Some(expr) = filter {
+                if !expr.evaluate_fast(&row) {
+                    continue;
+                }
+            }
+            if count >= offset {
+                result.push(row);
+                if result.len() >= limit {
+                    return result;
+                }
+            }
+            count += 1;
+        }
+
+        result
     }
 }
 

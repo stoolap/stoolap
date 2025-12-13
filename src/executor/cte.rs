@@ -514,6 +514,29 @@ impl Executor {
         // Execute the JOIN
         let join_type = join_source.join_type.to_uppercase();
 
+        // Determine if we can safely push LIMIT down to the JOIN
+        // Safe conditions: INNER/CROSS JOIN, no ORDER BY, no aggregation, no window functions
+        let can_push_limit = (join_type == "INNER" || join_type == "CROSS" || join_type.is_empty())
+            && stmt.order_by.is_empty()
+            && !self.has_aggregation(stmt)
+            && !self.has_window_functions(stmt)
+            && stmt.where_clause.is_none(); // WHERE could filter rows, so we need all rows first
+
+        // Calculate effective limit (LIMIT + OFFSET since we need offset rows too)
+        let effective_limit = if can_push_limit {
+            match (&stmt.limit, &stmt.offset) {
+                (Some(lim), Some(off)) => {
+                    let limit_val = self.evaluate_limit_offset(lim).unwrap_or(u64::MAX);
+                    let offset_val = self.evaluate_limit_offset(off).unwrap_or(0);
+                    Some(limit_val.saturating_add(offset_val))
+                }
+                (Some(lim), None) => self.evaluate_limit_offset(lim),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         // Use hash join for better performance (O(n+m) instead of O(n*m))
         let result_rows = if let Some(condition) = join_source.condition.as_deref() {
             // Extract equality keys for hash join
@@ -521,6 +544,13 @@ impl Executor {
                 Self::extract_join_keys_and_residual(condition, &left_qualified, &right_qualified);
 
             if !left_key_indices.is_empty() {
+                // Disable LIMIT pushdown if there are residual conditions (they filter after join)
+                let join_limit = if residual.is_empty() {
+                    effective_limit
+                } else {
+                    None
+                };
+
                 // Use hash join with equality keys
                 let mut rows = self.execute_hash_join(
                     &left_rows,
@@ -530,6 +560,7 @@ impl Executor {
                     &join_type,
                     left_qualified.len(),
                     right_qualified.len(),
+                    join_limit,
                 )?;
 
                 // Apply residual conditions (non-equality parts of ON clause)
@@ -556,6 +587,7 @@ impl Executor {
                     &right_qualified,
                     &join_type,
                     ctx,
+                    effective_limit,
                 )?
             }
         } else {
@@ -569,6 +601,7 @@ impl Executor {
                 &right_qualified,
                 &join_type,
                 ctx,
+                effective_limit,
             )?
         };
 
@@ -654,6 +687,20 @@ impl Executor {
             }
         }
         Ok(None)
+    }
+
+    /// Evaluate a LIMIT or OFFSET expression to a u64 value
+    fn evaluate_limit_offset(&self, expr: &Expression) -> Option<u64> {
+        match expr {
+            Expression::IntegerLiteral(lit) => {
+                if lit.value >= 0 {
+                    Some(lit.value as u64)
+                } else {
+                    None
+                }
+            }
+            _ => None, // For complex expressions, return None (don't push limit)
+        }
     }
 
     /// Execute a query on CTE result data

@@ -1381,7 +1381,9 @@ impl Executor {
                 let alias = ts.alias.as_ref().map(|a| a.value.clone());
                 (ts.name.value.clone(), alias)
             }
-            _ => return None, // Can't optimize subquery joins or derived tables
+            _ => {
+                return None; // Can't optimize subquery joins or derived tables
+            }
         };
 
         // 2. Parse WHERE clause to find correlation condition
@@ -1674,7 +1676,7 @@ impl Executor {
 
         let select_stmt = SelectStatement {
             token: dummy_token("SELECT", TokenType::Keyword),
-            distinct: true, // DISTINCT to avoid duplicates
+            distinct: false, // No DISTINCT - we collect into HashSet which deduplicates
             columns: vec![inner_col_expr],
             with: None,
             table_expr: Some(Box::new(table_source)),
@@ -1694,7 +1696,7 @@ impl Executor {
         // Execute the query
         let mut result = self.execute_select(&select_stmt, ctx)?;
 
-        // Collect values into HashSet
+        // Collect values into HashSet (deduplicates automatically)
         let mut hash_set = std::collections::HashSet::new();
         while result.next() {
             let row = result.row();
@@ -1715,8 +1717,20 @@ impl Executor {
     /// Replaces: EXISTS (SELECT ...) with: outer_col IN (hash_set_values)
     pub fn transform_exists_to_in_list(
         info: &SemiJoinInfo,
-        hash_set: &std::collections::HashSet<crate::core::Value>,
+        hash_set: std::collections::HashSet<crate::core::Value>,
     ) -> Expression {
+        // For empty hash set, return FALSE (no matches exist)
+        // For NOT EXISTS with empty set, return TRUE (nothing exists to negate)
+        if hash_set.is_empty() {
+            return Expression::BooleanLiteral(BooleanLiteral {
+                token: dummy_token(
+                    if info.is_negated { "TRUE" } else { "FALSE" },
+                    TokenType::Keyword,
+                ),
+                value: info.is_negated,
+            });
+        }
+
         // Build the outer column expression
         let outer_col_expr = if let Some(ref tbl) = info.outer_table {
             Expression::QualifiedIdentifier(QualifiedIdentifier {
@@ -1740,31 +1754,11 @@ impl Executor {
             })
         };
 
-        // Convert hash set to expression list
-        let value_exprs: Vec<Expression> = hash_set
-            .iter()
-            .map(|v| value_to_expression(v.clone()))
-            .collect();
-
-        // For empty hash set, return FALSE (no matches exist)
-        // For NOT EXISTS with empty set, return TRUE (nothing exists to negate)
-        if value_exprs.is_empty() {
-            return Expression::BooleanLiteral(BooleanLiteral {
-                token: dummy_token(
-                    if info.is_negated { "TRUE" } else { "FALSE" },
-                    TokenType::Keyword,
-                ),
-                value: info.is_negated,
-            });
-        }
-
-        Expression::In(InExpression {
+        // Use InHashSet with Arc for O(1) lookup and cheap cloning in parallel execution
+        Expression::InHashSet(InHashSetExpression {
             token: dummy_token("IN", TokenType::Keyword),
-            left: Box::new(outer_col_expr),
-            right: Box::new(Expression::ExpressionList(ExpressionList {
-                token: dummy_token("(", TokenType::Punctuator),
-                expressions: value_exprs,
-            })),
+            column: Box::new(outer_col_expr),
+            values: std::sync::Arc::new(hash_set),
             not: info.is_negated,
         })
     }
@@ -1781,7 +1775,7 @@ impl Executor {
             Expression::Exists(exists) => {
                 if let Some(info) = Self::try_extract_semi_join_info(exists, false, outer_tables) {
                     let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
-                    return Ok(Some(Self::transform_exists_to_in_list(&info, &hash_set)));
+                    return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
                 }
                 Ok(None)
             }
@@ -1791,7 +1785,7 @@ impl Executor {
                     if let Some(info) = Self::try_extract_semi_join_info(exists, true, outer_tables)
                     {
                         let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
-                        return Ok(Some(Self::transform_exists_to_in_list(&info, &hash_set)));
+                        return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
                     }
                 }
                 Ok(None)

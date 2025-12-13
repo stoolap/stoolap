@@ -305,6 +305,29 @@ impl Executor {
             .map(|(i, c)| (c.to_lowercase(), i))
             .collect();
 
+        // Determine if we can push LIMIT to aggregation for early termination
+        // This is safe when:
+        // 1. There's a LIMIT but no ORDER BY (order doesn't matter)
+        // 2. No HAVING clause (filtering might reduce groups below limit)
+        // 3. No DISTINCT (deduplication might reduce results)
+        let can_push_limit = stmt.limit.is_some()
+            && stmt.order_by.is_empty()
+            && stmt.having.is_none()
+            && !stmt.distinct;
+
+        let aggregation_limit = if can_push_limit {
+            stmt.limit.as_ref().and_then(|limit_expr| {
+                use super::evaluator::Evaluator;
+                let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+                evaluator.evaluate(limit_expr).ok().and_then(|v| match v {
+                    crate::core::Value::Integer(n) if n >= 0 => Some(n as usize),
+                    _ => None,
+                })
+            })
+        } else {
+            None
+        };
+
         // Build result
         let (result_columns, result_rows) = if group_by_columns.is_empty() {
             // Global aggregation (no GROUP BY)
@@ -326,7 +349,7 @@ impl Executor {
                 ctx,
             )?
         } else {
-            // Regular grouped aggregation
+            // Regular grouped aggregation - pass limit for early termination
             self.execute_grouped_aggregation(
                 &aggregations,
                 &group_by_columns,
@@ -335,6 +358,7 @@ impl Executor {
                 &col_index_map,
                 stmt,
                 ctx,
+                aggregation_limit,
             )?
         };
 
@@ -1009,6 +1033,7 @@ impl Executor {
             .collect();
 
         // Build result
+        // Note: No limit pushdown here because window functions need all rows
         let (result_columns, mut result_rows) = if group_by_columns.is_empty() {
             // Global aggregation (no GROUP BY)
             self.execute_global_aggregation(
@@ -1018,7 +1043,7 @@ impl Executor {
                 &col_index_map,
             )?
         } else {
-            // Grouped aggregation
+            // Grouped aggregation - no limit since window functions need all groups
             self.execute_grouped_aggregation(
                 &aggregations,
                 &group_by_columns,
@@ -1027,6 +1052,7 @@ impl Executor {
                 &col_index_map,
                 stmt,
                 ctx,
+                None, // Window functions need all groups
             )?
         };
 
@@ -2049,6 +2075,206 @@ impl Executor {
         }
     }
 
+    /// Try to use fast single-pass aggregation for simple cases
+    ///
+    /// Returns Some((columns, rows)) if fast path was used, None otherwise.
+    /// Fast path is used when:
+    /// - All GROUP BY items are simple column references
+    /// - All aggregates are SUM or COUNT (no DISTINCT, no FILTER, no ORDER BY, no expression)
+    ///
+    /// When `limit` is provided and there's no ORDER BY, enables early termination:
+    /// once we have `limit` complete groups, we stop creating new groups.
+    fn try_fast_aggregation(
+        &self,
+        aggregations: &[SqlAggregateFunction],
+        group_by_items: &[GroupByItem],
+        rows: &[Row],
+        _columns: &[String],
+        col_index_map: &FxHashMap<String, usize>,
+        limit: Option<usize>,
+    ) -> Result<Option<(Vec<String>, Vec<Row>)>> {
+        // Check if all GROUP BY items are simple column references
+        let group_by_indices: Vec<usize> = group_by_items
+            .iter()
+            .filter_map(|item| match item {
+                GroupByItem::Column(col_name) => {
+                    Self::lookup_column_index(&col_name.to_lowercase(), col_index_map)
+                }
+                _ => None,
+            })
+            .collect();
+
+        // All GROUP BY items must be resolved to column indices
+        if group_by_indices.len() != group_by_items.len() {
+            return Ok(None);
+        }
+
+        // Check if all aggregates are simple (SUM or COUNT without DISTINCT/FILTER/ORDER BY/expression)
+        #[derive(Clone)]
+        enum SimpleAgg {
+            Count,      // COUNT(*) or COUNT(col)
+            Sum(usize), // SUM(col) - stores column index
+        }
+
+        let simple_aggs: Vec<Option<SimpleAgg>> = aggregations
+            .iter()
+            .map(|agg| {
+                // Must not have DISTINCT, FILTER, ORDER BY, or expression
+                if agg.distinct
+                    || agg.filter.is_some()
+                    || !agg.order_by.is_empty()
+                    || agg.expression.is_some()
+                {
+                    return None;
+                }
+
+                match agg.name.to_uppercase().as_str() {
+                    "COUNT" => Some(SimpleAgg::Count),
+                    "SUM" => {
+                        if agg.column == "*" {
+                            None // SUM(*) is not valid
+                        } else {
+                            Self::lookup_column_index(&agg.column_lower, col_index_map)
+                                .map(SimpleAgg::Sum)
+                        }
+                    }
+                    _ => None, // Other aggregates not supported in fast path
+                }
+            })
+            .collect();
+
+        // All aggregates must be resolved for fast path
+        if simple_aggs.iter().any(|a| a.is_none()) {
+            return Ok(None);
+        }
+
+        let simple_aggs: Vec<SimpleAgg> = simple_aggs.into_iter().map(|a| a.unwrap()).collect();
+
+        // Fast path: single-pass streaming aggregation
+        // Store aggregate state directly in hash map instead of row indices
+        struct FastGroupState {
+            key_values: Vec<Value>,
+            agg_values: Vec<f64>,     // Running sums stored as f64
+            agg_has_value: Vec<bool>, // Track if any non-NULL value was seen (for SUM)
+            counts: Vec<i64>,         // For COUNT
+        }
+
+        let mut groups: FxHashMap<u64, FastGroupState> = FxHashMap::default();
+        let num_aggs = simple_aggs.len();
+
+        // Track for early termination optimization
+        let group_limit = limit.unwrap_or(usize::MAX);
+        let has_limit = limit.is_some();
+
+        for row in rows {
+            // Hash the group key
+            let mut hasher = rustc_hash::FxHasher::default();
+            for &idx in &group_by_indices {
+                if let Some(value) = row.get(idx) {
+                    hash_value_into(&mut hasher, value);
+                } else {
+                    hash_value_into(&mut hasher, &Value::null_unknown());
+                }
+            }
+            let hash = hasher.finish();
+
+            // Early termination: if we've reached the limit and this hash doesn't exist,
+            // skip this row (it would create a new group we don't need)
+            // Note: We still process rows for existing groups to get correct aggregates
+            if has_limit && groups.len() >= group_limit && !groups.contains_key(&hash) {
+                continue;
+            }
+
+            // Get or create group state
+            let state = groups.entry(hash).or_insert_with(|| {
+                let key_values: Vec<Value> = group_by_indices
+                    .iter()
+                    .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
+                    .collect();
+                FastGroupState {
+                    key_values,
+                    agg_values: vec![0.0; num_aggs],
+                    agg_has_value: vec![false; num_aggs],
+                    counts: vec![0; num_aggs],
+                }
+            });
+
+            // Accumulate aggregates
+            for (i, agg) in simple_aggs.iter().enumerate() {
+                match agg {
+                    SimpleAgg::Count => {
+                        state.counts[i] += 1;
+                    }
+                    SimpleAgg::Sum(col_idx) => {
+                        if let Some(value) = row.get(*col_idx) {
+                            match value {
+                                Value::Integer(v) => {
+                                    state.agg_values[i] += *v as f64;
+                                    state.agg_has_value[i] = true;
+                                }
+                                Value::Float(v) => {
+                                    state.agg_values[i] += v;
+                                    state.agg_has_value[i] = true;
+                                }
+                                _ => {} // Skip non-numeric and NULL
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build result columns
+        let mut result_columns = Vec::with_capacity(group_by_items.len() + aggregations.len());
+
+        // Add GROUP BY column names (use column index to get actual name)
+        for (i, item) in group_by_items.iter().enumerate() {
+            let name = match item {
+                GroupByItem::Column(col_name) => col_name.clone(),
+                _ => format!("col{}", i),
+            };
+            result_columns.push(name);
+        }
+
+        // Add aggregate column names
+        for agg in aggregations {
+            let col_name = if let Some(ref alias) = agg.alias {
+                alias.clone()
+            } else {
+                agg.get_expression_name()
+            };
+            result_columns.push(col_name);
+        }
+
+        // Build result rows
+        let result_rows: Vec<Row> = groups
+            .into_values()
+            .map(|state| {
+                let mut values = Vec::with_capacity(group_by_indices.len() + simple_aggs.len());
+                values.extend(state.key_values);
+
+                for (i, agg) in simple_aggs.iter().enumerate() {
+                    let value = match agg {
+                        SimpleAgg::Count => Value::Integer(state.counts[i]),
+                        SimpleAgg::Sum(_) => {
+                            // SUM returns NULL if no non-NULL values were seen
+                            if state.agg_has_value[i] {
+                                Value::Float(state.agg_values[i])
+                            } else {
+                                Value::null_unknown()
+                            }
+                        }
+                    };
+                    values.push(value);
+                }
+
+                Row::from_values(values)
+            })
+            .collect();
+
+        Ok(Some((result_columns, result_rows)))
+    }
+
     /// Execute grouped aggregation (with GROUP BY)
     ///
     /// Optimized version that:
@@ -2056,6 +2282,9 @@ impl Executor {
     /// 2. Pre-allocates aggregate functions once, resets per group
     /// 3. Pre-computes column indices for aggregate columns
     /// 4. Supports complex expressions in GROUP BY (e.g., function calls)
+    ///
+    /// When `limit` is provided (and there's no ORDER BY), enables early termination
+    /// for streaming aggregation - stops creating new groups after limit is reached.
     #[allow(clippy::too_many_arguments)]
     fn execute_grouped_aggregation(
         &self,
@@ -2066,7 +2295,21 @@ impl Executor {
         col_index_map: &FxHashMap<String, usize>,
         _stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        limit: Option<usize>,
     ) -> Result<(Vec<String>, Vec<Row>)> {
+        // FAST PATH: For simple aggregates (SUM, COUNT without DISTINCT/FILTER/ORDER BY/expression),
+        // use single-pass streaming aggregation that accumulates values directly
+        if let Some(result) = self.try_fast_aggregation(
+            aggregations,
+            group_by_items,
+            rows,
+            columns,
+            col_index_map,
+            limit,
+        )? {
+            return Ok(result);
+        }
+
         // Check if any aggregation has an expression (e.g., SUM(val * 2)), ORDER BY, or FILTER
         let has_agg_expression = aggregations
             .iter()
@@ -2144,6 +2387,10 @@ impl Executor {
             )
         });
 
+        // Track for early termination optimization
+        let group_limit = limit.unwrap_or(usize::MAX);
+        let has_limit = limit.is_some();
+
         if all_simple_columns && expr_evaluator.is_none() {
             // Fast path: hash directly from row references, only clone for new groups
             let column_indices: Vec<usize> = precomputed_group_by
@@ -2166,6 +2413,13 @@ impl Executor {
                     }
                 }
                 let hash = hasher.finish();
+
+                // Early termination: if we've reached the limit and this hash doesn't exist,
+                // skip this row (it would create a new group we don't need)
+                // Note: We still process rows for existing groups to get correct aggregates
+                if has_limit && groups.len() >= group_limit && !groups.contains_key(&hash) {
+                    continue;
+                }
 
                 // Only clone values when creating a NEW group
                 groups
@@ -2214,6 +2468,12 @@ impl Executor {
                 // Compute hash of key
                 let hash = hash_group_key(&key_buffer);
 
+                // Early termination: if we've reached the limit and this hash doesn't exist,
+                // skip this row (it would create a new group we don't need)
+                if has_limit && groups.len() >= group_limit && !groups.contains_key(&hash) {
+                    continue;
+                }
+
                 // Insert or update group
                 groups
                     .entry(hash)
@@ -2228,10 +2488,17 @@ impl Executor {
         // Convert groups to Vec for parallel processing
         let groups_vec: Vec<(u64, GroupEntry)> = groups.into_iter().collect();
 
-        // Determine if parallel processing is beneficial (threshold: 1000 rows or 4+ groups)
+        // Determine if parallel processing is beneficial
         // Don't use parallel processing when expressions are involved (harder to handle)
+        // Key insight: parallel creates aggregate functions PER GROUP, so for many small groups
+        // (e.g., 10k groups with 3 rows each), the allocation overhead dominates.
+        // Only parallelize when groups are large enough to amortize the allocation cost.
         let total_rows: usize = groups_vec.iter().map(|(_, g)| g.row_indices.len()).sum();
-        let use_parallel = groups_vec.len() >= 4 && total_rows >= 1000 && !has_agg_expression;
+        let avg_rows_per_group = total_rows / groups_vec.len().max(1);
+        let use_parallel = groups_vec.len() >= 4
+            && total_rows >= 10_000
+            && avg_rows_per_group >= 50
+            && !has_agg_expression;
 
         // Process groups (parallel or sequential based on data size)
         let result_rows: Vec<Row> = if use_parallel {

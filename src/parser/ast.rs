@@ -18,8 +18,11 @@
 //! and expressions.
 
 use super::token::{Position, Token};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
+
+use crate::core::Value;
 
 // ============================================================================
 // Core Traits
@@ -72,6 +75,9 @@ pub enum Expression {
     AllAny(AllAnyExpression),
     /// IN expression
     In(InExpression),
+    /// Pre-computed IN expression with HashSet (for semi-join optimization)
+    /// Uses Arc for cheap cloning in parallel execution
+    InHashSet(InHashSetExpression),
     /// BETWEEN expression
     Between(BetweenExpression),
     /// LIKE expression (with optional ESCAPE clause)
@@ -127,6 +133,7 @@ impl fmt::Display for Expression {
             Expression::Exists(e) => write!(f, "{}", e),
             Expression::AllAny(e) => write!(f, "{}", e),
             Expression::In(e) => write!(f, "{}", e),
+            Expression::InHashSet(e) => write!(f, "{}", e),
             Expression::Between(e) => write!(f, "{}", e),
             Expression::Like(e) => write!(f, "{}", e),
             Expression::ScalarSubquery(e) => write!(f, "{}", e),
@@ -168,6 +175,7 @@ impl Expression {
             Expression::Exists(e) => e.token.position,
             Expression::AllAny(e) => e.token.position,
             Expression::In(e) => e.token.position,
+            Expression::InHashSet(e) => e.token.position,
             Expression::Between(e) => e.token.position,
             Expression::Like(e) => e.token.position,
             Expression::ScalarSubquery(e) => e.token.position,
@@ -665,6 +673,41 @@ impl fmt::Display for InExpression {
             write!(f, "{} NOT IN {}", self.left, self.right)
         } else {
             write!(f, "{} IN {}", self.left, self.right)
+        }
+    }
+}
+
+/// Pre-computed IN expression with HashSet for O(1) lookup
+///
+/// This is used by the semi-join optimization to avoid rebuilding
+/// the HashSet on every row during parallel filtering.
+/// Arc enables cheap cloning when the expression is cloned for parallel execution.
+#[derive(Debug, Clone)]
+pub struct InHashSetExpression {
+    pub token: Token,
+    /// The column/expression to check
+    pub column: Box<Expression>,
+    /// Pre-computed HashSet for O(1) lookup - Arc for cheap parallel cloning
+    pub values: Arc<HashSet<Value>>,
+    /// Whether this is NOT IN
+    pub not: bool,
+}
+
+impl PartialEq for InHashSetExpression {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare by Arc pointer for efficiency (same HashSet = same Arc)
+        self.not == other.not
+            && Arc::ptr_eq(&self.values, &other.values)
+            && self.column == other.column
+    }
+}
+
+impl fmt::Display for InHashSetExpression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.not {
+            write!(f, "{} NOT IN (<{} values>)", self.column, self.values.len())
+        } else {
+            write!(f, "{} IN (<{} values>)", self.column, self.values.len())
         }
     }
 }
