@@ -37,15 +37,14 @@
 //! - ORDER BY: 50,000+ rows
 //! - Hash join: 5,000+ build rows
 
-use std::hash::Hash;
-
 use rayon::prelude::*;
 
 use crate::core::{Row, Value};
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::Expression;
 
-use super::evaluator::Evaluator;
+use super::expression::CompiledEvaluator;
+use super::utils::{hash_composite_key, hash_row, rows_equal, verify_composite_key_equality};
 
 // Default thresholds for parallel execution - single source of truth
 // These are used by both ParallelConfig and CostEstimator
@@ -180,7 +179,7 @@ pub fn parallel_filter(
         .chunks(chunk_size)
         .map(|chunk| {
             // Each thread gets its own evaluator (they're cheap to create)
-            let mut evaluator = Evaluator::new(function_registry);
+            let mut evaluator = CompiledEvaluator::new(function_registry);
             evaluator.init_columns(&columns_vec);
 
             let mut filtered = Vec::with_capacity(chunk.len() / 2); // Estimate 50% selectivity
@@ -218,7 +217,7 @@ fn sequential_filter(
     columns: &[String],
     function_registry: &FunctionRegistry,
 ) -> Vec<Row> {
-    let mut evaluator = Evaluator::new(function_registry);
+    let mut evaluator = CompiledEvaluator::new(function_registry);
     evaluator.init_columns(columns);
 
     rows.into_iter()
@@ -378,33 +377,6 @@ fn sequential_distinct(rows: Vec<Row>) -> Vec<Row> {
     result
 }
 
-/// Check if two rows are equal by comparing all values
-#[inline]
-fn rows_equal(a: &Row, b: &Row) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        match (a.get(i), b.get(i)) {
-            (Some(va), Some(vb)) if va == vb => continue,
-            (None, None) => continue,
-            _ => return false,
-        }
-    }
-    true
-}
-
-/// Hash a row for DISTINCT processing
-#[inline]
-fn hash_row(row: &Row) -> u64 {
-    use std::hash::Hasher;
-    let mut hasher = rustc_hash::FxHasher::default();
-    for value in row.iter() {
-        value.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 /// Parallel projection - evaluate expressions on rows in parallel
 ///
 /// For complex SELECT expressions (not simple column references),
@@ -477,7 +449,7 @@ pub fn parallel_hash_build(
         // For small datasets (below threshold), the DashMap overhead is negligible.
         let table: DashMap<u64, Vec<usize>> = DashMap::with_capacity(row_count);
         for (idx, row) in build_rows.iter().enumerate() {
-            let hash = hash_row_by_keys(row, key_indices);
+            let hash = hash_composite_key(row, key_indices);
             table.entry(hash).or_default().push(idx);
         }
         return ParallelHashTable { table, row_count };
@@ -496,7 +468,7 @@ pub fn parallel_hash_build(
             let base_idx = chunk_idx * chunk_size;
             for (local_idx, row) in chunk.iter().enumerate() {
                 let global_idx = base_idx + local_idx;
-                let hash = hash_row_by_keys(row, key_indices);
+                let hash = hash_composite_key(row, key_indices);
                 table.entry(hash).or_default().push(global_idx);
             }
         });
@@ -531,7 +503,7 @@ where
         // Sequential probe
         let mut matches = Vec::new();
         for (probe_idx, probe_row) in probe_rows.iter().enumerate() {
-            let hash = hash_row_by_keys(probe_row, probe_key_indices);
+            let hash = hash_composite_key(probe_row, probe_key_indices);
             if let Some(build_indices) = hash_table.table.get(&hash) {
                 for &build_idx in build_indices.value() {
                     if verify_match(probe_row, &build_rows[build_idx]) {
@@ -556,7 +528,7 @@ where
 
             for (local_idx, probe_row) in chunk.iter().enumerate() {
                 let probe_idx = base_idx + local_idx;
-                let hash = hash_row_by_keys(probe_row, probe_key_indices);
+                let hash = hash_composite_key(probe_row, probe_key_indices);
 
                 if let Some(build_indices) = hash_table.table.get(&hash) {
                     for &build_idx in build_indices.value() {
@@ -572,20 +544,15 @@ where
         .collect()
 }
 
-/// Hash a row using specific key column indices
+/// Hash a row using specific key column indices.
+/// Alias for hash_composite_key from utils for backward compatibility.
 #[inline]
 pub fn hash_row_by_keys(row: &Row, key_indices: &[usize]) -> u64 {
-    use std::hash::Hasher;
-    let mut hasher = rustc_hash::FxHasher::default();
-    for &idx in key_indices {
-        if let Some(value) = row.get(idx) {
-            value.hash(&mut hasher);
-        }
-    }
-    hasher.finish()
+    hash_composite_key(row, key_indices)
 }
 
-/// Verify that two rows match on their respective key columns
+/// Verify that two rows match on their respective key columns.
+/// Alias for verify_composite_key_equality from utils for backward compatibility.
 #[inline]
 pub fn verify_key_match(
     probe_row: &Row,
@@ -593,21 +560,7 @@ pub fn verify_key_match(
     probe_key_indices: &[usize],
     build_key_indices: &[usize],
 ) -> bool {
-    if probe_key_indices.len() != build_key_indices.len() {
-        return false;
-    }
-
-    for (probe_idx, build_idx) in probe_key_indices.iter().zip(build_key_indices.iter()) {
-        let probe_val = probe_row.get(*probe_idx);
-        let build_val = build_row.get(*build_idx);
-
-        match (probe_val, build_val) {
-            (Some(p), Some(b)) if p == b => continue,
-            _ => return false,
-        }
-    }
-
-    true
+    verify_composite_key_equality(probe_row, build_row, probe_key_indices, build_key_indices)
 }
 
 /// Join type for parallel hash join

@@ -47,6 +47,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::core::{Error, IsolationLevel, Result, Value};
+use crate::executor::context::ExecutionContextBuilder;
 use crate::executor::Executor;
 use crate::functions::FunctionRegistry;
 use crate::storage::mvcc::engine::MVCCEngine;
@@ -490,6 +491,74 @@ impl Database {
             Some(row) => Ok(Some(row?.get(0)?)),
             None => Ok(None),
         }
+    }
+
+    /// Execute a write statement with a timeout
+    ///
+    /// Like `execute`, but cancels the query if it exceeds the timeout.
+    /// Timeout is specified in milliseconds. Use 0 for no timeout.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Execute with 5 second timeout
+    /// db.execute_with_timeout("DELETE FROM large_table WHERE old = true", (), 5000)?;
+    /// ```
+    pub fn execute_with_timeout<P: Params>(
+        &self,
+        sql: &str,
+        params: P,
+        timeout_ms: u64,
+    ) -> Result<i64> {
+        let executor = self
+            .inner
+            .executor
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+
+        let param_values = params.into_params();
+        let ctx = ExecutionContextBuilder::new()
+            .params(param_values)
+            .timeout_ms(timeout_ms)
+            .build();
+
+        let result = executor.execute_with_context(sql, &ctx)?;
+        Ok(result.rows_affected())
+    }
+
+    /// Execute a query with a timeout
+    ///
+    /// Like `query`, but cancels the query if it exceeds the timeout.
+    /// Timeout is specified in milliseconds. Use 0 for no timeout.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Query with 10 second timeout
+    /// for row in db.query_with_timeout("SELECT * FROM large_table", (), 10000)? {
+    ///     // process row
+    /// }
+    /// ```
+    pub fn query_with_timeout<P: Params>(
+        &self,
+        sql: &str,
+        params: P,
+        timeout_ms: u64,
+    ) -> Result<Rows> {
+        let executor = self
+            .inner
+            .executor
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+
+        let param_values = params.into_params();
+        let ctx = ExecutionContextBuilder::new()
+            .params(param_values)
+            .timeout_ms(timeout_ms)
+            .build();
+
+        let result = executor.execute_with_context(sql, &ctx)?;
+        Ok(Rows::new(result))
     }
 
     /// Prepare a SQL statement for repeated execution

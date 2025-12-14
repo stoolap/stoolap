@@ -27,51 +27,34 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::core::{Error, Result, Row, Schema, Value};
+use crate::core::{Error, Result, Row, Value};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::mvcc::engine::ViewDefinition;
-use crate::storage::traits::{Engine, QueryResult, ScanPlan};
+use crate::storage::traits::{Engine, QueryResult};
 
 /// Maximum depth for nested views to prevent stack overflow
 const MAX_VIEW_DEPTH: usize = 32;
 
-/// Helper to create a dummy token for internal AST construction
-fn dummy_token(literal: &str, token_type: TokenType) -> Token {
-    Token::new(token_type, literal, Position::new(0, 1, 1))
-}
-
-use super::aggregation::expression_contains_aggregate;
-use super::context::ExecutionContext;
-use super::evaluator::Evaluator;
+use super::context::{ExecutionContext, TimeoutGuard};
+use super::expression::CompiledEvaluator;
+use super::join::{self, build_column_index_map};
 use super::parallel::{self, ParallelConfig};
+use super::pushdown;
 use super::result::{
     DistinctResult, ExecResult, ExecutorMemoryResult, ExprFilteredResult, ExprMappedResult,
     FilteredResult, LimitedResult, OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult,
     StreamingProjectionResult, TopNResult,
 };
+use super::utils::{
+    collect_table_qualifiers, combine_predicates_with_and, dummy_token,
+    expression_contains_aggregate, expression_has_parameters, extract_base_column_name,
+    flatten_and_predicates, get_table_alias_from_expr, strip_table_qualifier,
+};
 use super::Executor;
 use crate::optimizer::aqe::{decide_join_algorithm, AqeJoinDecision, JoinAqeContext};
-use crate::optimizer::bloom::BloomFilter;
-use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::optimizer::{BuildSide, JoinAlgorithm};
-
-/// Minimum build side size to use bloom filter optimization.
-/// For small build sides, the bloom filter overhead isn't worth it.
-const BLOOM_FILTER_MIN_BUILD_SIZE: usize = 100;
-
-/// Extract the base (unqualified) column name from a potentially qualified column name.
-/// For "table.column" returns "column", for "column" returns "column".
-/// The result is always lowercase for case-insensitive comparisons.
-#[inline]
-fn extract_base_column_name(col_name: &str) -> String {
-    if let Some(dot_idx) = col_name.rfind('.') {
-        col_name[dot_idx + 1..].to_lowercase()
-    } else {
-        col_name.to_lowercase()
-    }
-}
 
 /// Pre-computed column name mappings for correlated subqueries.
 /// Avoids repeated string allocations per row in the inner loop.
@@ -108,110 +91,6 @@ impl ColumnKeyMapping {
                 }
             })
             .collect()
-    }
-}
-
-/// Check if an expression contains any Parameter nodes ($1, $2, etc.)
-/// Parameterized queries cannot be semantically cached because the cache
-/// stores results tied to specific parameter values, but the AST only
-/// contains parameter indices, not values.
-fn expression_has_parameters(expr: &Expression) -> bool {
-    match expr {
-        Expression::Parameter(_) => true,
-        Expression::Prefix(prefix) => expression_has_parameters(&prefix.right),
-        Expression::Infix(infix) => {
-            expression_has_parameters(&infix.left) || expression_has_parameters(&infix.right)
-        }
-        Expression::In(in_expr) => {
-            expression_has_parameters(&in_expr.left)
-                || match in_expr.right.as_ref() {
-                    Expression::List(list) => list.elements.iter().any(expression_has_parameters),
-                    Expression::ExpressionList(list) => {
-                        list.expressions.iter().any(expression_has_parameters)
-                    }
-                    other => expression_has_parameters(other),
-                }
-        }
-        Expression::Between(between) => {
-            expression_has_parameters(&between.expr)
-                || expression_has_parameters(&between.lower)
-                || expression_has_parameters(&between.upper)
-        }
-        Expression::Like(like) => {
-            expression_has_parameters(&like.left) || expression_has_parameters(&like.pattern)
-        }
-        Expression::Case(case) => {
-            case.value
-                .as_ref()
-                .is_some_and(|e| expression_has_parameters(e))
-                || case.when_clauses.iter().any(|wc| {
-                    expression_has_parameters(&wc.condition)
-                        || expression_has_parameters(&wc.then_result)
-                })
-                || case
-                    .else_value
-                    .as_ref()
-                    .is_some_and(|e| expression_has_parameters(e))
-        }
-        Expression::FunctionCall(func) => func.arguments.iter().any(expression_has_parameters),
-        Expression::Aliased(aliased) => expression_has_parameters(&aliased.expression),
-        Expression::Cast(cast) => expression_has_parameters(&cast.expr),
-        _ => false,
-    }
-}
-
-/// Extract all table qualifiers (aliases) referenced in an expression.
-/// Returns a set of lowercase table names/aliases.
-fn collect_table_qualifiers(expr: &Expression) -> rustc_hash::FxHashSet<String> {
-    let mut qualifiers = rustc_hash::FxHashSet::default();
-    collect_table_qualifiers_impl(expr, &mut qualifiers);
-    qualifiers
-}
-
-fn collect_table_qualifiers_impl(
-    expr: &Expression,
-    qualifiers: &mut rustc_hash::FxHashSet<String>,
-) {
-    match expr {
-        Expression::QualifiedIdentifier(qi) => {
-            qualifiers.insert(qi.qualifier.value.to_lowercase());
-        }
-        Expression::Infix(infix) => {
-            collect_table_qualifiers_impl(&infix.left, qualifiers);
-            collect_table_qualifiers_impl(&infix.right, qualifiers);
-        }
-        Expression::Prefix(prefix) => {
-            collect_table_qualifiers_impl(&prefix.right, qualifiers);
-        }
-        Expression::In(in_expr) => {
-            collect_table_qualifiers_impl(&in_expr.left, qualifiers);
-            if let Expression::List(list) = in_expr.right.as_ref() {
-                for elem in &list.elements {
-                    collect_table_qualifiers_impl(elem, qualifiers);
-                }
-            }
-        }
-        Expression::Between(between) => {
-            collect_table_qualifiers_impl(&between.expr, qualifiers);
-            collect_table_qualifiers_impl(&between.lower, qualifiers);
-            collect_table_qualifiers_impl(&between.upper, qualifiers);
-        }
-        Expression::Like(like) => {
-            collect_table_qualifiers_impl(&like.left, qualifiers);
-            collect_table_qualifiers_impl(&like.pattern, qualifiers);
-        }
-        Expression::FunctionCall(func) => {
-            for arg in &func.arguments {
-                collect_table_qualifiers_impl(arg, qualifiers);
-            }
-        }
-        Expression::Aliased(aliased) => {
-            collect_table_qualifiers_impl(&aliased.expression, qualifiers);
-        }
-        Expression::Cast(cast) => {
-            collect_table_qualifiers_impl(&cast.expr, qualifiers);
-        }
-        _ => {}
     }
 }
 
@@ -263,132 +142,6 @@ fn partition_where_for_join(
     )
 }
 
-/// Flatten AND predicates into a list
-fn flatten_and_predicates(expr: &Expression) -> Vec<Expression> {
-    match expr {
-        Expression::Infix(infix) if infix.operator.to_uppercase() == "AND" => {
-            let mut result = flatten_and_predicates(&infix.left);
-            result.extend(flatten_and_predicates(&infix.right));
-            result
-        }
-        _ => vec![expr.clone()],
-    }
-}
-
-/// Combine predicates with AND
-fn combine_predicates_with_and(preds: Vec<Expression>) -> Option<Expression> {
-    if preds.is_empty() {
-        return None;
-    }
-
-    let mut result = preds.into_iter();
-    let first = result.next().unwrap();
-
-    Some(result.fold(first, |acc, pred| {
-        Expression::Infix(InfixExpression::new(
-            Token::new(TokenType::Keyword, "AND", Position::default()),
-            Box::new(acc),
-            "AND".to_string(),
-            Box::new(pred),
-        ))
-    }))
-}
-
-/// Get table alias from a table expression
-fn get_table_alias_from_expr(expr: &Expression) -> Option<String> {
-    match expr {
-        Expression::TableSource(ts) => Some(
-            ts.alias
-                .as_ref()
-                .map(|a| a.value.clone())
-                .unwrap_or_else(|| ts.name.value.clone()),
-        ),
-        Expression::SubquerySource(ss) => ss.alias.as_ref().map(|a| a.value.clone()),
-        _ => None,
-    }
-}
-
-/// Strip table qualifier from an expression, replacing qualified identifiers
-/// with unqualified ones. Used when pushing filters to individual table scans.
-fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {
-    let alias_lower = table_alias.to_lowercase();
-
-    match expr {
-        Expression::QualifiedIdentifier(qi) if qi.qualifier.value.to_lowercase() == alias_lower => {
-            // Convert to simple identifier
-            Expression::Identifier(Identifier::new(
-                qi.name.token.clone(),
-                qi.name.value.clone(),
-            ))
-        }
-        Expression::Infix(infix) => Expression::Infix(InfixExpression::new(
-            infix.token.clone(),
-            Box::new(strip_table_qualifier(&infix.left, table_alias)),
-            infix.operator.clone(),
-            Box::new(strip_table_qualifier(&infix.right, table_alias)),
-        )),
-        Expression::Prefix(prefix) => Expression::Prefix(PrefixExpression::new(
-            prefix.token.clone(),
-            prefix.operator.clone(),
-            Box::new(strip_table_qualifier(&prefix.right, table_alias)),
-        )),
-        Expression::In(in_expr) => {
-            let new_left = strip_table_qualifier(&in_expr.left, table_alias);
-            let new_right = match in_expr.right.as_ref() {
-                Expression::List(list) => Expression::List(ListExpression {
-                    token: list.token.clone(),
-                    elements: list
-                        .elements
-                        .iter()
-                        .map(|e| strip_table_qualifier(e, table_alias))
-                        .collect(),
-                }),
-                other => strip_table_qualifier(other, table_alias),
-            };
-            Expression::In(InExpression {
-                token: in_expr.token.clone(),
-                left: Box::new(new_left),
-                right: Box::new(new_right),
-                not: in_expr.not,
-            })
-        }
-        Expression::Between(between) => Expression::Between(BetweenExpression {
-            token: between.token.clone(),
-            expr: Box::new(strip_table_qualifier(&between.expr, table_alias)),
-            lower: Box::new(strip_table_qualifier(&between.lower, table_alias)),
-            upper: Box::new(strip_table_qualifier(&between.upper, table_alias)),
-            not: between.not,
-        }),
-        Expression::Like(like) => Expression::Like(LikeExpression {
-            token: like.token.clone(),
-            left: Box::new(strip_table_qualifier(&like.left, table_alias)),
-            pattern: Box::new(strip_table_qualifier(&like.pattern, table_alias)),
-            operator: like.operator.clone(),
-            escape: like
-                .escape
-                .as_ref()
-                .map(|e| Box::new(strip_table_qualifier(e, table_alias))),
-        }),
-        Expression::FunctionCall(func) => Expression::FunctionCall(FunctionCall {
-            token: func.token.clone(),
-            function: func.function.clone(),
-            arguments: func
-                .arguments
-                .iter()
-                .map(|a| strip_table_qualifier(a, table_alias))
-                .collect(),
-            is_distinct: func.is_distinct,
-            order_by: func.order_by.clone(),
-            filter: func
-                .filter
-                .as_ref()
-                .map(|f| Box::new(strip_table_qualifier(f, table_alias))),
-        }),
-        // For other expressions, return as-is
-        _ => expr.clone(),
-    }
-}
-
 impl Executor {
     /// Execute a SELECT statement
     pub(crate) fn execute_select(
@@ -396,6 +149,18 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        // Start timeout guard ONLY at the top level (query_depth == 0).
+        // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
+        // This ensures the timeout applies to the entire query, not each nested call.
+        let _timeout_guard = if ctx.query_depth == 0 {
+            TimeoutGuard::new(ctx)
+        } else {
+            None
+        };
+
+        // Check for cancellation at entry point
+        ctx.check_cancelled()?;
+
         // Validate: aggregate functions are not allowed in WHERE clause
         if let Some(ref where_clause) = stmt.where_clause {
             if expression_contains_aggregate(where_clause) {
@@ -412,7 +177,7 @@ impl Executor {
 
         // Evaluate LIMIT/OFFSET early (needed for set operations optimization)
         let limit = if let Some(ref limit_expr) = stmt.limit {
-            let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             match evaluator.evaluate(limit_expr) {
                 Ok(Value::Integer(l)) => {
                     if l < 0 {
@@ -446,7 +211,7 @@ impl Executor {
         };
 
         let offset = if let Some(ref offset_expr) = stmt.offset {
-            let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             match evaluator.evaluate(offset_expr) {
                 Ok(Value::Integer(o)) => {
                     if o < 0 {
@@ -673,7 +438,7 @@ impl Executor {
                 }
 
                 // Create evaluator for ORDER BY expressions
-                let mut evaluator = Evaluator::new(&self.function_registry);
+                let mut evaluator = CompiledEvaluator::new(&self.function_registry);
                 evaluator = evaluator.with_context(ctx);
                 evaluator.init_columns(&columns);
 
@@ -737,7 +502,7 @@ impl Executor {
                                         ) {
                                             Ok(processed_expr) => {
                                                 let mut corr_eval =
-                                                    Evaluator::new(&self.function_registry);
+                                                    CompiledEvaluator::new(&self.function_registry);
                                                 corr_eval.init_columns(&columns);
                                                 corr_eval.set_row_array(row);
                                                 corr_eval = corr_eval.with_context(&correlated_ctx);
@@ -997,203 +762,13 @@ impl Executor {
         }
     }
 
-    /// Execute set operations (UNION, INTERSECT, EXCEPT)
-    /// The limit parameter enables early termination for UNION ALL
-    fn execute_set_operations(
-        &self,
-        left_result: Box<dyn QueryResult>,
-        set_ops: &[SetOperation],
-        ctx: &ExecutionContext,
-        limit: Option<usize>,
-    ) -> Result<Box<dyn QueryResult>> {
-        use rustc_hash::FxHashSet;
-
-        // Materialize the left result (with limit for UNION ALL optimization)
-        let columns = left_result.columns().to_vec();
-
-        // For UNION ALL with limit, we can take advantage of early termination
-        // Check if all operations are UNION ALL
-        let all_union_all = set_ops
-            .iter()
-            .all(|op| matches!(op.operation, SetOperationType::UnionAll));
-
-        let mut result_rows = if let (true, Some(lim)) = (all_union_all, limit) {
-            // Only materialize up to limit rows from left side
-            let mut rows = Vec::with_capacity(lim.min(1024));
-            let mut left_result = left_result;
-            while left_result.next() {
-                rows.push(left_result.take_row());
-                if rows.len() >= lim {
-                    return Ok(Box::new(ExecutorMemoryResult::new(columns, rows)));
-                }
-            }
-            rows
-        } else {
-            Self::materialize_result(left_result)?
-        };
-
-        // Process each set operation in sequence
-        for set_op in set_ops {
-            // For UNION ALL with limit, check if we already have enough rows
-            if matches!(set_op.operation, SetOperationType::UnionAll) {
-                if let Some(lim) = limit {
-                    if result_rows.len() >= lim {
-                        // Already have enough rows, skip remaining set operations
-                        break;
-                    }
-                }
-            }
-
-            // Execute the right side query
-            let right_result = self.execute_select(&set_op.right, ctx)?;
-
-            // Validate column count matches (SQL standard requirement)
-            let right_col_count = right_result.columns().len();
-            let left_col_count = columns.len();
-            if left_col_count != right_col_count {
-                return Err(crate::Error::internal(format!(
-                    "each {} query must have the same number of columns: left has {}, right has {}",
-                    match &set_op.operation {
-                        SetOperationType::Union | SetOperationType::UnionAll => "UNION",
-                        SetOperationType::Intersect | SetOperationType::IntersectAll => "INTERSECT",
-                        SetOperationType::Except | SetOperationType::ExceptAll => "EXCEPT",
-                    },
-                    left_col_count,
-                    right_col_count
-                )));
-            }
-
-            // Apply the set operation
-            match &set_op.operation {
-                SetOperationType::Union => {
-                    // UNION: combine rows and remove duplicates
-                    let right_rows = Self::materialize_result(right_result)?;
-                    let mut seen: FxHashSet<u64> = FxHashSet::default();
-                    let mut unique_rows = Vec::new();
-
-                    // Add left rows (dedup)
-                    for row in result_rows {
-                        let hash = Self::hash_row(&row);
-                        if seen.insert(hash) {
-                            unique_rows.push(row);
-                        }
-                    }
-
-                    // Add right rows (dedup)
-                    for row in right_rows {
-                        let hash = Self::hash_row(&row);
-                        if seen.insert(hash) {
-                            unique_rows.push(row);
-                        }
-                    }
-
-                    result_rows = unique_rows;
-                }
-                SetOperationType::UnionAll => {
-                    // UNION ALL: just concatenate (keep all duplicates)
-                    // With limit optimization, only take as many rows as needed
-                    if let Some(lim) = limit {
-                        let needed = lim.saturating_sub(result_rows.len());
-                        if needed > 0 {
-                            let mut right_result = right_result;
-                            let mut count = 0;
-                            while right_result.next() && count < needed {
-                                result_rows.push(right_result.take_row());
-                                count += 1;
-                            }
-                        }
-                    } else {
-                        let right_rows = Self::materialize_result(right_result)?;
-                        result_rows.extend(right_rows);
-                    }
-                }
-                SetOperationType::Intersect => {
-                    // INTERSECT: keep only rows that exist in both (dedup)
-                    let right_rows = Self::materialize_result(right_result)?;
-                    let right_hashes: FxHashSet<u64> =
-                        right_rows.iter().map(Self::hash_row).collect();
-
-                    let mut seen: FxHashSet<u64> = FxHashSet::default();
-                    result_rows.retain(|row| {
-                        let hash = Self::hash_row(row);
-                        right_hashes.contains(&hash) && seen.insert(hash)
-                    });
-                }
-                SetOperationType::IntersectAll => {
-                    // INTERSECT ALL: keep matching rows with multiplicity
-                    let right_rows = Self::materialize_result(right_result)?;
-                    let mut right_counts: rustc_hash::FxHashMap<u64, usize> =
-                        rustc_hash::FxHashMap::default();
-                    for row in &right_rows {
-                        *right_counts.entry(Self::hash_row(row)).or_insert(0) += 1;
-                    }
-
-                    result_rows.retain(|row| {
-                        let hash = Self::hash_row(row);
-                        if let Some(count) = right_counts.get_mut(&hash) {
-                            if *count > 0 {
-                                *count -= 1;
-                                return true;
-                            }
-                        }
-                        false
-                    });
-                }
-                SetOperationType::Except => {
-                    // EXCEPT: keep left rows not in right (dedup)
-                    let right_rows = Self::materialize_result(right_result)?;
-                    let right_hashes: FxHashSet<u64> =
-                        right_rows.iter().map(Self::hash_row).collect();
-
-                    let mut seen: FxHashSet<u64> = FxHashSet::default();
-                    result_rows.retain(|row| {
-                        let hash = Self::hash_row(row);
-                        !right_hashes.contains(&hash) && seen.insert(hash)
-                    });
-                }
-                SetOperationType::ExceptAll => {
-                    // EXCEPT ALL: remove matching rows with multiplicity
-                    let right_rows = Self::materialize_result(right_result)?;
-                    let mut right_counts: rustc_hash::FxHashMap<u64, usize> =
-                        rustc_hash::FxHashMap::default();
-                    for row in &right_rows {
-                        *right_counts.entry(Self::hash_row(row)).or_insert(0) += 1;
-                    }
-
-                    result_rows.retain(|row| {
-                        let hash = Self::hash_row(row);
-                        if let Some(count) = right_counts.get_mut(&hash) {
-                            if *count > 0 {
-                                *count -= 1;
-                                return false; // Remove this row
-                            }
-                        }
-                        true // Keep this row
-                    });
-                }
-            }
-        }
-
-        Ok(Box::new(ExecutorMemoryResult::new(columns, result_rows)))
-    }
-
-    /// Hash a row for set operations
-    fn hash_row(row: &Row) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = rustc_hash::FxHasher::default();
-        for value in row.as_slice() {
-            value.hash(&mut hasher);
-        }
-        hasher.finish()
-    }
-
     /// Execute SELECT without FROM (expressions only)
     fn execute_expression_select(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
-        let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
 
         // Check WHERE clause first - if it evaluates to false, return empty result
         if let Some(where_clause) = &stmt.where_clause {
@@ -1575,7 +1150,7 @@ impl Executor {
                 // This allows queries like `WHERE indexed_col = 5 AND complex_func(x) > 0`
                 // to use the index for `indexed_col = 5` while filtering `complex_func(x) > 0` in memory.
                 let schema = table.schema();
-                self.try_extract_pushable_conjuncts(where_expr, schema, Some(ctx))
+                pushdown::try_pushdown(where_expr, schema, Some(ctx))
             }
         } else {
             (None, false)
@@ -1661,7 +1236,7 @@ impl Executor {
             && !needs_memory_filter; // Allow with storage_expr (WHERE on indexed columns)
 
         if can_pushdown_limit {
-            let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             let limit = if let Some(ref limit_expr) = stmt.limit {
                 match evaluator.evaluate(limit_expr) {
                     Ok(Value::Integer(l)) if l >= 0 => l as usize,
@@ -1770,7 +1345,7 @@ impl Executor {
                 if needs_memory_filter {
                     if let Some(where_expr) = where_to_use {
                         // Create evaluator for the filter closure
-                        let mut eval = Evaluator::new(&self.function_registry);
+                        let mut eval = CompiledEvaluator::new(&self.function_registry);
                         eval = eval.with_context(ctx);
                         eval.init_columns(&all_columns);
                         let where_clone = where_expr.clone();
@@ -1781,7 +1356,7 @@ impl Executor {
                             Box::new(move |row: &Row| {
                                 // Re-create evaluator for each call to avoid borrow issues
                                 // This is a tradeoff: we sacrifice some performance for Send+Sync safety
-                                let mut local_eval = Evaluator::with_defaults();
+                                let mut local_eval = CompiledEvaluator::with_defaults();
                                 local_eval.init_columns(&all_cols);
                                 local_eval.set_row_array(row);
                                 local_eval.evaluate_bool(&where_clone).unwrap_or(false)
@@ -1900,7 +1475,7 @@ impl Executor {
                     )
                 } else {
                     // Sequential filter for small datasets
-                    let mut eval = Evaluator::new(&self.function_registry);
+                    let mut eval = CompiledEvaluator::new(&self.function_registry);
                     eval = eval.with_context(ctx);
                     eval.init_columns(&all_columns);
 
@@ -1916,7 +1491,7 @@ impl Executor {
                 // SEQUENTIAL PATH: For correlated subqueries or complex cases
                 // Create evaluator once and reuse for all rows
                 let mut eval = if processed_where.is_some() {
-                    let mut e = Evaluator::new(&self.function_registry);
+                    let mut e = CompiledEvaluator::new(&self.function_registry);
                     e = e.with_context(ctx);
                     e.init_columns(&all_columns);
                     Some(e)
@@ -1949,7 +1524,14 @@ impl Executor {
                 };
 
                 let mut rows = Vec::new();
+                let mut row_count = 0u64;
                 while scanner.next() {
+                    // Check for cancellation every 100 rows (more frequent for slow queries)
+                    row_count += 1;
+                    if row_count.is_multiple_of(100) {
+                        ctx.check_cancelled()?;
+                    }
+
                     let row = scanner.take_row();
 
                     // Apply in-memory WHERE filter if needed (for complex expressions or subqueries)
@@ -2002,6 +1584,10 @@ impl Executor {
                             let processed =
                                 self.process_correlated_where(where_expr, &correlated_ctx)?;
 
+                            // Check for cancellation after processing each correlated subquery
+                            // This is critical for slow correlated subqueries
+                            ctx.check_cancelled()?;
+
                             // OPTIMIZATION: Take ownership instead of cloning - avoids HashMap clone
                             evaluator.set_outer_row_owned(
                                 correlated_ctx.outer_row.take().unwrap_or_default(),
@@ -2037,7 +1623,13 @@ impl Executor {
 
             // OPTIMIZATION: Use take_row() to avoid cloning each row
             let mut rows = Vec::new();
+            let mut row_count = 0u64;
             while scanner.next() {
+                // Check for cancellation every 100 rows
+                row_count += 1;
+                if row_count.is_multiple_of(100) {
+                    ctx.check_cancelled()?;
+                }
                 rows.push(scanner.take_row());
             }
             rows
@@ -2439,7 +2031,7 @@ impl Executor {
         let result_rows = if let Some(condition) = effective_condition {
             // Extract equality keys and non-equality residual conditions
             let (left_key_indices, right_key_indices, residual) =
-                Self::extract_join_keys_and_residual(condition, &left_columns, &right_columns);
+                join::extract_join_keys_and_residual(condition, &left_columns, &right_columns);
 
             // Use the query planner for cost-based join decision
             let has_equality_keys = !left_key_indices.is_empty();
@@ -2447,9 +2039,9 @@ impl Executor {
             // Detect if inputs are sorted on join keys for potential merge join optimization
             // This check is O(n) but enables O(n+m) merge join vs O(n*m) nested loop
             let left_sorted =
-                has_equality_keys && Self::is_sorted_on_keys(&left_rows, &left_key_indices);
+                has_equality_keys && join::is_sorted_on_keys(&left_rows, &left_key_indices);
             let right_sorted =
-                has_equality_keys && Self::is_sorted_on_keys(&right_rows, &right_key_indices);
+                has_equality_keys && join::is_sorted_on_keys(&right_rows, &right_key_indices);
 
             // Get estimated cardinalities from statistics (if available)
             // These are used by AQE to detect significant estimation errors
@@ -2544,7 +2136,8 @@ impl Executor {
             let join_limit = if can_push_limit {
                 // Extract LIMIT value if present
                 stmt.limit.as_ref().and_then(|limit_expr| {
-                    let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+                    let mut evaluator =
+                        CompiledEvaluator::new(&self.function_registry).with_context(ctx);
                     evaluator.evaluate(limit_expr).ok().and_then(|v| match v {
                         Value::Integer(n) if n >= 0 => Some(n as u64),
                         _ => None,
@@ -2648,7 +2241,8 @@ impl Executor {
                 && !cross_has_aggregation
             {
                 stmt.limit.as_ref().and_then(|limit_expr| {
-                    let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+                    let mut evaluator =
+                        CompiledEvaluator::new(&self.function_registry).with_context(ctx);
                     evaluator.evaluate(limit_expr).ok().and_then(|v| match v {
                         Value::Integer(n) if n >= 0 => Some(n as u64),
                         _ => None,
@@ -2699,7 +2293,7 @@ impl Executor {
             };
 
             // Create evaluator once and reuse
-            let mut where_eval = Evaluator::new(&self.function_registry);
+            let mut where_eval = CompiledEvaluator::new(&self.function_registry);
             where_eval = where_eval.with_context(ctx);
             where_eval.init_columns(&all_columns);
 
@@ -2821,7 +2415,9 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
-        let result = self.execute_select(&subquery_source.subquery, ctx)?;
+        // Execute subquery with incremented depth to avoid creating new TimeoutGuard
+        let subquery_ctx = ctx.with_incremented_query_depth();
+        let result = self.execute_select(&subquery_source.subquery, &subquery_ctx)?;
         let columns = result.columns().to_vec();
 
         // Materialize the subquery result
@@ -2829,7 +2425,7 @@ impl Executor {
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
-            let mut where_eval = Evaluator::new(&self.function_registry);
+            let mut where_eval = CompiledEvaluator::new(&self.function_registry);
             where_eval = where_eval.with_context(ctx);
             where_eval.init_columns(&columns);
 
@@ -3133,7 +2729,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
-        let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
 
         // Determine column names
         let num_columns = if values_source.rows.is_empty() {
@@ -3162,11 +2758,7 @@ impl Executor {
         };
 
         // Build a map of both simple and qualified column names to indices
-        let mut col_index_map: rustc_hash::FxHashMap<String, usize> = column_names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (name.to_lowercase(), i))
-            .collect();
+        let mut col_index_map = build_column_index_map(&column_names);
 
         // Also add qualified names (e.g., "v.id" for table alias "v")
         // OPTIMIZATION: Pre-compute lowercase table alias once outside the loop
@@ -3185,7 +2777,7 @@ impl Executor {
         // OPTIMIZATION: Pre-create evaluators outside the loop if WHERE clause exists
         let (mut where_eval, mut qualified_eval, _qualified_columns) =
             if stmt.where_clause.is_some() {
-                let mut eval = Evaluator::new(&self.function_registry);
+                let mut eval = CompiledEvaluator::new(&self.function_registry);
                 eval = eval.with_context(ctx);
                 eval.init_columns(&column_names);
 
@@ -3194,7 +2786,7 @@ impl Executor {
                     .iter()
                     .map(|c| format!("{}.{}", table_alias, c))
                     .collect();
-                let mut qual_eval = Evaluator::new(&self.function_registry);
+                let mut qual_eval = CompiledEvaluator::new(&self.function_registry);
                 qual_eval = qual_eval.with_context(ctx);
                 qual_eval.init_columns(&qualified_cols);
 
@@ -3313,7 +2905,7 @@ impl Executor {
         });
 
         let mut proj_eval = if needs_evaluator {
-            let mut eval = Evaluator::new(&self.function_registry);
+            let mut eval = CompiledEvaluator::new(&self.function_registry);
             eval = eval.with_context(ctx);
             eval.init_columns(&extended_columns);
             Some(eval)
@@ -3493,7 +3085,7 @@ impl Executor {
 
                     // Apply filter to CTE data if present
                     let filtered_rows = if let Some(filter_expr) = filter {
-                        let mut eval = Evaluator::new(&self.function_registry);
+                        let mut eval = CompiledEvaluator::new(&self.function_registry);
                         eval = eval.with_context(ctx);
                         eval.init_columns(columns);
 
@@ -3607,7 +3199,9 @@ impl Executor {
                 Ok((result, columns))
             }
             Expression::SubquerySource(ss) => {
-                let result = self.execute_select(&ss.subquery, ctx)?;
+                // Execute subquery with incremented depth to avoid creating new TimeoutGuard
+                let subquery_ctx = ctx.with_incremented_query_depth();
+                let result = self.execute_select(&ss.subquery, &subquery_ctx)?;
                 let columns = result.columns().to_vec();
 
                 // Prefix column names with subquery alias (required for proper ON condition resolution)
@@ -3890,7 +3484,7 @@ impl Executor {
         let mut projected = Vec::with_capacity(rows.len());
 
         // Create evaluator once and reuse for all rows
-        let mut evaluator = Evaluator::new(&self.function_registry);
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry);
         evaluator = evaluator.with_context(ctx);
         evaluator.init_columns(all_columns);
 
@@ -4005,7 +3599,7 @@ impl Executor {
                     }
                     _ => {
                         let value = self.evaluate_select_expr(
-                            &evaluator,
+                            &mut evaluator,
                             expr,
                             &row,
                             &col_index_map_lower,
@@ -4039,11 +3633,7 @@ impl Executor {
         };
 
         // Build column index map ONCE with FxHashMap for O(1) lookup
-        let col_index_map_lower: rustc_hash::FxHashMap<String, usize> = all_columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.to_lowercase(), i))
-            .collect();
+        let col_index_map_lower = build_column_index_map(all_columns);
 
         // Get SELECT column names (lowercase) for checking duplicates
         let select_column_names: Vec<String> = select_exprs
@@ -4125,7 +3715,7 @@ impl Executor {
             let mut projected = Vec::with_capacity(rows.len());
 
             // Create evaluator once and reuse for all rows
-            let mut evaluator = Evaluator::new(&self.function_registry);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry);
             evaluator = evaluator.with_context(ctx);
             evaluator.init_columns(all_columns);
 
@@ -4137,8 +3727,12 @@ impl Executor {
 
                 // Evaluate SELECT expressions
                 for expr in select_exprs.iter() {
-                    let value =
-                        self.evaluate_select_expr(&evaluator, expr, &row, &col_index_map_lower)?;
+                    let value = self.evaluate_select_expr(
+                        &mut evaluator,
+                        expr,
+                        &row,
+                        &col_index_map_lower,
+                    )?;
                     values.push(value);
                 }
 
@@ -4159,7 +3753,7 @@ impl Executor {
     #[allow(clippy::only_used_in_recursion)]
     fn evaluate_select_expr(
         &self,
-        evaluator: &Evaluator,
+        evaluator: &mut CompiledEvaluator,
         expr: &Expression,
         row: &Row,
         col_index_map: &rustc_hash::FxHashMap<String, usize>,
@@ -4291,11 +3885,7 @@ impl Executor {
             return Some(((0..all_columns.len()).collect(), all_columns.to_vec()));
         }
 
-        let col_index_map: rustc_hash::FxHashMap<String, usize> = all_columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.to_lowercase(), i))
-            .collect();
+        let col_index_map = build_column_index_map(all_columns);
 
         let mut indices = Vec::with_capacity(select_exprs.len());
         let mut names = Vec::with_capacity(select_exprs.len());
@@ -4345,49 +3935,6 @@ impl Executor {
         }
 
         Some((indices, names))
-    }
-
-    /// Resolve SELECT column list to actual column names and indices
-    #[allow(dead_code)]
-    fn resolve_select_columns(
-        &self,
-        stmt: &SelectStatement,
-        all_columns: &[String],
-        _schema: &Schema,
-    ) -> Result<(Vec<String>, Vec<usize>)> {
-        let mut output_columns = Vec::new();
-        let mut column_indices = Vec::new();
-
-        for (i, col_expr) in stmt.columns.iter().enumerate() {
-            match col_expr {
-                Expression::Star(_) | Expression::QualifiedStar(_) => {
-                    output_columns.extend(all_columns.iter().cloned());
-                    column_indices.clear();
-                    return Ok((output_columns, column_indices));
-                }
-                Expression::Identifier(id) => {
-                    // OPTIMIZATION: Use eq_ignore_ascii_case to avoid allocations
-                    if let Some(idx) = all_columns
-                        .iter()
-                        .position(|c| c.eq_ignore_ascii_case(&id.value_lower))
-                    {
-                        output_columns.push(all_columns[idx].clone());
-                        column_indices.push(idx);
-                    } else {
-                        return Err(Error::ColumnNotFoundNamed(id.value.clone()));
-                    }
-                }
-                Expression::Aliased(aliased) => {
-                    let name = aliased.alias.value.clone();
-                    output_columns.push(name);
-                }
-                _ => {
-                    output_columns.push(format!("expr{}", i + 1));
-                }
-            }
-        }
-
-        Ok((output_columns, column_indices))
     }
 
     /// Compare two rows for ORDER BY using pre-computed column indices
@@ -4558,951 +4105,6 @@ impl Executor {
         Ok(Box::new(ExecResult::empty()))
     }
 
-    /// Execute SHOW TABLES statement
-    pub(crate) fn execute_show_tables(
-        &self,
-        _stmt: &ShowTablesStatement,
-        _ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        let tx = self.engine.begin_transaction()?;
-        let tables = tx.list_tables()?;
-
-        let columns = vec!["table_name".to_string()];
-        let rows: Vec<Row> = tables
-            .into_iter()
-            .map(|name| Row::from_values(vec![Value::Text(std::sync::Arc::from(name.as_str()))]))
-            .collect();
-
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
-    }
-
-    /// Execute SHOW VIEWS statement
-    pub(crate) fn execute_show_views(
-        &self,
-        _stmt: &ShowViewsStatement,
-        _ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        let views = self.engine.list_views()?;
-
-        let columns = vec!["view_name".to_string()];
-        let rows: Vec<Row> = views
-            .into_iter()
-            .map(|name| Row::from_values(vec![Value::Text(std::sync::Arc::from(name.as_str()))]))
-            .collect();
-
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
-    }
-
-    /// Execute SHOW CREATE TABLE statement
-    pub(crate) fn execute_show_create_table(
-        &self,
-        stmt: &ShowCreateTableStatement,
-        _ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        let table_name = &stmt.table_name.value;
-        let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(table_name)?;
-        let schema = table.schema();
-
-        // Get unique column names from indexes
-        let mut unique_columns: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        if let Ok(indexes) = self.engine.list_table_indexes(table_name) {
-            for index_name in indexes.keys() {
-                if let Some(index) = table.get_index(index_name) {
-                    // Only single-column unique indexes should be shown as UNIQUE constraint on column
-                    let col_names = index.column_names();
-                    if index.is_unique() && col_names.len() == 1 {
-                        unique_columns.insert(col_names[0].to_lowercase());
-                    }
-                }
-            }
-        }
-
-        // Build CREATE TABLE statement
-        let mut create_sql = format!("CREATE TABLE {} (", table_name);
-        let col_defs: Vec<String> = schema
-            .columns
-            .iter()
-            .map(|col| {
-                let mut def = format!("{} {:?}", col.name, col.data_type);
-                if col.primary_key {
-                    def.push_str(" PRIMARY KEY");
-                    if col.auto_increment {
-                        def.push_str(" AUTO_INCREMENT");
-                    }
-                } else {
-                    // Check if this column has a UNIQUE constraint
-                    if unique_columns.contains(&col.name.to_lowercase()) {
-                        def.push_str(" UNIQUE");
-                    }
-                    if !col.nullable {
-                        def.push_str(" NOT NULL");
-                    }
-                }
-                // Add DEFAULT if present
-                if let Some(default_expr) = &col.default_expr {
-                    def.push_str(&format!(" DEFAULT {}", default_expr));
-                }
-                // Add CHECK constraint if present
-                if let Some(check) = &col.check_expr {
-                    def.push_str(&format!(" CHECK ({})", check));
-                }
-                def
-            })
-            .collect();
-        create_sql.push_str(&col_defs.join(", "));
-        create_sql.push(')');
-
-        let columns = vec!["Table".to_string(), "Create Table".to_string()];
-        let rows = vec![Row::from_values(vec![
-            Value::Text(std::sync::Arc::from(table_name.as_str())),
-            Value::Text(std::sync::Arc::from(create_sql.as_str())),
-        ])];
-
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
-    }
-
-    /// Execute SHOW CREATE VIEW statement
-    pub(crate) fn execute_show_create_view(
-        &self,
-        stmt: &ShowCreateViewStatement,
-        _ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        let view_name = &stmt.view_name.value;
-
-        // Get the view definition
-        let view_def = self
-            .engine
-            .get_view(view_name)?
-            .ok_or_else(|| Error::ViewNotFound(view_name.to_string()))?;
-
-        // Build CREATE VIEW statement
-        let create_sql = format!(
-            "CREATE VIEW {} AS {}",
-            view_def.original_name, view_def.query
-        );
-
-        let columns = vec!["View".to_string(), "Create View".to_string()];
-        let rows = vec![Row::from_values(vec![
-            Value::Text(std::sync::Arc::from(view_def.original_name.as_str())),
-            Value::Text(std::sync::Arc::from(create_sql.as_str())),
-        ])];
-
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
-    }
-
-    /// Execute SHOW INDEXES statement
-    pub(crate) fn execute_show_indexes(
-        &self,
-        stmt: &ShowIndexesStatement,
-        _ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        let table_name = &stmt.table_name.value;
-
-        // Get a table reference to access indexes
-        let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(table_name)?;
-
-        // Get index info from version store through the table
-        let index_names = {
-            let indexes = self.engine.list_table_indexes(table_name)?;
-            indexes.keys().cloned().collect::<Vec<_>>()
-        };
-
-        // Build rows with: table_name, index_name, column_name, index_type, is_unique
-        let columns = vec![
-            "table_name".to_string(),
-            "index_name".to_string(),
-            "column_name".to_string(),
-            "index_type".to_string(),
-            "is_unique".to_string(),
-        ];
-
-        let mut rows: Vec<Row> = Vec::new();
-        for index_name in index_names {
-            // Try to get index details from the table's underlying storage
-            if let Some(index) = table.get_index(&index_name) {
-                let column_names = index.column_names();
-                // Show all columns for multi-column indexes
-                let column_name = if column_names.len() > 1 {
-                    format!("({})", column_names.join(", "))
-                } else {
-                    column_names
-                        .first()
-                        .map(|s| s.to_string())
-                        .unwrap_or_default()
-                };
-                let is_unique = index.is_unique();
-                let index_type = index.index_type().as_str().to_uppercase();
-
-                rows.push(Row::from_values(vec![
-                    Value::Text(std::sync::Arc::from(table_name.as_str())),
-                    Value::Text(std::sync::Arc::from(index_name.as_str())),
-                    Value::Text(std::sync::Arc::from(column_name.as_str())),
-                    Value::Text(std::sync::Arc::from(index_type)),
-                    Value::Boolean(is_unique),
-                ]));
-            }
-        }
-
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
-    }
-
-    /// Execute DESCRIBE statement - shows table structure
-    pub(crate) fn execute_describe(
-        &self,
-        stmt: &DescribeStatement,
-        _ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        let table_name = &stmt.table_name.value;
-        let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(table_name)?;
-        let schema = table.schema();
-
-        // Column headers: Field, Type, Null, Key, Default, Extra
-        let columns = vec![
-            "Field".to_string(),
-            "Type".to_string(),
-            "Null".to_string(),
-            "Key".to_string(),
-            "Default".to_string(),
-            "Extra".to_string(),
-        ];
-
-        let mut rows: Vec<Row> = Vec::new();
-        for col in &schema.columns {
-            // Determine type string
-            let type_str = format!("{:?}", col.data_type);
-
-            // Determine nullability
-            let null_str = if col.nullable { "YES" } else { "NO" };
-
-            // Determine key type
-            let key_str = if col.primary_key { "PRI" } else { "" };
-
-            // Get default value if any
-            let default_str = col
-                .default_expr
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_default();
-
-            // Extra info (e.g., auto_increment equivalent)
-            let extra_str =
-                if col.primary_key && col.data_type == crate::core::types::DataType::Integer {
-                    "auto_increment"
-                } else {
-                    ""
-                };
-
-            rows.push(Row::from_values(vec![
-                Value::Text(std::sync::Arc::from(col.name.as_str())),
-                Value::Text(std::sync::Arc::from(type_str.as_str())),
-                Value::Text(std::sync::Arc::from(null_str)),
-                Value::Text(std::sync::Arc::from(key_str)),
-                Value::Text(std::sync::Arc::from(default_str.as_str())),
-                Value::Text(std::sync::Arc::from(extra_str)),
-            ]));
-        }
-
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
-    }
-
-    /// Execute EXPLAIN statement - shows query plan
-    pub(crate) fn execute_explain(
-        &self,
-        stmt: &ExplainStatement,
-        ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        let mut plan_lines: Vec<String> = Vec::new();
-
-        if stmt.analyze {
-            // EXPLAIN ANALYZE: Execute the query and collect statistics
-            let start = std::time::Instant::now();
-            let mut result = self.execute_statement(&stmt.statement, ctx)?;
-
-            // Count rows by iterating through the result
-            let mut row_count = 0usize;
-            while result.next() {
-                row_count += 1;
-            }
-            let duration = start.elapsed();
-
-            // Format duration nicely
-            let time_str = if duration.as_secs() > 0 {
-                format!("{:.2}s", duration.as_secs_f64())
-            } else if duration.as_millis() > 0 {
-                format!(
-                    "{:.2}ms",
-                    duration.as_millis() as f64 + (duration.as_micros() % 1000) as f64 / 1000.0
-                )
-            } else {
-                format!("{:.2}µs", duration.as_micros() as f64)
-            };
-
-            // Record cardinality feedback for SELECT statements with WHERE
-            if let Statement::Select(select) = &*stmt.statement {
-                if let Some(ref where_clause) = select.where_clause {
-                    // Try to get the table name and record feedback
-                    if let Some(ref table_expr) = select.table_expr {
-                        if let Some(table_name) = Self::extract_table_name(table_expr) {
-                            // Compute predicate fingerprint
-                            let predicate_hash = fingerprint_predicate(&table_name, where_clause);
-
-                            // Get estimated row count from planner
-                            let tx = self.engine.begin_transaction().ok();
-                            let estimated_rows = tx
-                                .as_ref()
-                                .and_then(|tx| tx.get_table(&table_name).ok())
-                                .map(|table| {
-                                    let stats = self
-                                        .get_query_planner()
-                                        .get_table_stats_with_fallback(&*table);
-                                    stats.row_count as usize
-                                })
-                                .unwrap_or(row_count);
-
-                            // Record feedback to global cache
-                            global_feedback_cache().record_feedback(
-                                &table_name,
-                                predicate_hash,
-                                None, // column_name for more granular tracking
-                                estimated_rows as u64,
-                                row_count as u64,
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Generate plan with actual statistics
-            self.explain_statement_with_stats(
-                &stmt.statement,
-                &mut plan_lines,
-                0,
-                row_count,
-                &time_str,
-            );
-
-            // Return the plan as a result
-            let columns = vec!["plan".to_string()];
-            let rows: Vec<Row> = plan_lines
-                .into_iter()
-                .map(|line| {
-                    Row::from_values(vec![Value::Text(std::sync::Arc::from(line.as_str()))])
-                })
-                .collect();
-
-            Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
-        } else {
-            // Regular EXPLAIN: Just show the plan without executing
-            self.explain_statement(&stmt.statement, &mut plan_lines, 0);
-
-            // Return as a single-column result
-            let columns = vec!["plan".to_string()];
-            let rows: Vec<Row> = plan_lines
-                .into_iter()
-                .map(|line| {
-                    Row::from_values(vec![Value::Text(std::sync::Arc::from(line.as_str()))])
-                })
-                .collect();
-
-            Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
-        }
-    }
-
-    /// Generate EXPLAIN output with actual execution statistics
-    fn explain_statement_with_stats(
-        &self,
-        stmt: &Statement,
-        lines: &mut Vec<String>,
-        indent: usize,
-        row_count: usize,
-        time_str: &str,
-    ) {
-        let prefix = "  ".repeat(indent);
-
-        match stmt {
-            Statement::Select(select) => {
-                lines.push(format!(
-                    "{}SELECT (actual time={}, rows={})",
-                    prefix, time_str, row_count
-                ));
-                self.explain_select_columns(select, lines, indent);
-
-                // FROM clause with access plan
-                if let Some(ref table_expr) = select.table_expr {
-                    self.explain_table_expr_with_where_and_stats(
-                        table_expr,
-                        select.where_clause.as_deref(),
-                        lines,
-                        indent + 1,
-                        row_count,
-                    );
-                }
-
-                // GROUP BY
-                if !select.group_by.columns.is_empty() {
-                    let groups: Vec<String> = select
-                        .group_by
-                        .columns
-                        .iter()
-                        .map(|g| format!("{}", g))
-                        .collect();
-                    lines.push(format!("{}  Group: {}", prefix, groups.join(", ")));
-                }
-
-                // HAVING
-                if let Some(ref having) = select.having {
-                    lines.push(format!("{}  Having: {}", prefix, having));
-                }
-
-                // ORDER BY
-                if !select.order_by.is_empty() {
-                    let orders: Vec<String> = select
-                        .order_by
-                        .iter()
-                        .map(|o| {
-                            let dir = if !o.ascending { " DESC" } else { "" };
-                            format!("{}{}", o.expression, dir)
-                        })
-                        .collect();
-                    lines.push(format!("{}  Order: {}", prefix, orders.join(", ")));
-                }
-
-                // LIMIT/OFFSET
-                if let Some(ref limit) = select.limit {
-                    lines.push(format!("{}  Limit: {}", prefix, limit));
-                }
-                if let Some(ref offset) = select.offset {
-                    lines.push(format!("{}  Offset: {}", prefix, offset));
-                }
-            }
-            Statement::Insert(insert) => {
-                lines.push(format!(
-                    "{}INSERT INTO {} (actual time={}, rows={})",
-                    prefix, insert.table_name, time_str, row_count
-                ));
-                if let Some(ref select) = insert.select {
-                    lines.push(format!("{}  Source:", prefix));
-                    self.explain_select(select, lines, indent + 2);
-                } else {
-                    lines.push(format!(
-                        "{}  Values: {} row(s)",
-                        prefix,
-                        insert.values.len()
-                    ));
-                }
-            }
-            Statement::Update(update) => {
-                lines.push(format!(
-                    "{}UPDATE {} (actual time={}, rows={})",
-                    prefix, update.table_name, time_str, row_count
-                ));
-                lines.push(format!(
-                    "{}  Set: {} column(s)",
-                    prefix,
-                    update.updates.len()
-                ));
-                if let Some(ref where_clause) = update.where_clause {
-                    lines.push(format!("{}  Filter: {}", prefix, where_clause));
-                }
-            }
-            Statement::Delete(delete) => {
-                lines.push(format!(
-                    "{}DELETE FROM {} (actual time={}, rows={})",
-                    prefix, delete.table_name, time_str, row_count
-                ));
-                if let Some(ref where_clause) = delete.where_clause {
-                    lines.push(format!("{}  Filter: {}", prefix, where_clause));
-                }
-            }
-            _ => {
-                lines.push(format!(
-                    "{}Statement: {} (actual time={}, rows={})",
-                    prefix, stmt, time_str, row_count
-                ));
-            }
-        }
-    }
-
-    /// Helper to show just the SELECT columns
-    fn explain_select_columns(
-        &self,
-        select: &SelectStatement,
-        lines: &mut Vec<String>,
-        indent: usize,
-    ) {
-        let prefix = "  ".repeat(indent);
-
-        // Show columns
-        let col_count = select.columns.len();
-        if col_count <= 5 {
-            let cols: Vec<String> = select.columns.iter().map(|c| format!("{}", c)).collect();
-            lines.push(format!("{}  Columns: {}", prefix, cols.join(", ")));
-        } else {
-            lines.push(format!("{}  Columns: {} column(s)", prefix, col_count));
-        }
-    }
-
-    /// Generate EXPLAIN output for a table expression with WHERE clause analysis and stats
-    fn explain_table_expr_with_where_and_stats(
-        &self,
-        expr: &Expression,
-        where_clause: Option<&Expression>,
-        lines: &mut Vec<String>,
-        indent: usize,
-        row_count: usize,
-    ) {
-        let prefix = "  ".repeat(indent);
-
-        match expr {
-            Expression::TableSource(simple) => {
-                // Try to get the table and analyze access plan
-                if let Ok(tx) = self.engine.begin_transaction() {
-                    if let Ok(table) = tx.get_table(&simple.name.value) {
-                        // Build storage expression from WHERE clause for analysis
-                        let storage_expr = if let Some(where_expr) = where_clause {
-                            let schema = table.schema();
-                            self.build_storage_expression_with_ctx(where_expr, schema, None)
-                                .ok()
-                        } else {
-                            None
-                        };
-
-                        // Get the scan plan
-                        let scan_plan = table.explain_scan(storage_expr.as_deref());
-
-                        // For SeqScan, use the AST expression's Display format instead of storage expr Debug
-                        // Check if parallel execution would be used based on TABLE's row count (not output rows)
-                        // Parallel decision is based on input size, not filtered output
-                        let parallel_config = parallel::ParallelConfig::default();
-                        let table_row_count = table.row_count();
-                        let would_use_parallel = where_clause.is_some()
-                            && parallel_config.should_parallel_filter(table_row_count);
-
-                        let scan_plan = match scan_plan {
-                            ScanPlan::SeqScan {
-                                table: tbl,
-                                filter: _,
-                            } if where_clause.is_some() => {
-                                let filter_str = Some(format!("{}", where_clause.unwrap()));
-                                if would_use_parallel {
-                                    ScanPlan::ParallelSeqScan {
-                                        table: tbl,
-                                        filter: filter_str,
-                                        workers: rayon::current_num_threads(),
-                                    }
-                                } else {
-                                    ScanPlan::SeqScan {
-                                        table: tbl,
-                                        filter: filter_str,
-                                    }
-                                }
-                            }
-                            other => other,
-                        };
-
-                        // Format the scan plan with actual stats
-                        let plan_str = format!("{}", scan_plan);
-                        for (i, line) in plan_str.lines().enumerate() {
-                            if i == 0 {
-                                lines.push(format!(
-                                    "{}-> {} (actual rows={})",
-                                    prefix, line, row_count
-                                ));
-                            } else {
-                                lines.push(format!("{}   {}", prefix, line));
-                            }
-                        }
-
-                        // Add alias if present
-                        if let Some(ref alias) = simple.alias {
-                            lines.push(format!("{}   Alias: {}", prefix, alias));
-                        }
-
-                        return;
-                    }
-                }
-
-                // Fallback if table not found
-                let mut table_info = format!(
-                    "{}-> Seq Scan on {} (actual rows={})",
-                    prefix, simple.name, row_count
-                );
-                if let Some(ref alias) = simple.alias {
-                    table_info.push_str(&format!(" AS {}", alias));
-                }
-                lines.push(table_info);
-                if let Some(ref where_expr) = where_clause {
-                    lines.push(format!("{}   Filter: {}", prefix, where_expr));
-                }
-            }
-            Expression::SubquerySource(subquery) => {
-                let mut sub_info =
-                    format!("{}-> Subquery Scan (actual rows={})", prefix, row_count);
-                if let Some(ref alias) = subquery.alias {
-                    sub_info.push_str(&format!(" AS {}", alias));
-                }
-                lines.push(sub_info);
-                self.explain_select(&subquery.subquery, lines, indent + 1);
-            }
-            Expression::JoinSource(join) => {
-                // Determine join algorithm based on condition
-                let join_algorithm = if join.condition.is_none() && join.using_columns.is_empty() {
-                    "Nested Loop"
-                } else if let Some(ref cond) = join.condition {
-                    if Self::is_equality_condition(cond) {
-                        "Hash Join"
-                    } else {
-                        "Nested Loop"
-                    }
-                } else {
-                    "Hash Join" // USING clause implies equality
-                };
-
-                lines.push(format!(
-                    "{}-> {} ({} Join) (actual rows={})",
-                    prefix, join_algorithm, join.join_type, row_count
-                ));
-                if let Some(ref condition) = join.condition {
-                    lines.push(format!("{}   Join Cond: {}", prefix, condition));
-                }
-                if !join.using_columns.is_empty() {
-                    let cols: Vec<String> =
-                        join.using_columns.iter().map(|c| c.to_string()).collect();
-                    lines.push(format!("{}   Using: ({})", prefix, cols.join(", ")));
-                }
-                // Left side gets the WHERE clause for potential pushdown
-                self.explain_table_expr_with_where(&join.left, where_clause, lines, indent + 1);
-                // Right side typically doesn't get the outer WHERE
-                self.explain_table_expr_with_where(&join.right, None, lines, indent + 1);
-            }
-            Expression::CteReference(cte_ref) => {
-                let mut cte_info = format!(
-                    "{}-> CTE Scan on {} (actual rows={})",
-                    prefix, cte_ref.name, row_count
-                );
-                if let Some(ref alias) = cte_ref.alias {
-                    cte_info.push_str(&format!(" AS {}", alias));
-                }
-                lines.push(cte_info);
-            }
-            _ => {
-                lines.push(format!(
-                    "{}-> Scan: {} (actual rows={})",
-                    prefix, expr, row_count
-                ));
-            }
-        }
-    }
-
-    /// Generate EXPLAIN output for a statement
-    fn explain_statement(&self, stmt: &Statement, lines: &mut Vec<String>, indent: usize) {
-        let prefix = "  ".repeat(indent);
-
-        match stmt {
-            Statement::Select(select) => {
-                self.explain_select(select, lines, indent);
-            }
-            Statement::Insert(insert) => {
-                lines.push(format!("{}INSERT INTO {}", prefix, insert.table_name));
-                if let Some(ref select) = insert.select {
-                    lines.push(format!("{}  Source:", prefix));
-                    self.explain_select(select, lines, indent + 2);
-                } else {
-                    lines.push(format!(
-                        "{}  Values: {} row(s)",
-                        prefix,
-                        insert.values.len()
-                    ));
-                }
-            }
-            Statement::Update(update) => {
-                lines.push(format!("{}UPDATE {}", prefix, update.table_name));
-                lines.push(format!(
-                    "{}  Set: {} column(s)",
-                    prefix,
-                    update.updates.len()
-                ));
-                if let Some(ref where_clause) = update.where_clause {
-                    lines.push(format!("{}  Filter: {}", prefix, where_clause));
-                }
-            }
-            Statement::Delete(delete) => {
-                lines.push(format!("{}DELETE FROM {}", prefix, delete.table_name));
-                if let Some(ref where_clause) = delete.where_clause {
-                    lines.push(format!("{}  Filter: {}", prefix, where_clause));
-                }
-            }
-            _ => {
-                lines.push(format!("{}Statement: {}", prefix, stmt));
-            }
-        }
-    }
-
-    /// Generate EXPLAIN output for a SELECT statement
-    fn explain_select(&self, select: &SelectStatement, lines: &mut Vec<String>, indent: usize) {
-        let prefix = "  ".repeat(indent);
-
-        // CTE info
-        if let Some(ref with) = select.with {
-            lines.push(format!("{}WITH (CTEs: {})", prefix, with.ctes.len()));
-            for cte in &with.ctes {
-                lines.push(format!(
-                    "{}  {} = ({})",
-                    prefix,
-                    cte.name,
-                    if cte.is_recursive {
-                        "RECURSIVE"
-                    } else {
-                        "non-recursive"
-                    }
-                ));
-            }
-        }
-
-        // Main operation
-        if select.distinct {
-            lines.push(format!("{}SELECT DISTINCT", prefix));
-        } else {
-            lines.push(format!("{}SELECT", prefix));
-        }
-
-        // Columns
-        let col_count = select.columns.len();
-        if col_count <= 3 {
-            let cols: Vec<String> = select.columns.iter().map(|c| format!("{}", c)).collect();
-            lines.push(format!("{}  Columns: {}", prefix, cols.join(", ")));
-        } else {
-            lines.push(format!("{}  Columns: {} column(s)", prefix, col_count));
-        }
-
-        // FROM clause with access plan
-        if let Some(ref table_expr) = select.table_expr {
-            self.explain_table_expr_with_where(
-                table_expr,
-                select.where_clause.as_deref(),
-                lines,
-                indent + 1,
-            );
-        }
-
-        // GROUP BY
-        if !select.group_by.columns.is_empty() {
-            let groups: Vec<String> = select
-                .group_by
-                .columns
-                .iter()
-                .map(|g| format!("{}", g))
-                .collect();
-            lines.push(format!("{}  Group By: {}", prefix, groups.join(", ")));
-        }
-
-        // HAVING
-        if let Some(ref having) = select.having {
-            lines.push(format!("{}  Having: {}", prefix, having));
-        }
-
-        // ORDER BY
-        if !select.order_by.is_empty() {
-            let orders: Vec<String> = select.order_by.iter().map(|o| format!("{}", o)).collect();
-            lines.push(format!("{}  Order By: {}", prefix, orders.join(", ")));
-        }
-
-        // LIMIT/OFFSET
-        if let Some(ref limit) = select.limit {
-            lines.push(format!("{}  Limit: {}", prefix, limit));
-        }
-        if let Some(ref offset) = select.offset {
-            lines.push(format!("{}  Offset: {}", prefix, offset));
-        }
-
-        // Set operations
-        if !select.set_operations.is_empty() {
-            for set_op in &select.set_operations {
-                lines.push(format!("{}  {}", prefix, set_op.operation));
-                self.explain_select(&set_op.right, lines, indent + 2);
-            }
-        }
-    }
-
-    /// Generate EXPLAIN output for a table expression with WHERE clause analysis
-    fn explain_table_expr_with_where(
-        &self,
-        expr: &Expression,
-        where_clause: Option<&Expression>,
-        lines: &mut Vec<String>,
-        indent: usize,
-    ) {
-        let prefix = "  ".repeat(indent);
-
-        match expr {
-            Expression::TableSource(simple) => {
-                // Try to get the table and analyze access plan
-                if let Ok(tx) = self.engine.begin_transaction() {
-                    if let Ok(table) = tx.get_table(&simple.name.value) {
-                        // Build storage expression from WHERE clause for analysis
-                        let storage_expr = if let Some(where_expr) = where_clause {
-                            let schema = table.schema();
-                            self.build_storage_expression_with_ctx(where_expr, schema, None)
-                                .ok()
-                        } else {
-                            None
-                        };
-
-                        // Get the scan plan
-                        let scan_plan = table.explain_scan(storage_expr.as_deref());
-
-                        // For SeqScan, use the AST expression's Display format instead of storage expr Debug
-                        let scan_plan = match scan_plan {
-                            ScanPlan::SeqScan { table, filter: _ } if where_clause.is_some() => {
-                                ScanPlan::SeqScan {
-                                    table,
-                                    filter: Some(format!("{}", where_clause.unwrap())),
-                                }
-                            }
-                            other => other,
-                        };
-
-                        // Format the scan plan with indentation
-                        let plan_str = format!("{}", scan_plan);
-                        for (i, line) in plan_str.lines().enumerate() {
-                            if i == 0 {
-                                lines.push(format!("{}-> {}", prefix, line));
-                            } else {
-                                lines.push(format!("{}   {}", prefix, line));
-                            }
-                        }
-
-                        // Add alias if present
-                        if let Some(ref alias) = simple.alias {
-                            lines.push(format!("{}   Alias: {}", prefix, alias));
-                        }
-
-                        return;
-                    }
-                }
-
-                // Fallback if table not found
-                let mut table_info = format!("{}-> Seq Scan on {}", prefix, simple.name);
-                if let Some(ref alias) = simple.alias {
-                    table_info.push_str(&format!(" AS {}", alias));
-                }
-                lines.push(table_info);
-                if let Some(ref where_expr) = where_clause {
-                    lines.push(format!("{}   Filter: {}", prefix, where_expr));
-                }
-            }
-            Expression::SubquerySource(subquery) => {
-                let mut sub_info = format!("{}-> Subquery Scan", prefix);
-                if let Some(ref alias) = subquery.alias {
-                    sub_info.push_str(&format!(" AS {}", alias));
-                }
-                lines.push(sub_info);
-                self.explain_select(&subquery.subquery, lines, indent + 1);
-            }
-            Expression::JoinSource(join) => {
-                // Determine join algorithm based on condition
-                let join_algorithm = if join.condition.is_none() && join.using_columns.is_empty() {
-                    // CROSS JOIN or no condition -> Nested Loop
-                    "Nested Loop"
-                } else if let Some(ref cond) = join.condition {
-                    // Check if it's an equality join (a.col = b.col)
-                    if Self::is_equality_condition(cond) {
-                        "Hash Join"
-                    } else {
-                        // Range condition or complex join
-                        "Nested Loop"
-                    }
-                } else {
-                    // USING clause implies equality join
-                    "Hash Join"
-                };
-
-                // Get cost estimate from query planner
-                let planner = self.get_query_planner();
-                let left_table_name = Self::extract_table_name(&join.left);
-                let right_table_name = Self::extract_table_name(&join.right);
-
-                // Get table statistics for cost estimation
-                let left_stats = left_table_name
-                    .as_ref()
-                    .and_then(|name| planner.get_table_stats(name));
-                let right_stats = right_table_name
-                    .as_ref()
-                    .and_then(|name| planner.get_table_stats(name));
-
-                // Calculate estimated rows and cost
-                let (estimated_rows, estimated_cost) = match (left_stats, right_stats) {
-                    (Some(ls), Some(rs)) => {
-                        // Hash join cost estimation
-                        let left_rows = ls.row_count.max(1);
-                        let right_rows = rs.row_count.max(1);
-                        // Simplified join cardinality estimate
-                        let rows = if join_algorithm == "Nested Loop" && join.condition.is_none() {
-                            // Cross join: left * right
-                            left_rows * right_rows
-                        } else {
-                            // Equality join: estimate as smaller side (pessimistic)
-                            left_rows.min(right_rows)
-                        };
-                        // Cost = build cost + probe cost
-                        let cost = if join_algorithm == "Hash Join" {
-                            (left_rows.min(right_rows) as f64)
-                                + (left_rows.max(right_rows) as f64 * 0.1)
-                        } else {
-                            // Nested loop: O(n*m) but with early termination
-                            (left_rows as f64) * (right_rows as f64).sqrt()
-                        };
-                        (rows, cost)
-                    }
-                    (Some(ls), None) => {
-                        // Only left stats available
-                        (ls.row_count, ls.row_count as f64 * 10.0)
-                    }
-                    (None, Some(rs)) => {
-                        // Only right stats available
-                        (rs.row_count, rs.row_count as f64 * 10.0)
-                    }
-                    (None, None) => {
-                        // No stats - use default estimate
-                        (1000, 10000.0)
-                    }
-                };
-
-                // Show join algorithm, type, cost and rows
-                lines.push(format!(
-                    "{}-> {} ({} Join) (cost={:.2} rows={})",
-                    prefix, join_algorithm, join.join_type, estimated_cost, estimated_rows
-                ));
-                if let Some(ref condition) = join.condition {
-                    lines.push(format!("{}   Join Cond: {}", prefix, condition));
-                }
-                if !join.using_columns.is_empty() {
-                    let cols: Vec<String> =
-                        join.using_columns.iter().map(|c| c.to_string()).collect();
-                    lines.push(format!("{}   Using: ({})", prefix, cols.join(", ")));
-                }
-                // Left side gets the WHERE clause for potential pushdown
-                self.explain_table_expr_with_where(&join.left, where_clause, lines, indent + 1);
-                // Right side typically doesn't get the outer WHERE
-                self.explain_table_expr_with_where(&join.right, None, lines, indent + 1);
-            }
-            Expression::CteReference(cte_ref) => {
-                let mut cte_info = format!("{}-> CTE Scan on {}", prefix, cte_ref.name);
-                if let Some(ref alias) = cte_ref.alias {
-                    cte_info.push_str(&format!(" AS {}", alias));
-                }
-                lines.push(cte_info);
-            }
-            _ => {
-                lines.push(format!("{}-> Scan: {}", prefix, expr));
-            }
-        }
-    }
-
     /// Execute PRAGMA statement
     pub(crate) fn execute_pragma(
         &self,
@@ -5669,7 +4271,7 @@ impl Executor {
         stmt: &ExpressionStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
 
         let value = evaluator.evaluate(&stmt.expression)?;
         let columns = vec!["result".to_string()];
@@ -5841,7 +4443,7 @@ impl Executor {
         let ascending = order_by.ascending;
 
         // Evaluate limit and offset
-        let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
         let limit = if let Some(ref limit_expr) = stmt.limit {
             match evaluator.evaluate(limit_expr) {
                 Ok(Value::Integer(l)) => l as usize,
@@ -5901,11 +4503,12 @@ impl Executor {
         let columns_to_fetch = self.build_columns_to_fetch(stmt, &all_columns)?;
 
         // Build storage expression if WHERE clause exists
-        // Note: .ok() converts Result to Option, discarding errors for complex expressions
-        let storage_expr = stmt.where_clause.as_ref().and_then(|where_expr| {
-            self.build_storage_expression_with_ctx(where_expr, &schema, Some(ctx))
-                .ok()
-        });
+        // Try to push down to storage, fall back to memory filter for complex expressions
+        let (storage_expr, needs_memory_filter) = stmt
+            .where_clause
+            .as_ref()
+            .map(|where_expr| pushdown::try_pushdown(where_expr, &schema, Some(ctx)))
+            .unwrap_or((None, false));
 
         // Execute temporal query
         let result = tx.select_as_of(
@@ -5927,16 +4530,18 @@ impl Executor {
             rows.push(result_iter.take_row());
         }
 
-        // Apply in-memory WHERE filter if storage expression couldn't handle it
-        if stmt.where_clause.is_some() && storage_expr.is_none() {
-            let mut evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
-            evaluator.init_columns(&all_columns);
+        // Apply in-memory WHERE filter if storage expression couldn't handle it fully
+        if needs_memory_filter {
+            if let Some(where_expr) = &stmt.where_clause {
+                let mut evaluator =
+                    CompiledEvaluator::new(&self.function_registry).with_context(ctx);
+                evaluator.init_columns(&all_columns);
 
-            let where_expr = stmt.where_clause.as_ref().unwrap();
-            rows.retain(|row| {
-                evaluator.set_row_array(row);
-                evaluator.evaluate_bool(where_expr).unwrap_or(false)
-            });
+                rows.retain(|row| {
+                    evaluator.set_row_array(row);
+                    evaluator.evaluate_bool(where_expr).unwrap_or(false)
+                });
+            }
         }
 
         // Check for window functions
@@ -5970,7 +4575,7 @@ impl Executor {
 
     /// Parse temporal value from AS OF clause
     fn parse_temporal_value(&self, as_of: &AsOfClause, ctx: &ExecutionContext) -> Result<i64> {
-        let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
 
         match as_of.as_of_type.to_uppercase().as_str() {
             "TRANSACTION" => {
@@ -6093,1096 +4698,6 @@ impl Executor {
         let output_columns = self.get_output_column_names(&stmt.columns, all_columns, None);
 
         Ok((projected, output_columns))
-    }
-
-    // ========================================================================
-    // Hash Join Implementation - O(N + M) instead of O(N * M)
-    // ========================================================================
-
-    /// Extract equality join keys and residual conditions
-    /// Returns (left_indices, right_indices, residual_conditions) where residual
-    /// contains non-equality conditions that must be applied after the hash join
-    pub(crate) fn extract_join_keys_and_residual(
-        condition: &Expression,
-        left_columns: &[String],
-        right_columns: &[String],
-    ) -> (Vec<usize>, Vec<usize>, Vec<Expression>) {
-        let mut left_indices = Vec::new();
-        let mut right_indices = Vec::new();
-        let mut residual = Vec::new();
-
-        Self::extract_join_keys_recursive(
-            condition,
-            left_columns,
-            right_columns,
-            &mut left_indices,
-            &mut right_indices,
-            &mut residual,
-        );
-
-        (left_indices, right_indices, residual)
-    }
-
-    /// Recursively extract equality join keys and residual conditions from AND expressions
-    fn extract_join_keys_recursive(
-        condition: &Expression,
-        left_columns: &[String],
-        right_columns: &[String],
-        left_indices: &mut Vec<usize>,
-        right_indices: &mut Vec<usize>,
-        residual: &mut Vec<Expression>,
-    ) {
-        match condition {
-            Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
-                // Recurse into AND branches
-                Self::extract_join_keys_recursive(
-                    &infix.left,
-                    left_columns,
-                    right_columns,
-                    left_indices,
-                    right_indices,
-                    residual,
-                );
-                Self::extract_join_keys_recursive(
-                    &infix.right,
-                    left_columns,
-                    right_columns,
-                    left_indices,
-                    right_indices,
-                    residual,
-                );
-            }
-            Expression::Infix(infix) if infix.op_type == InfixOperator::Equal => {
-                // Extract equality condition
-                if let (Some(left_col), Some(right_col)) = (
-                    Self::extract_join_column_name(&infix.left),
-                    Self::extract_join_column_name(&infix.right),
-                ) {
-                    // Case 1: left.col = right.col
-                    if let (Some(left_idx), Some(right_idx)) = (
-                        Self::find_column_index(&left_col, left_columns),
-                        Self::find_column_index(&right_col, right_columns),
-                    ) {
-                        left_indices.push(left_idx);
-                        right_indices.push(right_idx);
-                        return;
-                    }
-
-                    // Case 2: right.col = left.col (swapped)
-                    if let (Some(left_idx), Some(right_idx)) = (
-                        Self::find_column_index(&right_col, left_columns),
-                        Self::find_column_index(&left_col, right_columns),
-                    ) {
-                        left_indices.push(left_idx);
-                        right_indices.push(right_idx);
-                        return;
-                    }
-                }
-                // Non-join equality (e.g., a.x = 5) - add to residual
-                residual.push(condition.clone());
-            }
-            _ => {
-                // Non-equality condition - add to residual filters
-                residual.push(condition.clone());
-            }
-        }
-    }
-
-    /// Extract column name from identifier expression (for hash join key extraction)
-    /// Returns (qualifier, column_name) where qualifier is Some for qualified identifiers
-    fn extract_join_column_name(expr: &Expression) -> Option<(Option<String>, String)> {
-        match expr {
-            Expression::Identifier(id) => Some((None, id.value_lower.clone())),
-            Expression::QualifiedIdentifier(qid) => Some((
-                Some(qid.qualifier.value_lower.clone()),
-                qid.name.value_lower.clone(),
-            )),
-            _ => None,
-        }
-    }
-
-    /// Find column index by name (case-insensitive)
-    /// Takes (qualifier, column_name) tuple to properly match qualified columns
-    /// OPTIMIZATION: Use eq_ignore_ascii_case to avoid allocations per column
-    fn find_column_index(col_info: &(Option<String>, String), columns: &[String]) -> Option<usize> {
-        let (qualifier, col_name) = col_info;
-
-        columns.iter().position(|c| {
-            if let Some(ref qual) = qualifier {
-                // We have a qualified name like "t2.id" - match the full qualified name
-                let expected = format!("{}.{}", qual, col_name);
-                c.eq_ignore_ascii_case(&expected)
-            } else {
-                // Unqualified name - match either full name or just the column part
-                if c.eq_ignore_ascii_case(col_name) {
-                    return true;
-                }
-                // Match qualified name like "table.column" -> match "column" part
-                if let Some(dot_pos) = c.rfind('.') {
-                    c[dot_pos + 1..].eq_ignore_ascii_case(col_name)
-                } else {
-                    false
-                }
-            }
-        })
-    }
-
-    /// Apply residual conditions to join result rows
-    ///
-    /// For OUTER JOINs, we need special handling: rows with NULLs from the
-    /// padded side should be preserved even if residual conditions fail.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn apply_residual_conditions(
-        &self,
-        rows: &mut Vec<Row>,
-        residual: &[Expression],
-        all_columns: &[String],
-        join_type: &str,
-        left_col_count: usize,
-        right_col_count: usize,
-        ctx: &ExecutionContext,
-    ) {
-        let mut residual_eval = Evaluator::new(&self.function_registry);
-        residual_eval = residual_eval.with_context(ctx);
-        residual_eval.init_columns(all_columns);
-
-        let is_outer_join =
-            join_type.contains("LEFT") || join_type.contains("RIGHT") || join_type.contains("FULL");
-
-        if is_outer_join {
-            // For outer joins, we need to identify which rows are "padded"
-            // (have NULLs from the non-matching side) and preserve them
-            rows.retain(|row| {
-                // Check if this is a NULL-padded row from an outer join
-                let left_all_null =
-                    (0..left_col_count).all(|i| row.get(i).map(|v| v.is_null()).unwrap_or(true));
-                let right_all_null = (left_col_count..left_col_count + right_col_count)
-                    .all(|i| row.get(i).map(|v| v.is_null()).unwrap_or(true));
-
-                // Preserve NULL-padded outer join rows unconditionally
-                // (they already represent "no match" which is correct)
-                if (join_type.contains("LEFT") && right_all_null)
-                    || (join_type.contains("RIGHT") && left_all_null)
-                    || (join_type.contains("FULL") && (left_all_null || right_all_null))
-                {
-                    return true;
-                }
-
-                // For matched rows, apply residual conditions normally
-                residual_eval.set_row_array(row);
-                residual
-                    .iter()
-                    .all(|cond| residual_eval.evaluate_bool(cond).unwrap_or(false))
-            });
-        } else {
-            // For INNER JOIN, simple filter is correct
-            rows.retain(|row| {
-                residual_eval.set_row_array(row);
-                residual
-                    .iter()
-                    .all(|cond| residual_eval.evaluate_bool(cond).unwrap_or(false))
-            });
-        }
-    }
-
-    /// Execute hash join - O(N + M) complexity
-    /// Supports multiple join keys for conditions like: a.x = b.x AND a.y = b.y
-    /// Build phase: Create hash table from smaller side (optimization)
-    /// Probe phase: Scan larger side and probe hash table
-    ///
-    /// Uses parallel execution when either side has >= 5000 rows.
-    /// Optional limit parameter enables early termination for INNER JOINs.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn execute_hash_join(
-        &self,
-        left_rows: &[Row],
-        right_rows: &[Row],
-        left_key_indices: &[usize],
-        right_key_indices: &[usize],
-        join_type: &str,
-        left_col_count: usize,
-        right_col_count: usize,
-        limit: Option<u64>,
-    ) -> Result<Vec<Row>> {
-        // Optimization: Build hash table on smaller side
-        // For LEFT/FULL joins, we must build on right side to track unmatched rows correctly
-        // For RIGHT joins, we must build on left side
-        let build_on_left = !join_type.contains("LEFT")
-            && !join_type.contains("FULL")
-            && (join_type.contains("RIGHT") || left_rows.len() < right_rows.len());
-
-        // Check if parallel execution would be beneficial
-        // Note: When limit is set, prefer sequential execution for early termination
-        let parallel_config = ParallelConfig::default();
-        let use_parallel = limit.is_none()
-            && (parallel_config.should_parallel_join(left_rows.len())
-                || parallel_config.should_parallel_join(right_rows.len()));
-
-        if use_parallel {
-            // Use parallel hash join for large datasets
-            let parallel_join_type = parallel::JoinType::from_str(join_type);
-
-            let result = if build_on_left {
-                parallel::parallel_hash_join(
-                    right_rows,
-                    left_rows,
-                    right_key_indices,
-                    left_key_indices,
-                    parallel_join_type,
-                    right_col_count,
-                    left_col_count,
-                    true, // swapped
-                    &parallel_config,
-                )
-            } else {
-                parallel::parallel_hash_join(
-                    left_rows,
-                    right_rows,
-                    left_key_indices,
-                    right_key_indices,
-                    parallel_join_type,
-                    left_col_count,
-                    right_col_count,
-                    false, // not swapped
-                    &parallel_config,
-                )
-            };
-
-            return Ok(result.rows);
-        }
-
-        // Fall back to sequential execution for small datasets or when limit is set
-        if build_on_left {
-            // Build on left, probe with right (swap roles)
-            self.execute_hash_join_impl(
-                right_rows,
-                left_rows,
-                right_key_indices,
-                left_key_indices,
-                join_type,
-                right_col_count,
-                left_col_count,
-                true, // swapped = true
-                limit,
-            )
-        } else {
-            // Build on right, probe with left (normal)
-            self.execute_hash_join_impl(
-                left_rows,
-                right_rows,
-                left_key_indices,
-                right_key_indices,
-                join_type,
-                left_col_count,
-                right_col_count,
-                false, // swapped = false
-                limit,
-            )
-        }
-    }
-
-    /// Core hash join implementation
-    /// `swapped` indicates if left/right were swapped for build side optimization
-    /// `limit` enables early termination for INNER JOINs
-    #[allow(clippy::too_many_arguments)]
-    fn execute_hash_join_impl(
-        &self,
-        probe_rows: &[Row],
-        build_rows: &[Row],
-        probe_key_indices: &[usize],
-        build_key_indices: &[usize],
-        join_type: &str,
-        probe_col_count: usize,
-        build_col_count: usize,
-        swapped: bool,
-        limit: Option<u64>,
-    ) -> Result<Vec<Row>> {
-        use rustc_hash::FxHashMap;
-
-        // Build phase: Create hash table from build side
-        // Key: composite hash of all join key values, Value: list of row indices
-        let mut hash_table: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-
-        // Build bloom filter for faster probe-side filtering when build side is large enough
-        // Use adaptive FP rate based on observed bloom filter effectiveness
-        use crate::optimizer::bloom::BloomEffectivenessTracker;
-        let bloom_stats = BloomEffectivenessTracker::global();
-        let use_bloom_filter = build_rows.len() >= BLOOM_FILTER_MIN_BUILD_SIZE;
-        let mut bloom_filter = if use_bloom_filter {
-            // Use adaptively tuned false positive rate based on historical effectiveness
-            let fp_rate = bloom_stats.recommend_false_positive_rate();
-            Some(BloomFilter::new(build_rows.len(), fp_rate))
-        } else {
-            None
-        };
-
-        for (idx, row) in build_rows.iter().enumerate() {
-            let hash = Self::hash_composite_key(row, build_key_indices);
-            hash_table.entry(hash).or_default().push(idx);
-
-            // Insert into bloom filter if enabled
-            if let Some(ref mut bf) = bloom_filter {
-                bf.insert_raw_hash(hash);
-            }
-        }
-
-        let mut result_rows = Vec::new();
-        let mut build_matched = vec![false; build_rows.len()];
-
-        // Early termination is safe when:
-        // 1. INNER JOIN: we can stop after `limit` output rows
-        // 2. LEFT JOIN (not swapped): probe side = left = outer side, each probe row contributes to output
-        // 3. RIGHT JOIN (swapped): probe side = right = outer side, each probe row contributes to output
-        // NOT safe when we need to emit unmatched build rows at the end (FULL, or the "other" outer join)
-        let is_inner_join = !join_type.contains("LEFT")
-            && !join_type.contains("RIGHT")
-            && !join_type.contains("FULL");
-        let is_left_not_swapped =
-            join_type.contains("LEFT") && !swapped && !join_type.contains("FULL");
-        let is_right_swapped =
-            join_type.contains("RIGHT") && swapped && !join_type.contains("FULL");
-        let can_early_terminate = is_inner_join || is_left_not_swapped || is_right_swapped;
-        let effective_limit = if can_early_terminate { limit } else { None };
-
-        // Probe phase: Scan probe rows and lookup in hash table
-        'probe: for probe_row in probe_rows {
-            let mut matched = false;
-            let hash = Self::hash_composite_key(probe_row, probe_key_indices);
-
-            // Bloom filter early rejection: if definitely not in build side, skip
-            if let Some(ref bf) = bloom_filter {
-                if !bf.might_contain_raw_hash(hash) {
-                    // Record true negative for adaptive optimization
-                    bloom_stats.record_true_negative();
-                    // Definitely not in build side - handle OUTER join case and continue
-                    let needs_null_row = if swapped {
-                        join_type.contains("RIGHT") || join_type.contains("FULL")
-                    } else {
-                        join_type.contains("LEFT") || join_type.contains("FULL")
-                    };
-
-                    if needs_null_row {
-                        let values = if swapped {
-                            Self::combine_rows_with_nulls(
-                                probe_row,
-                                probe_col_count,
-                                build_col_count,
-                                false,
-                            )
-                        } else {
-                            Self::combine_rows_with_nulls(
-                                probe_row,
-                                probe_col_count,
-                                build_col_count,
-                                true,
-                            )
-                        };
-                        result_rows.push(Row::from_values(values));
-                        // Early termination check for OUTER join NULL rows
-                        if let Some(lim) = effective_limit {
-                            if result_rows.len() >= lim as usize {
-                                break 'probe;
-                            }
-                        }
-                    }
-                    continue;
-                }
-                // Bloom filter passed - record for stats (will be true positive or false positive)
-                bloom_stats.record_filter_passed();
-            }
-
-            if let Some(build_indices) = hash_table.get(&hash) {
-                for &build_idx in build_indices {
-                    let build_row = &build_rows[build_idx];
-
-                    // Verify actual equality for all keys (handle hash collisions)
-                    if Self::verify_composite_key_equality(
-                        probe_row,
-                        build_row,
-                        probe_key_indices,
-                        build_key_indices,
-                    ) {
-                        matched = true;
-                        build_matched[build_idx] = true;
-
-                        // Build combined row (respect original left/right order)
-                        let combined = if swapped {
-                            Self::combine_rows(
-                                build_row,
-                                probe_row,
-                                build_col_count,
-                                probe_col_count,
-                            )
-                        } else {
-                            Self::combine_rows(
-                                probe_row,
-                                build_row,
-                                probe_col_count,
-                                build_col_count,
-                            )
-                        };
-                        result_rows.push(Row::from_values(combined));
-
-                        // Early termination: if we've reached the limit, stop probing
-                        if let Some(lim) = effective_limit {
-                            if result_rows.len() >= lim as usize {
-                                break 'probe;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Handle unmatched probe rows for OUTER joins
-            if !matched {
-                let needs_null_row = if swapped {
-                    // Swapped: probe=right, build=left
-                    // RIGHT JOIN needs unmatched right rows (probe side)
-                    join_type.contains("RIGHT") || join_type.contains("FULL")
-                } else {
-                    // Normal: probe=left, build=right
-                    // LEFT JOIN needs unmatched left rows (probe side)
-                    join_type.contains("LEFT") || join_type.contains("FULL")
-                };
-
-                if needs_null_row {
-                    let values = if swapped {
-                        // Left side (build) is NULL, right side (probe) has values
-                        Self::combine_rows_with_nulls(
-                            probe_row,
-                            probe_col_count,
-                            build_col_count,
-                            false, // right side has values
-                        )
-                    } else {
-                        // Right side (build) is NULL, left side (probe) has values
-                        Self::combine_rows_with_nulls(
-                            probe_row,
-                            probe_col_count,
-                            build_col_count,
-                            true, // left side has values
-                        )
-                    };
-                    result_rows.push(Row::from_values(values));
-                    // Early termination check for OUTER join NULL rows
-                    if let Some(lim) = effective_limit {
-                        if result_rows.len() >= lim as usize {
-                            break 'probe;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Handle unmatched build rows for OUTER joins
-        let needs_unmatched_build = if swapped {
-            // Swapped: probe=right, build=left
-            // LEFT JOIN needs unmatched left rows (build side)
-            join_type.contains("LEFT") || join_type.contains("FULL")
-        } else {
-            // Normal: probe=left, build=right
-            // RIGHT JOIN needs unmatched right rows (build side)
-            join_type.contains("RIGHT") || join_type.contains("FULL")
-        };
-
-        if needs_unmatched_build {
-            for (build_idx, was_matched) in build_matched.iter().enumerate() {
-                if !was_matched {
-                    let values = if swapped {
-                        // Left side (build) has values, right side (probe) is NULL
-                        Self::combine_rows_with_nulls(
-                            &build_rows[build_idx],
-                            build_col_count,
-                            probe_col_count,
-                            true, // left side has values
-                        )
-                    } else {
-                        // Right side (build) has values, left side (probe) is NULL
-                        Self::combine_rows_with_nulls(
-                            &build_rows[build_idx],
-                            build_col_count,
-                            probe_col_count,
-                            false, // right side has values
-                        )
-                    };
-                    result_rows.push(Row::from_values(values));
-                }
-            }
-        }
-
-        Ok(result_rows)
-    }
-
-    /// Combine two rows into one
-    /// OPTIMIZATION: Use extend_from_slice instead of iter().cloned() for efficiency
-    fn combine_rows(left: &Row, right: &Row, left_count: usize, right_count: usize) -> Vec<Value> {
-        let mut combined = Vec::with_capacity(left_count + right_count);
-        combined.extend_from_slice(left.as_slice());
-        combined.extend_from_slice(right.as_slice());
-        combined
-    }
-
-    /// Combine a row with NULLs for the other side
-    /// OPTIMIZATION: Use extend_from_slice and resize for efficiency
-    fn combine_rows_with_nulls(
-        row: &Row,
-        row_count: usize,
-        null_count: usize,
-        row_is_left: bool,
-    ) -> Vec<Value> {
-        let mut values = Vec::with_capacity(row_count + null_count);
-        if row_is_left {
-            values.extend_from_slice(row.as_slice());
-            values.resize(row_count + null_count, Value::null_unknown());
-        } else {
-            values.resize(null_count, Value::null_unknown());
-            values.extend_from_slice(row.as_slice());
-        }
-        values
-    }
-
-    /// Hash multiple key columns into a single hash
-    fn hash_composite_key(row: &Row, key_indices: &[usize]) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = rustc_hash::FxHasher::default();
-
-        for &idx in key_indices {
-            if let Some(value) = row.get(idx) {
-                Self::hash_value_into(value, &mut hasher);
-            } else {
-                // NULL marker
-                0xDEADBEEFu64.hash(&mut hasher);
-            }
-        }
-
-        hasher.finish()
-    }
-
-    /// Hash a single value into an existing hasher
-    fn hash_value_into<H: std::hash::Hasher>(value: &Value, hasher: &mut H) {
-        use std::hash::Hash;
-        match value {
-            Value::Integer(i) => {
-                1u8.hash(hasher);
-                i.hash(hasher);
-            }
-            Value::Float(f) => {
-                2u8.hash(hasher);
-                f.to_bits().hash(hasher);
-            }
-            Value::Text(s) => {
-                3u8.hash(hasher);
-                s.hash(hasher);
-            }
-            Value::Boolean(b) => {
-                4u8.hash(hasher);
-                b.hash(hasher);
-            }
-            Value::Null(_) => {
-                5u8.hash(hasher);
-            }
-            Value::Timestamp(ts) => {
-                6u8.hash(hasher);
-                ts.timestamp_nanos_opt().hash(hasher);
-            }
-            Value::Json(j) => {
-                7u8.hash(hasher);
-                j.hash(hasher);
-            }
-        }
-    }
-
-    /// Verify that all composite key columns match (handles hash collisions)
-    fn verify_composite_key_equality(
-        row1: &Row,
-        row2: &Row,
-        indices1: &[usize],
-        indices2: &[usize],
-    ) -> bool {
-        debug_assert_eq!(indices1.len(), indices2.len());
-
-        for (&idx1, &idx2) in indices1.iter().zip(indices2.iter()) {
-            match (row1.get(idx1), row2.get(idx2)) {
-                (Some(v1), Some(v2)) => {
-                    if !Self::values_equal(v1, v2) {
-                        return false;
-                    }
-                }
-                (None, None) => {
-                    // Both NULL - in SQL, NULL != NULL, so no match
-                    return false;
-                }
-                _ => {
-                    // One NULL, one not - no match
-                    return false;
-                }
-            }
-        }
-        true
-    }
-    /// Compare two Values for equality
-    fn values_equal(a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Integer(x), Value::Integer(y)) => x == y,
-            (Value::Float(x), Value::Float(y)) => (x - y).abs() < f64::EPSILON,
-            (Value::Text(x), Value::Text(y)) => x == y,
-            (Value::Boolean(x), Value::Boolean(y)) => x == y,
-            (Value::Null(_), Value::Null(_)) => false, // NULL != NULL in SQL
-            (Value::Timestamp(x), Value::Timestamp(y)) => x == y,
-            (Value::Json(x), Value::Json(y)) => x == y,
-            // Cross-type comparisons - try numeric
-            (Value::Integer(x), Value::Float(y)) | (Value::Float(y), Value::Integer(x)) => {
-                (*x as f64 - y).abs() < f64::EPSILON
-            }
-            _ => false,
-        }
-    }
-
-    /// Nested loop join fallback for complex conditions
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn execute_nested_loop_join(
-        &self,
-        left_rows: &[Row],
-        right_rows: &[Row],
-        condition: Option<&Expression>,
-        all_columns: &[String],
-        left_columns: &[String],
-        right_columns: &[String],
-        join_type: &str,
-        ctx: &ExecutionContext,
-        limit: Option<u64>,
-    ) -> Result<Vec<Row>> {
-        // For INNER JOIN and CROSS JOIN, we can safely apply early termination
-        // For OUTER JOINs, we need all rows to compute NULL padding
-        let is_inner_or_cross = !join_type.contains("LEFT")
-            && !join_type.contains("RIGHT")
-            && !join_type.contains("FULL");
-        let effective_limit = if is_inner_or_cross { limit } else { None };
-        // Create evaluator once and reuse for all join condition checks
-        let mut eval = if condition.is_some() {
-            let mut e = Evaluator::new(&self.function_registry);
-            e = e.with_context(ctx);
-            e.init_columns(all_columns);
-            Some(e)
-        } else {
-            None
-        };
-
-        let mut result_rows = Vec::new();
-        let mut right_matched = vec![false; right_rows.len()];
-
-        // Calculate total columns for result rows
-        let left_col_count = left_columns.len();
-        let right_col_count = right_columns.len();
-        let total_cols = left_col_count + right_col_count;
-
-        'outer: for left_row in left_rows {
-            let mut matched = false;
-            let left_slice = left_row.as_slice();
-
-            for (right_idx, right_row) in right_rows.iter().enumerate() {
-                let right_slice = right_row.as_slice();
-
-                // Check join condition using ZERO-COPY evaluation
-                // OPTIMIZATION: Use set_join_rows to avoid cloning values for condition check
-                let matches = if let Some(cond) = condition {
-                    if let Some(ref mut evaluator) = eval {
-                        // Zero-copy: set both row pointers directly
-                        evaluator.set_join_rows(left_row, right_row);
-                        evaluator.evaluate_bool(cond)?
-                    } else {
-                        true
-                    }
-                } else {
-                    true // CROSS JOIN
-                };
-
-                if matches {
-                    matched = true;
-                    right_matched[right_idx] = true;
-                    // Only allocate result row when condition matches
-                    // OPTIMIZATION: Use extend_from_slice instead of iter().cloned()
-                    let mut values = Vec::with_capacity(total_cols);
-                    values.extend_from_slice(left_slice);
-                    values.extend_from_slice(right_slice);
-                    result_rows.push(Row::from_values(values));
-
-                    // Early termination if limit reached (for INNER/CROSS JOINs)
-                    if let Some(lim) = effective_limit {
-                        if result_rows.len() >= lim as usize {
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-
-            // Handle LEFT OUTER JOIN
-            if !matched && (join_type.contains("LEFT") || join_type.contains("FULL")) {
-                // OPTIMIZATION: Use extend_from_slice and resize for efficiency
-                let mut values = Vec::with_capacity(total_cols);
-                values.extend_from_slice(left_slice);
-                values.resize(total_cols, Value::null_unknown());
-                result_rows.push(Row::from_values(values));
-            }
-        }
-
-        // Handle RIGHT OUTER JOIN - now O(n) instead of O(n*m)
-        if join_type.contains("RIGHT") || join_type.contains("FULL") {
-            let left_col_count = left_columns.len();
-            for (right_idx, was_matched) in right_matched.iter().enumerate() {
-                if !was_matched {
-                    // OPTIMIZATION: Use resize and extend_from_slice for efficiency
-                    let mut values = Vec::with_capacity(total_cols);
-                    values.resize(left_col_count, Value::null_unknown());
-                    values.extend_from_slice(right_rows[right_idx].as_slice());
-                    result_rows.push(Row::from_values(values));
-                }
-            }
-        }
-
-        Ok(result_rows)
-    }
-
-    /// Merge join implementation for pre-sorted inputs
-    ///
-    /// Merge join is optimal when both inputs are sorted on the join keys.
-    /// Time complexity: O(N + M) where N and M are the input sizes.
-    ///
-    /// This implementation handles:
-    /// - INNER, LEFT, RIGHT, and FULL OUTER joins
-    /// - Duplicate key handling (many-to-many joins)
-    /// - Pre-sorted inputs (no sorting needed)
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn execute_merge_join(
-        &self,
-        left_rows: &[Row],
-        right_rows: &[Row],
-        left_key_indices: &[usize],
-        right_key_indices: &[usize],
-        join_type: &str,
-        left_col_count: usize,
-        right_col_count: usize,
-    ) -> Result<Vec<Row>> {
-        let total_cols = left_col_count + right_col_count;
-        let mut result_rows = Vec::new();
-
-        // Track matched rows for outer joins
-        let mut left_matched = vec![false; left_rows.len()];
-        let mut right_matched = vec![false; right_rows.len()];
-
-        let mut left_idx = 0;
-        let mut right_idx = 0;
-
-        while left_idx < left_rows.len() && right_idx < right_rows.len() {
-            let left_row = &left_rows[left_idx];
-            let right_row = &right_rows[right_idx];
-
-            // Compare keys using the first key column (primary sort)
-            let cmp = Self::compare_composite_keys(
-                left_row,
-                right_row,
-                left_key_indices,
-                right_key_indices,
-            );
-
-            match cmp {
-                Ordering::Less => {
-                    // Left key is smaller - advance left
-                    left_idx += 1;
-                }
-                Ordering::Greater => {
-                    // Right key is smaller - advance right
-                    right_idx += 1;
-                }
-                Ordering::Equal => {
-                    // Keys match - find all matching rows on both sides
-                    // This handles duplicate keys (many-to-many joins)
-
-                    // Find the range of left rows with the same key
-                    let left_start = left_idx;
-                    while left_idx < left_rows.len()
-                        && Self::compare_composite_keys(
-                            &left_rows[left_start],
-                            &left_rows[left_idx],
-                            left_key_indices,
-                            left_key_indices,
-                        ) == Ordering::Equal
-                    {
-                        left_idx += 1;
-                    }
-
-                    // Find the range of right rows with the same key
-                    let right_start = right_idx;
-                    while right_idx < right_rows.len()
-                        && Self::compare_composite_keys(
-                            &right_rows[right_start],
-                            &right_rows[right_idx],
-                            right_key_indices,
-                            right_key_indices,
-                        ) == Ordering::Equal
-                    {
-                        right_idx += 1;
-                    }
-
-                    // Cartesian product of matching groups
-                    for l_idx in left_start..left_idx {
-                        left_matched[l_idx] = true;
-                        for r_idx in right_start..right_idx {
-                            right_matched[r_idx] = true;
-                            let mut values = Vec::with_capacity(total_cols);
-                            values.extend_from_slice(left_rows[l_idx].as_slice());
-                            values.extend_from_slice(right_rows[r_idx].as_slice());
-                            result_rows.push(Row::from_values(values));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Handle LEFT OUTER JOIN - add unmatched left rows
-        if join_type.contains("LEFT") || join_type.contains("FULL") {
-            for (idx, was_matched) in left_matched.iter().enumerate() {
-                if !was_matched {
-                    let mut values = Vec::with_capacity(total_cols);
-                    values.extend_from_slice(left_rows[idx].as_slice());
-                    values.resize(total_cols, Value::null_unknown());
-                    result_rows.push(Row::from_values(values));
-                }
-            }
-        }
-
-        // Handle RIGHT OUTER JOIN - add unmatched right rows
-        if join_type.contains("RIGHT") || join_type.contains("FULL") {
-            for (idx, was_matched) in right_matched.iter().enumerate() {
-                if !was_matched {
-                    let mut values = Vec::with_capacity(total_cols);
-                    values.resize(left_col_count, Value::null_unknown());
-                    values.extend_from_slice(right_rows[idx].as_slice());
-                    result_rows.push(Row::from_values(values));
-                }
-            }
-        }
-
-        Ok(result_rows)
-    }
-
-    /// Compare composite keys for merge join ordering
-    ///
-    /// Returns Ordering::Less if left < right, Greater if left > right, Equal otherwise.
-    /// NULLs are considered equal to each other but are sorted last.
-    fn compare_composite_keys(
-        row1: &Row,
-        row2: &Row,
-        indices1: &[usize],
-        indices2: &[usize],
-    ) -> Ordering {
-        debug_assert_eq!(indices1.len(), indices2.len());
-
-        for (&idx1, &idx2) in indices1.iter().zip(indices2.iter()) {
-            let cmp = match (row1.get(idx1), row2.get(idx2)) {
-                (Some(v1), Some(v2)) => Self::compare_values(v1, v2),
-                (None, None) => Ordering::Equal,      // Both NULL
-                (None, Some(_)) => Ordering::Greater, // NULL sorts last
-                (Some(_), None) => Ordering::Less,    // NULL sorts last
-            };
-            if cmp != Ordering::Equal {
-                return cmp;
-            }
-        }
-        Ordering::Equal
-    }
-
-    /// Compare two Values for ordering
-    fn compare_values(a: &Value, b: &Value) -> Ordering {
-        match (a, b) {
-            (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-            (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-            (Value::Text(x), Value::Text(y)) => x.cmp(y),
-            (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
-            (Value::Null(_), Value::Null(_)) => Ordering::Equal,
-            (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
-            (Value::Json(x), Value::Json(y)) => x.cmp(y),
-            // Cross-type comparisons - try numeric
-            (Value::Integer(x), Value::Float(y)) => {
-                (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
-            }
-            (Value::Float(x), Value::Integer(y)) => {
-                x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
-            }
-            // NULL sorts last
-            (Value::Null(_), _) => Ordering::Greater,
-            (_, Value::Null(_)) => Ordering::Less,
-            // Different types - use a stable ordering based on type
-            _ => {
-                // Convert to a numeric type code for ordering
-                fn type_code(v: &Value) -> u8 {
-                    match v {
-                        Value::Null(_) => 0,
-                        Value::Boolean(_) => 1,
-                        Value::Integer(_) => 2,
-                        Value::Float(_) => 3,
-                        Value::Text(_) => 4,
-                        Value::Timestamp(_) => 5,
-                        Value::Json(_) => 6,
-                    }
-                }
-                type_code(a).cmp(&type_code(b))
-            }
-        }
-    }
-
-    /// Check if rows are sorted in ascending order on the specified key indices
-    ///
-    /// This is used to detect when merge join can be used efficiently.
-    /// Returns true if the rows are sorted (ascending) on all key columns.
-    /// For efficiency, only checks up to a sample of rows for large inputs.
-    fn is_sorted_on_keys(rows: &[Row], key_indices: &[usize]) -> bool {
-        if rows.len() <= 1 || key_indices.is_empty() {
-            return true; // Trivially sorted
-        }
-
-        // For large inputs, sample check is sufficient (merge join will work
-        // correctly even if not perfectly sorted, just less efficiently)
-        // But for correctness, we check all rows for small inputs
-        let check_limit = if rows.len() > 10000 {
-            // Sample: check first 1000, last 1000, and 1000 random middle
-            // For simplicity, just check first and last portions
-            1000
-        } else {
-            rows.len()
-        };
-
-        // Check if rows are sorted by comparing consecutive pairs
-        for i in 1..check_limit.min(rows.len()) {
-            let prev = &rows[i - 1];
-            let curr = &rows[i];
-
-            for &idx in key_indices {
-                match (prev.get(idx), curr.get(idx)) {
-                    (Some(v1), Some(v2)) => {
-                        let cmp = Self::compare_values(v1, v2);
-                        match cmp {
-                            Ordering::Less => break,           // prev < curr, sorted so far
-                            Ordering::Greater => return false, // prev > curr, not sorted
-                            Ordering::Equal => continue,       // Check next key
-                        }
-                    }
-                    (None, Some(_)) => break, // NULL < value (NULL first)
-                    (Some(_), None) => return false, // value > NULL
-                    (None, None) => continue, // Both NULL, check next key
-                }
-            }
-        }
-
-        // Also check last portion for large inputs
-        if rows.len() > 10000 {
-            let start = rows.len() - check_limit;
-            for i in (start + 1)..rows.len() {
-                let prev = &rows[i - 1];
-                let curr = &rows[i];
-
-                for &idx in key_indices {
-                    match (prev.get(idx), curr.get(idx)) {
-                        (Some(v1), Some(v2)) => {
-                            let cmp = Self::compare_values(v1, v2);
-                            match cmp {
-                                Ordering::Less => break,
-                                Ordering::Greater => return false,
-                                Ordering::Equal => continue,
-                            }
-                        }
-                        (None, Some(_)) => break,
-                        (Some(_), None) => return false,
-                        (None, None) => continue,
-                    }
-                }
-            }
-        }
-
-        true
-    }
-
-    /// Get estimated cardinalities for join inputs using table statistics
-    ///
-    /// This is used by AQE to detect significant estimation errors.
-    /// Returns (estimated_left, estimated_right) based on statistics if available,
-    /// or falls back to actual counts if stats are not available.
-    fn get_join_estimates(
-        &self,
-        left_expr: &Expression,
-        right_expr: &Expression,
-        actual_left: u64,
-        actual_right: u64,
-    ) -> (u64, u64) {
-        // Try to get estimated cardinality from table statistics
-        let estimated_left = self
-            .estimate_table_expression_rows(left_expr)
-            .unwrap_or(actual_left);
-        let estimated_right = self
-            .estimate_table_expression_rows(right_expr)
-            .unwrap_or(actual_right);
-
-        (estimated_left, estimated_right)
-    }
-
-    /// Estimate row count for a table expression using statistics
-    fn estimate_table_expression_rows(&self, expr: &Expression) -> Option<u64> {
-        match expr {
-            Expression::TableSource(table_source) => {
-                // For simple table source, use table stats
-                let table_name = &table_source.name.value_lower;
-                self.get_query_planner()
-                    .get_table_stats(table_name)
-                    .map(|stats| stats.row_count)
-            }
-            Expression::SubquerySource(_) => {
-                // For subqueries, we don't have estimates (would need to plan the subquery)
-                None
-            }
-            Expression::JoinSource(_) => {
-                // For nested joins, we don't estimate (complex to compute)
-                None
-            }
-            _ => None,
-        }
-    }
-
-    /// Check if an expression is an equality condition (for join algorithm selection)
-    fn is_equality_condition(expr: &Expression) -> bool {
-        match expr {
-            Expression::Infix(infix) => {
-                // Check for equality operator
-                if infix.operator == "=" {
-                    // Check that both sides are column references (not literals)
-                    let left_is_col = matches!(
-                        infix.left.as_ref(),
-                        Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
-                    );
-                    let right_is_col = matches!(
-                        infix.right.as_ref(),
-                        Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
-                    );
-                    left_is_col && right_is_col
-                } else if infix.operator.eq_ignore_ascii_case("AND") {
-                    // AND condition - check if any part is an equality join
-                    Self::is_equality_condition(&infix.left)
-                        || Self::is_equality_condition(&infix.right)
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        }
-    }
-
-    /// Extract table name from a table expression (for statistics lookup)
-    fn extract_table_name(expr: &Expression) -> Option<String> {
-        match expr {
-            Expression::TableSource(simple) => Some(simple.name.value.clone()),
-            Expression::JoinSource(join) => Self::extract_table_name(&join.left),
-            Expression::SubquerySource(_) => None, // Can't get stats for subquery
-            _ => None,
-        }
     }
 
     /// Build a map of column aliases to their underlying expressions from SELECT columns
@@ -7378,7 +4893,7 @@ impl Executor {
                 return None;
             }
             // Swap the keys
-            let evaluator = Evaluator::new(&self.function_registry);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry);
             let limit_value = stmt.limit.as_ref().and_then(|e| {
                 evaluator.evaluate(e).ok().and_then(|v| match v {
                     Value::Integer(n) if n > 0 => Some(n as usize),
@@ -7389,7 +4904,7 @@ impl Executor {
         }
 
         // Get LIMIT value
-        let evaluator = Evaluator::new(&self.function_registry);
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry);
         let limit_value = stmt.limit.as_ref().and_then(|e| {
             evaluator.evaluate(e).ok().and_then(|v| match v {
                 Value::Integer(n) if n > 0 => Some(n as usize),

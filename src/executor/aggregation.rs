@@ -20,7 +20,7 @@
 //! - Grouped aggregation: `SELECT category, SUM(amount) FROM sales GROUP BY category`
 //! - HAVING clause: `SELECT category, SUM(amount) FROM sales GROUP BY category HAVING SUM(amount) > 100`
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -32,9 +32,14 @@ use crate::parser::ast::*;
 use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
-use super::evaluator::Evaluator;
+use super::expression::CompiledEvaluator;
+use super::join::build_column_index_map;
 use super::result::ExecutorMemoryResult;
+use super::utils::hash_value_into;
 use super::Executor;
+
+// Re-export for backward compatibility
+pub use super::utils::{expression_contains_aggregate, is_aggregate_function};
 
 /// Represents a grouping set for ROLLUP/CUBE operations
 /// Each grouping set specifies which columns are active (included in grouping)
@@ -139,41 +144,9 @@ enum ColumnSource {
 fn hash_group_key(values: &[Value]) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
     for v in values {
-        hash_value_into(&mut hasher, v);
+        hash_value_into(v, &mut hasher);
     }
     hasher.finish()
-}
-
-/// Hash a single value into a hasher
-#[inline]
-fn hash_value_into<H: std::hash::Hasher>(hasher: &mut H, v: &Value) {
-    match v {
-        Value::Null(_) => 0u8.hash(hasher),
-        Value::Boolean(b) => {
-            1u8.hash(hasher);
-            b.hash(hasher);
-        }
-        Value::Integer(i) => {
-            2u8.hash(hasher);
-            i.hash(hasher);
-        }
-        Value::Float(f) => {
-            3u8.hash(hasher);
-            f.to_bits().hash(hasher);
-        }
-        Value::Text(s) => {
-            4u8.hash(hasher);
-            s.hash(hasher);
-        }
-        Value::Timestamp(ts) => {
-            5u8.hash(hasher);
-            ts.timestamp_nanos_opt().unwrap_or(0).hash(hasher);
-        }
-        Value::Json(j) => {
-            6u8.hash(hasher);
-            j.hash(hasher);
-        }
-    }
 }
 
 /// Group entry storing the key values and row indices
@@ -242,49 +215,6 @@ impl SqlAggregateFunction {
     }
 }
 
-/// Check if a function name is an aggregate function
-/// Uses the function registry - functions register themselves when added
-pub fn is_aggregate_function(name: &str) -> bool {
-    crate::functions::registry::global_registry().is_aggregate(name)
-}
-
-/// Check if an expression contains an aggregate function (used for nested aggregate detection)
-pub fn expression_contains_aggregate(expr: &Expression) -> bool {
-    match expr {
-        Expression::FunctionCall(func) => {
-            if is_aggregate_function(&func.function) {
-                return true;
-            }
-            // Check arguments recursively
-            func.arguments.iter().any(expression_contains_aggregate)
-        }
-        Expression::Aliased(aliased) => expression_contains_aggregate(&aliased.expression),
-        Expression::Infix(infix) => {
-            expression_contains_aggregate(&infix.left)
-                || expression_contains_aggregate(&infix.right)
-        }
-        Expression::Prefix(prefix) => expression_contains_aggregate(&prefix.right),
-        Expression::Cast(cast) => expression_contains_aggregate(&cast.expr),
-        Expression::Case(case) => {
-            for when_clause in &case.when_clauses {
-                if expression_contains_aggregate(&when_clause.condition)
-                    || expression_contains_aggregate(&when_clause.then_result)
-                {
-                    return true;
-                }
-            }
-            if let Some(ref else_val) = case.else_value {
-                if expression_contains_aggregate(else_val) {
-                    return true;
-                }
-            }
-            false
-        }
-        Expression::ScalarSubquery(_) => false, // Subqueries have their own scope
-        _ => false,
-    }
-}
-
 impl Executor {
     /// Execute SELECT with aggregation (GROUP BY support)
     pub(crate) fn execute_select_with_aggregation(
@@ -299,11 +229,7 @@ impl Executor {
         let group_by_columns = self.parse_group_by(stmt, base_columns)?;
 
         // Create column index map for fast lookup (FxHashMap for speed)
-        let col_index_map: FxHashMap<String, usize> = base_columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.to_lowercase(), i))
-            .collect();
+        let col_index_map = build_column_index_map(base_columns);
 
         // Determine if we can push LIMIT to aggregation for early termination
         // This is safe when:
@@ -317,8 +243,8 @@ impl Executor {
 
         let aggregation_limit = if can_push_limit {
             stmt.limit.as_ref().and_then(|limit_expr| {
-                use super::evaluator::Evaluator;
-                let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+                let mut evaluator =
+                    CompiledEvaluator::new(&self.function_registry).with_context(ctx);
                 evaluator.evaluate(limit_expr).ok().and_then(|v| match v {
                     crate::core::Value::Integer(n) if n >= 0 => Some(n as usize),
                     _ => None,
@@ -369,11 +295,12 @@ impl Executor {
             let processed_having = self.process_where_subqueries(having, ctx)?;
 
             // Build aggregate expression aliases for HAVING clause
+            // IMPORTANT: Include ALL aggregates, not just aliased ones,
+            // because CompiledEvaluator needs expression_aliases to match FunctionCall expressions
             let group_by_count = group_by_columns.len();
             let agg_aliases: Vec<(String, usize)> = aggregations
                 .iter()
                 .enumerate()
-                .filter(|(_, agg)| agg.alias.is_some())
                 .map(|(i, agg)| (agg.get_expression_name(), group_by_count + i))
                 .collect();
 
@@ -433,11 +360,7 @@ impl Executor {
 
         if !hidden_aggs.is_empty() {
             // Build index map for having_columns (aggregation result columns)
-            let having_col_index_map: FxHashMap<String, usize> = having_columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (c.to_lowercase(), i))
-                .collect();
+            let having_col_index_map = build_column_index_map(&having_columns);
 
             for (agg_idx, agg) in &hidden_aggs {
                 // Get the column name for this aggregate
@@ -528,11 +451,7 @@ impl Executor {
         let columns_to_use = processed_columns.as_ref().unwrap_or(&stmt.columns);
 
         // Build column index map for aggregate result columns
-        let mut agg_col_index_map: FxHashMap<String, usize> = agg_columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.to_lowercase(), i))
-            .collect();
+        let mut agg_col_index_map = build_column_index_map(&agg_columns);
 
         // Build additional mappings for aggregate expressions to handle deduplication
         // When aggregates are deduplicated (e.g., SUM(value) and SUM(value) AS total),
@@ -815,7 +734,7 @@ impl Executor {
 
         // Evaluate each row
         let mut final_rows = Vec::with_capacity(agg_rows.len());
-        let mut evaluator = Evaluator::new(crate::functions::registry::global_registry());
+        let mut evaluator = CompiledEvaluator::new(crate::functions::registry::global_registry());
         evaluator.init_columns(&agg_columns);
 
         // Add aggregate expression aliases so COALESCE(SUM(val), 0) can find the "sum(val)" column
@@ -920,10 +839,10 @@ impl Executor {
                         {
                             Ok(processed_expr) => {
                                 // Evaluate the processed expression
-                                let mut corr_eval = Evaluator::new(&self.function_registry);
+                                let mut corr_eval = CompiledEvaluator::new(&self.function_registry)
+                                    .with_context(&correlated_ctx);
                                 corr_eval.init_columns(&agg_columns);
                                 corr_eval.set_row_array(&row);
-                                corr_eval = corr_eval.with_context(&correlated_ctx);
                                 corr_eval
                                     .evaluate(&processed_expr)
                                     .unwrap_or(Value::null_unknown())
@@ -1026,11 +945,7 @@ impl Executor {
         let group_by_columns = self.parse_group_by(stmt, base_columns)?;
 
         // Create column index map for fast lookup
-        let col_index_map: FxHashMap<String, usize> = base_columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.to_lowercase(), i))
-            .collect();
+        let col_index_map = build_column_index_map(base_columns);
 
         // Build result
         // Note: No limit pushdown here because window functions need all rows
@@ -1059,17 +974,17 @@ impl Executor {
         // Apply HAVING clause filter (in-place)
         if let Some(ref having) = stmt.having {
             // OPTIMIZATION: Create evaluator once and reuse for all rows
-            let mut having_eval = Evaluator::new(&self.function_registry);
-            having_eval = having_eval.with_context(ctx);
+            let mut having_eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             having_eval.init_columns(&result_columns);
 
             // Build aggregate expression aliases for HAVING clause
             // This maps "SUM(price)" to its column index even if aliased as "total"
+            // IMPORTANT: Include ALL aggregates, not just aliased ones,
+            // because CompiledEvaluator needs expression_aliases to match FunctionCall expressions
             let group_by_count = group_by_columns.len();
             let agg_aliases: Vec<(String, usize)> = aggregations
                 .iter()
                 .enumerate()
-                .filter(|(_, agg)| agg.alias.is_some()) // Only aliased aggregates need mapping
                 .map(|(i, agg)| (agg.get_expression_name(), group_by_count + i))
                 .collect();
             having_eval.add_aggregate_aliases(&agg_aliases);
@@ -1667,7 +1582,7 @@ impl Executor {
 
         // Create evaluator for expression evaluation (if needed)
         let mut expr_evaluator = if has_expression {
-            let mut eval = Evaluator::new(&self.function_registry);
+            let mut eval = CompiledEvaluator::new(&self.function_registry);
             eval.init_columns(columns);
             Some(eval)
         } else {
@@ -2171,9 +2086,9 @@ impl Executor {
             let mut hasher = rustc_hash::FxHasher::default();
             for &idx in &group_by_indices {
                 if let Some(value) = row.get(idx) {
-                    hash_value_into(&mut hasher, value);
+                    hash_value_into(value, &mut hasher);
                 } else {
-                    hash_value_into(&mut hasher, &Value::null_unknown());
+                    hash_value_into(&Value::null_unknown(), &mut hasher);
                 }
             }
             let hash = hasher.finish();
@@ -2370,8 +2285,7 @@ impl Executor {
 
         // Create evaluator if we have GROUP BY expressions or aggregate expressions
         let mut expr_evaluator = if has_expr_group_by || has_agg_expression {
-            let mut eval = Evaluator::new(&self.function_registry);
-            eval = eval.with_context(ctx);
+            let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             eval.init_columns(columns);
             Some(eval)
         } else {
@@ -2407,9 +2321,9 @@ impl Executor {
                 let mut hasher = rustc_hash::FxHasher::default();
                 for &idx in &column_indices {
                     if let Some(value) = row.get(idx) {
-                        hash_value_into(&mut hasher, value);
+                        hash_value_into(value, &mut hasher);
                     } else {
-                        hash_value_into(&mut hasher, &Value::null_unknown());
+                        hash_value_into(&Value::null_unknown(), &mut hasher);
                     }
                 }
                 let hash = hasher.finish();
@@ -2810,8 +2724,7 @@ impl Executor {
             .any(|item| matches!(item, PrecomputedGroupBy::Expression(_)));
 
         let mut expr_evaluator = if has_expr_group_by || has_agg_expression {
-            let mut eval = Evaluator::new(&self.function_registry);
-            eval = eval.with_context(ctx);
+            let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             eval.init_columns(columns);
             Some(eval)
         } else {
@@ -3225,8 +3138,7 @@ impl Executor {
 
         // Filter rows based on HAVING clause
         // OPTIMIZATION: Create evaluator once and reuse for all rows
-        let mut eval = Evaluator::new(&self.function_registry);
-        eval = eval.with_context(ctx);
+        let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
         eval.init_columns(columns);
         eval.add_aggregate_aliases(agg_aliases);
         eval.add_expression_aliases(expr_aliases);

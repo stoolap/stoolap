@@ -40,18 +40,14 @@
 //! - Arithmetic expressions
 //! - Column-to-column comparisons
 
-use crate::core::{DataType, Operator, Value};
+use crate::core::{Operator, Value};
+use crate::executor::utils::{dummy_token, extract_column_name, extract_literal_value, flip_operator, infix_to_operator};
 use crate::parser::ast::{self as ast, InfixOperator, PrefixOperator};
-use crate::parser::token::{Position, Token, TokenType};
+use crate::parser::token::TokenType;
 use crate::storage::expression::{
     AndExpr, BetweenExpr, ComparisonExpr, Expression, InListExpr, LikeExpr, NotExpr, NullCheckExpr,
     OrExpr,
 };
-
-/// Create a dummy token for synthesized expressions
-fn dummy_token() -> Token {
-    Token::new(TokenType::Error, "", Position::new(0, 1, 1))
-}
 
 /// Convert an AST expression to a storage expression for predicate pushdown
 ///
@@ -153,13 +149,13 @@ fn convert_infix(infix: &ast::InfixExpression) -> Option<Box<dyn Expression>> {
 fn convert_comparison(infix: &ast::InfixExpression) -> Option<Box<dyn Expression>> {
     // Try column on left, value on right
     if let Some((column, value)) = try_extract_column_value(&infix.left, &infix.right) {
-        let operator = convert_operator(infix.op_type)?;
+        let operator = infix_to_operator(infix.op_type)?;
         return Some(Box::new(ComparisonExpr::new(column, operator, value)));
     }
 
     // Try value on left, column on right (flip the operator)
     if let Some((column, value)) = try_extract_column_value(&infix.right, &infix.left) {
-        let operator = flip_operator(convert_operator(infix.op_type)?);
+        let operator = flip_operator(infix_to_operator(infix.op_type)?);
         return Some(Box::new(ComparisonExpr::new(column, operator, value)));
     }
 
@@ -177,53 +173,6 @@ fn try_extract_column_value(
     Some((column, value))
 }
 
-/// Extract column name from an identifier expression
-fn extract_column_name(expr: &ast::Expression) -> Option<String> {
-    match expr {
-        ast::Expression::Identifier(id) => Some(id.value.clone()),
-        ast::Expression::QualifiedIdentifier(qid) => {
-            // Use only the column name part for now
-            Some(qid.name.value.clone())
-        }
-        _ => None,
-    }
-}
-
-/// Extract a literal value from an expression
-fn extract_literal_value(expr: &ast::Expression) -> Option<Value> {
-    match expr {
-        ast::Expression::IntegerLiteral(i) => Some(Value::Integer(i.value)),
-        ast::Expression::FloatLiteral(f) => Some(Value::Float(f.value)),
-        ast::Expression::StringLiteral(s) => Some(Value::Text(s.value.clone().into())),
-        ast::Expression::BooleanLiteral(b) => Some(Value::Boolean(b.value)),
-        ast::Expression::NullLiteral(_) => Some(Value::Null(DataType::Text)),
-        _ => None,
-    }
-}
-
-/// Convert AST operator to storage Operator
-fn convert_operator(op: InfixOperator) -> Option<Operator> {
-    match op {
-        InfixOperator::Equal => Some(Operator::Eq),
-        InfixOperator::NotEqual => Some(Operator::Ne),
-        InfixOperator::LessThan => Some(Operator::Lt),
-        InfixOperator::LessEqual => Some(Operator::Lte),
-        InfixOperator::GreaterThan => Some(Operator::Gt),
-        InfixOperator::GreaterEqual => Some(Operator::Gte),
-        _ => None,
-    }
-}
-
-/// Flip an operator for reversed comparisons (e.g., 5 < x becomes x > 5)
-fn flip_operator(op: Operator) -> Operator {
-    match op {
-        Operator::Lt => Operator::Gt,
-        Operator::Lte => Operator::Gte,
-        Operator::Gt => Operator::Lt,
-        Operator::Gte => Operator::Lte,
-        other => other, // Eq, Ne are symmetric
-    }
-}
 
 /// Convert IS NULL / IS NOT NULL expression
 fn convert_is_null(infix: &ast::InfixExpression) -> Option<Box<dyn Expression>> {
@@ -348,7 +297,7 @@ pub fn split_pushable_predicates(
             // Combine remaining parts
             let remaining = match (left_remain, right_remain) {
                 (Some(l), Some(r)) => Some(ast::Expression::Infix(ast::InfixExpression::new(
-                    dummy_token(),
+                    dummy_token("AND", TokenType::Keyword),
                     Box::new(l),
                     "AND".to_string(),
                     Box::new(r),
@@ -397,13 +346,16 @@ mod tests {
 
     // Helper to create AST identifier
     fn make_ident(name: &str) -> ast::Expression {
-        ast::Expression::Identifier(ast::Identifier::new(dummy_token(), name.to_string()))
+        ast::Expression::Identifier(ast::Identifier::new(
+            dummy_token(name, TokenType::Identifier),
+            name.to_string(),
+        ))
     }
 
     // Helper to create AST integer literal
     fn make_int(value: i64) -> ast::Expression {
         ast::Expression::IntegerLiteral(ast::IntegerLiteral {
-            token: dummy_token(),
+            token: dummy_token(&value.to_string(), TokenType::Integer),
             value,
         })
     }
@@ -411,7 +363,7 @@ mod tests {
     // Helper to create AST string literal
     fn make_str(value: &str) -> ast::Expression {
         ast::Expression::StringLiteral(ast::StringLiteral {
-            token: dummy_token(),
+            token: dummy_token(value, TokenType::String),
             value: value.to_string(),
             type_hint: None,
         })
@@ -420,7 +372,7 @@ mod tests {
     // Helper to create AST infix expression
     fn make_infix(left: ast::Expression, op: &str, right: ast::Expression) -> ast::InfixExpression {
         ast::InfixExpression::new(
-            dummy_token(),
+            dummy_token(op, TokenType::Operator),
             Box::new(left),
             op.to_string(),
             Box::new(right),
@@ -480,7 +432,7 @@ mod tests {
     fn test_cannot_convert_function_call() {
         // Function calls can't be pushed down
         let ast_expr = ast::Expression::FunctionCall(ast::FunctionCall {
-            token: dummy_token(),
+            token: dummy_token("UPPER", TokenType::Identifier),
             function: "UPPER".to_string(),
             arguments: vec![make_ident("name")],
             is_distinct: false,

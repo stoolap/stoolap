@@ -123,6 +123,11 @@ struct Args {
     /// Enable or disable compression for WAL and snapshots (default: on)
     #[arg(long = "compression", value_name = "on|off")]
     compression: Option<String>,
+
+    /// Query timeout in milliseconds (0 for no timeout, default: 0)
+    /// Long-running queries will be cancelled after this time.
+    #[arg(short = 't', long = "timeout", value_name = "MS", default_value = "0")]
+    timeout_ms: u64,
 }
 
 /// CLI state for interactive mode
@@ -134,13 +139,20 @@ struct Cli {
     limit: usize,
     #[allow(dead_code)]
     quiet: bool,
+    timeout_ms: u64,
     editor: Editor<(), DefaultHistory>,
     current_query: String,
     in_multi_line: bool,
 }
 
 impl Cli {
-    fn new(db: Database, json_output: bool, limit: usize, quiet: bool) -> io::Result<Self> {
+    fn new(
+        db: Database,
+        json_output: bool,
+        limit: usize,
+        quiet: bool,
+        timeout_ms: u64,
+    ) -> io::Result<Self> {
         let config = Config::builder()
             .history_ignore_space(true)
             .edit_mode(EditMode::Emacs)
@@ -162,6 +174,7 @@ impl Cli {
             json_output,
             limit,
             quiet,
+            timeout_ms,
             editor,
             current_query: String::new(),
             in_multi_line: false,
@@ -387,6 +400,10 @@ impl Cli {
             } else {
                 return Err("Transaction not available".to_string());
             }
+        } else if self.timeout_ms > 0 {
+            self.db
+                .query_with_timeout(query, (), self.timeout_ms)
+                .map_err(|e| e.to_string())?
         } else {
             self.db.query(query, ()).map_err(|e| e.to_string())?
         };
@@ -422,6 +439,10 @@ impl Cli {
             } else {
                 return Err("Transaction not available".to_string());
             }
+        } else if self.timeout_ms > 0 {
+            self.db
+                .execute_with_timeout(query, (), self.timeout_ms)
+                .map_err(|e| e.to_string())?
         } else {
             self.db.execute(query, ()).map_err(|e| e.to_string())?
         };
@@ -713,9 +734,14 @@ fn main() {
 
     // Handle execute flag - run single query and exit
     if let Some(ref sql) = args.execute {
-        if let Err(e) =
-            execute_query_with_options(&db, sql, args.json_output, args.quiet, args.limit)
-        {
+        if let Err(e) = execute_query_with_options(
+            &db,
+            sql,
+            args.json_output,
+            args.quiet,
+            args.limit,
+            args.timeout_ms,
+        ) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
@@ -724,7 +750,14 @@ fn main() {
 
     // Handle file flag - execute SQL from file
     if let Some(ref filename) = args.file {
-        if let Err(e) = execute_from_file(&db, filename, args.json_output, args.quiet, args.limit) {
+        if let Err(e) = execute_from_file(
+            &db,
+            filename,
+            args.json_output,
+            args.quiet,
+            args.limit,
+            args.timeout_ms,
+        ) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
@@ -735,7 +768,13 @@ fn main() {
     let is_pipe = !std::io::stdin().is_terminal();
 
     if is_pipe {
-        if let Err(e) = execute_piped_input(&db, args.json_output, args.quiet, args.limit) {
+        if let Err(e) = execute_piped_input(
+            &db,
+            args.json_output,
+            args.quiet,
+            args.limit,
+            args.timeout_ms,
+        ) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
@@ -743,7 +782,13 @@ fn main() {
     }
 
     // Interactive mode
-    let mut cli = match Cli::new(db, args.json_output, args.limit, args.quiet) {
+    let mut cli = match Cli::new(
+        db,
+        args.json_output,
+        args.limit,
+        args.quiet,
+        args.timeout_ms,
+    ) {
         Ok(cli) => cli,
         Err(e) => {
             eprintln!("Error initializing CLI: {}", e);
@@ -763,6 +808,7 @@ fn execute_from_file(
     json_output: bool,
     quiet: bool,
     row_limit: usize,
+    timeout_ms: u64,
 ) -> Result<(), String> {
     let file =
         File::open(filename).map_err(|e| format!("Error opening file {}: {}", filename, e))?;
@@ -796,9 +842,14 @@ fn execute_from_file(
                         continue;
                     }
 
-                    if let Err(e) =
-                        execute_query_with_options(db, stmt, json_output, quiet, row_limit)
-                    {
+                    if let Err(e) = execute_query_with_options(
+                        db,
+                        stmt,
+                        json_output,
+                        quiet,
+                        row_limit,
+                        timeout_ms,
+                    ) {
                         eprintln!("Error: {}", e);
                     }
                 }
@@ -820,7 +871,8 @@ fn execute_from_file(
                     continue;
                 }
 
-                if let Err(e) = execute_query_with_options(db, stmt, json_output, quiet, row_limit)
+                if let Err(e) =
+                    execute_query_with_options(db, stmt, json_output, quiet, row_limit, timeout_ms)
                 {
                     eprintln!("Error: {}", e);
                 }
@@ -836,6 +888,7 @@ fn execute_piped_input(
     json_output: bool,
     quiet: bool,
     row_limit: usize,
+    timeout_ms: u64,
 ) -> Result<(), String> {
     let stdin = io::stdin();
     let reader = stdin.lock();
@@ -869,9 +922,14 @@ fn execute_piped_input(
                     }
 
                     let start = Instant::now();
-                    if let Err(e) =
-                        execute_query_with_options(db, stmt, json_output, quiet, row_limit)
-                    {
+                    if let Err(e) = execute_query_with_options(
+                        db,
+                        stmt,
+                        json_output,
+                        quiet,
+                        row_limit,
+                        timeout_ms,
+                    ) {
                         eprintln!("Error: {}", e);
                     } else if !json_output && !quiet {
                         println!("Query executed in {:?}", start.elapsed());
@@ -896,7 +954,8 @@ fn execute_piped_input(
                 }
 
                 let start = Instant::now();
-                if let Err(e) = execute_query_with_options(db, stmt, json_output, quiet, row_limit)
+                if let Err(e) =
+                    execute_query_with_options(db, stmt, json_output, quiet, row_limit, timeout_ms)
                 {
                     eprintln!("Error: {}", e);
                 } else if !json_output && !quiet {
@@ -915,6 +974,7 @@ fn execute_query_with_options(
     json_output: bool,
     quiet: bool,
     row_limit: usize,
+    timeout_ms: u64,
 ) -> Result<(), String> {
     let upper_query = query.to_uppercase();
     let upper_query = upper_query.trim();
@@ -946,7 +1006,12 @@ fn execute_query_with_options(
         || upper_query.contains(" RETURNING ")
         || upper_query.ends_with(" RETURNING")
     {
-        let rows_result = db.query(&sql, params).map_err(|e| e.to_string())?;
+        let rows_result = if timeout_ms > 0 {
+            db.query_with_timeout(&sql, params, timeout_ms)
+                .map_err(|e| e.to_string())?
+        } else {
+            db.query(&sql, params).map_err(|e| e.to_string())?
+        };
 
         let columns: Vec<String> = rows_result.columns().to_vec();
 
@@ -970,7 +1035,12 @@ fn execute_query_with_options(
         }
     } else {
         // Execute a non-query statement
-        let rows_affected = db.execute(&sql, params).map_err(|e| e.to_string())?;
+        let rows_affected = if timeout_ms > 0 {
+            db.execute_with_timeout(&sql, params, timeout_ms)
+                .map_err(|e| e.to_string())?
+        } else {
+            db.execute(&sql, params).map_err(|e| e.to_string())?
+        };
 
         if json_output {
             println!(r#"{{"rows_affected":{}}}"#, rows_affected);

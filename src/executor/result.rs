@@ -23,7 +23,7 @@ use crate::functions::FunctionRegistry;
 use crate::parser::ast::Expression;
 use crate::storage::traits::QueryResult;
 
-use super::evaluator::Evaluator;
+use super::expression::CompiledEvaluator;
 
 /// Execution result for DML operations (INSERT, UPDATE, DELETE)
 ///
@@ -457,16 +457,16 @@ impl QueryResult for MappedResult {
     }
 }
 
-/// Expression-based filtered result that owns an Evaluator for efficient reuse
+/// Expression-based filtered result that owns a CompiledEvaluator for efficient reuse
 ///
-/// Unlike FilteredResult which takes a closure, this struct owns the Evaluator
-/// and Expression directly, avoiding per-row allocations. The Evaluator is
+/// Unlike FilteredResult which takes a closure, this struct owns the CompiledEvaluator
+/// and Expression directly, avoiding per-row allocations. The evaluator is
 /// initialized once with column mappings and reused for every row.
 pub struct ExprFilteredResult<'a> {
     /// Underlying result
     inner: Box<dyn QueryResult>,
     /// Owned evaluator (reused for each row)
-    evaluator: Evaluator<'a>,
+    evaluator: CompiledEvaluator<'a>,
     /// Filter expression (WHERE clause)
     filter_expr: Expression,
     /// Current row (cached after filter passes)
@@ -476,7 +476,7 @@ pub struct ExprFilteredResult<'a> {
 }
 
 // SAFETY: ExprFilteredResult is Send because:
-// 1. The Evaluator's raw pointers are only used within next() after set_row_array()
+// 1. The CompiledEvaluator's raw pointers are only used within next() after set_row_array()
 // 2. The row data comes from `inner` which is owned by this struct
 // 3. The pointer is always refreshed before use, never persisted across method calls
 unsafe impl Send for ExprFilteredResult<'_> {}
@@ -494,7 +494,7 @@ impl<'a> ExprFilteredResult<'a> {
         function_registry: &'a FunctionRegistry,
     ) -> Self {
         let columns = inner.columns().to_vec();
-        let mut evaluator = Evaluator::new(function_registry);
+        let mut evaluator = CompiledEvaluator::new(function_registry);
         evaluator.init_columns(&columns);
 
         Self {
@@ -509,7 +509,7 @@ impl<'a> ExprFilteredResult<'a> {
     /// Create with default function registry (static lifetime)
     pub fn with_defaults(inner: Box<dyn QueryResult>, filter_expr: Expression) -> Self {
         let columns = inner.columns().to_vec();
-        let mut evaluator = Evaluator::with_defaults();
+        let mut evaluator = CompiledEvaluator::with_defaults();
         evaluator.init_columns(&columns);
 
         Self {
@@ -595,15 +595,15 @@ impl QueryResult for ExprFilteredResult<'static> {
     }
 }
 
-/// Expression-based mapped result that owns an Evaluator for efficient reuse
+/// Expression-based mapped result that owns a CompiledEvaluator for efficient reuse
 ///
-/// Unlike MappedResult which takes a closure, this struct owns the Evaluator
+/// Unlike MappedResult which takes a closure, this struct owns the CompiledEvaluator
 /// and expressions directly, avoiding per-row allocations.
 pub struct ExprMappedResult<'a> {
     /// Underlying result
     inner: Box<dyn QueryResult>,
     /// Owned evaluator (reused for each row)
-    evaluator: Evaluator<'a>,
+    evaluator: CompiledEvaluator<'a>,
     /// Projection expressions
     expressions: Vec<Expression>,
     /// Current mapped row
@@ -613,7 +613,7 @@ pub struct ExprMappedResult<'a> {
 }
 
 // SAFETY: ExprMappedResult is Send because:
-// 1. The Evaluator's raw pointers are only used within next() after set_row_array()
+// 1. The CompiledEvaluator's raw pointers are only used within next() after set_row_array()
 // 2. The row data comes from `inner` which is owned by this struct
 // 3. The pointer is always refreshed before use, never persisted across method calls
 unsafe impl Send for ExprMappedResult<'_> {}
@@ -626,7 +626,7 @@ impl<'a> ExprMappedResult<'a> {
         output_columns: Vec<String>,
         function_registry: &'a FunctionRegistry,
     ) -> Self {
-        let mut evaluator = Evaluator::new(function_registry);
+        let mut evaluator = CompiledEvaluator::new(function_registry);
         evaluator.init_columns(inner.columns());
 
         Self {
@@ -644,7 +644,7 @@ impl<'a> ExprMappedResult<'a> {
         expressions: Vec<Expression>,
         output_columns: Vec<String>,
     ) -> Self {
-        let mut evaluator = Evaluator::with_defaults();
+        let mut evaluator = CompiledEvaluator::with_defaults();
         evaluator.init_columns(inner.columns());
 
         Self {

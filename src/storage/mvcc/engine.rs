@@ -256,22 +256,24 @@ pub struct MVCCEngine {
     path: String,
     /// Configuration
     config: RwLock<Config>,
-    /// Table schemas
-    schemas: RwLock<HashMap<String, Schema>>,
-    /// Version stores for each table
-    version_stores: RwLock<HashMap<String, Arc<VersionStore>>>,
+    /// Table schemas (Arc-wrapped for safe sharing with transactions)
+    schemas: Arc<RwLock<HashMap<String, Schema>>>,
+    /// Version stores for each table (Arc-wrapped for safe sharing with transactions)
+    version_stores: Arc<RwLock<HashMap<String, Arc<VersionStore>>>>,
     /// Transaction registry
     registry: Arc<TransactionRegistry>,
     /// Whether the engine is open
     open: AtomicBool,
     /// Cache of transaction version stores per (txn_id, table_name) for proper commit/rollback
-    txn_version_stores: RwLock<TxnVersionStoreMap>,
+    /// (Arc-wrapped for safe sharing with transactions)
+    txn_version_stores: Arc<RwLock<TxnVersionStoreMap>>,
     /// View definitions (Arc for cheap cloning on lookup)
     views: RwLock<HashMap<String, Arc<ViewDefinition>>>,
-    /// Persistence manager for WAL and snapshot operations
-    persistence: Option<PersistenceManager>,
+    /// Persistence manager for WAL and snapshot operations (Arc-wrapped for safe sharing)
+    persistence: Arc<Option<PersistenceManager>>,
     /// Flag to indicate we're loading from disk to avoid triggering redundant WAL writes
-    loading_from_disk: AtomicBool,
+    /// (Arc-wrapped for safe sharing with transactions)
+    loading_from_disk: Arc<AtomicBool>,
     /// File lock to prevent multiple processes from accessing the same database
     file_lock: Mutex<Option<FileLock>>,
 }
@@ -301,14 +303,14 @@ impl MVCCEngine {
                 path
             },
             config: RwLock::new(config),
-            schemas: RwLock::new(HashMap::new()),
-            version_stores: RwLock::new(HashMap::new()),
+            schemas: Arc::new(RwLock::new(HashMap::new())),
+            version_stores: Arc::new(RwLock::new(HashMap::new())),
             registry: Arc::new(TransactionRegistry::new()),
             open: AtomicBool::new(false),
-            txn_version_stores: RwLock::new(HashMap::new()),
+            txn_version_stores: Arc::new(RwLock::new(HashMap::new())),
             views: RwLock::new(HashMap::new()),
-            persistence,
-            loading_from_disk: AtomicBool::new(false),
+            persistence: Arc::new(persistence),
+            loading_from_disk: Arc::new(AtomicBool::new(false)),
             file_lock: Mutex::new(None),
         }
     }
@@ -336,7 +338,7 @@ impl MVCCEngine {
         self.registry.start_accepting_transactions();
 
         // If persistence is enabled, start it and replay WAL for recovery
-        if let Some(ref pm) = self.persistence {
+        if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
                 pm.start()?;
 
@@ -791,7 +793,7 @@ impl MVCCEngine {
         drop(stores);
 
         // Stop persistence manager
-        if let Some(ref pm) = self.persistence {
+        if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
                 if let Err(e) = pm.stop() {
                     eprintln!("Warning: Error stopping persistence: {}", e);
@@ -1084,7 +1086,7 @@ impl MVCCEngine {
         if self.should_skip_wal() {
             return;
         }
-        if let Some(ref pm) = self.persistence {
+        if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
                 if let Err(e) = pm.record_ddl_operation(table_name, op, schema_data) {
                     eprintln!("Warning: Failed to record DDL operation in WAL: {}", e);
@@ -2386,60 +2388,56 @@ impl Drop for CleanupHandle {
 }
 
 /// Engine operations for transaction callbacks
+///
+/// Holds Arc references to shared engine state, allowing safe access
+/// from transactions without raw pointers.
 struct EngineOperations {
-    /// Reference to schemas
-    schemas: *const RwLock<HashMap<String, Schema>>,
-    /// Reference to version stores
-    version_stores: *const RwLock<HashMap<String, Arc<VersionStore>>>,
-    /// Reference to registry
+    /// Shared reference to schemas
+    schemas: Arc<RwLock<HashMap<String, Schema>>>,
+    /// Shared reference to version stores
+    version_stores: Arc<RwLock<HashMap<String, Arc<VersionStore>>>>,
+    /// Shared reference to registry
     registry: Arc<TransactionRegistry>,
-    /// Reference to transaction version stores cache
-    txn_version_stores: *const RwLock<TxnVersionStoreMap>,
-    /// Reference to persistence manager (optional)
-    persistence: *const Option<PersistenceManager>,
-    /// Reference to loading_from_disk flag
-    loading_from_disk: *const AtomicBool,
+    /// Shared reference to transaction version stores cache
+    txn_version_stores: Arc<RwLock<TxnVersionStoreMap>>,
+    /// Shared reference to persistence manager (optional)
+    persistence: Arc<Option<PersistenceManager>>,
+    /// Shared reference to loading_from_disk flag
+    loading_from_disk: Arc<AtomicBool>,
 }
 
-// Safety: The engine outlives the transaction, and we only read/write through RwLock
-unsafe impl Send for EngineOperations {}
-unsafe impl Sync for EngineOperations {}
+// EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
 
 impl EngineOperations {
     fn new(engine: &MVCCEngine) -> Self {
         Self {
-            schemas: &engine.schemas as *const _,
-            version_stores: &engine.version_stores as *const _,
+            schemas: Arc::clone(&engine.schemas),
+            version_stores: Arc::clone(&engine.version_stores),
             registry: Arc::clone(&engine.registry),
-            txn_version_stores: &engine.txn_version_stores as *const _,
-            persistence: &engine.persistence as *const _,
-            loading_from_disk: &engine.loading_from_disk as *const _,
+            txn_version_stores: Arc::clone(&engine.txn_version_stores),
+            persistence: Arc::clone(&engine.persistence),
+            loading_from_disk: Arc::clone(&engine.loading_from_disk),
         }
     }
 
     fn schemas(&self) -> &RwLock<HashMap<String, Schema>> {
-        // Safety: Engine outlives transactions
-        unsafe { &*self.schemas }
+        &self.schemas
     }
 
     fn version_stores(&self) -> &RwLock<HashMap<String, Arc<VersionStore>>> {
-        // Safety: Engine outlives transactions
-        unsafe { &*self.version_stores }
+        &self.version_stores
     }
 
     fn txn_version_stores(&self) -> &RwLock<TxnVersionStoreMap> {
-        // Safety: Engine outlives transactions
-        unsafe { &*self.txn_version_stores }
+        &self.txn_version_stores
     }
 
     fn persistence(&self) -> &Option<PersistenceManager> {
-        // Safety: Engine outlives transactions
-        unsafe { &*self.persistence }
+        &self.persistence
     }
 
     fn should_skip_wal(&self) -> bool {
-        // Safety: Engine outlives transactions
-        unsafe { (*self.loading_from_disk).load(Ordering::Acquire) }
+        self.loading_from_disk.load(Ordering::Acquire)
     }
 }
 

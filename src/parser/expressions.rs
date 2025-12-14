@@ -298,6 +298,15 @@ impl Parser {
             && (self.cur_token_is(TokenType::Integer) || self.cur_token_is(TokenType::Float))
         {
             if self.cur_token_is(TokenType::Integer) {
+                // Handle i64::MIN special case: -9223372036854775808
+                // The literal "9223372036854775808" is too large for i64, but when negated
+                // it equals i64::MIN. We must check this before trying parse::<i64>().
+                if self.cur_token.literal == "9223372036854775808" {
+                    return Some(Expression::IntegerLiteral(IntegerLiteral {
+                        token: self.cur_token.clone(),
+                        value: i64::MIN,
+                    }));
+                }
                 if let Ok(value) = self.cur_token.literal.parse::<i64>() {
                     return Some(Expression::IntegerLiteral(IntegerLiteral {
                         token: self.cur_token.clone(),

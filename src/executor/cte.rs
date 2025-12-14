@@ -32,7 +32,8 @@ use crate::parser::ast::*;
 use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
-use super::evaluator::Evaluator;
+use super::expression::CompiledEvaluator;
+use super::join::{self, build_column_index_map};
 use super::result::ExecutorMemoryResult;
 use super::Executor;
 
@@ -209,11 +210,7 @@ impl Executor {
                         self.try_execute_join_with_ctes(stmt, ctx, join_source, cte_registry)?
                     {
                         let columns = result.columns().to_vec();
-                        let mut result_mut = result;
-                        let mut rows = Vec::new();
-                        while result_mut.next() {
-                            rows.push(result_mut.take_row());
-                        }
+                        let rows = Self::materialize_result(result)?;
                         return Ok((columns, rows));
                     }
                 }
@@ -223,13 +220,9 @@ impl Executor {
         // Execute as a normal SELECT and materialize
         // Create context with CTE data so tables can resolve CTE references
         let ctx_with_ctes = ctx.with_cte_data(cte_registry.data());
-        let mut result = self.execute_select(stmt, &ctx_with_ctes)?;
+        let result = self.execute_select(stmt, &ctx_with_ctes)?;
         let columns = result.columns().to_vec();
-
-        let mut rows = Vec::new();
-        while result.next() {
-            rows.push(result.take_row());
-        }
+        let rows = Self::materialize_result(result)?;
 
         Ok((columns, rows))
     }
@@ -282,7 +275,7 @@ impl Executor {
             set_operations: vec![],
         };
 
-        let mut result = self.execute_select(&anchor_stmt, ctx)?;
+        let result = self.execute_select(&anchor_stmt, ctx)?;
         let anchor_columns = result.columns().to_vec();
 
         // Apply column aliases if provided (for recursive CTE column naming)
@@ -305,10 +298,7 @@ impl Executor {
             anchor_columns
         };
 
-        let mut all_rows: Vec<Row> = Vec::new();
-        while result.next() {
-            all_rows.push(result.take_row());
-        }
+        let mut all_rows = Self::materialize_result(result)?;
 
         // If no anchor rows, return empty result
         if all_rows.is_empty() {
@@ -541,7 +531,7 @@ impl Executor {
         let result_rows = if let Some(condition) = join_source.condition.as_deref() {
             // Extract equality keys for hash join
             let (left_key_indices, right_key_indices, residual) =
-                Self::extract_join_keys_and_residual(condition, &left_qualified, &right_qualified);
+                join::extract_join_keys_and_residual(condition, &left_qualified, &right_qualified);
 
             if !left_key_indices.is_empty() {
                 // Disable LIMIT pushdown if there are residual conditions (they filter after join)
@@ -607,8 +597,7 @@ impl Executor {
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
-            let mut where_eval = Evaluator::new(&self.function_registry);
-            where_eval = where_eval.with_context(ctx);
+            let mut where_eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             where_eval.init_columns(&all_columns);
 
             let mut rows = Vec::new();
@@ -632,16 +621,13 @@ impl Executor {
 
         // Check for aggregation (must handle before projection)
         if self.has_aggregation(stmt) {
-            let mut result =
+            let result =
                 self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &all_columns)?;
 
             // Apply ORDER BY if present (aggregation doesn't handle it for CTE JOINs)
             if !stmt.order_by.is_empty() {
                 let output_columns = result.columns().to_vec();
-                let mut rows = Vec::new();
-                while result.next() {
-                    rows.push(result.take_row());
-                }
+                let rows = Self::materialize_result(result)?;
                 let sorted_rows =
                     self.apply_order_by_to_rows(rows, &stmt.order_by, &output_columns)?;
                 return Ok(Some(Box::new(ExecutorMemoryResult::new(
@@ -721,8 +707,7 @@ impl Executor {
             };
 
             // OPTIMIZATION: Create evaluator once and reuse for all rows
-            let mut eval = Evaluator::new(&self.function_registry);
-            eval = eval.with_context(ctx);
+            let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             eval.init_columns(&cte_columns);
 
             let mut result = Vec::new();
@@ -742,12 +727,7 @@ impl Executor {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &cte_columns)?;
             let columns = result.columns().to_vec();
-
-            let mut result_mut = result;
-            let mut rows = Vec::new();
-            while result_mut.next() {
-                rows.push(result_mut.take_row());
-            }
+            let rows = Self::materialize_result(result)?;
 
             return Ok((columns, rows));
         }
@@ -757,12 +737,7 @@ impl Executor {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, filtered_rows, &cte_columns)?;
             let columns = result.columns().to_vec();
-
-            let mut result_mut = result;
-            let mut rows = Vec::new();
-            while result_mut.next() {
-                rows.push(result_mut.take_row());
-            }
+            let rows = Self::materialize_result(result)?;
 
             return Ok((columns, rows));
         }
@@ -784,95 +759,8 @@ impl Executor {
 
         // Apply ORDER BY sorting
         if !stmt.order_by.is_empty() {
-            // Create a column index map for the output columns
-            let col_index_map: FxHashMap<String, usize> = output_columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (c.to_lowercase(), i))
-                .collect();
-
-            // Build order specs: (column_index, ascending, nulls_first)
-            let order_specs: Vec<(Option<usize>, bool, Option<bool>)> = stmt
-                .order_by
-                .iter()
-                .map(|ob| {
-                    let col_idx = match &ob.expression {
-                        Expression::Identifier(id) => col_index_map.get(&id.value_lower).copied(),
-                        Expression::QualifiedIdentifier(qi) => {
-                            // Try both qualified and unqualified names
-                            let full_name =
-                                format!("{}.{}", qi.qualifier, qi.name.value).to_lowercase();
-                            col_index_map
-                                .get(&full_name)
-                                .or_else(|| col_index_map.get(&qi.name.value_lower))
-                                .copied()
-                        }
-                        Expression::IntegerLiteral(lit) => {
-                            // ORDER BY 1, 2, etc. - 1-based column position
-                            let pos = lit.value as usize;
-                            if pos > 0 && pos <= output_columns.len() {
-                                Some(pos - 1)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
-                    (col_idx, ob.ascending, ob.nulls_first)
-                })
-                .collect();
-
-            // Sort using the same comparison function as the main query executor
-            result_rows.sort_by(|a, b| {
-                for (col_idx, ascending, nulls_first) in &order_specs {
-                    if let Some(idx) = col_idx {
-                        let a_val = a.get(*idx);
-                        let b_val = b.get(*idx);
-
-                        // Check if either value is NULL
-                        let a_is_null =
-                            a_val.is_none() || a_val.map(|v| v.is_null()).unwrap_or(true);
-                        let b_is_null =
-                            b_val.is_none() || b_val.map(|v| v.is_null()).unwrap_or(true);
-
-                        // Handle NULL comparison
-                        if a_is_null || b_is_null {
-                            if a_is_null && b_is_null {
-                                continue; // Both NULL, move to next column
-                            }
-                            // Default: NULLS LAST for ASC, NULLS FIRST for DESC
-                            let nulls_come_first = nulls_first.unwrap_or(!*ascending);
-                            let cmp = if a_is_null {
-                                if nulls_come_first {
-                                    std::cmp::Ordering::Less
-                                } else {
-                                    std::cmp::Ordering::Greater
-                                }
-                            } else if nulls_come_first {
-                                std::cmp::Ordering::Greater
-                            } else {
-                                std::cmp::Ordering::Less
-                            };
-                            return cmp;
-                        }
-
-                        // Both non-NULL - normal comparison
-                        let cmp = match (a_val, b_val) {
-                            (Some(av), Some(bv)) => {
-                                av.partial_cmp(bv).unwrap_or(std::cmp::Ordering::Equal)
-                            }
-                            _ => std::cmp::Ordering::Equal,
-                        };
-
-                        let cmp = if !*ascending { cmp.reverse() } else { cmp };
-
-                        if cmp != std::cmp::Ordering::Equal {
-                            return cmp;
-                        }
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
+            result_rows =
+                self.apply_order_by_to_rows(result_rows, &stmt.order_by, &output_columns)?;
         }
 
         // Apply LIMIT and OFFSET
@@ -997,11 +885,7 @@ impl Executor {
         cte_columns: &[String],
         ctx: &ExecutionContext,
     ) -> Result<Vec<Row>> {
-        let col_index_map: FxHashMap<String, usize> = cte_columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.to_lowercase(), i))
-            .collect();
+        let col_index_map = build_column_index_map(cte_columns);
 
         // OPTIMIZATION: Check if we need expression evaluation and create evaluator once
         let needs_expr_eval = columns.iter().any(|col| {
@@ -1010,8 +894,7 @@ impl Executor {
         });
 
         let mut evaluator = if needs_expr_eval {
-            let mut eval = Evaluator::new(&self.function_registry);
-            eval = eval.with_context(ctx);
+            let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             eval.init_columns(cte_columns);
             Some(eval)
         } else {
@@ -1075,11 +958,7 @@ impl Executor {
         }
 
         // Build column index map
-        let col_index_map: FxHashMap<String, usize> = columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.to_lowercase(), i))
-            .collect();
+        let col_index_map = build_column_index_map(columns);
 
         // Build order specs: (column_index, ascending, nulls_first)
         let order_specs: Vec<(Option<usize>, bool, Option<bool>)> = order_by

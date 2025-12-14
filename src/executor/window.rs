@@ -43,7 +43,8 @@ use crate::parser::ast::*;
 use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
-use super::evaluator::Evaluator;
+use super::expression::CompiledEvaluator;
+use super::join::build_column_index_map;
 use super::result::ExecutorMemoryResult;
 use super::Executor;
 
@@ -108,11 +109,7 @@ impl Executor {
         }
 
         // Build column index map for base columns
-        let mut col_index_map: FxHashMap<String, usize> = base_columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.to_lowercase(), i))
-            .collect();
+        let mut col_index_map = build_column_index_map(base_columns);
 
         // Build a mapping from aggregate expression patterns to their column names
         // This handles cases like:
@@ -156,8 +153,14 @@ impl Executor {
         let mut result_rows: Vec<Row> = Vec::with_capacity(num_rows);
 
         // Create evaluator once for expression evaluation
-        let mut evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+        // Include ALL col_index_map entries as aggregate aliases for CompiledEvaluator
+        let agg_aliases: Vec<(String, usize)> =
+            col_index_map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
         evaluator.init_columns(base_columns);
+        if !agg_aliases.is_empty() {
+            evaluator.add_aggregate_aliases(&agg_aliases);
+        }
 
         // Pre-transform expressions with window functions by replacing Window expr with Identifier
         // This is done once, not per row
@@ -185,8 +188,11 @@ impl Executor {
         }
 
         // Create a new evaluator with extended columns
-        let mut ext_evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+        let mut ext_evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
         ext_evaluator.init_columns(&extended_columns);
+        if !agg_aliases.is_empty() {
+            ext_evaluator.add_aggregate_aliases(&agg_aliases);
+        }
 
         for (row_idx, base_row) in base_rows.iter().enumerate() {
             let mut values = Vec::with_capacity(select_items.len());
@@ -260,11 +266,7 @@ impl Executor {
         base_columns: &[String],
         window_functions: &[WindowFunctionInfo],
     ) -> Vec<SelectItem> {
-        let col_index_map: FxHashMap<String, usize> = base_columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.to_lowercase(), i))
-            .collect();
+        let col_index_map = build_column_index_map(base_columns);
 
         let mut items = Vec::new();
         let mut wf_idx = 0;
@@ -1011,7 +1013,7 @@ impl Executor {
     ) -> Result<Value> {
         // Get offset (default 1)
         let offset = if wf_info.arguments.len() > 1 {
-            let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             match evaluator.evaluate(&wf_info.arguments[1])? {
                 Value::Integer(n) => n as usize,
                 _ => 1,
@@ -1022,9 +1024,9 @@ impl Executor {
 
         // Get default value - use current row context for column references
         let default_value = if wf_info.arguments.len() > 2 {
-            let evaluator = Evaluator::new(&self.function_registry)
-                .with_context(ctx)
-                .with_row(current_row_data.clone(), columns);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
+            evaluator.init_columns(columns);
+            evaluator.set_row_array(current_row_data);
             evaluator.evaluate(&wf_info.arguments[2])?
         } else {
             Value::null_unknown()
@@ -1054,7 +1056,7 @@ impl Executor {
     ) -> Result<Value> {
         // Get n (number of buckets)
         let n = if !wf_info.arguments.is_empty() {
-            let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             match evaluator.evaluate(&wf_info.arguments[0])? {
                 Value::Integer(n) if n > 0 => n as usize,
                 _ => 1,
@@ -1184,7 +1186,7 @@ impl Executor {
 
         // Get n (1-indexed position) from second argument
         let n = if wf_info.arguments.len() > 1 {
-            let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             match evaluator.evaluate(&wf_info.arguments[1])? {
                 Value::Integer(n) if n > 0 => n as usize,
                 _ => return Ok(Value::null_unknown()),
@@ -1445,19 +1447,17 @@ impl Executor {
 
         if has_complex_expr {
             // Use evaluator for complex expressions
-            let mut evaluator = Evaluator::new(&self.function_registry);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry);
             evaluator = evaluator.with_context(ctx);
             evaluator.init_columns(columns);
 
             // Add aggregate expression mappings from col_index_map (e.g., "sum(val)" -> column_index)
-            // This allows ORDER BY SUM(val) to resolve to the correct column when SUM(val) is aliased
-            let col_lower_set: std::collections::HashSet<String> =
-                columns.iter().map(|c| c.to_lowercase()).collect();
-            let agg_aliases: Vec<(String, usize)> = col_index_map
-                .iter()
-                .filter(|(k, _)| !col_lower_set.contains(*k))
-                .map(|(k, v)| (k.clone(), *v))
-                .collect();
+            // This allows ORDER BY SUM(val) to resolve to the correct column when SUM(val) is a column
+            // IMPORTANT: Include ALL col_index_map entries, not just non-column ones,
+            // because the CompiledEvaluator needs expression_aliases to match FunctionCall expressions
+            // even when the column is already named after the aggregate (e.g., "SUM(val)")
+            let agg_aliases: Vec<(String, usize)> =
+                col_index_map.iter().map(|(k, v)| (k.clone(), *v)).collect();
             if !agg_aliases.is_empty() {
                 evaluator.add_aggregate_aliases(&agg_aliases);
             }
@@ -1561,7 +1561,7 @@ impl Executor {
 
         // Pre-compute expression values for all rows if needed
         let expression_values: Vec<Value> = if has_expression_arg {
-            let mut evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             evaluator.init_columns(columns);
             rows.iter()
                 .map(|row| {

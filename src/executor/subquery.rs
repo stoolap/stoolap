@@ -19,11 +19,15 @@
 //! - Scalar subqueries
 //! - IN subqueries
 
-use crate::core::{Error, Result};
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use crate::core::{Error, Result, Value};
 use crate::parser::ast::*;
-use crate::parser::token::{Position, Token, TokenType};
+use crate::parser::token::TokenType;
 
 use super::context::ExecutionContext;
+use super::utils::{dummy_token, value_to_expression};
 use super::Executor;
 
 // ============================================================================
@@ -53,42 +57,6 @@ pub struct SemiJoinInfo {
     pub non_correlated_where: Option<Expression>,
     /// Whether this is NOT EXISTS
     pub is_negated: bool,
-}
-
-/// Helper to create a dummy token for internal AST construction
-fn dummy_token(literal: &str, token_type: TokenType) -> Token {
-    Token::new(token_type, literal, Position::new(0, 1, 1))
-}
-
-/// Convert a Value to an Expression for use in subquery result replacement
-fn value_to_expression(v: crate::core::Value) -> Expression {
-    match v {
-        crate::core::Value::Integer(i) => Expression::IntegerLiteral(IntegerLiteral {
-            token: dummy_token(&i.to_string(), TokenType::Integer),
-            value: i,
-        }),
-        crate::core::Value::Float(f) => Expression::FloatLiteral(FloatLiteral {
-            token: dummy_token(&f.to_string(), TokenType::Float),
-            value: f,
-        }),
-        crate::core::Value::Text(s) => Expression::StringLiteral(StringLiteral {
-            token: dummy_token(&format!("'{}'", s), TokenType::String),
-            value: s.to_string(),
-            type_hint: None,
-        }),
-        crate::core::Value::Boolean(b) => Expression::BooleanLiteral(BooleanLiteral {
-            token: dummy_token(if b { "TRUE" } else { "FALSE" }, TokenType::Keyword),
-            value: b,
-        }),
-        crate::core::Value::Null(_) => Expression::NullLiteral(NullLiteral {
-            token: dummy_token("NULL", TokenType::Keyword),
-        }),
-        _ => Expression::StringLiteral(StringLiteral {
-            token: dummy_token(&format!("'{}'", v), TokenType::String),
-            value: v.to_string(),
-            type_hint: None,
-        }),
-    }
 }
 
 impl Executor {
@@ -183,7 +151,7 @@ impl Executor {
                         for row in rows {
                             let col_count = row.len();
                             let mut tuple_exprs = Vec::with_capacity(col_count);
-                            for value in row {
+                            for value in &row {
                                 tuple_exprs.push(value_to_expression(value));
                             }
                             expressions.push(Expression::ExpressionList(ExpressionList {
@@ -202,22 +170,17 @@ impl Executor {
                             not: in_expr.not,
                         }));
                     } else {
-                        // Single-column IN
+                        // Single-column IN - use InHashSet for O(1) lookups
                         let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
 
-                        // Pre-allocate with known capacity for better performance
-                        let mut expressions = Vec::with_capacity(values.len());
-                        for value in values {
-                            expressions.push(value_to_expression(value));
-                        }
+                        // Collect into HashSet for O(1) membership testing
+                        let hash_set: HashSet<Value> = values.into_iter().collect();
 
-                        return Ok(Expression::In(InExpression {
+                        // Use InHashSet with Arc for fast O(1) lookup per row
+                        return Ok(Expression::InHashSet(InHashSetExpression {
                             token: in_expr.token.clone(),
-                            left: Box::new(processed_left),
-                            right: Box::new(Expression::ExpressionList(ExpressionList {
-                                token: dummy_token("(", TokenType::Punctuator),
-                                expressions,
-                            })),
+                            column: Box::new(processed_left),
+                            values: Arc::new(hash_set),
                             not: in_expr.not,
                         }));
                     }
@@ -360,8 +323,9 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<bool> {
-        // Execute the subquery
-        let mut result = self.execute_select(subquery, ctx)?;
+        // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
+        let subquery_ctx = ctx.with_incremented_query_depth();
+        let mut result = self.execute_select(subquery, &subquery_ctx)?;
 
         // Check if there's at least one row
         let exists = result.next();
@@ -406,10 +370,7 @@ impl Executor {
         }
 
         // Convert values to expressions
-        let value_exprs: Vec<Expression> = values
-            .iter()
-            .map(|v| value_to_expression(v.clone()))
-            .collect();
+        let value_exprs: Vec<Expression> = values.iter().map(value_to_expression).collect();
 
         // Special case: = ANY is equivalent to IN
         if op == "=" && matches!(all_any.all_any_type, AllAnyType::Any) {
@@ -489,7 +450,7 @@ impl Executor {
                 all_any.token.clone(),
                 all_any.left.clone(),
                 op.to_string(),
-                Box::new(value_to_expression(cmp_val.clone())),
+                Box::new(value_to_expression(cmp_val)),
             )));
         }
 
@@ -536,8 +497,9 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<crate::core::Value> {
-        // Execute the subquery
-        let mut result = self.execute_select(subquery, ctx)?;
+        // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
+        let subquery_ctx = ctx.with_incremented_query_depth();
+        let mut result = self.execute_select(subquery, &subquery_ctx)?;
 
         // Get the first row
         if !result.next() {
@@ -571,8 +533,9 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Vec<crate::core::Value>> {
-        // Execute the subquery
-        let mut result = self.execute_select(subquery, ctx)?;
+        // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
+        let subquery_ctx = ctx.with_incremented_query_depth();
+        let mut result = self.execute_select(subquery, &subquery_ctx)?;
 
         // Collect all values from the first column
         let mut values = Vec::new();
@@ -596,8 +559,9 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Vec<Vec<crate::core::Value>>> {
-        // Execute the subquery
-        let mut result = self.execute_select(subquery, ctx)?;
+        // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
+        let subquery_ctx = ctx.with_incremented_query_depth();
+        let mut result = self.execute_select(subquery, &subquery_ctx)?;
 
         // Collect all values from all columns
         let mut rows = Vec::new();
@@ -679,7 +643,7 @@ impl Executor {
             Expression::ScalarSubquery(subquery) => {
                 // Execute scalar subquery and replace with literal value
                 let value = self.execute_scalar_subquery(&subquery.subquery, ctx)?;
-                Ok(Some(Self::value_to_expression(&value)))
+                Ok(Some(value_to_expression(&value)))
             }
 
             Expression::Exists(exists) => {
@@ -864,37 +828,6 @@ impl Executor {
         }
     }
 
-    /// Convert a Value to an Expression literal
-    fn value_to_expression(value: &crate::core::Value) -> Expression {
-        match value {
-            crate::core::Value::Integer(i) => Expression::IntegerLiteral(IntegerLiteral {
-                token: dummy_token(&i.to_string(), TokenType::Integer),
-                value: *i,
-            }),
-            crate::core::Value::Float(f) => Expression::FloatLiteral(FloatLiteral {
-                token: dummy_token(&f.to_string(), TokenType::Float),
-                value: *f,
-            }),
-            crate::core::Value::Text(s) => Expression::StringLiteral(StringLiteral {
-                token: dummy_token(&format!("'{}'", s), TokenType::String),
-                value: s.to_string(),
-                type_hint: None,
-            }),
-            crate::core::Value::Boolean(b) => Expression::BooleanLiteral(BooleanLiteral {
-                token: dummy_token(if *b { "TRUE" } else { "FALSE" }, TokenType::Keyword),
-                value: *b,
-            }),
-            crate::core::Value::Null(_) => Expression::NullLiteral(NullLiteral {
-                token: dummy_token("NULL", TokenType::Keyword),
-            }),
-            _ => Expression::StringLiteral(StringLiteral {
-                token: dummy_token(&format!("'{}'", value), TokenType::String),
-                value: value.to_string(),
-                type_hint: None,
-            }),
-        }
-    }
-
     // ============================================================================
     // Correlated Subquery Support
     // ============================================================================
@@ -954,7 +887,7 @@ impl Executor {
             Expression::ScalarSubquery(subquery) => {
                 // Execute scalar subquery with outer row context
                 let value = self.execute_scalar_subquery(&subquery.subquery, ctx)?;
-                Ok(Self::value_to_expression(&value))
+                Ok(value_to_expression(&value))
             }
 
             Expression::Exists(exists) => {
@@ -1021,19 +954,14 @@ impl Executor {
                 let processed_left = self.process_correlated_expression(&in_expr.left, ctx)?;
 
                 if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
+                    // Use InHashSet for O(1) lookups
                     let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
-                    let expressions: Vec<Expression> = values
-                        .into_iter()
-                        .map(|v| Self::value_to_expression(&v))
-                        .collect();
+                    let hash_set: HashSet<Value> = values.into_iter().collect();
 
-                    return Ok(Expression::In(InExpression {
+                    return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
-                        left: Box::new(processed_left),
-                        right: Box::new(Expression::ExpressionList(ExpressionList {
-                            token: dummy_token("(", TokenType::Punctuator),
-                            expressions,
-                        })),
+                        column: Box::new(processed_left),
+                        values: Arc::new(hash_set),
                         not: in_expr.not,
                     }));
                 }
@@ -1305,26 +1233,21 @@ impl Executor {
             Expression::ScalarSubquery(subquery) => {
                 // Execute scalar subquery with outer row context
                 let value = self.execute_scalar_subquery(&subquery.subquery, ctx)?;
-                Ok(Self::value_to_expression(&value))
+                Ok(value_to_expression(&value))
             }
 
             Expression::In(in_expr) => {
                 let processed_left = self.process_correlated_where(&in_expr.left, ctx)?;
 
                 if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
+                    // Use InHashSet for O(1) lookups
                     let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
-                    let expressions: Vec<Expression> = values
-                        .into_iter()
-                        .map(|v| Self::value_to_expression(&v))
-                        .collect();
+                    let hash_set: HashSet<Value> = values.into_iter().collect();
 
-                    return Ok(Expression::In(InExpression {
+                    return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
-                        left: Box::new(processed_left),
-                        right: Box::new(Expression::ExpressionList(ExpressionList {
-                            token: dummy_token("(", TokenType::Punctuator),
-                            expressions,
-                        })),
+                        column: Box::new(processed_left),
+                        values: Arc::new(hash_set),
                         not: in_expr.not,
                     }));
                 }
@@ -1693,8 +1616,9 @@ impl Executor {
             set_operations: vec![],
         };
 
-        // Execute the query
-        let mut result = self.execute_select(&select_stmt, ctx)?;
+        // Execute the query with incremented depth to avoid creating new TimeoutGuard
+        let subquery_ctx = ctx.with_incremented_query_depth();
+        let mut result = self.execute_select(&select_stmt, &subquery_ctx)?;
 
         // Collect values into HashSet (deduplicates automatically)
         let mut hash_set = std::collections::HashSet::new();

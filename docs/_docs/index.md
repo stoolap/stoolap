@@ -9,7 +9,7 @@ Welcome to the Stoolap Documentation! This is your comprehensive guide to using 
 
 ## What is Stoolap?
 
-Stoolap is a modern embedded SQL database that provides full ACID transactions with MVCC, a sophisticated cost-based query optimizer, and features that rival established databases like PostgreSQL and DuckDB. Built entirely in Rust with zero unsafe code, Stoolap features:
+Stoolap is a modern embedded SQL database that provides full ACID transactions with MVCC, a sophisticated cost-based query optimizer, and features that rival established databases like PostgreSQL and DuckDB. Built entirely in Rust with minimal unsafe code (only for FFI and performance-critical hot paths), Stoolap features:
 
 - **Multiple Index Types**: B-tree, Hash, and Bitmap indexes with automatic type selection
 - **Multi-Column Indexes**: Composite indexes for complex query patterns

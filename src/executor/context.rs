@@ -18,9 +18,10 @@
 //! parameter handling, transaction state, and query options.
 
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::core::{Result, Row, Value};
 
@@ -49,6 +50,9 @@ pub struct ExecutionContext {
     timeout_ms: u64,
     /// Current view nesting depth (for detecting infinite recursion)
     view_depth: usize,
+    /// Query execution depth (0 = top-level query, >0 = subquery/nested)
+    /// Used to ensure TimeoutGuard is only created once at the top level
+    pub(crate) query_depth: usize,
     /// Outer row context for correlated subqueries
     /// Maps column name (lowercase) to value from the outer query
     /// Uses FxHashMap for faster hashing
@@ -84,6 +88,7 @@ impl ExecutionContext {
             session_vars: Arc::new(HashMap::new()),
             timeout_ms: 0,
             view_depth: 0,
+            query_depth: 0,
             outer_row: None,
             outer_columns: None,
             cte_data: None,
@@ -220,6 +225,7 @@ impl ExecutionContext {
 
     /// Create a new context with incremented view depth.
     /// Used when executing nested views to track recursion depth.
+    /// Also increments query_depth since views are nested queries.
     pub fn with_incremented_view_depth(&self) -> Self {
         Self {
             params: self.params.clone(),
@@ -230,6 +236,27 @@ impl ExecutionContext {
             session_vars: self.session_vars.clone(),
             timeout_ms: self.timeout_ms,
             view_depth: self.view_depth + 1,
+            query_depth: self.query_depth + 1, // Views are nested queries
+            outer_row: self.outer_row.clone(),
+            outer_columns: self.outer_columns.clone(),
+            cte_data: self.cte_data.clone(),
+            transaction_id: self.transaction_id,
+        }
+    }
+
+    /// Create a new context with incremented query depth.
+    /// Used when executing subqueries to ensure TimeoutGuard is only created at the top level.
+    pub fn with_incremented_query_depth(&self) -> Self {
+        Self {
+            params: self.params.clone(),
+            named_params: self.named_params.clone(),
+            auto_commit: self.auto_commit,
+            cancelled: self.cancelled.clone(),
+            current_database: self.current_database.clone(),
+            session_vars: self.session_vars.clone(),
+            timeout_ms: self.timeout_ms,
+            view_depth: self.view_depth,
+            query_depth: self.query_depth + 1,
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
             cte_data: self.cte_data.clone(),
@@ -264,6 +291,7 @@ impl ExecutionContext {
             session_vars: self.session_vars.clone(), // Arc clone = cheap
             timeout_ms: self.timeout_ms,
             view_depth: self.view_depth,
+            query_depth: self.query_depth + 1, // Increment for subquery
             outer_row: Some(outer_row),
             outer_columns: Some(outer_columns), // Arc clone = cheap
             cte_data: self.cte_data.clone(),    // Arc clone = cheap
@@ -298,6 +326,7 @@ impl ExecutionContext {
             session_vars: self.session_vars.clone(),
             timeout_ms: self.timeout_ms,
             view_depth: self.view_depth,
+            query_depth: self.query_depth,
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
             cte_data: Some(cte_data),
@@ -326,6 +355,7 @@ impl ExecutionContext {
             session_vars: self.session_vars.clone(),
             timeout_ms: self.timeout_ms,
             view_depth: self.view_depth,
+            query_depth: self.query_depth,
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
             cte_data: self.cte_data.clone(),
@@ -358,6 +388,207 @@ impl CancellationHandle {
     /// Check if the query has been cancelled
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
+// ============================================================================
+// Global Timeout Manager
+// ============================================================================
+//
+// Uses a single background thread to manage all query timeouts efficiently.
+// This avoids spawning a new thread for each query with a timeout.
+
+/// Entry in the timeout priority queue
+struct TimeoutEntry {
+    /// When the timeout expires
+    deadline: Instant,
+    /// Unique ID for this timeout (for cancellation)
+    id: u64,
+    /// Handle to cancel the query
+    cancel_handle: CancellationHandle,
+    /// Whether this timeout has been cancelled (query completed)
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PartialEq for TimeoutEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.id == other.id
+    }
+}
+
+impl Eq for TimeoutEntry {}
+
+impl PartialOrd for TimeoutEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimeoutEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse ordering so BinaryHeap becomes a min-heap (earliest deadline first)
+        other.deadline.cmp(&self.deadline)
+    }
+}
+
+/// Global timeout manager state
+struct TimeoutManagerState {
+    /// Priority queue of pending timeouts (min-heap by deadline)
+    timeouts: BinaryHeap<TimeoutEntry>,
+    /// Whether the manager is shutting down
+    shutdown: bool,
+}
+
+/// Global timeout manager that handles all query timeouts in a single thread
+struct TimeoutManager {
+    /// Shared state protected by mutex
+    state: Mutex<TimeoutManagerState>,
+    /// Condition variable to wake the timer thread
+    condvar: Condvar,
+    /// Counter for generating unique timeout IDs
+    next_id: AtomicU64,
+}
+
+impl TimeoutManager {
+    /// Create a new timeout manager and spawn its background thread
+    fn new() -> Arc<Self> {
+        let manager = Arc::new(Self {
+            state: Mutex::new(TimeoutManagerState {
+                timeouts: BinaryHeap::new(),
+                shutdown: false,
+            }),
+            condvar: Condvar::new(),
+            next_id: AtomicU64::new(1),
+        });
+
+        // Spawn the background timer thread
+        let manager_clone = Arc::clone(&manager);
+        std::thread::Builder::new()
+            .name("stoolap-timeout-manager".to_string())
+            .spawn(move || {
+                manager_clone.run();
+            })
+            .expect("Failed to spawn timeout manager thread");
+
+        manager
+    }
+
+    /// Background thread loop
+    fn run(&self) {
+        loop {
+            let mut state = self.state.lock().unwrap();
+
+            // Check for shutdown
+            if state.shutdown && state.timeouts.is_empty() {
+                return;
+            }
+
+            // Process expired timeouts
+            let now = Instant::now();
+            while let Some(entry) = state.timeouts.peek() {
+                if entry.deadline <= now {
+                    let entry = state.timeouts.pop().unwrap();
+                    // Only cancel if the timeout wasn't already cancelled
+                    if !entry.cancelled.load(Ordering::Relaxed) {
+                        entry.cancel_handle.cancel();
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Calculate wait time until next timeout
+            let wait_duration = if let Some(entry) = state.timeouts.peek() {
+                entry.deadline.saturating_duration_since(now)
+            } else {
+                // No timeouts pending, wait indefinitely for new work
+                Duration::from_secs(3600) // 1 hour max wait
+            };
+
+            // Wait for new work or timeout
+            if wait_duration.is_zero() {
+                continue; // Immediately process
+            }
+            let (new_state, _timeout_result) =
+                self.condvar.wait_timeout(state, wait_duration).unwrap();
+            state = new_state;
+
+            // Re-check shutdown after waking
+            if state.shutdown && state.timeouts.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// Register a new timeout, returns the timeout ID
+    fn register(
+        &self,
+        timeout_ms: u64,
+        cancel_handle: CancellationHandle,
+        cancelled: Arc<AtomicBool>,
+    ) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+        let entry = TimeoutEntry {
+            deadline,
+            id,
+            cancel_handle,
+            cancelled,
+        };
+
+        let mut state = self.state.lock().unwrap();
+        let was_empty = state.timeouts.is_empty();
+        let is_earliest = state.timeouts.peek().is_none_or(|e| deadline < e.deadline);
+
+        state.timeouts.push(entry);
+
+        // Wake the timer thread if this is the new earliest deadline
+        if was_empty || is_earliest {
+            self.condvar.notify_one();
+        }
+
+        id
+    }
+}
+
+/// Get or create the global timeout manager
+fn global_timeout_manager() -> &'static Arc<TimeoutManager> {
+    use std::sync::OnceLock;
+    static MANAGER: OnceLock<Arc<TimeoutManager>> = OnceLock::new();
+    MANAGER.get_or_init(TimeoutManager::new)
+}
+
+/// Guard that automatically cancels a query after a timeout.
+/// Uses a global timeout manager for efficient handling of many concurrent timeouts.
+pub struct TimeoutGuard {
+    /// Flag to signal that the query completed (timeout should be ignored)
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TimeoutGuard {
+    /// Create a new timeout guard that will cancel the query after timeout_ms.
+    /// Returns None if timeout_ms is 0 (no timeout).
+    pub fn new(ctx: &ExecutionContext) -> Option<Self> {
+        let timeout_ms = ctx.timeout_ms();
+        if timeout_ms == 0 {
+            return None;
+        }
+
+        let cancel_handle = ctx.cancellation_handle();
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        // Register with the global timeout manager
+        global_timeout_manager().register(timeout_ms, cancel_handle, Arc::clone(&cancelled));
+
+        Some(Self { cancelled })
+    }
+}
+
+impl Drop for TimeoutGuard {
+    fn drop(&mut self) {
+        // Mark this timeout as cancelled so the manager ignores it
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 }
 

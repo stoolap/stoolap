@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use crate::core::{Error, Result, Row, Value};
 use crate::executor::context::ExecutionContext;
-use crate::executor::evaluator::Evaluator;
+use crate::executor::expression::CompiledEvaluator;
 use crate::executor::result::ExecutorMemoryResult;
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::{Expression, Statement};
@@ -213,7 +213,8 @@ impl Transaction {
                 let table_name = &stmt.table_name.value;
                 let mut table = tx.get_table(table_name)?;
 
-                let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+                let mut evaluator =
+                    CompiledEvaluator::new(&self.function_registry).with_context(ctx);
 
                 let mut total_inserted = 0i64;
 
@@ -253,8 +254,8 @@ impl Transaction {
                     .collect();
 
                 // OPTIMIZATION: Create evaluator once outside the loop
-                let mut evaluator = Evaluator::new(function_registry);
-                evaluator = evaluator.with_context(&ctx_clone);
+                let mut evaluator =
+                    CompiledEvaluator::new(function_registry).with_context(&ctx_clone);
                 evaluator.init_columns(&columns);
 
                 let mut setter = |row: Row| -> (Row, bool) {
@@ -312,7 +313,8 @@ impl Transaction {
                 let table_expr = match &stmt.table_expr {
                     Some(expr) => expr,
                     None => {
-                        let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+                        let mut evaluator =
+                            CompiledEvaluator::new(&self.function_registry).with_context(ctx);
 
                         let mut columns = Vec::new();
                         let mut values = Vec::new();
@@ -445,7 +447,8 @@ impl Transaction {
                 };
 
                 // Get value from right side
-                let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+                let mut evaluator =
+                    CompiledEvaluator::new(&self.function_registry).with_context(ctx);
                 let value = evaluator.evaluate(&infix.right)?;
 
                 Ok(Box::new(ComparisonExpr::new(column, op, value)))
@@ -487,7 +490,7 @@ impl Transaction {
         }
 
         // OPTIMIZATION: Create evaluator once and reuse for all rows
-        let mut eval = Evaluator::new(&self.function_registry).with_context(ctx);
+        let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
         eval.init_columns(source_columns);
         let num_cols = stmt.columns.len();
 

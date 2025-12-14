@@ -90,6 +90,45 @@ let users: Vec<_> = db.query("SELECT * FROM users", ())?
     .collect::<Result<Vec<_>, _>>()?;
 ```
 
+### execute_with_timeout()
+
+Execute a write statement with a timeout. The query is cancelled if it exceeds the specified timeout.
+
+```rust
+// Execute with 5 second timeout (timeout in milliseconds)
+db.execute_with_timeout(
+    "DELETE FROM large_table WHERE created_at < $1",
+    ("2020-01-01",),
+    5000  // 5000ms = 5 seconds
+)?;
+
+// Use 0 for no timeout
+db.execute_with_timeout("UPDATE users SET active = true", (), 0)?;
+```
+
+### query_with_timeout()
+
+Execute a query with a timeout. The query is cancelled if it exceeds the specified timeout.
+
+```rust
+// Query with 10 second timeout
+for row in db.query_with_timeout(
+    "SELECT * FROM large_table WHERE complex_condition",
+    (),
+    10000  // 10000ms = 10 seconds
+)? {
+    let row = row?;
+    // Process row...
+}
+
+// Useful for preventing long-running queries from blocking
+let results = db.query_with_timeout(
+    "SELECT * FROM orders WHERE status = $1",
+    ("pending",),
+    3000  // 3 second timeout
+)?;
+```
+
 ### query_one()
 
 Execute a query that returns a single value.
@@ -353,3 +392,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 5. **Use `query_one` for single values**: Simpler than iterating
 6. **Close database properly**: The database is automatically closed when dropped
 7. **Run ANALYZE after bulk inserts**: Updates optimizer statistics
+8. **Use timeouts for untrusted queries**: Use `execute_with_timeout` and `query_with_timeout` to prevent long-running queries from blocking your application

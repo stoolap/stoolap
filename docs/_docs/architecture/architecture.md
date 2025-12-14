@@ -18,7 +18,7 @@ Stoolap is a high-performance embedded SQL database written in pure Rust. Its ar
 - Cost-based query optimizer with adaptive execution
 - Multiple index types (B-tree, Hash, Bitmap)
 - Parallel query execution via Rayon
-- Zero unsafe code
+- Minimal unsafe code (only for FFI and hot paths)
 
 ## Core Components
 
@@ -182,7 +182,7 @@ src/
 Stoolap's architecture is guided by the following principles:
 
 1. **Performance First** - Optimize for speed and memory efficiency
-2. **Memory Safety** - Pure Rust with zero unsafe code
+2. **Memory Safety** - Pure Rust with minimal unsafe code (FFI and hot paths only)
 3. **Modularity** - Clean component interfaces for extensibility
 4. **Simplicity** - Favor simple solutions over complex ones
 5. **Data Integrity** - Ensure consistent and correct results

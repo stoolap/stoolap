@@ -27,7 +27,8 @@ use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use super::context::ExecutionContext;
-use super::evaluator::Evaluator;
+use super::expression::CompiledEvaluator;
+use super::pushdown;
 use super::result::ExecResult;
 use super::Executor;
 
@@ -151,7 +152,7 @@ impl Executor {
         }
 
         // Create evaluator for expressions
-        let evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
 
         let mut rows_affected = 0i64;
 
@@ -546,13 +547,14 @@ impl Executor {
                 (**where_clause).clone()
             };
 
-            // Try to build storage expression, fall back to memory filter if it fails
-            match self.build_storage_expression_with_ctx(&processed_where, schema, Some(ctx)) {
-                Ok(expr) => (Some(expr), false, None),
-                Err(_) => {
-                    // Complex expression (like a + b > 100) - use in-memory filtering
-                    (None, true, Some(processed_where))
-                }
+            // Try to push down predicate to storage layer
+            let (storage_expr, needs_mem) =
+                pushdown::try_pushdown(&processed_where, schema, Some(ctx));
+            if needs_mem {
+                // Complex expression (like a + b > 100) - use in-memory filtering
+                (storage_expr, true, Some(processed_where))
+            } else {
+                (storage_expr, false, None)
             }
         } else {
             (None, false, None)
@@ -561,8 +563,7 @@ impl Executor {
         let function_registry = &self.function_registry;
 
         // Create evaluator once and reuse for all rows (optimization)
-        let mut evaluator = Evaluator::new(function_registry);
-        evaluator = evaluator.with_context(ctx);
+        let mut evaluator = CompiledEvaluator::new(function_registry).with_context(ctx);
         evaluator.init_columns(column_names);
 
         // For correlated subqueries, we need to process per-row with outer row context
@@ -653,8 +654,8 @@ impl Executor {
                         match self.process_correlated_expression(expr, &correlated_ctx) {
                             Ok(processed_expr) => {
                                 // Now evaluate the processed expression (subquery replaced with value)
-                                let mut eval = Evaluator::new(function_registry);
-                                eval = eval.with_context(&correlated_ctx);
+                                let mut eval = CompiledEvaluator::new(function_registry)
+                                    .with_context(&correlated_ctx);
                                 eval.init_columns(column_names);
                                 eval.set_row_array(row);
                                 eval.evaluate(&processed_expr).ok()
@@ -839,13 +840,14 @@ impl Executor {
                     (**where_clause).clone()
                 };
 
-                // Try to build storage expression, fall back to memory filter if it fails
-                match self.build_storage_expression_with_ctx(&processed_where, schema, Some(ctx)) {
-                    Ok(expr) => (Some(expr), false, None),
-                    Err(_) => {
-                        // Complex expression (like a + b > 100) - use in-memory filtering
-                        (None, true, Some(processed_where))
-                    }
+                // Try to push down predicate to storage layer
+                let (storage_expr, needs_mem) =
+                    pushdown::try_pushdown(&processed_where, schema, Some(ctx));
+                if needs_mem {
+                    // Complex expression (like a + b > 100) - use in-memory filtering
+                    (storage_expr, true, Some(processed_where))
+                } else {
+                    (storage_expr, false, None)
                 }
             }
         } else {
@@ -873,8 +875,7 @@ impl Executor {
             let schema_clone = schema.clone();
 
             // Create evaluator for WHERE filtering
-            let mut evaluator = Evaluator::new(&self.function_registry);
-            evaluator = evaluator.with_context(ctx);
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             // Initialize with prefixed column names to support alias.column syntax
             evaluator.init_columns(&column_names_with_prefix);
 
@@ -1099,675 +1100,6 @@ impl Executor {
         )))
     }
 
-    /// Build a storage-layer expression from a parser AST expression
-    #[allow(dead_code)]
-    pub(crate) fn build_storage_expression(
-        &self,
-        expr: &Expression,
-        schema: &crate::core::Schema,
-    ) -> Result<Box<dyn StorageExpr>> {
-        self.build_storage_expression_with_ctx(expr, schema, None)
-    }
-
-    pub(crate) fn build_storage_expression_with_ctx(
-        &self,
-        expr: &Expression,
-        schema: &crate::core::Schema,
-        ctx: Option<&ExecutionContext>,
-    ) -> Result<Box<dyn StorageExpr>> {
-        use crate::parser::ast::InfixOperator;
-
-        match expr {
-            Expression::Infix(infix) => {
-                // OPTIMIZATION: Use pre-computed op_type enum instead of string comparison
-                // This avoids to_uppercase() allocation on every query
-                match infix.op_type {
-                    InfixOperator::And => {
-                        let left =
-                            self.build_storage_expression_with_ctx(&infix.left, schema, ctx)?;
-                        let right =
-                            self.build_storage_expression_with_ctx(&infix.right, schema, ctx)?;
-                        Ok(Box::new(crate::storage::expression::AndExpr::new(vec![
-                            left, right,
-                        ])))
-                    }
-                    InfixOperator::Or => {
-                        let left =
-                            self.build_storage_expression_with_ctx(&infix.left, schema, ctx)?;
-                        let right =
-                            self.build_storage_expression_with_ctx(&infix.right, schema, ctx)?;
-                        Ok(Box::new(crate::storage::expression::OrExpr::new(vec![
-                            left, right,
-                        ])))
-                    }
-                    InfixOperator::Xor => {
-                        // XOR is equivalent to: (A OR B) AND NOT (A AND B)
-                        // Or more simply: (A AND NOT B) OR (NOT A AND B)
-                        let left =
-                            self.build_storage_expression_with_ctx(&infix.left, schema, ctx)?;
-                        let right =
-                            self.build_storage_expression_with_ctx(&infix.right, schema, ctx)?;
-                        // Clone the expressions for the second part
-                        let left2 =
-                            self.build_storage_expression_with_ctx(&infix.left, schema, ctx)?;
-                        let right2 =
-                            self.build_storage_expression_with_ctx(&infix.right, schema, ctx)?;
-                        // Build: (left AND NOT right) OR (NOT left AND right)
-                        let left_and_not_right = crate::storage::expression::AndExpr::new(vec![
-                            left,
-                            Box::new(crate::storage::expression::NotExpr::new(right)),
-                        ]);
-                        let not_left_and_right = crate::storage::expression::AndExpr::new(vec![
-                            Box::new(crate::storage::expression::NotExpr::new(left2)),
-                            right2,
-                        ]);
-                        Ok(Box::new(crate::storage::expression::OrExpr::new(vec![
-                            Box::new(left_and_not_right),
-                            Box::new(not_left_and_right),
-                        ])))
-                    }
-                    InfixOperator::Equal
-                    | InfixOperator::NotEqual
-                    | InfixOperator::LessThan
-                    | InfixOperator::LessEqual
-                    | InfixOperator::GreaterThan
-                    | InfixOperator::GreaterEqual => {
-                        // Simple comparison - use pre-computed operator
-                        let (column, value) =
-                            self.extract_comparison_with_ctx(&infix.left, &infix.right, ctx)?;
-                        let operator = self.infix_op_to_core_op(infix.op_type);
-                        // Coerce value to column type for proper comparison
-                        // (e.g., WHERE float_col = 5 should work with integer literal)
-                        // OPTIMIZATION: Use into_coerce_to_type to avoid clone when types match
-                        let coerced_value = if let Some(col_type) = schema
-                            .column_index_map()
-                            .get(column)
-                            .and_then(|&idx| schema.columns.get(idx).map(|c| c.data_type))
-                        {
-                            value.into_coerce_to_type(col_type)
-                        } else {
-                            value
-                        };
-                        let mut expr = ComparisonExpr::new(column, operator, coerced_value);
-                        expr.prepare_for_schema(schema);
-                        Ok(Box::new(expr))
-                    }
-                    InfixOperator::Like => {
-                        let (column, pattern) =
-                            self.extract_comparison_with_ctx(&infix.left, &infix.right, ctx)?;
-                        let pattern_str = match pattern {
-                            Value::Text(s) => s.to_string(),
-                            _ => {
-                                return Err(Error::Type(
-                                    "LIKE pattern must be a string".to_string(),
-                                ))
-                            }
-                        };
-                        let mut expr =
-                            crate::storage::expression::LikeExpr::new(column, pattern_str);
-                        expr.prepare_for_schema(schema);
-                        Ok(Box::new(expr))
-                    }
-                    InfixOperator::ILike => {
-                        let (column, pattern) =
-                            self.extract_comparison_with_ctx(&infix.left, &infix.right, ctx)?;
-                        let pattern_str = match pattern {
-                            Value::Text(s) => s.to_string(),
-                            _ => {
-                                return Err(Error::Type(
-                                    "ILIKE pattern must be a string".to_string(),
-                                ))
-                            }
-                        };
-                        let mut expr =
-                            crate::storage::expression::LikeExpr::new_ilike(column, pattern_str);
-                        expr.prepare_for_schema(schema);
-                        Ok(Box::new(expr))
-                    }
-                    InfixOperator::NotLike => {
-                        let (column, pattern) =
-                            self.extract_comparison_with_ctx(&infix.left, &infix.right, ctx)?;
-                        let pattern_str = match pattern {
-                            Value::Text(s) => s.to_string(),
-                            _ => {
-                                return Err(Error::Type(
-                                    "NOT LIKE pattern must be a string".to_string(),
-                                ))
-                            }
-                        };
-                        let mut like_expr =
-                            crate::storage::expression::LikeExpr::new(column, pattern_str);
-                        like_expr.prepare_for_schema(schema);
-                        // Wrap in NOT expression
-                        Ok(Box::new(crate::storage::expression::NotExpr::new(
-                            Box::new(like_expr),
-                        )))
-                    }
-                    InfixOperator::NotILike => {
-                        let (column, pattern) =
-                            self.extract_comparison_with_ctx(&infix.left, &infix.right, ctx)?;
-                        let pattern_str = match pattern {
-                            Value::Text(s) => s.to_string(),
-                            _ => {
-                                return Err(Error::Type(
-                                    "NOT ILIKE pattern must be a string".to_string(),
-                                ))
-                            }
-                        };
-                        let mut like_expr =
-                            crate::storage::expression::LikeExpr::new_ilike(column, pattern_str);
-                        like_expr.prepare_for_schema(schema);
-                        // Wrap in NOT expression
-                        Ok(Box::new(crate::storage::expression::NotExpr::new(
-                            Box::new(like_expr),
-                        )))
-                    }
-                    InfixOperator::Is => {
-                        // Handle IS NULL, IS TRUE, IS FALSE
-                        let column = self.extract_column_name(&infix.left)?;
-                        match infix.right.as_ref() {
-                            Expression::NullLiteral(_) => {
-                                // IS NULL
-                                let mut expr =
-                                    crate::storage::expression::NullCheckExpr::is_null(column);
-                                expr.prepare_for_schema(schema);
-                                Ok(Box::new(expr))
-                            }
-                            Expression::BooleanLiteral(b) => {
-                                // IS TRUE or IS FALSE
-                                let mut expr = ComparisonExpr::eq(column, Value::Boolean(b.value));
-                                expr.prepare_for_schema(schema);
-                                Ok(Box::new(expr))
-                            }
-                            _ => Err(Error::NotSupportedMessage(
-                                "IS requires NULL, TRUE, or FALSE".to_string(),
-                            )),
-                        }
-                    }
-                    InfixOperator::IsNot => {
-                        // Handle IS NOT NULL, IS NOT TRUE, IS NOT FALSE
-                        let column = self.extract_column_name(&infix.left)?;
-                        match infix.right.as_ref() {
-                            Expression::NullLiteral(_) => {
-                                // IS NOT NULL
-                                let mut expr =
-                                    crate::storage::expression::NullCheckExpr::is_not_null(column);
-                                expr.prepare_for_schema(schema);
-                                Ok(Box::new(expr))
-                            }
-                            Expression::BooleanLiteral(b) => {
-                                // IS NOT TRUE or IS NOT FALSE
-                                // This is equivalent to (col <> TRUE/FALSE OR col IS NULL)
-                                let mut ne_expr =
-                                    ComparisonExpr::ne(column, Value::Boolean(b.value));
-                                ne_expr.prepare_for_schema(schema);
-                                let mut null_expr =
-                                    crate::storage::expression::NullCheckExpr::is_null(column);
-                                null_expr.prepare_for_schema(schema);
-                                Ok(Box::new(crate::storage::expression::OrExpr::new(vec![
-                                    Box::new(ne_expr),
-                                    Box::new(null_expr),
-                                ])))
-                            }
-                            _ => Err(Error::NotSupportedMessage(
-                                "IS NOT requires NULL, TRUE, or FALSE".to_string(),
-                            )),
-                        }
-                    }
-                    _ => Err(Error::NotSupportedMessage(format!(
-                        "Operator {} in WHERE clause",
-                        infix.operator
-                    ))),
-                }
-            }
-            Expression::Prefix(prefix) => {
-                // OPTIMIZATION: Use pre-computed op_type enum instead of string comparison
-                use crate::parser::ast::PrefixOperator;
-                if prefix.op_type == PrefixOperator::Not {
-                    let inner =
-                        self.build_storage_expression_with_ctx(&prefix.right, schema, ctx)?;
-                    Ok(Box::new(crate::storage::expression::NotExpr::new(inner)))
-                } else {
-                    Err(Error::NotSupportedMessage(format!(
-                        "Prefix operator {} in WHERE clause",
-                        prefix.operator
-                    )))
-                }
-            }
-            Expression::Between(between) => {
-                let column = self.extract_column_name(&between.expr)?;
-                let lower = self.evaluate_literal_with_ctx(&between.lower, ctx)?;
-                let upper = self.evaluate_literal_with_ctx(&between.upper, ctx)?;
-                // Coerce values to column type
-                // OPTIMIZATION: Use into_coerce_to_type to avoid clone when types match
-                let (lower, upper) = if let Some(col_type) = schema
-                    .column_index_map()
-                    .get(column)
-                    .and_then(|&idx| schema.columns.get(idx).map(|c| c.data_type))
-                {
-                    (
-                        lower.into_coerce_to_type(col_type),
-                        upper.into_coerce_to_type(col_type),
-                    )
-                } else {
-                    (lower, upper)
-                };
-                // Use not_between for NOT BETWEEN to handle NULL correctly
-                // (NOT(NULL) = NULL = false in WHERE context)
-                let mut expr = if between.not {
-                    crate::storage::expression::BetweenExpr::not_between(column, lower, upper)
-                } else {
-                    crate::storage::expression::BetweenExpr::new(column, lower, upper)
-                };
-                expr.prepare_for_schema(schema);
-                Ok(Box::new(expr))
-            }
-            Expression::In(in_expr) => {
-                let column = self.extract_column_name(&in_expr.left)?;
-                let values = self.extract_in_list_values_with_ctx(&in_expr.right, ctx)?;
-                // Coerce values to column type
-                // OPTIMIZATION: Use into_coerce_to_type to avoid clone when types match
-                let values = if let Some(col_type) = schema
-                    .column_index_map()
-                    .get(column)
-                    .and_then(|&idx| schema.columns.get(idx).map(|c| c.data_type))
-                {
-                    values
-                        .into_iter()
-                        .map(|v| v.into_coerce_to_type(col_type))
-                        .collect()
-                } else {
-                    values
-                };
-                let mut expr = if in_expr.not {
-                    crate::storage::expression::InListExpr::not_in(column, values)
-                } else {
-                    crate::storage::expression::InListExpr::new(column, values)
-                };
-                expr.prepare_for_schema(schema);
-                Ok(Box::new(expr))
-            }
-            Expression::BooleanLiteral(bool_lit) => {
-                // Handle boolean literals (e.g., from EXISTS subquery evaluation)
-                Ok(Box::new(crate::storage::expression::ConstBoolExpr::new(
-                    bool_lit.value,
-                )))
-            }
-            _ => Err(Error::NotSupportedMessage(
-                "Expression type in WHERE clause not supported".to_string(),
-            )),
-        }
-    }
-
-    /// Try to extract pushable conjuncts from a WHERE clause for partial pushdown.
-    ///
-    /// For AND expressions, if one side can be pushed to storage and the other cannot,
-    /// returns the pushable portion. This enables using indexes for simple predicates
-    /// while filtering complex predicates in memory.
-    ///
-    /// Returns: (Option<StorageExpr>, needs_memory_filter)
-    /// - Some(expr) means we have a storage expression to push down
-    /// - needs_memory_filter=true means there are predicates that couldn't be pushed
-    ///
-    /// Example: `WHERE indexed_col = 5 AND complex_func(x) > 0`
-    /// Returns: (Some(indexed_col = 5), true) - push indexed_col, memory filter the rest
-    pub(crate) fn try_extract_pushable_conjuncts(
-        &self,
-        expr: &Expression,
-        schema: &crate::core::Schema,
-        ctx: Option<&ExecutionContext>,
-    ) -> (Option<Box<dyn StorageExpr>>, bool) {
-        use crate::parser::ast::InfixOperator;
-
-        match expr {
-            Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
-                // For AND: try both sides, combine what we can push
-                let (left_pushable, left_needs_mem) =
-                    self.try_extract_pushable_conjuncts(&infix.left, schema, ctx);
-                let (right_pushable, right_needs_mem) =
-                    self.try_extract_pushable_conjuncts(&infix.right, schema, ctx);
-
-                let needs_memory_filter = left_needs_mem || right_needs_mem;
-
-                match (left_pushable, right_pushable) {
-                    (Some(left), Some(right)) => {
-                        // Both sides pushable - combine with AND
-                        (
-                            Some(Box::new(crate::storage::expression::AndExpr::new(vec![
-                                left, right,
-                            ]))),
-                            needs_memory_filter,
-                        )
-                    }
-                    (Some(expr), None) | (None, Some(expr)) => {
-                        // Only one side pushable - push that side, memory filter the rest
-                        (Some(expr), true)
-                    }
-                    (None, None) => {
-                        // Neither side pushable - need full memory filter
-                        (None, true)
-                    }
-                }
-            }
-            Expression::Infix(infix) if infix.op_type == InfixOperator::Or => {
-                // For OR: can only push if BOTH sides are fully pushable
-                // (partial pushdown of OR would change semantics)
-                match self.build_storage_expression_with_ctx(expr, schema, ctx) {
-                    Ok(storage_expr) => (Some(storage_expr), false),
-                    Err(_) => (None, true),
-                }
-            }
-            _ => {
-                // Other expressions: try to convert entirely
-                match self.build_storage_expression_with_ctx(expr, schema, ctx) {
-                    Ok(storage_expr) => (Some(storage_expr), false),
-                    Err(_) => (None, true),
-                }
-            }
-        }
-    }
-
-    /// Extract values from an IN list expression
-    #[allow(dead_code)]
-    fn extract_in_list_values(&self, expr: &Expression) -> Result<Vec<Value>> {
-        match expr {
-            Expression::List(list) => list
-                .elements
-                .iter()
-                .map(|e| self.evaluate_literal(e))
-                .collect(),
-            Expression::ExpressionList(list) => list
-                .expressions
-                .iter()
-                .map(|e| self.evaluate_literal(e))
-                .collect(),
-            _ => {
-                // Single value
-                Ok(vec![self.evaluate_literal(expr)?])
-            }
-        }
-    }
-
-    /// Extract column name and value from comparison operands
-    #[allow(dead_code)]
-    fn extract_comparison<'a>(
-        &self,
-        left: &'a Expression,
-        right: &'a Expression,
-    ) -> Result<(&'a str, Value)> {
-        // Try left as column, right as value
-        if let Ok(column) = self.extract_column_name(left) {
-            if let Ok(value) = self.evaluate_literal(right) {
-                return Ok((column, value));
-            }
-        }
-
-        // Try right as column, left as value
-        if let Ok(column) = self.extract_column_name(right) {
-            if let Ok(value) = self.evaluate_literal(left) {
-                return Ok((column, value));
-            }
-        }
-
-        Err(Error::InvalidArgumentMessage(
-            "Comparison must have a column and a literal value".to_string(),
-        ))
-    }
-
-    /// Extract column name from an expression
-    /// OPTIMIZATION: Return reference to pre-computed lowercase value to avoid allocation
-    fn extract_column_name<'a>(&self, expr: &'a Expression) -> Result<&'a str> {
-        match expr {
-            Expression::Identifier(id) => Ok(&id.value_lower),
-            Expression::QualifiedIdentifier(qid) => Ok(&qid.name.value_lower),
-            _ => Err(Error::InvalidArgumentMessage(
-                "Expected column reference".to_string(),
-            )),
-        }
-    }
-
-    /// Evaluate a literal expression to a Value
-    #[allow(dead_code)]
-    fn evaluate_literal(&self, expr: &Expression) -> Result<Value> {
-        self.evaluate_literal_with_ctx(expr, None)
-    }
-
-    /// Evaluate a literal expression to a Value, with context for parameter binding
-    fn evaluate_literal_with_ctx(
-        &self,
-        expr: &Expression,
-        ctx: Option<&ExecutionContext>,
-    ) -> Result<Value> {
-        match expr {
-            Expression::IntegerLiteral(lit) => Ok(Value::Integer(lit.value)),
-            Expression::FloatLiteral(lit) => Ok(Value::Float(lit.value)),
-            Expression::StringLiteral(lit) => {
-                // Handle typed literals (TIMESTAMP '...', DATE '...', TIME '...')
-                if let Some(ref type_hint) = lit.type_hint {
-                    match type_hint.to_uppercase().as_str() {
-                        "TIMESTAMP" => {
-                            crate::core::value::parse_timestamp(&lit.value).map(Value::Timestamp)
-                        }
-                        "DATE" => {
-                            // Parse date and convert to timestamp at midnight
-                            crate::core::value::parse_timestamp(&lit.value).map(Value::Timestamp)
-                        }
-                        "TIME" => {
-                            // Parse time and convert to timestamp
-                            crate::core::value::parse_timestamp(&lit.value).map(Value::Timestamp)
-                        }
-                        _ => Ok(Value::Text(std::sync::Arc::from(lit.value.as_str()))),
-                    }
-                } else {
-                    Ok(Value::Text(std::sync::Arc::from(lit.value.as_str())))
-                }
-            }
-            Expression::BooleanLiteral(lit) => Ok(Value::Boolean(lit.value)),
-            Expression::NullLiteral(_) => Ok(Value::null_unknown()),
-            Expression::Parameter(param) => {
-                if let Some(ctx) = ctx {
-                    // Check if it's a named parameter (starts with :)
-                    if param.name.starts_with(':') {
-                        let name = &param.name[1..];
-                        if let Some(value) = ctx.get_named_param(name) {
-                            Ok(value.clone())
-                        } else {
-                            Err(Error::InvalidArgumentMessage(format!(
-                                "Named parameter '{}' not found",
-                                param.name
-                            )))
-                        }
-                    } else {
-                        // Positional parameter
-                        let params = ctx.params();
-                        if param.index > 0 && param.index <= params.len() {
-                            Ok(params[param.index - 1].clone())
-                        } else {
-                            Err(Error::InvalidArgumentMessage(format!(
-                                "Parameter index {} out of range (have {} parameters)",
-                                param.index,
-                                params.len()
-                            )))
-                        }
-                    }
-                } else {
-                    Err(Error::InvalidArgumentMessage(
-                        "Parameters require execution context".to_string(),
-                    ))
-                }
-            }
-            // Handle identifier references from outer query context (for correlated subqueries)
-            Expression::Identifier(id) => {
-                if let Some(ctx) = ctx {
-                    if let Some(outer_row) = ctx.outer_row() {
-                        let name = id.value.to_lowercase();
-                        if let Some(value) = outer_row.get(&name) {
-                            return Ok(value.clone());
-                        }
-                    }
-                }
-                Err(Error::InvalidArgumentMessage(
-                    "Expected literal value".to_string(),
-                ))
-            }
-            // Handle qualified identifier references from outer query context (e.g., c.id)
-            Expression::QualifiedIdentifier(qid) => {
-                if let Some(ctx) = ctx {
-                    if let Some(outer_row) = ctx.outer_row() {
-                        // Try qualified name first (e.g., "c.id")
-                        let qualified_name = format!(
-                            "{}.{}",
-                            qid.qualifier.value.to_lowercase(),
-                            qid.name.value.to_lowercase()
-                        );
-                        if let Some(value) = outer_row.get(&qualified_name) {
-                            return Ok(value.clone());
-                        }
-                        // Try just the column name (e.g., "id")
-                        let name = qid.name.value.to_lowercase();
-                        if let Some(value) = outer_row.get(&name) {
-                            return Ok(value.clone());
-                        }
-                    }
-                }
-                Err(Error::InvalidArgumentMessage(
-                    "Expected literal value".to_string(),
-                ))
-            }
-            // Handle arithmetic expressions (e.g., 5 + 10, 100 * 2)
-            // These are constant expressions that can be evaluated without row context
-            // BUT only if they don't contain column references
-            Expression::Infix(_) | Expression::Prefix(_) | Expression::FunctionCall(_) => {
-                // Check if the expression contains any column references
-                // If so, we can't evaluate it as a constant (needs row context)
-                if Self::contains_column_reference(expr) {
-                    return Err(Error::InvalidArgumentMessage(
-                        "Expression contains column references and cannot be evaluated as a constant".to_string(),
-                    ));
-                }
-                // Use the evaluator to evaluate constant expressions
-                let evaluator = Evaluator::new(&self.function_registry);
-                evaluator.evaluate(expr)
-            }
-            _ => Err(Error::InvalidArgumentMessage(
-                "Expected literal value".to_string(),
-            )),
-        }
-    }
-
-    /// Extract values from an IN list expression with context
-    fn extract_in_list_values_with_ctx(
-        &self,
-        expr: &Expression,
-        ctx: Option<&ExecutionContext>,
-    ) -> Result<Vec<Value>> {
-        match expr {
-            Expression::List(list) => list
-                .elements
-                .iter()
-                .map(|e| self.evaluate_literal_with_ctx(e, ctx))
-                .collect(),
-            Expression::ExpressionList(list) => list
-                .expressions
-                .iter()
-                .map(|e| self.evaluate_literal_with_ctx(e, ctx))
-                .collect(),
-            _ => {
-                // Single value
-                Ok(vec![self.evaluate_literal_with_ctx(expr, ctx)?])
-            }
-        }
-    }
-
-    /// Extract column name and value from comparison operands with context
-    /// OPTIMIZATION: Returns &str reference to avoid String allocation
-    fn extract_comparison_with_ctx<'a>(
-        &self,
-        left: &'a Expression,
-        right: &'a Expression,
-        ctx: Option<&ExecutionContext>,
-    ) -> Result<(&'a str, Value)> {
-        // Try left as column, right as value
-        if let Ok(column) = self.extract_column_name(left) {
-            if let Ok(value) = self.evaluate_literal_with_ctx(right, ctx) {
-                return Ok((column, value));
-            }
-        }
-
-        // Try right as column, left as value
-        if let Ok(column) = self.extract_column_name(right) {
-            if let Ok(value) = self.evaluate_literal_with_ctx(left, ctx) {
-                return Ok((column, value));
-            }
-        }
-
-        Err(Error::InvalidArgumentMessage(
-            "Comparison must have a column and a literal value".to_string(),
-        ))
-    }
-
-    /// Convert InfixOperator enum to core Operator enum (no string allocation)
-    #[inline]
-    fn infix_op_to_core_op(&self, op: crate::parser::ast::InfixOperator) -> crate::core::Operator {
-        use crate::parser::ast::InfixOperator;
-        match op {
-            InfixOperator::Equal => crate::core::Operator::Eq,
-            InfixOperator::NotEqual => crate::core::Operator::Ne,
-            InfixOperator::LessThan => crate::core::Operator::Lt,
-            InfixOperator::GreaterThan => crate::core::Operator::Gt,
-            InfixOperator::LessEqual => crate::core::Operator::Lte,
-            InfixOperator::GreaterEqual => crate::core::Operator::Gte,
-            // These shouldn't be called but map to Eq as fallback
-            _ => crate::core::Operator::Eq,
-        }
-    }
-
-    /// Check if an expression contains any column references (Identifier or QualifiedIdentifier)
-    /// This is used to determine if an expression can be evaluated as a constant.
-    fn contains_column_reference(expr: &Expression) -> bool {
-        match expr {
-            Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => true,
-            Expression::Infix(infix) => {
-                Self::contains_column_reference(&infix.left)
-                    || Self::contains_column_reference(&infix.right)
-            }
-            Expression::Prefix(prefix) => Self::contains_column_reference(&prefix.right),
-            Expression::FunctionCall(func) => {
-                func.arguments.iter().any(Self::contains_column_reference)
-            }
-            Expression::Case(case) => {
-                case.value
-                    .as_ref()
-                    .is_some_and(|e| Self::contains_column_reference(e))
-                    || case.when_clauses.iter().any(|w| {
-                        Self::contains_column_reference(&w.condition)
-                            || Self::contains_column_reference(&w.then_result)
-                    })
-                    || case
-                        .else_value
-                        .as_ref()
-                        .is_some_and(|e| Self::contains_column_reference(e))
-            }
-            Expression::Cast(cast) => Self::contains_column_reference(&cast.expr),
-            Expression::List(list) => list.elements.iter().any(Self::contains_column_reference),
-            Expression::ExpressionList(list) => {
-                list.expressions.iter().any(Self::contains_column_reference)
-            }
-            Expression::In(in_expr) => {
-                Self::contains_column_reference(&in_expr.left)
-                    || Self::contains_column_reference(&in_expr.right)
-            }
-            Expression::Between(between) => {
-                Self::contains_column_reference(&between.expr)
-                    || Self::contains_column_reference(&between.lower)
-                    || Self::contains_column_reference(&between.upper)
-            }
-            Expression::Aliased(aliased) => Self::contains_column_reference(&aliased.expression),
-            // Literals and other non-column expressions
-            _ => false,
-        }
-    }
-
     /// Apply ON DUPLICATE KEY UPDATE to an existing row
     fn apply_on_duplicate_update(
         &self,
@@ -1813,8 +1145,7 @@ impl Executor {
         let column_names: Vec<String> = schema.column_names_owned().to_vec();
 
         // Create evaluator once and reuse for all rows
-        let mut evaluator = Evaluator::new(function_registry);
-        evaluator = evaluator.with_context(&ctx_clone);
+        let mut evaluator = CompiledEvaluator::new(function_registry).with_context(&ctx_clone);
         evaluator.init_columns(&column_names);
 
         // Create a setter function that applies the ON DUPLICATE KEY UPDATE
@@ -1918,7 +1249,7 @@ impl Executor {
         // Extract the expression from the SELECT statement
         if let crate::parser::ast::Statement::Select(select) = &stmts[0] {
             if let Some(expr) = select.columns.first() {
-                let evaluator = Evaluator::new(&self.function_registry);
+                let mut evaluator = CompiledEvaluator::new(&self.function_registry);
                 let value = evaluator.evaluate(expr)?;
                 return Ok(value.into_coerce_to_type(target_type));
             }
@@ -1959,7 +1290,9 @@ impl Executor {
                 // Create evaluator and evaluate with row context
                 let columns = vec![col_name.to_string()];
                 let row = crate::core::Row::from_values(vec![col_value.clone()]);
-                let evaluator = Evaluator::new(&self.function_registry).with_row(row, &columns);
+                let mut evaluator = CompiledEvaluator::new(&self.function_registry);
+                evaluator.init_columns(&columns);
+                evaluator.set_row_array(&row);
 
                 let result = evaluator.evaluate(expr)?;
 
@@ -2051,7 +1384,7 @@ impl Executor {
         }
 
         // Create evaluator for RETURNING expressions
-        let mut evaluator = Evaluator::new(&self.function_registry).with_context(ctx);
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
         evaluator.init_columns(column_names);
 
         // Evaluate RETURNING expressions for each row

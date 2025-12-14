@@ -85,7 +85,8 @@ use crate::core::Row;
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::{Expression, InfixOperator};
 
-use super::evaluator::Evaluator;
+use super::expression::CompiledEvaluator;
+use super::utils::{expressions_equivalent, extract_and_conditions, extract_column_name};
 
 /// Maximum number of cached query results per table+column combination.
 ///
@@ -794,7 +795,7 @@ impl SemanticCache {
         columns: &[String],
         function_registry: &FunctionRegistry,
     ) -> Vec<Row> {
-        let mut evaluator = Evaluator::new(function_registry);
+        let mut evaluator = CompiledEvaluator::new(function_registry);
         evaluator.init_columns(columns);
 
         rows.into_iter()
@@ -966,40 +967,6 @@ fn check_predicate_subsumption(cached: &Expression, new: &Expression) -> Subsump
     SubsumptionResult::NoSubsumption
 }
 
-/// Check if two expressions are structurally equivalent
-fn expressions_equivalent(a: &Expression, b: &Expression) -> bool {
-    match (a, b) {
-        (Expression::Identifier(ia), Expression::Identifier(ib)) => {
-            ia.value_lower == ib.value_lower
-        }
-        (Expression::QualifiedIdentifier(qa), Expression::QualifiedIdentifier(qb)) => {
-            qa.qualifier.value_lower == qb.qualifier.value_lower
-                && qa.name.value_lower == qb.name.value_lower
-        }
-        (Expression::IntegerLiteral(la), Expression::IntegerLiteral(lb)) => la.value == lb.value,
-        (Expression::FloatLiteral(la), Expression::FloatLiteral(lb)) => {
-            (la.value - lb.value).abs() < f64::EPSILON
-        }
-        (Expression::StringLiteral(la), Expression::StringLiteral(lb)) => la.value == lb.value,
-        (Expression::BooleanLiteral(la), Expression::BooleanLiteral(lb)) => la.value == lb.value,
-        (Expression::NullLiteral(_), Expression::NullLiteral(_)) => true,
-        (Expression::Infix(ia), Expression::Infix(ib)) => {
-            ia.op_type == ib.op_type
-                && expressions_equivalent(&ia.left, &ib.left)
-                && expressions_equivalent(&ia.right, &ib.right)
-        }
-        (Expression::Prefix(pa), Expression::Prefix(pb)) => {
-            pa.operator == pb.operator && expressions_equivalent(&pa.right, &pb.right)
-        }
-        (Expression::Between(ba), Expression::Between(bb)) => {
-            expressions_equivalent(&ba.expr, &bb.expr)
-                && expressions_equivalent(&ba.lower, &bb.lower)
-                && expressions_equivalent(&ba.upper, &bb.upper)
-        }
-        _ => false,
-    }
-}
-
 /// Check for numeric range subsumption
 ///
 /// Examples:
@@ -1147,25 +1114,6 @@ fn check_and_subsumption(cached: &Expression, new: &Expression) -> Option<Subsum
     None
 }
 
-/// Extract all AND-ed conditions from an expression
-fn extract_and_conditions(expr: &Expression) -> Vec<&Expression> {
-    let mut conditions = Vec::new();
-
-    fn collect<'a>(expr: &'a Expression, out: &mut Vec<&'a Expression>) {
-        if let Expression::Infix(infix) = expr {
-            if matches!(infix.op_type, InfixOperator::And) {
-                collect(&infix.left, out);
-                collect(&infix.right, out);
-                return;
-            }
-        }
-        out.push(expr);
-    }
-
-    collect(expr, &mut conditions);
-    conditions
-}
-
 /// Check for IN list subsumption
 ///
 /// If new IN list is subset of cached IN list, new is subsumed
@@ -1260,15 +1208,6 @@ fn extract_in_values(expr: &Expression) -> Option<Vec<NumericValue>> {
 /// Compare two NumericValues for equality
 fn values_equal(a: &NumericValue, b: &NumericValue) -> bool {
     a == b
-}
-
-/// Extract column name from an expression
-fn extract_column_name(expr: &Expression) -> Option<String> {
-    match expr {
-        Expression::Identifier(ident) => Some(ident.value.clone()),
-        Expression::QualifiedIdentifier(qi) => Some(qi.name.value.clone()),
-        _ => None,
-    }
 }
 
 /// Extract numeric value from a literal expression

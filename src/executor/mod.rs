@@ -45,7 +45,7 @@
 //! - Various result wrappers for query pipeline
 
 pub mod context;
-pub mod evaluator;
+pub mod expression;
 pub mod parallel;
 pub mod pattern_cache;
 pub mod planner;
@@ -58,8 +58,14 @@ mod aggregation;
 mod cte;
 mod ddl;
 mod dml;
+mod explain;
+mod join;
+pub mod pushdown;
 mod query;
+mod set_ops;
+mod show;
 mod subquery;
+pub mod utils;
 mod window;
 
 use rustc_hash::FxHashMap;
@@ -72,8 +78,11 @@ use crate::parser::Parser;
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 
-pub use context::ExecutionContext;
-pub use evaluator::Evaluator;
+pub use context::{ExecutionContext, TimeoutGuard};
+pub use expression::{
+    CompileContext, CompileError, CompiledEvaluator, ExecuteContext, ExprCompiler, ExprVM,
+    Program as ExprProgram,
+};
 pub use parallel::{
     hash_row_by_keys,
     parallel_hash_build,
