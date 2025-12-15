@@ -1607,7 +1607,7 @@ impl Executor {
         info: &SemiJoinInfo,
         ctx: &ExecutionContext,
     ) -> Result<std::collections::HashSet<crate::core::Value>> {
-        // Build SELECT DISTINCT inner_column FROM inner_table WHERE non_correlated_predicates
+        // Build SELECT inner_column FROM inner_table WHERE non_correlated_predicates
         let inner_col_expr = Expression::Identifier(Identifier {
             token: dummy_token(&info.inner_column, TokenType::Identifier),
             value: info.inner_column.clone(),
@@ -1631,7 +1631,7 @@ impl Executor {
 
         let select_stmt = SelectStatement {
             token: dummy_token("SELECT", TokenType::Keyword),
-            distinct: false, // No DISTINCT - we collect into HashSet which deduplicates
+            distinct: false, // No DISTINCT - HashSet deduplicates automatically
             columns: vec![inner_col_expr],
             with: None,
             table_expr: Some(Box::new(table_source)),
@@ -1652,15 +1652,14 @@ impl Executor {
         let subquery_ctx = ctx.with_incremented_query_depth();
         let mut result = self.execute_select(&select_stmt, &subquery_ctx)?;
 
-        // Collect values into HashSet (deduplicates automatically)
-        let mut hash_set = std::collections::HashSet::new();
+        // Collect values into HashSet - deduplicates automatically
+        // Pre-allocate with reasonable capacity to avoid resizing
+        let mut hash_set = std::collections::HashSet::with_capacity(1024);
         while result.next() {
             let row = result.row();
-            if !row.is_empty() {
-                if let Some(value) = row.get(0) {
-                    if !value.is_null() {
-                        hash_set.insert(value.clone());
-                    }
+            if let Some(value) = row.get(0) {
+                if !value.is_null() {
+                    hash_set.insert(value.clone());
                 }
             }
         }
@@ -1730,6 +1729,7 @@ impl Executor {
         match expr {
             Expression::Exists(exists) => {
                 if let Some(info) = Self::try_extract_semi_join_info(exists, false, outer_tables) {
+                    // Semi-join optimization: execute inner query once, collect into hash set
                     let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
                     return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
                 }

@@ -1846,7 +1846,7 @@ impl Executor {
 
         let (left_rows, left_columns, right_rows, right_columns) =
             if let Some((limit_n, left_key_col, right_key_col)) = semijoin_limit {
-                // Optimized path: semi-join reduction
+                // Semi-join reduction for LEFT JOIN + GROUP BY
                 // Step 1: Execute and materialize left side with limit
                 let (left_result, left_cols) = self.execute_table_expression_with_filter(
                     &join_source.left,

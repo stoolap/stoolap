@@ -38,6 +38,7 @@ use crate::core::{Error, Result, Row, Value};
 
 /// Type alias for partition keys - stack-allocated for common case (up to 4 columns)
 type PartitionKey = SmallVec<[Value; 4]>;
+
 use crate::functions::WindowFunction;
 use crate::parser::ast::*;
 use crate::storage::traits::QueryResult;
@@ -796,12 +797,26 @@ impl Executor {
 
         // If there's no partitioning, treat all rows as one partition
         if wf_info.partition_by.is_empty() {
+            // Precompute ORDER BY values once
+            let precomputed_order_by = if !wf_info.order_by.is_empty() {
+                Some(self.precompute_order_by_values(
+                    &wf_info.order_by,
+                    rows,
+                    columns,
+                    col_index_map,
+                    ctx,
+                ))
+            } else {
+                None
+            };
+
             let row_indices: Vec<usize> = (0..rows.len()).collect();
             let (partition_results, sorted_indices) = self.compute_window_for_partition(
                 &*window_func,
                 wf_info,
                 rows,
                 row_indices,
+                precomputed_order_by.as_ref(),
                 columns,
                 col_index_map,
                 ctx,
@@ -821,6 +836,21 @@ impl Executor {
             }
             return Ok(results);
         }
+
+        // OPTIMIZATION: Precompute ORDER BY values ONCE for all rows (not per-partition!)
+        // This is critical - precompute_order_by_values was being called for ALL rows
+        // inside each partition, causing O(n × p) work instead of O(n).
+        let precomputed_order_by = if !wf_info.order_by.is_empty() {
+            Some(self.precompute_order_by_values(
+                &wf_info.order_by,
+                rows,
+                columns,
+                col_index_map,
+                ctx,
+            ))
+        } else {
+            None
+        };
 
         // Group rows by partition key
         // OPTIMIZATION: Use SmallVec for partition keys to avoid heap allocation
@@ -877,6 +907,7 @@ impl Executor {
                         wf_info,
                         rows,
                         row_indices.clone(),
+                        precomputed_order_by.as_ref(),
                         columns,
                         col_index_map,
                         ctx,
@@ -901,6 +932,7 @@ impl Executor {
                     wf_info,
                     rows,
                     row_indices,
+                    precomputed_order_by.as_ref(),
                     columns,
                     col_index_map,
                     ctx,
@@ -918,6 +950,7 @@ impl Executor {
 
     /// Compute window function for a single partition
     /// Returns (results in sorted order, sorted row indices) to avoid re-sorting in the caller
+    /// precomputed_order_by: Optional precomputed ORDER BY values for ALL rows (avoids recomputation)
     #[allow(clippy::too_many_arguments)]
     fn compute_window_for_partition(
         &self,
@@ -925,30 +958,25 @@ impl Executor {
         wf_info: &WindowFunctionInfo,
         all_rows: &[Row],
         mut row_indices: Vec<usize>,
+        precomputed_order_by: Option<&Vec<Vec<(Value, bool)>>>,
         columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
         ctx: &ExecutionContext,
     ) -> Result<(Vec<Value>, Vec<usize>)> {
-        // Precompute ORDER BY values (supports complex expressions like COALESCE(SUM(val), 0))
-        // We need these for both sorting and for ranking functions
-        let order_by_values = if !wf_info.order_by.is_empty() {
-            self.precompute_order_by_values(
-                &wf_info.order_by,
-                all_rows,
-                columns,
-                col_index_map,
-                ctx,
-            )
-        } else {
-            vec![]
-        };
+        // Suppress unused variable warnings - these are needed for compute_lead_lag, compute_ntile, etc.
+        let _ = columns;
+
+        // Use precomputed ORDER BY values if available (avoids O(n × p) recomputation)
+        // The precomputed values are indexed by row index in the original rows array
+        let order_by_values: &[Vec<(Value, bool)>] =
+            precomputed_order_by.map(|v| v.as_slice()).unwrap_or(&[]);
 
         // Sort partition by ORDER BY if specified
-        if !wf_info.order_by.is_empty() {
-            Self::sort_by_order_values(&mut row_indices, &order_by_values);
+        if !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+            Self::sort_by_order_values(&mut row_indices, order_by_values);
         }
 
-        // OPTIMIZATION: Pre-compute column indices outside the loop to avoid to_lowercase() per row
+        // OPTIMIZATION: Pre-compute column index for function argument
         let arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() {
             self.extract_column_from_arg(&wf_info.arguments[0])
                 .and_then(|col_name| col_index_map.get(&col_name.to_lowercase()).copied())
