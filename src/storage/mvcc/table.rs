@@ -18,7 +18,6 @@
 //!
 
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::common::Int64Set;
@@ -2211,7 +2210,7 @@ impl Table for MVCCTable {
         &self,
         columns: &[&str],
         expr: Option<&dyn Expression>,
-        aliases: &HashMap<String, String>,
+        aliases: &FxHashMap<String, String>,
     ) -> Result<Box<dyn QueryResult>> {
         // Get base result
         let result = self.select(columns, expr)?;

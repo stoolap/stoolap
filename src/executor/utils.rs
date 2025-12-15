@@ -24,7 +24,7 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::core::{DataType, Operator, Row, Value};
 use crate::parser::ast::{
@@ -134,9 +134,11 @@ pub fn combine_rows_with_nulls(
 // ============================================================================
 
 /// Hash multiple key columns into a single hash value.
+/// Used heavily in hash joins - called on every row during build and probe phases.
+/// Uses FxHasher which is optimized for trusted keys in embedded database context.
 #[inline]
 pub fn hash_composite_key(row: &Row, key_indices: &[usize]) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = FxHasher::default();
 
     for &idx in key_indices {
         if let Some(value) = row.get(idx) {
@@ -281,9 +283,10 @@ pub fn verify_composite_key_equality(
 
 /// Hash all values in a row into a single hash value.
 /// Used for DISTINCT operations and set operations (UNION, INTERSECT, EXCEPT).
+/// Uses FxHasher which is optimized for trusted keys in embedded database context.
 #[inline]
 pub fn hash_row(row: &Row) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = FxHasher::default();
     for value in row.iter() {
         value.hash(&mut hasher);
     }

@@ -34,7 +34,7 @@
 //! - ORDER BY optimization - use BTree
 //!
 //! ## Implementation:
-//! Uses `ahash` (~30 GB/s) for fast hashing, avoiding O(strlen) comparisons
+//! Uses `ahash` for fast hashing, avoiding O(strlen) comparisons
 //! that would occur with each B-tree node comparison.
 //!
 //! ## Known Limitations:
@@ -94,7 +94,7 @@ fn hash_values(values: &[Value]) -> u64 {
 ///
 /// ## Key features:
 /// - O(1) exact lookups via hash
-/// - Uses ahash (~30 GB/s) - 15x faster than SipHash
+/// - Uses ahash - faster than SipHash
 /// - SmallVec optimization for single-match case (common for unique indexes)
 /// - Thread-safe with RwLock
 ///

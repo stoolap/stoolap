@@ -17,7 +17,7 @@
 //! Provides the main MVCC storage engine implementation.
 //!
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -36,7 +36,7 @@ use crate::storage::mvcc::{
 use crate::storage::traits::{Engine, Index, Table, Transaction};
 
 /// Type alias for the transaction version store map
-type TxnVersionStoreMap = HashMap<(i64, String), Arc<RwLock<TransactionVersionStore>>>;
+type TxnVersionStoreMap = FxHashMap<(i64, String), Arc<RwLock<TransactionVersionStore>>>;
 
 // ============================================================================
 // Binary Snapshot Metadata Functions
@@ -257,9 +257,9 @@ pub struct MVCCEngine {
     /// Configuration
     config: RwLock<Config>,
     /// Table schemas (Arc-wrapped for safe sharing with transactions)
-    schemas: Arc<RwLock<HashMap<String, Schema>>>,
+    schemas: Arc<RwLock<FxHashMap<String, Schema>>>,
     /// Version stores for each table (Arc-wrapped for safe sharing with transactions)
-    version_stores: Arc<RwLock<HashMap<String, Arc<VersionStore>>>>,
+    version_stores: Arc<RwLock<FxHashMap<String, Arc<VersionStore>>>>,
     /// Transaction registry
     registry: Arc<TransactionRegistry>,
     /// Whether the engine is open
@@ -268,7 +268,7 @@ pub struct MVCCEngine {
     /// (Arc-wrapped for safe sharing with transactions)
     txn_version_stores: Arc<RwLock<TxnVersionStoreMap>>,
     /// View definitions (Arc for cheap cloning on lookup)
-    views: RwLock<HashMap<String, Arc<ViewDefinition>>>,
+    views: RwLock<FxHashMap<String, Arc<ViewDefinition>>>,
     /// Persistence manager for WAL and snapshot operations (Arc-wrapped for safe sharing)
     persistence: Arc<Option<PersistenceManager>>,
     /// Flag to indicate we're loading from disk to avoid triggering redundant WAL writes
@@ -303,12 +303,12 @@ impl MVCCEngine {
                 path
             },
             config: RwLock::new(config),
-            schemas: Arc::new(RwLock::new(HashMap::new())),
-            version_stores: Arc::new(RwLock::new(HashMap::new())),
+            schemas: Arc::new(RwLock::new(FxHashMap::default())),
+            version_stores: Arc::new(RwLock::new(FxHashMap::default())),
             registry: Arc::new(TransactionRegistry::new()),
             open: AtomicBool::new(false),
-            txn_version_stores: Arc::new(RwLock::new(HashMap::new())),
-            views: RwLock::new(HashMap::new()),
+            txn_version_stores: Arc::new(RwLock::new(FxHashMap::default())),
+            views: RwLock::new(FxHashMap::default()),
             persistence: Arc::new(persistence),
             loading_from_disk: Arc::new(AtomicBool::new(false)),
             file_lock: Mutex::new(None),
@@ -1752,13 +1752,13 @@ impl Engine for MVCCEngine {
             .ok_or(Error::TableNotFound)
     }
 
-    fn list_table_indexes(&self, table_name: &str) -> Result<HashMap<String, String>> {
+    fn list_table_indexes(&self, table_name: &str) -> Result<FxHashMap<String, String>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
 
         let store = self.get_version_store(table_name)?;
-        let mut result = HashMap::new();
+        let mut result = FxHashMap::default();
         for index_name in store.list_indexes() {
             result.insert(index_name, "BTree".to_string());
         }
@@ -2393,9 +2393,9 @@ impl Drop for CleanupHandle {
 /// from transactions without raw pointers.
 struct EngineOperations {
     /// Shared reference to schemas
-    schemas: Arc<RwLock<HashMap<String, Schema>>>,
+    schemas: Arc<RwLock<FxHashMap<String, Schema>>>,
     /// Shared reference to version stores
-    version_stores: Arc<RwLock<HashMap<String, Arc<VersionStore>>>>,
+    version_stores: Arc<RwLock<FxHashMap<String, Arc<VersionStore>>>>,
     /// Shared reference to registry
     registry: Arc<TransactionRegistry>,
     /// Shared reference to transaction version stores cache
@@ -2420,11 +2420,11 @@ impl EngineOperations {
         }
     }
 
-    fn schemas(&self) -> &RwLock<HashMap<String, Schema>> {
+    fn schemas(&self) -> &RwLock<FxHashMap<String, Schema>> {
         &self.schemas
     }
 
-    fn version_stores(&self) -> &RwLock<HashMap<String, Arc<VersionStore>>> {
+    fn version_stores(&self) -> &RwLock<FxHashMap<String, Arc<VersionStore>>> {
         &self.version_stores
     }
 

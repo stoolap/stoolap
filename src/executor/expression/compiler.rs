@@ -26,6 +26,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use ahash::AHashSet;
 use rustc_hash::FxHashMap;
 
 use super::ops::{CompareOp, CompiledPattern, Op};
@@ -1000,7 +1001,7 @@ impl<'a> ExprCompiler<'a> {
 
         // Single-value IN expression
         // Build the set of values at compile time if possible
-        let mut values = HashSet::new();
+        let mut values = AHashSet::default();
         let mut has_null = false;
         let mut all_constant = true;
 

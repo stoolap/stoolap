@@ -22,6 +22,7 @@
 
 use std::hash::Hasher;
 
+use ahash::AHasher;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
@@ -142,9 +143,12 @@ enum ColumnSource {
 
 /// Compute a hash for a group key (slice of Values)
 /// This avoids allocating Vec<Value> for each row
+/// OPTIMIZATION: Use AHasher for optimal hashing of Value types (strings, floats, JSON, etc.)
+/// Empirically tested to perform better than FxHasher for GROUP BY workloads
+/// Called on every row in GROUP BY, so performance is critical
 #[inline]
 fn hash_group_key(values: &[Value]) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = AHasher::default();
     for v in values {
         hash_value_into(v, &mut hasher);
     }
@@ -1304,7 +1308,7 @@ impl Executor {
         let mut group_items = Vec::new();
 
         // Build a map of aliases to their expressions from SELECT clause
-        let alias_map: rustc_hash::FxHashMap<String, Expression> = stmt
+        let alias_map: FxHashMap<String, Expression> = stmt
             .columns
             .iter()
             .filter_map(|col| {
@@ -2114,47 +2118,62 @@ impl Executor {
         // Pre-allocate hash map with estimated capacity to reduce resizing.
         // Estimate: for high-cardinality groupings, assume ~1/3 of rows are unique groups.
         // For low-cardinality, this over-allocates but that's fine.
+        // CRITICAL: Use Vec to handle hash collisions (multiple groups per hash)
         let estimated_groups = (rows.len() / 3).max(64);
-        let mut groups: FxHashMap<u64, FastGroupState> =
+        let mut groups: FxHashMap<u64, Vec<FastGroupState>> =
             FxHashMap::with_capacity_and_hasher(estimated_groups, Default::default());
         let num_aggs = simple_aggs.len();
 
         // Track for early termination optimization
         let group_limit = limit.unwrap_or(usize::MAX);
         let has_limit = limit.is_some();
+        let mut current_group_count: usize = 0; // Track actual group count for O(1) LIMIT checks
 
         for row in rows {
-            // Hash the group key
-            let mut hasher = rustc_hash::FxHasher::default();
-            for &idx in &group_by_indices {
-                if let Some(value) = row.get(idx) {
-                    hash_value_into(value, &mut hasher);
-                } else {
-                    hash_value_into(&Value::null_unknown(), &mut hasher);
-                }
+            // Build key values for this row (needed for collision detection)
+            let key_values: Vec<Value> = group_by_indices
+                .iter()
+                .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
+                .collect();
+
+            // Hash the group key with AHasher (optimal for Value types)
+            let mut hasher = AHasher::default();
+            for value in &key_values {
+                hash_value_into(value, &mut hasher);
             }
             let hash = hasher.finish();
 
-            // Early termination: if we've reached the limit and this hash doesn't exist,
-            // skip this row (it would create a new group we don't need)
-            // Note: We still process rows for existing groups to get correct aggregates
-            if has_limit && groups.len() >= group_limit && !groups.contains_key(&hash) {
+            // Early termination: check if this key exists before checking limit
+            // CRITICAL: Must check actual key equality, not just hash (handle collisions)
+            let key_exists = groups
+                .get(&hash)
+                .map(|bucket| bucket.iter().any(|state| state.key_values == key_values))
+                .unwrap_or(false);
+
+            if has_limit && !key_exists && current_group_count >= group_limit {
+                // Would create a new group, but we're at limit - skip this row
                 continue;
             }
 
-            // Get or create group state
-            let state = groups.entry(hash).or_insert_with(|| {
-                let key_values: Vec<Value> = group_by_indices
-                    .iter()
-                    .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
-                    .collect();
-                FastGroupState {
+            // Get or create bucket for this hash
+            let bucket = groups.entry(hash).or_default();
+
+            // Find existing group or create new one (handles hash collisions)
+            let state = if let Some(state) = bucket.iter_mut().find(|s| s.key_values == key_values)
+            {
+                // Existing group - reuse it
+                state
+            } else {
+                // New group - create and add to bucket
+                bucket.push(FastGroupState {
                     key_values,
                     agg_values: vec![0.0; num_aggs],
                     agg_has_value: vec![false; num_aggs],
                     counts: vec![0; num_aggs],
-                }
-            });
+                });
+                current_group_count += 1; // Track for O(1) LIMIT checks
+                bucket.last_mut().unwrap()
+            };
 
             // Accumulate aggregates
             for (i, agg) in simple_aggs.iter().enumerate() {
@@ -2203,9 +2222,10 @@ impl Executor {
             result_columns.push(col_name);
         }
 
-        // Build result rows
+        // Build result rows - flatten buckets (each bucket may have multiple groups due to collisions)
         let result_rows: Vec<Row> = groups
             .into_values()
+            .flatten() // Flatten Vec<FastGroupState> from each bucket
             .map(|state| {
                 let mut values = Vec::with_capacity(group_by_indices.len() + simple_aggs.len());
                 values.extend(state.key_values);
@@ -2286,9 +2306,11 @@ impl Executor {
             })
             .collect();
 
-        // Use hash-based grouping: hash -> GroupEntry
-        // This avoids creating Vec<Value> for every row
-        let mut groups: FxHashMap<u64, GroupEntry> = FxHashMap::default();
+        // Use hash-based grouping with collision handling: u64 hash -> Vec<GroupEntry>
+        // Each hash bucket can contain multiple groups (handles hash collisions correctly)
+        // Uses u64 keys for performance (8 bytes vs hundreds of bytes for Vec<Value>)
+        // FxHashMap is optimized for trusted keys in embedded database context
+        let mut groups: FxHashMap<u64, Vec<GroupEntry>> = FxHashMap::default();
 
         // Temporary buffer for computing group key hash (reused across rows)
         let mut key_buffer: Vec<Value> = Vec::with_capacity(group_by_items.len());
@@ -2353,9 +2375,10 @@ impl Executor {
         // Track for early termination optimization
         let group_limit = limit.unwrap_or(usize::MAX);
         let has_limit = limit.is_some();
+        let mut current_group_count: usize = 0; // Track actual group count for LIMIT optimization
 
         if all_simple_columns && expr_vm.is_none() {
-            // Fast path: hash directly from row references, only clone for new groups
+            // Fast path: extract key values directly from row columns
             let column_indices: Vec<usize> = precomputed_group_by
                 .iter()
                 .map(|item| match item {
@@ -2366,39 +2389,60 @@ impl Executor {
                 .collect();
 
             for (row_idx, row) in rows.iter().enumerate() {
-                // Compute hash directly from row references (no cloning!)
-                let mut hasher = rustc_hash::FxHasher::default();
+                // Build key values for this row
+                key_buffer.clear();
                 for &idx in &column_indices {
-                    if let Some(value) = row.get(idx) {
-                        hash_value_into(value, &mut hasher);
-                    } else {
-                        hash_value_into(&Value::null_unknown(), &mut hasher);
+                    key_buffer.push(row.get(idx).cloned().unwrap_or_else(Value::null_unknown));
+                }
+
+                // Compute hash once (8-byte key instead of cloning entire Vec<Value>)
+                let hash = hash_group_key(&key_buffer);
+
+                // Early termination: if we've reached the limit, check before adding new groups
+                // CRITICAL: Must check if key exists in bucket to distinguish new group vs existing group
+                // Count actual groups, not buckets (hash collisions create multiple groups per bucket)
+                if has_limit {
+                    let key_exists_in_bucket = groups
+                        .get(&hash)
+                        .map(|bucket| bucket.iter().any(|entry| entry.key_values == key_buffer))
+                        .unwrap_or(false);
+
+                    if !key_exists_in_bucket && current_group_count >= group_limit {
+                        // This would create a new group, but we're at limit - skip
+                        continue;
                     }
                 }
-                let hash = hasher.finish();
 
-                // Early termination: if we've reached the limit and this hash doesn't exist,
-                // skip this row (it would create a new group we don't need)
-                // Note: We still process rows for existing groups to get correct aggregates
-                if has_limit && groups.len() >= group_limit && !groups.contains_key(&hash) {
-                    continue;
-                }
-
-                // Only clone values when creating a NEW group
-                groups
-                    .entry(hash)
-                    .and_modify(|entry| entry.row_indices.push(row_idx))
-                    .or_insert_with(|| {
-                        // Clone values only for new groups
-                        let key_values: Vec<Value> = column_indices
-                            .iter()
-                            .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
-                            .collect();
-                        GroupEntry {
-                            key_values,
-                            row_indices: vec![row_idx],
+                // Handle bucket with proper collision detection
+                match groups.entry(hash) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let bucket = e.get_mut();
+                        // Search bucket for matching group (handles hash collisions)
+                        if let Some(entry) = bucket
+                            .iter_mut()
+                            .find(|entry| entry.key_values == key_buffer)
+                        {
+                            // Existing group - just add this row to it
+                            entry.row_indices.push(row_idx);
+                        } else {
+                            // Hash collision: different key with same hash - add new group
+                            // (limit already checked above)
+                            bucket.push(GroupEntry {
+                                key_values: key_buffer.clone(),
+                                row_indices: vec![row_idx],
+                            });
+                            current_group_count += 1; // Track new group for LIMIT optimization
                         }
-                    });
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        // First entry for this hash (limit already checked above)
+                        e.insert(vec![GroupEntry {
+                            key_values: key_buffer.clone(),
+                            row_indices: vec![row_idx],
+                        }]);
+                        current_group_count += 1; // Track new group for LIMIT optimization
+                    }
+                }
             }
         } else {
             // Slow path: need to evaluate expressions, use buffer
@@ -2436,28 +2480,63 @@ impl Executor {
                     key_buffer.push(value);
                 }
 
-                // Compute hash of key
+                // Compute hash of key (8-byte key for fast lookups)
                 let hash = hash_group_key(&key_buffer);
 
-                // Early termination: if we've reached the limit and this hash doesn't exist,
-                // skip this row (it would create a new group we don't need)
-                if has_limit && groups.len() >= group_limit && !groups.contains_key(&hash) {
-                    continue;
+                // Early termination: if we've reached the limit, check before adding new groups
+                // CRITICAL: Must check if key exists in bucket to distinguish new group vs existing group
+                // Count actual groups, not buckets (hash collisions create multiple groups per bucket)
+                if has_limit {
+                    let key_exists_in_bucket = groups
+                        .get(&hash)
+                        .map(|bucket| bucket.iter().any(|entry| entry.key_values == key_buffer))
+                        .unwrap_or(false);
+
+                    if !key_exists_in_bucket && current_group_count >= group_limit {
+                        // This would create a new group, but we're at limit - skip
+                        continue;
+                    }
                 }
 
-                // Insert or update group
-                groups
-                    .entry(hash)
-                    .and_modify(|entry| entry.row_indices.push(row_idx))
-                    .or_insert_with(|| GroupEntry {
-                        key_values: key_buffer.clone(), // Only clone once per unique group
-                        row_indices: vec![row_idx],
-                    });
+                // Handle bucket with proper collision detection
+                match groups.entry(hash) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let bucket = e.get_mut();
+                        // Search bucket for matching group (handles hash collisions)
+                        if let Some(entry) = bucket
+                            .iter_mut()
+                            .find(|entry| entry.key_values == key_buffer)
+                        {
+                            // Existing group - just add this row to it
+                            entry.row_indices.push(row_idx);
+                        } else {
+                            // Hash collision: different key with same hash - add new group
+                            // (limit already checked above)
+                            bucket.push(GroupEntry {
+                                key_values: key_buffer.clone(),
+                                row_indices: vec![row_idx],
+                            });
+                            current_group_count += 1; // Track new group for LIMIT optimization
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        // First entry for this hash (limit already checked above)
+                        e.insert(vec![GroupEntry {
+                            key_values: key_buffer.clone(),
+                            row_indices: vec![row_idx],
+                        }]);
+                        current_group_count += 1; // Track new group for LIMIT optimization
+                    }
+                }
             }
         }
 
         // Convert groups to Vec for parallel processing
-        let groups_vec: Vec<(u64, GroupEntry)> = groups.into_iter().collect();
+        // Flatten buckets: each bucket may contain multiple groups (hash collisions)
+        let groups_vec: Vec<GroupEntry> = groups
+            .into_iter()
+            .flat_map(|(_hash, bucket)| bucket)
+            .collect();
 
         // Pre-compile aggregate filter and expression programs for VM-based evaluation
         // CRITICAL: Propagate errors instead of silently ignoring compilation failures
@@ -2509,7 +2588,7 @@ impl Executor {
         // Key insight: parallel creates aggregate functions PER GROUP, so for many small groups
         // (e.g., 10k groups with 3 rows each), the allocation overhead dominates.
         // Only parallelize when groups are large enough to amortize the allocation cost.
-        let total_rows: usize = groups_vec.iter().map(|(_, g)| g.row_indices.len()).sum();
+        let total_rows: usize = groups_vec.iter().map(|g| g.row_indices.len()).sum();
         let avg_rows_per_group = total_rows / groups_vec.len().max(1);
         let use_parallel = groups_vec.len() >= 4
             && total_rows >= 10_000
@@ -2523,7 +2602,7 @@ impl Executor {
 
             groups_vec
                 .into_par_iter()
-                .map(|(_hash, group)| {
+                .map(|group| {
                     // Each thread creates its own aggregate functions
                     let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
                         .iter()
@@ -2613,7 +2692,7 @@ impl Executor {
             let mut expr_values: Vec<Value> = vec![Value::null_unknown(); aggregations.len()];
 
             let mut result_rows_seq = Vec::with_capacity(groups_vec.len());
-            for (_hash, group) in groups_vec {
+            for group in groups_vec {
                 // Reset aggregate functions for this group
                 for f in agg_funcs.iter_mut().flatten() {
                     f.reset();
@@ -2944,8 +3023,10 @@ impl Executor {
                 all_result_rows.push(Row::from_values(row_values));
             } else {
                 // Partial grouping: group by active columns only
-                // Use hash-based grouping
-                let mut groups: FxHashMap<u64, GroupEntry> = FxHashMap::default();
+                // Use hash-based grouping with collision handling: u64 hash -> Vec<GroupEntry>
+                // Each hash bucket can contain multiple groups (handles hash collisions correctly)
+                // FxHashMap is optimized for trusted keys in embedded database context
+                let mut groups: FxHashMap<u64, Vec<GroupEntry>> = FxHashMap::default();
                 let mut key_buffer: Vec<Value> = Vec::with_capacity(active_count);
 
                 for (row_idx, row) in rows.iter().enumerate() {
@@ -2985,14 +3066,33 @@ impl Executor {
                         }
                     }
 
+                    // Compute hash and handle bucket with proper collision detection
                     let hash = hash_group_key(&key_buffer);
-                    groups
-                        .entry(hash)
-                        .and_modify(|entry| entry.row_indices.push(row_idx))
-                        .or_insert_with(|| GroupEntry {
-                            key_values: key_buffer.clone(),
-                            row_indices: vec![row_idx],
-                        });
+                    match groups.entry(hash) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            let bucket = e.get_mut();
+                            // Search bucket for matching group (handles hash collisions)
+                            if let Some(entry) = bucket
+                                .iter_mut()
+                                .find(|entry| entry.key_values == key_buffer)
+                            {
+                                entry.row_indices.push(row_idx);
+                            } else {
+                                // Hash collision: different key with same hash
+                                bucket.push(GroupEntry {
+                                    key_values: key_buffer.clone(),
+                                    row_indices: vec![row_idx],
+                                });
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            // First entry for this hash
+                            e.insert(vec![GroupEntry {
+                                key_values: key_buffer.clone(),
+                                row_indices: vec![row_idx],
+                            }]);
+                        }
+                    }
                 }
 
                 // Process each group
@@ -3015,80 +3115,83 @@ impl Executor {
                 // Note: We don't sort groups here for performance.
                 // SQL does not guarantee result order without ORDER BY.
                 // Users who need ordered results should add ORDER BY to their query.
-                for (_hash, group) in groups {
-                    // Reset aggregate functions
-                    for f in agg_funcs.iter_mut().flatten() {
-                        f.reset();
-                    }
+                // Flatten buckets: each bucket may contain multiple groups (hash collisions)
+                for (_hash, bucket) in groups {
+                    for group in bucket {
+                        // Reset aggregate functions
+                        for f in agg_funcs.iter_mut().flatten() {
+                            f.reset();
+                        }
 
-                    let count_star_value = Value::Integer(1);
-                    for &row_idx in &group.row_indices {
-                        let row = &rows[row_idx];
+                        let count_star_value = Value::Integer(1);
+                        for &row_idx in &group.row_indices {
+                            let row = &rows[row_idx];
 
-                        // Create execution context for this row
-                        // CRITICAL: Include params for parameterized queries
-                        let row_data = row.as_slice();
-                        let exec_ctx = ExecuteContext::new(row_data)
-                            .with_params(ctx.params())
-                            .with_named_params(ctx.named_params());
+                            // Create execution context for this row
+                            // CRITICAL: Include params for parameterized queries
+                            let row_data = row.as_slice();
+                            let exec_ctx = ExecuteContext::new(row_data)
+                                .with_params(ctx.params())
+                                .with_named_params(ctx.named_params());
 
-                        for (i, agg) in aggregations.iter().enumerate() {
-                            if let Some(ref mut func) = agg_funcs[i] {
-                                if let Some(ref expr_program) = compiled_agg_expressions[i] {
-                                    if let Some(ref mut vm) = expr_vm {
-                                        if let Ok(val) = vm.execute(expr_program, &exec_ctx) {
-                                            expr_values[i] = val;
-                                            func.accumulate(&expr_values[i], agg.distinct);
+                            for (i, agg) in aggregations.iter().enumerate() {
+                                if let Some(ref mut func) = agg_funcs[i] {
+                                    if let Some(ref expr_program) = compiled_agg_expressions[i] {
+                                        if let Some(ref mut vm) = expr_vm {
+                                            if let Ok(val) = vm.execute(expr_program, &exec_ctx) {
+                                                expr_values[i] = val;
+                                                func.accumulate(&expr_values[i], agg.distinct);
+                                            }
                                         }
-                                    }
-                                } else {
-                                    let value_ref = if let Some(col_idx) = agg_col_indices[i] {
-                                        row.get(col_idx)
                                     } else {
-                                        Some(&count_star_value)
-                                    };
-                                    if let Some(v) = value_ref {
-                                        func.accumulate(v, agg.distinct);
+                                        let value_ref = if let Some(col_idx) = agg_col_indices[i] {
+                                            row.get(col_idx)
+                                        } else {
+                                            Some(&count_star_value)
+                                        };
+                                        if let Some(v) = value_ref {
+                                            func.accumulate(v, agg.distinct);
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Build result row
-                    // For GROUP BY columns: use key value if active, NULL if rolled up
-                    let mut row_values = Vec::with_capacity(
-                        group_by_items.len() + aggregations.len() + group_by_items.len(),
-                    );
+                        // Build result row
+                        // For GROUP BY columns: use key value if active, NULL if rolled up
+                        let mut row_values = Vec::with_capacity(
+                            group_by_items.len() + aggregations.len() + group_by_items.len(),
+                        );
 
-                    let mut key_idx = 0;
-                    for &is_active in &grouping_set.active_columns {
-                        if is_active {
-                            row_values.push(group.key_values[key_idx].clone());
-                            key_idx += 1;
-                        } else {
-                            row_values.push(Value::null_unknown());
+                        let mut key_idx = 0;
+                        for &is_active in &grouping_set.active_columns {
+                            if is_active {
+                                row_values.push(group.key_values[key_idx].clone());
+                                key_idx += 1;
+                            } else {
+                                row_values.push(Value::null_unknown());
+                            }
                         }
-                    }
 
-                    for (i, agg) in aggregations.iter().enumerate() {
-                        let value = if let Some(ref func) = agg_funcs[i] {
-                            func.result()
-                        } else if agg.name == "COUNT" && agg.column == "*" {
-                            Value::Integer(group.row_indices.len() as i64)
-                        } else {
-                            Value::null_unknown()
-                        };
-                        row_values.push(value);
-                    }
+                        for (i, agg) in aggregations.iter().enumerate() {
+                            let value = if let Some(ref func) = agg_funcs[i] {
+                                func.result()
+                            } else if agg.name == "COUNT" && agg.column == "*" {
+                                Value::Integer(group.row_indices.len() as i64)
+                            } else {
+                                Value::null_unknown()
+                            };
+                            row_values.push(value);
+                        }
 
-                    // Add GROUPING flags: 0 if column is active (grouped), 1 if rolled up
-                    for &is_active in &grouping_set.active_columns {
-                        row_values.push(Value::Integer(if is_active { 0 } else { 1 }));
-                    }
+                        // Add GROUPING flags: 0 if column is active (grouped), 1 if rolled up
+                        for &is_active in &grouping_set.active_columns {
+                            row_values.push(Value::Integer(if is_active { 0 } else { 1 }));
+                        }
 
-                    all_result_rows.push(Row::from_values(row_values));
-                }
+                        all_result_rows.push(Row::from_values(row_values));
+                    } // end for group in bucket
+                } // end for bucket in groups
             }
         }
 

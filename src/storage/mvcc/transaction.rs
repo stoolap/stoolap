@@ -17,7 +17,7 @@
 //! Provides transaction semantics with two-phase commit protocol.
 //!
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -48,7 +48,7 @@ pub struct MvccTransaction {
     /// Transaction state
     state: TransactionState,
     /// Tables accessed in this transaction
-    tables: HashMap<String, Box<dyn Table>>,
+    tables: FxHashMap<String, Box<dyn Table>>,
     /// Transaction-specific isolation level (if different from engine default)
     isolation_level: Option<IsolationLevel>,
     /// Reference to the transaction registry
@@ -60,7 +60,7 @@ pub struct MvccTransaction {
     /// Engine reference for table operations (will be set by Engine)
     engine_operations: Option<Arc<dyn TransactionEngineOperations>>,
     /// Savepoints: maps savepoint name to timestamp when created
-    savepoints: HashMap<String, i64>,
+    savepoints: FxHashMap<String, i64>,
     /// Tables created in this transaction (for rollback)
     created_tables: Vec<String>,
     /// Tables dropped in this transaction (for rollback - stores name and schema)
@@ -113,13 +113,13 @@ impl MvccTransaction {
             id,
             start_time: Instant::now(),
             state: TransactionState::Active,
-            tables: HashMap::new(),
+            tables: FxHashMap::default(),
             isolation_level: None,
             registry,
             begin_seq,
             last_table_name: None,
             engine_operations: None,
-            savepoints: HashMap::new(),
+            savepoints: FxHashMap::default(),
             created_tables: Vec::new(),
             dropped_tables: Vec::new(),
         }
@@ -634,7 +634,7 @@ impl Transaction for MvccTransaction {
         table_name: &str,
         columns_to_fetch: &[String],
         expr: Option<&dyn Expression>,
-        aliases: &HashMap<String, String>,
+        aliases: &FxHashMap<String, String>,
         _original_columns: Option<&[String]>,
     ) -> Result<Box<dyn QueryResult>> {
         self.check_active()?;

@@ -23,6 +23,7 @@ use crate::core::{DataType, Error, Result, Row, Value};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::traits::{Engine, QueryResult, Table};
+use ahash::AHashMap;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -609,8 +610,8 @@ impl Executor {
 
             // Pre-compute values for all rows
             // Map: pk_value -> Vec<(col_idx, new_value)>
-            let mut precomputed: FxHashMap<Value, Vec<(usize, Value)>> =
-                FxHashMap::with_capacity_and_hasher(64, Default::default());
+            // OPTIMIZATION: Use AHashMap for Value keys (better hash distribution)
+            let mut precomputed: AHashMap<Value, Vec<(usize, Value)>> = AHashMap::with_capacity(64);
 
             // Build column indices for scanning (all columns)
             let all_col_indices: Vec<usize> = (0..column_names_vec.len()).collect();
@@ -926,11 +927,8 @@ impl Executor {
 
             // Reusable outer_row_map for correlated subqueries
             let estimated_entries = col_name_triples.len() * 3; // up to 3 entries per column
-            let mut outer_row_map: rustc_hash::FxHashMap<String, Value> =
-                rustc_hash::FxHashMap::with_capacity_and_hasher(
-                    estimated_entries,
-                    Default::default(),
-                );
+            let mut outer_row_map: FxHashMap<String, Value> =
+                FxHashMap::with_capacity_and_hasher(estimated_entries, Default::default());
 
             while scanner.next() {
                 let row = scanner.row();

@@ -36,8 +36,8 @@
 //! SELECT * FROM users WHERE status = 'pending';
 //! ```
 
+use rustc_hash::FxHashMap;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -147,7 +147,7 @@ impl CardinalityFeedback {
 #[derive(Debug)]
 pub struct FeedbackCache {
     /// Feedback entries keyed by (table_name, predicate_hash)
-    entries: RwLock<HashMap<(String, u64), CardinalityFeedback>>,
+    entries: RwLock<FxHashMap<(String, u64), CardinalityFeedback>>,
     /// Decay factor for EMA smoothing
     decay_factor: f64,
     /// Maximum number of entries to keep
@@ -164,7 +164,7 @@ impl FeedbackCache {
     /// Create a new feedback cache with default settings
     pub fn new() -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
+            entries: RwLock::new(FxHashMap::default()),
             decay_factor: DEFAULT_DECAY_FACTOR,
             max_entries: 10000,
         }
@@ -173,7 +173,7 @@ impl FeedbackCache {
     /// Create a cache with custom settings
     pub fn with_settings(decay_factor: f64, max_entries: usize) -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
+            entries: RwLock::new(FxHashMap::default()),
             decay_factor,
             max_entries,
         }
@@ -248,7 +248,7 @@ impl FeedbackCache {
     }
 
     /// Evict oldest entries to make room for new ones
-    fn evict_oldest(&self, entries: &mut HashMap<(String, u64), CardinalityFeedback>) {
+    fn evict_oldest(&self, entries: &mut FxHashMap<(String, u64), CardinalityFeedback>) {
         // Find the oldest 10% of entries
         let evict_count = self.max_entries / 10;
 

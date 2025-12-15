@@ -243,7 +243,7 @@ pub enum IndexType {
 
     /// Hash index for fast O(1) equality lookups
     /// Best for: TEXT, VARCHAR, UUID columns
-    /// Uses ahash (~30 GB/s) - avoids O(strlen) comparisons
+    /// Uses ahash - avoids O(strlen) comparisons
     /// Note: Does NOT support range queries
     Hash,
 

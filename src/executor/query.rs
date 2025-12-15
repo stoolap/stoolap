@@ -27,6 +27,8 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
 use crate::core::{Error, Result, Row, Value};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
@@ -480,8 +482,7 @@ impl Executor {
                     rows.iter()
                         .map(|row| {
                             // Build outer row context from current row
-                            let mut outer_row_map: rustc_hash::FxHashMap<String, Value> =
-                                rustc_hash::FxHashMap::default();
+                            let mut outer_row_map: FxHashMap<String, Value> = FxHashMap::default();
                             for (idx, col_name) in columns.iter().enumerate() {
                                 let val = row.get(idx).cloned().unwrap_or(Value::null_unknown());
                                 let col_lower = col_name.to_lowercase();
@@ -901,7 +902,7 @@ impl Executor {
         }
 
         // Get SELECT column names (lowercase) using HashSet for O(1) lookup
-        let select_columns: rustc_hash::FxHashSet<String> = stmt
+        let select_columns: FxHashSet<String> = stmt
             .columns
             .iter()
             .filter_map(|expr| self.extract_select_column_name(expr))
@@ -1514,8 +1515,7 @@ impl Executor {
 
                 // OPTIMIZATION: Pre-allocate outer_row_map with capacity and reuse
                 let base_capacity = all_columns.len() * 2 + ctx.outer_row().map_or(0, |m| m.len());
-                let mut outer_row_map: rustc_hash::FxHashMap<String, Value> =
-                    rustc_hash::FxHashMap::default();
+                let mut outer_row_map: FxHashMap<String, Value> = FxHashMap::default();
                 outer_row_map.reserve(base_capacity);
 
                 // OPTIMIZATION: Wrap all_columns in Arc once, reuse for all rows (only if needed)
@@ -2957,8 +2957,8 @@ impl Executor {
                             // Check if it's correlated (references outer columns)
                             if Self::has_correlated_subqueries(&a.expression) {
                                 // Build outer row context for correlated subquery
-                                let mut outer_row_map: rustc_hash::FxHashMap<String, Value> =
-                                    rustc_hash::FxHashMap::default();
+                                let mut outer_row_map: FxHashMap<String, Value> =
+                                    FxHashMap::default();
                                 for (i, col_name) in extended_columns.iter().enumerate() {
                                     if let Some(value) = row.get(i) {
                                         outer_row_map
@@ -2990,8 +2990,8 @@ impl Executor {
                             // Check if it's correlated (references outer columns)
                             if Self::has_correlated_subqueries(other) {
                                 // Build outer row context for correlated subquery
-                                let mut outer_row_map: rustc_hash::FxHashMap<String, Value> =
-                                    rustc_hash::FxHashMap::default();
+                                let mut outer_row_map: FxHashMap<String, Value> =
+                                    FxHashMap::default();
                                 for (i, col_name) in extended_columns.iter().enumerate() {
                                     if let Some(value) = row.get(i) {
                                         outer_row_map
@@ -3315,8 +3315,7 @@ impl Executor {
 
         // Build column index map ONCE with FxHashMap for O(1) lookup
         // Use the pre-computed lowercase names
-        let mut col_index_map_lower: rustc_hash::FxHashMap<String, usize> =
-            rustc_hash::FxHashMap::default();
+        let mut col_index_map_lower: FxHashMap<String, usize> = FxHashMap::default();
         for (i, lower) in all_columns_lower.iter().enumerate() {
             col_index_map_lower.insert(lower.clone(), i);
 
@@ -3433,7 +3432,7 @@ impl Executor {
         // the second take of the same index would get null (value already moved)
         if all_simple && !simple_column_indices.is_empty() {
             // Check for duplicate indices (can happen with ambiguous column names after JOIN)
-            let mut seen_indices: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+            let mut seen_indices: FxHashSet<usize> = FxHashSet::default();
             let has_duplicates = simple_column_indices
                 .iter()
                 .any(|&idx| !seen_indices.insert(idx));
@@ -3466,8 +3465,7 @@ impl Executor {
 
         // OPTIMIZATION: Pre-allocate outer_row_map with capacity and reuse
         let base_capacity = all_columns.len() * 2;
-        let mut outer_row_map: rustc_hash::FxHashMap<String, Value> =
-            rustc_hash::FxHashMap::default();
+        let mut outer_row_map: FxHashMap<String, Value> = FxHashMap::default();
         if has_correlated_select {
             outer_row_map.reserve(base_capacity);
         }
@@ -3729,7 +3727,7 @@ impl Executor {
         evaluator: &mut CompiledEvaluator,
         expr: &Expression,
         row: &Row,
-        col_index_map: &rustc_hash::FxHashMap<String, usize>,
+        col_index_map: &FxHashMap<String, usize>,
     ) -> Result<Value> {
         match expr {
             // Simple column reference - get from row by index using O(1) HashMap lookup
@@ -3990,7 +3988,7 @@ impl Executor {
 
         *active_tx = Some(ActiveTransaction {
             transaction,
-            tables: rustc_hash::FxHashMap::default(),
+            tables: FxHashMap::default(),
         });
 
         Ok(Box::new(ExecResult::empty()))
@@ -4676,8 +4674,8 @@ impl Executor {
     }
 
     /// Build a map of column aliases to their underlying expressions from SELECT columns
-    fn build_alias_map(columns: &[Expression]) -> rustc_hash::FxHashMap<String, Expression> {
-        let mut alias_map = rustc_hash::FxHashMap::default();
+    fn build_alias_map(columns: &[Expression]) -> FxHashMap<String, Expression> {
+        let mut alias_map = FxHashMap::default();
         for col_expr in columns {
             if let Expression::Aliased(aliased) = col_expr {
                 let alias_name = aliased.alias.value_lower.clone();
@@ -4690,7 +4688,7 @@ impl Executor {
     /// Substitute column aliases in an expression with their underlying expressions
     fn substitute_aliases(
         expr: &Expression,
-        alias_map: &rustc_hash::FxHashMap<String, Expression>,
+        alias_map: &FxHashMap<String, Expression>,
     ) -> Expression {
         match expr {
             Expression::Identifier(id) => {

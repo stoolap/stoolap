@@ -26,6 +26,8 @@
 
 use std::cmp::Ordering;
 
+use rustc_hash::FxHashMap;
+
 #[cfg(test)]
 use crate::core::Value;
 use crate::core::{Result, Row};
@@ -338,9 +340,8 @@ impl Executor {
         limit: Option<u64>,
     ) -> Result<Vec<Row>> {
         use crate::optimizer::bloom::BloomEffectivenessTracker;
-        use rustc_hash::FxHashMap;
 
-        // Build phase: Create hash table from build side
+        // Build phase: Create hash table from build side with FxHash (optimized for trusted keys)
         let mut hash_table: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
 
         // Build bloom filter for faster probe-side filtering

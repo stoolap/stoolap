@@ -15,7 +15,7 @@
 //! Result trait for query results
 //!
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::core::{Result, Row, Value};
 
@@ -80,7 +80,7 @@ pub trait QueryResult: Send {
     ///
     /// The map keys are alias names, values are original column names.
     /// Returns a new result with the aliases applied.
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult>;
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult>;
 }
 
 /// A simple in-memory query result (useful for testing and simple results)
@@ -207,7 +207,10 @@ impl QueryResult for MemoryResult {
         self.last_insert_id
     }
 
-    fn with_aliases(mut self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(
+        mut self: Box<Self>,
+        aliases: FxHashMap<String, String>,
+    ) -> Box<dyn QueryResult> {
         // Apply aliases to column names
         for col in &mut self.columns {
             // Find if this column has an alias (reverse lookup)
@@ -286,7 +289,7 @@ impl QueryResult for EmptyResult {
         self.last_insert_id
     }
 
-    fn with_aliases(self: Box<Self>, _aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, _aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         self
     }
 }
@@ -364,7 +367,7 @@ mod tests {
         let rows = vec![Row::from_values(vec![Value::Integer(1)])];
         let result = Box::new(MemoryResult::with_rows(vec!["user_id".to_string()], rows));
 
-        let mut aliases = HashMap::new();
+        let mut aliases = FxHashMap::default();
         aliases.insert("id".to_string(), "user_id".to_string());
 
         let aliased = result.with_aliases(aliases);

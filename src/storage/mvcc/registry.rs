@@ -18,7 +18,7 @@
 //! Uses concurrent hash maps for high-performance thread-safe access.
 //!
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -78,7 +78,7 @@ pub struct TransactionRegistry {
     global_isolation_level: RwLock<IsolationLevel>,
 
     /// Per-transaction isolation level overrides
-    transaction_isolation_levels: RwLock<HashMap<i64, IsolationLevel>>,
+    transaction_isolation_levels: RwLock<FxHashMap<i64, IsolationLevel>>,
 
     /// Whether new transactions are being accepted
     accepting: AtomicBool,
@@ -96,7 +96,10 @@ impl TransactionRegistry {
             committed_transactions: new_concurrent_int64_map(),
             committing_transactions: new_concurrent_int64_map(),
             global_isolation_level: RwLock::new(IsolationLevel::ReadCommitted),
-            transaction_isolation_levels: RwLock::new(HashMap::with_capacity(100)),
+            transaction_isolation_levels: RwLock::new(FxHashMap::with_capacity_and_hasher(
+                100,
+                Default::default(),
+            )),
             accepting: AtomicBool::new(true),
             next_sequence: AtomicI64::new(0),
         }

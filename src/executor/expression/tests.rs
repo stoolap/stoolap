@@ -1,4 +1,6 @@
 // Copyright 2025 Stoolap Contributors
+use ahash::AHashSet;
+
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +16,6 @@
 
 // Tests for the Compiled Expression VM
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::compiler::{CompileContext, ExprCompiler};
@@ -168,7 +169,7 @@ fn test_arithmetic() {
 fn test_in_set() {
     let mut vm = ExprVM::new();
 
-    let set: HashSet<Value> = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+    let set: AHashSet<Value> = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
         .into_iter()
         .collect();
 

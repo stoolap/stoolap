@@ -1766,6 +1766,7 @@ impl Default for ExprVM {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahash::AHashSet;
 
     #[test]
     fn test_simple_comparison() {
@@ -1816,10 +1817,9 @@ mod tests {
     #[test]
     fn test_in_set() {
         let mut vm = ExprVM::new();
-        let set: std::collections::HashSet<Value> =
-            [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
-                .into_iter()
-                .collect();
+        let set: AHashSet<Value> = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+            .into_iter()
+            .collect();
 
         let program = Program::new(vec![
             Op::LoadColumn(0),

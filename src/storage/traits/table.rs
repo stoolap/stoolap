@@ -15,7 +15,7 @@
 //! Table trait for database tables
 //!
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::fmt;
 
 use crate::core::{DataType, Error, IndexType, Result, Row, Schema, Value};
@@ -618,7 +618,7 @@ pub trait Table: Send + Sync {
         &self,
         columns: &[&str],
         expr: Option<&dyn Expression>,
-        aliases: &HashMap<String, String>,
+        aliases: &FxHashMap<String, String>,
     ) -> Result<Box<dyn QueryResult>>;
 
     /// Executes a temporal SELECT query as of a specific point in time

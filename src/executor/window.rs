@@ -131,6 +131,7 @@ impl Executor {
         }
 
         // Step 1: Compute all window function values upfront
+        // OPTIMIZATION: Use FxHashMap for fastest lookups with trusted keys
         let mut window_value_map: FxHashMap<String, Vec<Value>> = FxHashMap::default();
         for wf in &window_functions {
             let window_values =
@@ -855,6 +856,7 @@ impl Executor {
         // Group rows by partition key
         // OPTIMIZATION: Use SmallVec for partition keys to avoid heap allocation
         // for common cases (up to 4 partition columns)
+        // OPTIMIZATION: Use FxHashMap for fastest hash table operations with trusted keys
         let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
 
         // OPTIMIZATION: Pre-compute partition column indices to avoid to_lowercase() per row
@@ -1674,6 +1676,7 @@ impl Executor {
 
         // Group rows by partition key
         // OPTIMIZATION: Use SmallVec for partition keys to avoid heap allocation
+        // OPTIMIZATION: Use FxHashMap for fastest hash table operations with trusted keys
         let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
 
         for (i, row) in rows.iter().enumerate() {

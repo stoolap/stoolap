@@ -19,8 +19,9 @@
 //! - Scalar subqueries
 //! - IN subqueries
 
-use std::collections::HashSet;
 use std::sync::Arc;
+
+use ahash::AHashSet;
 
 use crate::core::{Error, Result, Value};
 use crate::parser::ast::*;
@@ -173,8 +174,8 @@ impl Executor {
                         // Single-column IN - use InHashSet for O(1) lookups
                         let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
 
-                        // Collect into HashSet for O(1) membership testing
-                        let hash_set: HashSet<Value> = values.into_iter().collect();
+                        // Collect into AHashSet for O(1) membership testing (better for Value types)
+                        let hash_set: AHashSet<Value> = values.into_iter().collect();
 
                         // Use InHashSet with Arc for fast O(1) lookup per row
                         return Ok(Expression::InHashSet(InHashSetExpression {
@@ -986,9 +987,9 @@ impl Executor {
                 let processed_left = self.process_correlated_expression(&in_expr.left, ctx)?;
 
                 if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
-                    // Use InHashSet for O(1) lookups
+                    // Use InHashSet for O(1) lookups with FxHash (optimized for trusted keys)
                     let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
-                    let hash_set: HashSet<Value> = values.into_iter().collect();
+                    let hash_set: AHashSet<Value> = values.into_iter().collect();
 
                     return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
@@ -1272,9 +1273,9 @@ impl Executor {
                 let processed_left = self.process_correlated_where(&in_expr.left, ctx)?;
 
                 if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
-                    // Use InHashSet for O(1) lookups
+                    // Use InHashSet for O(1) lookups with FxHash (optimized for trusted keys)
                     let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
-                    let hash_set: HashSet<Value> = values.into_iter().collect();
+                    let hash_set: AHashSet<Value> = values.into_iter().collect();
 
                     return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
@@ -1601,12 +1602,12 @@ impl Executor {
     /// Instead of executing the subquery for each outer row, we:
     /// 1. Execute the inner query once with non-correlated predicates
     /// 2. Collect all distinct values of the inner correlation column
-    /// 3. Return a HashSet for fast O(1) lookups
+    /// 3. Return an AHashSet for fast O(1) lookups
     pub fn execute_semi_join_optimization(
         &self,
         info: &SemiJoinInfo,
         ctx: &ExecutionContext,
-    ) -> Result<std::collections::HashSet<crate::core::Value>> {
+    ) -> Result<AHashSet<crate::core::Value>> {
         // Build SELECT inner_column FROM inner_table WHERE non_correlated_predicates
         let inner_col_expr = Expression::Identifier(Identifier {
             token: dummy_token(&info.inner_column, TokenType::Identifier),
@@ -1652,9 +1653,10 @@ impl Executor {
         let subquery_ctx = ctx.with_incremented_query_depth();
         let mut result = self.execute_select(&select_stmt, &subquery_ctx)?;
 
-        // Collect values into HashSet - deduplicates automatically
-        // Pre-allocate with reasonable capacity to avoid resizing
-        let mut hash_set = std::collections::HashSet::with_capacity(1024);
+        // Collect values into AHashSet for fast O(1) lookups
+        // AHash handles Value types better than FxHash (particularly f64 bit patterns from integers)
+        // Pre-allocate with larger capacity to reduce rehashing (estimated 10k rows)
+        let mut hash_set = AHashSet::with_capacity(10_000);
         while result.next() {
             let row = result.row();
             if let Some(value) = row.get(0) {
@@ -1672,7 +1674,7 @@ impl Executor {
     /// Replaces: EXISTS (SELECT ...) with: outer_col IN (hash_set_values)
     pub fn transform_exists_to_in_list(
         info: &SemiJoinInfo,
-        hash_set: std::collections::HashSet<crate::core::Value>,
+        hash_set: AHashSet<crate::core::Value>,
     ) -> Expression {
         // For empty hash set, return FALSE (no matches exist)
         // For NOT EXISTS with empty set, return TRUE (nothing exists to negate)

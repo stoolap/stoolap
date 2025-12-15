@@ -27,6 +27,8 @@
 
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
+
 use crate::core::{IndexType, Operator, Result, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::optimizer::workload::{EdgeAwarePlanner, EdgeJoinRecommendation};
@@ -48,7 +50,7 @@ pub struct QueryPlanner {
     /// Cost estimator for evaluating access methods
     cost_estimator: CostEstimator,
     /// Cache of table statistics to avoid repeated lookups
-    stats_cache: std::sync::RwLock<rustc_hash::FxHashMap<String, CachedStats>>,
+    stats_cache: std::sync::RwLock<FxHashMap<String, CachedStats>>,
 }
 
 /// Default TTL for cached statistics (5 minutes)
@@ -63,7 +65,7 @@ const MAX_STATS_CACHE_SIZE: usize = 1000;
 #[derive(Clone)]
 struct CachedStats {
     table_stats: TableStats,
-    column_stats: rustc_hash::FxHashMap<String, ColumnStatsCache>,
+    column_stats: FxHashMap<String, ColumnStatsCache>,
     #[allow(dead_code)]
     zone_maps: Option<TableZoneMap>,
     /// Timestamp when this cache entry was created
@@ -134,7 +136,7 @@ impl QueryPlanner {
         Self {
             engine,
             cost_estimator: CostEstimator::new(),
-            stats_cache: std::sync::RwLock::new(rustc_hash::FxHashMap::default()),
+            stats_cache: std::sync::RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -295,7 +297,7 @@ impl QueryPlanner {
         let column_stats = if has_column_stats {
             self.read_column_stats(&*tx, table_name)?
         } else {
-            rustc_hash::FxHashMap::default()
+            FxHashMap::default()
         };
 
         // Cache the stats with current timestamp
@@ -370,8 +372,8 @@ impl QueryPlanner {
         &self,
         tx: &dyn Transaction,
         table_name: &str,
-    ) -> Result<rustc_hash::FxHashMap<String, ColumnStatsCache>> {
-        let mut stats = rustc_hash::FxHashMap::default();
+    ) -> Result<FxHashMap<String, ColumnStatsCache>> {
+        let mut stats = FxHashMap::default();
 
         let stats_table = match tx.get_table(SYS_COLUMN_STATS) {
             Ok(t) => t,

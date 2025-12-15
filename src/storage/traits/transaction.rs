@@ -15,7 +15,7 @@
 //! Transaction trait for database transactions
 //!
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::core::{IsolationLevel, Result, Schema, SchemaColumn};
 use crate::storage::expression::Expression;
@@ -186,7 +186,7 @@ pub trait Transaction: Send {
         table_name: &str,
         columns_to_fetch: &[String],
         expr: Option<&dyn Expression>,
-        aliases: &HashMap<String, String>,
+        aliases: &FxHashMap<String, String>,
         original_columns: Option<&[String]>,
     ) -> Result<Box<dyn QueryResult>>;
 

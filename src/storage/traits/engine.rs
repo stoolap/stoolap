@@ -15,6 +15,8 @@
 //! Engine trait for the storage engine
 //!
 
+use rustc_hash::FxHashMap;
+
 use crate::core::{IsolationLevel, Result, Schema};
 use crate::storage::config::Config;
 use crate::storage::traits::{Index, Transaction};
@@ -81,10 +83,7 @@ pub trait Engine: Send + Sync {
     /// Lists all indexes for a table
     ///
     /// Returns a map from index name to index type string.
-    fn list_table_indexes(
-        &self,
-        table_name: &str,
-    ) -> Result<std::collections::HashMap<String, String>>;
+    fn list_table_indexes(&self, table_name: &str) -> Result<FxHashMap<String, String>>;
 
     /// Gets all index objects for a table
     fn get_all_indexes(&self, table_name: &str) -> Result<Vec<Box<dyn Index>>>;

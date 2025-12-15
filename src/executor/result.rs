@@ -16,11 +16,10 @@
 //!
 //! This module provides result types for SQL query execution.
 
-use std::collections::HashMap;
-
 use crate::core::{Result, Row, Value};
 use crate::parser::ast::Expression;
 use crate::storage::traits::QueryResult;
+use rustc_hash::{FxHashMap, FxHasher};
 
 use super::expression::RowFilter;
 
@@ -96,7 +95,7 @@ impl QueryResult for ExecResult {
         self.insert_id
     }
 
-    fn with_aliases(self: Box<Self>, _aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, _aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         self
     }
 }
@@ -255,7 +254,10 @@ impl QueryResult for ExecutorMemoryResult {
         self.insert_id
     }
 
-    fn with_aliases(mut self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(
+        mut self: Box<Self>,
+        aliases: FxHashMap<String, String>,
+    ) -> Box<dyn QueryResult> {
         // Apply aliases to column names
         for col in &mut self.columns {
             // Find if this column has an alias (reverse lookup)
@@ -361,7 +363,7 @@ impl QueryResult for FilteredResult {
         self.inner.last_insert_id()
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
 }
@@ -451,7 +453,7 @@ impl QueryResult for MappedResult {
         0
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
 }
@@ -579,7 +581,7 @@ impl QueryResult for ExprFilteredResult {
         self.inner.last_insert_id()
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
 }
@@ -767,7 +769,7 @@ impl QueryResult for ExprMappedResult {
         0
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
 }
@@ -870,7 +872,7 @@ impl QueryResult for LimitedResult {
         self.inner.last_insert_id()
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
 }
@@ -1082,7 +1084,7 @@ impl QueryResult for OrderedResult {
         0
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
 }
@@ -1236,7 +1238,7 @@ impl QueryResult for TopNResult {
         0
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
 }
@@ -1272,21 +1274,38 @@ impl DistinctResult {
         let columns = inner.columns().to_vec();
         let num_distinct_cols = distinct_columns.unwrap_or(columns.len());
 
-        // OPTIMIZATION: Use FxHashSet with pre-computed hashes for O(1) lookup
+        // OPTIMIZATION: Use hash map with collision handling for correct DISTINCT behavior
+        // Maps: hash -> list of indices into result vec (handles hash collisions)
         // Hash values directly instead of converting to strings (600K fewer allocations for 100K rows)
-        let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+        let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
         let mut rows = Vec::new();
 
         while inner.next() {
             // Hash only the columns that matter for distinctness
-            let mut hasher = rustc_hash::FxHasher::default();
-            let row = inner.row().as_slice();
-            for value in row.iter().take(num_distinct_cols) {
+            let mut hasher = FxHasher::default();
+            let row = inner.row();
+            for value in row.as_slice().iter().take(num_distinct_cols) {
                 value.hash(&mut hasher);
             }
             let hash = hasher.finish();
 
-            if seen.insert(hash) {
+            // Check if this exact row already exists (handle hash collisions)
+            let indices = hash_to_indices.entry(hash).or_default();
+            let is_duplicate = indices.iter().any(|&idx| {
+                // Compare only the first num_distinct_cols columns
+                let existing_row: &Row = &rows[idx];
+                for i in 0..num_distinct_cols {
+                    match (row.get(i), existing_row.get(i)) {
+                        (Some(v1), Some(v2)) if v1 == v2 => continue,
+                        (None, None) => continue,
+                        _ => return false,
+                    }
+                }
+                true
+            });
+
+            if !is_duplicate {
+                indices.push(rows.len());
                 rows.push(inner.take_row());
             }
         }
@@ -1332,7 +1351,7 @@ impl QueryResult for DistinctResult {
         0
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
 }
@@ -1347,7 +1366,7 @@ pub struct AliasedResult {
 
 impl AliasedResult {
     /// Create a new aliased result
-    pub fn new(inner: Box<dyn QueryResult>, aliases: HashMap<String, String>) -> Self {
+    pub fn new(inner: Box<dyn QueryResult>, aliases: FxHashMap<String, String>) -> Self {
         let original_columns = inner.columns().to_vec();
         let aliased_columns = original_columns
             .iter()
@@ -1402,7 +1421,7 @@ impl QueryResult for AliasedResult {
         self.inner.last_insert_id()
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         // Apply additional aliases
         Box::new(AliasedResult::new(self, aliases))
     }
@@ -1490,7 +1509,7 @@ impl QueryResult for ProjectedResult {
         0
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
 }
@@ -1584,7 +1603,7 @@ impl QueryResult for ScannerResult {
         0
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
 }
@@ -1690,7 +1709,7 @@ impl QueryResult for StreamingProjectionResult {
         0
     }
 
-    fn with_aliases(self: Box<Self>, aliases: HashMap<String, String>) -> Box<dyn QueryResult> {
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
 }
@@ -1860,7 +1879,7 @@ mod tests {
 
         let inner = Box::new(ExecutorMemoryResult::new(columns, rows));
 
-        let mut aliases = std::collections::HashMap::new();
+        let mut aliases = FxHashMap::default();
         aliases.insert("user_name".to_string(), "name".to_string());
 
         let mut result = AliasedResult::new(inner, aliases);

@@ -20,8 +20,9 @@
 // - Fast to dispatch (small enum, good for branch prediction)
 // - Zero allocation (all data pre-computed at compile time)
 
-use std::collections::HashSet;
 use std::sync::Arc;
+
+use ahash::AHashSet;
 
 use crate::core::{DataType, Value};
 use crate::functions::ScalarFunction;
@@ -399,9 +400,9 @@ pub enum Op {
     /// Stack: [] -> [bool]
     LikeColumn(u16, Arc<CompiledPattern>, bool), // col_idx, pattern, case_insensitive
 
-    /// Fused: column IN (constant set)
+    /// Fused: column IN (constant set with AHash)
     /// Stack: [] -> [bool]
-    InSetColumn(u16, Arc<HashSet<Value>>, bool), // col_idx, set, has_null
+    InSetColumn(u16, Arc<AHashSet<Value>>, bool), // col_idx, set, has_null
 
     /// Fused: column BETWEEN low AND high (constants)
     /// Stack: [] -> [bool]
@@ -519,13 +520,13 @@ pub enum Op {
     // =========================================================================
     // SET OPERATIONS
     // =========================================================================
-    /// IN set membership (pre-built HashSet)
+    /// IN set membership (pre-built AHashSet for fast lookups)
     /// Stack: [value] -> [bool]
-    InSet(Arc<HashSet<Value>>, bool), // set, has_null
+    InSet(Arc<AHashSet<Value>>, bool), // set, has_null
 
     /// NOT IN set membership
     /// Stack: [value] -> [bool]
-    NotInSet(Arc<HashSet<Value>>, bool), // set, has_null
+    NotInSet(Arc<AHashSet<Value>>, bool), // set, has_null
 
     /// BETWEEN check: value BETWEEN low AND high
     /// Stack: [value, low, high] -> [bool]

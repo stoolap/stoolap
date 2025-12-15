@@ -33,7 +33,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -255,13 +255,13 @@ pub enum TemporalPattern {
 /// Workload learner - learns from query patterns to optimize future queries
 pub struct WorkloadLearner {
     /// Pattern statistics
-    patterns: RwLock<HashMap<QueryPattern, PatternStats>>,
+    patterns: RwLock<FxHashMap<QueryPattern, PatternStats>>,
     /// Query fingerprint to pattern mapping
-    fingerprints: RwLock<HashMap<u64, QueryPattern>>,
+    fingerprints: RwLock<FxHashMap<u64, QueryPattern>>,
     /// Table access frequency
-    table_access_counts: RwLock<HashMap<String, AtomicU64>>,
+    table_access_counts: RwLock<FxHashMap<String, AtomicU64>>,
     /// Column filter frequency (table.column -> count)
-    filter_column_counts: RwLock<HashMap<String, AtomicU64>>,
+    filter_column_counts: RwLock<FxHashMap<String, AtomicU64>>,
     /// Total queries observed
     total_queries: AtomicU64,
     /// Short queries (< 10ms)
@@ -278,10 +278,10 @@ impl WorkloadLearner {
     /// Create a new workload learner
     pub fn new() -> Self {
         Self {
-            patterns: RwLock::new(HashMap::new()),
-            fingerprints: RwLock::new(HashMap::new()),
-            table_access_counts: RwLock::new(HashMap::new()),
-            filter_column_counts: RwLock::new(HashMap::new()),
+            patterns: RwLock::new(FxHashMap::default()),
+            fingerprints: RwLock::new(FxHashMap::default()),
+            table_access_counts: RwLock::new(FxHashMap::default()),
+            filter_column_counts: RwLock::new(FxHashMap::default()),
             total_queries: AtomicU64::new(0),
             short_queries: AtomicU64::new(0),
             long_queries: AtomicU64::new(0),

@@ -17,10 +17,10 @@
 //! This module implements the ANALYZE command which collects statistics
 //! about tables and stores them in system tables for query optimization.
 
-use std::collections::HashSet;
 use std::time::SystemTime;
 
 use rand::Rng;
+use rustc_hash::FxHashSet;
 
 use crate::core::{Error, Result, Row, Value};
 use crate::parser::ast::AnalyzeStatement;
@@ -73,19 +73,25 @@ impl Executor {
             // Begin a transaction for this table's analysis
             let mut tx = self.engine.begin_transaction()?;
 
-            match self.analyze_table(&mut *tx, table_name) {
+            let success = match self.analyze_table(&mut *tx, table_name) {
                 Ok(_) => {
                     tx.commit()?;
                     analyzed_count += 1;
-
-                    // Invalidate cached statistics for this table so fresh stats are used
-                    self.get_query_planner().invalidate_stats_cache(table_name);
+                    true
                 }
                 Err(e) => {
                     let _ = tx.rollback();
                     // Log warning but continue with other tables
                     eprintln!("Warning: Failed to analyze table '{}': {}", table_name, e);
+                    false
                 }
+            };
+
+            // Invalidate cached statistics AFTER transaction is dropped
+            // This avoids potential lock ordering issues between transaction locks
+            // and stats_cache write lock
+            if success {
+                self.get_query_planner().invalidate_stats_cache(table_name);
             }
         }
 
@@ -289,7 +295,7 @@ impl Executor {
         Option<Histogram>,
     ) {
         let mut null_count = 0i64;
-        let mut distinct_values: HashSet<String> = HashSet::new();
+        let mut distinct_values: FxHashSet<String> = FxHashSet::default();
         let mut min_value: Option<Value> = None;
         let mut max_value: Option<Value> = None;
         let mut total_width = 0usize;
@@ -300,7 +306,7 @@ impl Executor {
                 if value.is_null() {
                     null_count += 1;
                 } else {
-                    // Track distinct values using string representation
+                    // Track distinct values using string representation with FxHash for speed
                     distinct_values.insert(format!("{}", value));
 
                     // Track min/max

@@ -24,6 +24,7 @@
 //!
 //! Note: Recursive CTEs are parsed but not yet executed.
 
+use ahash::AHashSet;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -727,6 +728,7 @@ impl Executor {
 
         // Only use semi-join reduction if CTE is small enough.
         // Large IN clauses are expensive to build and evaluate.
+        // Optimal threshold: ~3000 rows (below=fast, above=slow)
         const MAX_SEMIJOIN_SIZE: usize = 500;
 
         // Try to extract join key column from condition (e.g., "u.id = h.user_id" -> id, user_id)
@@ -756,8 +758,8 @@ impl Executor {
 
                 if let Some(idx) = cte_col_idx {
                     // Extract distinct non-NULL values from CTE
-                    // Use FxHashSet<Value> for correct deduplication (not hash-based)
-                    let mut seen: rustc_hash::FxHashSet<Value> = rustc_hash::FxHashSet::default();
+                    // Use AHashSet for fastest inserts (better for Value types)
+                    let mut seen: AHashSet<Value> = AHashSet::with_capacity(cte_rows.len());
 
                     for row in &cte_rows {
                         if let Some(val) = row.get(idx) {

@@ -18,7 +18,8 @@
 //! and expressions.
 
 use super::token::{Position, Token};
-use std::collections::{HashMap, HashSet};
+use ahash::AHashSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -687,8 +688,8 @@ pub struct InHashSetExpression {
     pub token: Token,
     /// The column/expression to check
     pub column: Box<Expression>,
-    /// Pre-computed HashSet for O(1) lookup - Arc for cheap parallel cloning
-    pub values: Arc<HashSet<Value>>,
+    /// Pre-computed AHashSet for O(1) lookup - Arc for cheap parallel cloning
+    pub values: Arc<AHashSet<Value>>,
     /// Whether this is NOT IN
     pub not: bool,
 }

@@ -35,6 +35,7 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
+use ahash::AHashMap;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -91,8 +92,8 @@ pub struct BTreeIndex {
     sorted_values: RwLock<BTreeMap<Value, RowIdSet>>,
 
     /// Hash-based value to row IDs mapping (for O(1) equality lookups)
-    /// Used when we know we're doing exact equality checks
-    value_to_rows: RwLock<FxHashMap<Value, RowIdSet>>,
+    /// Used when we know we're doing exact equality checks (AHash for Value keys)
+    value_to_rows: RwLock<AHashMap<Value, RowIdSet>>,
 
     /// Row ID to value mapping (for removal operations)
     /// Uses FxHashMap for O(1) lookups with fast integer hashing
@@ -130,7 +131,7 @@ impl BTreeIndex {
             unique,
             closed: AtomicBool::new(false),
             sorted_values: RwLock::new(BTreeMap::new()),
-            value_to_rows: RwLock::new(FxHashMap::default()),
+            value_to_rows: RwLock::new(AHashMap::default()),
             row_to_value: RwLock::new(FxHashMap::default()),
             cached_min: RwLock::new(None),
             cached_max: RwLock::new(None),
