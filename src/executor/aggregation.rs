@@ -32,7 +32,9 @@ use crate::parser::ast::*;
 use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
+#[allow(deprecated)]
 use super::expression::CompiledEvaluator;
+use super::expression::{ExpressionEval, RowFilter};
 use super::join::build_column_index_map;
 use super::result::ExecutorMemoryResult;
 use super::utils::hash_value_into;
@@ -243,9 +245,10 @@ impl Executor {
 
         let aggregation_limit = if can_push_limit {
             stmt.limit.as_ref().and_then(|limit_expr| {
-                let mut evaluator =
-                    CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-                evaluator.evaluate(limit_expr).ok().and_then(|v| match v {
+                let mut eval = ExpressionEval::compile(limit_expr, &[])
+                    .ok()?
+                    .with_context(ctx);
+                eval.eval_slice(&[]).ok().and_then(|v| match v {
                     crate::core::Value::Integer(n) if n >= 0 => Some(n as usize),
                     _ => None,
                 })
@@ -262,6 +265,7 @@ impl Executor {
                 &base_rows,
                 base_columns,
                 &col_index_map,
+                ctx,
             )?
         } else if stmt.group_by.modifier != GroupByModifier::None {
             // ROLLUP or CUBE aggregation
@@ -956,6 +960,7 @@ impl Executor {
                 &base_rows,
                 base_columns,
                 &col_index_map,
+                ctx,
             )?
         } else {
             // Grouped aggregation - no limit since window functions need all groups
@@ -973,46 +978,32 @@ impl Executor {
 
         // Apply HAVING clause filter (in-place)
         if let Some(ref having) = stmt.having {
-            // OPTIMIZATION: Create evaluator once and reuse for all rows
-            let mut having_eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            having_eval.init_columns(&result_columns);
-
             // Build aggregate expression aliases for HAVING clause
             // This maps "SUM(price)" to its column index even if aliased as "total"
             // IMPORTANT: Include ALL aggregates, not just aliased ones,
-            // because CompiledEvaluator needs expression_aliases to match FunctionCall expressions
+            // because the evaluator needs expression_aliases to match FunctionCall expressions
             let group_by_count = group_by_columns.len();
-            let agg_aliases: Vec<(String, usize)> = aggregations
+            let mut all_aliases: Vec<(String, usize)> = aggregations
                 .iter()
                 .enumerate()
                 .map(|(i, agg)| (agg.get_expression_name(), group_by_count + i))
                 .collect();
-            having_eval.add_aggregate_aliases(&agg_aliases);
 
             // Build GROUP BY expression aliases for HAVING clause
             // This maps expressions like "x + y" to their GROUP BY column indices
             // allowing HAVING x + y > 20 to work when GROUP BY x + y
-            let expr_aliases: Vec<(String, usize)> = group_by_columns
-                .iter()
-                .enumerate()
-                .filter_map(|(i, item)| {
-                    if let GroupByItem::Expression { expr, .. } = item {
-                        Some((self.expression_to_string(expr), i))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            having_eval.add_expression_aliases(&expr_aliases);
-
-            let mut filtered_rows = Vec::with_capacity(result_rows.len());
-            for row in result_rows {
-                having_eval.set_row_array(&row);
-                if having_eval.evaluate_bool(having)? {
-                    filtered_rows.push(row);
+            for (i, item) in group_by_columns.iter().enumerate() {
+                if let GroupByItem::Expression { expr, .. } = item {
+                    all_aliases.push((self.expression_to_string(expr), i));
                 }
             }
-            result_rows = filtered_rows;
+
+            // Create RowFilter with all aliases and context
+            let having_filter =
+                RowFilter::with_aliases(having, &result_columns, &all_aliases)?.with_context(ctx);
+
+            // Filter rows using the pre-compiled filter
+            result_rows.retain(|row| having_filter.matches(row));
         }
 
         Ok((result_columns, result_rows))
@@ -1512,6 +1503,7 @@ impl Executor {
         rows: &[Row],
         columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
+        ctx: &ExecutionContext,
     ) -> Result<(Vec<String>, Vec<Row>)> {
         // Check if any aggregation has an expression (e.g., SUM(val * 2)), ORDER BY, or FILTER
         let has_expression = aggregations
@@ -1580,11 +1572,52 @@ impl Executor {
         // Check if any aggregation uses DISTINCT (can't parallelize easily)
         let has_distinct = aggregations.iter().any(|a| a.distinct);
 
-        // Create evaluator for expression evaluation (if needed)
-        let mut expr_evaluator = if has_expression {
-            let mut eval = CompiledEvaluator::new(&self.function_registry);
-            eval.init_columns(columns);
-            Some(eval)
+        // Pre-compile filter, expression, and ORDER BY programs for VM-based evaluation
+        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
+        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+        let compiled_filters: Vec<Option<SharedProgram>> = if has_expression {
+            aggregations
+                .iter()
+                .map(|agg| {
+                    agg.filter
+                        .as_ref()
+                        .map(|f| compile_expression(f, columns))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![None; aggregations.len()]
+        };
+        let compiled_agg_expressions: Vec<Option<SharedProgram>> = if has_expression {
+            aggregations
+                .iter()
+                .map(|agg| {
+                    agg.expression
+                        .as_ref()
+                        .map(|e| compile_expression(e, columns))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![None; aggregations.len()]
+        };
+        // Pre-compile ORDER BY expressions for each aggregation
+        // CRITICAL: Propagate errors instead of silently skipping failed compilations
+        let compiled_order_by: Vec<Vec<SharedProgram>> = if has_expression {
+            aggregations
+                .iter()
+                .map(|agg| {
+                    agg.order_by
+                        .iter()
+                        .map(|o| compile_expression(&o.expression, columns))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![Vec::new(); aggregations.len()]
+        };
+        let mut expr_vm = if has_expression {
+            Some(ExprVM::new())
         } else {
             None
         };
@@ -1748,33 +1781,36 @@ impl Executor {
                 let mut expr_values: Vec<Value> = vec![Value::null_unknown(); aggregations.len()];
 
                 for row in rows {
-                    // If we have an evaluator, set the current row
-                    if let Some(ref mut eval) = expr_evaluator {
-                        eval.set_row_array(row);
-                    }
+                    // Create execution context for this row
+                    // CRITICAL: Include params for parameterized queries
+                    let row_data = row.as_slice();
+                    let exec_ctx = ExecuteContext::new(row_data)
+                        .with_params(ctx.params())
+                        .with_named_params(ctx.named_params());
 
                     for (i, agg) in aggregations.iter().enumerate() {
                         if let Some(ref mut func) = agg_funcs[i] {
                             // Check FILTER clause first - skip row if filter is false
-                            if let Some(ref filter) = agg.filter {
-                                if let Some(ref mut eval) = expr_evaluator {
-                                    match eval.evaluate(filter) {
+                            if let Some(ref filter_program) = compiled_filters[i] {
+                                if let Some(ref mut vm) = expr_vm {
+                                    match vm.execute(filter_program, &exec_ctx) {
                                         Ok(Value::Boolean(true)) => {} // Continue with accumulation
                                         Ok(Value::Boolean(false)) | Ok(Value::Null(_)) => continue, // Skip this row
                                         Ok(_) => continue, // Non-boolean treated as false
                                         Err(_) => continue, // Error treated as false
                                     }
                                 } else {
-                                    // Can't evaluate filter without evaluator - skip
+                                    // Can't evaluate filter without VM - skip
                                     continue;
                                 }
                             }
 
                             // Get the value to accumulate
-                            let value = if let Some(ref expr) = agg.expression {
-                                // Evaluate the expression for this row
-                                if let Some(ref mut eval) = expr_evaluator {
-                                    match eval.evaluate(expr) {
+                            let value = if let Some(ref expr_program) = compiled_agg_expressions[i]
+                            {
+                                // Evaluate the expression for this row using VM
+                                if let Some(ref mut vm) = expr_vm {
+                                    match vm.execute(expr_program, &exec_ctx) {
                                         Ok(val) => {
                                             expr_values[i] = val;
                                             Some(&expr_values[i])
@@ -1804,13 +1840,14 @@ impl Executor {
 
                             if let Some(v) = value {
                                 // Check if this aggregate has ORDER BY and supports it
-                                if !agg.order_by.is_empty() && func.supports_order_by() {
-                                    // Evaluate ORDER BY expressions to get sort keys
-                                    if let Some(ref mut eval) = expr_evaluator {
-                                        let mut sort_keys = Vec::with_capacity(agg.order_by.len());
+                                if !compiled_order_by[i].is_empty() && func.supports_order_by() {
+                                    // Evaluate ORDER BY expressions to get sort keys using pre-compiled programs
+                                    if let Some(ref mut vm) = expr_vm {
+                                        let mut sort_keys =
+                                            Vec::with_capacity(compiled_order_by[i].len());
                                         let mut all_ok = true;
-                                        for order_expr in &agg.order_by {
-                                            match eval.evaluate(&order_expr.expression) {
+                                        for order_program in &compiled_order_by[i] {
+                                            match vm.execute(order_program, &exec_ctx) {
                                                 Ok(key) => sort_keys.push(key),
                                                 Err(_) => {
                                                     all_ok = false;
@@ -1826,7 +1863,7 @@ impl Executor {
                                             );
                                         }
                                     } else {
-                                        // No evaluator - fall back to regular accumulate
+                                        // No VM - fall back to regular accumulate
                                         func.accumulate(v, agg.distinct);
                                     }
                                 } else {
@@ -2278,16 +2315,23 @@ impl Executor {
             .collect();
 
         // OPTIMIZATION: Check if we have any Expression GROUP BY items
-        // If so, create one evaluator and reuse it for all rows
+        // If so, pre-compile expressions and use VM for evaluation
         let has_expr_group_by = precomputed_group_by
             .iter()
             .any(|item| matches!(item, PrecomputedGroupBy::Expression(_)));
 
-        // Create evaluator if we have GROUP BY expressions or aggregate expressions
-        let mut expr_evaluator = if has_expr_group_by || has_agg_expression {
-            let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            eval.init_columns(columns);
-            Some(eval)
+        // Pre-compile GROUP BY expressions for VM-based evaluation
+        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
+        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+        let compiled_group_by_exprs: Vec<Option<SharedProgram>> = precomputed_group_by
+            .iter()
+            .map(|item| match item {
+                PrecomputedGroupBy::Expression(expr) => compile_expression(expr, columns).map(Some),
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut expr_vm = if has_expr_group_by || has_agg_expression {
+            Some(ExprVM::new())
         } else {
             None
         };
@@ -2305,7 +2349,7 @@ impl Executor {
         let group_limit = limit.unwrap_or(usize::MAX);
         let has_limit = limit.is_some();
 
-        if all_simple_columns && expr_evaluator.is_none() {
+        if all_simple_columns && expr_vm.is_none() {
             // Fast path: hash directly from row references, only clone for new groups
             let column_indices: Vec<usize> = precomputed_group_by
                 .iter()
@@ -2356,7 +2400,14 @@ impl Executor {
             for (row_idx, row) in rows.iter().enumerate() {
                 key_buffer.clear();
 
-                for item in &precomputed_group_by {
+                // Create execution context for this row
+                // CRITICAL: Include params for parameterized queries
+                let row_data = row.as_slice();
+                let exec_ctx = ExecuteContext::new(row_data)
+                    .with_params(ctx.params())
+                    .with_named_params(ctx.named_params());
+
+                for (i, item) in precomputed_group_by.iter().enumerate() {
                     let value = match item {
                         PrecomputedGroupBy::ColumnIndex(idx) => {
                             row.get(*idx).cloned().unwrap_or_else(Value::null_unknown)
@@ -2364,11 +2415,12 @@ impl Executor {
                         PrecomputedGroupBy::Position(idx) => {
                             row.get(*idx).cloned().unwrap_or_else(Value::null_unknown)
                         }
-                        PrecomputedGroupBy::Expression(expr) => {
-                            // OPTIMIZATION: Reuse evaluator instead of creating new one per row
-                            if let Some(ref mut eval) = expr_evaluator {
-                                eval.set_row_array(row);
-                                eval.evaluate(expr)
+                        PrecomputedGroupBy::Expression(_) => {
+                            // Use pre-compiled expression with VM
+                            if let (Some(ref mut vm), Some(ref program)) =
+                                (&mut expr_vm, &compiled_group_by_exprs[i])
+                            {
+                                vm.execute(program, &exec_ctx)
                                     .unwrap_or_else(|_| Value::null_unknown())
                             } else {
                                 Value::null_unknown()
@@ -2401,6 +2453,51 @@ impl Executor {
 
         // Convert groups to Vec for parallel processing
         let groups_vec: Vec<(u64, GroupEntry)> = groups.into_iter().collect();
+
+        // Pre-compile aggregate filter and expression programs for VM-based evaluation
+        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
+        let compiled_agg_filters: Vec<Option<SharedProgram>> = if has_agg_expression {
+            aggregations
+                .iter()
+                .map(|agg| {
+                    agg.filter
+                        .as_ref()
+                        .map(|f| compile_expression(f, columns))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![None; aggregations.len()]
+        };
+        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
+        let compiled_agg_expressions: Vec<Option<SharedProgram>> = if has_agg_expression {
+            aggregations
+                .iter()
+                .map(|agg| {
+                    agg.expression
+                        .as_ref()
+                        .map(|e| compile_expression(e, columns))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![None; aggregations.len()]
+        };
+        // Pre-compile ORDER BY expressions for each aggregation
+        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
+        let compiled_agg_order_by: Vec<Vec<SharedProgram>> = if has_agg_expression {
+            aggregations
+                .iter()
+                .map(|agg| {
+                    agg.order_by
+                        .iter()
+                        .map(|o| compile_expression(&o.expression, columns))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![Vec::new(); aggregations.len()]
+        };
 
         // Determine if parallel processing is beneficial
         // Don't use parallel processing when expressions are involved (harder to handle)
@@ -2523,33 +2620,36 @@ impl Executor {
                 for &row_idx in &group.row_indices {
                     let row = &rows[row_idx];
 
-                    // If we have an evaluator, set the current row
-                    if let Some(ref mut eval) = expr_evaluator {
-                        eval.set_row_array(row);
-                    }
+                    // Create execution context for this row
+                    // CRITICAL: Include params for parameterized queries
+                    let row_data = row.as_slice();
+                    let exec_ctx = ExecuteContext::new(row_data)
+                        .with_params(ctx.params())
+                        .with_named_params(ctx.named_params());
 
                     for (i, agg) in aggregations.iter().enumerate() {
                         if let Some(ref mut func) = agg_funcs[i] {
                             // Check FILTER clause first - skip row if filter is false
-                            if let Some(ref filter) = agg.filter {
-                                if let Some(ref mut eval) = expr_evaluator {
-                                    match eval.evaluate(filter) {
+                            if let Some(ref filter_program) = compiled_agg_filters[i] {
+                                if let Some(ref mut vm) = expr_vm {
+                                    match vm.execute(filter_program, &exec_ctx) {
                                         Ok(Value::Boolean(true)) => {} // Continue with accumulation
                                         Ok(Value::Boolean(false)) | Ok(Value::Null(_)) => continue, // Skip this row
                                         Ok(_) => continue, // Non-boolean treated as false
                                         Err(_) => continue, // Error treated as false
                                     }
                                 } else {
-                                    // Can't evaluate filter without evaluator - skip
+                                    // Can't evaluate filter without VM - skip
                                     continue;
                                 }
                             }
 
                             // Check if this aggregate has an expression to evaluate
-                            let value = if let Some(ref expr) = agg.expression {
-                                // Evaluate the expression for this row
-                                if let Some(ref mut eval) = expr_evaluator {
-                                    match eval.evaluate(expr) {
+                            let value = if let Some(ref expr_program) = compiled_agg_expressions[i]
+                            {
+                                // Evaluate the expression for this row using VM
+                                if let Some(ref mut vm) = expr_vm {
+                                    match vm.execute(expr_program, &exec_ctx) {
                                         Ok(val) => {
                                             expr_values[i] = val;
                                             Some(&expr_values[i])
@@ -2579,13 +2679,15 @@ impl Executor {
 
                             if let Some(v) = value {
                                 // Check if this aggregate has ORDER BY and supports it
-                                if !agg.order_by.is_empty() && func.supports_order_by() {
-                                    // Evaluate ORDER BY expressions to get sort keys
-                                    if let Some(ref mut eval) = expr_evaluator {
-                                        let mut sort_keys = Vec::with_capacity(agg.order_by.len());
+                                if !compiled_agg_order_by[i].is_empty() && func.supports_order_by()
+                                {
+                                    // Evaluate ORDER BY expressions to get sort keys using pre-compiled programs
+                                    if let Some(ref mut vm) = expr_vm {
+                                        let mut sort_keys =
+                                            Vec::with_capacity(compiled_agg_order_by[i].len());
                                         let mut all_ok = true;
-                                        for order_expr in &agg.order_by {
-                                            match eval.evaluate(&order_expr.expression) {
+                                        for order_program in &compiled_agg_order_by[i] {
+                                            match vm.execute(order_program, &exec_ctx) {
                                                 Ok(key) => sort_keys.push(key),
                                                 Err(_) => {
                                                     all_ok = false;
@@ -2601,7 +2703,7 @@ impl Executor {
                                             );
                                         }
                                     } else {
-                                        // No evaluator - fall back to regular accumulate
+                                        // No VM - fall back to regular accumulate
                                         func.accumulate(v, agg.distinct);
                                     }
                                 } else {
@@ -2718,15 +2820,40 @@ impl Executor {
             })
             .collect();
 
-        // Create evaluator if we have GROUP BY expressions or aggregate expressions
+        // Pre-compile GROUP BY and aggregate expressions for VM-based evaluation
         let has_expr_group_by = precomputed_group_by
             .iter()
             .any(|item| matches!(item, PrecomputedGroupBy::Expression(_)));
 
-        let mut expr_evaluator = if has_expr_group_by || has_agg_expression {
-            let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            eval.init_columns(columns);
-            Some(eval)
+        // Pre-compile GROUP BY expressions
+        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
+        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+        let compiled_group_by_exprs: Vec<Option<SharedProgram>> = precomputed_group_by
+            .iter()
+            .map(|item| match item {
+                PrecomputedGroupBy::Expression(expr) => compile_expression(expr, columns).map(Some),
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Pre-compile aggregate expressions
+        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
+        let compiled_agg_expressions: Vec<Option<SharedProgram>> = if has_agg_expression {
+            aggregations
+                .iter()
+                .map(|agg| {
+                    agg.expression
+                        .as_ref()
+                        .map(|e| compile_expression(e, columns))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![None; aggregations.len()]
+        };
+
+        let mut expr_vm = if has_expr_group_by || has_agg_expression {
+            Some(ExprVM::new())
         } else {
             None
         };
@@ -2758,15 +2885,18 @@ impl Executor {
                 let mut expr_values: Vec<Value> = vec![Value::null_unknown(); aggregations.len()];
 
                 for row in rows {
-                    if let Some(ref mut eval) = expr_evaluator {
-                        eval.set_row_array(row);
-                    }
+                    // Create execution context for this row
+                    // CRITICAL: Include params for parameterized queries
+                    let row_data = row.as_slice();
+                    let exec_ctx = ExecuteContext::new(row_data)
+                        .with_params(ctx.params())
+                        .with_named_params(ctx.named_params());
 
                     for (i, agg) in aggregations.iter().enumerate() {
                         if let Some(ref mut func) = agg_funcs[i] {
-                            if let Some(ref expr) = agg.expression {
-                                if let Some(ref mut eval) = expr_evaluator {
-                                    if let Ok(val) = eval.evaluate(expr) {
+                            if let Some(ref expr_program) = compiled_agg_expressions[i] {
+                                if let Some(ref mut vm) = expr_vm {
+                                    if let Ok(val) = vm.execute(expr_program, &exec_ctx) {
                                         expr_values[i] = val;
                                         func.accumulate(&expr_values[i], agg.distinct);
                                     }
@@ -2816,6 +2946,13 @@ impl Executor {
                 for (row_idx, row) in rows.iter().enumerate() {
                     key_buffer.clear();
 
+                    // Create execution context for this row
+                    // CRITICAL: Include params for parameterized queries
+                    let row_data = row.as_slice();
+                    let exec_ctx = ExecuteContext::new(row_data)
+                        .with_params(ctx.params())
+                        .with_named_params(ctx.named_params());
+
                     // Only include active columns in the key
                     for (col_idx, &is_active) in grouping_set.active_columns.iter().enumerate() {
                         if is_active {
@@ -2826,10 +2963,12 @@ impl Executor {
                                 PrecomputedGroupBy::Position(idx) => {
                                     row.get(*idx).cloned().unwrap_or_else(Value::null_unknown)
                                 }
-                                PrecomputedGroupBy::Expression(expr) => {
-                                    if let Some(ref mut eval) = expr_evaluator {
-                                        eval.set_row_array(row);
-                                        eval.evaluate(expr)
+                                PrecomputedGroupBy::Expression(_) => {
+                                    // Use pre-compiled expression with VM
+                                    if let (Some(ref mut vm), Some(ref program)) =
+                                        (&mut expr_vm, &compiled_group_by_exprs[col_idx])
+                                    {
+                                        vm.execute(program, &exec_ctx)
                                             .unwrap_or_else(|_| Value::null_unknown())
                                     } else {
                                         Value::null_unknown()
@@ -2880,15 +3019,19 @@ impl Executor {
                     let count_star_value = Value::Integer(1);
                     for &row_idx in &group.row_indices {
                         let row = &rows[row_idx];
-                        if let Some(ref mut eval) = expr_evaluator {
-                            eval.set_row_array(row);
-                        }
+
+                        // Create execution context for this row
+                        // CRITICAL: Include params for parameterized queries
+                        let row_data = row.as_slice();
+                        let exec_ctx = ExecuteContext::new(row_data)
+                            .with_params(ctx.params())
+                            .with_named_params(ctx.named_params());
 
                         for (i, agg) in aggregations.iter().enumerate() {
                             if let Some(ref mut func) = agg_funcs[i] {
-                                if let Some(ref expr) = agg.expression {
-                                    if let Some(ref mut eval) = expr_evaluator {
-                                        if let Ok(val) = eval.evaluate(expr) {
+                                if let Some(ref expr_program) = compiled_agg_expressions[i] {
+                                    if let Some(ref mut vm) = expr_vm {
+                                        if let Ok(val) = vm.execute(expr_program, &exec_ctx) {
                                             expr_values[i] = val;
                                             func.accumulate(&expr_values[i], agg.distinct);
                                         }
@@ -3136,20 +3279,19 @@ impl Executor {
             rows.push(result.take_row());
         }
 
-        // Filter rows based on HAVING clause
-        // OPTIMIZATION: Create evaluator once and reuse for all rows
-        let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-        eval.init_columns(columns);
-        eval.add_aggregate_aliases(agg_aliases);
-        eval.add_expression_aliases(expr_aliases);
+        // Combine all aliases for HAVING clause evaluation
+        let mut all_aliases: Vec<(String, usize)> = agg_aliases.to_vec();
+        all_aliases.extend_from_slice(expr_aliases);
 
-        let mut filtered_rows = Vec::new();
-        for row in rows {
-            eval.set_row_array(&row);
-            if eval.evaluate_bool(having)? {
-                filtered_rows.push(row);
-            }
-        }
+        // Create RowFilter with all aliases and context
+        let having_filter =
+            RowFilter::with_aliases(having, columns, &all_aliases)?.with_context(ctx);
+
+        // Filter rows using the pre-compiled filter
+        let filtered_rows: Vec<Row> = rows
+            .into_iter()
+            .filter(|row| having_filter.matches(row))
+            .collect();
 
         Ok(Box::new(ExecutorMemoryResult::new(
             columns.to_vec(),

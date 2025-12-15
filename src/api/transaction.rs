@@ -32,13 +32,10 @@
 //! tx.commit()?;
 //! ```
 
-use std::sync::Arc;
-
 use crate::core::{Error, Result, Row, Value};
 use crate::executor::context::ExecutionContext;
-use crate::executor::expression::CompiledEvaluator;
+use crate::executor::expression::ExpressionEval;
 use crate::executor::result::ExecutorMemoryResult;
-use crate::functions::FunctionRegistry;
 use crate::parser::ast::{Expression, Statement};
 use crate::parser::Parser;
 use crate::storage::traits::{QueryResult, Transaction as StorageTransaction};
@@ -53,20 +50,15 @@ use super::rows::Rows;
 /// Must be explicitly committed or rolled back.
 pub struct Transaction {
     tx: Option<Box<dyn StorageTransaction>>,
-    function_registry: Arc<FunctionRegistry>,
     committed: bool,
     rolled_back: bool,
 }
 
 impl Transaction {
     /// Create a new transaction wrapper
-    pub(crate) fn new(
-        tx: Box<dyn StorageTransaction>,
-        function_registry: Arc<FunctionRegistry>,
-    ) -> Self {
+    pub(crate) fn new(tx: Box<dyn StorageTransaction>) -> Self {
         Self {
             tx: Some(tx),
-            function_registry,
             committed: false,
             rolled_back: false,
         }
@@ -213,15 +205,14 @@ impl Transaction {
                 let table_name = &stmt.table_name.value;
                 let mut table = tx.get_table(table_name)?;
 
-                let mut evaluator =
-                    CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-
                 let mut total_inserted = 0i64;
 
                 for row_values in &stmt.values {
                     let mut values = Vec::with_capacity(row_values.len());
                     for expr in row_values {
-                        values.push(evaluator.evaluate(expr)?);
+                        // Use ExpressionEval for value expression evaluation
+                        let mut eval = ExpressionEval::compile(expr, &[])?.with_context(ctx);
+                        values.push(eval.eval_slice(&[])?);
                     }
 
                     let row = Row::from_values(values);
@@ -232,6 +223,10 @@ impl Transaction {
                 Ok(Box::new(ExecResult::with_rows_affected(total_inserted)))
             }
             Statement::Update(stmt) => {
+                use crate::executor::expression::{
+                    compile_expression, ExecuteContext, ExprVM, RowFilter, SharedProgram,
+                };
+
                 let table_name = &stmt.table_name.value;
                 let mut table = tx.get_table(table_name)?;
                 // Get column names owned to avoid borrow conflict with table.update()
@@ -239,46 +234,70 @@ impl Transaction {
 
                 // Build the setter function that applies updates
                 let updates = stmt.updates.clone();
-                let function_registry = &self.function_registry;
-                let ctx_clone = ctx.clone();
 
-                // OPTIMIZATION: Pre-compute column indices for updates (avoid per-row lookups)
-                let update_indices: Vec<(usize, &crate::parser::Expression)> = updates
+                // OPTIMIZATION: Pre-compile WHERE clause (if present) using RowFilter
+                // CRITICAL: Must include context for parameter support
+                let where_filter: Option<RowFilter> = stmt
+                    .where_clause
+                    .as_ref()
+                    .map(|expr| RowFilter::new(expr, &columns).map(|f| f.with_context(ctx)))
+                    .transpose()?;
+
+                // OPTIMIZATION: Pre-compile update expressions and compute column indices
+                // CRITICAL: Return errors instead of silently skipping failed compilations
+                let compiled_updates: Vec<(usize, SharedProgram)> = updates
                     .iter()
-                    .filter_map(|(col_name, expr)| {
-                        columns
+                    .map(|(col_name, expr)| {
+                        let idx = columns
                             .iter()
                             .position(|c| c.eq_ignore_ascii_case(col_name))
-                            .map(|idx| (idx, expr))
+                            .ok_or_else(|| Error::ColumnNotFoundNamed(col_name.clone()))?;
+                        let program = compile_expression(expr, &columns)?;
+                        Ok((idx, program))
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
 
-                // OPTIMIZATION: Create evaluator once outside the loop
-                let mut evaluator =
-                    CompiledEvaluator::new(function_registry).with_context(&ctx_clone);
-                evaluator.init_columns(&columns);
+                // Create VM for expression execution (reused for all rows)
+                let mut vm = ExprVM::new();
+
+                // CRITICAL: Capture errors from setter since closure can't return Result
+                use std::cell::RefCell;
+                let update_error: RefCell<Option<Error>> = RefCell::new(None);
 
                 let mut setter = |row: Row| -> (Row, bool) {
-                    // Check WHERE clause if present
-                    if let Some(ref where_clause) = stmt.where_clause {
-                        evaluator.set_row_array(&row);
-                        match evaluator.evaluate_bool(where_clause) {
-                            Ok(true) => {}
-                            _ => return (row, false),
+                    // If we already have an error, skip processing
+                    if update_error.borrow().is_some() {
+                        return (row, false);
+                    }
+
+                    // Check WHERE clause if present (uses thread-local VM internally)
+                    if let Some(ref filter) = where_filter {
+                        if !filter.matches(&row) {
+                            return (row, false);
                         }
                     }
 
-                    // OPTIMIZATION: Use set_row_array instead of creating new evaluator per column
-                    evaluator.set_row_array(&row);
+                    // Evaluate all expressions first (while we can still borrow row)
+                    let row_data = row.as_slice();
+                    let exec_ctx = ExecuteContext::new(row_data);
 
-                    // Apply updates using pre-computed indices
-                    // OPTIMIZATION: Take ownership of row's values to avoid clone
-                    let mut new_values = row.into_values();
-
-                    for (idx, expr) in &update_indices {
-                        if let Ok(value) = evaluator.evaluate(expr) {
-                            new_values[*idx] = value;
+                    // CRITICAL: Collect evaluated values, capturing any errors
+                    let mut updates_to_apply: Vec<(usize, Value)> =
+                        Vec::with_capacity(compiled_updates.len());
+                    for (idx, program) in compiled_updates.iter() {
+                        match vm.execute(program, &exec_ctx) {
+                            Ok(v) => updates_to_apply.push((*idx, v)),
+                            Err(e) => {
+                                *update_error.borrow_mut() = Some(e);
+                                return (row, false);
+                            }
                         }
+                    }
+
+                    // Now apply updates - take ownership of row
+                    let mut new_values = row.into_values();
+                    for (idx, value) in updates_to_apply {
+                        new_values[idx] = value;
                     }
 
                     (Row::from_values(new_values), true)
@@ -286,6 +305,11 @@ impl Transaction {
 
                 // Use None for where_expr since we handle WHERE in the setter
                 let updated_count = table.update(None, &mut setter)?;
+
+                // Check if any errors were captured during update
+                if let Some(err) = update_error.into_inner() {
+                    return Err(err);
+                }
 
                 Ok(Box::new(ExecResult::with_rows_affected(
                     updated_count as i64,
@@ -313,9 +337,6 @@ impl Transaction {
                 let table_expr = match &stmt.table_expr {
                     Some(expr) => expr,
                     None => {
-                        let mut evaluator =
-                            CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-
                         let mut columns = Vec::new();
                         let mut values = Vec::new();
 
@@ -326,7 +347,10 @@ impl Transaction {
                                 _ => format!("expr{}", i + 1),
                             };
                             columns.push(col_name);
-                            values.push(evaluator.evaluate(col_expr)?);
+                            // Use ExpressionEval for constant expression evaluation
+                            let mut eval =
+                                ExpressionEval::compile(col_expr, &[])?.with_context(ctx);
+                            values.push(eval.eval_slice(&[])?);
                         }
 
                         let rows = vec![Row::from_values(values)];
@@ -446,10 +470,10 @@ impl Transaction {
                     }
                 };
 
-                // Get value from right side
-                let mut evaluator =
-                    CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-                let value = evaluator.evaluate(&infix.right)?;
+                // Get value from right side (constant expression, no row context needed)
+                let value = ExpressionEval::compile(&infix.right, &[])?
+                    .with_context(ctx)
+                    .eval_slice(&[])?;
 
                 Ok(Box::new(ComparisonExpr::new(column, op, value)))
             }
@@ -468,45 +492,72 @@ impl Transaction {
         rows: Vec<Row>,
         ctx: &ExecutionContext,
     ) -> Result<(Vec<String>, Vec<Row>)> {
+        use crate::executor::expression::compile_expression;
+
         let mut result_columns = Vec::new();
         let mut result_rows = Vec::new();
 
-        // Determine output columns
+        // Pre-compile expressions and determine output columns
+        // Store either None for Star or Some(program) for compiled expressions
+        let mut compiled_exprs: Vec<Option<crate::executor::expression::SharedProgram>> =
+            Vec::with_capacity(stmt.columns.len());
+
         for (i, col_expr) in stmt.columns.iter().enumerate() {
             match col_expr {
                 Expression::Star(_) => {
                     result_columns.extend(source_columns.iter().cloned());
+                    compiled_exprs.push(None); // Star marker
                 }
                 Expression::Aliased(a) => {
                     result_columns.push(a.alias.value.clone());
+                    compiled_exprs.push(Some(compile_expression(col_expr, source_columns)?));
                 }
                 Expression::Identifier(id) => {
                     result_columns.push(id.value.clone());
+                    compiled_exprs.push(Some(compile_expression(col_expr, source_columns)?));
                 }
                 _ => {
                     result_columns.push(format!("expr{}", i + 1));
+                    compiled_exprs.push(Some(compile_expression(col_expr, source_columns)?));
                 }
             }
         }
 
-        // OPTIMIZATION: Create evaluator once and reuse for all rows
-        let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-        eval.init_columns(source_columns);
+        // Create execution context with parameters
+        let params = ctx.params();
+        // Convert HashMap to FxHashMap for ExecuteContext
+        let named_params: rustc_hash::FxHashMap<String, Value> = ctx
+            .named_params()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // Create VM for execution (reused for all rows and expressions)
+        let mut vm = crate::executor::expression::ExprVM::new();
         let num_cols = stmt.columns.len();
 
         // Project each row
         for row in rows {
-            eval.set_row_array(&row);
+            let row_data = row.as_slice();
+            let mut exec_ctx = crate::executor::expression::ExecuteContext::new(row_data);
+            if !params.is_empty() {
+                exec_ctx = exec_ctx.with_params(params);
+            }
+            if !named_params.is_empty() {
+                exec_ctx = exec_ctx.with_named_params(&named_params);
+            }
+
             let mut values = Vec::with_capacity(num_cols.max(row.len()));
 
-            for col_expr in &stmt.columns {
-                match col_expr {
-                    Expression::Star(_) => {
-                        // OPTIMIZATION: Use extend_from_slice instead of iter().cloned()
-                        values.extend_from_slice(row.as_slice());
+            for compiled in &compiled_exprs {
+                match compiled {
+                    None => {
+                        // Star: expand all columns
+                        values.extend_from_slice(row_data);
                     }
-                    _ => {
-                        values.push(eval.evaluate(col_expr)?);
+                    Some(program) => {
+                        // Execute pre-compiled expression
+                        values.push(vm.execute(program, &exec_ctx)?);
                     }
                 }
             }

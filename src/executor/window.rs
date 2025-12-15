@@ -43,7 +43,7 @@ use crate::parser::ast::*;
 use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
-use super::expression::CompiledEvaluator;
+use super::expression::{ExpressionEval, MultiExpressionEval};
 use super::join::build_column_index_map;
 use super::result::ExecutorMemoryResult;
 use super::Executor;
@@ -152,15 +152,9 @@ impl Executor {
         let num_rows = base_rows.len();
         let mut result_rows: Vec<Row> = Vec::with_capacity(num_rows);
 
-        // Create evaluator once for expression evaluation
-        // Include ALL col_index_map entries as aggregate aliases for CompiledEvaluator
+        // Build aliases from col_index_map for expression evaluation
         let agg_aliases: Vec<(String, usize)> =
             col_index_map.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-        evaluator.init_columns(base_columns);
-        if !agg_aliases.is_empty() {
-            evaluator.add_aggregate_aliases(&agg_aliases);
-        }
 
         // Pre-transform expressions with window functions by replacing Window expr with Identifier
         // This is done once, not per row
@@ -187,67 +181,112 @@ impl Executor {
             }
         }
 
-        // Create a new evaluator with extended columns
-        let mut ext_evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-        ext_evaluator.init_columns(&extended_columns);
-        if !agg_aliases.is_empty() {
-            ext_evaluator.add_aggregate_aliases(&agg_aliases);
-        }
+        // Collect Expression items (with base_columns) and their indices
+        let base_expr_items: Vec<(usize, &Expression)> = transformed_items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (item, _, _))| {
+                if let SelectItemSource::Expression(expr) = &item.source {
+                    Some((i, expr))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Collect ExpressionWithWindow transformed expressions and their indices
+        let ext_expr_items: Vec<(usize, &Expression)> = transformed_items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, transformed_opt, _))| transformed_opt.as_ref().map(|t| (i, t)))
+            .collect();
+
+        // Pre-compile base expressions (Expression items with base_columns)
+        // CRITICAL: Propagate compilation errors instead of silently producing NULLs
+        let base_exprs: Vec<Expression> =
+            base_expr_items.iter().map(|(_, e)| (*e).clone()).collect();
+        let mut base_eval = if !base_exprs.is_empty() {
+            Some(
+                MultiExpressionEval::compile_with_aliases(&base_exprs, base_columns, &agg_aliases)?
+                    .with_context(ctx),
+            )
+        } else {
+            None
+        };
+
+        // Pre-compile extended expressions (ExpressionWithWindow with extended_columns)
+        // CRITICAL: Propagate compilation errors instead of silently producing NULLs
+        let ext_exprs: Vec<Expression> = ext_expr_items.iter().map(|(_, e)| (*e).clone()).collect();
+        let mut ext_eval = if !ext_exprs.is_empty() {
+            Some(
+                MultiExpressionEval::compile_with_aliases(
+                    &ext_exprs,
+                    &extended_columns,
+                    &agg_aliases,
+                )?
+                .with_context(ctx),
+            )
+        } else {
+            None
+        };
 
         for (row_idx, base_row) in base_rows.iter().enumerate() {
-            let mut values = Vec::with_capacity(select_items.len());
+            // Initialize result values with null
+            let mut values: Vec<Value> = vec![Value::null_unknown(); select_items.len()];
 
-            // Build extended row once per base row: base_row + ALL window function values
-            // This is built lazily only if needed
-            let mut ext_row_cached: Option<Row> = None;
-
-            for (item, transformed_opt, _wf_name_opt) in &transformed_items {
-                let value = match &item.source {
-                    SelectItemSource::BaseColumn(col_idx) => base_row
-                        .get(*col_idx)
-                        .cloned()
-                        .unwrap_or_else(Value::null_unknown),
-                    SelectItemSource::WindowFunction(wf_name_lower) => window_value_map
-                        .get(wf_name_lower) // wf_name_lower is already lowercase
-                        .and_then(|vals| vals.get(row_idx).cloned())
-                        .unwrap_or_else(Value::null_unknown),
-                    SelectItemSource::Expression(expr) => {
-                        // For expressions, evaluate using the evaluator
-                        evaluator.set_row_array(base_row);
-                        evaluator
-                            .evaluate(expr)
-                            .unwrap_or_else(|_| Value::null_unknown())
+            // Fill BaseColumn and WindowFunction items directly
+            for (item_idx, (item, _, _)) in transformed_items.iter().enumerate() {
+                match &item.source {
+                    SelectItemSource::BaseColumn(col_idx) => {
+                        values[item_idx] = base_row
+                            .get(*col_idx)
+                            .cloned()
+                            .unwrap_or_else(Value::null_unknown);
                     }
-                    SelectItemSource::ExpressionWithWindow(_, _) => {
-                        // Use transformed expression and extended row
-                        if let Some(transformed_expr) = transformed_opt {
-                            // Build extended row with ALL window function values (lazy, cached)
-                            let ext_row = ext_row_cached.get_or_insert_with(|| {
-                                // OPTIMIZATION: Pre-allocate exact capacity to avoid reallocation
-                                let mut ext_values =
-                                    Vec::with_capacity(base_row.len() + added_wf_names.len());
-                                ext_values.extend(base_row.iter().cloned());
-                                // Add all window function values in the order they appear in added_wf_names
-                                for wf_name in &added_wf_names {
-                                    let wf_value = window_value_map
-                                        .get(wf_name)
-                                        .and_then(|vals| vals.get(row_idx).cloned())
-                                        .unwrap_or_else(Value::null_unknown);
-                                    ext_values.push(wf_value);
-                                }
-                                Row::from_values(ext_values)
-                            });
+                    SelectItemSource::WindowFunction(wf_name_lower) => {
+                        values[item_idx] = window_value_map
+                            .get(wf_name_lower)
+                            .and_then(|vals| vals.get(row_idx).cloned())
+                            .unwrap_or_else(Value::null_unknown);
+                    }
+                    _ => {} // Handled below
+                }
+            }
 
-                            ext_evaluator.set_row_array(ext_row);
-                            ext_evaluator
-                                .evaluate(transformed_expr)
-                                .unwrap_or_else(|_| Value::null_unknown())
-                        } else {
-                            Value::null_unknown()
+            // Evaluate base expressions and fill their values
+            if let Some(ref mut eval) = base_eval {
+                if let Ok(base_values) = eval.eval_all(base_row) {
+                    for (eval_idx, (item_idx, _)) in base_expr_items.iter().enumerate() {
+                        if eval_idx < base_values.len() {
+                            values[*item_idx] = base_values[eval_idx].clone();
                         }
                     }
-                };
-                values.push(value);
+                }
+            }
+
+            // Evaluate extended expressions (if any) and fill their values
+            if !ext_expr_items.is_empty() {
+                if let Some(ref mut eval) = ext_eval {
+                    // Build extended row: base_row + window function values
+                    let mut ext_values = Vec::with_capacity(base_row.len() + added_wf_names.len());
+                    ext_values.extend(base_row.iter().cloned());
+                    for wf_name in &added_wf_names {
+                        let wf_value = window_value_map
+                            .get(wf_name)
+                            .and_then(|vals| vals.get(row_idx).cloned())
+                            .unwrap_or_else(Value::null_unknown);
+                        ext_values.push(wf_value);
+                    }
+                    let ext_row = Row::from_values(ext_values);
+
+                    if let Ok(ext_result_values) = eval.eval_all(&ext_row) {
+                        for (eval_idx, (item_idx, _)) in ext_expr_items.iter().enumerate() {
+                            if eval_idx < ext_result_values.len() {
+                                values[*item_idx] = ext_result_values[eval_idx].clone();
+                            }
+                        }
+                    }
+                }
             }
 
             result_rows.push(Row::from_values(values));
@@ -1013,8 +1052,8 @@ impl Executor {
     ) -> Result<Value> {
         // Get offset (default 1)
         let offset = if wf_info.arguments.len() > 1 {
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            match evaluator.evaluate(&wf_info.arguments[1])? {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
+            match eval.eval_slice(&[])? {
                 Value::Integer(n) => n as usize,
                 _ => 1,
             }
@@ -1024,10 +1063,9 @@ impl Executor {
 
         // Get default value - use current row context for column references
         let default_value = if wf_info.arguments.len() > 2 {
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            evaluator.init_columns(columns);
-            evaluator.set_row_array(current_row_data);
-            evaluator.evaluate(&wf_info.arguments[2])?
+            let mut eval =
+                ExpressionEval::compile(&wf_info.arguments[2], columns)?.with_context(ctx);
+            eval.eval(current_row_data)?
         } else {
             Value::null_unknown()
         };
@@ -1056,8 +1094,8 @@ impl Executor {
     ) -> Result<Value> {
         // Get n (number of buckets)
         let n = if !wf_info.arguments.is_empty() {
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            match evaluator.evaluate(&wf_info.arguments[0])? {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[0], &[])?.with_context(ctx);
+            match eval.eval_slice(&[])? {
                 Value::Integer(n) if n > 0 => n as usize,
                 _ => 1,
             }
@@ -1186,8 +1224,8 @@ impl Executor {
 
         // Get n (1-indexed position) from second argument
         let n = if wf_info.arguments.len() > 1 {
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            match evaluator.evaluate(&wf_info.arguments[1])? {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
+            match eval.eval_slice(&[])? {
                 Value::Integer(n) if n > 0 => n as usize,
                 _ => return Ok(Value::null_unknown()),
             }
@@ -1446,36 +1484,46 @@ impl Executor {
         });
 
         if has_complex_expr {
-            // Use evaluator for complex expressions
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry);
-            evaluator = evaluator.with_context(ctx);
-            evaluator.init_columns(columns);
-
-            // Add aggregate expression mappings from col_index_map (e.g., "sum(val)" -> column_index)
-            // This allows ORDER BY SUM(val) to resolve to the correct column when SUM(val) is a column
-            // IMPORTANT: Include ALL col_index_map entries, not just non-column ones,
-            // because the CompiledEvaluator needs expression_aliases to match FunctionCall expressions
-            // even when the column is already named after the aggregate (e.g., "SUM(val)")
+            // Build aliases from col_index_map (e.g., "sum(val)" -> column_index)
+            // This allows ORDER BY SUM(val) to resolve to the correct column
             let agg_aliases: Vec<(String, usize)> =
                 col_index_map.iter().map(|(k, v)| (k.clone(), *v)).collect();
-            if !agg_aliases.is_empty() {
-                evaluator.add_aggregate_aliases(&agg_aliases);
-            }
 
-            rows.iter()
-                .map(|row| {
-                    evaluator.set_row_array(row);
-                    order_by
-                        .iter()
-                        .map(|ob| {
-                            let value = evaluator
-                                .evaluate(&ob.expression)
-                                .unwrap_or(Value::null_unknown());
-                            (value, ob.ascending)
+            // Extract order_by expressions and ascending flags
+            let order_exprs: Vec<Expression> =
+                order_by.iter().map(|ob| ob.expression.clone()).collect();
+            let ascending_flags: Vec<bool> = order_by.iter().map(|ob| ob.ascending).collect();
+
+            // Compile all expressions with aliases
+            match MultiExpressionEval::compile_with_aliases(&order_exprs, columns, &agg_aliases) {
+                Ok(eval) => {
+                    let mut eval = eval.with_context(ctx);
+                    rows.iter()
+                        .map(|row| match eval.eval_all(row) {
+                            Ok(values) => values
+                                .into_iter()
+                                .zip(ascending_flags.iter())
+                                .map(|(value, &asc)| (value, asc))
+                                .collect(),
+                            Err(_) => ascending_flags
+                                .iter()
+                                .map(|&asc| (Value::null_unknown(), asc))
+                                .collect(),
                         })
                         .collect()
-                })
-                .collect()
+                }
+                Err(_) => {
+                    // Compilation failed - return all nulls
+                    rows.iter()
+                        .map(|_| {
+                            ascending_flags
+                                .iter()
+                                .map(|&asc| (Value::null_unknown(), asc))
+                                .collect()
+                        })
+                        .collect()
+                }
+            }
         } else {
             // Fast path: simple column references
             let order_by_indices: Vec<(Option<usize>, bool)> = order_by
@@ -1561,15 +1609,10 @@ impl Executor {
 
         // Pre-compute expression values for all rows if needed
         let expression_values: Vec<Value> = if has_expression_arg {
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            evaluator.init_columns(columns);
+            let mut eval =
+                ExpressionEval::compile(&wf_info.arguments[0], columns)?.with_context(ctx);
             rows.iter()
-                .map(|row| {
-                    evaluator.set_row_array(row);
-                    evaluator
-                        .evaluate(&wf_info.arguments[0])
-                        .unwrap_or_else(|_| Value::null_unknown())
-                })
+                .map(|row| eval.eval(row).unwrap_or_else(|_| Value::null_unknown()))
                 .collect()
         } else {
             vec![]

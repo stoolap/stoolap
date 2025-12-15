@@ -39,11 +39,11 @@
 
 use rayon::prelude::*;
 
-use crate::core::{Row, Value};
+use crate::core::{Result, Row, Value};
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::Expression;
 
-use super::expression::CompiledEvaluator;
+use super::expression::{ExpressionEval, RowFilter};
 use super::utils::{hash_composite_key, hash_row, rows_equal, verify_composite_key_equality};
 
 // Default thresholds for parallel execution - single source of truth
@@ -146,13 +146,16 @@ impl ParallelConfig {
 /// - Number of CPU cores
 /// - Complexity of the WHERE predicate
 /// - Selectivity (how many rows pass the filter)
+///
+/// CRITICAL: This function now returns Result to properly propagate compilation errors.
+/// Previously, errors were silently swallowed which could cause data loss.
 pub fn parallel_filter(
     rows: Vec<Row>,
     filter_expr: &Expression,
     columns: &[String],
     function_registry: &FunctionRegistry,
     config: &ParallelConfig,
-) -> Vec<Row> {
+) -> Result<Vec<Row>> {
     let row_count = rows.len();
 
     // Check if parallel execution is beneficial
@@ -169,28 +172,25 @@ pub fn parallel_filter(
     let target_chunks = num_threads * 4; // 4 chunks per thread for work-stealing
     let chunk_size = (row_count / target_chunks).max(config.chunk_size).max(512);
 
-    // Clone expression for each thread (Expression is Clone)
-    let filter_clone = filter_expr.clone();
+    // Pre-compile the filter expression once (RowFilter is Send+Sync)
+    // This avoids compiling the expression in each thread
+    // CRITICAL: Propagate compilation errors instead of silently falling back
     let columns_vec: Vec<String> = columns.to_vec();
+    let filter = RowFilter::new(filter_expr, &columns_vec)?;
 
     // Process chunks in parallel
     let filtered_chunks: Vec<Vec<Row>> = rows
         .into_par_iter()
         .chunks(chunk_size)
         .map(|chunk| {
-            // Each thread gets its own evaluator (they're cheap to create)
-            let mut evaluator = CompiledEvaluator::new(function_registry);
-            evaluator.init_columns(&columns_vec);
-
             let mut filtered = Vec::with_capacity(chunk.len() / 2); // Estimate 50% selectivity
 
             for row in chunk {
-                evaluator.set_row_array(&row);
                 // SQL semantics: NULL or error in WHERE predicate => row excluded
                 // This matches standard SQL behavior where NULL is neither true nor false,
                 // so rows with NULL predicate results are filtered out.
                 // Errors (e.g., type mismatches) are treated the same way.
-                if evaluator.evaluate_bool(&filter_clone).unwrap_or(false) {
+                if filter.matches(&row) {
                     filtered.push(row);
                 }
             }
@@ -207,25 +207,24 @@ pub fn parallel_filter(
         result.extend(chunk);
     }
 
-    result
+    Ok(result)
 }
 
 /// Sequential filter for small datasets or when parallel is disabled
+///
+/// CRITICAL: This function now returns Result to properly propagate compilation errors.
+/// Previously, errors were silently swallowed which could cause data loss.
 fn sequential_filter(
     rows: Vec<Row>,
     filter_expr: &Expression,
     columns: &[String],
-    function_registry: &FunctionRegistry,
-) -> Vec<Row> {
-    let mut evaluator = CompiledEvaluator::new(function_registry);
-    evaluator.init_columns(columns);
+    _function_registry: &FunctionRegistry,
+) -> Result<Vec<Row>> {
+    let columns_vec: Vec<String> = columns.to_vec();
+    // CRITICAL: Propagate compilation errors instead of silently returning empty
+    let mut eval = ExpressionEval::compile(filter_expr, &columns_vec)?;
 
-    rows.into_iter()
-        .filter(|row| {
-            evaluator.set_row_array(row);
-            evaluator.evaluate_bool(filter_expr).unwrap_or(false)
-        })
-        .collect()
+    Ok(rows.into_iter().filter(|row| eval.eval_bool(row)).collect())
 }
 
 /// Parallel filter with ownership transfer (more efficient for large results)
@@ -1107,13 +1106,15 @@ where
 }
 
 /// Parallel filter with statistics collection
+///
+/// CRITICAL: This function now returns Result to properly propagate compilation errors.
 pub fn parallel_filter_with_stats(
     rows: Vec<Row>,
     filter_expr: &Expression,
     columns: &[String],
     function_registry: &FunctionRegistry,
     config: &ParallelConfig,
-) -> (Vec<Row>, ParallelStats) {
+) -> Result<(Vec<Row>, ParallelStats)> {
     let row_count = rows.len();
     let parallel_used = config.should_parallel_filter(row_count);
 
@@ -1129,10 +1130,11 @@ pub fn parallel_filter_with_stats(
 
     let chunks_used = row_count.div_ceil(chunk_size);
 
+    // CRITICAL: Propagate errors with ? instead of silently swallowing them
     let result = if parallel_used {
-        parallel_filter(rows, filter_expr, columns, function_registry, config)
+        parallel_filter(rows, filter_expr, columns, function_registry, config)?
     } else {
-        sequential_filter(rows, filter_expr, columns, function_registry)
+        sequential_filter(rows, filter_expr, columns, function_registry)?
     };
 
     let stats = ParallelStats {
@@ -1142,7 +1144,7 @@ pub fn parallel_filter_with_stats(
         parallel_used,
     };
 
-    (result, stats)
+    Ok((result, stats))
 }
 
 #[cfg(test)]

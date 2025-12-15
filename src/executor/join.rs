@@ -33,7 +33,7 @@ use crate::optimizer::bloom::BloomFilter;
 use crate::parser::ast::{Expression, InfixOperator};
 
 use super::context::ExecutionContext;
-use super::expression::CompiledEvaluator;
+use super::expression::{JoinFilter, RowFilter};
 use super::parallel::{self, ParallelConfig};
 use super::Executor;
 
@@ -177,6 +177,9 @@ impl Executor {
     /// Apply residual conditions (non-equality parts of ON clause) after join.
     ///
     /// For OUTER JOINs, preserves NULL-padded rows that represent "no match".
+    ///
+    /// CRITICAL: This function now returns Result to properly propagate compilation errors.
+    /// Previously, compilation failures were silently ignored which could cause incorrect results.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_residual_conditions(
         &self,
@@ -187,10 +190,19 @@ impl Executor {
         left_col_count: usize,
         right_col_count: usize,
         ctx: &ExecutionContext,
-    ) {
-        let mut residual_eval = CompiledEvaluator::new(&self.function_registry);
-        residual_eval = residual_eval.with_context(ctx);
-        residual_eval.init_columns(all_columns);
+    ) -> Result<()> {
+        // Pre-compile all residual conditions into filters
+        // CRITICAL: Propagate compilation errors instead of silently ignoring them
+        let all_columns_vec: Vec<String> = all_columns.to_vec();
+        let filters: Vec<RowFilter> = residual
+            .iter()
+            .map(|cond| RowFilter::new(cond, &all_columns_vec).map(|f| f.with_context(ctx)))
+            .collect::<Result<Vec<_>>>()?;
+
+        // If no filters, nothing to do
+        if filters.is_empty() {
+            return Ok(());
+        }
 
         let is_outer_join =
             join_type.contains("LEFT") || join_type.contains("RIGHT") || join_type.contains("FULL");
@@ -212,20 +224,14 @@ impl Executor {
                 }
 
                 // For matched rows, apply residual conditions normally
-                residual_eval.set_row_array(row);
-                residual
-                    .iter()
-                    .all(|cond| residual_eval.evaluate_bool(cond).unwrap_or(false))
+                filters.iter().all(|f| f.matches(row))
             });
         } else {
             // For INNER JOIN, simple filter is correct
-            rows.retain(|row| {
-                residual_eval.set_row_array(row);
-                residual
-                    .iter()
-                    .all(|cond| residual_eval.evaluate_bool(cond).unwrap_or(false))
-            });
+            rows.retain(|row| filters.iter().all(|f| f.matches(row)));
         }
+
+        Ok(())
     }
 
     /// Execute hash join - O(N + M) complexity.
@@ -497,7 +503,7 @@ impl Executor {
         left_columns: &[String],
         right_columns: &[String],
         join_type: &str,
-        ctx: &ExecutionContext,
+        _ctx: &ExecutionContext,
         limit: Option<u64>,
     ) -> Result<Vec<Row>> {
         let is_inner_or_cross = !join_type.contains("LEFT")
@@ -505,11 +511,14 @@ impl Executor {
             && !join_type.contains("FULL");
         let effective_limit = if is_inner_or_cross { limit } else { None };
 
-        let mut eval = if condition.is_some() {
-            let mut e = CompiledEvaluator::new(&self.function_registry);
-            e = e.with_context(ctx);
-            e.init_join_columns(left_columns, right_columns);
-            Some(e)
+        // Pre-compile join filter if condition exists
+        let join_filter = if let Some(cond) = condition {
+            Some(JoinFilter::new(
+                cond,
+                left_columns,
+                right_columns,
+                &self.function_registry,
+            )?)
         } else {
             None
         };
@@ -524,13 +533,8 @@ impl Executor {
             let mut matched = false;
 
             for (right_idx, right_row) in right_rows.iter().enumerate() {
-                let matches = if let Some(cond) = condition {
-                    if let Some(ref mut evaluator) = eval {
-                        evaluator.set_join_rows(left_row, right_row);
-                        evaluator.evaluate_bool(cond)?
-                    } else {
-                        true
-                    }
+                let matches = if let Some(ref filter) = join_filter {
+                    filter.matches(left_row, right_row)
                 } else {
                     true // CROSS JOIN
                 };

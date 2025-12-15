@@ -19,11 +19,10 @@
 use std::collections::HashMap;
 
 use crate::core::{Result, Row, Value};
-use crate::functions::FunctionRegistry;
 use crate::parser::ast::Expression;
 use crate::storage::traits::QueryResult;
 
-use super::expression::CompiledEvaluator;
+use super::expression::RowFilter;
 
 /// Execution result for DML operations (INSERT, UPDATE, DELETE)
 ///
@@ -457,72 +456,67 @@ impl QueryResult for MappedResult {
     }
 }
 
-/// Expression-based filtered result that owns a CompiledEvaluator for efficient reuse
+/// Expression-based filtered result that uses RowFilter for efficient reuse
 ///
-/// Unlike FilteredResult which takes a closure, this struct owns the CompiledEvaluator
-/// and Expression directly, avoiding per-row allocations. The evaluator is
-/// initialized once with column mappings and reused for every row.
-pub struct ExprFilteredResult<'a> {
+/// Unlike FilteredResult which takes a closure, this struct owns a pre-compiled
+/// RowFilter, avoiding per-row compilation. The filter is compiled once during
+/// construction and reused for every row.
+pub struct ExprFilteredResult {
     /// Underlying result
     inner: Box<dyn QueryResult>,
-    /// Owned evaluator (reused for each row)
-    evaluator: CompiledEvaluator<'a>,
-    /// Filter expression (WHERE clause)
-    filter_expr: Expression,
+    /// Pre-compiled row filter (thread-safe, reusable)
+    filter: RowFilter,
     /// Current row (cached after filter passes)
     current_row: Option<Row>,
     /// Columns cached
     columns: Vec<String>,
 }
 
-// SAFETY: ExprFilteredResult is Send because:
-// 1. The CompiledEvaluator's raw pointers are only used within next() after set_row_array()
-// 2. The row data comes from `inner` which is owned by this struct
-// 3. The pointer is always refreshed before use, never persisted across method calls
-unsafe impl Send for ExprFilteredResult<'_> {}
+// ExprFilteredResult is Send because all fields are Send:
+// - Box<dyn QueryResult> is Send (trait bound)
+// - RowFilter is Send+Sync (uses Arc internally)
+// - Option<Row> and Vec<String> are Send
+unsafe impl Send for ExprFilteredResult {}
 
-impl<'a> ExprFilteredResult<'a> {
+impl ExprFilteredResult {
     /// Create a new expression-filtered result
     ///
     /// # Arguments
     /// * `inner` - The source result to filter
     /// * `filter_expr` - The WHERE clause expression
-    /// * `function_registry` - Function registry for expression evaluation
-    pub fn new(
-        inner: Box<dyn QueryResult>,
-        filter_expr: Expression,
-        function_registry: &'a FunctionRegistry,
-    ) -> Self {
+    ///
+    /// Returns an error if the filter expression cannot be compiled.
+    pub fn new(inner: Box<dyn QueryResult>, filter_expr: &Expression) -> Result<Self> {
         let columns = inner.columns().to_vec();
-        let mut evaluator = CompiledEvaluator::new(function_registry);
-        evaluator.init_columns(&columns);
+        let filter = RowFilter::new(filter_expr, &columns)?;
 
-        Self {
+        Ok(Self {
             inner,
-            evaluator,
-            filter_expr,
+            filter,
             current_row: None,
             columns,
-        }
+        })
     }
 
     /// Create with default function registry (static lifetime)
+    ///
+    /// This is a convenience method that panics on compilation errors.
+    /// For fallible construction, use `new()` instead.
     pub fn with_defaults(inner: Box<dyn QueryResult>, filter_expr: Expression) -> Self {
         let columns = inner.columns().to_vec();
-        let mut evaluator = CompiledEvaluator::with_defaults();
-        evaluator.init_columns(&columns);
+        let filter =
+            RowFilter::new(&filter_expr, &columns).expect("Failed to compile filter expression");
 
         Self {
             inner,
-            evaluator,
-            filter_expr,
+            filter,
             current_row: None,
             columns,
         }
     }
 }
 
-impl QueryResult for ExprFilteredResult<'static> {
+impl QueryResult for ExprFilteredResult {
     fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -531,13 +525,8 @@ impl QueryResult for ExprFilteredResult<'static> {
         // Keep advancing until we find a row that passes the filter
         while self.inner.next() {
             let row = self.inner.row();
-            // Reuse evaluator - just update row pointer (very cheap)
-            self.evaluator.set_row_array(row);
-            if self
-                .evaluator
-                .evaluate_bool(&self.filter_expr)
-                .unwrap_or(false)
-            {
+            // Use pre-compiled filter - thread-safe and efficient
+            if self.filter.matches(row) {
                 self.current_row = Some(self.inner.take_row());
                 return true;
             }
@@ -595,104 +584,143 @@ impl QueryResult for ExprFilteredResult<'static> {
     }
 }
 
-/// Expression-based mapped result that owns a CompiledEvaluator for efficient reuse
+/// Pre-compiled projection that can be either a Star expansion or a compiled expression.
+enum CompiledProjection {
+    /// Expand all columns from source (SELECT *)
+    Star,
+    /// Expand columns for specific table/alias (SELECT t.*)
+    QualifiedStar {
+        /// Lowercase prefix for matching (e.g., "t.")
+        prefix_lower: String,
+    },
+    /// A pre-compiled expression program
+    Compiled(super::expression::SharedProgram),
+}
+
+/// Expression-based mapped result with pre-compiled projections
 ///
-/// Unlike MappedResult which takes a closure, this struct owns the CompiledEvaluator
-/// and expressions directly, avoiding per-row allocations.
-pub struct ExprMappedResult<'a> {
+/// Unlike MappedResult which takes a closure, this struct pre-compiles all
+/// expressions during construction, providing efficient per-row evaluation.
+pub struct ExprMappedResult {
     /// Underlying result
     inner: Box<dyn QueryResult>,
-    /// Owned evaluator (reused for each row)
-    evaluator: CompiledEvaluator<'a>,
-    /// Projection expressions
-    expressions: Vec<Expression>,
+    /// Pre-compiled projections (one per output column)
+    projections: Vec<CompiledProjection>,
+    /// VM instance for expression execution (reused)
+    vm: super::expression::ExprVM,
     /// Current mapped row
     current_row: Row,
     /// Output column names
     output_columns: Vec<String>,
+    /// Source columns (cached for QualifiedStar matching)
+    source_columns: Vec<String>,
 }
 
-// SAFETY: ExprMappedResult is Send because:
-// 1. The CompiledEvaluator's raw pointers are only used within next() after set_row_array()
-// 2. The row data comes from `inner` which is owned by this struct
-// 3. The pointer is always refreshed before use, never persisted across method calls
-unsafe impl Send for ExprMappedResult<'_> {}
+// ExprMappedResult is Send because all fields are Send:
+// - Box<dyn QueryResult> is Send (trait bound)
+// - CompiledProjection is Send (SharedProgram uses Arc)
+// - ExprVM is Send
+// - Row, Vec<String> are Send
+unsafe impl Send for ExprMappedResult {}
 
-impl<'a> ExprMappedResult<'a> {
+impl ExprMappedResult {
     /// Create a new expression-mapped result
+    ///
+    /// # Arguments
+    /// * `inner` - The source result to project
+    /// * `expressions` - The projection expressions
+    /// * `output_columns` - Names for the output columns
+    ///
+    /// Returns an error if any expression cannot be compiled.
     pub fn new(
         inner: Box<dyn QueryResult>,
         expressions: Vec<Expression>,
         output_columns: Vec<String>,
-        function_registry: &'a FunctionRegistry,
-    ) -> Self {
-        let mut evaluator = CompiledEvaluator::new(function_registry);
-        evaluator.init_columns(inner.columns());
+    ) -> Result<Self> {
+        use super::expression::compile_expression;
 
-        Self {
+        let source_columns = inner.columns().to_vec();
+
+        // Pre-compile all expressions
+        let mut projections = Vec::with_capacity(expressions.len());
+        for expr in &expressions {
+            let projection = match expr {
+                Expression::Star(_) => CompiledProjection::Star,
+                Expression::QualifiedStar(qs) => {
+                    let prefix = format!("{}.", qs.qualifier);
+                    CompiledProjection::QualifiedStar {
+                        prefix_lower: prefix.to_lowercase(),
+                    }
+                }
+                _ => {
+                    let program = compile_expression(expr, &source_columns)?;
+                    CompiledProjection::Compiled(program)
+                }
+            };
+            projections.push(projection);
+        }
+
+        Ok(Self {
             inner,
-            evaluator,
-            expressions,
+            projections,
+            vm: super::expression::ExprVM::new(),
             current_row: Row::new(),
             output_columns,
-        }
+            source_columns,
+        })
     }
 
     /// Create with default function registry (static lifetime)
+    ///
+    /// This is a convenience method that panics on compilation errors.
+    /// For fallible construction, use `new()` instead.
     pub fn with_defaults(
         inner: Box<dyn QueryResult>,
         expressions: Vec<Expression>,
         output_columns: Vec<String>,
     ) -> Self {
-        let mut evaluator = CompiledEvaluator::with_defaults();
-        evaluator.init_columns(inner.columns());
-
-        Self {
-            inner,
-            evaluator,
-            expressions,
-            current_row: Row::new(),
-            output_columns,
-        }
+        Self::new(inner, expressions, output_columns)
+            .expect("Failed to compile projection expressions")
     }
 }
 
-impl QueryResult for ExprMappedResult<'static> {
+impl QueryResult for ExprMappedResult {
     fn columns(&self) -> &[String] {
         &self.output_columns
     }
 
     fn next(&mut self) -> bool {
+        use super::expression::ExecuteContext;
+
         if self.inner.next() {
             let source_row = self.inner.row();
-            // Reuse evaluator - just update row pointer (very cheap)
-            self.evaluator.set_row_array(source_row);
+            let row_data = source_row.as_slice();
 
-            let mut result_row = Row::with_capacity(self.expressions.len());
-            for expr in &self.expressions {
-                match expr {
-                    Expression::Star(_) => {
+            let mut result_row = Row::with_capacity(self.projections.len());
+            for projection in &self.projections {
+                match projection {
+                    CompiledProjection::Star => {
                         // Expand all columns from source
                         for value in source_row.iter() {
                             result_row.push(value.clone());
                         }
                     }
-                    Expression::QualifiedStar(qs) => {
+                    CompiledProjection::QualifiedStar { prefix_lower, .. } => {
                         // Expand columns for specific table/alias
-                        let prefix = format!("{}.", qs.qualifier);
-                        let prefix_lower = prefix.to_lowercase();
-                        for (idx, col) in self.inner.columns().iter().enumerate() {
-                            if col.to_lowercase().starts_with(&prefix_lower)
+                        for (idx, col) in self.source_columns.iter().enumerate() {
+                            if col.to_lowercase().starts_with(prefix_lower)
                                 && idx < source_row.len()
                             {
                                 result_row.push(source_row[idx].clone());
                             }
                         }
                     }
-                    _ => {
+                    CompiledProjection::Compiled(program) => {
+                        // Execute pre-compiled expression
+                        let ctx = ExecuteContext::new(row_data);
                         let value = self
-                            .evaluator
-                            .evaluate(expr)
+                            .vm
+                            .execute(program, &ctx)
                             .unwrap_or(Value::null_unknown());
                         result_row.push(value);
                     }

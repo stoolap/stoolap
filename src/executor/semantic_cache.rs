@@ -81,11 +81,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::core::Row;
+use crate::core::{Result, Row};
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::{Expression, InfixOperator};
 
-use super::expression::CompiledEvaluator;
+use super::expression::ExpressionEval;
 use super::utils::{expressions_equivalent, extract_and_conditions, extract_column_name};
 
 /// Maximum number of cached query results per table+column combination.
@@ -789,21 +789,20 @@ impl SemanticCache {
     ///
     /// This is used when a subsumption match is found to filter
     /// the broader cached result down to the stricter query's result.
+    ///
+    /// CRITICAL: This function now returns Result to properly propagate compilation errors.
+    /// Previously, compilation failures silently returned unfiltered data which was incorrect.
     pub fn filter_rows(
         rows: Vec<Row>,
         filter: &Expression,
         columns: &[String],
-        function_registry: &FunctionRegistry,
-    ) -> Vec<Row> {
-        let mut evaluator = CompiledEvaluator::new(function_registry);
-        evaluator.init_columns(columns);
+        _function_registry: &FunctionRegistry,
+    ) -> Result<Vec<Row>> {
+        let columns_vec: Vec<String> = columns.to_vec();
+        // CRITICAL: Propagate compilation errors instead of returning unfiltered data
+        let mut eval = ExpressionEval::compile(filter, &columns_vec)?;
 
-        rows.into_iter()
-            .filter(|row| {
-                evaluator.set_row_array(row);
-                evaluator.evaluate_bool(filter).unwrap_or(false)
-            })
-            .collect()
+        Ok(rows.into_iter().filter(|row| eval.eval_bool(row)).collect())
     }
 
     // Private helpers

@@ -38,7 +38,7 @@ use crate::storage::traits::{Engine, QueryResult};
 const MAX_VIEW_DEPTH: usize = 32;
 
 use super::context::{ExecutionContext, TimeoutGuard};
-use super::expression::CompiledEvaluator;
+use super::expression::{CompiledEvaluator, ExpressionEval, RowFilter};
 use super::join::{self, build_column_index_map};
 use super::parallel::{self, ParallelConfig};
 use super::pushdown;
@@ -177,9 +177,11 @@ impl Executor {
 
         // Evaluate LIMIT/OFFSET early (needed for set operations optimization)
         let limit = if let Some(ref limit_expr) = stmt.limit {
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            match evaluator.evaluate(limit_expr) {
-                Ok(Value::Integer(l)) => {
+            match ExpressionEval::compile(limit_expr, &[])?
+                .with_context(ctx)
+                .eval_slice(&[])?
+            {
+                Value::Integer(l) => {
                     if l < 0 {
                         return Err(Error::ParseError(format!(
                             "LIMIT must be non-negative, got {}",
@@ -188,7 +190,7 @@ impl Executor {
                     }
                     Some(l as usize)
                 }
-                Ok(Value::Float(f)) => {
+                Value::Float(f) => {
                     let l = f as i64;
                     if l < 0 {
                         return Err(Error::ParseError(format!(
@@ -198,22 +200,23 @@ impl Executor {
                     }
                     Some(l as usize)
                 }
-                Ok(other) => {
+                other => {
                     return Err(Error::ParseError(format!(
                         "LIMIT must be an integer, got {:?}",
                         other
                     )));
                 }
-                Err(_) => None,
             }
         } else {
             None
         };
 
         let offset = if let Some(ref offset_expr) = stmt.offset {
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            match evaluator.evaluate(offset_expr) {
-                Ok(Value::Integer(o)) => {
+            match ExpressionEval::compile(offset_expr, &[])
+                .ok()
+                .and_then(|eval| eval.with_context(ctx).eval_slice(&[]).ok())
+            {
+                Some(Value::Integer(o)) => {
                     if o < 0 {
                         return Err(Error::ParseError(format!(
                             "OFFSET must be non-negative, got {}",
@@ -222,7 +225,7 @@ impl Executor {
                     }
                     o as usize
                 }
-                Ok(Value::Float(f)) => {
+                Some(Value::Float(f)) => {
                     let o = f as i64;
                     if o < 0 {
                         return Err(Error::ParseError(format!(
@@ -232,13 +235,13 @@ impl Executor {
                     }
                     o as usize
                 }
-                Ok(other) => {
+                Some(other) => {
                     return Err(Error::ParseError(format!(
                         "OFFSET must be an integer, got {:?}",
                         other
                     )));
                 }
-                Err(_) => 0,
+                None => 0,
             }
         } else {
             0
@@ -768,13 +771,13 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-
         // Check WHERE clause first - if it evaluates to false, return empty result
         if let Some(where_clause) = &stmt.where_clause {
             // Pre-process subqueries in WHERE clause (EXISTS, IN, ALL/ANY, scalar subqueries)
             let processed_where = self.process_where_subqueries(where_clause, ctx)?;
-            let where_result = evaluator.evaluate(&processed_where)?;
+            let where_result = ExpressionEval::compile(&processed_where, &[])?
+                .with_context(ctx)
+                .eval_slice(&[])?;
             let passes = match where_result {
                 Value::Boolean(b) => b,
                 Value::Null(_) => false, // NULL in WHERE is treated as false
@@ -826,7 +829,9 @@ impl Executor {
             columns.push(col_name);
 
             // Evaluate expression
-            let value = evaluator.evaluate(col_expr)?;
+            let value = ExpressionEval::compile(col_expr, &[])?
+                .with_context(ctx)
+                .eval_slice(&[])?;
             values.push(value);
         }
 
@@ -1119,7 +1124,7 @@ impl Executor {
                             &filter,
                             &columns,
                             &self.function_registry,
-                        );
+                        )?;
                         let output_columns = self.get_output_column_names(
                             &stmt.columns,
                             &all_columns,
@@ -1236,18 +1241,20 @@ impl Executor {
             && !needs_memory_filter; // Allow with storage_expr (WHERE on indexed columns)
 
         if can_pushdown_limit {
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
             let limit = if let Some(ref limit_expr) = stmt.limit {
-                match evaluator.evaluate(limit_expr) {
-                    Ok(Value::Integer(l)) if l >= 0 => l as usize,
-                    Ok(Value::Integer(l)) => {
+                match ExpressionEval::compile(limit_expr, &[])?
+                    .with_context(ctx)
+                    .eval_slice(&[])?
+                {
+                    Value::Integer(l) if l >= 0 => l as usize,
+                    Value::Integer(l) => {
                         return Err(Error::ParseError(format!(
                             "LIMIT must be non-negative, got {}",
                             l
                         )));
                     }
-                    Ok(Value::Float(f)) if f >= 0.0 => f as usize,
-                    Ok(Value::Float(f)) => {
+                    Value::Float(f) if f >= 0.0 => f as usize,
+                    Value::Float(f) => {
                         return Err(Error::ParseError(format!(
                             "LIMIT must be non-negative, got {}",
                             f
@@ -1260,16 +1267,19 @@ impl Executor {
             };
 
             let offset = if let Some(ref offset_expr) = stmt.offset {
-                match evaluator.evaluate(offset_expr) {
-                    Ok(Value::Integer(o)) if o >= 0 => o as usize,
-                    Ok(Value::Integer(o)) => {
+                match ExpressionEval::compile(offset_expr, &[])?
+                    .with_context(ctx)
+                    .eval_slice(&[])?
+                {
+                    Value::Integer(o) if o >= 0 => o as usize,
+                    Value::Integer(o) => {
                         return Err(Error::ParseError(format!(
                             "OFFSET must be non-negative, got {}",
                             o
                         )));
                     }
-                    Ok(Value::Float(f)) if f >= 0.0 => f as usize,
-                    Ok(Value::Float(f)) => {
+                    Value::Float(f) if f >= 0.0 => f as usize,
+                    Value::Float(f) => {
                         return Err(Error::ParseError(format!(
                             "OFFSET must be non-negative, got {}",
                             f
@@ -1344,23 +1354,12 @@ impl Executor {
                 // If we need memory filtering (complex WHERE that couldn't be pushed down)
                 if needs_memory_filter {
                     if let Some(where_expr) = where_to_use {
-                        // Create evaluator for the filter closure
-                        let mut eval = CompiledEvaluator::new(&self.function_registry);
-                        eval = eval.with_context(ctx);
-                        eval.init_columns(&all_columns);
-                        let where_clone = where_expr.clone();
-                        let all_cols = all_columns.clone();
+                        // Create a pre-compiled filter (RowFilter is Clone+Send+Sync)
+                        let filter = RowFilter::new(where_expr, &all_columns)?.with_context(ctx);
 
-                        // Create a filter predicate using the evaluator
+                        // Create a filter predicate using the RowFilter
                         let predicate: Box<dyn Fn(&Row) -> bool + Send + Sync> =
-                            Box::new(move |row: &Row| {
-                                // Re-create evaluator for each call to avoid borrow issues
-                                // This is a tradeoff: we sacrifice some performance for Send+Sync safety
-                                let mut local_eval = CompiledEvaluator::with_defaults();
-                                local_eval.init_columns(&all_cols);
-                                local_eval.set_row_array(row);
-                                local_eval.evaluate_bool(&where_clone).unwrap_or(false)
-                            });
+                            Box::new(move |row: &Row| filter.matches(row));
 
                         result = Box::new(FilteredResult::new(result, predicate));
                     }
@@ -1453,7 +1452,11 @@ impl Executor {
             // Check if we can use the PARALLEL PATH:
             // For simple WHERE without subqueries, collect all rows first
             // then filter in parallel. This is much faster for large tables.
-            let use_parallel_path = !has_correlated && processed_where.is_some();
+            // CRITICAL: Cannot use parallel path when there's outer context because
+            // the WHERE clause may reference outer columns (e.g., products.id in
+            // a correlated subquery like WHERE product_id = products.id)
+            let use_parallel_path =
+                !has_correlated && !has_outer_context && processed_where.is_some();
 
             if use_parallel_path {
                 let where_expr = processed_where.as_ref().unwrap();
@@ -1465,6 +1468,7 @@ impl Executor {
                 }
 
                 // Apply parallel filtering if we have enough rows
+                // CRITICAL: Propagate errors with ? instead of silently swallowing them
                 if parallel_config.should_parallel_filter(all_rows.len()) {
                     parallel::parallel_filter(
                         all_rows,
@@ -1472,19 +1476,15 @@ impl Executor {
                         &all_columns,
                         &self.function_registry,
                         &parallel_config,
-                    )
+                    )?
                 } else {
-                    // Sequential filter for small datasets
-                    let mut eval = CompiledEvaluator::new(&self.function_registry);
-                    eval = eval.with_context(ctx);
-                    eval.init_columns(&all_columns);
+                    // Sequential filter for small datasets using pre-compiled expression
+                    let mut eval =
+                        ExpressionEval::compile(where_expr, &all_columns)?.with_context(ctx);
 
                     all_rows
                         .into_iter()
-                        .filter(|row| {
-                            eval.set_row_array(row);
-                            eval.evaluate_bool(where_expr).unwrap_or(false)
-                        })
+                        .filter(|row| eval.eval_bool(row))
                         .collect()
                 }
             } else {
@@ -2136,12 +2136,13 @@ impl Executor {
             let join_limit = if can_push_limit {
                 // Extract LIMIT value if present
                 stmt.limit.as_ref().and_then(|limit_expr| {
-                    let mut evaluator =
-                        CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-                    evaluator.evaluate(limit_expr).ok().and_then(|v| match v {
-                        Value::Integer(n) if n >= 0 => Some(n as u64),
-                        _ => None,
-                    })
+                    ExpressionEval::compile(limit_expr, &[])
+                        .ok()
+                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|v| match v {
+                            Value::Integer(n) if n >= 0 => Some(n as u64),
+                            _ => None,
+                        })
                 })
             } else {
                 None
@@ -2180,7 +2181,7 @@ impl Executor {
                             left_columns.len(),
                             right_columns.len(),
                             ctx,
-                        );
+                        )?;
                     }
                     rows
                 }
@@ -2207,7 +2208,7 @@ impl Executor {
                             left_columns.len(),
                             right_columns.len(),
                             ctx,
-                        );
+                        )?;
                     }
                     rows
                 }
@@ -2241,12 +2242,13 @@ impl Executor {
                 && !cross_has_aggregation
             {
                 stmt.limit.as_ref().and_then(|limit_expr| {
-                    let mut evaluator =
-                        CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-                    evaluator.evaluate(limit_expr).ok().and_then(|v| match v {
-                        Value::Integer(n) if n >= 0 => Some(n as u64),
-                        _ => None,
-                    })
+                    ExpressionEval::compile(limit_expr, &[])
+                        .ok()
+                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|v| match v {
+                            Value::Integer(n) if n >= 0 => Some(n as u64),
+                            _ => None,
+                        })
                 })
             } else {
                 None
@@ -2292,19 +2294,13 @@ impl Executor {
                 (**where_clause).clone()
             };
 
-            // Create evaluator once and reuse
-            let mut where_eval = CompiledEvaluator::new(&self.function_registry);
-            where_eval = where_eval.with_context(ctx);
-            where_eval.init_columns(&all_columns);
+            // Create RowFilter once and reuse
+            let where_filter = RowFilter::new(&processed_where, &all_columns)?.with_context(ctx);
 
-            let mut rows = Vec::new();
-            for row in result_rows {
-                where_eval.set_row_array(&row);
-                if where_eval.evaluate_bool(&processed_where)? {
-                    rows.push(row);
-                }
-            }
-            rows
+            result_rows
+                .into_iter()
+                .filter(|row| where_filter.matches(row))
+                .collect()
         } else {
             result_rows
         };
@@ -2425,18 +2421,11 @@ impl Executor {
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
-            let mut where_eval = CompiledEvaluator::new(&self.function_registry);
-            where_eval = where_eval.with_context(ctx);
-            where_eval.init_columns(&columns);
+            let where_filter = RowFilter::new(where_clause, &columns)?.with_context(ctx);
 
-            let mut filtered = Vec::new();
-            for row in rows {
-                where_eval.set_row_array(&row);
-                if where_eval.evaluate_bool(where_clause)? {
-                    filtered.push(row);
-                }
-            }
-            filtered
+            rows.into_iter()
+                .filter(|row| where_filter.matches(row))
+                .collect()
         } else {
             rows
         };
@@ -2729,8 +2718,6 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-
         // Determine column names
         let num_columns = if values_source.rows.is_empty() {
             0
@@ -2774,55 +2761,40 @@ impl Executor {
             }
         }
 
-        // OPTIMIZATION: Pre-create evaluators outside the loop if WHERE clause exists
-        let (mut where_eval, mut qualified_eval, _qualified_columns) =
-            if stmt.where_clause.is_some() {
-                let mut eval = CompiledEvaluator::new(&self.function_registry);
-                eval = eval.with_context(ctx);
-                eval.init_columns(&column_names);
+        // OPTIMIZATION: Pre-create RowFilters outside the loop if WHERE clause exists
+        let (where_filter, qualified_filter) = if let Some(ref where_clause) = stmt.where_clause {
+            // Pre-compute qualified column names once
+            let qualified_cols: Vec<String> = column_names
+                .iter()
+                .map(|c| format!("{}.{}", table_alias, c))
+                .collect();
 
-                // Pre-compute qualified column names once
-                let qualified_cols: Vec<String> = column_names
-                    .iter()
-                    .map(|c| format!("{}.{}", table_alias, c))
-                    .collect();
-                let mut qual_eval = CompiledEvaluator::new(&self.function_registry);
-                qual_eval = qual_eval.with_context(ctx);
-                qual_eval.init_columns(&qualified_cols);
+            // Create filters for simple and qualified column names
+            let filter = RowFilter::new(where_clause, &column_names)?.with_context(ctx);
+            let qual_filter = RowFilter::new(where_clause, &qualified_cols)?.with_context(ctx);
 
-                (Some(eval), Some(qual_eval), qualified_cols)
-            } else {
-                (None, None, Vec::new())
-            };
+            (Some(filter), Some(qual_filter))
+        } else {
+            (None, None)
+        };
 
         // Evaluate all rows
         let mut result_rows = Vec::with_capacity(values_source.rows.len());
         for row_exprs in &values_source.rows {
             let mut row_values = Vec::with_capacity(row_exprs.len());
             for expr in row_exprs {
-                let value = evaluator.evaluate(expr)?;
+                let value = ExpressionEval::compile(expr, &[])?
+                    .with_context(ctx)
+                    .eval_slice(&[])?;
                 row_values.push(value);
             }
             let row = Row::from_values(row_values);
 
             // Apply WHERE clause filtering
-            if let Some(ref where_clause) = stmt.where_clause {
-                let eval = where_eval.as_mut().unwrap();
-                eval.set_row_array(&row);
-
-                // Try to evaluate, but handle qualified identifiers
-                match eval.evaluate_bool(where_clause) {
-                    Ok(true) => result_rows.push(row),
-                    Ok(false) => {} // Skip this row
-                    Err(_) => {
-                        // Try with table-qualified column names
-                        let qual_eval = qualified_eval.as_mut().unwrap();
-                        qual_eval.set_row_array(&row);
-
-                        if qual_eval.evaluate_bool(where_clause).unwrap_or(false) {
-                            result_rows.push(row);
-                        }
-                    }
+            if let (Some(wf), Some(qf)) = (&where_filter, &qualified_filter) {
+                // Try with simple column names first, then qualified
+                if wf.matches(&row) || qf.matches(&row) {
+                    result_rows.push(row);
                 }
             } else {
                 result_rows.push(row);
@@ -3085,18 +3057,11 @@ impl Executor {
 
                     // Apply filter to CTE data if present
                     let filtered_rows = if let Some(filter_expr) = filter {
-                        let mut eval = CompiledEvaluator::new(&self.function_registry);
-                        eval = eval.with_context(ctx);
-                        eval.init_columns(columns);
-
-                        let mut result_rows = Vec::new();
-                        for row in rows {
-                            eval.set_row_array(row);
-                            if eval.evaluate_bool(filter_expr).unwrap_or(false) {
-                                result_rows.push(row.clone());
-                            }
-                        }
-                        result_rows
+                        let row_filter = RowFilter::new(filter_expr, columns)?;
+                        rows.iter()
+                            .filter(|row| row_filter.matches(row))
+                            .cloned()
+                            .collect()
                     } else {
                         rows.clone()
                     };
@@ -3341,14 +3306,16 @@ impl Executor {
         };
         let select_exprs = select_exprs_cow.as_ref();
 
+        // OPTIMIZATION: Pre-compute lowercase column names ONCE and reuse throughout
+        // This avoids repeated to_lowercase() calls in col_index_map building,
+        // QualifiedStar expansion, and row projection loop
+        let all_columns_lower: Vec<String> = all_columns.iter().map(|c| c.to_lowercase()).collect();
+
         // Build column index map ONCE with FxHashMap for O(1) lookup
-        // Use lowercase keys for case-insensitive matching
-        // Note: We could use schema.column_index_map() if we had access to the table here,
-        // but project_rows is also called for CTEs which don't have a schema
+        // Use the pre-computed lowercase names
         let mut col_index_map_lower: rustc_hash::FxHashMap<String, usize> =
             rustc_hash::FxHashMap::default();
-        for (i, c) in all_columns.iter().enumerate() {
-            let lower = c.to_lowercase();
+        for (i, lower) in all_columns_lower.iter().enumerate() {
             col_index_map_lower.insert(lower.clone(), i);
 
             // Also add unqualified column names for qualified columns (e.g., "table.column" -> "column")
@@ -3377,12 +3344,12 @@ impl Executor {
                 }
                 Expression::QualifiedStar(qs) => {
                     // Expand columns for specific table/alias
-                    let prefix = format!("{}.", qs.qualifier);
-                    let prefix_lower = prefix.to_lowercase();
+                    let prefix_lower = format!("{}.", qs.qualifier.to_lowercase());
                     let qualifier_lower = qs.qualifier.to_lowercase();
                     let mut found_any = false;
-                    for (idx, col) in all_columns.iter().enumerate() {
-                        if col.to_lowercase().starts_with(&prefix_lower) {
+                    // OPTIMIZATION: Use pre-computed all_columns_lower instead of to_lowercase() per column
+                    for (idx, col_lower) in all_columns_lower.iter().enumerate() {
+                        if col_lower.starts_with(&prefix_lower) {
                             simple_column_indices.push(idx);
                             found_any = true;
                         }
@@ -3510,6 +3477,9 @@ impl Executor {
             None
         };
 
+        // OPTIMIZATION: Pre-compute table alias lowercase (all_columns_lower computed earlier)
+        let table_alias_lower: Option<String> = table_alias.map(|a| a.to_lowercase());
+
         // OPTIMIZATION: Reuse col_index_map_lower (already built above) for O(1) lookup
         // instead of O(N) linear search in evaluate_select_expr
         for row in rows {
@@ -3573,12 +3543,12 @@ impl Executor {
                     }
                     Expression::QualifiedStar(qs) => {
                         // Expand columns for specific table/alias
-                        let prefix = format!("{}.", qs.qualifier);
-                        let prefix_lower = prefix.to_lowercase();
+                        let prefix_lower = format!("{}.", qs.qualifier.to_lowercase());
                         let qualifier_lower = qs.qualifier.to_lowercase();
                         let mut found_any = false;
-                        for (idx, col) in all_columns.iter().enumerate() {
-                            if col.to_lowercase().starts_with(&prefix_lower) {
+                        // OPTIMIZATION: Use pre-computed all_columns_lower instead of to_lowercase() per row
+                        for (idx, col_lower) in all_columns_lower.iter().enumerate() {
+                            if col_lower.starts_with(&prefix_lower) {
                                 if let Some(val) = row.get(idx) {
                                     values.push(val.clone());
                                     found_any = true;
@@ -3588,8 +3558,9 @@ impl Executor {
                         // If no columns matched the prefix (single-table query), check if
                         // the qualifier matches the table alias - if so, include all columns
                         if !found_any {
-                            if let Some(alias) = table_alias {
-                                if alias.to_lowercase() == qualifier_lower {
+                            // OPTIMIZATION: Use pre-computed table_alias_lower
+                            if let Some(ref alias_lower) = table_alias_lower {
+                                if *alias_lower == qualifier_lower {
                                     for val in row.iter() {
                                         values.push(val.clone());
                                     }
@@ -4271,9 +4242,9 @@ impl Executor {
         stmt: &ExpressionStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-
-        let value = evaluator.evaluate(&stmt.expression)?;
+        let value = ExpressionEval::compile(&stmt.expression, &[])?
+            .with_context(ctx)
+            .eval_slice(&[])?;
         let columns = vec!["result".to_string()];
         let rows = vec![Row::from_values(vec![value])];
 
@@ -4443,11 +4414,13 @@ impl Executor {
         let ascending = order_by.ascending;
 
         // Evaluate limit and offset
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
         let limit = if let Some(ref limit_expr) = stmt.limit {
-            match evaluator.evaluate(limit_expr) {
-                Ok(Value::Integer(l)) => l as usize,
-                Ok(Value::Float(f)) => f as usize,
+            match ExpressionEval::compile(limit_expr, &[])
+                .ok()
+                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+            {
+                Some(Value::Integer(l)) => l as usize,
+                Some(Value::Float(f)) => f as usize,
                 _ => return Ok(None),
             }
         } else {
@@ -4455,9 +4428,12 @@ impl Executor {
         };
 
         let offset = if let Some(ref offset_expr) = stmt.offset {
-            match evaluator.evaluate(offset_expr) {
-                Ok(Value::Integer(o)) => o as usize,
-                Ok(Value::Float(f)) => f as usize,
+            match ExpressionEval::compile(offset_expr, &[])
+                .ok()
+                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+            {
+                Some(Value::Integer(o)) => o as usize,
+                Some(Value::Float(f)) => f as usize,
                 _ => 0,
             }
         } else {
@@ -4533,14 +4509,9 @@ impl Executor {
         // Apply in-memory WHERE filter if storage expression couldn't handle it fully
         if needs_memory_filter {
             if let Some(where_expr) = &stmt.where_clause {
-                let mut evaluator =
-                    CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-                evaluator.init_columns(&all_columns);
+                let where_filter = RowFilter::new(where_expr, &all_columns)?.with_context(ctx);
 
-                rows.retain(|row| {
-                    evaluator.set_row_array(row);
-                    evaluator.evaluate_bool(where_expr).unwrap_or(false)
-                });
+                rows.retain(|row| where_filter.matches(row));
             }
         }
 
@@ -4575,12 +4546,14 @@ impl Executor {
 
     /// Parse temporal value from AS OF clause
     fn parse_temporal_value(&self, as_of: &AsOfClause, ctx: &ExecutionContext) -> Result<i64> {
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
+        let value = ExpressionEval::compile(&as_of.value, &[])?
+            .with_context(ctx)
+            .eval_slice(&[])?;
 
         match as_of.as_of_type.to_uppercase().as_str() {
             "TRANSACTION" => {
                 // Expect integer transaction ID
-                match evaluator.evaluate(&as_of.value)? {
+                match value {
                     Value::Integer(txn_id) => Ok(txn_id),
                     _ => Err(Error::invalid_argument(
                         "AS OF TRANSACTION requires integer value",
@@ -4589,7 +4562,7 @@ impl Executor {
             }
             "TIMESTAMP" => {
                 // Expect timestamp string or timestamp value
-                match evaluator.evaluate(&as_of.value)? {
+                match value {
                     Value::Timestamp(ts) => {
                         // Convert to nanoseconds since epoch
                         Ok(ts.timestamp_nanos_opt().unwrap_or(0))
@@ -4893,23 +4866,27 @@ impl Executor {
                 return None;
             }
             // Swap the keys
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry);
             let limit_value = stmt.limit.as_ref().and_then(|e| {
-                evaluator.evaluate(e).ok().and_then(|v| match v {
-                    Value::Integer(n) if n > 0 => Some(n as usize),
-                    _ => None,
-                })
+                ExpressionEval::compile(e, &[])
+                    .ok()
+                    .and_then(|mut eval| eval.eval_slice(&[]).ok())
+                    .and_then(|v| match v {
+                        Value::Integer(n) if n > 0 => Some(n as usize),
+                        _ => None,
+                    })
             })?;
             return Some((limit_value, right_key_col, left_key_col));
         }
 
         // Get LIMIT value
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry);
         let limit_value = stmt.limit.as_ref().and_then(|e| {
-            evaluator.evaluate(e).ok().and_then(|v| match v {
-                Value::Integer(n) if n > 0 => Some(n as usize),
-                _ => None,
-            })
+            ExpressionEval::compile(e, &[])
+                .ok()
+                .and_then(|mut eval| eval.eval_slice(&[]).ok())
+                .and_then(|v| match v {
+                    Value::Integer(n) if n > 0 => Some(n as usize),
+                    _ => None,
+                })
         })?;
 
         Some((limit_value, left_key_col, right_key_col))

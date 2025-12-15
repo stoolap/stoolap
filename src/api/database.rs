@@ -775,10 +775,7 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let tx = executor.begin_transaction_with_isolation(isolation)?;
-        Ok(Transaction::new(
-            tx,
-            Arc::clone(executor.function_registry()),
-        ))
+        Ok(Transaction::new(tx))
     }
 
     /// Get the underlying storage engine

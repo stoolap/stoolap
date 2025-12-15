@@ -32,7 +32,7 @@ use crate::parser::ast::*;
 use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
-use super::expression::CompiledEvaluator;
+use super::expression::ExpressionEval;
 use super::join::{self, build_column_index_map};
 use super::result::ExecutorMemoryResult;
 use super::Executor;
@@ -563,7 +563,7 @@ impl Executor {
                         left_qualified.len(),
                         right_qualified.len(),
                         ctx,
-                    );
+                    )?;
                 }
                 rows
             } else {
@@ -597,13 +597,12 @@ impl Executor {
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
-            let mut where_eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            where_eval.init_columns(&all_columns);
+            let mut where_eval =
+                ExpressionEval::compile(where_clause, &all_columns)?.with_context(ctx);
 
             let mut rows = Vec::new();
             for row in result_rows {
-                where_eval.set_row_array(&row);
-                if where_eval.evaluate_bool(where_clause)? {
+                if where_eval.eval_bool(&row) {
                     rows.push(row);
                 }
             }
@@ -706,14 +705,13 @@ impl Executor {
                 (**where_clause).clone()
             };
 
-            // OPTIMIZATION: Create evaluator once and reuse for all rows
-            let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            eval.init_columns(&cte_columns);
+            // Compile filter once and reuse for all rows
+            let mut eval =
+                ExpressionEval::compile(&processed_where, &cte_columns)?.with_context(ctx);
 
             let mut result = Vec::new();
             for row in cte_rows {
-                eval.set_row_array(&row);
-                if eval.evaluate_bool(&processed_where)? {
+                if eval.eval_bool(&row) {
                     result.push(row);
                 }
             }
@@ -885,52 +883,64 @@ impl Executor {
         cte_columns: &[String],
         ctx: &ExecutionContext,
     ) -> Result<Vec<Row>> {
+        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+
         let col_index_map = build_column_index_map(cte_columns);
 
-        // OPTIMIZATION: Check if we need expression evaluation and create evaluator once
-        let needs_expr_eval = columns.iter().any(|col| {
-            matches!(col, Expression::Aliased(_))
-                || (!matches!(col, Expression::Star(_) | Expression::Identifier(_)))
-        });
+        // Pre-compile expressions that need evaluation
+        // Store: Star -> None, Identifier -> column index, Complex -> compiled program
+        enum CompiledColumn {
+            Star,
+            Identifier(Option<usize>),
+            Compiled(SharedProgram),
+        }
 
-        let mut evaluator = if needs_expr_eval {
-            let mut eval = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-            eval.init_columns(cte_columns);
-            Some(eval)
-        } else {
-            None
-        };
+        let compiled_columns: Vec<CompiledColumn> = columns
+            .iter()
+            .map(|col_expr| match col_expr {
+                Expression::Star(_) => Ok(CompiledColumn::Star),
+                Expression::Identifier(id) => {
+                    let idx = col_index_map.get(&id.value_lower).copied();
+                    Ok(CompiledColumn::Identifier(idx))
+                }
+                Expression::Aliased(aliased) => {
+                    let program = compile_expression(&aliased.expression, cte_columns)?;
+                    Ok(CompiledColumn::Compiled(program))
+                }
+                _ => {
+                    let program = compile_expression(col_expr, cte_columns)?;
+                    Ok(CompiledColumn::Compiled(program))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
 
+        // Create VM for expression execution (reused for all rows)
+        let mut vm = ExprVM::new();
         let mut result_rows = Vec::with_capacity(rows.len());
 
         for row in rows {
             // OPTIMIZATION: Pre-allocate Vec with estimated capacity
             let mut values = Vec::with_capacity(columns.len().max(row.len()));
+            let row_data = row.as_slice();
+            // CRITICAL: Include params from context for parameterized queries
+            let exec_ctx = ExecuteContext::new(row_data)
+                .with_params(ctx.params())
+                .with_named_params(ctx.named_params());
 
-            for col_expr in columns {
-                match col_expr {
-                    Expression::Star(_) => {
+            for compiled in &compiled_columns {
+                match compiled {
+                    CompiledColumn::Star => {
                         // OPTIMIZATION: Use extend_from_slice instead of to_vec()
-                        values.extend_from_slice(row.as_slice());
+                        values.extend_from_slice(row_data);
                     }
-                    Expression::Identifier(id) => {
-                        if let Some(&idx) = col_index_map.get(&id.value_lower) {
-                            values.push(row.get(idx).cloned().unwrap_or_else(Value::null_unknown));
-                        } else {
-                            values.push(Value::null_unknown());
-                        }
+                    CompiledColumn::Identifier(Some(idx)) => {
+                        values.push(row.get(*idx).cloned().unwrap_or_else(Value::null_unknown));
                     }
-                    Expression::Aliased(aliased) => {
-                        if let Some(ref mut eval) = evaluator {
-                            eval.set_row_array(row);
-                            values.push(eval.evaluate(&aliased.expression)?);
-                        }
+                    CompiledColumn::Identifier(None) => {
+                        values.push(Value::null_unknown());
                     }
-                    _ => {
-                        if let Some(ref mut eval) = evaluator {
-                            eval.set_row_array(row);
-                            values.push(eval.evaluate(col_expr)?);
-                        }
+                    CompiledColumn::Compiled(program) => {
+                        values.push(vm.execute(program, &exec_ctx)?);
                     }
                 }
             }

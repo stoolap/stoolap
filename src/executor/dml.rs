@@ -151,8 +151,21 @@ impl Executor {
             }
         }
 
-        // Create evaluator for expressions
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
+        // Create VM for constant expression evaluation (reused for all INSERT values)
+        use super::expression::{compile_expression, ExecuteContext, ExprVM};
+        let mut vm = ExprVM::new();
+        let params = ctx.params();
+        let named_params = ctx.named_params();
+        let empty_row: &[Value] = &[];
+
+        // OPTIMIZATION: Pre-build ExecuteContext once (reused for all expressions)
+        let mut base_exec_ctx = ExecuteContext::new(empty_row);
+        if !params.is_empty() {
+            base_exec_ctx = base_exec_ctx.with_params(params);
+        }
+        if !named_params.is_empty() {
+            base_exec_ctx = base_exec_ctx.with_named_params(named_params);
+        }
 
         let mut rows_affected = 0i64;
 
@@ -275,7 +288,9 @@ impl Executor {
                     if matches!(expr, Expression::Default(_)) {
                         continue;
                     }
-                    let value = evaluator.evaluate(expr)?;
+                    // Compile and evaluate constant expression (reuse pre-built context)
+                    let program = compile_expression(expr, &[])?;
+                    let value = vm.execute(&program, &base_exec_ctx)?;
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
                     // Validate coercion didn't silently fail
@@ -364,7 +379,9 @@ impl Executor {
                     if matches!(expr, Expression::Default(_)) {
                         continue;
                     }
-                    let value = evaluator.evaluate(expr)?;
+                    // Compile and evaluate constant expression (reuse pre-built context)
+                    let program = compile_expression(expr, &[])?;
+                    let value = vm.execute(&program, &base_exec_ctx)?;
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
                     // Validate coercion didn't silently fail
@@ -1108,7 +1125,7 @@ impl Executor {
         row_id: i64,
         _insert_values: &[Value],
         stmt: &InsertStatement,
-        ctx: &ExecutionContext,
+        _ctx: &ExecutionContext,
     ) -> Result<()> {
         // Build a WHERE clause to find the specific row by primary key
         let pk_col = schema
@@ -1140,27 +1157,43 @@ impl Executor {
             })
             .collect();
 
-        let function_registry = &self.function_registry;
-        let ctx_clone = ctx.clone();
         let column_names: Vec<String> = schema.column_names_owned().to_vec();
 
-        // Create evaluator once and reuse for all rows
-        let mut evaluator = CompiledEvaluator::new(function_registry).with_context(&ctx_clone);
-        evaluator.init_columns(&column_names);
+        // Pre-compile update expressions for efficient evaluation
+        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+        let compiled_updates: Vec<(usize, crate::core::DataType, SharedProgram)> = update_specs
+            .iter()
+            .filter_map(|(idx, col_type, expr)| {
+                compile_expression(expr, &column_names)
+                    .ok()
+                    .map(|program| (*idx, *col_type, program))
+            })
+            .collect();
+
+        // Create VM once and reuse for all rows
+        let mut vm = ExprVM::new();
 
         // Create a setter function that applies the ON DUPLICATE KEY UPDATE
         let mut setter = |mut row: Row| -> (Row, bool) {
-            evaluator.set_row_array(&row);
+            // Collect all updates first to avoid borrow conflicts
+            let updates_to_apply: Vec<(usize, Value)> = {
+                let row_data = row.as_slice();
+                let exec_ctx = ExecuteContext::new(row_data);
 
-            let mut changed = false;
+                compiled_updates
+                    .iter()
+                    .filter_map(|(idx, col_type, program)| {
+                        vm.execute(program, &exec_ctx)
+                            .ok()
+                            .map(|v| (*idx, v.into_coerce_to_type(*col_type)))
+                    })
+                    .collect()
+            };
 
-            // Use pre-computed indices instead of per-row position() lookup
-            for (idx, col_type, expr) in &update_specs {
-                if let Ok(new_value) = evaluator.evaluate(expr) {
-                    // OPTIMIZATION: Use into_coerce_to_type to avoid clone when types match
-                    let _ = row.set(*idx, new_value.into_coerce_to_type(*col_type));
-                    changed = true;
-                }
+            // Now apply updates
+            let changed = !updates_to_apply.is_empty();
+            for (idx, new_value) in updates_to_apply {
+                let _ = row.set(idx, new_value);
             }
 
             (row, changed)
@@ -1234,6 +1267,7 @@ impl Executor {
         default_expr: &str,
         target_type: crate::core::DataType,
     ) -> Result<Value> {
+        use super::expression::ExpressionEval;
         use crate::parser::parse_sql;
 
         // Parse the default expression as a SELECT expression
@@ -1249,8 +1283,8 @@ impl Executor {
         // Extract the expression from the SELECT statement
         if let crate::parser::ast::Statement::Select(select) = &stmts[0] {
             if let Some(expr) = select.columns.first() {
-                let mut evaluator = CompiledEvaluator::new(&self.function_registry);
-                let value = evaluator.evaluate(expr)?;
+                // Constant expression - no row context needed
+                let value = ExpressionEval::compile(expr, &[])?.eval_slice(&[])?;
                 return Ok(value.into_coerce_to_type(target_type));
             }
         }
@@ -1287,14 +1321,14 @@ impl Executor {
         // Create an evaluator with the column value in context
         if let crate::parser::ast::Statement::Select(select) = &stmts[0] {
             if let Some(expr) = select.columns.first() {
+                use super::expression::ExpressionEval;
+
                 // Create evaluator and evaluate with row context
                 let columns = vec![col_name.to_string()];
                 let row = crate::core::Row::from_values(vec![col_value.clone()]);
-                let mut evaluator = CompiledEvaluator::new(&self.function_registry);
-                evaluator.init_columns(&columns);
-                evaluator.set_row_array(&row);
 
-                let result = evaluator.evaluate(expr)?;
+                // Compile and evaluate expression with single-column row context
+                let result = ExpressionEval::compile(expr, &columns)?.eval(&row)?;
 
                 // Check if the result is truthy
                 match result {
@@ -1383,20 +1417,30 @@ impl Executor {
             )));
         }
 
-        // Create evaluator for RETURNING expressions
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-        evaluator.init_columns(column_names);
+        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+
+        // Pre-compile all RETURNING expressions
+        let compiled_exprs: Vec<SharedProgram> = expanded_exprs
+            .iter()
+            .map(|expr| compile_expression(expr, column_names))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Create VM for execution (reused for all rows)
+        let mut vm = ExprVM::new();
 
         // Evaluate RETURNING expressions for each row
         let mut result_rows = Vec::with_capacity(source_rows.len());
         for row in source_rows {
-            evaluator.set_row_array(&row);
+            let row_data = row.as_slice();
+            // CRITICAL: Include params from context for parameterized queries
+            let exec_ctx = ExecuteContext::new(row_data)
+                .with_params(ctx.params())
+                .with_named_params(ctx.named_params());
 
-            let mut row_values = Vec::with_capacity(expanded_exprs.len());
-            for expr in &expanded_exprs {
-                let value = evaluator
-                    .evaluate(expr)
-                    .unwrap_or_else(|_| Value::null_unknown());
+            let mut row_values = Vec::with_capacity(compiled_exprs.len());
+            for program in &compiled_exprs {
+                // CRITICAL: Propagate errors instead of silently returning NULL
+                let value = vm.execute(program, &exec_ctx)?;
                 row_values.push(value);
             }
             result_rows.push(Row::from_values(row_values));

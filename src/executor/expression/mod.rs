@@ -43,7 +43,10 @@ mod program;
 mod vm;
 
 pub use compiler::{CompileContext, CompileError, ExprCompiler};
-pub use evaluator_bridge::{CompiledEvaluator, SharedProgram};
+pub use evaluator_bridge::{
+    compile_expression, compile_expression_with_context, CompiledEvaluator, ExpressionEval,
+    JoinFilter, MultiExpressionEval, RowFilter, SharedProgram,
+};
 pub use ops::Op;
 pub use program::{Constant, Program};
 pub use vm::{ExecuteContext, ExprVM, SubqueryExecutor};

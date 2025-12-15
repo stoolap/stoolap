@@ -37,7 +37,7 @@ pub struct ExecutionContext {
     /// Query parameters ($1, $2, etc.) - wrapped in Arc for cheap cloning
     params: Arc<Vec<Value>>,
     /// Named parameters (:name) - wrapped in Arc for cheap cloning
-    named_params: Arc<HashMap<String, Value>>,
+    named_params: Arc<FxHashMap<String, Value>>,
     /// Whether to use auto-commit for DML statements
     auto_commit: bool,
     /// Cancellation flag
@@ -81,7 +81,7 @@ impl ExecutionContext {
     pub fn new() -> Self {
         Self {
             params: Arc::new(Vec::new()),
-            named_params: Arc::new(HashMap::new()),
+            named_params: Arc::new(FxHashMap::default()),
             auto_commit: true,
             cancelled: Arc::new(AtomicBool::new(false)),
             current_database: Arc::new(None),
@@ -105,9 +105,12 @@ impl ExecutionContext {
     }
 
     /// Create an execution context with named parameters
-    pub fn with_named_params(named_params: HashMap<String, Value>) -> Self {
+    /// Accepts std::collections::HashMap for API compatibility
+    pub fn with_named_params(named_params: std::collections::HashMap<String, Value>) -> Self {
+        // Convert HashMap to FxHashMap (more efficient for lookups)
+        let fx_params: FxHashMap<String, Value> = named_params.into_iter().collect();
         Self {
-            named_params: Arc::new(named_params),
+            named_params: Arc::new(fx_params),
             ..Self::new()
         }
     }
@@ -131,8 +134,20 @@ impl ExecutionContext {
         &self.params
     }
 
+    /// Get the params Arc for zero-copy sharing.
+    /// Used by evaluator bridge to avoid cloning params.
+    pub fn params_arc(&self) -> &Arc<Vec<Value>> {
+        &self.params
+    }
+
     /// Get all named parameters
-    pub fn named_params(&self) -> &HashMap<String, Value> {
+    pub fn named_params(&self) -> &FxHashMap<String, Value> {
+        &self.named_params
+    }
+
+    /// Get the named_params Arc for zero-copy sharing.
+    /// Used by evaluator bridge to avoid cloning params.
+    pub fn named_params_arc(&self) -> &Arc<FxHashMap<String, Value>> {
         &self.named_params
     }
 

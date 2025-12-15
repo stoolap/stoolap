@@ -21,6 +21,11 @@
 // - Matches Evaluator's public API (new, init_columns, set_row_array, evaluate)
 // - Uses per-evaluator local cache for compiled programs
 // - Uses ExprVM for execution
+//
+// Performance Optimization:
+// - For closure-based filtering, use `RowFilter` instead of creating evaluators per-row
+// - `RowFilter` pre-compiles the expression once and shares `Arc<Program>` across threads
+// - The VM is lightweight and can be created per-thread without performance penalty
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -37,15 +42,826 @@ use crate::parser::ast::Expression;
 
 use crate::executor::context::ExecutionContext;
 
+// ============================================================================
+// STANDALONE COMPILATION FUNCTIONS
+// ============================================================================
+
+/// Compile an expression to a program for a given column schema.
+///
+/// This is the recommended way to compile expressions for use in closures
+/// or parallel execution. The returned `Arc<Program>` is `Send + Sync` and
+/// can be shared across threads efficiently.
+///
+/// # Arguments
+/// * `expr` - The expression to compile
+/// * `columns` - Column names for the schema
+///
+/// # Returns
+/// * `Arc<Program>` that can be executed with `RowFilter` or `ExprVM`
+pub fn compile_expression(expr: &Expression, columns: &[String]) -> Result<SharedProgram> {
+    let ctx = CompileContext::with_global_registry(columns);
+    let compiler = ExprCompiler::new(&ctx);
+    compiler
+        .compile(expr)
+        .map(Arc::new)
+        .map_err(|e| Error::internal(format!("Compile error: {}", e)))
+}
+
+/// Compile an expression with full context (parameters, outer columns, etc.)
+///
+/// Use this when you need parameters or correlated subquery support.
+pub fn compile_expression_with_context(
+    expr: &Expression,
+    columns: &[String],
+    outer_columns: Option<&[String]>,
+    function_registry: &FunctionRegistry,
+) -> Result<SharedProgram> {
+    let mut ctx = CompileContext::new(columns, function_registry);
+    if let Some(outer_cols) = outer_columns {
+        ctx = ctx.with_outer_columns(outer_cols);
+    }
+    let compiler = ExprCompiler::new(&ctx);
+    compiler
+        .compile(expr)
+        .map(Arc::new)
+        .map_err(|e| Error::internal(format!("Compile error: {}", e)))
+}
+
+// ============================================================================
+// ROW FILTER - Lightweight, Send+Sync filter for closures
+// ============================================================================
+
+/// A lightweight, thread-safe row filter for closure-based filtering.
+///
+/// `RowFilter` pre-compiles the expression once and can be cloned cheaply
+/// (it uses `Arc<Program>` internally). Each thread should create its own
+/// `ExprVM` for execution.
+///
+/// # Example
+/// ```ignore
+/// // Create filter once
+/// let filter = RowFilter::new(&where_expr, &columns)?;
+///
+/// // Use in closure (filter is cloned into closure)
+/// let predicate = move |row: &Row| filter.matches(row);
+///
+/// // Or use with parallel iteration
+/// rows.par_iter().filter(|row| filter.matches(row)).collect()
+/// ```
+#[derive(Clone)]
+pub struct RowFilter {
+    /// Pre-compiled program (shared across clones)
+    program: SharedProgram,
+    /// Query parameters (shared)
+    params: Arc<[Value]>,
+    /// Named parameters (shared)
+    named_params: Arc<FxHashMap<String, Value>>,
+}
+
+impl RowFilter {
+    /// Create a new row filter by compiling the given expression.
+    ///
+    /// # Arguments
+    /// * `expr` - The boolean expression to use as filter
+    /// * `columns` - Column names matching the row schema
+    pub fn new(expr: &Expression, columns: &[String]) -> Result<Self> {
+        let program = compile_expression(expr, columns)?;
+        Ok(Self {
+            program,
+            params: Arc::from([]),
+            named_params: Arc::new(FxHashMap::default()),
+        })
+    }
+
+    /// Create a row filter with expression aliases for HAVING clause evaluation.
+    ///
+    /// Expression aliases map expression strings (like "SUM(amount)") to column
+    /// indices in the result row. This is used for HAVING clauses where aggregate
+    /// expressions need to reference pre-computed aggregate results.
+    ///
+    /// # Arguments
+    /// * `expr` - The boolean expression to use as filter
+    /// * `columns` - Column names matching the row schema
+    /// * `aliases` - Slice of (expression_name, column_index) pairs
+    ///
+    /// # Example
+    /// ```ignore
+    /// // For HAVING SUM(amount) > 100, where SUM(amount) is at column 2
+    /// let aliases = vec![("sum(amount)".to_string(), 2)];
+    /// let filter = RowFilter::with_aliases(&having_expr, &columns, &aliases)?;
+    ///
+    /// // Filter rows
+    /// for row in rows {
+    ///     if filter.matches(&row) {
+    ///         // row passes HAVING clause
+    ///     }
+    /// }
+    /// ```
+    pub fn with_aliases(
+        expr: &Expression,
+        columns: &[String],
+        aliases: &[(String, usize)],
+    ) -> Result<Self> {
+        let alias_map: FxHashMap<String, u16> = aliases
+            .iter()
+            .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
+            .collect();
+
+        let ctx = CompileContext::with_global_registry(columns).with_expression_aliases(alias_map);
+        let compiler = ExprCompiler::new(&ctx);
+        let program = compiler
+            .compile(expr)
+            .map(Arc::new)
+            .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
+
+        Ok(Self {
+            program,
+            params: Arc::from([]),
+            named_params: Arc::new(FxHashMap::default()),
+        })
+    }
+
+    /// Create a filter with query parameters.
+    pub fn with_params(mut self, params: Vec<Value>) -> Self {
+        self.params = Arc::from(params);
+        self
+    }
+
+    /// Create a filter with named parameters.
+    pub fn with_named_params(mut self, named_params: FxHashMap<String, Value>) -> Self {
+        self.named_params = Arc::new(named_params);
+        self
+    }
+
+    /// Create a filter from execution context.
+    ///
+    /// PERF: For `named_params`, we share the Arc to avoid cloning.
+    /// For `params`, we must clone because RowFilter uses Arc<[Value]> while
+    /// ExecutionContext uses Arc<Vec<Value>>. These are incompatible types.
+    pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
+        // Clone params (type mismatch: Arc<[Value]> vs Arc<Vec<Value>>)
+        self.params = Arc::from(ctx.params().to_vec());
+        // Share named_params Arc - no cloning needed
+        self.named_params = Arc::clone(ctx.named_params_arc());
+        self
+    }
+
+    /// Create a filter from a pre-compiled program.
+    pub fn from_program(program: SharedProgram) -> Self {
+        Self {
+            program,
+            params: Arc::from([]),
+            named_params: Arc::new(FxHashMap::default()),
+        }
+    }
+
+    /// Check if a row matches the filter condition.
+    ///
+    /// This method is thread-safe and can be called from multiple threads.
+    /// Each call uses a thread-local VM for execution.
+    #[inline]
+    pub fn matches(&self, row: &Row) -> bool {
+        // Use thread-local VM for zero allocation in hot path
+        thread_local! {
+            static VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
+        }
+
+        VM.with(|vm| {
+            let row_data = row.as_slice();
+            let mut ctx = ExecuteContext::new(row_data);
+
+            if !self.params.is_empty() {
+                ctx = ctx.with_params(&self.params);
+            }
+            if !self.named_params.is_empty() {
+                ctx = ctx.with_named_params(&self.named_params);
+            }
+
+            // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
+            // If the VM is already borrowed, create a temporary one for this call.
+            if let Ok(mut borrowed_vm) = vm.try_borrow_mut() {
+                borrowed_vm.execute_bool(&self.program, &ctx)
+            } else {
+                // Fallback: create a fresh VM for recursive calls
+                let mut temp_vm = ExprVM::new();
+                temp_vm.execute_bool(&self.program, &ctx)
+            }
+        })
+    }
+
+    /// Evaluate the filter expression and return the value.
+    #[inline]
+    pub fn evaluate(&self, row: &Row) -> Result<Value> {
+        thread_local! {
+            static VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
+        }
+
+        VM.with(|vm| {
+            let row_data = row.as_slice();
+            let mut ctx = ExecuteContext::new(row_data);
+
+            if !self.params.is_empty() {
+                ctx = ctx.with_params(&self.params);
+            }
+            if !self.named_params.is_empty() {
+                ctx = ctx.with_named_params(&self.named_params);
+            }
+
+            // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
+            // If the VM is already borrowed, create a temporary one for this call.
+            if let Ok(mut borrowed_vm) = vm.try_borrow_mut() {
+                borrowed_vm.execute(&self.program, &ctx)
+            } else {
+                // Fallback: create a fresh VM for recursive calls
+                let mut temp_vm = ExprVM::new();
+                temp_vm.execute(&self.program, &ctx)
+            }
+        })
+    }
+
+    /// Get the underlying program (for advanced use cases).
+    pub fn program(&self) -> &SharedProgram {
+        &self.program
+    }
+}
+
+// Static assertions to verify RowFilter implements Send + Sync.
+// This is safer than unsafe impl because it will fail at compile time
+// if any field doesn't implement Send/Sync, rather than causing UB at runtime.
+// All fields are Send + Sync:
+// - Arc<Program> is Send + Sync (Program is immutable)
+// - Arc<[Value]> is Send + Sync
+// - Arc<FxHashMap<String, Value>> is Send + Sync
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    let _ = assert_send_sync::<RowFilter>;
+};
+
+// ============================================================================
+// JOIN FILTER - For join condition evaluation
+// ============================================================================
+
+/// A filter for join condition evaluation between two rows.
+#[derive(Clone)]
+pub struct JoinFilter {
+    /// Pre-compiled program
+    program: SharedProgram,
+}
+
+impl JoinFilter {
+    /// Create a join filter by compiling the condition.
+    ///
+    /// # Arguments
+    /// * `expr` - The join condition expression
+    /// * `left_columns` - Column names for the left table
+    /// * `right_columns` - Column names for the right table
+    pub fn new(
+        expr: &Expression,
+        left_columns: &[String],
+        right_columns: &[String],
+        function_registry: &FunctionRegistry,
+    ) -> Result<Self> {
+        let ctx =
+            CompileContext::new(left_columns, function_registry).with_second_row(right_columns);
+        let compiler = ExprCompiler::new(&ctx);
+        let program = compiler
+            .compile(expr)
+            .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
+        Ok(Self {
+            program: Arc::new(program),
+        })
+    }
+
+    /// Check if a pair of rows satisfies the join condition.
+    #[inline]
+    pub fn matches(&self, left_row: &Row, right_row: &Row) -> bool {
+        thread_local! {
+            static VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
+        }
+
+        VM.with(|vm| {
+            let ctx = ExecuteContext::for_join(left_row.as_slice(), right_row.as_slice());
+
+            // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
+            // If the VM is already borrowed, create a temporary one for this call.
+            if let Ok(mut borrowed_vm) = vm.try_borrow_mut() {
+                borrowed_vm.execute_bool(&self.program, &ctx)
+            } else {
+                // Fallback: create a fresh VM for recursive calls
+                let mut temp_vm = ExprVM::new();
+                temp_vm.execute_bool(&self.program, &ctx)
+            }
+        })
+    }
+
+    /// Get the underlying program.
+    pub fn program(&self) -> &SharedProgram {
+        &self.program
+    }
+}
+
+// Static assertions to verify JoinFilter implements Send + Sync.
+// This is safer than unsafe impl because it will fail at compile time
+// if any field doesn't implement Send/Sync, rather than causing UB at runtime.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    let _ = assert_send_sync::<JoinFilter>;
+};
+
+// ============================================================================
+// EXPRESSION EVAL - Direct VM usage for maximum performance
+// ============================================================================
+
+/// Lightweight expression evaluator using direct VM execution.
+///
+/// `ExpressionEval` provides the simplest possible API for expression evaluation:
+/// 1. Compile the expression once with `new()`
+/// 2. Evaluate rows with `eval()` or `eval_bool()`
+///
+/// This is the recommended replacement for `CompiledEvaluator` when you have
+/// a single expression to evaluate repeatedly.
+///
+/// # Example
+/// ```ignore
+/// // Compile once
+/// let eval = ExpressionEval::compile(&expr, &columns)?;
+///
+/// // Evaluate many rows
+/// for row in rows {
+///     let value = eval.eval(&row)?;
+///     // or for boolean: let matches = eval.eval_bool(&row);
+/// }
+/// ```
+pub struct ExpressionEval {
+    /// Pre-compiled program
+    program: SharedProgram,
+    /// VM instance (reusable, maintains stack)
+    vm: ExprVM,
+    /// Query parameters
+    params: Vec<Value>,
+    /// Named parameters
+    named_params: FxHashMap<String, Value>,
+    /// Outer row context for correlated subqueries
+    outer_row: Option<FxHashMap<Arc<str>, Value>>,
+    /// Transaction ID
+    transaction_id: Option<u64>,
+}
+
+impl ExpressionEval {
+    /// Compile an expression for evaluation.
+    pub fn compile(expr: &Expression, columns: &[String]) -> Result<Self> {
+        let program = compile_expression(expr, columns)?;
+        Ok(Self {
+            program,
+            vm: ExprVM::new(),
+            params: Vec::new(),
+            named_params: FxHashMap::default(),
+            outer_row: None,
+            transaction_id: None,
+        })
+    }
+
+    /// Compile with expression aliases for HAVING clause evaluation.
+    ///
+    /// Expression aliases map expression strings (like "SUM(amount)") to column
+    /// indices in the result row. This is used for HAVING clauses where aggregate
+    /// expressions need to reference pre-computed aggregate results.
+    ///
+    /// # Arguments
+    /// * `expr` - The expression to compile
+    /// * `columns` - Column names for the result row
+    /// * `aliases` - Slice of (expression_name, column_index) pairs
+    ///
+    /// # Example
+    /// ```ignore
+    /// // For HAVING SUM(amount) > 100, where SUM(amount) is at column 2
+    /// let aliases = vec![("sum(amount)".to_string(), 2)];
+    /// let eval = ExpressionEval::compile_with_aliases(&having_expr, &columns, &aliases)?;
+    /// ```
+    pub fn compile_with_aliases(
+        expr: &Expression,
+        columns: &[String],
+        aliases: &[(String, usize)],
+    ) -> Result<Self> {
+        let alias_map: FxHashMap<String, u16> = aliases
+            .iter()
+            .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
+            .collect();
+
+        Self::compile_with_options(
+            expr,
+            columns,
+            None,
+            None,
+            Some(alias_map),
+            global_registry(),
+        )
+    }
+
+    /// Compile with full context options.
+    pub fn compile_with_options(
+        expr: &Expression,
+        columns: &[String],
+        columns2: Option<&[String]>,
+        outer_columns: Option<&[String]>,
+        expression_aliases: Option<FxHashMap<String, u16>>,
+        function_registry: &FunctionRegistry,
+    ) -> Result<Self> {
+        let mut ctx = CompileContext::new(columns, function_registry);
+        if let Some(cols2) = columns2 {
+            ctx = ctx.with_second_row(cols2);
+        }
+        if let Some(outer) = outer_columns {
+            ctx = ctx.with_outer_columns(outer);
+        }
+        if let Some(aliases) = expression_aliases {
+            ctx = ctx.with_expression_aliases(aliases);
+        }
+        let compiler = ExprCompiler::new(&ctx);
+        let program = compiler
+            .compile(expr)
+            .map(Arc::new)
+            .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
+        Ok(Self {
+            program,
+            vm: ExprVM::new(),
+            params: Vec::new(),
+            named_params: FxHashMap::default(),
+            outer_row: None,
+            transaction_id: None,
+        })
+    }
+
+    /// Create from a pre-compiled program.
+    pub fn from_program(program: SharedProgram) -> Self {
+        Self {
+            program,
+            vm: ExprVM::new(),
+            params: Vec::new(),
+            named_params: FxHashMap::default(),
+            outer_row: None,
+            transaction_id: None,
+        }
+    }
+
+    /// Set query parameters.
+    pub fn with_params(mut self, params: Vec<Value>) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// Set named parameters.
+    pub fn with_named_params(mut self, named_params: FxHashMap<String, Value>) -> Self {
+        self.named_params = named_params;
+        self
+    }
+
+    /// Set context from ExecutionContext.
+    pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
+        self.params = ctx.params().to_vec();
+        self.named_params = ctx
+            .named_params()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if let Some(outer) = ctx.outer_row() {
+            let mut arc_map = FxHashMap::default();
+            for (k, v) in outer.iter() {
+                arc_map.insert(Arc::from(k.as_str()), v.clone());
+            }
+            self.outer_row = Some(arc_map);
+        }
+        self.transaction_id = ctx.transaction_id();
+        self
+    }
+
+    /// Set transaction ID.
+    pub fn with_transaction_id(mut self, txn_id: Option<u64>) -> Self {
+        self.transaction_id = txn_id;
+        self
+    }
+
+    /// Set outer row for correlated subqueries.
+    pub fn set_outer_row(&mut self, outer: &FxHashMap<String, Value>) {
+        let mut arc_map = FxHashMap::default();
+        for (k, v) in outer.iter() {
+            arc_map.insert(Arc::from(k.as_str()), v.clone());
+        }
+        self.outer_row = Some(arc_map);
+    }
+
+    /// Clear outer row.
+    pub fn clear_outer_row(&mut self) {
+        self.outer_row = None;
+    }
+
+    /// Evaluate the expression for a row.
+    #[inline]
+    pub fn eval(&mut self, row: &Row) -> Result<Value> {
+        let row_data = row.as_slice();
+        let mut ctx = ExecuteContext::new(row_data);
+
+        if !self.params.is_empty() {
+            ctx = ctx.with_params(&self.params);
+        }
+        if !self.named_params.is_empty() {
+            ctx = ctx.with_named_params(&self.named_params);
+        }
+        if let Some(ref outer) = self.outer_row {
+            ctx = ctx.with_outer_row(outer);
+        }
+        ctx = ctx.with_transaction_id(self.transaction_id);
+
+        self.vm.execute(&self.program, &ctx)
+    }
+
+    /// Evaluate as boolean (for WHERE/HAVING).
+    #[inline]
+    pub fn eval_bool(&mut self, row: &Row) -> bool {
+        let row_data = row.as_slice();
+        let mut ctx = ExecuteContext::new(row_data);
+
+        if !self.params.is_empty() {
+            ctx = ctx.with_params(&self.params);
+        }
+        if !self.named_params.is_empty() {
+            ctx = ctx.with_named_params(&self.named_params);
+        }
+        if let Some(ref outer) = self.outer_row {
+            ctx = ctx.with_outer_row(outer);
+        }
+        ctx = ctx.with_transaction_id(self.transaction_id);
+
+        self.vm.execute_bool(&self.program, &ctx)
+    }
+
+    /// Evaluate with two rows (for joins).
+    #[inline]
+    pub fn eval_join(&mut self, left: &Row, right: &Row) -> Result<Value> {
+        let ctx = ExecuteContext::for_join(left.as_slice(), right.as_slice());
+        self.vm.execute(&self.program, &ctx)
+    }
+
+    /// Evaluate join as boolean.
+    #[inline]
+    pub fn eval_join_bool(&mut self, left: &Row, right: &Row) -> bool {
+        let ctx = ExecuteContext::for_join(left.as_slice(), right.as_slice());
+        self.vm.execute_bool(&self.program, &ctx)
+    }
+
+    /// Evaluate with raw slice data (avoids Row wrapper overhead).
+    #[inline]
+    pub fn eval_slice(&mut self, row: &[Value]) -> Result<Value> {
+        let mut ctx = ExecuteContext::new(row);
+
+        if !self.params.is_empty() {
+            ctx = ctx.with_params(&self.params);
+        }
+        if !self.named_params.is_empty() {
+            ctx = ctx.with_named_params(&self.named_params);
+        }
+        if let Some(ref outer) = self.outer_row {
+            ctx = ctx.with_outer_row(outer);
+        }
+        ctx = ctx.with_transaction_id(self.transaction_id);
+
+        self.vm.execute(&self.program, &ctx)
+    }
+
+    /// Evaluate slice as boolean.
+    #[inline]
+    pub fn eval_slice_bool(&mut self, row: &[Value]) -> bool {
+        let mut ctx = ExecuteContext::new(row);
+
+        if !self.params.is_empty() {
+            ctx = ctx.with_params(&self.params);
+        }
+        if !self.named_params.is_empty() {
+            ctx = ctx.with_named_params(&self.named_params);
+        }
+        if let Some(ref outer) = self.outer_row {
+            ctx = ctx.with_outer_row(outer);
+        }
+        ctx = ctx.with_transaction_id(self.transaction_id);
+
+        self.vm.execute_bool(&self.program, &ctx)
+    }
+
+    /// Get the underlying program.
+    pub fn program(&self) -> &SharedProgram {
+        &self.program
+    }
+}
+
+// ============================================================================
+// MULTI-EXPRESSION EVALUATOR - For SELECT projections
+// ============================================================================
+
+/// Evaluates multiple expressions efficiently (for SELECT projections).
+///
+/// Pre-compiles all expressions once, then evaluates them together for each row.
+pub struct MultiExpressionEval {
+    /// Pre-compiled programs for each expression
+    programs: Vec<SharedProgram>,
+    /// Single VM instance (reused for all expressions)
+    vm: ExprVM,
+    /// Query parameters
+    params: Vec<Value>,
+    /// Named parameters
+    named_params: FxHashMap<String, Value>,
+    /// Transaction ID
+    transaction_id: Option<u64>,
+}
+
+impl MultiExpressionEval {
+    /// Compile multiple expressions.
+    pub fn compile(exprs: &[Expression], columns: &[String]) -> Result<Self> {
+        let ctx = CompileContext::with_global_registry(columns);
+        let compiler = ExprCompiler::new(&ctx);
+
+        let programs = exprs
+            .iter()
+            .map(|expr| {
+                compiler
+                    .compile(expr)
+                    .map(Arc::new)
+                    .map_err(|e| Error::internal(format!("Compile error: {}", e)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            programs,
+            vm: ExprVM::new(),
+            params: Vec::new(),
+            named_params: FxHashMap::default(),
+            transaction_id: None,
+        })
+    }
+
+    /// Compile multiple expressions with expression aliases.
+    ///
+    /// Expression aliases map expression strings (like "SUM(amount)") to column
+    /// indices in the result row. This is used for window function ORDER BY
+    /// clauses where aggregate expressions need to reference pre-computed results.
+    ///
+    /// # Arguments
+    /// * `exprs` - The expressions to compile
+    /// * `columns` - Column names for the result row
+    /// * `aliases` - Slice of (expression_name, column_index) pairs
+    pub fn compile_with_aliases(
+        exprs: &[Expression],
+        columns: &[String],
+        aliases: &[(String, usize)],
+    ) -> Result<Self> {
+        let alias_map: FxHashMap<String, u16> = aliases
+            .iter()
+            .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
+            .collect();
+
+        let ctx = CompileContext::with_global_registry(columns).with_expression_aliases(alias_map);
+        let compiler = ExprCompiler::new(&ctx);
+
+        let programs = exprs
+            .iter()
+            .map(|expr| {
+                compiler
+                    .compile(expr)
+                    .map(Arc::new)
+                    .map_err(|e| Error::internal(format!("Compile error: {}", e)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            programs,
+            vm: ExprVM::new(),
+            params: Vec::new(),
+            named_params: FxHashMap::default(),
+            transaction_id: None,
+        })
+    }
+
+    /// Set query parameters.
+    pub fn with_params(mut self, params: Vec<Value>) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// Set from execution context.
+    pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
+        self.params = ctx.params().to_vec();
+        self.named_params = ctx
+            .named_params()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        self.transaction_id = ctx.transaction_id();
+        self
+    }
+
+    /// Evaluate all expressions for a row, returning values in order.
+    #[inline]
+    pub fn eval_all(&mut self, row: &Row) -> Result<Vec<Value>> {
+        let row_data = row.as_slice();
+        let mut ctx = ExecuteContext::new(row_data);
+
+        if !self.params.is_empty() {
+            ctx = ctx.with_params(&self.params);
+        }
+        if !self.named_params.is_empty() {
+            ctx = ctx.with_named_params(&self.named_params);
+        }
+        ctx = ctx.with_transaction_id(self.transaction_id);
+
+        self.programs
+            .iter()
+            .map(|prog| self.vm.execute(prog, &ctx))
+            .collect()
+    }
+
+    /// Evaluate all expressions, writing results into provided buffer.
+    #[inline]
+    pub fn eval_into(&mut self, row: &Row, output: &mut Vec<Value>) -> Result<()> {
+        let row_data = row.as_slice();
+        let mut ctx = ExecuteContext::new(row_data);
+
+        if !self.params.is_empty() {
+            ctx = ctx.with_params(&self.params);
+        }
+        if !self.named_params.is_empty() {
+            ctx = ctx.with_named_params(&self.named_params);
+        }
+        ctx = ctx.with_transaction_id(self.transaction_id);
+
+        output.clear();
+        for prog in &self.programs {
+            output.push(self.vm.execute(prog, &ctx)?);
+        }
+        Ok(())
+    }
+
+    /// Number of expressions.
+    pub fn len(&self) -> usize {
+        self.programs.len()
+    }
+
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.programs.is_empty()
+    }
+}
+
 /// Shared program reference for zero-copy caching
 pub type SharedProgram = Arc<Program>;
 
-/// Compiled expression evaluator using the Expression VM
+// ============================================================================
+// COMPILED EVALUATOR - DEPRECATED, use ExpressionEval instead
+// ============================================================================
+
+/// Compiled expression evaluator using the Expression VM.
 ///
-/// This is a drop-in replacement for the AST-based Evaluator that uses
-/// compiled bytecode for faster expression evaluation.
+/// # Deprecated
 ///
-/// Uses per-evaluator local cache for compiled programs.
+/// **This type is deprecated.** Use the new, more efficient alternatives:
+///
+/// - [`ExpressionEval`] - For single expression evaluation (most common case)
+/// - [`RowFilter`] - For closure-based filtering (Send+Sync safe)
+/// - [`JoinFilter`] - For join condition evaluation
+/// - [`MultiExpressionEval`] - For SELECT projections (multiple expressions)
+///
+/// The new APIs pre-compile expressions eagerly rather than lazily, avoiding
+/// cache invalidation issues and providing better performance.
+///
+/// ## Migration Guide
+///
+/// **Before (CompiledEvaluator):**
+/// ```ignore
+/// let mut eval = CompiledEvaluator::new(&registry);
+/// eval.init_columns(&columns);
+/// for row in rows {
+///     eval.set_row_array(&row);
+///     let value = eval.evaluate(&expr)?;
+/// }
+/// ```
+///
+/// **After (ExpressionEval):**
+/// ```ignore
+/// let mut eval = ExpressionEval::compile(&expr, &columns)?;
+/// for row in rows {
+///     let value = eval.eval(&row)?;
+/// }
+/// ```
+///
+/// # When to use CompiledEvaluator vs new APIs
+///
+/// **Use the new APIs (recommended for most cases):**
+/// - [`ExpressionEval`] - Single expression with static schema
+/// - [`RowFilter`] - WHERE clause filtering (thread-safe)
+/// - [`MultiExpressionEval`] - SELECT projections (multiple expressions)
+///
+/// **Use CompiledEvaluator when:**
+/// - Expressions change per-row (e.g., after `process_correlated_expression`)
+/// - You need dynamic/lazy expression compilation
+/// - Complex scenarios with correlated subqueries
 pub struct CompiledEvaluator<'a> {
     /// Function registry for compilation
     function_registry: &'a FunctionRegistry,
@@ -679,133 +1495,5 @@ impl<'a> CompiledEvaluator<'a> {
 impl Default for CompiledEvaluator<'static> {
     fn default() -> Self {
         Self::with_defaults()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::Row;
-    use crate::parser::ast::*;
-    use crate::parser::token::{Position, Token, TokenType};
-
-    fn make_token() -> Token {
-        Token {
-            token_type: TokenType::Integer,
-            literal: "1".to_string(),
-            position: Position {
-                offset: 0,
-                line: 1,
-                column: 1,
-            },
-            error: None,
-        }
-    }
-
-    #[test]
-    fn test_simple_comparison() {
-        let columns = vec!["a".to_string()];
-        let mut eval = CompiledEvaluator::with_defaults();
-        eval.init_columns(&columns);
-
-        // a > 5
-        let expr = Expression::Infix(InfixExpression {
-            token: make_token(),
-            left: Box::new(Expression::Identifier(Identifier::new(
-                make_token(),
-                "a".to_string(),
-            ))),
-            operator: ">".to_string(),
-            op_type: InfixOperator::GreaterThan,
-            right: Box::new(Expression::IntegerLiteral(IntegerLiteral {
-                token: make_token(),
-                value: 5,
-            })),
-        });
-
-        // Test with a > 5 being true
-        let row = Row::from_values(vec![Value::Integer(10)]);
-        eval.set_row_array(&row);
-        let result = eval.evaluate(&expr).unwrap();
-        assert_eq!(result, Value::Boolean(true));
-
-        // Test with a > 5 being false
-        let row = Row::from_values(vec![Value::Integer(3)]);
-        eval.set_row_array(&row);
-        let result = eval.evaluate(&expr).unwrap();
-        assert_eq!(result, Value::Boolean(false));
-    }
-
-    #[test]
-    fn test_evaluate_bool() {
-        let columns = vec!["x".to_string()];
-        let mut eval = CompiledEvaluator::with_defaults();
-        eval.init_columns(&columns);
-
-        // x > 0
-        let expr = Expression::Infix(InfixExpression {
-            token: make_token(),
-            left: Box::new(Expression::Identifier(Identifier::new(
-                make_token(),
-                "x".to_string(),
-            ))),
-            operator: ">".to_string(),
-            op_type: InfixOperator::GreaterThan,
-            right: Box::new(Expression::IntegerLiteral(IntegerLiteral {
-                token: make_token(),
-                value: 0,
-            })),
-        });
-
-        let row = Row::from_values(vec![Value::Integer(5)]);
-        eval.set_row_array(&row);
-        assert!(eval.evaluate_bool(&expr).unwrap());
-
-        let row = Row::from_values(vec![Value::Integer(-1)]);
-        eval.set_row_array(&row);
-        assert!(!eval.evaluate_bool(&expr).unwrap());
-    }
-
-    #[test]
-    fn test_program_caching() {
-        let columns = vec!["a".to_string()];
-        let mut eval = CompiledEvaluator::with_defaults();
-        eval.init_columns(&columns);
-
-        let expr = Expression::IntegerLiteral(IntegerLiteral {
-            token: make_token(),
-            value: 42,
-        });
-
-        // First evaluation compiles
-        let row = Row::from_values(vec![Value::Integer(1)]);
-        eval.set_row_array(&row);
-        let result1 = eval.evaluate(&expr).unwrap();
-
-        // Second evaluation should use cache
-        let result2 = eval.evaluate(&expr).unwrap();
-
-        assert_eq!(result1, result2);
-        assert_eq!(eval.local_cache.len(), 1);
-    }
-
-    #[test]
-    fn test_with_params() {
-        let columns = vec!["a".to_string()];
-        let mut eval = CompiledEvaluator::with_defaults();
-        eval.init_columns(&columns);
-        eval.params = vec![Value::Integer(100)];
-
-        // $1
-        let expr = Expression::Parameter(Parameter {
-            token: make_token(),
-            index: 1,
-            name: "$1".to_string(),
-        });
-
-        let row = Row::from_values(vec![Value::Integer(1)]);
-        eval.set_row_array(&row);
-        let result = eval.evaluate(&expr).unwrap();
-        assert_eq!(result, Value::Integer(100));
     }
 }

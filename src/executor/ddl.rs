@@ -28,7 +28,7 @@ use crate::parser::ast::*;
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
-use super::expression::CompiledEvaluator;
+use super::expression::ExpressionEval;
 use super::result::ExecResult;
 use super::Executor;
 
@@ -753,8 +753,8 @@ impl Executor {
         // Extract the expression from the SELECT statement
         if let Statement::Select(select) = &stmts[0] {
             if let Some(expr) = select.columns.first() {
-                let mut evaluator = CompiledEvaluator::new(&self.function_registry);
-                let value = evaluator.evaluate(expr)?;
+                let mut eval = ExpressionEval::compile(expr, &[])?;
+                let value = eval.eval_slice(&[])?;
                 return Ok(value.into_coerce_to_type(target_type));
             }
         }
