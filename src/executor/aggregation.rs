@@ -2111,7 +2111,12 @@ impl Executor {
             counts: Vec<i64>,         // For COUNT
         }
 
-        let mut groups: FxHashMap<u64, FastGroupState> = FxHashMap::default();
+        // Pre-allocate hash map with estimated capacity to reduce resizing.
+        // Estimate: for high-cardinality groupings, assume ~1/3 of rows are unique groups.
+        // For low-cardinality, this over-allocates but that's fine.
+        let estimated_groups = (rows.len() / 3).max(64);
+        let mut groups: FxHashMap<u64, FastGroupState> =
+            FxHashMap::with_capacity_and_hasher(estimated_groups, Default::default());
         let num_aggs = simple_aggs.len();
 
         // Track for early termination optimization

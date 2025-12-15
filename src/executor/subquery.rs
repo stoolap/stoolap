@@ -26,7 +26,7 @@ use crate::core::{Error, Result, Value};
 use crate::parser::ast::*;
 use crate::parser::token::TokenType;
 
-use super::context::ExecutionContext;
+use super::context::{cache_scalar_subquery, get_cached_scalar_subquery, ExecutionContext};
 use super::utils::{dummy_token, value_to_expression};
 use super::Executor;
 
@@ -491,24 +491,51 @@ impl Executor {
         }))
     }
 
-    /// Execute a scalar subquery and return its single value
+    /// Execute a scalar subquery and return its single value.
+    /// For non-correlated subqueries (no outer row context), results are cached
+    /// to avoid re-execution when the same subquery appears multiple times.
     fn execute_scalar_subquery(
         &self,
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<crate::core::Value> {
+        // Check if this is a non-correlated subquery (no outer row context)
+        // Non-correlated subqueries can be cached since they return the same result
+        let is_non_correlated =
+            ctx.outer_row().is_none() && !Self::is_subquery_correlated(subquery);
+
+        // For non-correlated subqueries, check cache first using SQL string as key
+        let cache_key = if is_non_correlated {
+            let key = subquery.to_string();
+            if let Some(cached_value) = get_cached_scalar_subquery(&key) {
+                return Ok(cached_value);
+            }
+            Some(key)
+        } else {
+            None
+        };
+
         // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
         let mut result = self.execute_select(subquery, &subquery_ctx)?;
 
         // Get the first row
         if !result.next() {
-            return Ok(crate::core::Value::null_unknown());
+            let null_value = crate::core::Value::null_unknown();
+            // Cache the result for non-correlated subqueries
+            if let Some(key) = cache_key {
+                cache_scalar_subquery(key, null_value.clone());
+            }
+            return Ok(null_value);
         }
 
         let row = result.take_row();
         if row.is_empty() {
-            return Ok(crate::core::Value::null_unknown());
+            let null_value = crate::core::Value::null_unknown();
+            if let Some(key) = cache_key {
+                cache_scalar_subquery(key, null_value.clone());
+            }
+            return Ok(null_value);
         }
 
         // Get the first value
@@ -522,6 +549,11 @@ impl Executor {
             return Err(Error::Internal {
                 message: "scalar subquery returned more than one row".to_string(),
             });
+        }
+
+        // Cache the result for non-correlated subqueries
+        if let Some(key) = cache_key {
+            cache_scalar_subquery(key, first_value.clone());
         }
 
         Ok(first_value)

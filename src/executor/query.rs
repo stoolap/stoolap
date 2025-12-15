@@ -37,7 +37,7 @@ use crate::storage::traits::{Engine, QueryResult};
 /// Maximum depth for nested views to prevent stack overflow
 const MAX_VIEW_DEPTH: usize = 32;
 
-use super::context::{ExecutionContext, TimeoutGuard};
+use super::context::{clear_scalar_subquery_cache, ExecutionContext, TimeoutGuard};
 use super::expression::{CompiledEvaluator, ExpressionEval, RowFilter};
 use super::join::{self, build_column_index_map};
 use super::parallel::{self, ParallelConfig};
@@ -153,6 +153,8 @@ impl Executor {
         // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
         // This ensures the timeout applies to the entire query, not each nested call.
         let _timeout_guard = if ctx.query_depth == 0 {
+            // Clear scalar subquery cache at top-level to avoid stale results between queries
+            clear_scalar_subquery_cache();
             TimeoutGuard::new(ctx)
         } else {
             None
@@ -3033,7 +3035,7 @@ impl Executor {
 
     /// Execute a table expression with optional filter pushdown
     /// This is used by JOIN to push WHERE predicates to individual table scans
-    fn execute_table_expression_with_filter(
+    pub(crate) fn execute_table_expression_with_filter(
         &self,
         expr: &Expression,
         ctx: &ExecutionContext,
@@ -4939,7 +4941,7 @@ impl Executor {
     }
 
     /// Build an IN filter expression: column_name IN (v1, v2, ..., vN)
-    fn build_in_filter_expression(
+    pub(crate) fn build_in_filter_expression(
         &self,
         column_name: &str,
         values: &[Value],

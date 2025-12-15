@@ -18,12 +18,41 @@
 //! parameter handling, transaction state, and query options.
 
 use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::core::{Result, Row, Value};
+
+// Cache for scalar subquery results to avoid re-execution.
+// Thread-local to avoid synchronization overhead.
+// Uses SQL string as key (not hash) to avoid collision risk.
+thread_local! {
+    static SCALAR_SUBQUERY_CACHE: RefCell<FxHashMap<String, Value>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the scalar subquery cache. Should be called at the start of each top-level query.
+pub fn clear_scalar_subquery_cache() {
+    SCALAR_SUBQUERY_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit(); // Release capacity to avoid memory bloat in long-running apps
+    });
+}
+
+/// Get a cached scalar subquery result by SQL string key.
+pub fn get_cached_scalar_subquery(key: &str) -> Option<Value> {
+    SCALAR_SUBQUERY_CACHE.with(|cache| cache.borrow().get(key).cloned())
+}
+
+/// Cache a scalar subquery result.
+pub fn cache_scalar_subquery(key: String, value: Value) {
+    SCALAR_SUBQUERY_CACHE.with(|cache| {
+        cache.borrow_mut().insert(key, value);
+    });
+}
 
 /// Execution context for SQL queries
 ///

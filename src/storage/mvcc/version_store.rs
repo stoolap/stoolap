@@ -816,6 +816,92 @@ impl VersionStore {
         result
     }
 
+    /// Get visible rows with limit and offset applied at the storage layer.
+    ///
+    /// # Current Limitations (NOT True Early Termination)
+    /// Due to DashMap's concurrent design, iteration order is non-deterministic.
+    /// To maintain consistent results (e.g., LIMIT 1 returns first inserted row),
+    /// this function:
+    /// 1. Iterates ALL visible rows (O(n) scan)
+    /// 2. Sorts by row_id (O(n log n))
+    /// 3. Applies offset/limit (O(limit))
+    ///
+    /// This is NOT early termination - it still scans the full table. The benefit
+    /// is reduced data transfer to the executor (only `limit` rows returned vs all).
+    /// True early termination would require ordered storage (B-tree on row_id).
+    ///
+    /// # Arguments
+    /// * `txn_id` - Transaction ID for visibility check
+    /// * `limit` - Maximum number of rows to return
+    /// * `offset` - Number of rows to skip before collecting
+    pub fn get_visible_rows_with_limit(
+        &self,
+        txn_id: i64,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<(i64, Row)> {
+        if self.closed.load(Ordering::Acquire) || limit == 0 {
+            return Vec::new();
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+
+        // Pre-acquire arena locks ONCE for the entire operation
+        let (arena_rows, arena_data) = self.arena.read_guards();
+        let arena_rows_slice = arena_rows.as_slice();
+        let arena_data_slice = arena_data.as_slice();
+        let arena_len = arena_rows_slice.len();
+
+        // Collect all visible rows (we need to sort to maintain insertion order)
+        // For tables smaller than 2x the needed rows, this is efficient
+        let needed = limit + offset;
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(self.versions.len().min(needed * 2));
+
+        for entry in self.versions.iter() {
+            let row_id = *entry.key();
+            let chain = entry.value();
+            let mut current: Option<&VersionChainEntry> = Some(chain);
+
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                if checker.is_visible(version_txn_id, txn_id) {
+                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
+                        break; // Row is deleted
+                    }
+
+                    // Read row data
+                    if let Some(idx) = e.arena_idx {
+                        if idx < arena_len {
+                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
+                            let slice =
+                                unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                            result.push((row_id, Row::from_values(slice.to_vec())));
+                        }
+                    } else {
+                        result.push((row_id, e.version.data.clone()));
+                    }
+                    break;
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
+            }
+        }
+
+        // Drop arena locks before sorting
+        drop(arena_rows);
+        drop(arena_data);
+
+        // Sort by row_id to maintain insertion order (critical for deterministic LIMIT)
+        sort_by_key(&mut result, |(row_id, _)| *row_id);
+
+        // Apply offset and limit
+        result.into_iter().skip(offset).take(limit).collect()
+    }
+
     /// Get all visible rows with filter applied during collection
     /// This saves memory by not allocating space for non-matching rows
     ///
@@ -896,6 +982,97 @@ impl VersionStore {
 
         sort_by_key(&mut result, |(row_id, _)| *row_id);
         result
+    }
+
+    /// Get visible rows with filter, limit and offset applied at the storage layer.
+    ///
+    /// # Current Limitations (NOT True Early Termination)
+    /// Like `get_visible_rows_with_limit`, this scans all rows due to DashMap's
+    /// non-deterministic iteration order. The filter is applied during iteration,
+    /// but all matching rows are collected before sorting and applying limit.
+    ///
+    /// # Arguments
+    /// * `txn_id` - Transaction ID for visibility check
+    /// * `filter` - Expression filter to apply to rows
+    /// * `limit` - Maximum number of matching rows to return
+    /// * `offset` - Number of matching rows to skip before collecting
+    pub fn get_visible_rows_filtered_with_limit(
+        &self,
+        txn_id: i64,
+        filter: &dyn crate::storage::expression::Expression,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<(i64, Row)> {
+        if self.closed.load(Ordering::Acquire) || limit == 0 {
+            return Vec::new();
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+
+        // Compile the filter once at the start
+        let schema = self.schema.read().unwrap();
+        let compiled_filter = CompiledFilter::compile(filter, &schema);
+        drop(schema);
+
+        // Pre-acquire arena locks ONCE
+        let (arena_rows, arena_data) = self.arena.read_guards();
+        let arena_rows_slice = arena_rows.as_slice();
+        let arena_data_slice = arena_data.as_slice();
+        let arena_len = arena_rows_slice.len();
+
+        // Collect all matching rows (need to sort for deterministic order)
+        let mut result: Vec<(i64, Row)> = Vec::new();
+
+        for entry in self.versions.iter() {
+            let row_id = *entry.key();
+            let chain = entry.value();
+            let mut current: Option<&VersionChainEntry> = Some(chain);
+
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                if checker.is_visible(version_txn_id, txn_id) {
+                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
+                        break; // Row is deleted
+                    }
+
+                    // Read row data
+                    let row = if let Some(idx) = e.arena_idx {
+                        if idx < arena_len {
+                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
+                            let slice =
+                                unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                            Row::from_values(slice.to_vec())
+                        } else {
+                            e.version.data.clone()
+                        }
+                    } else {
+                        e.version.data.clone()
+                    };
+
+                    // Apply filter - only collect matching rows
+                    if compiled_filter.matches(&row) {
+                        result.push((row_id, row));
+                    }
+                    break;
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
+            }
+        }
+
+        // Drop arena locks before sorting
+        drop(arena_rows);
+        drop(arena_data);
+
+        // Sort by row_id to maintain insertion order
+        sort_by_key(&mut result, |(row_id, _)| *row_id);
+
+        // Apply offset and limit
+        result.into_iter().skip(offset).take(limit).collect()
     }
 
     /// Returns a zero-copy streaming iterator over visible rows

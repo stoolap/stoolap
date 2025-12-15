@@ -40,6 +40,9 @@ use super::Executor;
 /// Type alias for CTE data map
 pub type CteDataMap = FxHashMap<String, (Vec<String>, Vec<Row>)>;
 
+/// Type alias for join data result (left_columns, left_rows, right_columns, right_rows)
+type JoinDataResult = (Vec<String>, Vec<Row>, Vec<String>, Vec<Row>);
+
 /// Registry for CTE results during query execution
 #[derive(Default)]
 pub struct CteRegistry {
@@ -443,25 +446,46 @@ impl Executor {
         let left_is_cte = left_data.is_some();
         let right_is_cte = right_data.is_some();
 
-        // At least one side is a CTE - execute the JOIN manually
-        let (left_columns, left_rows) = match left_data {
-            Some(data) => data,
-            None => {
-                // Execute left side as normal query
-                let (result, cols) = self.execute_table_expression(&join_source.left, ctx)?;
-                let rows = Self::materialize_result(result)?;
-                (cols, rows)
-            }
-        };
+        // Determine join type for semi-join reduction eligibility
+        let join_type = join_source.join_type.to_uppercase();
+        let is_inner_join = join_type == "INNER" || join_type.is_empty() || join_type == "JOIN";
 
-        let (right_columns, right_rows) = match right_data {
-            Some(data) => data,
-            None => {
-                // Execute right side as normal query
-                let (result, cols) = self.execute_table_expression(&join_source.right, ctx)?;
-                let rows = Self::materialize_result(result)?;
-                (cols, rows)
-            }
+        // SEMI-JOIN REDUCTION: For INNER JOIN where one side is CTE and other is regular table,
+        // extract join keys from CTE to filter the regular table scan (uses index!)
+        // This avoids materializing the entire regular table.
+        let (left_columns, left_rows, right_columns, right_rows) = if is_inner_join
+            && left_is_cte != right_is_cte
+        {
+            // One side is CTE, other is regular table - try semi-join reduction
+            self.execute_cte_join_with_semijoin_reduction(
+                &join_source.left,
+                &join_source.right,
+                join_source.condition.as_deref(),
+                left_data,
+                right_data,
+                left_is_cte,
+                ctx,
+            )?
+        } else {
+            // Both CTEs or both regular tables - use standard path
+            let (left_columns, left_rows) = match left_data {
+                Some(data) => data,
+                None => {
+                    let (result, cols) = self.execute_table_expression(&join_source.left, ctx)?;
+                    let rows = Self::materialize_result(result)?;
+                    (cols, rows)
+                }
+            };
+
+            let (right_columns, right_rows) = match right_data {
+                Some(data) => data,
+                None => {
+                    let (result, cols) = self.execute_table_expression(&join_source.right, ctx)?;
+                    let rows = Self::materialize_result(result)?;
+                    (cols, rows)
+                }
+            };
+            (left_columns, left_rows, right_columns, right_rows)
         };
 
         // Combine columns with qualified names (table.column) for proper resolution
@@ -672,6 +696,184 @@ impl Executor {
             }
         }
         Ok(None)
+    }
+
+    /// Execute CTE JOIN with semi-join reduction optimization.
+    /// When one side is a CTE and the other is a regular table, extract join keys from the CTE
+    /// and use them to filter the regular table scan via IN clause (which can use indexes).
+    #[allow(clippy::too_many_arguments)]
+    fn execute_cte_join_with_semijoin_reduction(
+        &self,
+        left_expr: &Expression,
+        right_expr: &Expression,
+        join_condition: Option<&Expression>,
+        left_data: Option<(Vec<String>, Vec<Row>)>,
+        right_data: Option<(Vec<String>, Vec<Row>)>,
+        left_is_cte: bool,
+        ctx: &ExecutionContext,
+    ) -> Result<JoinDataResult> {
+        // Determine which side is CTE and which is regular table
+        let (cte_expr, table_expr, cte_data, cte_on_left) = if left_is_cte {
+            (left_expr, right_expr, left_data.unwrap(), true)
+        } else {
+            (right_expr, left_expr, right_data.unwrap(), false)
+        };
+
+        let (cte_columns, cte_rows) = cte_data;
+
+        // Extract aliases for proper qualifier matching in join conditions
+        let cte_alias = self.extract_cte_reference(cte_expr);
+        let table_alias = self.extract_cte_reference(table_expr);
+
+        // Only use semi-join reduction if CTE is small enough.
+        // Large IN clauses are expensive to build and evaluate.
+        const MAX_SEMIJOIN_SIZE: usize = 500;
+
+        // Try to extract join key column from condition (e.g., "u.id = h.user_id" -> id, user_id)
+        // Uses qualifier matching to correctly identify which column belongs to which side
+        let (table_join_col, cte_join_col) = if cte_rows.len() <= MAX_SEMIJOIN_SIZE {
+            if let Some(condition) = join_condition {
+                self.extract_join_key_columns_with_qualifiers(
+                    condition,
+                    cte_alias.as_deref(),
+                    table_alias.as_deref(),
+                )
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        // If we can identify the CTE join column, extract values for IN filter
+        let in_filter = if let Some(cte_col) = cte_join_col {
+            if let Some(table_col) = table_join_col.clone() {
+                // Find CTE column index
+                let cte_col_lower = cte_col.to_lowercase();
+                let cte_col_idx = cte_columns
+                    .iter()
+                    .position(|c| c.to_lowercase() == cte_col_lower);
+
+                if let Some(idx) = cte_col_idx {
+                    // Extract distinct non-NULL values from CTE
+                    // Use FxHashSet<Value> for correct deduplication (not hash-based)
+                    let mut seen: rustc_hash::FxHashSet<Value> = rustc_hash::FxHashSet::default();
+
+                    for row in &cte_rows {
+                        if let Some(val) = row.get(idx) {
+                            if !val.is_null() {
+                                seen.insert(val.clone());
+                            }
+                        }
+                    }
+
+                    let key_values: Vec<Value> = seen.into_iter().collect();
+
+                    // Build IN filter: table_col IN (v1, v2, ...)
+                    if !key_values.is_empty() {
+                        self.build_in_filter_expression(&table_col, &key_values)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Execute regular table with or without IN filter
+        let (table_result, table_cols) = if in_filter.is_some() {
+            self.execute_table_expression_with_filter(table_expr, ctx, in_filter.as_ref())?
+        } else {
+            self.execute_table_expression(table_expr, ctx)?
+        };
+        let table_rows = Self::materialize_result(table_result)?;
+
+        // Return in correct order (left, right)
+        if cte_on_left {
+            Ok((cte_columns, cte_rows, table_cols, table_rows))
+        } else {
+            Ok((table_cols, table_rows, cte_columns, cte_rows))
+        }
+    }
+
+    /// Extract join key column names from a condition like "a.id = b.user_id".
+    /// Returns (table_column, cte_column) by matching qualifiers against known aliases.
+    /// This correctly handles both "cte.col = table.col" and "table.col = cte.col".
+    fn extract_join_key_columns_with_qualifiers(
+        &self,
+        condition: &Expression,
+        cte_alias: Option<&str>,
+        table_alias: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        match condition {
+            Expression::Infix(infix) if infix.operator == "=" => {
+                let left_info = self.extract_qualified_column(&infix.left);
+                let right_info = self.extract_qualified_column(&infix.right);
+
+                if let (Some((left_qualifier, left_col)), Some((right_qualifier, right_col))) =
+                    (left_info, right_info)
+                {
+                    // Match qualifiers to aliases (case-insensitive)
+                    let left_is_cte = self.qualifier_matches_alias(&left_qualifier, cte_alias);
+                    let left_is_table = self.qualifier_matches_alias(&left_qualifier, table_alias);
+                    let right_is_cte = self.qualifier_matches_alias(&right_qualifier, cte_alias);
+                    let right_is_table =
+                        self.qualifier_matches_alias(&right_qualifier, table_alias);
+
+                    // Determine which column belongs to which side based on qualifiers
+                    if left_is_cte && right_is_table {
+                        (Some(right_col), Some(left_col))
+                    } else if left_is_table && right_is_cte {
+                        (Some(left_col), Some(right_col))
+                    } else {
+                        // Qualifiers don't match known aliases - skip optimization
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            }
+            Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("AND") => {
+                // Try left side first
+                let (table_col, cte_col) = self.extract_join_key_columns_with_qualifiers(
+                    &infix.left,
+                    cte_alias,
+                    table_alias,
+                );
+                if table_col.is_some() && cte_col.is_some() {
+                    return (table_col, cte_col);
+                }
+                // Try right side
+                self.extract_join_key_columns_with_qualifiers(&infix.right, cte_alias, table_alias)
+            }
+            _ => (None, None),
+        }
+    }
+
+    /// Check if a qualifier matches an alias (case-insensitive).
+    fn qualifier_matches_alias(&self, qualifier: &Option<String>, alias: Option<&str>) -> bool {
+        match (qualifier, alias) {
+            (Some(q), Some(a)) => q.eq_ignore_ascii_case(a),
+            _ => false,
+        }
+    }
+
+    /// Extract qualifier and column name from an expression.
+    /// Returns (Some(qualifier), column_name) for qualified identifiers,
+    /// or (None, column_name) for simple identifiers.
+    fn extract_qualified_column(&self, expr: &Expression) -> Option<(Option<String>, String)> {
+        match expr {
+            Expression::Identifier(id) => Some((None, id.value.clone())),
+            Expression::QualifiedIdentifier(qi) => {
+                Some((Some(qi.qualifier.value.clone()), qi.name.value.clone()))
+            }
+            _ => None,
+        }
     }
 
     /// Evaluate a LIMIT or OFFSET expression to a u64 value
