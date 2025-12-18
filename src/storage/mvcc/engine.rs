@@ -1765,16 +1765,15 @@ impl Engine for MVCCEngine {
         Ok(result)
     }
 
-    fn get_all_indexes(&self, table_name: &str) -> Result<Vec<Box<dyn Index>>> {
+    fn get_all_indexes(&self, table_name: &str) -> Result<Vec<std::sync::Arc<dyn Index>>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
 
-        // Verify table exists
-        let _ = self.get_version_store(table_name)?;
+        let store = self.get_version_store(table_name)?;
 
-        // Index retrieval will be implemented in Phase 6.6
-        Ok(Vec::new())
+        // Get all indexes from the version store
+        Ok(store.get_all_indexes())
     }
 
     fn get_isolation_level(&self) -> IsolationLevel {
@@ -2266,6 +2265,45 @@ impl Engine for MVCCEngine {
         data.extend_from_slice(new_table_name.as_bytes());
 
         self.record_ddl(old_table_name, WALOperationType::AlterTable, &data);
+    }
+
+    fn fetch_rows_by_ids(
+        &self,
+        table_name: &str,
+        row_ids: &[i64],
+    ) -> Result<Vec<(i64, crate::core::Row)>> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+
+        let store = self.get_version_store(table_name)?;
+
+        // Use a high txn_id to see the latest committed version
+        // INVALID_TRANSACTION_ID + 1 will see all committed transactions
+        let read_txn_id = INVALID_TRANSACTION_ID + 1;
+
+        Ok(store.get_visible_versions_batch(row_ids, read_txn_id))
+    }
+
+    fn get_row_fetcher(
+        &self,
+        table_name: &str,
+    ) -> Result<Box<dyn Fn(&[i64]) -> Vec<(i64, crate::core::Row)> + Send + Sync>> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+
+        // Get the version store reference once
+        let store = self.get_version_store(table_name)?;
+
+        // Use a high txn_id to see the latest committed version
+        let read_txn_id = INVALID_TRANSACTION_ID + 1;
+
+        // Return a closure that captures the store and can be called repeatedly
+        // without the overhead of looking up the version store each time
+        Ok(Box::new(move |row_ids: &[i64]| {
+            store.get_visible_versions_batch(row_ids, read_txn_id)
+        }))
     }
 }
 

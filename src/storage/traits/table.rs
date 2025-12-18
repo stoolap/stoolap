@@ -341,6 +341,30 @@ pub trait Table: Send + Sync {
         Ok(all_rows.into_iter().skip(offset).take(limit).collect())
     }
 
+    /// Collects rows with LIMIT/OFFSET without guaranteeing deterministic order.
+    ///
+    /// This is an optimization for queries with LIMIT but without ORDER BY.
+    /// Since SQL doesn't guarantee order for LIMIT without ORDER BY, we can
+    /// skip sorting and return rows in arbitrary order. This provides significant
+    /// speedup by enabling true early termination.
+    ///
+    /// # Arguments
+    /// * `where_expr` - Optional filter expression
+    /// * `limit` - Maximum number of rows to return
+    /// * `offset` - Number of rows to skip before returning
+    ///
+    /// # Returns
+    /// A vector of rows up to the limit (after offset), in arbitrary order
+    fn collect_rows_with_limit_unordered(
+        &self,
+        where_expr: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Row>> {
+        // Default implementation: delegate to ordered version
+        self.collect_rows_with_limit(where_expr, limit, offset)
+    }
+
     /// Closes the table and releases any resources
     fn close(&mut self) -> Result<()>;
 
@@ -570,6 +594,73 @@ pub trait Table: Send + Sync {
     ) -> Option<Vec<Row>> {
         let _ = (column_name, ascending, limit, offset);
         None // Default implementation - override in concrete tables
+    }
+
+    /// Collects rows grouped by an indexed partition column (PARTITION BY optimization)
+    ///
+    /// For window functions with `PARTITION BY col` where col is indexed, this uses the
+    /// index to iterate through unique values and collect rows already grouped by partition.
+    /// This avoids O(n) hash-based grouping in window function execution.
+    ///
+    /// # Arguments
+    /// * `column_name` - The indexed column to partition by
+    ///
+    /// # Returns
+    /// Some(Vec<(Value, Vec<Row>)>) where each tuple is (partition_value, rows_in_partition)
+    /// Returns None if the column has no index
+    fn collect_rows_grouped_by_partition(
+        &self,
+        column_name: &str,
+    ) -> Option<Vec<(Value, Vec<Row>)>> {
+        let _ = column_name;
+        None // Default implementation - override in concrete tables
+    }
+
+    /// Get distinct partition values from an indexed column.
+    /// Used for LIMIT pushdown in window functions - allows fetching partitions one at a time.
+    ///
+    /// # Arguments
+    /// * `column_name` - The indexed column to get partition values from
+    ///
+    /// # Returns
+    /// Some(Vec<Value>) with distinct values, or None if column has no index
+    fn get_partition_values(&self, column_name: &str) -> Option<Vec<Value>> {
+        let _ = column_name;
+        None // Default implementation - override in concrete tables
+    }
+
+    /// Get rows for a specific partition value.
+    /// Used for LIMIT pushdown in window functions - fetches only one partition at a time.
+    ///
+    /// # Arguments
+    /// * `column_name` - The indexed column
+    /// * `partition_value` - The specific partition value to fetch rows for
+    ///
+    /// # Returns
+    /// Some(Vec<Row>) with rows matching the partition value, or None if column has no index
+    fn get_rows_for_partition_value(
+        &self,
+        column_name: &str,
+        partition_value: &Value,
+    ) -> Option<Vec<Row>> {
+        let _ = (column_name, partition_value);
+        None // Default implementation - override in concrete tables
+    }
+
+    /// Fetch rows by their row IDs with an optional filter.
+    ///
+    /// This is used for index-based lookups where we have a list of row IDs
+    /// and need to fetch the actual rows efficiently.
+    ///
+    /// # Arguments
+    /// * `row_ids` - The row IDs to fetch
+    /// * `filter` - Filter expression to apply to fetched rows
+    ///
+    /// # Returns
+    /// Vector of (row_id, Row) pairs for visible, non-deleted rows that pass the filter
+    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Vec<(i64, Row)> {
+        let _ = (row_ids, filter);
+        Vec::new() // Default implementation - override in concrete tables
     }
 
     // ---- Additional Column Operations ----

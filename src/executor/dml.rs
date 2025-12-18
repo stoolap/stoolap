@@ -51,6 +51,26 @@ fn validate_coercion(
     Ok(())
 }
 
+/// Try to extract a literal value directly from an expression without VM compilation.
+/// Returns Some(value) for simple literals, None for complex expressions that need VM.
+#[inline]
+fn try_extract_literal(expr: &Expression) -> Option<Value> {
+    match expr {
+        Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
+        Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
+        Expression::StringLiteral(lit) => Some(Value::text(&lit.value)),
+        Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
+        Expression::NullLiteral(_) => Some(Value::null_unknown()),
+        // Negative numbers: -5, -3.14
+        Expression::Prefix(prefix) if prefix.operator == "-" => match prefix.right.as_ref() {
+            Expression::IntegerLiteral(lit) => Some(Value::Integer(-lit.value)),
+            Expression::FloatLiteral(lit) => Some(Value::Float(-lit.value)),
+            _ => None,
+        },
+        _ => None, // Complex expression - needs VM
+    }
+}
+
 impl Executor {
     /// Execute an INSERT statement
     pub(crate) fn execute_insert(
@@ -289,9 +309,15 @@ impl Executor {
                     if matches!(expr, Expression::Default(_)) {
                         continue;
                     }
-                    // Compile and evaluate constant expression (reuse pre-built context)
-                    let program = compile_expression(expr, &[])?;
-                    let value = vm.execute(&program, &base_exec_ctx)?;
+                    // OPTIMIZATION: Try to extract literal value directly without VM compilation
+                    // This avoids ~1-2μs per expression for simple literals (INTEGER, TEXT, etc.)
+                    let value = if let Some(lit_value) = try_extract_literal(expr) {
+                        lit_value
+                    } else {
+                        // Fall back to VM for complex expressions (Parameters, functions, etc.)
+                        let program = compile_expression(expr, &[])?;
+                        vm.execute(&program, &base_exec_ctx)?
+                    };
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
                     // Validate coercion didn't silently fail
@@ -380,9 +406,15 @@ impl Executor {
                     if matches!(expr, Expression::Default(_)) {
                         continue;
                     }
-                    // Compile and evaluate constant expression (reuse pre-built context)
-                    let program = compile_expression(expr, &[])?;
-                    let value = vm.execute(&program, &base_exec_ctx)?;
+                    // OPTIMIZATION: Try to extract literal value directly without VM compilation
+                    // This avoids ~1-2μs per expression for simple literals (INTEGER, TEXT, etc.)
+                    let value = if let Some(lit_value) = try_extract_literal(expr) {
+                        lit_value
+                    } else {
+                        // Fall back to VM for complex expressions (Parameters, functions, etc.)
+                        let program = compile_expression(expr, &[])?;
+                        vm.execute(&program, &base_exec_ctx)?
+                    };
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
                     // Validate coercion didn't silently fail

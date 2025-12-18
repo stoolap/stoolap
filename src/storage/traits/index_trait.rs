@@ -140,6 +140,26 @@ pub trait Index: Send + Sync {
         include_max: bool,
     ) -> Vec<i64>;
 
+    /// Returns row IDs for values in the given list (IN clause optimization)
+    ///
+    /// For hash indexes, this does O(k) equality lookups where k is the list size.
+    /// For btree indexes, this does O(k * log n) lookups.
+    /// Much faster than `get_filtered_row_ids` which may scan the entire index.
+    ///
+    /// # Arguments
+    /// * `value_list` - List of values to match (each is a single column value)
+    ///
+    /// # Returns
+    /// Vector of row IDs matching any value in the list
+    fn get_row_ids_in(&self, value_list: &[Value]) -> Vec<i64> {
+        // Default implementation: do multiple equality lookups
+        let mut results = Vec::new();
+        for value in value_list {
+            results.extend(self.get_row_ids_equal(std::slice::from_ref(value)));
+        }
+        results
+    }
+
     /// Returns row IDs that match the given expression
     ///
     /// # Arguments
@@ -170,6 +190,27 @@ pub trait Index: Send + Sync {
     /// This enables sorted iteration through unique values for TOP-N queries.
     fn get_all_values(&self) -> Vec<Value> {
         Vec::new() // Default implementation - override in concrete indexes
+    }
+
+    /// Returns row IDs in sorted order by index value (for ORDER BY optimization)
+    ///
+    /// This enables efficient ORDER BY queries by iterating through the B-tree
+    /// in order, avoiding the need to sort the entire result set.
+    ///
+    /// # Arguments
+    /// * `ascending` - If true, return in ascending order; if false, descending
+    /// * `limit` - Maximum number of row IDs to return
+    /// * `offset` - Number of row IDs to skip before returning
+    ///
+    /// # Returns
+    /// Vector of row IDs in sorted order, or None if the index doesn't support ordered access
+    fn get_row_ids_ordered(
+        &self,
+        _ascending: bool,
+        _limit: usize,
+        _offset: usize,
+    ) -> Option<Vec<i64>> {
+        None // Default implementation - only B-tree indexes support this
     }
 
     /// Closes the index and releases any resources

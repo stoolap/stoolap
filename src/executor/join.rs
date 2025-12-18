@@ -39,6 +39,17 @@ use super::expression::{JoinFilter, RowFilter};
 use super::parallel::{self, ParallelConfig};
 use super::Executor;
 
+/// Index Nested Loop Join lookup strategy.
+/// Determines how to find matching rows in the inner (right) table.
+#[derive(Clone)]
+pub enum IndexLookupStrategy {
+    /// Use a secondary index for lookups (index.get_row_ids_equal)
+    SecondaryIndex(std::sync::Arc<dyn crate::storage::traits::Index>),
+    /// Use primary key lookup (direct row_id = value)
+    /// In stoolap, PRIMARY KEY INTEGER values ARE the row_ids
+    PrimaryKey,
+}
+
 // Re-export utilities from utils.rs for backward compatibility
 #[allow(unused_imports)]
 pub use super::utils::{
@@ -688,6 +699,117 @@ impl Executor {
                 }
             }
         }
+
+        Ok(result_rows)
+    }
+
+    /// Index Nested Loop Join - uses index on inner table for O(N * log M) lookups.
+    ///
+    /// This is optimal when:
+    /// - The inner (right) table has an index on the join key column
+    /// - The outer (left) table is small or has good selectivity
+    ///
+    /// For each row in the outer table, we use the index/PK to find matching rows
+    /// in the inner table, avoiding a full scan of the inner table.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_index_nested_loop_join(
+        &self,
+        outer_rows: &[Row],
+        inner_table: &dyn crate::storage::traits::Table,
+        lookup_strategy: &IndexLookupStrategy,
+        outer_key_idx: usize,
+        residual_filter: Option<&super::expression::JoinFilter>,
+        join_type: &str,
+        outer_col_count: usize,
+        inner_col_count: usize,
+        limit: Option<u64>,
+    ) -> Result<Vec<Row>> {
+        use crate::core::Value;
+        use crate::storage::expression::ConstBoolExpr;
+
+        let is_inner_join = !join_type.contains("LEFT")
+            && !join_type.contains("RIGHT")
+            && !join_type.contains("FULL");
+        let effective_limit = if is_inner_join { limit } else { None };
+
+        let mut result_rows = Vec::new();
+        let true_expr = ConstBoolExpr::true_expr();
+
+        'outer: for outer_row in outer_rows {
+            let mut matched = false;
+
+            // Get the join key value from the outer row
+            let key_value = match outer_row.get(outer_key_idx) {
+                Some(v) if !v.is_null() => v,
+                _ => {
+                    // NULL key - no match possible (NULL != NULL in SQL)
+                    if join_type.contains("LEFT") || join_type.contains("FULL") {
+                        let values = combine_rows_with_nulls(
+                            outer_row,
+                            outer_col_count,
+                            inner_col_count,
+                            true,
+                        );
+                        result_rows.push(Row::from_values(values));
+                    }
+                    continue;
+                }
+            };
+
+            // Find matching row IDs based on lookup strategy
+            let row_ids: Vec<i64> = match lookup_strategy {
+                IndexLookupStrategy::SecondaryIndex(index) => {
+                    // Use secondary index to find matching row IDs
+                    index.get_row_ids_equal(std::slice::from_ref(key_value))
+                }
+                IndexLookupStrategy::PrimaryKey => {
+                    // For PK lookup, the key_value IS the row_id
+                    match key_value {
+                        Value::Integer(id) => vec![*id],
+                        Value::Float(f) => vec![*f as i64],
+                        _ => vec![], // Non-numeric PK values can't match
+                    }
+                }
+            };
+
+            if !row_ids.is_empty() {
+                // Fetch matching rows from inner table
+                let inner_rows = inner_table.fetch_rows_by_ids(&row_ids, &true_expr);
+
+                for (_row_id, inner_row) in inner_rows {
+                    // Apply residual filter if present
+                    let passes_filter = if let Some(filter) = residual_filter {
+                        filter.matches(outer_row, &inner_row)
+                    } else {
+                        true
+                    };
+
+                    if passes_filter {
+                        matched = true;
+                        let values =
+                            combine_rows(outer_row, &inner_row, outer_col_count, inner_col_count);
+                        result_rows.push(Row::from_values(values));
+
+                        if let Some(lim) = effective_limit {
+                            if result_rows.len() >= lim as usize {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle LEFT OUTER JOIN - emit outer row with NULLs if no match
+            if !matched && (join_type.contains("LEFT") || join_type.contains("FULL")) {
+                let values =
+                    combine_rows_with_nulls(outer_row, outer_col_count, inner_col_count, true);
+                result_rows.push(Row::from_values(values));
+            }
+        }
+
+        // Note: RIGHT/FULL OUTER JOIN would require tracking all matched inner rows,
+        // which defeats the purpose of index nested loop. For those cases, fall back
+        // to hash join or nested loop join.
 
         Ok(result_rows)
     }

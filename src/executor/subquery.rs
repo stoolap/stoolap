@@ -26,8 +26,15 @@ use ahash::AHashSet;
 use crate::core::{Error, Result, Value};
 use crate::parser::ast::*;
 use crate::parser::token::TokenType;
+use crate::storage::traits::Engine;
 
-use super::context::{cache_scalar_subquery, get_cached_scalar_subquery, ExecutionContext};
+use super::context::{
+    cache_exists_fetcher, cache_exists_index, cache_exists_pred_key, cache_exists_predicate,
+    cache_exists_schema, cache_in_subquery, cache_scalar_subquery, cache_semi_join,
+    get_cached_exists_fetcher, get_cached_exists_index, get_cached_exists_pred_key,
+    get_cached_exists_predicate, get_cached_exists_schema, get_cached_in_subquery,
+    get_cached_scalar_subquery, get_cached_semi_join, ExecutionContext,
+};
 use super::utils::{dummy_token, value_to_expression};
 use super::Executor;
 
@@ -58,6 +65,19 @@ pub struct SemiJoinInfo {
     pub non_correlated_where: Option<Expression>,
     /// Whether this is NOT EXISTS
     pub is_negated: bool,
+}
+
+/// Information needed for index-nested-loop EXISTS execution.
+///
+/// This is used for direct index probing instead of running a full subquery.
+#[derive(Debug)]
+struct IndexNestedLoopInfo {
+    outer_column: String,
+    outer_table: Option<String>,
+    inner_column: String,
+    inner_table: String,
+    #[allow(dead_code)]
+    additional_predicate: Option<Expression>,
 }
 
 impl Executor {
@@ -319,12 +339,17 @@ impl Executor {
     }
 
     /// Execute an EXISTS subquery and return true if any rows exist
-    fn execute_exists_subquery(
+    pub(crate) fn execute_exists_subquery(
         &self,
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<bool> {
-        // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
+        // Try index-nested-loop optimization for correlated EXISTS
+        if let Some(exists) = self.try_execute_exists_with_index_probe(subquery, ctx)? {
+            return Ok(exists);
+        }
+
+        // Fall back to full subquery execution
         let subquery_ctx = ctx.with_incremented_query_depth();
         let mut result = self.execute_select(subquery, &subquery_ctx)?;
 
@@ -332,6 +357,382 @@ impl Executor {
         let exists = result.next();
 
         Ok(exists)
+    }
+
+    /// Try to execute EXISTS using index-nested-loop optimization.
+    ///
+    /// This optimization is used when:
+    /// 1. The subquery has a simple correlation: inner.col = outer.col
+    /// 2. The inner table has an index on the correlation column
+    /// 3. There's an outer row value available in the context
+    ///
+    /// Instead of running a full query, we probe the index directly for O(log n) or O(1) lookup.
+    fn try_execute_exists_with_index_probe(
+        &self,
+        subquery: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<bool>> {
+        // Need outer row context for correlated subquery
+        let outer_row = match ctx.outer_row() {
+            Some(row) => row,
+            None => return Ok(None), // Not a correlated context
+        };
+
+        // Extract correlation info from subquery
+        let correlation = match Self::extract_index_nested_loop_info(subquery) {
+            Some(info) => info,
+            None => return Ok(None), // Can't use index-nested-loop
+        };
+
+        // Get the outer value from the outer row hashmap
+        // Try qualified name first (e.g., "u.id"), then just column name
+        let outer_value = if let Some(tbl) = &correlation.outer_table {
+            let qualified = format!("{}.{}", tbl, &correlation.outer_column);
+            outer_row
+                .get(&qualified.to_lowercase())
+                .or_else(|| outer_row.get(&correlation.outer_column.to_lowercase()))
+        } else {
+            outer_row.get(&correlation.outer_column.to_lowercase())
+        };
+
+        let outer_value = match outer_value {
+            Some(v) if !v.is_null() => v.clone(),
+            Some(_) => return Ok(Some(false)), // NULL never matches in EXISTS
+            None => return Ok(None),           // Column not found, fall back
+        };
+
+        // OPTIMIZATION: Cache index reference to avoid repeated lookups
+        // This reduces the ~2-5μs overhead per EXISTS probe to nearly zero for subsequent probes
+        let index_cache_key = format!("{}:{}", correlation.inner_table, correlation.inner_column);
+
+        let index = match get_cached_exists_index(&index_cache_key) {
+            Some(idx) => idx,
+            None => {
+                // First time: get index from engine and cache it
+                let indexes = match self.engine.get_all_indexes(&correlation.inner_table) {
+                    Ok(idxs) => idxs,
+                    Err(_) => return Ok(None), // Table not found, fall back
+                };
+
+                // Find the index on the correlation column
+                let idx = indexes
+                    .into_iter()
+                    .find(|idx| idx.column_names().contains(&correlation.inner_column));
+
+                match idx {
+                    Some(idx) => {
+                        cache_exists_index(index_cache_key, idx.clone());
+                        idx
+                    }
+                    None => return Ok(None), // No index, fall back to full query
+                }
+            }
+        };
+
+        // Probe the index for matching row IDs
+        let row_ids = index.get_row_ids_equal(std::slice::from_ref(&outer_value));
+
+        if row_ids.is_empty() {
+            return Ok(Some(false)); // No matches from index
+        }
+
+        // If there's no additional predicate, any match means EXISTS is true
+        // (we found at least one matching row_id in the index)
+        if correlation.additional_predicate.is_none() {
+            // The index returned row_ids, which means rows exist
+            // For EXISTS we just need to know at least one exists
+            return Ok(Some(true));
+        }
+
+        // With additional predicate, we need to check each matching row
+        // OPTIMIZATION: Directly fetch rows by row_ids and evaluate the predicate
+        // This avoids the overhead of building and executing a full SELECT query
+        let additional_pred = correlation.additional_predicate.as_ref().unwrap();
+
+        // OPTIMIZATION: Cache schema column names to avoid repeated get_table_schema() calls
+        // This reduces the ~1μs overhead per EXISTS probe
+        let columns = match get_cached_exists_schema(&correlation.inner_table) {
+            Some(cols) => cols,
+            None => {
+                let schema = match self.engine.get_table_schema(&correlation.inner_table) {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None), // Fall back if schema not found
+                };
+                let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                cache_exists_schema(correlation.inner_table.clone(), cols.clone());
+                Arc::new(cols)
+            }
+        };
+
+        // OPTIMIZATION: Use a cheap subquery identifier to look up the cached predicate cache key.
+        // This avoids expensive alias stripping and Debug formatting on every probe.
+        // The subquery pointer (as string) is stable within a query execution.
+        let subquery_id = format!("{:p}", subquery as *const SelectStatement);
+
+        // Try to get cached predicate filter using the cached predicate cache key
+        let predicate_filter = match get_cached_exists_pred_key(&subquery_id) {
+            Some(cache_key) => {
+                // Fast path: we have a cached predicate cache key
+                match get_cached_exists_predicate(&cache_key) {
+                    Some(filter) => filter,
+                    None => {
+                        // Cache key exists but filter was evicted - this shouldn't happen normally
+                        // but handle it by recompiling
+                        let stripped_pred = Self::strip_table_alias_from_expr(additional_pred);
+                        match super::expression::RowFilter::new(&stripped_pred, &columns) {
+                            Ok(filter) => {
+                                cache_exists_predicate(cache_key, filter.clone());
+                                filter
+                            }
+                            Err(_) => return Ok(None),
+                        }
+                    }
+                }
+            }
+            None => {
+                // First probe for this subquery - compute and cache the predicate cache key
+                let stripped_pred = Self::strip_table_alias_from_expr(additional_pred);
+                let cache_key = format!("{}:{:?}", correlation.inner_table, stripped_pred);
+
+                // Cache the predicate cache key for subsequent probes
+                cache_exists_pred_key(subquery_id, cache_key.clone());
+
+                match get_cached_exists_predicate(&cache_key) {
+                    Some(filter) => filter,
+                    None => match super::expression::RowFilter::new(&stripped_pred, &columns) {
+                        Ok(filter) => {
+                            cache_exists_predicate(cache_key, filter.clone());
+                            filter
+                        }
+                        Err(_) => return Ok(None),
+                    },
+                }
+            }
+        };
+
+        // Get or create a cached row fetcher for this table
+        // This avoids repeated version store lookups per EXISTS probe
+        let row_fetcher = match get_cached_exists_fetcher(&correlation.inner_table) {
+            Some(f) => f,
+            None => {
+                let fetcher = match self.engine.get_row_fetcher(&correlation.inner_table) {
+                    Ok(f) => f,
+                    Err(_) => return Ok(None), // Fall back if fetcher creation fails
+                };
+                cache_exists_fetcher(correlation.inner_table.clone(), fetcher);
+                match get_cached_exists_fetcher(&correlation.inner_table) {
+                    Some(f) => f,
+                    None => return Ok(None), // Should not happen, but be safe
+                }
+            }
+        };
+
+        // Fetch rows by their IDs using the cached row fetcher
+        const BATCH_SIZE: usize = 10;
+        for batch in row_ids.chunks(BATCH_SIZE) {
+            let fetched = row_fetcher(batch);
+
+            // Check each row against the predicate
+            for (_row_id, row) in fetched {
+                if predicate_filter.matches(&row) {
+                    return Ok(Some(true));
+                }
+            }
+        }
+
+        // No rows matched the predicate
+        Ok(Some(false))
+    }
+
+    /// Extract index-nested-loop correlation info from a subquery.
+    ///
+    /// Looks for patterns like:
+    /// SELECT 1 FROM orders WHERE orders.user_id = u.id [AND additional_predicates]
+    fn extract_index_nested_loop_info(subquery: &SelectStatement) -> Option<IndexNestedLoopInfo> {
+        // Must have a simple table source
+        let (inner_table, inner_alias) = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
+            Some(Expression::TableSource(ts)) => {
+                let alias = ts.alias.as_ref().map(|a| a.value.clone());
+                (ts.name.value.clone(), alias)
+            }
+            _ => return None,
+        };
+
+        // Must have a WHERE clause
+        let where_clause = subquery.where_clause.as_ref()?;
+
+        // Extract correlation condition
+        let inner_tables = vec![inner_alias
+            .clone()
+            .unwrap_or_else(|| inner_table.to_lowercase())
+            .to_lowercase()];
+
+        Self::extract_correlation_for_index(where_clause, &inner_tables, &inner_table)
+    }
+
+    /// Extract correlation info suitable for index-nested-loop from a WHERE clause.
+    fn extract_correlation_for_index(
+        expr: &Expression,
+        inner_tables: &[String],
+        inner_table_name: &str,
+    ) -> Option<IndexNestedLoopInfo> {
+        match expr {
+            Expression::Infix(infix) if infix.operator == "=" => {
+                // Try to match: inner.col = outer.col or outer.col = inner.col
+                if let Some((inner_col, outer_col, outer_tbl)) =
+                    Self::extract_correlation_pair(&infix.left, &infix.right, inner_tables)
+                {
+                    return Some(IndexNestedLoopInfo {
+                        outer_column: outer_col,
+                        outer_table: outer_tbl,
+                        inner_column: inner_col,
+                        inner_table: inner_table_name.to_string(),
+                        additional_predicate: None,
+                    });
+                }
+                if let Some((inner_col, outer_col, outer_tbl)) =
+                    Self::extract_correlation_pair(&infix.right, &infix.left, inner_tables)
+                {
+                    return Some(IndexNestedLoopInfo {
+                        outer_column: outer_col,
+                        outer_table: outer_tbl,
+                        inner_column: inner_col,
+                        inner_table: inner_table_name.to_string(),
+                        additional_predicate: None,
+                    });
+                }
+                None
+            }
+
+            Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("AND") => {
+                // Try left side for correlation
+                if let Some(mut info) =
+                    Self::extract_correlation_for_index(&infix.left, inner_tables, inner_table_name)
+                {
+                    // Right side becomes additional predicate
+                    info.additional_predicate = Some((*infix.right).clone());
+                    return Some(info);
+                }
+                // Try right side for correlation
+                if let Some(mut info) = Self::extract_correlation_for_index(
+                    &infix.right,
+                    inner_tables,
+                    inner_table_name,
+                ) {
+                    // Left side becomes additional predicate
+                    info.additional_predicate = Some((*infix.left).clone());
+                    return Some(info);
+                }
+                None
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Extract correlation pair from two expressions.
+    /// Returns (inner_column, outer_column, outer_table) if one side is inner ref and other is outer ref.
+    fn extract_correlation_pair(
+        left: &Expression,
+        right: &Expression,
+        inner_tables: &[String],
+    ) -> Option<(String, String, Option<String>)> {
+        // left should be inner column, right should be outer column
+        let inner_col = Self::get_inner_column_name(left, inner_tables)?;
+        let (outer_col, outer_tbl) = Self::get_outer_column_name(right, inner_tables)?;
+        Some((inner_col, outer_col, outer_tbl))
+    }
+
+    /// Get column name if expression is an inner table column reference.
+    fn get_inner_column_name(expr: &Expression, inner_tables: &[String]) -> Option<String> {
+        match expr {
+            Expression::QualifiedIdentifier(qid) => {
+                let table = qid.qualifier.value.to_lowercase();
+                if inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table)) {
+                    Some(qid.name.value.clone())
+                } else {
+                    None
+                }
+            }
+            Expression::Identifier(id) => {
+                // Unqualified identifier assumed to be inner if in context
+                Some(id.value.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Get column name if expression is an outer table column reference.
+    /// Returns (column_name, table_alias).
+    fn get_outer_column_name(
+        expr: &Expression,
+        inner_tables: &[String],
+    ) -> Option<(String, Option<String>)> {
+        match expr {
+            Expression::QualifiedIdentifier(qid) => {
+                let table = qid.qualifier.value.to_lowercase();
+                // If NOT in inner_tables, it's an outer reference
+                if !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table)) {
+                    Some((qid.name.value.clone(), Some(qid.qualifier.value.clone())))
+                } else {
+                    None
+                }
+            }
+            // Unqualified identifiers could be outer, but we can't be sure without schema
+            _ => None,
+        }
+    }
+
+    /// Strip table alias from column references in an expression.
+    /// Converts "o.amount" to "amount", "t.name" to "name", etc.
+    /// This is needed when evaluating predicates against rows from fetch_rows_by_ids,
+    /// which uses unqualified column names from the table schema.
+    fn strip_table_alias_from_expr(expr: &Expression) -> Expression {
+        match expr {
+            Expression::QualifiedIdentifier(qid) => {
+                // Convert qualified identifier to unqualified
+                Expression::Identifier(Identifier::new(
+                    qid.name.token.clone(),
+                    qid.name.value.clone(),
+                ))
+            }
+            Expression::Infix(infix) => {
+                // Recursively strip aliases from both sides
+                Expression::Infix(InfixExpression::new(
+                    infix.token.clone(),
+                    Box::new(Self::strip_table_alias_from_expr(&infix.left)),
+                    infix.operator.clone(),
+                    Box::new(Self::strip_table_alias_from_expr(&infix.right)),
+                ))
+            }
+            Expression::Prefix(prefix) => {
+                // Recursively strip aliases from the inner expression
+                Expression::Prefix(PrefixExpression {
+                    token: prefix.token.clone(),
+                    operator: prefix.operator.clone(),
+                    op_type: prefix.op_type,
+                    right: Box::new(Self::strip_table_alias_from_expr(&prefix.right)),
+                })
+            }
+            Expression::FunctionCall(func) => {
+                // Recursively strip aliases from function arguments
+                let new_args: Vec<Expression> = func
+                    .arguments
+                    .iter()
+                    .map(Self::strip_table_alias_from_expr)
+                    .collect();
+                Expression::FunctionCall(FunctionCall {
+                    token: func.token.clone(),
+                    function: func.function.clone(),
+                    arguments: new_args,
+                    is_distinct: func.is_distinct,
+                    order_by: func.order_by.clone(),
+                    filter: func.filter.clone(),
+                })
+            }
+            // For other expressions, return as-is
+            _ => expr.clone(),
+        }
     }
 
     /// Convert ALL/ANY expression to an equivalent expression that the evaluator can handle.
@@ -560,12 +961,30 @@ impl Executor {
         Ok(first_value)
     }
 
-    /// Execute an IN subquery and return its values
+    /// Execute an IN subquery and return its values.
+    /// For non-correlated subqueries (no outer row context), results are cached
+    /// to avoid re-execution when the same subquery appears multiple times.
     fn execute_in_subquery(
         &self,
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Vec<crate::core::Value>> {
+        // Check if this is a non-correlated subquery (no outer row context)
+        // Non-correlated subqueries can be cached since they return the same result
+        let is_non_correlated =
+            ctx.outer_row().is_none() && !Self::is_subquery_correlated(subquery);
+
+        // For non-correlated subqueries, check cache first using SQL string as key
+        let cache_key = if is_non_correlated {
+            let key = subquery.to_string();
+            if let Some(cached_values) = get_cached_in_subquery(&key) {
+                return Ok(cached_values);
+            }
+            Some(key)
+        } else {
+            None
+        };
+
         // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
         let mut result = self.execute_select(subquery, &subquery_ctx)?;
@@ -581,6 +1000,11 @@ impl Executor {
                         .unwrap_or_else(crate::core::Value::null_unknown),
                 );
             }
+        }
+
+        // Cache the result for non-correlated subqueries
+        if let Some(key) = cache_key {
+            cache_in_subquery(key, values.clone());
         }
 
         Ok(values)
@@ -1071,7 +1495,7 @@ impl Executor {
     }
 
     /// Check if a subquery is correlated (references outer columns)
-    fn is_subquery_correlated(subquery: &SelectStatement) -> bool {
+    pub(crate) fn is_subquery_correlated(subquery: &SelectStatement) -> bool {
         // Get table/alias names defined in the subquery's FROM clause
         let subquery_tables = Self::collect_subquery_table_columns(subquery);
 
@@ -1337,9 +1761,7 @@ impl Executor {
                 let alias = ts.alias.as_ref().map(|a| a.value.clone());
                 (ts.name.value.clone(), alias)
             }
-            _ => {
-                return None; // Can't optimize subquery joins or derived tables
-            }
+            _ => return None, // Can't optimize subquery joins or derived tables
         };
 
         // 2. Parse WHERE clause to find correlation condition
@@ -1352,8 +1774,9 @@ impl Executor {
             .to_lowercase()];
 
         // Try to extract: outer.col = inner.col (or inner.col = outer.col)
-        let (outer_col, outer_tbl, inner_col, remaining) =
-            Self::extract_equality_correlation(where_clause, outer_tables, &inner_tables)?;
+        let extraction =
+            Self::extract_equality_correlation(where_clause, outer_tables, &inner_tables);
+        let (outer_col, outer_tbl, inner_col, remaining) = extraction?;
 
         // IMPORTANT: Check if the remaining predicates reference outer tables.
         // If they do, we cannot use semi-join optimization because those predicates
@@ -1597,17 +2020,86 @@ impl Executor {
         }
     }
 
+    /// Check if index-nested-loop would be more efficient than semi-join for EXISTS.
+    ///
+    /// Returns true if:
+    /// 1. There's a small LIMIT (< 500)
+    /// 2. Inner table has index on correlation column
+    ///
+    /// With small LIMIT and early termination at the outer level, per-row EXISTS
+    /// evaluation is faster because:
+    /// - O(LIMIT × log(inner_size)) for index probe vs O(inner_size) for hash build
+    /// - Example: LIMIT 100, inner=30K → 100×15=1500 ops vs 30000 ops
+    ///
+    /// For EXISTS with additional predicate (e.g., EXISTS ... WHERE o.user_id = u.id AND o.amount > 500):
+    /// - Index lookup gets candidate row_ids for correlation
+    /// - Rows are fetched in batches and predicate is evaluated with early exit
+    /// - This is O(LIMIT × avg_rows_per_key × predicate_selectivity) which is still efficient
+    fn should_use_index_nested_loop(&self, info: &SemiJoinInfo, outer_limit: Option<i64>) -> bool {
+        // Use index-nested-loop for small LIMIT queries
+        // The LIMIT early termination in the sequential path makes this efficient
+        const SMALL_LIMIT_THRESHOLD: i64 = 500;
+
+        // For small LIMIT, per-row EXISTS with index probe is faster
+        // Complexity: O(LIMIT × log(inner)) vs O(inner) for semi-join hash build
+        if let Some(limit) = outer_limit {
+            if limit > 0 && limit <= SMALL_LIMIT_THRESHOLD {
+                // Check if inner table has an index on correlation column
+                // Without index, per-row evaluation would be slow
+                let txn = match self.engine.begin_transaction() {
+                    Ok(t) => t,
+                    Err(_) => return false,
+                };
+                let inner_table = match txn.get_table(&info.inner_table) {
+                    Ok(t) => t,
+                    Err(_) => return false,
+                };
+
+                // Check for index on correlation column
+                if inner_table
+                    .get_index_on_column(&info.inner_column)
+                    .is_some()
+                {
+                    return true;
+                }
+            }
+        }
+
+        // For larger queries, additional predicates, or no index, use semi-join
+        false
+    }
+
     /// Execute the semi-join optimization for an EXISTS subquery.
     ///
     /// Instead of executing the subquery for each outer row, we:
     /// 1. Execute the inner query once with non-correlated predicates
     /// 2. Collect all distinct values of the inner correlation column
     /// 3. Return an AHashSet for fast O(1) lookups
+    ///
+    /// Results are cached to avoid re-execution for the same query within a single
+    /// top-level query execution.
     pub fn execute_semi_join_optimization(
         &self,
         info: &SemiJoinInfo,
         ctx: &ExecutionContext,
     ) -> Result<AHashSet<crate::core::Value>> {
+        // Build cache key from inner table, column, and WHERE predicate
+        let cache_key = format!(
+            "SEMI:{}:{}:{}",
+            info.inner_table,
+            info.inner_column,
+            info.non_correlated_where
+                .as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        );
+
+        // Check cache first
+        if let Some(cached) = get_cached_semi_join(&cache_key) {
+            // Return owned copy from Arc (Arc::unwrap_or_clone equivalent)
+            return Ok((*cached).clone());
+        }
+
         // Build SELECT inner_column FROM inner_table WHERE non_correlated_predicates
         let inner_col_expr = Expression::Identifier(Identifier {
             token: dummy_token(&info.inner_column, TokenType::Identifier),
@@ -1632,7 +2124,10 @@ impl Executor {
 
         let select_stmt = SelectStatement {
             token: dummy_token("SELECT", TokenType::Keyword),
-            distinct: false, // No DISTINCT - HashSet deduplicates automatically
+            // Don't use DISTINCT here - it's slower in Stoolap because it requires
+            // additional hashing/sorting overhead. Instead, we collect into HashSet
+            // which deduplicates more efficiently for this use case.
+            distinct: false,
             columns: vec![inner_col_expr],
             with: None,
             table_expr: Some(Box::new(table_source)),
@@ -1653,18 +2148,22 @@ impl Executor {
         let subquery_ctx = ctx.with_incremented_query_depth();
         let mut result = self.execute_select(&select_stmt, &subquery_ctx)?;
 
-        // Collect values into AHashSet for fast O(1) lookups
-        // AHash handles Value types better than FxHash (particularly f64 bit patterns from integers)
-        // Pre-allocate with larger capacity to reduce rehashing (estimated 10k rows)
-        let mut hash_set = AHashSet::with_capacity(10_000);
+        // Collect values into Vec first (faster than direct AHashSet insertion),
+        // then convert to AHashSet for deduplication and O(1) lookups
+        let mut values_vec = Vec::with_capacity(10_000);
         while result.next() {
             let row = result.row();
             if let Some(value) = row.get(0) {
                 if !value.is_null() {
-                    hash_set.insert(value.clone());
+                    values_vec.push(value.clone());
                 }
             }
         }
+        // Build AHashSet from Vec - this deduplicates automatically
+        let hash_set: AHashSet<crate::core::Value> = values_vec.into_iter().collect();
+
+        // Cache for subsequent calls within this query
+        cache_semi_join(cache_key, hash_set.clone());
 
         Ok(hash_set)
     }
@@ -1722,16 +2221,30 @@ impl Executor {
 
     /// Try to optimize correlated EXISTS subqueries to semi-join.
     /// Returns Some(optimized_expression) if successful, None if not applicable.
+    ///
+    /// Note: This function now checks if index-nested-loop would be more efficient
+    /// and skips the semi-join transformation in that case, allowing per-row index probing.
+    ///
+    /// The `outer_limit` parameter helps decide between strategies:
+    /// - With small LIMIT + index: prefer index-nested-loop (per-row probing with early termination)
+    /// - Without LIMIT: prefer semi-join (scan inner once, hash lookup per outer row)
     pub fn try_optimize_exists_to_semi_join(
         &self,
         expr: &Expression,
         ctx: &ExecutionContext,
         outer_tables: &[String],
+        outer_limit: Option<i64>,
     ) -> Result<Option<Expression>> {
         match expr {
             Expression::Exists(exists) => {
                 if let Some(info) = Self::try_extract_semi_join_info(exists, false, outer_tables) {
+                    // Check if index-nested-loop would be more efficient
+                    // (index exists + no additional predicates, OR index exists + small LIMIT)
+                    if self.should_use_index_nested_loop(&info, outer_limit) {
+                        return Ok(None); // Skip semi-join, use index probing per row
+                    }
                     // Semi-join optimization: execute inner query once, collect into hash set
+                    // This enables InHashSet optimization to probe outer table's PK directly
                     let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
                     return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
                 }
@@ -1742,6 +2255,10 @@ impl Executor {
                 if let Expression::Exists(exists) = prefix.right.as_ref() {
                     if let Some(info) = Self::try_extract_semi_join_info(exists, true, outer_tables)
                     {
+                        // Check if index-nested-loop would be more efficient
+                        if self.should_use_index_nested_loop(&info, outer_limit) {
+                            return Ok(None); // Skip semi-join, use index probing per row
+                        }
                         let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
                         return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
                     }
@@ -1751,10 +2268,18 @@ impl Executor {
 
             Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("AND") => {
                 // Try to optimize EXISTS in either branch of AND
-                let left_opt =
-                    self.try_optimize_exists_to_semi_join(&infix.left, ctx, outer_tables)?;
-                let right_opt =
-                    self.try_optimize_exists_to_semi_join(&infix.right, ctx, outer_tables)?;
+                let left_opt = self.try_optimize_exists_to_semi_join(
+                    &infix.left,
+                    ctx,
+                    outer_tables,
+                    outer_limit,
+                )?;
+                let right_opt = self.try_optimize_exists_to_semi_join(
+                    &infix.right,
+                    ctx,
+                    outer_tables,
+                    outer_limit,
+                )?;
 
                 match (left_opt, right_opt) {
                     (Some(new_left), Some(new_right)) => {
@@ -1787,10 +2312,18 @@ impl Executor {
             Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("OR") => {
                 // For OR, both branches must be optimizable for benefit
                 // But we can still optimize individual EXISTS clauses
-                let left_opt =
-                    self.try_optimize_exists_to_semi_join(&infix.left, ctx, outer_tables)?;
-                let right_opt =
-                    self.try_optimize_exists_to_semi_join(&infix.right, ctx, outer_tables)?;
+                let left_opt = self.try_optimize_exists_to_semi_join(
+                    &infix.left,
+                    ctx,
+                    outer_tables,
+                    outer_limit,
+                )?;
+                let right_opt = self.try_optimize_exists_to_semi_join(
+                    &infix.right,
+                    ctx,
+                    outer_tables,
+                    outer_limit,
+                )?;
 
                 match (left_opt, right_opt) {
                     (Some(new_left), Some(new_right)) => {

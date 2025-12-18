@@ -271,6 +271,25 @@ impl MVCCTable {
             return Some(result);
         }
 
+        // OPTIMIZATION: Handle IN list expressions with direct index lookup
+        // For 'col IN (a, b, c)', use get_row_ids_in for efficient multi-value lookup
+        if let Some(in_list) = expr
+            .as_any()
+            .downcast_ref::<crate::storage::expression::InListExpr>()
+        {
+            // Only handle positive IN (not NOT IN)
+            if !in_list.is_not() {
+                if let Some(col_name) = in_list.get_column_name() {
+                    if let Some(index) = self.version_store.get_index_by_column(col_name) {
+                        // Use the efficient get_row_ids_in method
+                        let values = in_list.get_values();
+                        let row_ids = index.get_row_ids_in(values);
+                        return Some(row_ids);
+                    }
+                }
+            }
+        }
+
         // OPTIMIZATION: Handle LIKE prefix patterns with index range scan
         // For 'name LIKE 'John%'', use index range scan from 'John' to 'John\xff'
         if let Some((col_name, prefix, negated)) = expr.get_like_prefix_info() {
@@ -819,53 +838,6 @@ impl MVCCTable {
         count
     }
 
-    /// Fetch rows by their IDs, applying filter
-    ///
-    /// Optimized to use batch fetch for global store rows,
-    /// reducing lock contention from O(n) to O(1).
-    #[inline]
-    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Vec<(i64, Row)> {
-        let txn_versions = self.txn_versions.read().unwrap();
-        let schema = &self.cached_schema;
-        let mut rows = Vec::with_capacity(row_ids.len());
-        let mut global_row_ids = Vec::with_capacity(row_ids.len());
-
-        // Step 1: Check local versions first (uncommitted changes in this transaction)
-        for &row_id in row_ids {
-            if let Some(version) = txn_versions.get_local_version(row_id) {
-                if !version.is_deleted() {
-                    // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                    let row = self.normalize_row_to_schema(version.data.clone(), schema);
-                    if filter.evaluate_fast(&row) {
-                        rows.push((row_id, row));
-                    }
-                }
-                // Skip global lookup - local version takes precedence
-            } else {
-                // Need to fetch from global store
-                global_row_ids.push(row_id);
-            }
-        }
-
-        // Step 2: Batch fetch from global store (single lock acquisition)
-        if !global_row_ids.is_empty() {
-            let global_rows = self
-                .version_store
-                .get_visible_versions_batch(&global_row_ids, self.txn_id);
-
-            // Apply filter to fetched rows
-            for (row_id, row) in global_rows {
-                // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                let row = self.normalize_row_to_schema(row, schema);
-                if filter.evaluate_fast(&row) {
-                    rows.push((row_id, row));
-                }
-            }
-        }
-
-        rows
-    }
-
     /// Collect all visible rows, optionally filtered
     ///
     /// Optimized to use batch fetch even when there are local changes,
@@ -1033,6 +1005,50 @@ impl MVCCTable {
 
         result
     }
+
+    /// Collect visible rows with LIMIT without guaranteeing deterministic order.
+    /// This is an optimization for queries with LIMIT but without ORDER BY.
+    /// Since SQL doesn't guarantee order for LIMIT without ORDER BY, we can
+    /// skip sorting and return rows in arbitrary order, enabling true early termination.
+    fn collect_visible_rows_with_limit_unordered(
+        &self,
+        filter: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<Row> {
+        let txn_versions = self.txn_versions.read().unwrap();
+        let schema = &self.cached_schema;
+
+        // Check if we have local versions (uncommitted changes in this transaction)
+        let has_local = txn_versions.has_local_changes();
+
+        if !has_local {
+            // No local versions - use optimized unordered path with true early termination
+            let raw_rows = if let Some(expr) = filter {
+                self.version_store
+                    .get_visible_rows_filtered_with_limit_unordered(
+                        self.txn_id,
+                        expr,
+                        limit,
+                        offset,
+                    )
+            } else {
+                self.version_store
+                    .get_visible_rows_with_limit_unordered(self.txn_id, limit, offset)
+            };
+
+            return raw_rows
+                .into_iter()
+                .map(|(_, row)| self.normalize_row_to_schema(row, schema))
+                .collect();
+        }
+
+        // Has local versions - use same path as ordered (local changes are rare)
+        // Early termination is already implemented in collect_visible_rows_with_limit
+        // when there are local changes
+        drop(txn_versions);
+        self.collect_visible_rows_with_limit(filter, limit, offset)
+    }
 }
 
 impl Table for MVCCTable {
@@ -1042,6 +1058,52 @@ impl Table for MVCCTable {
 
     fn schema(&self) -> &Schema {
         &self.cached_schema
+    }
+
+    /// Fetch rows by their IDs, applying filter
+    ///
+    /// Optimized to use batch fetch for global store rows,
+    /// reducing lock contention from O(n) to O(1).
+    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Vec<(i64, Row)> {
+        let txn_versions = self.txn_versions.read().unwrap();
+        let schema = &self.cached_schema;
+        let mut rows = Vec::with_capacity(row_ids.len());
+        let mut global_row_ids = Vec::with_capacity(row_ids.len());
+
+        // Step 1: Check local versions first (uncommitted changes in this transaction)
+        for &row_id in row_ids {
+            if let Some(version) = txn_versions.get_local_version(row_id) {
+                if !version.is_deleted() {
+                    // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
+                    let row = self.normalize_row_to_schema(version.data.clone(), schema);
+                    if filter.evaluate_fast(&row) {
+                        rows.push((row_id, row));
+                    }
+                }
+                // Skip global lookup - local version takes precedence
+            } else {
+                // Need to fetch from global store
+                global_row_ids.push(row_id);
+            }
+        }
+
+        // Step 2: Batch fetch from global store (single lock acquisition)
+        if !global_row_ids.is_empty() {
+            let global_rows = self
+                .version_store
+                .get_visible_versions_batch(&global_row_ids, self.txn_id);
+
+            // Apply filter to fetched rows
+            for (row_id, row) in global_rows {
+                // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
+                let row = self.normalize_row_to_schema(row, schema);
+                if filter.evaluate_fast(&row) {
+                    rows.push((row_id, row));
+                }
+            }
+        }
+
+        rows
     }
 
     fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
@@ -1618,6 +1680,16 @@ impl Table for MVCCTable {
         Ok(self.collect_visible_rows_with_limit(where_expr, limit, offset))
     }
 
+    fn collect_rows_with_limit_unordered(
+        &self,
+        where_expr: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Row>> {
+        // Use the optimized unordered version with true early termination
+        Ok(self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset))
+    }
+
     fn close(&mut self) -> Result<()> {
         // Rollback any uncommitted changes
         self.txn_versions.write().unwrap().rollback();
@@ -2113,7 +2185,45 @@ impl Table for MVCCTable {
         // Check if column has an index
         let index = self.version_store.get_index_by_column(column_name)?;
 
-        // Get all unique values from the index
+        // Try using the efficient ordered iteration method (available in B-tree indexes)
+        // We request more row IDs than needed to account for invisible rows
+        let batch_size = (limit + offset) * 2 + 100; // Request extra to handle filtered rows
+
+        if let Some(ordered_row_ids) = index.get_row_ids_ordered(ascending, batch_size, 0) {
+            // Fast path: B-tree index supports ordered iteration
+            let mut rows = Vec::with_capacity(limit.min(100));
+            let mut skipped = 0;
+
+            for row_id in ordered_row_ids {
+                // Check visibility and get row
+                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                    if version.is_deleted() {
+                        continue;
+                    }
+
+                    // Handle offset
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    rows.push(version.data.clone());
+
+                    // Check if we've reached the limit
+                    if rows.len() >= limit {
+                        return Some(rows);
+                    }
+                }
+            }
+
+            // If we got all needed rows, return them
+            // If not, we may need to fetch more (rare case with many invisible rows)
+            if !rows.is_empty() {
+                return Some(rows);
+            }
+        }
+
+        // Fallback path: Get all values and sort (for non-B-tree indexes)
         let all_values = index.get_all_values();
 
         // Sort values using partial_cmp (Value implements PartialOrd)
@@ -2153,6 +2263,75 @@ impl Table for MVCCTable {
                     if rows.len() >= limit {
                         return Some(rows);
                     }
+                }
+            }
+        }
+
+        Some(rows)
+    }
+
+    fn collect_rows_grouped_by_partition(
+        &self,
+        column_name: &str,
+    ) -> Option<Vec<(Value, Vec<Row>)>> {
+        // Check if column has an index
+        let index = self.version_store.get_index_by_column(column_name)?;
+
+        // Get all unique values from the index (partition keys)
+        let all_values = index.get_all_values();
+        if all_values.is_empty() {
+            return Some(Vec::new());
+        }
+
+        // Collect rows grouped by partition value
+        let mut result: Vec<(Value, Vec<Row>)> = Vec::with_capacity(all_values.len());
+
+        for partition_value in all_values {
+            // Get all row IDs for this partition value
+            let row_ids = index.get_row_ids_equal(std::slice::from_ref(&partition_value));
+
+            // Collect visible rows for this partition
+            let mut partition_rows = Vec::with_capacity(row_ids.len());
+            for row_id in row_ids {
+                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                    if !version.is_deleted() {
+                        partition_rows.push(version.data.clone());
+                    }
+                }
+            }
+
+            if !partition_rows.is_empty() {
+                result.push((partition_value, partition_rows));
+            }
+        }
+
+        Some(result)
+    }
+
+    fn get_partition_values(&self, column_name: &str) -> Option<Vec<Value>> {
+        // Get index for the column
+        let index = self.version_store.get_index_by_column(column_name)?;
+        // Return all distinct values from the index
+        Some(index.get_all_values())
+    }
+
+    fn get_rows_for_partition_value(
+        &self,
+        column_name: &str,
+        partition_value: &Value,
+    ) -> Option<Vec<Row>> {
+        // Get index for the column
+        let index = self.version_store.get_index_by_column(column_name)?;
+
+        // Get row IDs for this partition value
+        let row_ids = index.get_row_ids_equal(std::slice::from_ref(partition_value));
+
+        // Collect visible rows for this partition
+        let mut rows = Vec::with_capacity(row_ids.len());
+        for row_id in row_ids {
+            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                if !version.is_deleted() {
+                    rows.push(version.data.clone());
                 }
             }
         }

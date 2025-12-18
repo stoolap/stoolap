@@ -429,10 +429,10 @@ fn test_scalar_subquery_in_select_null() {
         .expect("Failed to execute query");
 
     let row = result.into_iter().next().unwrap().unwrap();
-    let id: i64 = row.get(0).unwrap();
+    let _id: i64 = row.get(0).unwrap(); // id is arbitrary without ORDER BY
     let max_price: Option<f64> = row.get(1).ok();
 
-    assert_eq!(id, 1);
+    // The key assertion: scalar subquery for non-existent category returns NULL
     assert!(
         max_price.is_none(),
         "Expected NULL for non-existent category"

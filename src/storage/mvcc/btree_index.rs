@@ -863,6 +863,64 @@ impl Index for BTreeIndex {
         sorted_values.keys().cloned().collect()
     }
 
+    fn get_row_ids_ordered(
+        &self,
+        ascending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Option<Vec<i64>> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return None;
+        }
+
+        let sorted_values = self.sorted_values.read().unwrap();
+
+        // Pre-allocate with expected capacity
+        let mut result = Vec::with_capacity(limit.min(128));
+        let mut skipped = 0;
+
+        // Iterate in the requested order using BTreeMap's natural ordering
+        if ascending {
+            // Forward iteration (ascending order)
+            'outer: for row_ids in sorted_values.values() {
+                for &row_id in row_ids {
+                    // Handle offset
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    result.push(row_id);
+
+                    // Check limit
+                    if result.len() >= limit {
+                        break 'outer;
+                    }
+                }
+            }
+        } else {
+            // Reverse iteration (descending order)
+            'outer: for row_ids in sorted_values.values().rev() {
+                for &row_id in row_ids {
+                    // Handle offset
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    result.push(row_id);
+
+                    // Check limit
+                    if result.len() >= limit {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        Some(result)
+    }
+
     fn close(&mut self) -> Result<()> {
         self.closed.store(true, AtomicOrdering::Release);
 

@@ -65,7 +65,7 @@ use ahash::AHashMap;
 use smallvec::SmallVec;
 
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
-use crate::storage::expression::Expression;
+use crate::storage::expression::{ComparisonExpr, Expression, InListExpr};
 use crate::storage::traits::Index;
 
 /// Compute hash for a slice of Values using ahash
@@ -443,18 +443,37 @@ impl Index for HashIndex {
     }
 
     fn get_filtered_row_ids(&self, expr: &dyn Expression) -> Vec<i64> {
-        // For complex expressions, we need to scan all entries
-        // This is inefficient but necessary for correctness
+        // Try to optimize for IN list expressions
+        if let Some(in_list) = expr.as_any().downcast_ref::<InListExpr>() {
+            // Check if this IN list is on our indexed column
+            if let Some(col_name) = in_list.get_column_name() {
+                if self.column_names.len() == 1 && self.column_names[0] == col_name {
+                    // Use efficient get_row_ids_in
+                    let values = in_list.get_values();
+                    return self.get_row_ids_in(values);
+                }
+            }
+        }
+
+        // Try to optimize for equality expressions
+        if let Some(comparison) = expr.as_any().downcast_ref::<ComparisonExpr>() {
+            if comparison.operator() == Operator::Eq {
+                if let Some(col_name) = comparison.get_column_name() {
+                    if self.column_names.len() == 1 && self.column_names[0] == col_name {
+                        // Use efficient equality lookup
+                        return self.get_row_ids_equal(&[comparison.value().to_value()]);
+                    }
+                }
+            }
+        }
+
+        // Fallback: return all row IDs and let caller filter
+        // This is inefficient but necessary for correctness for complex expressions
         let hash_to_values = self.hash_to_values.read().unwrap();
         let mut results = Vec::new();
 
         for entries in hash_to_values.values() {
-            for (values, row_ids) in entries {
-                // Try to evaluate the expression against these values
-                // For now, just return all row_ids and let the caller filter
-                // A more sophisticated implementation would evaluate the expression
-                let _ = values;
-                let _ = expr;
+            for (_values, row_ids) in entries {
                 results.extend(row_ids.iter().copied());
             }
         }

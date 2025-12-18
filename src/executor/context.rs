@@ -54,6 +54,201 @@ pub fn cache_scalar_subquery(key: String, value: Value) {
     });
 }
 
+// Cache for IN subquery results to avoid re-execution.
+// Thread-local to avoid synchronization overhead.
+// Uses SQL string as key (not hash) to avoid collision risk.
+thread_local! {
+    static IN_SUBQUERY_CACHE: RefCell<FxHashMap<String, Vec<Value>>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the IN subquery cache. Should be called at the start of each top-level query.
+pub fn clear_in_subquery_cache() {
+    IN_SUBQUERY_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit(); // Release capacity to avoid memory bloat
+    });
+}
+
+/// Get a cached IN subquery result by SQL string key.
+pub fn get_cached_in_subquery(key: &str) -> Option<Vec<Value>> {
+    IN_SUBQUERY_CACHE.with(|cache| cache.borrow().get(key).cloned())
+}
+
+/// Cache an IN subquery result.
+pub fn cache_in_subquery(key: String, values: Vec<Value>) {
+    IN_SUBQUERY_CACHE.with(|cache| {
+        cache.borrow_mut().insert(key, values);
+    });
+}
+
+// Cache for semi-join (EXISTS) hash sets to avoid re-execution.
+// Thread-local to avoid synchronization overhead.
+// Uses the inner query SQL + predicate as key.
+use ahash::AHashSet;
+thread_local! {
+    static SEMI_JOIN_CACHE: RefCell<FxHashMap<String, Arc<AHashSet<Value>>>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the semi-join cache. Should be called at the start of each top-level query.
+pub fn clear_semi_join_cache() {
+    SEMI_JOIN_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+}
+
+/// Get a cached semi-join hash set by key.
+pub fn get_cached_semi_join(key: &str) -> Option<Arc<AHashSet<Value>>> {
+    SEMI_JOIN_CACHE.with(|cache| cache.borrow().get(key).cloned())
+}
+
+/// Cache a semi-join hash set result.
+pub fn cache_semi_join(key: String, values: AHashSet<Value>) {
+    SEMI_JOIN_CACHE.with(|cache| {
+        cache.borrow_mut().insert(key, Arc::new(values));
+    });
+}
+
+/// Cache a semi-join hash set result (Arc version for zero-copy).
+pub fn cache_semi_join_arc(key: String, values: Arc<AHashSet<Value>>) {
+    SEMI_JOIN_CACHE.with(|cache| {
+        cache.borrow_mut().insert(key, values);
+    });
+}
+
+// Cache for EXISTS predicate filters to avoid re-compilation per row.
+// The key is the predicate expression string (after alias stripping).
+// The value is the compiled RowFilter.
+use super::expression::RowFilter;
+thread_local! {
+    static EXISTS_PREDICATE_CACHE: RefCell<FxHashMap<String, RowFilter>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the EXISTS predicate cache. Should be called at the start of each top-level query.
+pub fn clear_exists_predicate_cache() {
+    EXISTS_PREDICATE_CACHE.with(|cache| {
+        cache.borrow_mut().clear();
+    });
+}
+
+/// Get a cached EXISTS predicate filter by key.
+pub fn get_cached_exists_predicate(key: &str) -> Option<RowFilter> {
+    EXISTS_PREDICATE_CACHE.with(|cache| cache.borrow().get(key).cloned())
+}
+
+/// Cache an EXISTS predicate filter.
+pub fn cache_exists_predicate(key: String, filter: RowFilter) {
+    EXISTS_PREDICATE_CACHE.with(|cache| {
+        cache.borrow_mut().insert(key, filter);
+    });
+}
+
+// Cache for EXISTS index lookups to avoid re-fetching per row.
+// The key is "table_name:column_name", the value is the index reference.
+use crate::storage::traits::Index;
+thread_local! {
+    static EXISTS_INDEX_CACHE: RefCell<FxHashMap<String, std::sync::Arc<dyn Index>>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the EXISTS index cache. Should be called at the start of each top-level query.
+pub fn clear_exists_index_cache() {
+    EXISTS_INDEX_CACHE.with(|cache| {
+        cache.borrow_mut().clear();
+    });
+}
+
+/// Get a cached EXISTS index by key.
+pub fn get_cached_exists_index(key: &str) -> Option<std::sync::Arc<dyn Index>> {
+    EXISTS_INDEX_CACHE.with(|cache| cache.borrow().get(key).cloned())
+}
+
+/// Cache an EXISTS index.
+pub fn cache_exists_index(key: String, index: std::sync::Arc<dyn Index>) {
+    EXISTS_INDEX_CACHE.with(|cache| {
+        cache.borrow_mut().insert(key, index);
+    });
+}
+
+// Type alias for row fetcher function
+type RowFetcher = Box<dyn Fn(&[i64]) -> Vec<(i64, crate::core::Row)> + Send + Sync>;
+
+// Cache for EXISTS row fetchers to avoid repeated version store lookups.
+// The key is the table name, the value is the row fetcher function.
+thread_local! {
+    static EXISTS_FETCHER_CACHE: RefCell<FxHashMap<String, std::sync::Arc<RowFetcher>>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the EXISTS row fetcher cache. Should be called at the start of each top-level query.
+pub fn clear_exists_fetcher_cache() {
+    EXISTS_FETCHER_CACHE.with(|cache| {
+        cache.borrow_mut().clear();
+    });
+}
+
+/// Get a cached EXISTS row fetcher by table name.
+pub fn get_cached_exists_fetcher(key: &str) -> Option<std::sync::Arc<RowFetcher>> {
+    EXISTS_FETCHER_CACHE.with(|cache| cache.borrow().get(key).cloned())
+}
+
+/// Cache an EXISTS row fetcher.
+pub fn cache_exists_fetcher(key: String, fetcher: RowFetcher) {
+    EXISTS_FETCHER_CACHE.with(|cache| {
+        cache.borrow_mut().insert(key, std::sync::Arc::new(fetcher));
+    });
+}
+
+// Cache for table schema column names to avoid repeated get_table_schema() calls.
+// The key is the table name, the value is the list of column names.
+thread_local! {
+    static EXISTS_SCHEMA_CACHE: RefCell<FxHashMap<String, std::sync::Arc<Vec<String>>>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the EXISTS schema cache. Should be called at the start of each top-level query.
+pub fn clear_exists_schema_cache() {
+    EXISTS_SCHEMA_CACHE.with(|cache| {
+        cache.borrow_mut().clear();
+    });
+}
+
+/// Get cached table column names by table name.
+pub fn get_cached_exists_schema(key: &str) -> Option<std::sync::Arc<Vec<String>>> {
+    EXISTS_SCHEMA_CACHE.with(|cache| cache.borrow().get(key).cloned())
+}
+
+/// Cache table column names.
+pub fn cache_exists_schema(key: String, columns: Vec<String>) {
+    EXISTS_SCHEMA_CACHE.with(|cache| {
+        cache.borrow_mut().insert(key, std::sync::Arc::new(columns));
+    });
+}
+
+// Cache for pre-computed EXISTS predicate cache keys to avoid expensive format!("{:?}") on every probe.
+// The key is a stable identifier for the subquery (e.g., its Debug repr), the value is the predicate cache key.
+thread_local! {
+    static EXISTS_PRED_KEY_CACHE: RefCell<FxHashMap<String, String>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the EXISTS predicate key cache.
+pub fn clear_exists_pred_key_cache() {
+    EXISTS_PRED_KEY_CACHE.with(|cache| {
+        cache.borrow_mut().clear();
+    });
+}
+
+/// Get cached predicate cache key by subquery identifier.
+pub fn get_cached_exists_pred_key(subquery_key: &str) -> Option<String> {
+    EXISTS_PRED_KEY_CACHE.with(|cache| cache.borrow().get(subquery_key).cloned())
+}
+
+/// Cache a predicate cache key.
+pub fn cache_exists_pred_key(subquery_key: String, pred_key: String) {
+    EXISTS_PRED_KEY_CACHE.with(|cache| {
+        cache.borrow_mut().insert(subquery_key, pred_key);
+    });
+}
+
 /// Execution context for SQL queries
 ///
 /// The execution context carries state and configuration for query execution,

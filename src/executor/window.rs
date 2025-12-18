@@ -41,7 +41,7 @@ type PartitionKey = SmallVec<[Value; 4]>;
 
 use crate::functions::WindowFunction;
 use crate::parser::ast::*;
-use crate::storage::traits::QueryResult;
+use crate::storage::traits::{QueryResult, Table};
 
 use super::context::ExecutionContext;
 use super::expression::{ExpressionEval, MultiExpressionEval};
@@ -72,14 +72,14 @@ pub struct WindowFunctionInfo {
 }
 
 /// Information about a SELECT list item for window function processing
-struct SelectItem {
-    output_name: String,
-    source: SelectItemSource,
+pub struct SelectItem {
+    pub output_name: String,
+    pub source: SelectItemSource,
 }
 
 /// Source of a SELECT item value
 #[allow(clippy::large_enum_variant)]
-enum SelectItemSource {
+pub enum SelectItemSource {
     BaseColumn(usize),
     /// Window function name - stored in lowercase for O(1) lookup in window_value_map
     WindowFunction(String),
@@ -87,6 +87,27 @@ enum SelectItemSource {
     /// Expression containing a window function - needs special handling
     /// Stores (expression, synthetic_column_name_for_window_func)
     ExpressionWithWindow(Expression, String),
+}
+
+/// Pre-sorted state for window function optimization
+/// When rows are pre-sorted by an indexed column, we can skip sorting in window functions
+#[derive(Clone, Debug)]
+pub struct WindowPreSortedState {
+    /// Column name that rows are sorted by (lowercase)
+    pub column: String,
+    /// Whether sorted in ascending order
+    pub ascending: bool,
+}
+
+/// Pre-grouped state for window function PARTITION BY optimization
+/// When rows are fetched grouped by an indexed partition column, we can skip hash-based grouping
+#[derive(Clone)]
+pub struct WindowPreGroupedState {
+    /// Column name that rows are partitioned by (lowercase)
+    #[allow(dead_code)]
+    pub column: String,
+    /// Pre-built partition map: partition key -> row indices
+    pub partition_map: FxHashMap<PartitionKey, Vec<usize>>,
 }
 
 impl Executor {
@@ -98,6 +119,68 @@ impl Executor {
         base_rows: Vec<Row>,
         base_columns: &[String],
     ) -> Result<Box<dyn QueryResult>> {
+        self.execute_select_with_window_functions_internal(
+            stmt,
+            ctx,
+            base_rows,
+            base_columns,
+            None,
+            None,
+        )
+    }
+
+    /// Execute SELECT with window functions, with optional pre-sorted state
+    /// When pre_sorted is Some, rows are already sorted by the specified column,
+    /// allowing us to skip sorting for window functions that ORDER BY the same column
+    pub(crate) fn execute_select_with_window_functions_presorted(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        base_rows: Vec<Row>,
+        base_columns: &[String],
+        pre_sorted: Option<WindowPreSortedState>,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.execute_select_with_window_functions_internal(
+            stmt,
+            ctx,
+            base_rows,
+            base_columns,
+            pre_sorted,
+            None,
+        )
+    }
+
+    /// Execute SELECT with window functions, with pre-grouped partitions
+    /// When pre_grouped is provided, rows are already grouped by partition column,
+    /// allowing us to skip hash-based grouping for window functions
+    pub(crate) fn execute_select_with_window_functions_pregrouped(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        base_rows: Vec<Row>,
+        base_columns: &[String],
+        pre_grouped: WindowPreGroupedState,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.execute_select_with_window_functions_internal(
+            stmt,
+            ctx,
+            base_rows,
+            base_columns,
+            None,
+            Some(pre_grouped),
+        )
+    }
+
+    /// Internal implementation with pre-sorted and pre-grouped state parameters
+    fn execute_select_with_window_functions_internal(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        base_rows: Vec<Row>,
+        base_columns: &[String],
+        pre_sorted: Option<WindowPreSortedState>,
+        pre_grouped: Option<WindowPreGroupedState>,
+    ) -> Result<Box<dyn QueryResult>> {
         // Parse window functions from the SELECT list
         let window_functions = self.parse_window_functions(stmt, base_columns)?;
 
@@ -107,6 +190,33 @@ impl Executor {
                 base_columns.to_vec(),
                 base_rows,
             )));
+        }
+
+        // OPTIMIZATION: LIMIT pushdown for PARTITION BY queries
+        // If there's a LIMIT and PARTITION BY, we can process partitions one at a time
+        // and stop early once we have enough rows (like SQLite does)
+        if let Some(limit_expr) = &stmt.limit {
+            // Check if we have PARTITION BY (not just ORDER BY)
+            let has_partition_by = window_functions
+                .iter()
+                .any(|wf| !wf.partition_by.is_empty());
+
+            if has_partition_by {
+                // Try to evaluate the LIMIT expression
+                if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
+                    let limit_val = lit.value;
+                    if limit_val > 0 {
+                        return self.execute_select_with_window_functions_streaming(
+                            stmt,
+                            ctx,
+                            base_rows,
+                            base_columns,
+                            &window_functions,
+                            limit_val as usize,
+                        );
+                    }
+                }
+            }
         }
 
         // Build column index map for base columns
@@ -134,8 +244,15 @@ impl Executor {
         // OPTIMIZATION: Use FxHashMap for fastest lookups with trusted keys
         let mut window_value_map: FxHashMap<String, Vec<Value>> = FxHashMap::default();
         for wf in &window_functions {
-            let window_values =
-                self.compute_window_function(wf, &base_rows, base_columns, &col_index_map, ctx)?;
+            let window_values = self.compute_window_function(
+                wf,
+                &base_rows,
+                base_columns,
+                &col_index_map,
+                ctx,
+                pre_sorted.as_ref(),
+                pre_grouped.as_ref(),
+            )?;
             window_value_map.insert(wf.column_name.to_lowercase(), window_values);
         }
 
@@ -292,6 +409,333 @@ impl Executor {
             }
 
             result_rows.push(Row::from_values(values));
+        }
+
+        Ok(Box::new(ExecutorMemoryResult::new(
+            result_columns,
+            result_rows,
+        )))
+    }
+
+    /// Streaming execution for window functions with LIMIT pushdown
+    /// Processes partitions one at a time and stops early when LIMIT is reached
+    fn execute_select_with_window_functions_streaming(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        base_rows: Vec<Row>,
+        base_columns: &[String],
+        window_functions: &[WindowFunctionInfo],
+        limit: usize,
+    ) -> Result<Box<dyn QueryResult>> {
+        // Get the first window function with PARTITION BY (for partitioning logic)
+        let wf_info = window_functions
+            .iter()
+            .find(|wf| !wf.partition_by.is_empty())
+            .unwrap(); // Safe: we checked has_partition_by before calling this
+
+        // Build column index map
+        let col_index_map = build_column_index_map(base_columns);
+
+        // Get window function from registry
+        let window_func = self
+            .function_registry
+            .get_window(&wf_info.name)
+            .ok_or_else(|| {
+                Error::NotSupportedMessage(format!("Unknown window function: {}", wf_info.name))
+            })?;
+
+        // Build partition map: group rows by partition key
+        let partition_indices: SmallVec<[Option<usize>; 4]> = wf_info
+            .partition_by
+            .iter()
+            .map(|part_col| {
+                let lower = part_col.to_lowercase();
+                col_index_map.get(&lower).copied().or_else(|| {
+                    if let Some(dot_pos) = lower.rfind('.') {
+                        col_index_map.get(&lower[dot_pos + 1..]).copied()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
+        for (i, row) in base_rows.iter().enumerate() {
+            let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
+            for idx_opt in &partition_indices {
+                let value = if let Some(&idx) = idx_opt.as_ref() {
+                    row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
+                } else {
+                    Value::null_unknown()
+                };
+                key.push(value);
+            }
+            partitions.entry(key).or_default().push(i);
+        }
+
+        // Build result columns from SELECT list
+        let select_items = self.parse_select_list_for_window(stmt, base_columns, window_functions);
+        let result_columns: Vec<String> =
+            select_items.iter().map(|i| i.output_name.clone()).collect();
+
+        // Precompute ORDER BY values once for all rows
+        let precomputed_order_by = if !wf_info.order_by.is_empty() {
+            Some(self.precompute_order_by_values(
+                &wf_info.order_by,
+                &base_rows,
+                base_columns,
+                &col_index_map,
+                ctx,
+            ))
+        } else {
+            None
+        };
+
+        // Process partitions one at a time, stopping when we have enough rows
+        let mut result_rows: Vec<Row> = Vec::with_capacity(limit);
+
+        // Convert to vec for sequential processing
+        let partitions_vec: Vec<_> = partitions.into_iter().collect();
+
+        for (_partition_key, row_indices) in partitions_vec {
+            if result_rows.len() >= limit {
+                break; // Early exit: we have enough rows
+            }
+
+            // Compute window function for this partition
+            let (partition_results, sorted_indices) = self.compute_window_for_partition(
+                &*window_func,
+                wf_info,
+                &base_rows,
+                row_indices,
+                precomputed_order_by.as_ref(),
+                base_columns,
+                &col_index_map,
+                ctx,
+                false,
+            )?;
+
+            // Build result rows in sorted order (within this partition)
+            for (sorted_pos, &orig_idx) in sorted_indices.iter().enumerate() {
+                if result_rows.len() >= limit {
+                    break; // Early exit within partition
+                }
+
+                let base_row = &base_rows[orig_idx];
+                let window_value = &partition_results[sorted_pos];
+
+                // Build output row
+                let mut values: Vec<Value> = Vec::with_capacity(select_items.len());
+                for item in &select_items {
+                    match &item.source {
+                        SelectItemSource::BaseColumn(col_idx) => {
+                            values.push(
+                                base_row
+                                    .get(*col_idx)
+                                    .cloned()
+                                    .unwrap_or_else(Value::null_unknown),
+                            );
+                        }
+                        SelectItemSource::WindowFunction(_) => {
+                            values.push(window_value.clone());
+                        }
+                        SelectItemSource::Expression(expr) => {
+                            // Evaluate expression
+                            if let Ok(mut eval) = ExpressionEval::compile(expr, base_columns) {
+                                let val = eval
+                                    .eval(base_row)
+                                    .unwrap_or_else(|_| Value::null_unknown());
+                                values.push(val);
+                            } else {
+                                values.push(Value::null_unknown());
+                            }
+                        }
+                        SelectItemSource::ExpressionWithWindow(expr, _wf_name) => {
+                            // For expressions with window functions, we need to substitute
+                            // the window function value
+                            let transformed =
+                                Self::replace_window_with_identifier(expr, &item.output_name);
+                            let mut ext_columns = base_columns.to_vec();
+                            ext_columns.push(item.output_name.clone());
+                            let mut ext_values: Vec<Value> = base_row.iter().cloned().collect();
+                            ext_values.push(window_value.clone());
+                            let ext_row = Row::from_values(ext_values);
+                            if let Ok(mut eval) =
+                                ExpressionEval::compile(&transformed, &ext_columns)
+                            {
+                                let val = eval
+                                    .eval(&ext_row)
+                                    .unwrap_or_else(|_| Value::null_unknown());
+                                values.push(val);
+                            } else {
+                                values.push(Value::null_unknown());
+                            }
+                        }
+                    }
+                }
+                result_rows.push(Row::from_values(values));
+            }
+        }
+
+        Ok(Box::new(ExecutorMemoryResult::new(
+            result_columns,
+            result_rows,
+        )))
+    }
+
+    /// Lazy partition fetching for window functions with LIMIT pushdown
+    /// Fetches partitions one at a time from the index and stops when LIMIT is reached
+    /// This is the key optimization for PARTITION BY + LIMIT queries
+    pub fn execute_select_with_window_functions_lazy_partition(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        table: &dyn Table,
+        base_columns: &[String],
+        partition_col: &str,
+        limit: usize,
+    ) -> Result<Box<dyn QueryResult>> {
+        // Parse window functions from SELECT list
+        let window_functions = self.parse_window_functions(stmt, base_columns)?;
+        if window_functions.is_empty() {
+            return Err(Error::internal(
+                "No window functions found for lazy partition fetch",
+            ));
+        }
+
+        // Get the first window function with PARTITION BY
+        let wf_info = window_functions
+            .iter()
+            .find(|wf| !wf.partition_by.is_empty())
+            .ok_or_else(|| Error::internal("No PARTITION BY window function found"))?;
+
+        // Build column index map
+        let col_index_map = build_column_index_map(base_columns);
+
+        // Get window function from registry
+        let window_func = self
+            .function_registry
+            .get_window(&wf_info.name)
+            .ok_or_else(|| {
+                Error::NotSupportedMessage(format!("Unknown window function: {}", wf_info.name))
+            })?;
+
+        // Build result columns from SELECT list
+        let select_items = self.parse_select_list_for_window(stmt, base_columns, &window_functions);
+        let result_columns: Vec<String> =
+            select_items.iter().map(|i| i.output_name.clone()).collect();
+
+        // Get partition values from the index (lazy iteration key!)
+        let partition_values = match table.get_partition_values(partition_col) {
+            Some(values) => values,
+            None => return Err(Error::internal("Failed to get partition values from index")),
+        };
+
+        // Process partitions one at a time, stopping when we have enough rows
+        let mut result_rows: Vec<Row> = Vec::with_capacity(limit);
+
+        for partition_value in partition_values {
+            if result_rows.len() >= limit {
+                break; // Early exit: we have enough rows
+            }
+
+            // Fetch rows for this partition only (KEY OPTIMIZATION!)
+            let partition_rows =
+                match table.get_rows_for_partition_value(partition_col, &partition_value) {
+                    Some(rows) => rows,
+                    None => continue,
+                };
+
+            if partition_rows.is_empty() {
+                continue;
+            }
+
+            // Precompute ORDER BY values for this partition
+            let precomputed_order_by = if !wf_info.order_by.is_empty() {
+                Some(self.precompute_order_by_values(
+                    &wf_info.order_by,
+                    &partition_rows,
+                    base_columns,
+                    &col_index_map,
+                    ctx,
+                ))
+            } else {
+                None
+            };
+
+            // Compute window function for this partition
+            let row_indices: Vec<usize> = (0..partition_rows.len()).collect();
+            let (partition_results, sorted_indices) = self.compute_window_for_partition(
+                &*window_func,
+                wf_info,
+                &partition_rows,
+                row_indices,
+                precomputed_order_by.as_ref(),
+                base_columns,
+                &col_index_map,
+                ctx,
+                false,
+            )?;
+
+            // Build result rows in sorted order (within this partition)
+            for (sorted_pos, &row_idx) in sorted_indices.iter().enumerate() {
+                if result_rows.len() >= limit {
+                    break; // Early exit within partition
+                }
+
+                let base_row = &partition_rows[row_idx];
+                let window_value = &partition_results[sorted_pos];
+
+                // Build output row
+                let mut values: Vec<Value> = Vec::with_capacity(select_items.len());
+                for item in &select_items {
+                    match &item.source {
+                        SelectItemSource::BaseColumn(col_idx) => {
+                            values.push(
+                                base_row
+                                    .get(*col_idx)
+                                    .cloned()
+                                    .unwrap_or_else(Value::null_unknown),
+                            );
+                        }
+                        SelectItemSource::WindowFunction(_) => {
+                            values.push(window_value.clone());
+                        }
+                        SelectItemSource::Expression(expr) => {
+                            if let Ok(mut eval) = ExpressionEval::compile(expr, base_columns) {
+                                let val = eval
+                                    .eval(base_row)
+                                    .unwrap_or_else(|_| Value::null_unknown());
+                                values.push(val);
+                            } else {
+                                values.push(Value::null_unknown());
+                            }
+                        }
+                        SelectItemSource::ExpressionWithWindow(expr, _wf_name) => {
+                            let transformed =
+                                Self::replace_window_with_identifier(expr, &item.output_name);
+                            let mut ext_columns = base_columns.to_vec();
+                            ext_columns.push(item.output_name.clone());
+                            let mut ext_values: Vec<Value> = base_row.iter().cloned().collect();
+                            ext_values.push(window_value.clone());
+                            let ext_row = Row::from_values(ext_values);
+                            if let Ok(mut eval) =
+                                ExpressionEval::compile(&transformed, &ext_columns)
+                            {
+                                let val = eval
+                                    .eval(&ext_row)
+                                    .unwrap_or_else(|_| Value::null_unknown());
+                                values.push(val);
+                            } else {
+                                values.push(Value::null_unknown());
+                            }
+                        }
+                    }
+                }
+                result_rows.push(Row::from_values(values));
+            }
         }
 
         Ok(Box::new(ExecutorMemoryResult::new(
@@ -766,6 +1210,9 @@ impl Executor {
     }
 
     /// Compute window function values for all rows
+    /// pre_sorted: Optional info about whether rows are already sorted by an indexed column
+    /// pre_grouped: Optional pre-grouped partitions from index (avoids hash-based grouping)
+    #[allow(clippy::too_many_arguments)]
     fn compute_window_function(
         &self,
         wf_info: &WindowFunctionInfo,
@@ -773,6 +1220,8 @@ impl Executor {
         columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
         ctx: &ExecutionContext,
+        pre_sorted: Option<&WindowPreSortedState>,
+        pre_grouped: Option<&WindowPreGroupedState>,
     ) -> Result<Vec<Value>> {
         // Check if this is an aggregate function used as window function
         let is_aggregate = self.function_registry.is_aggregate(&wf_info.name);
@@ -785,6 +1234,7 @@ impl Executor {
                 columns,
                 col_index_map,
                 ctx,
+                pre_sorted,
             );
         }
 
@@ -798,7 +1248,11 @@ impl Executor {
 
         // If there's no partitioning, treat all rows as one partition
         if wf_info.partition_by.is_empty() {
-            // Precompute ORDER BY values once
+            // OPTIMIZATION: Check if rows are already sorted by the window ORDER BY column
+            // This allows us to skip sorting when we've pre-sorted using an index
+            let rows_already_sorted = self.check_rows_presorted(wf_info, pre_sorted);
+
+            // Precompute ORDER BY values once (needed for tie detection even if pre-sorted)
             let precomputed_order_by = if !wf_info.order_by.is_empty() {
                 Some(self.precompute_order_by_values(
                     &wf_info.order_by,
@@ -821,6 +1275,7 @@ impl Executor {
                 columns,
                 col_index_map,
                 ctx,
+                rows_already_sorted, // Skip sorting if rows are pre-sorted by index
             )?;
 
             // Map results back to original row order
@@ -854,41 +1309,49 @@ impl Executor {
         };
 
         // Group rows by partition key
+        // OPTIMIZATION: Use pre-grouped partitions from index if available (avoids O(n) hashing)
         // OPTIMIZATION: Use SmallVec for partition keys to avoid heap allocation
         // for common cases (up to 4 partition columns)
         // OPTIMIZATION: Use FxHashMap for fastest hash table operations with trusted keys
-        let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
+        let partitions: FxHashMap<PartitionKey, Vec<usize>> = if let Some(pg) = pre_grouped {
+            // Use pre-grouped partitions from index - no hashing needed!
+            pg.partition_map.clone()
+        } else {
+            // Build partition map by hashing (default path)
+            let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
 
-        // OPTIMIZATION: Pre-compute partition column indices to avoid to_lowercase() per row
-        // Try both qualified (e.g., "l.grp") and unqualified (e.g., "grp") names
-        let partition_indices: SmallVec<[Option<usize>; 4]> = wf_info
-            .partition_by
-            .iter()
-            .map(|part_col| {
-                let lower = part_col.to_lowercase();
-                col_index_map.get(&lower).copied().or_else(|| {
-                    // If qualified name not found, try unqualified (last part after dot)
-                    if let Some(dot_pos) = lower.rfind('.') {
-                        col_index_map.get(&lower[dot_pos + 1..]).copied()
-                    } else {
-                        None
-                    }
+            // OPTIMIZATION: Pre-compute partition column indices to avoid to_lowercase() per row
+            // Try both qualified (e.g., "l.grp") and unqualified (e.g., "grp") names
+            let partition_indices: SmallVec<[Option<usize>; 4]> = wf_info
+                .partition_by
+                .iter()
+                .map(|part_col| {
+                    let lower = part_col.to_lowercase();
+                    col_index_map.get(&lower).copied().or_else(|| {
+                        // If qualified name not found, try unqualified (last part after dot)
+                        if let Some(dot_pos) = lower.rfind('.') {
+                            col_index_map.get(&lower[dot_pos + 1..]).copied()
+                        } else {
+                            None
+                        }
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        for (i, row) in rows.iter().enumerate() {
-            let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
-            for idx_opt in &partition_indices {
-                let value = if let Some(&idx) = idx_opt.as_ref() {
-                    row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
-                } else {
-                    Value::null_unknown()
-                };
-                key.push(value);
+            for (i, row) in rows.iter().enumerate() {
+                let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
+                for idx_opt in &partition_indices {
+                    let value = if let Some(&idx) = idx_opt.as_ref() {
+                        row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
+                    } else {
+                        Value::null_unknown()
+                    };
+                    key.push(value);
+                }
+                partitions.entry(key).or_default().push(i);
             }
-            partitions.entry(key).or_default().push(i);
-        }
+            partitions
+        };
 
         // Compute window function for each partition
         // Use parallel execution for large number of partitions
@@ -913,6 +1376,7 @@ impl Executor {
                         columns,
                         col_index_map,
                         ctx,
+                        false, // Partitioned case: sorting is needed per-partition
                     )?;
 
                     // Map results from sorted order back to original row indices
@@ -938,6 +1402,7 @@ impl Executor {
                     columns,
                     col_index_map,
                     ctx,
+                    false, // Partitioned case: sorting is needed per-partition
                 )?;
 
                 // Map results from sorted order back to original row indices
@@ -953,6 +1418,7 @@ impl Executor {
     /// Compute window function for a single partition
     /// Returns (results in sorted order, sorted row indices) to avoid re-sorting in the caller
     /// precomputed_order_by: Optional precomputed ORDER BY values for ALL rows (avoids recomputation)
+    /// skip_sorting: If true, skip sorting (rows are already pre-sorted by index)
     #[allow(clippy::too_many_arguments)]
     fn compute_window_for_partition(
         &self,
@@ -964,6 +1430,7 @@ impl Executor {
         columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
         ctx: &ExecutionContext,
+        skip_sorting: bool,
     ) -> Result<(Vec<Value>, Vec<usize>)> {
         // Suppress unused variable warnings - these are needed for compute_lead_lag, compute_ntile, etc.
         let _ = columns;
@@ -973,8 +1440,8 @@ impl Executor {
         let order_by_values: &[Vec<(Value, bool)>] =
             precomputed_order_by.map(|v| v.as_slice()).unwrap_or(&[]);
 
-        // Sort partition by ORDER BY if specified
-        if !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+        // Sort partition by ORDER BY if specified (skip if already pre-sorted by index)
+        if !skip_sorting && !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
             Self::sort_by_order_values(&mut row_indices, order_by_values);
         }
 
@@ -1591,6 +2058,36 @@ impl Executor {
         }
     }
 
+    /// Check if rows are already pre-sorted by the window ORDER BY column
+    /// Returns true if we can skip sorting
+    fn check_rows_presorted(
+        &self,
+        wf_info: &WindowFunctionInfo,
+        pre_sorted: Option<&WindowPreSortedState>,
+    ) -> bool {
+        let pre_sorted = match pre_sorted {
+            Some(ps) => ps,
+            None => return false,
+        };
+
+        // Only optimize if there's exactly one ORDER BY column (simple case)
+        if wf_info.order_by.len() != 1 {
+            return false;
+        }
+
+        let order_by = &wf_info.order_by[0];
+
+        // Extract column name from ORDER BY expression
+        let order_col = match &order_by.expression {
+            Expression::Identifier(id) => id.value_lower.clone(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value_lower.clone(),
+            _ => return false, // Complex expressions can't be pre-sorted
+        };
+
+        // Check if pre-sorted column matches and direction matches
+        order_col == pre_sorted.column && order_by.ascending == pre_sorted.ascending
+    }
+
     /// Sort row indices using precomputed ORDER BY values
     fn sort_by_order_values(row_indices: &mut [usize], order_by_values: &[Vec<(Value, bool)>]) {
         row_indices.sort_by(|&a, &b| {
@@ -1618,6 +2115,7 @@ impl Executor {
         columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
         ctx: &ExecutionContext,
+        pre_sorted: Option<&WindowPreSortedState>,
     ) -> Result<Vec<Value>> {
         // Check if this is COUNT(*) - Star expression means count all rows
         let is_count_star =
@@ -1692,13 +2190,21 @@ impl Executor {
             partitions.entry(key).or_default().push(i);
         }
 
+        // Check if we can skip sorting (index optimization)
+        // Only applies when there's no PARTITION BY (single partition)
+        let skip_sorting =
+            wf_info.partition_by.is_empty() && self.check_rows_presorted(wf_info, pre_sorted);
+
         // Compute aggregate for each partition
         let mut results = vec![Value::null_unknown(); rows.len()];
 
         for (_key, mut row_indices) in partitions {
-            // Sort partition by ORDER BY if specified
+            // Sort partition by ORDER BY if specified (skip if pre-sorted)
             if !wf_info.order_by.is_empty() {
-                Self::sort_by_order_values(&mut row_indices, &order_by_values);
+                // Only sort if not already pre-sorted by index
+                if !skip_sorting {
+                    Self::sort_by_order_values(&mut row_indices, &order_by_values);
+                }
 
                 // With ORDER BY, compute aggregate with frame specification
                 // Default frame is UNBOUNDED PRECEDING to CURRENT ROW if no explicit frame

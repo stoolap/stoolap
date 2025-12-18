@@ -105,6 +105,43 @@ fn main() {
         1_000_000.0 / avg_us
     );
 
+    // SELECT by index (exact match on age)
+    let select_by_index = db.prepare("SELECT * FROM users WHERE age = $1").unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for i in 0..ITERATIONS {
+        let age = ((i % 62) + 18) as i64; // Ages 18-79
+        let start = Instant::now();
+        let rows = select_by_index.query((age,)).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "SELECT by index (exact)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // SELECT by index (range query on age)
+    let select_by_index_range = db
+        .prepare("SELECT * FROM users WHERE age >= $1 AND age <= $2")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = select_by_index_range.query((30_i64, 40_i64)).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "SELECT by index (range)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
     // SELECT complex (prepared statement)
     let select_complex = db
         .prepare("SELECT id, name, balance FROM users WHERE age >= 25 AND age <= 45 AND active = true ORDER BY balance DESC LIMIT 100")
@@ -422,7 +459,7 @@ fn main() {
         1_000_000.0 / avg_us
     );
 
-    // Window function - ROW_NUMBER
+    // Window function - ROW_NUMBER (non-indexed column)
     let window_stmt = db
         .prepare("SELECT name, balance, ROW_NUMBER() OVER (ORDER BY balance DESC) as rank FROM users LIMIT 100")
         .unwrap();
@@ -437,6 +474,25 @@ fn main() {
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
         "Window ROW_NUMBER",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Window function - ROW_NUMBER with PK (index optimization)
+    let window_pk_stmt = db
+        .prepare("SELECT name, ROW_NUMBER() OVER (ORDER BY id) as rank FROM users LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = window_pk_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Window ROW_NUMBER (PK)",
         avg_us,
         1_000_000.0 / avg_us
     );
@@ -517,16 +573,18 @@ fn main() {
         1_000_000.0 / avg_us
     );
 
-    // Batch INSERT (100 rows)
+    // Batch INSERT in transaction (100 individual INSERTs wrapped in BEGIN/COMMIT)
     let mut total = std::time::Duration::ZERO;
     for iter in 0..ITERATIONS {
         let base_id = (ROW_COUNT * 10 + iter * 100) as i64;
         let start = Instant::now();
+        db.execute("BEGIN", ()).unwrap();
         for i in 0..100 {
             insert_order
                 .execute((base_id + i as i64, 1_i64, 100.0, "pending", "2024-02-01"))
                 .unwrap();
         }
+        db.execute("COMMIT", ()).unwrap();
         total += start.elapsed();
     }
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;

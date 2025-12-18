@@ -39,8 +39,13 @@ use crate::storage::traits::{Engine, QueryResult};
 /// Maximum depth for nested views to prevent stack overflow
 const MAX_VIEW_DEPTH: usize = 32;
 
-use super::context::{clear_scalar_subquery_cache, ExecutionContext, TimeoutGuard};
-use super::expression::{CompiledEvaluator, ExpressionEval, RowFilter};
+use super::context::{
+    cache_in_subquery, clear_exists_fetcher_cache, clear_exists_index_cache,
+    clear_exists_pred_key_cache, clear_exists_predicate_cache, clear_exists_schema_cache,
+    clear_in_subquery_cache, clear_scalar_subquery_cache, clear_semi_join_cache,
+    get_cached_in_subquery, ExecutionContext, TimeoutGuard,
+};
+use super::expression::{CompiledEvaluator, ExpressionEval, JoinFilter, RowFilter};
 use super::join::{self, build_column_index_map};
 use super::parallel::{self, ParallelConfig};
 use super::pushdown;
@@ -50,10 +55,11 @@ use super::result::{
     StreamingProjectionResult, TopNResult,
 };
 use super::utils::{
-    collect_table_qualifiers, combine_predicates_with_and, dummy_token,
+    add_table_qualifier, collect_table_qualifiers, combine_predicates_with_and, dummy_token,
     expression_contains_aggregate, expression_has_parameters, extract_base_column_name,
     flatten_and_predicates, get_table_alias_from_expr, strip_table_qualifier,
 };
+use super::window::{WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
 use crate::optimizer::aqe::{decide_join_algorithm, AqeJoinDecision, JoinAqeContext};
 use crate::optimizer::{BuildSide, JoinAlgorithm};
@@ -155,8 +161,15 @@ impl Executor {
         // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
         // This ensures the timeout applies to the entire query, not each nested call.
         let _timeout_guard = if ctx.query_depth == 0 {
-            // Clear scalar subquery cache at top-level to avoid stale results between queries
+            // Clear subquery caches at top-level to avoid stale results between queries
             clear_scalar_subquery_cache();
+            clear_in_subquery_cache();
+            clear_semi_join_cache();
+            clear_exists_predicate_cache();
+            clear_exists_index_cache();
+            clear_exists_fetcher_cache();
+            clear_exists_schema_cache();
+            clear_exists_pred_key_cache();
             TimeoutGuard::new(ctx)
         } else {
             None
@@ -298,7 +311,8 @@ impl Executor {
 
         // Apply ORDER BY (with TOP-N optimization if LIMIT is present)
         // Note: LIMIT/OFFSET was already evaluated earlier for set operations optimization
-        if !stmt.order_by.is_empty() {
+        // Skip ORDER BY if storage-level optimization already applied sorting + LIMIT/OFFSET
+        if !stmt.order_by.is_empty() && !limit_offset_applied {
             // Helper to format aggregate function call as column name
             let format_agg_column = |func: &crate::parser::ast::FunctionCall| -> String {
                 if func.arguments.is_empty() {
@@ -1231,6 +1245,42 @@ impl Executor {
             }
         }
 
+        // FAST PATH: IN subquery index optimization
+        // For queries like `SELECT * FROM table WHERE id IN (SELECT col FROM other_table WHERE ...)`
+        // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows
+        if needs_memory_filter && !has_outer_context && stmt.group_by.columns.is_empty() {
+            if let Some(where_expr) = where_to_use {
+                if let Some((result, columns)) = self.try_in_subquery_index_optimization(
+                    stmt,
+                    where_expr,
+                    &*table,
+                    &all_columns,
+                    table_alias.as_deref(),
+                    ctx,
+                )? {
+                    return Ok((result, columns, false));
+                }
+            }
+        }
+
+        // FAST PATH: IN list literal index optimization
+        // For queries like `SELECT * FROM table WHERE id IN (1, 2, 3, 5, 8)`
+        // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows
+        if needs_memory_filter && !has_outer_context && stmt.group_by.columns.is_empty() {
+            if let Some(where_expr) = where_to_use {
+                if let Some((result, columns)) = self.try_in_list_index_optimization(
+                    stmt,
+                    where_expr,
+                    &*table,
+                    &all_columns,
+                    table_alias.as_deref(),
+                    ctx,
+                )? {
+                    return Ok((result, columns, false));
+                }
+            }
+        }
+
         // FAST PATH: LIMIT pushdown optimization
         // For simple queries like `SELECT * FROM table LIMIT 10` or
         // `SELECT * FROM table WHERE indexed_col = value LIMIT 10` without ORDER BY,
@@ -1295,7 +1345,10 @@ impl Executor {
             };
 
             // Pass storage_expr to filter while scanning with limit
-            let rows = table.collect_rows_with_limit(storage_expr.as_deref(), limit, offset)?;
+            // Use unordered version since ORDER BY is already confirmed empty by can_pushdown_limit
+            // This enables true early termination without sorting overhead
+            let rows =
+                table.collect_rows_with_limit_unordered(storage_expr.as_deref(), limit, offset)?;
 
             // Project rows according to SELECT expressions
             // Note: collect_rows_with_limit always returns full rows (all columns),
@@ -1401,7 +1454,7 @@ impl Executor {
         // PARALLEL EXECUTION: Use parallel filtering for large datasets
         let parallel_config = ParallelConfig::default();
 
-        let rows = if needs_memory_filter {
+        let rows_result = if needs_memory_filter {
             // Path 1: Need in-memory filtering (subqueries or complex expressions)
             // For memory filter, we need all columns to evaluate the WHERE clause
             let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
@@ -1427,10 +1480,23 @@ impl Executor {
                     // Get outer table names for semi-join detection
                     let outer_tables = Self::collect_outer_table_names(&stmt.table_expr);
 
+                    // Extract limit value for optimization decision
+                    // With small LIMIT, index-nested-loop with early termination is faster
+                    let outer_limit = stmt.limit.as_ref().and_then(|limit_expr| {
+                        if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
+                            Some(lit.value)
+                        } else {
+                            None
+                        }
+                    });
+
                     // Try semi-join optimization
-                    if let Ok(Some(optimized)) =
-                        self.try_optimize_exists_to_semi_join(where_expr, ctx, &outer_tables)
-                    {
+                    if let Ok(Some(optimized)) = self.try_optimize_exists_to_semi_join(
+                        where_expr,
+                        ctx,
+                        &outer_tables,
+                        outer_limit,
+                    ) {
                         // Successfully transformed EXISTS to IN - no longer correlated!
                         // The optimized expression uses a hash set lookup instead of per-row subquery
                         (Some(optimized), false)
@@ -1451,6 +1517,29 @@ impl Executor {
             } else {
                 (None, false)
             };
+
+            // FAST PATH: InHashSet index optimization (from EXISTS → semi-join transformation)
+            // If EXISTS was transformed to InHashSet and the column is PK/indexed,
+            // probe directly instead of scanning all rows
+            // Skip if there are correlated subqueries in SELECT columns
+            if !has_correlated && stmt.group_by.columns.is_empty() {
+                let has_correlated_select =
+                    stmt.columns.iter().any(Self::has_correlated_subqueries);
+                if !has_correlated_select {
+                    if let Some(ref where_expr) = processed_where {
+                        if let Some((result, columns)) = self.try_in_hashset_index_optimization(
+                            stmt,
+                            where_expr,
+                            &*table,
+                            &all_columns,
+                            table_alias.as_deref(),
+                            ctx,
+                        )? {
+                            return Ok((result, columns, false));
+                        }
+                    }
+                }
+            }
 
             // Check if we can use the PARALLEL PATH:
             // For simple WHERE without subqueries, collect all rows first
@@ -1473,22 +1562,30 @@ impl Executor {
                 // Apply parallel filtering if we have enough rows
                 // CRITICAL: Propagate errors with ? instead of silently swallowing them
                 if parallel_config.should_parallel_filter(all_rows.len()) {
-                    parallel::parallel_filter(
-                        all_rows,
-                        where_expr,
-                        &all_columns,
-                        &self.function_registry,
-                        &parallel_config,
-                    )?
+                    (
+                        parallel::parallel_filter(
+                            all_rows,
+                            where_expr,
+                            &all_columns,
+                            &self.function_registry,
+                            &parallel_config,
+                        )?,
+                        None,
+                        None,
+                    )
                 } else {
                     // Sequential filter for small datasets using pre-compiled expression
                     let mut eval =
                         ExpressionEval::compile(where_expr, &all_columns)?.with_context(ctx);
 
-                    all_rows
-                        .into_iter()
-                        .filter(|row| eval.eval_bool(row))
-                        .collect()
+                    (
+                        all_rows
+                            .into_iter()
+                            .filter(|row| eval.eval_bool(row))
+                            .collect(),
+                        None,
+                        None,
+                    )
                 }
             } else {
                 // SEQUENTIAL PATH: For correlated subqueries or complex cases
@@ -1524,6 +1621,44 @@ impl Executor {
                 } else {
                     None
                 };
+
+                // LIMIT EARLY TERMINATION: For correlated subqueries without ORDER BY,
+                // we can stop as soon as we have enough matching rows.
+                // This turns O(outer_size) EXISTS evaluations into O(LIMIT) evaluations.
+                let early_termination_target: Option<usize> =
+                    if has_correlated && stmt.order_by.is_empty() {
+                        let offset = stmt
+                            .offset
+                            .as_ref()
+                            .and_then(|offset_expr| {
+                                ExpressionEval::compile(offset_expr, &[])
+                                    .ok()
+                                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                                    .and_then(|v| {
+                                        if let Value::Integer(o) = v {
+                                            Some(o.max(0) as usize)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                            })
+                            .unwrap_or(0);
+
+                        stmt.limit.as_ref().and_then(|limit_expr| {
+                            ExpressionEval::compile(limit_expr, &[])
+                                .ok()
+                                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                                .and_then(|v| {
+                                    if let Value::Integer(l) = v {
+                                        Some(offset + l.max(0) as usize)
+                                    } else {
+                                        None
+                                    }
+                                })
+                        })
+                    } else {
+                        None
+                    };
 
                 let mut rows = Vec::new();
                 let mut row_count = 0u64;
@@ -1582,24 +1717,72 @@ impl Executor {
                                 all_columns_arc.clone().unwrap(), // Arc clone = cheap
                             );
 
-                            // Process the correlated subquery with outer row context
-                            let processed =
-                                self.process_correlated_where(where_expr, &correlated_ctx)?;
+                            // FAST PATH: If WHERE is just EXISTS or NOT EXISTS, evaluate directly
+                            // without creating AST nodes. This saves ~2-3μs per row.
+                            let (result, used_evaluator) = if let Expression::Exists(exists) =
+                                where_expr
+                            {
+                                let r = self
+                                    .execute_exists_subquery(&exists.subquery, &correlated_ctx)?;
+                                (r, false)
+                            } else if let Expression::Prefix(prefix) = where_expr {
+                                if prefix.operator.eq_ignore_ascii_case("NOT") {
+                                    if let Expression::Exists(exists) = prefix.right.as_ref() {
+                                        let r = !self.execute_exists_subquery(
+                                            &exists.subquery,
+                                            &correlated_ctx,
+                                        )?;
+                                        (r, false)
+                                    } else {
+                                        // Not a simple NOT EXISTS, use standard path
+                                        let processed = self.process_correlated_where(
+                                            where_expr,
+                                            &correlated_ctx,
+                                        )?;
+                                        ctx.check_cancelled()?;
+                                        evaluator.set_outer_row_owned(
+                                            correlated_ctx.outer_row.take().unwrap_or_default(),
+                                        );
+                                        evaluator.set_row_array(&row);
+                                        let r = evaluator.evaluate_bool(&processed)?;
+                                        (r, true)
+                                    }
+                                } else {
+                                    // Not EXISTS/NOT EXISTS, use standard path
+                                    let processed =
+                                        self.process_correlated_where(where_expr, &correlated_ctx)?;
+                                    ctx.check_cancelled()?;
+                                    evaluator.set_outer_row_owned(
+                                        correlated_ctx.outer_row.take().unwrap_or_default(),
+                                    );
+                                    evaluator.set_row_array(&row);
+                                    let r = evaluator.evaluate_bool(&processed)?;
+                                    (r, true)
+                                }
+                            } else {
+                                // Complex WHERE expression, use standard path
+                                let processed =
+                                    self.process_correlated_where(where_expr, &correlated_ctx)?;
 
-                            // Check for cancellation after processing each correlated subquery
-                            // This is critical for slow correlated subqueries
-                            ctx.check_cancelled()?;
+                                // Check for cancellation after processing each correlated subquery
+                                // This is critical for slow correlated subqueries
+                                ctx.check_cancelled()?;
 
-                            // OPTIMIZATION: Take ownership instead of cloning - avoids HashMap clone
-                            evaluator.set_outer_row_owned(
-                                correlated_ctx.outer_row.take().unwrap_or_default(),
-                            );
-                            evaluator.set_row_array(&row);
+                                // OPTIMIZATION: Take ownership instead of cloning - avoids HashMap clone
+                                evaluator.set_outer_row_owned(
+                                    correlated_ctx.outer_row.take().unwrap_or_default(),
+                                );
+                                evaluator.set_row_array(&row);
 
-                            let result = evaluator.evaluate_bool(&processed)?;
+                                (evaluator.evaluate_bool(&processed)?, true)
+                            };
 
-                            // Take back the map from evaluator for reuse (zero-copy transfer)
-                            outer_row_map = evaluator.take_outer_row();
+                            // Take back the map for reuse
+                            if used_evaluator {
+                                outer_row_map = evaluator.take_outer_row();
+                            } else {
+                                outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
+                            }
 
                             if !result {
                                 continue;
@@ -1613,8 +1796,15 @@ impl Executor {
                     }
 
                     rows.push(row);
+
+                    // LIMIT EARLY TERMINATION: Stop if we have enough rows
+                    if let Some(target) = early_termination_target {
+                        if rows.len() >= target {
+                            break;
+                        }
+                    }
                 }
-                rows
+                (rows, None, None)
             }
         } else if storage_expr.is_some() {
             // Path 2: WHERE clause with pushdown - use scanner for index optimization
@@ -1634,13 +1824,140 @@ impl Executor {
                 }
                 rows.push(scanner.take_row());
             }
-            rows
+            (rows, None, None)
         } else {
             // Path 3: Full scan without WHERE - use collect_all_rows
             // Note: collect_projected_rows was SLOWER due to extra allocations per row
             // Projection is handled later by the executor which is more efficient
-            table.collect_all_rows(None)?
+            //
+            // OPTIMIZATION: For window functions, check if we can use index-based fetching:
+            // 1. PARTITION BY on indexed column -> fetch rows grouped by partition
+            // 2. ORDER BY on indexed column -> fetch rows in sorted order
+            let has_window = self.has_window_functions(stmt);
+            let has_agg = self.has_aggregation(stmt);
+
+            if has_window && !has_agg {
+                // First try PARTITION BY optimization (bigger speedup, avoids O(n) hashing)
+                if let Some(partition_col) = Self::extract_window_partition_info(stmt) {
+                    let col_lower = partition_col.to_lowercase();
+                    let schema = table.schema();
+                    let pk_columns = schema.primary_key_columns();
+                    let is_pk =
+                        pk_columns.len() == 1 && pk_columns[0].name.to_lowercase() == col_lower;
+                    let has_index = is_pk || table.get_index_on_column(&partition_col).is_some();
+
+                    if has_index {
+                        // OPTIMIZATION: If we have LIMIT without ORDER BY, use lazy partition fetching
+                        // This avoids fetching all partitions when only a few are needed
+                        // NOTE: Cannot use this optimization if there's a top-level ORDER BY
+                        // because we need all rows to sort before applying LIMIT
+                        let has_order_by = !stmt.order_by.is_empty();
+                        if !has_order_by {
+                            if let Some(limit_expr) = &stmt.limit {
+                                if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
+                                    if lit.value > 0 {
+                                        let limit_val = lit.value as usize;
+                                        // Use lazy partition fetching - returns early!
+                                        let result = self
+                                            .execute_select_with_window_functions_lazy_partition(
+                                                stmt,
+                                                ctx,
+                                                table.as_ref(),
+                                                &all_columns,
+                                                &partition_col,
+                                                limit_val,
+                                            );
+                                        if let Ok(query_result) = result {
+                                            let columns = query_result.columns().to_vec();
+                                            return Ok((query_result, columns, false));
+                                        }
+                                        // Fall through to regular path if optimization fails
+                                    }
+                                }
+                            }
+                        }
+
+                        // Regular path: Fetch rows grouped by partition (no hash grouping needed)
+                        if let Some(grouped_data) =
+                            table.collect_rows_grouped_by_partition(&partition_col)
+                        {
+                            // Flatten rows and build partition map
+                            let mut all_rows: Vec<Row> = Vec::new();
+                            let mut partition_map: rustc_hash::FxHashMap<
+                                smallvec::SmallVec<[Value; 4]>,
+                                Vec<usize>,
+                            > = rustc_hash::FxHashMap::default();
+
+                            for (partition_value, partition_rows) in grouped_data {
+                                let start_idx = all_rows.len();
+                                let partition_size = partition_rows.len();
+                                all_rows.extend(partition_rows);
+
+                                // Build partition key and indices
+                                let key: smallvec::SmallVec<[Value; 4]> =
+                                    smallvec::smallvec![partition_value];
+                                let indices: Vec<usize> =
+                                    (start_idx..start_idx + partition_size).collect();
+                                partition_map.insert(key, indices);
+                            }
+
+                            (
+                                all_rows,
+                                None,
+                                Some(WindowPreGroupedState {
+                                    column: col_lower,
+                                    partition_map,
+                                }),
+                            )
+                        } else {
+                            (table.collect_all_rows(None)?, None, None)
+                        }
+                    } else {
+                        (table.collect_all_rows(None)?, None, None)
+                    }
+                }
+                // Then try ORDER BY optimization (avoids sorting)
+                else if let Some((col_name, ascending)) = Self::extract_window_order_info(stmt) {
+                    let col_lower = col_name.to_lowercase();
+                    let schema = table.schema();
+                    let pk_columns = schema.primary_key_columns();
+                    let is_pk =
+                        pk_columns.len() == 1 && pk_columns[0].name.to_lowercase() == col_lower;
+                    let has_index = is_pk || table.get_index_on_column(&col_name).is_some();
+
+                    if has_index {
+                        // Fetch rows in sorted order from the index (no re-fetch needed)
+                        if let Some(sorted_rows) =
+                            table.collect_rows_ordered_by_index(&col_name, ascending, usize::MAX, 0)
+                        {
+                            (
+                                sorted_rows,
+                                Some(WindowPreSortedState {
+                                    column: col_lower,
+                                    ascending,
+                                }),
+                                None,
+                            )
+                        } else {
+                            (table.collect_all_rows(None)?, None, None)
+                        }
+                    } else {
+                        (table.collect_all_rows(None)?, None, None)
+                    }
+                } else {
+                    (table.collect_all_rows(None)?, None, None)
+                }
+            } else {
+                (table.collect_all_rows(None)?, None, None)
+            }
         };
+
+        // Destructure: rows and optional window optimization states
+        let (rows, window_presorted_state, window_pregrouped_state): (
+            Vec<Row>,
+            Option<WindowPreSortedState>,
+            Option<WindowPreGroupedState>,
+        ) = rows_result;
 
         // Record cardinality feedback for future estimate improvements
         // This helps the optimizer learn from actual query execution
@@ -1685,8 +2002,29 @@ impl Executor {
 
         // Check if we need window functions only (no aggregation)
         if has_window {
-            let result =
-                self.execute_select_with_window_functions(stmt, ctx, rows, &all_columns)?;
+            // Use optimized paths if rows were pre-fetched with index optimization
+            let result = if let Some(pregrouped) = window_pregrouped_state {
+                // PARTITION BY optimization: rows are already grouped by partition
+                self.execute_select_with_window_functions_pregrouped(
+                    stmt,
+                    ctx,
+                    rows,
+                    &all_columns,
+                    pregrouped,
+                )?
+            } else if window_presorted_state.is_some() {
+                // ORDER BY optimization: rows are already sorted
+                self.execute_select_with_window_functions_presorted(
+                    stmt,
+                    ctx,
+                    rows,
+                    &all_columns,
+                    window_presorted_state,
+                )?
+            } else {
+                // Default path: no optimization
+                self.execute_select_with_window_functions(stmt, ctx, rows, &all_columns)?
+            };
             let columns = result.columns().to_vec();
             return Ok((result, columns, false));
         }
@@ -1899,6 +2237,351 @@ impl Executor {
 
                 (left_rows, left_cols, right_rows, right_cols)
             } else {
+                // Skip Index Nested Loop if query has aggregation or window functions
+                // These require full result sets and can't use early termination
+                let has_agg = self.has_aggregation(stmt);
+                let has_window = self.has_window_functions(stmt);
+
+                // Check if we can use Index Nested Loop Join
+                // This optimization avoids materializing the right side entirely
+                // NOTE: Don't use Index NL for aggregation/window queries - they need full results
+                // and the current implementation falls through to standard path, causing double execution
+                let index_nl_info = if has_agg || has_window {
+                    None
+                } else {
+                    self.check_index_nested_loop_opportunity(
+                        &join_source.right,
+                        join_source.condition.as_ref().map(|c| c.as_ref()),
+                        &join_type,
+                        left_alias.as_deref(),
+                        right_alias.as_deref(),
+                    )
+                };
+
+                // Join reordering optimization for INNER JOINs:
+                // When one side has a filter, prefer putting filtered side as outer (left)
+                // This reduces the number of probes into the inner table.
+                // Swap if: right has filter, left doesn't, and swapped order gives Index NL on PK
+                let (index_nl_info, nl_left_filter, nl_right_filter, swapped) = if !has_agg
+                        && !has_window
+                        && join_type == "INNER"
+                        && right_filter.is_some()  // Right side has a filter
+                        && left_filter.is_none()
+                // Left side doesn't have a filter
+                {
+                    // Check if swapping gives Index NL opportunity with PK lookup
+                    // (which is more efficient than secondary index lookup)
+                    let swapped_info = self.check_index_nested_loop_opportunity(
+                        &join_source.left, // Left becomes inner (right)
+                        join_source.condition.as_ref().map(|c| c.as_ref()),
+                        &join_type,
+                        right_alias.as_deref(), // Swap aliases
+                        left_alias.as_deref(),
+                    );
+
+                    // Prefer swapped if it gives PK lookup (most efficient)
+                    let prefer_swap = matches!(
+                        &swapped_info,
+                        Some((_, join::IndexLookupStrategy::PrimaryKey, _, _))
+                    );
+
+                    if prefer_swap {
+                        // Swap: right filter becomes outer filter
+                        (
+                            swapped_info,
+                            right_filter.clone(),
+                            left_filter.clone(),
+                            true,
+                        )
+                    } else {
+                        (
+                            index_nl_info,
+                            left_filter.clone(),
+                            right_filter.clone(),
+                            false,
+                        )
+                    }
+                } else {
+                    (
+                        index_nl_info,
+                        left_filter.clone(),
+                        right_filter.clone(),
+                        false,
+                    )
+                };
+
+                if let Some((table_name, lookup_strategy, _inner_col, outer_col)) = index_nl_info {
+                    // Index Nested Loop path: only materialize outer (left) side
+                    // When swapped, execute right side as outer (with original right filter, now in nl_left_filter)
+                    let outer_expr = if swapped {
+                        &join_source.right
+                    } else {
+                        &join_source.left
+                    };
+                    let (outer_result, outer_cols) = self.execute_table_expression_with_filter(
+                        outer_expr,
+                        ctx,
+                        nl_left_filter.as_ref(),
+                    )?;
+                    let outer_rows = Self::materialize_result(outer_result)?;
+
+                    // Find the outer key index in outer columns
+                    let outer_col_lower = outer_col.to_lowercase();
+                    let outer_key_idx = outer_cols
+                        .iter()
+                        .position(|c| c.to_lowercase() == outer_col_lower)
+                        .or_else(|| {
+                            // Try unqualified match
+                            let outer_unqualified = outer_col_lower
+                                .rfind('.')
+                                .map(|p| &outer_col_lower[p + 1..])
+                                .unwrap_or(&outer_col_lower);
+                            outer_cols.iter().position(|c| {
+                                let c_lower = c.to_lowercase();
+                                let c_unqualified = c_lower
+                                    .rfind('.')
+                                    .map(|p| &c_lower[p + 1..])
+                                    .unwrap_or(&c_lower);
+                                c_unqualified == outer_unqualified
+                            })
+                        });
+
+                    if let Some(outer_idx) = outer_key_idx {
+                        // Get inner table for schema and row fetching
+                        let txn = self.engine.begin_transaction()?;
+                        let inner_table = txn.get_table(&table_name)?;
+                        let inner_schema = inner_table.schema();
+
+                        // Build inner columns list (qualified)
+                        // When swapped, inner table alias is the original left alias
+                        let inner_alias = if swapped {
+                            left_alias.as_deref().unwrap_or(&table_name)
+                        } else {
+                            right_alias.as_deref().unwrap_or(&table_name)
+                        };
+                        let inner_cols: Vec<String> = inner_schema
+                            .columns
+                            .iter()
+                            .map(|col| format!("{}.{}", inner_alias, col.name))
+                            .collect();
+
+                        // Compute join limit if applicable
+                        let has_group_by = !stmt.group_by.columns.is_empty();
+                        let has_aggregation = self.has_aggregation(stmt);
+                        let can_push_limit = !join_type.contains("FULL")
+                            && stmt.order_by.is_empty()
+                            && !has_group_by
+                            && !has_aggregation;
+
+                        let join_limit = if can_push_limit {
+                            stmt.limit.as_ref().and_then(|limit_expr| {
+                                ExpressionEval::compile(limit_expr, &[])
+                                    .ok()
+                                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                                    .and_then(|v| match v {
+                                        Value::Integer(n) if n >= 0 => Some(n as u64),
+                                        _ => None,
+                                    })
+                            })
+                        } else {
+                            None
+                        };
+
+                        // Build all columns for combined row
+                        // When swapped, result order is outer(orig_right), inner(orig_left)
+                        // But we need final order to be: orig_left, orig_right
+                        let (all_columns, _orig_left_cols, _orig_right_cols) = if swapped {
+                            // Swapped: outer=orig_right, inner=orig_left
+                            let mut all = inner_cols.clone(); // orig_left first
+                            all.extend(outer_cols.clone()); // orig_right second
+                            (all, inner_cols.clone(), outer_cols.clone())
+                        } else {
+                            // Not swapped: outer=orig_left, inner=orig_right
+                            let mut all = outer_cols.clone(); // orig_left first
+                            all.extend(inner_cols.clone()); // orig_right second
+                            (all, outer_cols.clone(), inner_cols.clone())
+                        };
+
+                        // Create residual filter from nl_right_filter if present
+                        // This allows early termination during Index Nested Loop
+                        let residual_filter = if let Some(ref rf) = nl_right_filter {
+                            // Re-qualify the filter with inner table alias
+                            let qualified_rf = add_table_qualifier(rf, inner_alias);
+                            JoinFilter::new(
+                                &qualified_rf,
+                                &outer_cols,
+                                &inner_cols,
+                                &self.function_registry,
+                            )
+                            .ok()
+                        } else {
+                            None
+                        };
+
+                        // Execute Index Nested Loop Join with residual filter
+                        let result_rows = self.execute_index_nested_loop_join(
+                            &outer_rows,
+                            inner_table.as_ref(),
+                            &lookup_strategy,
+                            outer_idx,
+                            residual_filter.as_ref(),
+                            &join_type,
+                            outer_cols.len(),
+                            inner_cols.len(),
+                            join_limit,
+                        )?;
+
+                        // When swapped, reorder columns from (outer, inner) to (orig_left, orig_right)
+                        let result_rows = if swapped {
+                            // Result is (outer=orig_right, inner=orig_left), need (orig_left, orig_right)
+                            let _orig_left_count = inner_cols.len();
+                            let orig_right_count = outer_cols.len();
+                            result_rows
+                                .into_iter()
+                                .map(|row| {
+                                    let values = row.as_slice();
+                                    // Reorder: [outer(orig_right), inner(orig_left)] -> [orig_left, orig_right]
+                                    let mut new_values = Vec::with_capacity(values.len());
+                                    // First add inner values (which are orig_left)
+                                    new_values.extend(values[orig_right_count..].iter().cloned());
+                                    // Then add outer values (which are orig_right)
+                                    new_values.extend(values[..orig_right_count].iter().cloned());
+                                    Row::from_values(new_values)
+                                })
+                                .collect()
+                        } else {
+                            result_rows
+                        };
+
+                        // No need to apply right_filter again - it was applied during the join
+                        let mut final_rows = result_rows;
+
+                        // Apply cross-table WHERE filters if any
+                        if let Some(ref cross) = cross_filter {
+                            let filter = RowFilter::new(cross, &all_columns)?;
+                            final_rows.retain(|row| filter.matches(row));
+                        }
+
+                        // Apply ORDER BY if present
+                        if !stmt.order_by.is_empty() {
+                            // Build sort specs by evaluating ORDER BY expressions
+                            let mut evaluator = CompiledEvaluator::new(&self.function_registry);
+                            evaluator = evaluator.with_context(ctx);
+                            evaluator.init_columns(&all_columns);
+
+                            // Compute sort keys and indices
+                            let sort_keys: Vec<Vec<Value>> = final_rows
+                                .iter()
+                                .map(|row| {
+                                    evaluator.set_row_array(row);
+                                    stmt.order_by
+                                        .iter()
+                                        .map(|ob| {
+                                            evaluator
+                                                .evaluate(&ob.expression)
+                                                .unwrap_or(Value::null_unknown())
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+
+                            // Sort by indices
+                            let mut indices: Vec<usize> = (0..final_rows.len()).collect();
+                            indices.sort_by(|&a, &b| {
+                                for (i, ob) in stmt.order_by.iter().enumerate() {
+                                    let av = &sort_keys[a][i];
+                                    let bv = &sort_keys[b][i];
+                                    let asc = ob.ascending;
+                                    let nulls_first = ob.nulls_first.unwrap_or(!asc);
+
+                                    let cmp = if av.is_null() && bv.is_null() {
+                                        Ordering::Equal
+                                    } else if av.is_null() {
+                                        if nulls_first {
+                                            Ordering::Less
+                                        } else {
+                                            Ordering::Greater
+                                        }
+                                    } else if bv.is_null() {
+                                        if nulls_first {
+                                            Ordering::Greater
+                                        } else {
+                                            Ordering::Less
+                                        }
+                                    } else {
+                                        join::compare_values(av, bv)
+                                    };
+
+                                    let cmp = if asc { cmp } else { cmp.reverse() };
+                                    if cmp != Ordering::Equal {
+                                        return cmp;
+                                    }
+                                }
+                                Ordering::Equal
+                            });
+
+                            // Reorder rows
+                            final_rows =
+                                indices.into_iter().map(|i| final_rows[i].clone()).collect();
+
+                            // Apply LIMIT/OFFSET after sorting
+                            let offset = stmt
+                                .offset
+                                .as_ref()
+                                .and_then(|e| {
+                                    ExpressionEval::compile(e, &[])
+                                        .ok()
+                                        .and_then(|eval| {
+                                            eval.with_context(ctx).eval_slice(&[]).ok()
+                                        })
+                                        .and_then(|v| match v {
+                                            Value::Integer(n) if n >= 0 => Some(n as usize),
+                                            _ => None,
+                                        })
+                                })
+                                .unwrap_or(0);
+
+                            let limit = stmt
+                                .limit
+                                .as_ref()
+                                .and_then(|e| {
+                                    ExpressionEval::compile(e, &[])
+                                        .ok()
+                                        .and_then(|eval| {
+                                            eval.with_context(ctx).eval_slice(&[]).ok()
+                                        })
+                                        .and_then(|v| match v {
+                                            Value::Integer(n) if n >= 0 => Some(n as usize),
+                                            _ => None,
+                                        })
+                                })
+                                .unwrap_or(usize::MAX);
+
+                            final_rows = final_rows.into_iter().skip(offset).take(limit).collect();
+                        }
+
+                        // Check for aggregation/window functions that need special handling
+                        let has_agg = self.has_aggregation(stmt);
+                        let has_window = self.has_window_functions(stmt);
+
+                        if has_agg || has_window {
+                            // Fall through to standard path for aggregation/window handling
+                            // Don't return early - let the standard path handle these
+                        } else {
+                            // Project rows according to SELECT expressions
+                            let projected_rows =
+                                self.project_rows(&stmt.columns, final_rows, &all_columns, ctx)?;
+                            let output_columns =
+                                self.get_output_column_names(&stmt.columns, &all_columns, None);
+
+                            // Return with projected results
+                            let result =
+                                ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+                            return Ok((Box::new(result), output_columns, false));
+                        }
+                    }
+                }
+
                 // Standard path: execute both sides normally
                 let (left_result, left_cols) = self.execute_table_expression_with_filter(
                     &join_source.left,
@@ -2272,10 +2955,16 @@ impl Executor {
         let alias_map = Self::build_alias_map(&stmt.columns);
 
         // Apply remaining WHERE clause if present (after filter pushdown)
-        // Use cross_filter if we did pushdown, otherwise use the full WHERE clause
-        let effective_where = if cross_filter.is_some() {
+        // IMPORTANT: When predicates were pushed to left/right (left_filter or right_filter is Some),
+        // we should ONLY apply cross_filter (predicates that reference both tables).
+        // If cross_filter is None and any pushdown happened, we don't need post-join filtering.
+        // Only use stmt.where_clause when NO pushdown happened at all.
+        let did_any_pushdown = left_filter.is_some() || right_filter.is_some();
+        let effective_where = if did_any_pushdown {
+            // Pushdown happened - only apply cross predicates (if any)
             cross_filter.clone()
         } else {
+            // No pushdown - apply full WHERE clause
             stmt.where_clause.as_ref().map(|wc| (**wc).clone())
         };
 
@@ -2320,11 +3009,11 @@ impl Executor {
 
             if has_star {
                 // Create a set for O(1) lookup
-                let excluded_set: std::collections::HashSet<usize> =
+                let excluded_set: FxHashSet<usize> =
                     excluded_column_indices.iter().copied().collect();
 
                 // Create rename map for join columns
-                let rename_map: std::collections::HashMap<usize, String> =
+                let rename_map: FxHashMap<usize, String> =
                     join_col_renames.iter().cloned().collect();
 
                 // Build list of indices to keep (all except excluded)
@@ -4446,14 +5135,947 @@ impl Executor {
         {
             // Project rows according to SELECT expressions
             let projected_rows = self.project_rows(&stmt.columns, rows, all_columns, ctx)?;
+
             // Note: This optimization path doesn't have table_alias available,
             // so we pass None. The prefix-based matching will still work for JOINs.
             let output_columns = self.get_output_column_names(&stmt.columns, all_columns, None);
+
             let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
             return Ok(Some((Box::new(result), output_columns)));
         }
 
         Ok(None)
+    }
+
+    /// Extract window ORDER BY information for optimization
+    /// Returns (column_name, ascending) if a simple optimizable case is found
+    fn extract_window_order_info(stmt: &SelectStatement) -> Option<(String, bool)> {
+        // Look for window functions in SELECT columns
+        for col_expr in &stmt.columns {
+            if let Some(info) = Self::find_window_order_in_expr(col_expr) {
+                return Some(info);
+            }
+        }
+        None
+    }
+
+    /// Find window ORDER BY info in an expression
+    fn find_window_order_in_expr(expr: &Expression) -> Option<(String, bool)> {
+        match expr {
+            Expression::Window(window_expr) => {
+                // Check for no PARTITION BY (single partition case)
+                if !window_expr.partition_by.is_empty() {
+                    return None; // Pre-sorting doesn't help with partitions
+                }
+
+                // Check if using a window reference (can't analyze those)
+                if window_expr.window_ref.is_some() {
+                    return None;
+                }
+
+                // Get ORDER BY info
+                let order_by = &window_expr.order_by;
+
+                // Only optimize if exactly one simple ORDER BY column
+                if order_by.len() != 1 {
+                    return None;
+                }
+
+                let order = &order_by[0];
+                let column_name = match &order.expression {
+                    Expression::Identifier(id) => id.value.clone(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+                    _ => return None, // Complex expression, can't optimize
+                };
+
+                Some((column_name, order.ascending))
+            }
+            Expression::Aliased(aliased) => Self::find_window_order_in_expr(&aliased.expression),
+            _ => None,
+        }
+    }
+
+    /// Extract window PARTITION BY information for optimization
+    /// Returns column_name if a simple single-column PARTITION BY is found
+    fn extract_window_partition_info(stmt: &SelectStatement) -> Option<String> {
+        // Look for window functions in SELECT columns
+        for col_expr in &stmt.columns {
+            if let Some(info) = Self::find_window_partition_in_expr(col_expr) {
+                return Some(info);
+            }
+        }
+        None
+    }
+
+    /// Find window PARTITION BY info in an expression
+    fn find_window_partition_in_expr(expr: &Expression) -> Option<String> {
+        match expr {
+            Expression::Window(window_expr) => {
+                // Only optimize single-column PARTITION BY
+                if window_expr.partition_by.len() != 1 {
+                    return None;
+                }
+
+                // Check if using a window reference (can't analyze those)
+                if window_expr.window_ref.is_some() {
+                    return None;
+                }
+
+                // Get PARTITION BY column
+                let partition_col = &window_expr.partition_by[0];
+                let column_name = match partition_col {
+                    Expression::Identifier(id) => id.value.clone(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+                    _ => return None, // Complex expression, can't optimize
+                };
+
+                Some(column_name)
+            }
+            Expression::Aliased(aliased) => {
+                Self::find_window_partition_in_expr(&aliased.expression)
+            }
+            _ => None,
+        }
+    }
+
+    /// IN subquery index optimization
+    ///
+    /// For queries like `SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE ...)`
+    /// where `id` has an index, probe the index for each subquery value instead of scanning all rows.
+    /// This is O(k log n) where k = subquery result size, vs O(n) for full table scan.
+    #[allow(clippy::type_complexity)]
+    fn try_in_subquery_index_optimization(
+        &self,
+        stmt: &SelectStatement,
+        where_expr: &Expression,
+        table: &dyn crate::storage::traits::Table,
+        all_columns: &[String],
+        table_alias: Option<&str>,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+        // Extract IN subquery info: (column_name, subquery, is_negated, remaining_predicate)
+        let (column_name, subquery, is_negated, remaining_predicate) =
+            match Self::extract_in_subquery_info(where_expr) {
+                Some(info) => info,
+                None => return Ok(None),
+            };
+
+        // Skip correlated subqueries - they can't be pre-evaluated
+        if Self::is_subquery_correlated(&subquery.subquery) {
+            return Ok(None);
+        }
+
+        // Skip if SELECT columns have correlated subqueries (need per-row context)
+        for col in &stmt.columns {
+            if Self::has_correlated_subqueries(col) {
+                return Ok(None);
+            }
+        }
+
+        // Check if this is a PRIMARY KEY column (O(1) lookup) or has an index
+        let schema = table.schema();
+        let pk_indices = schema.primary_key_indices();
+        let is_pk_column = pk_indices.len() == 1 && {
+            let pk_col_idx = pk_indices[0];
+            schema.columns[pk_col_idx].name.to_lowercase() == column_name
+        };
+
+        // If not PK, check for index
+        let index = if !is_pk_column {
+            match table.get_index_on_column(&column_name) {
+                Some(idx) => Some(idx),
+                None => return Ok(None), // No PK, no index, can't optimize
+            }
+        } else {
+            None
+        };
+
+        // Execute the subquery to get values (with caching for non-correlated subqueries)
+        let cache_key = subquery.subquery.to_string();
+        let values = if let Some(cached) = get_cached_in_subquery(&cache_key) {
+            cached
+        } else {
+            let subquery_ctx = ctx.with_incremented_query_depth();
+            let mut result = self.execute_select(&subquery.subquery, &subquery_ctx)?;
+
+            // Collect all values from the first column
+            let mut values = Vec::new();
+            while result.next() {
+                let row = result.row();
+                if !row.is_empty() {
+                    values.push(
+                        row.get(0)
+                            .cloned()
+                            .unwrap_or_else(crate::core::Value::null_unknown),
+                    );
+                }
+            }
+            // Cache for future use
+            cache_in_subquery(cache_key, values.clone());
+            values
+        };
+
+        if values.is_empty() {
+            // Empty subquery result
+            if is_negated {
+                // NOT IN empty set = all rows match (fall through to normal scan)
+                return Ok(None);
+            } else {
+                // IN empty set = no rows match
+                let output_columns =
+                    self.get_output_column_names(&stmt.columns, all_columns, table_alias);
+                let result = ExecutorMemoryResult::new(output_columns.clone(), vec![]);
+                return Ok(Some((Box::new(result), output_columns)));
+            }
+        }
+
+        // For NOT IN, we can't easily use the index (would need to exclude rows)
+        // Fall back to normal scan
+        if is_negated {
+            return Ok(None);
+        }
+
+        // Collect row_ids: either from PK (direct) or from index probe
+        let mut all_row_ids = Vec::new();
+        if is_pk_column {
+            // PRIMARY KEY: the value IS the row_id (for INTEGER PK)
+            for value in &values {
+                if let Value::Integer(id) = value {
+                    all_row_ids.push(*id);
+                }
+            }
+        } else if let Some(ref idx) = index {
+            // Index probe for each value
+            for value in &values {
+                let row_ids = idx.get_row_ids_equal(std::slice::from_ref(value));
+                all_row_ids.extend(row_ids);
+            }
+        }
+
+        // Remove duplicates and sort for efficient batch fetch
+        all_row_ids.sort_unstable();
+        all_row_ids.dedup();
+
+        // EARLY LIMIT OPTIMIZATION: When there's no ORDER BY and no remaining predicate,
+        // we can apply LIMIT early to avoid fetching unnecessary rows
+        let (early_limit_applied, early_limit, early_offset) =
+            if stmt.order_by.is_empty() && remaining_predicate.is_none() {
+                let offset = if let Some(ref offset_expr) = stmt.offset {
+                    match ExpressionEval::compile(offset_expr, &[])
+                        .ok()
+                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    {
+                        Some(Value::Integer(o)) if o >= 0 => o as usize,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+
+                let limit = if let Some(ref limit_expr) = stmt.limit {
+                    match ExpressionEval::compile(limit_expr, &[])
+                        .ok()
+                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    {
+                        Some(Value::Integer(l)) if l >= 0 => l as usize,
+                        _ => usize::MAX,
+                    }
+                } else {
+                    usize::MAX
+                };
+
+                // Truncate row_ids to avoid fetching unnecessary rows
+                if limit < usize::MAX {
+                    let take_count = (offset + limit).min(all_row_ids.len());
+                    all_row_ids.truncate(take_count);
+                }
+                (true, limit, offset)
+            } else {
+                (false, usize::MAX, 0)
+            };
+
+        // Create a filter expression for remaining predicate + visibility
+        use crate::storage::expression::logical::ConstBoolExpr;
+        let filter: Box<dyn crate::storage::expression::Expression> =
+            Box::new(ConstBoolExpr::true_expr());
+
+        // Fetch rows by row_ids
+        let fetched_rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
+
+        // Convert (row_id, Row) to just Row
+        let mut rows: Vec<crate::core::Row> =
+            fetched_rows.into_iter().map(|(_, row)| row).collect();
+
+        // Apply remaining predicate if any
+        if let Some(ref remaining) = remaining_predicate {
+            // Process any subqueries in the remaining predicate
+            let processed_remaining = if Self::has_subqueries(remaining) {
+                self.process_where_subqueries(remaining, ctx)?
+            } else {
+                remaining.clone()
+            };
+
+            // Compile the filter using RowFilter
+            let columns_slice: Vec<String> = all_columns.to_vec();
+            let row_filter =
+                crate::executor::expression::RowFilter::new(&processed_remaining, &columns_slice)?;
+
+            // Filter rows
+            rows.retain(|row| row_filter.matches(row));
+        }
+
+        // Apply LIMIT/OFFSET if present (and no ORDER BY)
+        // Skip if we already applied early limit optimization
+        if early_limit_applied {
+            // Early optimization already truncated row_ids, but we still need to apply offset
+            if early_offset > 0 {
+                rows = rows
+                    .into_iter()
+                    .skip(early_offset)
+                    .take(early_limit)
+                    .collect();
+            } else if early_limit < rows.len() {
+                rows.truncate(early_limit);
+            }
+        } else if stmt.order_by.is_empty() {
+            let offset = if let Some(ref offset_expr) = stmt.offset {
+                match ExpressionEval::compile(offset_expr, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                {
+                    Some(Value::Integer(o)) if o >= 0 => o as usize,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+
+            let limit = if let Some(ref limit_expr) = stmt.limit {
+                match ExpressionEval::compile(limit_expr, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                {
+                    Some(Value::Integer(l)) if l >= 0 => l as usize,
+                    _ => usize::MAX,
+                }
+            } else {
+                usize::MAX
+            };
+
+            if offset > 0 || limit < usize::MAX {
+                rows = rows.into_iter().skip(offset).take(limit).collect();
+            }
+        }
+
+        // Project rows according to SELECT expressions
+        let projected_rows =
+            self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
+        let output_columns = self.get_output_column_names(&stmt.columns, all_columns, table_alias);
+        let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+        Ok(Some((Box::new(result), output_columns)))
+    }
+
+    /// IN list literal index optimization
+    ///
+    /// For queries like `SELECT * FROM users WHERE id IN (1, 2, 3, 5, 8)`
+    /// where `id` has an index or is PRIMARY KEY, probe the index directly for each value
+    /// instead of scanning all rows. This is O(k log n) where k = list size.
+    #[allow(clippy::type_complexity)]
+    fn try_in_list_index_optimization(
+        &self,
+        stmt: &SelectStatement,
+        where_expr: &Expression,
+        table: &dyn crate::storage::traits::Table,
+        all_columns: &[String],
+        table_alias: Option<&str>,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+        // Extract IN list info: (column_name, values, is_negated, remaining_predicate)
+        let (column_name, values, is_negated, remaining_predicate) =
+            match Self::extract_in_list_info(where_expr, ctx) {
+                Some(info) => info,
+                None => return Ok(None),
+            };
+
+        // Skip if SELECT columns have correlated subqueries (need per-row context)
+        for col in &stmt.columns {
+            if Self::has_correlated_subqueries(col) {
+                return Ok(None);
+            }
+        }
+
+        // Check if this is a PRIMARY KEY column (O(1) lookup) or has an index
+        let schema = table.schema();
+        let pk_indices = schema.primary_key_indices();
+        let is_pk_column = pk_indices.len() == 1 && {
+            let pk_col_idx = pk_indices[0];
+            schema.columns[pk_col_idx].name.to_lowercase() == column_name
+        };
+
+        // If not PK, check for index
+        let index = if !is_pk_column {
+            match table.get_index_on_column(&column_name) {
+                Some(idx) => Some(idx),
+                None => return Ok(None), // No PK, no index, can't optimize
+            }
+        } else {
+            None
+        };
+
+        if values.is_empty() {
+            // Empty IN list
+            if is_negated {
+                // NOT IN empty set = all rows match (fall through to normal scan)
+                return Ok(None);
+            } else {
+                // IN empty set = no rows match
+                let output_columns =
+                    self.get_output_column_names(&stmt.columns, all_columns, table_alias);
+                let result = ExecutorMemoryResult::new(output_columns.clone(), vec![]);
+                return Ok(Some((Box::new(result), output_columns)));
+            }
+        }
+
+        // For NOT IN, we can't easily use the index (would need to exclude rows)
+        // Fall back to normal scan
+        if is_negated {
+            return Ok(None);
+        }
+
+        // Collect row_ids: either from PK (direct) or from index probe
+        let mut all_row_ids = Vec::new();
+        if is_pk_column {
+            // PRIMARY KEY: the value IS the row_id (for INTEGER PK)
+            for value in &values {
+                if let Value::Integer(id) = value {
+                    all_row_ids.push(*id);
+                }
+            }
+        } else if let Some(ref idx) = index {
+            // Index probe for each value
+            for value in &values {
+                let row_ids = idx.get_row_ids_equal(std::slice::from_ref(value));
+                all_row_ids.extend(row_ids);
+            }
+        }
+
+        // Remove duplicates and sort for efficient batch fetch
+        all_row_ids.sort_unstable();
+        all_row_ids.dedup();
+
+        // EARLY LIMIT OPTIMIZATION: When there's no ORDER BY and no remaining predicate,
+        // we can apply LIMIT early to avoid fetching unnecessary rows
+        let (early_limit_applied, early_limit, early_offset) =
+            if stmt.order_by.is_empty() && remaining_predicate.is_none() {
+                let offset = if let Some(ref offset_expr) = stmt.offset {
+                    match ExpressionEval::compile(offset_expr, &[])
+                        .ok()
+                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    {
+                        Some(Value::Integer(o)) if o >= 0 => o as usize,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+
+                let limit = if let Some(ref limit_expr) = stmt.limit {
+                    match ExpressionEval::compile(limit_expr, &[])
+                        .ok()
+                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    {
+                        Some(Value::Integer(l)) if l >= 0 => l as usize,
+                        _ => usize::MAX,
+                    }
+                } else {
+                    usize::MAX
+                };
+
+                // Truncate row_ids to avoid fetching unnecessary rows
+                if limit < usize::MAX {
+                    let take_count = (offset + limit).min(all_row_ids.len());
+                    all_row_ids.truncate(take_count);
+                }
+                (true, limit, offset)
+            } else {
+                (false, usize::MAX, 0)
+            };
+
+        // Create a filter expression for remaining predicate + visibility
+        use crate::storage::expression::logical::ConstBoolExpr;
+        let filter: Box<dyn crate::storage::expression::Expression> =
+            Box::new(ConstBoolExpr::true_expr());
+
+        // Fetch rows by row_ids
+        let fetched_rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
+
+        // Convert (row_id, Row) to just Row
+        let mut rows: Vec<crate::core::Row> =
+            fetched_rows.into_iter().map(|(_, row)| row).collect();
+
+        // Apply remaining predicate if any
+        if let Some(ref remaining) = remaining_predicate {
+            // Process any subqueries in the remaining predicate
+            let processed_remaining = if Self::has_subqueries(remaining) {
+                self.process_where_subqueries(remaining, ctx)?
+            } else {
+                remaining.clone()
+            };
+
+            // Compile the filter using RowFilter
+            let columns_slice: Vec<String> = all_columns.to_vec();
+            let row_filter =
+                crate::executor::expression::RowFilter::new(&processed_remaining, &columns_slice)?;
+
+            // Filter rows
+            rows.retain(|row| row_filter.matches(row));
+        }
+
+        // Apply LIMIT/OFFSET if present (and no ORDER BY)
+        // Skip if we already applied early limit optimization
+        if early_limit_applied {
+            // Early optimization already truncated row_ids, but we still need to apply offset
+            if early_offset > 0 {
+                rows = rows
+                    .into_iter()
+                    .skip(early_offset)
+                    .take(early_limit)
+                    .collect();
+            } else if early_limit < rows.len() {
+                rows.truncate(early_limit);
+            }
+        } else if stmt.order_by.is_empty() {
+            let offset = if let Some(ref offset_expr) = stmt.offset {
+                match ExpressionEval::compile(offset_expr, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                {
+                    Some(Value::Integer(o)) if o >= 0 => o as usize,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+
+            let limit = if let Some(ref limit_expr) = stmt.limit {
+                match ExpressionEval::compile(limit_expr, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                {
+                    Some(Value::Integer(l)) if l >= 0 => l as usize,
+                    _ => usize::MAX,
+                }
+            } else {
+                usize::MAX
+            };
+
+            if offset > 0 || limit < usize::MAX {
+                rows = rows.into_iter().skip(offset).take(limit).collect();
+            }
+        }
+
+        // Project rows according to SELECT expressions
+        let projected_rows =
+            self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
+        let output_columns = self.get_output_column_names(&stmt.columns, all_columns, table_alias);
+        let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+        Ok(Some((Box::new(result), output_columns)))
+    }
+
+    /// Extract IN list literal information from a WHERE clause.
+    /// Returns (column_name, values, is_negated, remaining_predicate)
+    fn extract_in_list_info(
+        expr: &Expression,
+        ctx: &ExecutionContext,
+    ) -> Option<(String, Vec<Value>, bool, Option<Expression>)> {
+        match expr {
+            // Direct IN list: column IN (v1, v2, ...)
+            Expression::In(in_expr) => {
+                // Get the column name from the left side (lowercase for case-insensitive match)
+                let column_name = match in_expr.left.as_ref() {
+                    Expression::Identifier(id) => id.value_lower.clone(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.clone(),
+                    _ => return None, // Can't optimize complex left expressions
+                };
+
+                // Get the values from the right side (must be a literal list, not subquery)
+                let values = match in_expr.right.as_ref() {
+                    Expression::List(list) => {
+                        // ListExpression has Vec<Expression>
+                        Self::extract_literal_values(&list.elements, ctx)
+                    }
+                    Expression::ExpressionList(list) => {
+                        // ExpressionList has Vec<Expression>
+                        Self::extract_literal_values(&list.expressions, ctx)
+                    }
+                    _ => return None, // Not a literal list (might be subquery)
+                };
+
+                values.map(|v| (column_name, v, in_expr.not, None))
+            }
+
+            // IN list with AND: column IN (...) AND other_condition
+            Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
+                // Try left side as IN list
+                if let Some((col, vals, neg, _)) = Self::extract_in_list_info(&infix.left, ctx) {
+                    return Some((col, vals, neg, Some((*infix.right).clone())));
+                }
+                // Try right side as IN list
+                if let Some((col, vals, neg, _)) = Self::extract_in_list_info(&infix.right, ctx) {
+                    return Some((col, vals, neg, Some((*infix.left).clone())));
+                }
+                None
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Extract literal values from a list of expressions.
+    /// Returns None if any expression is not a literal (e.g., column reference, subquery).
+    fn extract_literal_values(exprs: &[Expression], ctx: &ExecutionContext) -> Option<Vec<Value>> {
+        let mut values = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            // Try to evaluate as a constant expression
+            match ExpressionEval::compile(expr, &[]) {
+                Ok(compiled) => {
+                    match compiled.with_context(ctx).eval_slice(&[]) {
+                        Ok(val) => values.push(val),
+                        Err(_) => return None, // Can't evaluate as constant
+                    }
+                }
+                Err(_) => return None, // Can't compile (e.g., column reference)
+            }
+        }
+        Some(values)
+    }
+
+    /// Extract IN subquery information from a WHERE clause.
+    /// Returns (column_name, subquery, is_negated, remaining_predicate)
+    fn extract_in_subquery_info(
+        expr: &Expression,
+    ) -> Option<(String, &ScalarSubquery, bool, Option<Expression>)> {
+        match expr {
+            // Direct IN subquery: column IN (SELECT ...)
+            Expression::In(in_expr) => {
+                // Get the column name from the left side (lowercase for case-insensitive match)
+                let column_name = match in_expr.left.as_ref() {
+                    Expression::Identifier(id) => id.value_lower.clone(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.clone(),
+                    _ => return None, // Can't optimize complex left expressions
+                };
+
+                // Get the subquery from the right side
+                if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
+                    return Some((column_name, subquery, in_expr.not, None));
+                }
+                None
+            }
+
+            // IN subquery with AND: column IN (SELECT ...) AND other_condition
+            Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
+                // Try left side as IN subquery
+                if let Some((col, sq, neg, _)) = Self::extract_in_subquery_info(&infix.left) {
+                    return Some((col, sq, neg, Some((*infix.right).clone())));
+                }
+                // Try right side as IN subquery
+                if let Some((col, sq, neg, _)) = Self::extract_in_subquery_info(&infix.right) {
+                    return Some((col, sq, neg, Some((*infix.left).clone())));
+                }
+                None
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Try to optimize InHashSet expressions (from EXISTS → semi-join transformation).
+    ///
+    /// When EXISTS is transformed to InHashSet via semi-join, we can further optimize
+    /// by probing the PRIMARY KEY or index directly instead of scanning all rows.
+    ///
+    /// For example: `SELECT * FROM users WHERE users.id IN {1, 2, 3} LIMIT 100`
+    /// Instead of scanning all 10,000 users, probe the PK for ids 1, 2, 3 directly.
+    #[allow(clippy::type_complexity)]
+    fn try_in_hashset_index_optimization(
+        &self,
+        stmt: &SelectStatement,
+        where_expr: &Expression,
+        table: &dyn crate::storage::traits::Table,
+        all_columns: &[String],
+        table_alias: Option<&str>,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+        // Extract InHashSet info: (column_name, values, is_negated, remaining_predicate)
+        let (column_name, values, is_negated, remaining_predicate) =
+            match Self::extract_in_hashset_info(where_expr) {
+                Some(info) => info,
+                None => return Ok(None),
+            };
+
+        // NOT IN is harder to optimize - fall back to normal scan
+        if is_negated {
+            return Ok(None);
+        }
+
+        // Check if this is a PRIMARY KEY column (O(1) lookup) or has an index
+        let schema = table.schema();
+        let pk_indices = schema.primary_key_indices();
+        let is_pk_column = pk_indices.len() == 1 && {
+            let pk_col_idx = pk_indices[0];
+            let pk_col_name = schema.columns[pk_col_idx].name.to_lowercase();
+            pk_col_name == column_name
+        };
+
+        // If not PK, check for index
+        let index = if !is_pk_column {
+            match table.get_index_on_column(&column_name) {
+                Some(idx) => Some(idx),
+                None => return Ok(None), // No PK, no index, can't optimize
+            }
+        } else {
+            None
+        };
+
+        // EARLY LIMIT CHECK: Compute limit+offset before collecting row_ids
+        // This allows us to stop collection early when there's no ORDER BY
+        let early_termination_target = if stmt.order_by.is_empty() && remaining_predicate.is_none()
+        {
+            let offset = stmt
+                .offset
+                .as_ref()
+                .and_then(|offset_expr| {
+                    ExpressionEval::compile(offset_expr, &[])
+                        .ok()
+                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|v| {
+                            if let Value::Integer(o) = v {
+                                Some(o.max(0) as usize)
+                            } else {
+                                None
+                            }
+                        })
+                })
+                .unwrap_or(0);
+
+            let limit = stmt.limit.as_ref().and_then(|limit_expr| {
+                ExpressionEval::compile(limit_expr, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|v| {
+                        if let Value::Integer(l) = v {
+                            Some(l.max(0) as usize)
+                        } else {
+                            None
+                        }
+                    })
+            });
+
+            limit.map(|l| offset + l)
+        } else {
+            None // Can't use early termination with ORDER BY or remaining predicate
+        };
+
+        // Collect row_ids: either from PK (direct) or from index probe
+        // With early termination target, stop once we have enough
+        let mut all_row_ids = Vec::new();
+        if is_pk_column {
+            // PRIMARY KEY: the value IS the row_id (for INTEGER PK)
+            for value in values.iter() {
+                // Early termination check
+                if let Some(target) = early_termination_target {
+                    if all_row_ids.len() >= target {
+                        break;
+                    }
+                }
+                match value {
+                    Value::Integer(id) => all_row_ids.push(*id),
+                    Value::Float(f) => {
+                        // Handle case where integer was stored as float
+                        if f.fract() == 0.0 {
+                            all_row_ids.push(*f as i64);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else if let Some(ref idx) = index {
+            // Index probe for each value
+            for value in values.iter() {
+                // Early termination check
+                if let Some(target) = early_termination_target {
+                    if all_row_ids.len() >= target {
+                        break;
+                    }
+                }
+                let row_ids = idx.get_row_ids_equal(std::slice::from_ref(value));
+                all_row_ids.extend(row_ids);
+            }
+        }
+
+        // If no row_ids found, return empty result
+        if all_row_ids.is_empty() {
+            let output_columns =
+                self.get_output_column_names(&stmt.columns, all_columns, table_alias);
+            let result = ExecutorMemoryResult::new(output_columns.clone(), vec![]);
+            return Ok(Some((Box::new(result), output_columns)));
+        }
+
+        // Remove duplicates and sort for efficient batch fetch
+        all_row_ids.sort_unstable();
+        all_row_ids.dedup();
+
+        // EARLY LIMIT OPTIMIZATION: When there's no ORDER BY and no remaining predicate,
+        // we can apply LIMIT early to avoid fetching unnecessary rows
+        let (early_limit_applied, early_limit, early_offset) =
+            if stmt.order_by.is_empty() && remaining_predicate.is_none() {
+                let offset = if let Some(ref offset_expr) = stmt.offset {
+                    match ExpressionEval::compile(offset_expr, &[])
+                        .ok()
+                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    {
+                        Some(Value::Integer(o)) if o >= 0 => o as usize,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+
+                let limit = if let Some(ref limit_expr) = stmt.limit {
+                    match ExpressionEval::compile(limit_expr, &[])
+                        .ok()
+                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    {
+                        Some(Value::Integer(l)) if l >= 0 => l as usize,
+                        _ => usize::MAX,
+                    }
+                } else {
+                    usize::MAX
+                };
+
+                // Truncate row_ids to avoid fetching unnecessary rows
+                if limit < usize::MAX {
+                    let take_count = (offset + limit).min(all_row_ids.len());
+                    all_row_ids.truncate(take_count);
+                }
+                (true, limit, offset)
+            } else {
+                (false, usize::MAX, 0)
+            };
+
+        // Create a filter expression for remaining predicate + visibility
+        use crate::storage::expression::logical::ConstBoolExpr;
+        let filter: Box<dyn crate::storage::expression::Expression> =
+            Box::new(ConstBoolExpr::true_expr());
+
+        // Fetch rows by row_ids
+        let fetched_rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
+
+        // Convert (row_id, Row) to just Row
+        let mut rows: Vec<crate::core::Row> =
+            fetched_rows.into_iter().map(|(_, row)| row).collect();
+
+        // Apply remaining predicate if any
+        if let Some(ref remaining) = remaining_predicate {
+            // Compile the filter using RowFilter
+            let columns_slice: Vec<String> = all_columns.to_vec();
+            let row_filter =
+                crate::executor::expression::RowFilter::new(remaining, &columns_slice)?;
+
+            // Filter rows
+            rows.retain(|row| row_filter.matches(row));
+        }
+
+        // Apply LIMIT/OFFSET if present (and no ORDER BY)
+        // Skip if we already applied early limit optimization
+        if early_limit_applied {
+            // Early optimization already truncated row_ids, but we still need to apply offset
+            if early_offset > 0 {
+                rows = rows
+                    .into_iter()
+                    .skip(early_offset)
+                    .take(early_limit)
+                    .collect();
+            } else if early_limit < rows.len() {
+                rows.truncate(early_limit);
+            }
+        } else if stmt.order_by.is_empty() {
+            let offset = if let Some(ref offset_expr) = stmt.offset {
+                match ExpressionEval::compile(offset_expr, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                {
+                    Some(Value::Integer(o)) if o >= 0 => o as usize,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+
+            let limit = if let Some(ref limit_expr) = stmt.limit {
+                match ExpressionEval::compile(limit_expr, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                {
+                    Some(Value::Integer(l)) if l >= 0 => l as usize,
+                    _ => usize::MAX,
+                }
+            } else {
+                usize::MAX
+            };
+
+            if offset > 0 || limit < usize::MAX {
+                rows = rows.into_iter().skip(offset).take(limit).collect();
+            }
+        }
+
+        // Project rows according to SELECT expressions
+        let projected_rows =
+            self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
+        let output_columns = self.get_output_column_names(&stmt.columns, all_columns, table_alias);
+        let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+        Ok(Some((Box::new(result), output_columns)))
+    }
+
+    /// Extract InHashSet information from a WHERE clause.
+    /// Returns (column_name, hash_set_values, is_negated, remaining_predicate)
+    #[allow(clippy::type_complexity)]
+    fn extract_in_hashset_info(
+        expr: &Expression,
+    ) -> Option<(
+        String,
+        std::sync::Arc<ahash::AHashSet<Value>>,
+        bool,
+        Option<Expression>,
+    )> {
+        match expr {
+            // Direct InHashSet: column IN {hash_set}
+            Expression::InHashSet(in_hash) => {
+                // Get the column name from the column expression (lowercase for case-insensitive match)
+                let column_name = match in_hash.column.as_ref() {
+                    Expression::Identifier(id) => id.value_lower.clone(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.clone(),
+                    _ => return None, // Can't optimize complex column expressions
+                };
+
+                Some((column_name, in_hash.values.clone(), in_hash.not, None))
+            }
+
+            // InHashSet with AND: column IN {hash_set} AND other_condition
+            Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
+                // Try left side as InHashSet
+                if let Some((col, vals, neg, _)) = Self::extract_in_hashset_info(&infix.left) {
+                    return Some((col, vals, neg, Some((*infix.right).clone())));
+                }
+                // Try right side as InHashSet
+                if let Some((col, vals, neg, _)) = Self::extract_in_hashset_info(&infix.right) {
+                    return Some((col, vals, neg, Some((*infix.left).clone())));
+                }
+                None
+            }
+
+            _ => None,
+        }
     }
 
     /// Execute a temporal query (AS OF TRANSACTION or AS OF TIMESTAMP)
@@ -4936,6 +6558,128 @@ impl Executor {
             Expression::Identifier(id) => Some(id.value.clone()),
             _ => None,
         }
+    }
+
+    /// Check if Index Nested Loop Join can be used.
+    ///
+    /// Returns Some((table_name, index, inner_key_column, outer_key_column, outer_key_idx)) if:
+    /// - Right side is a simple TableSource (not CTE, view, subquery, or nested join)
+    /// - There's an equality join condition on a column that has an index on the right table
+    /// - Join type is INNER or LEFT (not RIGHT or FULL)
+    ///
+    /// The outer_key_idx will be determined after materializing the outer side.
+    #[allow(clippy::type_complexity)]
+    fn check_index_nested_loop_opportunity(
+        &self,
+        right_expr: &Expression,
+        join_condition: Option<&Expression>,
+        join_type: &str,
+        left_alias: Option<&str>,
+        right_alias: Option<&str>,
+    ) -> Option<(
+        String,                    // table_name
+        join::IndexLookupStrategy, // lookup strategy (index or PK)
+        String,                    // inner_key_column (unqualified)
+        String,                    // outer_key_column (qualified)
+    )> {
+        // Only for INNER or LEFT joins (not RIGHT or FULL)
+        // RIGHT joins would need to track all unmatched inner rows
+        if join_type.contains("RIGHT") || join_type.contains("FULL") {
+            return None;
+        }
+
+        // Right side must be a simple TableSource (possibly wrapped in Aliased)
+        let table_source = match right_expr {
+            Expression::TableSource(ts) => ts,
+            Expression::Aliased(aliased) => {
+                // Unwrap the alias to get the underlying TableSource
+                match aliased.expression.as_ref() {
+                    Expression::TableSource(ts) => ts,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+
+        let table_name = &table_source.name.value_lower;
+
+        // Check if it's a CTE (CTEs don't have indexes)
+        // We can't check CTEs here without context, but we'll verify when we try to get the table
+
+        // Need a join condition
+        let condition = join_condition?;
+
+        // Extract equality keys from the join condition
+        let (left_col, right_col) = self.extract_simple_join_key(condition)?;
+
+        // Determine which column belongs to which table
+        let left_col_lower = left_col.to_lowercase();
+        let right_col_lower = right_col.to_lowercase();
+
+        // Get the right table alias (or table name if no alias)
+        let right_table_alias = right_alias.unwrap_or(table_name);
+
+        // Check if left_col is from right table and right_col is from left table (swapped)
+        let (inner_col, outer_col) = if left_col_lower
+            .starts_with(&format!("{}.", right_table_alias.to_lowercase()))
+        {
+            // left_col is actually from right (inner) table
+            (left_col.clone(), right_col.clone())
+        } else if right_col_lower.starts_with(&format!("{}.", right_table_alias.to_lowercase())) {
+            // right_col is from right (inner) table - normal case
+            (right_col.clone(), left_col.clone())
+        } else {
+            // Can't determine which column is from which table
+            return None;
+        };
+
+        // Verify outer column is from left table (if we have left alias)
+        if let Some(left_a) = left_alias {
+            let outer_col_lower = outer_col.to_lowercase();
+            if !outer_col_lower.starts_with(&format!("{}.", left_a.to_lowercase())) {
+                // Outer column doesn't reference left table
+                return None;
+            }
+        }
+
+        // Extract unqualified column name for the inner (right) table
+        let inner_col_unqualified = if let Some(dot_pos) = inner_col.rfind('.') {
+            inner_col[dot_pos + 1..].to_string()
+        } else {
+            inner_col.clone()
+        };
+
+        // Try to get the table and check for index or PK
+        let txn = self.engine.begin_transaction().ok()?;
+        let table = txn.get_table(table_name).ok()?;
+        let schema = table.schema();
+
+        // First check if inner column is the PRIMARY KEY (direct row_id lookup)
+        let inner_col_lower = inner_col_unqualified.to_lowercase();
+        if let Some(pk_idx) = schema.pk_column_index() {
+            if schema.columns[pk_idx].name.to_lowercase() == inner_col_lower {
+                // It's a primary key lookup - most efficient!
+                return Some((
+                    table_name.clone(),
+                    join::IndexLookupStrategy::PrimaryKey,
+                    inner_col_unqualified,
+                    outer_col,
+                ));
+            }
+        }
+
+        // Check if there's a secondary index on the inner column
+        if let Some(index) = table.get_index_on_column(&inner_col_unqualified) {
+            return Some((
+                table_name.clone(),
+                join::IndexLookupStrategy::SecondaryIndex(index),
+                inner_col_unqualified,
+                outer_col,
+            ));
+        }
+
+        // No index or PK available
+        None
     }
 
     /// Build an IN filter expression: column_name IN (v1, v2, ..., vN)

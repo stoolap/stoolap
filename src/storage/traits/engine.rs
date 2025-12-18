@@ -17,7 +17,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::core::{IsolationLevel, Result, Schema};
+use crate::core::{IsolationLevel, Result, Row, Schema};
 use crate::storage::config::Config;
 use crate::storage::traits::{Index, Transaction};
 
@@ -86,7 +86,7 @@ pub trait Engine: Send + Sync {
     fn list_table_indexes(&self, table_name: &str) -> Result<FxHashMap<String, String>>;
 
     /// Gets all index objects for a table
-    fn get_all_indexes(&self, table_name: &str) -> Result<Vec<Box<dyn Index>>>;
+    fn get_all_indexes(&self, table_name: &str) -> Result<Vec<std::sync::Arc<dyn Index>>>;
 
     /// Gets the current default isolation level
     fn get_isolation_level(&self) -> IsolationLevel;
@@ -177,6 +177,39 @@ pub trait Engine: Send + Sync {
     fn record_alter_table_rename(&self, old_table_name: &str, new_table_name: &str) {
         // Default implementation does nothing
         let _ = (old_table_name, new_table_name);
+    }
+
+    /// Fetch rows by IDs directly from storage without creating a full transaction.
+    ///
+    /// This is an optimization for EXISTS subquery evaluation where we only need
+    /// to check if rows exist and evaluate predicates. It avoids the ~2-5μs overhead
+    /// of creating a new transaction per EXISTS probe.
+    ///
+    /// The returned rows represent the latest committed state visible to any reader.
+    fn fetch_rows_by_ids(&self, table_name: &str, row_ids: &[i64]) -> Result<Vec<(i64, Row)>> {
+        // Default implementation: fall back to creating a transaction
+        // Concrete implementations can override for better performance
+        let _ = (table_name, row_ids);
+        Err(crate::core::Error::internal(
+            "fetch_rows_by_ids not supported by this engine",
+        ))
+    }
+
+    /// Get a cached row fetcher for a table.
+    ///
+    /// This returns a function that can be called repeatedly to fetch rows without
+    /// the overhead of looking up the table each time. This is useful for EXISTS
+    /// subquery evaluation where we probe the same table many times.
+    #[allow(clippy::type_complexity)]
+    fn get_row_fetcher(
+        &self,
+        table_name: &str,
+    ) -> Result<Box<dyn Fn(&[i64]) -> Vec<(i64, Row)> + Send + Sync>> {
+        // Default implementation: fall back to fetch_rows_by_ids
+        let _ = table_name;
+        Err(crate::core::Error::internal(
+            "get_row_fetcher not supported by this engine",
+        ))
     }
 }
 

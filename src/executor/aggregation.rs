@@ -1626,9 +1626,7 @@ impl Executor {
             None
         };
 
-        // Use parallel processing for very large datasets without DISTINCT
-        // Threshold is high because parallel overhead can outweigh benefits
-        // Don't use parallel processing when expressions are involved (harder to handle)
+        // Use parallel processing for large datasets without DISTINCT
         let use_parallel = rows.len() >= 100_000 && !has_distinct && !has_expression;
 
         let result_values: Vec<Value> = if use_parallel {
@@ -2388,59 +2386,97 @@ impl Executor {
                 })
                 .collect();
 
-            for (row_idx, row) in rows.iter().enumerate() {
-                // Build key values for this row
-                key_buffer.clear();
-                for &idx in &column_indices {
-                    key_buffer.push(row.get(idx).cloned().unwrap_or_else(Value::null_unknown));
+            // OPTIMIZATION: Single-column GROUP BY uses direct hash map (no Vec<Value> overhead)
+            if column_indices.len() == 1 {
+                let col_idx = column_indices[0];
+                // Use value hash directly as key, store (key_value, row_indices)
+                let mut single_col_groups: FxHashMap<u64, (Value, Vec<usize>)> =
+                    FxHashMap::default();
+
+                for (row_idx, row) in rows.iter().enumerate() {
+                    let key_value = row
+                        .get(col_idx)
+                        .cloned()
+                        .unwrap_or_else(Value::null_unknown);
+                    let hash = {
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = rustc_hash::FxHasher::default();
+                        key_value.hash(&mut hasher);
+                        hasher.finish()
+                    };
+
+                    // For single column, hash collisions are rare - use simple entry API
+                    single_col_groups
+                        .entry(hash)
+                        .and_modify(|e| e.1.push(row_idx))
+                        .or_insert_with(|| (key_value, vec![row_idx]));
                 }
 
-                // Compute hash once (8-byte key instead of cloning entire Vec<Value>)
-                let hash = hash_group_key(&key_buffer);
-
-                // Early termination: if we've reached the limit, check before adding new groups
-                // CRITICAL: Must check if key exists in bucket to distinguish new group vs existing group
-                // Count actual groups, not buckets (hash collisions create multiple groups per bucket)
-                if has_limit {
-                    let key_exists_in_bucket = groups
-                        .get(&hash)
-                        .map(|bucket| bucket.iter().any(|entry| entry.key_values == key_buffer))
-                        .unwrap_or(false);
-
-                    if !key_exists_in_bucket && current_group_count >= group_limit {
-                        // This would create a new group, but we're at limit - skip
-                        continue;
+                // Convert to GroupEntry format for downstream processing
+                for (_hash, (key_value, row_indices)) in single_col_groups {
+                    groups
+                        .entry(0) // Use dummy hash, we'll flatten anyway
+                        .or_default()
+                        .push(GroupEntry {
+                            key_values: vec![key_value],
+                            row_indices,
+                        });
+                }
+            } else {
+                for (row_idx, row) in rows.iter().enumerate() {
+                    // Build key values for this row
+                    key_buffer.clear();
+                    for &idx in &column_indices {
+                        key_buffer.push(row.get(idx).cloned().unwrap_or_else(Value::null_unknown));
                     }
-                }
 
-                // Handle bucket with proper collision detection
-                match groups.entry(hash) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        let bucket = e.get_mut();
-                        // Search bucket for matching group (handles hash collisions)
-                        if let Some(entry) = bucket
-                            .iter_mut()
-                            .find(|entry| entry.key_values == key_buffer)
-                        {
-                            // Existing group - just add this row to it
-                            entry.row_indices.push(row_idx);
-                        } else {
-                            // Hash collision: different key with same hash - add new group
-                            // (limit already checked above)
-                            bucket.push(GroupEntry {
-                                key_values: key_buffer.clone(),
-                                row_indices: vec![row_idx],
-                            });
-                            current_group_count += 1; // Track new group for LIMIT optimization
+                    // Compute hash once (8-byte key instead of cloning entire Vec<Value>)
+                    let hash = hash_group_key(&key_buffer);
+
+                    // Early termination: if we've reached the limit, check before adding new groups
+                    // CRITICAL: Must check if key exists in bucket to distinguish new group vs existing group
+                    // Count actual groups, not buckets (hash collisions create multiple groups per bucket)
+                    if has_limit {
+                        let key_exists_in_bucket = groups
+                            .get(&hash)
+                            .map(|bucket| bucket.iter().any(|entry| entry.key_values == key_buffer))
+                            .unwrap_or(false);
+
+                        if !key_exists_in_bucket && current_group_count >= group_limit {
+                            // This would create a new group, but we're at limit - skip
+                            continue;
                         }
                     }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        // First entry for this hash (limit already checked above)
-                        e.insert(vec![GroupEntry {
-                            key_values: key_buffer.clone(),
-                            row_indices: vec![row_idx],
-                        }]);
-                        current_group_count += 1; // Track new group for LIMIT optimization
+
+                    // Handle bucket with proper collision detection
+                    match groups.entry(hash) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            let bucket = e.get_mut();
+                            // Search bucket for matching group (handles hash collisions)
+                            if let Some(entry) = bucket
+                                .iter_mut()
+                                .find(|entry| entry.key_values == key_buffer)
+                            {
+                                // Existing group - just add this row to it
+                                entry.row_indices.push(row_idx);
+                            } else {
+                                // Hash collision: different key with same hash - add new group
+                                // (limit already checked above)
+                                bucket.push(GroupEntry {
+                                    key_values: key_buffer.clone(),
+                                    row_indices: vec![row_idx],
+                                });
+                                current_group_count += 1; // Track new group for LIMIT optimization
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            // First entry for this hash (limit already checked above)
+                            e.insert(vec![GroupEntry {
+                                key_values: key_buffer.clone(),
+                                row_indices: vec![row_idx],
+                            }]);
+                            current_group_count += 1; // Track new group for LIMIT optimization
+                        }
                     }
                 }
             }

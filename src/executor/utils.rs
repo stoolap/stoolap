@@ -682,6 +682,90 @@ pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression
     }
 }
 
+/// Add table qualifier to an expression, converting simple identifiers
+/// to qualified ones. Used when applying filters post-join that were
+/// originally stripped for pushdown.
+pub fn add_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {
+    match expr {
+        Expression::Identifier(id) => {
+            // Convert to qualified identifier
+            Expression::QualifiedIdentifier(QualifiedIdentifier {
+                token: Token::new(TokenType::Identifier, table_alias, Position::default()),
+                qualifier: Box::new(Identifier::new(
+                    Token::new(TokenType::Identifier, table_alias, Position::default()),
+                    table_alias.to_string(),
+                )),
+                name: Box::new(id.clone()),
+            })
+        }
+        Expression::Infix(infix) => Expression::Infix(InfixExpression::new(
+            infix.token.clone(),
+            Box::new(add_table_qualifier(&infix.left, table_alias)),
+            infix.operator.clone(),
+            Box::new(add_table_qualifier(&infix.right, table_alias)),
+        )),
+        Expression::Prefix(prefix) => Expression::Prefix(PrefixExpression::new(
+            prefix.token.clone(),
+            prefix.operator.clone(),
+            Box::new(add_table_qualifier(&prefix.right, table_alias)),
+        )),
+        Expression::In(in_expr) => {
+            let new_left = add_table_qualifier(&in_expr.left, table_alias);
+            let new_right = match in_expr.right.as_ref() {
+                Expression::List(list) => Expression::List(ListExpression {
+                    token: list.token.clone(),
+                    elements: list
+                        .elements
+                        .iter()
+                        .map(|e| add_table_qualifier(e, table_alias))
+                        .collect(),
+                }),
+                other => add_table_qualifier(other, table_alias),
+            };
+            Expression::In(InExpression {
+                token: in_expr.token.clone(),
+                left: Box::new(new_left),
+                right: Box::new(new_right),
+                not: in_expr.not,
+            })
+        }
+        Expression::Between(between) => Expression::Between(BetweenExpression {
+            token: between.token.clone(),
+            expr: Box::new(add_table_qualifier(&between.expr, table_alias)),
+            lower: Box::new(add_table_qualifier(&between.lower, table_alias)),
+            upper: Box::new(add_table_qualifier(&between.upper, table_alias)),
+            not: between.not,
+        }),
+        Expression::Like(like) => Expression::Like(LikeExpression {
+            token: like.token.clone(),
+            left: Box::new(add_table_qualifier(&like.left, table_alias)),
+            pattern: Box::new(add_table_qualifier(&like.pattern, table_alias)),
+            operator: like.operator.clone(),
+            escape: like
+                .escape
+                .as_ref()
+                .map(|e| Box::new(add_table_qualifier(e, table_alias))),
+        }),
+        Expression::FunctionCall(func) => Expression::FunctionCall(FunctionCall {
+            token: func.token.clone(),
+            function: func.function.clone(),
+            arguments: func
+                .arguments
+                .iter()
+                .map(|a| add_table_qualifier(a, table_alias))
+                .collect(),
+            is_distinct: func.is_distinct,
+            order_by: func.order_by.clone(),
+            filter: func
+                .filter
+                .as_ref()
+                .map(|f| Box::new(add_table_qualifier(f, table_alias))),
+        }),
+        // Return unchanged for other expression types (literals, qualified identifiers, etc.)
+        other => other.clone(),
+    }
+}
+
 // ============================================================================
 // Aggregate Function Utilities
 // ============================================================================
