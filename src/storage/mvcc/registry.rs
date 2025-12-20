@@ -18,9 +18,8 @@
 //! Uses concurrent hash maps for high-performance thread-safe access.
 //!
 
-use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::RwLock;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::common::{new_concurrent_int64_map, ConcurrentInt64Map};
@@ -32,6 +31,47 @@ pub const INVALID_TRANSACTION_ID: i64 = -999999999;
 
 /// Special transaction ID for recovery transactions (always visible)
 pub const RECOVERY_TRANSACTION_ID: i64 = -1;
+
+/// Cache size for thread-local committed transaction cache
+/// Small size (32 entries) is sufficient since most scans see rows from few transactions
+const COMMITTED_CACHE_SIZE: usize = 32;
+
+// Thread-local cache for committed transaction IDs
+// Avoids repeated DashMap lookups during table scans
+thread_local! {
+    static COMMITTED_TXN_CACHE: RefCell<CommittedTxnCache> = const { RefCell::new(CommittedTxnCache::new()) };
+}
+
+/// Simple fixed-size cache for committed transaction IDs
+/// Uses circular buffer with direct-mapped indexing for O(1) lookup
+struct CommittedTxnCache {
+    /// Cached transaction IDs (0 = empty slot)
+    entries: [i64; COMMITTED_CACHE_SIZE],
+}
+
+impl CommittedTxnCache {
+    #[inline]
+    const fn new() -> Self {
+        Self {
+            entries: [0; COMMITTED_CACHE_SIZE],
+        }
+    }
+
+    /// Check if txn_id is in cache
+    #[inline(always)]
+    fn contains(&self, txn_id: i64) -> bool {
+        // Direct-mapped: use lower bits of txn_id as index
+        let idx = (txn_id as usize) & (COMMITTED_CACHE_SIZE - 1);
+        self.entries[idx] == txn_id
+    }
+
+    /// Add txn_id to cache
+    #[inline(always)]
+    fn insert(&mut self, txn_id: i64) {
+        let idx = (txn_id as usize) & (COMMITTED_CACHE_SIZE - 1);
+        self.entries[idx] = txn_id;
+    }
+}
 
 /// Transaction registry manages transaction states and visibility rules
 ///
@@ -74,11 +114,17 @@ pub struct TransactionRegistry {
     /// Committing transactions (two-phase commit): txn_id -> commit_sequence
     committing_transactions: ConcurrentInt64Map<i64>,
 
-    /// Global isolation level for new transactions
-    global_isolation_level: RwLock<IsolationLevel>,
+    /// Global isolation level for new transactions (stored as u8 for lock-free access)
+    /// 0 = ReadCommitted, 1 = SnapshotIsolation
+    global_isolation_level: AtomicU8,
 
     /// Per-transaction isolation level overrides
-    transaction_isolation_levels: RwLock<FxHashMap<i64, IsolationLevel>>,
+    /// Key: txn_id, Value: isolation level as u8 (0 = ReadCommitted, 1 = SnapshotIsolation)
+    transaction_isolation_levels: ConcurrentInt64Map<u8>,
+
+    /// Count of active per-transaction isolation level overrides
+    /// When 0, is_visible() can skip the DashMap lookup entirely
+    isolation_override_count: AtomicUsize,
 
     /// Whether new transactions are being accepted
     accepting: AtomicBool,
@@ -95,51 +141,75 @@ impl TransactionRegistry {
             active_transactions: new_concurrent_int64_map(),
             committed_transactions: new_concurrent_int64_map(),
             committing_transactions: new_concurrent_int64_map(),
-            global_isolation_level: RwLock::new(IsolationLevel::ReadCommitted),
-            transaction_isolation_levels: RwLock::new(FxHashMap::with_capacity_and_hasher(
-                100,
-                Default::default(),
-            )),
+            global_isolation_level: AtomicU8::new(0), // 0 = ReadCommitted
+            transaction_isolation_levels: new_concurrent_int64_map(),
+            isolation_override_count: AtomicUsize::new(0),
             accepting: AtomicBool::new(true),
             next_sequence: AtomicI64::new(0),
         }
     }
 
-    /// Sets the isolation level for a specific transaction
+    /// Converts IsolationLevel to u8 for atomic storage
+    #[inline(always)]
+    const fn isolation_level_to_u8(level: IsolationLevel) -> u8 {
+        match level {
+            IsolationLevel::ReadCommitted => 0,
+            IsolationLevel::SnapshotIsolation => 1,
+        }
+    }
+
+    /// Converts u8 to IsolationLevel
+    #[inline(always)]
+    const fn u8_to_isolation_level(value: u8) -> IsolationLevel {
+        match value {
+            0 => IsolationLevel::ReadCommitted,
+            _ => IsolationLevel::SnapshotIsolation,
+        }
+    }
+
+    /// Sets the isolation level for a specific transaction (lock-free)
     pub fn set_transaction_isolation_level(&self, txn_id: i64, level: IsolationLevel) {
-        let mut levels = self.transaction_isolation_levels.write().unwrap();
-        levels.insert(txn_id, level);
+        // Check if this is a new override (not replacing existing)
+        let is_new = !self.transaction_isolation_levels.contains_key(&txn_id);
+        self.transaction_isolation_levels
+            .insert(txn_id, Self::isolation_level_to_u8(level));
+        if is_new {
+            self.isolation_override_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    /// Removes the isolation level for a transaction
+    /// Removes the isolation level for a transaction (lock-free)
     pub fn remove_transaction_isolation_level(&self, txn_id: i64) {
-        let mut levels = self.transaction_isolation_levels.write().unwrap();
-        levels.remove(&txn_id);
+        if self.transaction_isolation_levels.remove(&txn_id).is_some() {
+            self.isolation_override_count
+                .fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
-    /// Sets the global isolation level for new transactions
+    /// Sets the global isolation level for new transactions (lock-free)
     pub fn set_global_isolation_level(&self, level: IsolationLevel) {
-        let mut global = self.global_isolation_level.write().unwrap();
-        *global = level;
+        self.global_isolation_level
+            .store(Self::isolation_level_to_u8(level), Ordering::Release);
     }
 
-    /// Gets the current global isolation level
+    /// Gets the current global isolation level (lock-free)
+    #[inline(always)]
     pub fn get_global_isolation_level(&self) -> IsolationLevel {
-        *self.global_isolation_level.read().unwrap()
+        Self::u8_to_isolation_level(self.global_isolation_level.load(Ordering::Acquire))
     }
 
-    /// Gets the isolation level for a specific transaction
+    /// Gets the isolation level for a specific transaction (lock-free)
     ///
     /// Returns the transaction-specific level if set, otherwise the global level.
+    #[inline(always)]
     pub fn get_isolation_level(&self, txn_id: i64) -> IsolationLevel {
-        // Check for transaction-specific level first
-        let levels = self.transaction_isolation_levels.read().unwrap();
-        if let Some(&level) = levels.get(&txn_id) {
-            return level;
+        // Check for transaction-specific level first (DashMap is lock-free)
+        if let Some(level) = self.transaction_isolation_levels.get(&txn_id) {
+            return Self::u8_to_isolation_level(*level);
         }
-        drop(levels);
 
-        // Fall back to global level
+        // Fall back to global level (atomic load)
         self.get_global_isolation_level()
     }
 
@@ -328,6 +398,10 @@ impl TransactionRegistry {
     ///
     /// This is an ultra-fast path with minimal checks.
     /// Used when we know the viewer is using READ COMMITTED isolation.
+    ///
+    /// Uses thread-local cache to avoid repeated DashMap lookups during scans.
+    /// For a 100K row scan with rows from ~10 transactions, this reduces
+    /// DashMap lookups from 100K to ~10 (99.99% reduction).
     #[inline(always)]
     pub fn is_directly_visible(&self, version_txn_id: i64) -> bool {
         // Special case for recovery transactions (rare path)
@@ -335,9 +409,16 @@ impl TransactionRegistry {
             return true;
         }
 
-        // Fast path: check committed first (most common case)
-        // DashMap::contains_key is lock-free
+        // FAST PATH: Check thread-local cache first (~1-2ns)
+        let cached = COMMITTED_TXN_CACHE.with(|cache| cache.borrow().contains(version_txn_id));
+        if cached {
+            return true;
+        }
+
+        // SLOW PATH: DashMap lookup (~15-20ns)
         if self.committed_transactions.contains_key(&version_txn_id) {
+            // Cache for future lookups
+            COMMITTED_TXN_CACHE.with(|cache| cache.borrow_mut().insert(version_txn_id));
             return true;
         }
 
@@ -350,6 +431,7 @@ impl TransactionRegistry {
     /// # Performance
     ///
     /// This is the hot path for MVCC - called for every row during scans.
+    /// Fully lock-free implementation using atomic operations and DashMap.
     /// Optimized for the common case (READ COMMITTED, committed versions).
     ///
     /// # Arguments
@@ -370,14 +452,26 @@ impl TransactionRegistry {
             return true;
         }
 
-        // FAST PATH 3: READ COMMITTED - just check if committed
-        // This avoids the RwLock on isolation_levels for the common case
-        {
-            let levels = self.transaction_isolation_levels.read().unwrap();
-            if !levels.contains_key(&viewer_txn_id) {
-                // Using global level - check if it's ReadCommitted (default)
-                drop(levels);
-                if *self.global_isolation_level.read().unwrap() == IsolationLevel::ReadCommitted {
+        // FAST PATH 3: READ COMMITTED with no per-txn override (common case)
+        // Check global level first (atomic load - ~1ns)
+        if self.global_isolation_level.load(Ordering::Relaxed) == 0 {
+            // Global is ReadCommitted
+            // Check if ANY overrides exist (atomic load - ~1ns)
+            // This avoids the DashMap lookup when no overrides exist (99% of cases)
+            if self.isolation_override_count.load(Ordering::Relaxed) == 0 {
+                return self.is_directly_visible(version_txn_id);
+            }
+            // Some overrides exist - check if this txn has one (DashMap - ~15-20ns)
+            if !self
+                .transaction_isolation_levels
+                .contains_key(&viewer_txn_id)
+            {
+                return self.is_directly_visible(version_txn_id);
+            }
+            // Has override - check what it is
+            if let Some(level) = self.transaction_isolation_levels.get(&viewer_txn_id) {
+                if *level == 0 {
+                    // Override is also ReadCommitted
                     return self.is_directly_visible(version_txn_id);
                 }
             }

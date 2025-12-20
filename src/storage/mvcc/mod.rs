@@ -76,7 +76,8 @@ pub use table::MVCCTable;
 pub use timestamp::get_fast_timestamp;
 pub use transaction::{MvccTransaction, TransactionEngineOperations, TransactionState};
 pub use version_store::{
-    RowVersion, TransactionVersionStore, VersionStore, VisibilityChecker, WriteSetEntry,
+    AggregateOp, AggregateResult, RowIndex, RowVersion, TransactionVersionStore, VersionStore,
+    VisibilityChecker, WriteSetEntry,
 };
 pub use wal_manager::{
     CheckpointMetadata, WALEntry, WALManager, WALOperationType, DEFAULT_WAL_BUFFER_SIZE,

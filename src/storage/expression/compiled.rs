@@ -67,6 +67,21 @@ pub enum CompiledPattern {
     Suffix(Arc<str>),
     /// Contains match (%pattern%)
     Contains(Arc<str>),
+    /// Prefix with pattern (literal_prefix + wildcard_pattern%)
+    /// First check starts_with(prefix), then regex for the rest
+    PrefixWithPattern {
+        prefix: Arc<str>,
+        prefix_len: usize,
+        rest_regex: regex::Regex,
+    },
+    /// Simple underscore pattern with trailing % (e.g., "User_1%")
+    /// Template contains literal chars (Some) or wildcards (None for _)
+    SimpleUnderscorePrefix {
+        /// Literal characters (None means wildcard _)
+        template: Vec<Option<char>>,
+        /// Has trailing %
+        has_trailing_percent: bool,
+    },
     /// Full regex pattern (complex patterns)
     Regex(regex::Regex),
 }
@@ -96,7 +111,53 @@ impl CompiledPattern {
                 (true, true) => CompiledPattern::Contains(Arc::from(inner)),
             }
         } else {
-            // Complex pattern - fall back to regex
+            // Check for simple underscore patterns without middle % (e.g., "User_1%", "User_1")
+            // These can use direct character comparison instead of regex
+            let has_middle_percent = inner.contains('%');
+            if !has_middle_percent && !case_insensitive {
+                // Pattern only has _ wildcards (and possibly trailing %)
+                // Build a template for direct character matching
+                let template: Vec<Option<char>> = inner
+                    .chars()
+                    .map(|c| if c == '_' { None } else { Some(c) })
+                    .collect();
+
+                return CompiledPattern::SimpleUnderscorePrefix {
+                    template,
+                    has_trailing_percent,
+                };
+            }
+
+            // Check for patterns with a literal prefix before wildcards (e.g., "User_1%")
+            // This allows fast rejection via starts_with before falling back to regex
+            if !has_leading_percent {
+                // Find the literal prefix (characters before first wildcard)
+                let prefix_end = pattern
+                    .chars()
+                    .position(|c| c == '%' || c == '_')
+                    .unwrap_or(pattern.len());
+
+                if prefix_end >= 2 {
+                    // We have a meaningful prefix (at least 2 chars)
+                    let prefix = &pattern[..prefix_end];
+                    let rest = &pattern[prefix_end..];
+
+                    // Build regex for the rest of the pattern
+                    let rest_regex_pattern = like_to_regex(rest);
+                    let flags = if case_insensitive { "(?i)" } else { "" };
+                    let full_rest_pattern = format!("^{}{}$", flags, rest_regex_pattern);
+
+                    if let Ok(rest_regex) = regex::Regex::new(&full_rest_pattern) {
+                        return CompiledPattern::PrefixWithPattern {
+                            prefix: Arc::from(prefix),
+                            prefix_len: prefix.len(),
+                            rest_regex,
+                        };
+                    }
+                }
+            }
+
+            // Complex pattern - fall back to full regex
             let regex_pattern = like_to_regex(&pattern);
             let flags = if case_insensitive { "(?i)" } else { "" };
             let full_pattern = format!("^{}{}$", flags, regex_pattern);
@@ -128,6 +189,56 @@ impl CompiledPattern {
             CompiledPattern::Prefix(prefix) => s.starts_with(prefix.as_ref()),
             CompiledPattern::Suffix(suffix) => s.ends_with(suffix.as_ref()),
             CompiledPattern::Contains(substr) => s.contains(substr.as_ref()),
+            CompiledPattern::PrefixWithPattern {
+                prefix,
+                prefix_len,
+                rest_regex,
+            } => {
+                // Fast path: check prefix first
+                if !s.starts_with(prefix.as_ref()) {
+                    return false;
+                }
+                // Slow path: check the rest with regex
+                if s.len() < *prefix_len {
+                    return false;
+                }
+                rest_regex.is_match(&s[*prefix_len..])
+            }
+            CompiledPattern::SimpleUnderscorePrefix {
+                template,
+                has_trailing_percent,
+            } => {
+                // Use character iteration for proper UTF-8 handling
+                let mut chars = s.chars();
+
+                // Check each character in template
+                for expected in template.iter() {
+                    match chars.next() {
+                        Some(actual_char) => {
+                            if let Some(expected_char) = expected {
+                                // Must match exact character
+                                if actual_char != *expected_char {
+                                    return false;
+                                }
+                            }
+                            // None means _ wildcard, matches any single character (skip check)
+                        }
+                        None => {
+                            // String is shorter than template
+                            return false;
+                        }
+                    }
+                }
+
+                // Check length constraints
+                if *has_trailing_percent {
+                    // With trailing %, any remaining chars are fine
+                    true
+                } else {
+                    // Without trailing %, string must be exactly min_len characters
+                    chars.next().is_none()
+                }
+            }
             CompiledPattern::Regex(re) => re.is_match(&s),
         }
     }

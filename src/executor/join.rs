@@ -263,6 +263,36 @@ impl Executor {
         right_col_count: usize,
         limit: Option<u64>,
     ) -> Result<Vec<Row>> {
+        self.execute_hash_join_with_residual(
+            left_rows,
+            right_rows,
+            left_key_indices,
+            right_key_indices,
+            join_type,
+            left_col_count,
+            right_col_count,
+            limit,
+            &[], // No residual filters
+        )
+    }
+
+    /// Execute hash join with optional residual condition for early termination.
+    ///
+    /// When residual_filters is provided, it's applied during the probe phase,
+    /// enabling early termination even with non-equality conditions like `a.id < b.id`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_hash_join_with_residual(
+        &self,
+        left_rows: &[Row],
+        right_rows: &[Row],
+        left_key_indices: &[usize],
+        right_key_indices: &[usize],
+        join_type: &str,
+        left_col_count: usize,
+        right_col_count: usize,
+        limit: Option<u64>,
+        residual_filters: &[RowFilter],
+    ) -> Result<Vec<Row>> {
         // Optimization: Build hash table on smaller side
         // For LEFT/FULL joins, we must build on right side to track unmatched rows correctly
         // For RIGHT joins, we must build on left side
@@ -271,8 +301,10 @@ impl Executor {
             && (join_type.contains("RIGHT") || left_rows.len() < right_rows.len());
 
         // Check if parallel execution would be beneficial
+        // Skip parallel if we have residual filters (need sequential for early termination)
         let parallel_config = ParallelConfig::default();
         let use_parallel = limit.is_none()
+            && residual_filters.is_empty()
             && (parallel_config.should_parallel_join(left_rows.len())
                 || parallel_config.should_parallel_join(right_rows.len()));
 
@@ -320,6 +352,7 @@ impl Executor {
                 left_col_count,
                 true,
                 limit,
+                residual_filters,
             )
         } else {
             self.execute_hash_join_impl(
@@ -332,6 +365,7 @@ impl Executor {
                 right_col_count,
                 false,
                 limit,
+                residual_filters,
             )
         }
     }
@@ -349,6 +383,7 @@ impl Executor {
         build_col_count: usize,
         swapped: bool,
         limit: Option<u64>,
+        residual_filters: &[RowFilter],
     ) -> Result<Vec<Row>> {
         use crate::optimizer::bloom::BloomEffectivenessTracker;
 
@@ -442,19 +477,36 @@ impl Executor {
                         probe_key_indices,
                         build_key_indices,
                     ) {
-                        matched = true;
-                        build_matched[build_idx] = true;
-
-                        let values = if swapped {
-                            combine_rows(build_row, probe_row, build_col_count, probe_col_count)
+                        // Combine rows first (needed for residual filter evaluation)
+                        let combined_row = if swapped {
+                            Row::from_values(combine_rows(
+                                build_row,
+                                probe_row,
+                                build_col_count,
+                                probe_col_count,
+                            ))
                         } else {
-                            combine_rows(probe_row, build_row, probe_col_count, build_col_count)
+                            Row::from_values(combine_rows(
+                                probe_row,
+                                build_row,
+                                probe_col_count,
+                                build_col_count,
+                            ))
                         };
-                        result_rows.push(Row::from_values(values));
 
-                        if let Some(lim) = effective_limit {
-                            if result_rows.len() >= lim as usize {
-                                break 'probe;
+                        // Apply residual filters (if any)
+                        let passes_residual = residual_filters.is_empty()
+                            || residual_filters.iter().all(|f| f.matches(&combined_row));
+
+                        if passes_residual {
+                            matched = true;
+                            build_matched[build_idx] = true;
+                            result_rows.push(combined_row);
+
+                            if let Some(lim) = effective_limit {
+                                if result_rows.len() >= lim as usize {
+                                    break 'probe;
+                                }
                             }
                         }
                     }

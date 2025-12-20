@@ -23,7 +23,7 @@
 //! - Memory usage: O(1) instead of O(n)
 //! - Works with MVCC visibility by pre-computing visible row indices
 
-use std::sync::RwLockReadGuard;
+use parking_lot::RwLockReadGuard;
 
 use crate::core::{Row, Value};
 use crate::storage::mvcc::arena::ArenaRowMeta;

@@ -32,10 +32,10 @@ use ahash::AHashSet;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use crate::core::{Error, Result, Row, Value};
+use crate::core::{DataType, Error, Result, Row, Value};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
-use crate::storage::traits::QueryResult;
+use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 
 use super::context::ExecutionContext;
 use super::expression::ExpressionEval;
@@ -50,63 +50,64 @@ pub type CteDataMap = FxHashMap<String, (Vec<String>, Vec<Row>)>;
 type JoinDataResult = (Vec<String>, Vec<Row>, Vec<String>, Vec<Row>);
 
 /// Registry for CTE results during query execution
-#[derive(Default)]
+///
+/// Uses Arc with COW (copy-on-write) semantics to avoid cloning:
+/// - During building: `Arc::make_mut` gives mutable access without cloning (single owner)
+/// - During sharing: `data()` returns cheap Arc clone (O(1), no data copy)
+#[derive(Clone)]
 pub struct CteRegistry {
     /// Materialized CTE results (name -> (columns, rows))
-    /// Wrapped in Arc for cheap sharing with ExecutionContext
-    materialized: CteDataMap,
-    /// Cached Arc for sharing - created lazily when data() is called
-    shared: Option<Arc<CteDataMap>>,
+    /// Arc provides cheap sharing; make_mut provides COW for modifications
+    data: Arc<CteDataMap>,
+}
+
+impl Default for CteRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CteRegistry {
     /// Create a new CTE registry
     pub fn new() -> Self {
         Self {
-            materialized: FxHashMap::default(),
-            shared: None,
+            data: Arc::new(FxHashMap::default()),
         }
     }
 
     /// Store a materialized CTE result
+    ///
+    /// Uses Arc::make_mut for COW semantics:
+    /// - If we're the only owner, mutates in place (no clone)
+    /// - If shared, clones first then mutates (preserves other references)
     pub fn store(&mut self, name: &str, columns: Vec<String>, rows: Vec<Row>) {
-        // Use stack-allocated buffer for lowercase conversion when possible
         let name_lower = name.to_lowercase();
-        self.materialized.insert(name_lower, (columns, rows));
-        // Invalidate cached Arc since data changed
-        self.shared = None;
+        Arc::make_mut(&mut self.data).insert(name_lower, (columns, rows));
     }
 
     /// Get a CTE result by name
     pub fn get(&self, name: &str) -> Option<(&Vec<String>, &Vec<Row>)> {
         let name_lower = name.to_lowercase();
-        self.materialized
-            .get(&name_lower)
-            .map(|(cols, rows)| (cols, rows))
+        self.data.get(&name_lower).map(|(cols, rows)| (cols, rows))
     }
 
     /// Check if a CTE exists
     #[allow(dead_code)]
     pub fn exists(&self, name: &str) -> bool {
-        self.materialized.contains_key(&name.to_lowercase())
+        self.data.contains_key(&name.to_lowercase())
     }
 
     /// Get a shared Arc reference to the internal data map for context transfer
-    /// This is cheap after the first call (returns cached Arc clone)
-    pub fn data(&mut self) -> Arc<CteDataMap> {
-        if let Some(ref arc) = self.shared {
-            arc.clone()
-        } else {
-            // Clone the data into an Arc only once
-            let arc = Arc::new(self.materialized.clone());
-            self.shared = Some(arc.clone());
-            arc
-        }
+    ///
+    /// This is always O(1) - just an Arc reference count increment.
+    /// No data cloning ever happens here.
+    pub fn data(&self) -> Arc<CteDataMap> {
+        self.data.clone()
     }
 
     /// Iterate over all stored CTEs (for copying to temp registries)
     pub fn iter(&self) -> impl Iterator<Item = (&String, &(Vec<String>, Vec<Row>))> {
-        self.materialized.iter()
+        self.data.iter()
     }
 }
 
@@ -466,6 +467,65 @@ impl Executor {
         let join_type = join_source.join_type.to_uppercase();
         let is_inner_join = join_type == "INNER" || join_type.is_empty() || join_type == "JOIN";
 
+        // INDEX NESTED LOOP: Try Index Nested Loop first when one side is CTE and other is table.
+        // This is much faster than hash join when the table has PK/index on join key because
+        // we can do O(N * log M) lookups instead of O(N + M) hash build + probe.
+        if is_inner_join && left_is_cte != right_is_cte {
+            // Determine which side is CTE and which is table
+            let (cte_data, table_expr, cte_on_left) = if left_is_cte {
+                (left_data.clone().unwrap(), &join_source.right, true)
+            } else {
+                (right_data.clone().unwrap(), &join_source.left, false)
+            };
+
+            // Calculate effective limit for Index Nested Loop (same logic as later)
+            let can_push_limit = stmt.order_by.is_empty()
+                && !self.has_aggregation(stmt)
+                && !self.has_window_functions(stmt)
+                && stmt.where_clause.is_none();
+
+            let effective_limit = if can_push_limit {
+                match (&stmt.limit, &stmt.offset) {
+                    (Some(lim), Some(off)) => {
+                        let limit_val = self.evaluate_limit_offset(lim).unwrap_or(u64::MAX);
+                        let offset_val = self.evaluate_limit_offset(off).unwrap_or(0);
+                        Some(limit_val.saturating_add(offset_val))
+                    }
+                    (Some(lim), None) => self.evaluate_limit_offset(lim),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            // Get aliases for qualifier matching
+            let cte_alias = if cte_on_left {
+                left_name.clone()
+            } else {
+                right_name.clone()
+            };
+            let table_alias = if cte_on_left {
+                right_name.clone()
+            } else {
+                left_name.clone()
+            };
+
+            // Try Index Nested Loop - returns early if successful
+            if let Some(result) = self.try_cte_index_nested_loop_join(
+                stmt,
+                ctx,
+                join_source,
+                cte_data,
+                table_expr,
+                cte_on_left,
+                cte_alias,
+                table_alias,
+                effective_limit,
+            )? {
+                return Ok(Some(result));
+            }
+        }
+
         // SEMI-JOIN REDUCTION: For INNER JOIN where one side is CTE and other is regular table,
         // extract join keys from CTE to filter the regular table scan (uses index!)
         // This avoids materializing the entire regular table.
@@ -764,11 +824,11 @@ impl Executor {
         // If we can identify the CTE join column, extract values for IN filter
         let in_filter = if let Some(cte_col) = cte_join_col {
             if let Some(table_col) = table_join_col.clone() {
-                // Find CTE column index
+                // Find CTE column index using case-insensitive comparison (no allocation)
                 let cte_col_lower = cte_col.to_lowercase();
                 let cte_col_idx = cte_columns
                     .iter()
-                    .position(|c| c.to_lowercase() == cte_col_lower);
+                    .position(|c| c.eq_ignore_ascii_case(&cte_col_lower));
 
                 if let Some(idx) = cte_col_idx {
                     // Extract distinct non-NULL values from CTE
@@ -1554,6 +1614,269 @@ impl Executor {
             }
             _ => expr.clone(),
         }
+    }
+
+    /// Try to use Index Nested Loop for CTE + Table joins.
+    ///
+    /// When one side is a CTE (materialized) and the other is a regular table with
+    /// a PK or index on the join key, Index Nested Loop is often faster than hash join
+    /// because we can do direct lookups instead of building a hash table.
+    ///
+    /// Returns Some(result) if Index Nested Loop was used, None if not applicable.
+    #[allow(clippy::too_many_arguments)]
+    fn try_cte_index_nested_loop_join(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        join_source: &JoinTableSource,
+        cte_data: (Vec<String>, Vec<Row>),
+        table_expr: &Expression,
+        cte_on_left: bool,
+        cte_alias: Option<String>,
+        table_alias: Option<String>,
+        effective_limit: Option<u64>,
+    ) -> Result<Option<Box<dyn QueryResult>>> {
+        let join_type = join_source.join_type.to_uppercase();
+
+        // Only for INNER or LEFT joins (not RIGHT or FULL)
+        // RIGHT/FULL would need to track all unmatched inner rows
+        if join_type.contains("RIGHT") || join_type.contains("FULL") {
+            return Ok(None);
+        }
+
+        // Need a join condition
+        let condition = match join_source.condition.as_deref() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // Extract table name from table expression
+        let table_name = match table_expr {
+            Expression::TableSource(ts) => ts.name.value_lower.clone(),
+            Expression::Aliased(aliased) => match aliased.expression.as_ref() {
+                Expression::TableSource(ts) => ts.name.value_lower.clone(),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        // Extract join key columns using qualifier matching
+        let (table_col, cte_col) = self.extract_join_key_columns_with_qualifiers(
+            condition,
+            cte_alias.as_deref(),
+            table_alias.as_deref(),
+        );
+
+        let table_col = match table_col {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let cte_col = match cte_col {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // Get the table column (unqualified)
+        let table_col_unqualified = if let Some(dot_pos) = table_col.rfind('.') {
+            table_col[dot_pos + 1..].to_string()
+        } else {
+            table_col.clone()
+        };
+
+        // Try to get the table and check for index or PK
+        let txn: Box<dyn Transaction> = self.engine.begin_transaction()?;
+        let table: Box<dyn Table> = match txn.get_table(&table_name) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let schema = table.schema();
+
+        // Check if table column is the PRIMARY KEY (direct row_id lookup)
+        let table_col_lower = table_col_unqualified.to_lowercase();
+        let lookup_strategy = if let Some(pk_idx) = schema.pk_column_index() {
+            if schema.columns[pk_idx].name.to_lowercase() == table_col_lower {
+                // It's a primary key lookup - most efficient!
+                join::IndexLookupStrategy::PrimaryKey
+            } else if let Some(index) = table.get_index_on_column(&table_col_unqualified) {
+                join::IndexLookupStrategy::SecondaryIndex(index)
+            } else {
+                return Ok(None);
+            }
+        } else if let Some(index) = table.get_index_on_column(&table_col_unqualified) {
+            join::IndexLookupStrategy::SecondaryIndex(index)
+        } else {
+            return Ok(None);
+        };
+
+        // Get CTE data
+        let (cte_columns, cte_rows) = cte_data;
+
+        // Find CTE column index for the join key
+        // Pre-compute the suffix pattern to avoid repeated allocations
+        let cte_col_lower = cte_col.to_lowercase();
+        let suffix_pattern = format!(".{}", cte_col_lower);
+        let cte_key_idx = cte_columns
+            .iter()
+            .position(|c| {
+                // Use case-insensitive comparison without allocation
+                c.eq_ignore_ascii_case(&cte_col_lower)
+                    || (c.len() > suffix_pattern.len()
+                        && c[c.len() - suffix_pattern.len()..]
+                            .eq_ignore_ascii_case(&suffix_pattern))
+            })
+            .ok_or_else(|| Error::internal(format!("CTE column not found: {}", cte_col)))?;
+
+        // Build qualified column names for CTE (they're not prefixed yet)
+        let cte_qualified: Vec<String> = if let Some(ref alias) = cte_alias {
+            cte_columns
+                .iter()
+                .map(|col| format!("{}.{}", alias, col))
+                .collect()
+        } else {
+            cte_columns.clone()
+        };
+
+        // Get table columns with qualified names
+        let table_qualified: Vec<String> = {
+            let alias = table_alias.as_ref().unwrap_or(&table_name);
+            schema
+                .columns
+                .iter()
+                .map(|col| format!("{}.{}", alias, col.name))
+                .collect()
+        };
+
+        // Determine outer/inner based on which side is CTE
+        // CTE is the outer (driver), Table is the inner (lookup)
+        let (outer_cols, outer_rows, outer_key_idx, inner_cols) = if cte_on_left {
+            // CTE on left = CTE is outer, Table is inner
+            (
+                cte_qualified.clone(),
+                &cte_rows,
+                cte_key_idx,
+                table_qualified.clone(),
+            )
+        } else {
+            // CTE on right = CTE is outer, Table is inner
+            // Note: We swap the semantics but the result order must match SQL expectations
+            (
+                cte_qualified.clone(),
+                &cte_rows,
+                cte_key_idx,
+                table_qualified.clone(),
+            )
+        };
+
+        // Execute Index Nested Loop Join
+        let result_rows = self.execute_index_nested_loop_join(
+            outer_rows,
+            table.as_ref(),
+            &lookup_strategy,
+            outer_key_idx,
+            None, // No residual filter for now (handled later if needed)
+            &join_type,
+            outer_cols.len(),
+            inner_cols.len(),
+            effective_limit,
+        )?;
+
+        // Store column counts before moving vectors
+        let cte_col_count = cte_qualified.len();
+        let table_col_count = table_qualified.len();
+
+        // Build all_columns in correct order based on original positions
+        let all_columns: Vec<String> = if cte_on_left {
+            let mut cols = cte_qualified;
+            cols.extend(table_qualified);
+            cols
+        } else {
+            let mut cols = table_qualified;
+            cols.extend(cte_qualified);
+            cols
+        };
+
+        // Reorder columns if CTE was on right (Index NL always puts outer first)
+        let final_rows = if !cte_on_left {
+            // Need to swap column order: CTE columns come before table columns in result
+            // but Index NL puts outer (CTE) first in result, which is wrong when CTE is on right
+            result_rows
+                .into_iter()
+                .map(|row| {
+                    let mut values = Vec::with_capacity(cte_col_count + table_col_count);
+                    // Table columns first (they should be on left)
+                    for i in cte_col_count..(cte_col_count + table_col_count) {
+                        values.push(row.get(i).cloned().unwrap_or(Value::Null(DataType::Null)));
+                    }
+                    // CTE columns second (they should be on right)
+                    for i in 0..cte_col_count {
+                        values.push(row.get(i).cloned().unwrap_or(Value::Null(DataType::Null)));
+                    }
+                    Row::from_values(values)
+                })
+                .collect()
+        } else {
+            result_rows
+        };
+
+        // Apply WHERE clause if present
+        let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
+            let mut where_eval =
+                ExpressionEval::compile(where_clause, &all_columns)?.with_context(ctx);
+
+            let mut rows = Vec::new();
+            for row in final_rows {
+                if where_eval.eval_bool(&row) {
+                    rows.push(row);
+                }
+            }
+            rows
+        } else {
+            final_rows
+        };
+
+        // Check for window functions
+        if self.has_window_functions(stmt) {
+            let result =
+                self.execute_select_with_window_functions(stmt, ctx, filtered_rows, &all_columns)?;
+            return Ok(Some(result));
+        }
+
+        // Check for aggregation
+        if self.has_aggregation(stmt) {
+            let result =
+                self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &all_columns)?;
+
+            // Apply ORDER BY if present (aggregation doesn't handle it for CTE JOINs)
+            if !stmt.order_by.is_empty() {
+                let output_columns = result.columns().to_vec();
+                let rows = Self::materialize_result(result)?;
+                let sorted_rows =
+                    self.apply_order_by_to_rows(rows, &stmt.order_by, &output_columns)?;
+                return Ok(Some(Box::new(ExecutorMemoryResult::new(
+                    output_columns,
+                    sorted_rows,
+                ))));
+            }
+            return Ok(Some(result));
+        }
+
+        // Project rows according to SELECT expressions
+        let projected_rows = self.project_rows(&stmt.columns, filtered_rows, &all_columns, ctx)?;
+
+        // Determine output column names
+        let output_columns = self.get_output_column_names(&stmt.columns, &all_columns, None);
+
+        // Apply ORDER BY if present
+        let final_rows = if !stmt.order_by.is_empty() {
+            self.apply_order_by_to_rows(projected_rows, &stmt.order_by, &output_columns)?
+        } else {
+            projected_rows
+        };
+
+        Ok(Some(Box::new(ExecutorMemoryResult::new(
+            output_columns,
+            final_rows,
+        ))))
     }
 }
 

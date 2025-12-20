@@ -65,10 +65,7 @@ fn test_reverse_function() {
     assert_eq!(result, "a");
 }
 
-// NOTE: LEFT function is implemented but parser treats LEFT as a reserved keyword (for JOIN)
-// The function will work when parser is updated to allow keywords as function names
 #[test]
-#[ignore = "LEFT is a reserved keyword in parser, needs parser update"]
 fn test_left_function() {
     let db = Database::open("memory://test_left").expect("Failed to create database");
 
@@ -90,10 +87,7 @@ fn test_left_function() {
     assert_eq!(result, "");
 }
 
-// NOTE: RIGHT function is implemented but parser treats RIGHT as a reserved keyword (for JOIN)
-// The function will work when parser is updated to allow keywords as function names
 #[test]
-#[ignore = "RIGHT is a reserved keyword in parser, needs parser update"]
 fn test_right_function() {
     let db = Database::open("memory://test_right").expect("Failed to create database");
 

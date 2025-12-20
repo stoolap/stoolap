@@ -612,17 +612,42 @@ impl Executor {
                 });
 
                 // Reorder rows using sorted indices
-                // OPTIMIZATION: Use swap-based reordering to avoid extra allocations
-                // when possible, but for simplicity use index-based collection
-                let sorted_rows: Vec<Row> = indices.into_iter().map(|i| rows[i].clone()).collect();
-
-                // Apply LIMIT/OFFSET
-                let final_rows = if let Some(lim) = limit {
-                    sorted_rows.into_iter().skip(offset).take(lim).collect()
-                } else if offset > 0 {
-                    sorted_rows.into_iter().skip(offset).collect()
+                // OPTIMIZATION: For LIMIT queries, only collect needed rows
+                // For full results, use in-place cycle-based permutation
+                let final_rows = if limit.is_some() || offset > 0 {
+                    // With LIMIT/OFFSET: Only collect the rows we actually need
+                    let take_count = limit.unwrap_or(usize::MAX);
+                    indices
+                        .into_iter()
+                        .skip(offset)
+                        .take(take_count)
+                        .map(|i| std::mem::take(&mut rows[i]))
+                        .collect()
                 } else {
-                    sorted_rows
+                    // No LIMIT: Use in-place cycle-based permutation (no cloning!)
+                    // This follows permutation cycles and swaps elements in place
+                    let n = rows.len();
+                    for start in 0..n {
+                        // Skip if already in correct position or already processed
+                        if indices[start] == start || indices[start] == usize::MAX {
+                            continue;
+                        }
+
+                        // Follow the cycle
+                        let mut current = start;
+                        loop {
+                            let target = indices[current];
+                            if target == start {
+                                // Cycle complete
+                                indices[current] = usize::MAX; // Mark as processed
+                                break;
+                            }
+                            rows.swap(current, target);
+                            indices[current] = usize::MAX; // Mark as processed
+                            current = target;
+                        }
+                    }
+                    rows
                 };
 
                 // Project to expected columns if needed
@@ -1015,6 +1040,20 @@ impl Executor {
             .map(|a| a.value_lower.clone())
             .or_else(|| Some(table_name.clone()));
 
+        // AGGREGATION PUSHDOWN: Try to compute simple aggregates directly on storage
+        // This avoids all row materialization for queries like:
+        // - SELECT COUNT(*) FROM table
+        // - SELECT SUM(col), MIN(col), MAX(col) FROM table
+        // Must check before any row collection happens
+        if self.has_aggregation(stmt) && !self.has_window_functions(stmt) {
+            if let Some(result) =
+                self.try_aggregation_pushdown(table.as_ref(), stmt, &all_columns, ctx)?
+            {
+                let columns = result.columns().to_vec();
+                return Ok((result, columns, false));
+            }
+        }
+
         // Check if we need aggregation/window functions (need all columns)
         let needs_all_columns = self.has_aggregation(stmt) || self.has_window_functions(stmt);
 
@@ -1164,9 +1203,29 @@ impl Executor {
             if Self::has_subqueries(where_expr) {
                 (None, true)
             } else if has_outer_context {
-                // If we have outer row context, this might be a correlated subquery
-                // Force in-memory evaluation to use outer row values
-                (None, true)
+                // If we have outer row context, this is a correlated subquery
+                // OPTIMIZATION: Substitute outer references with their actual values
+                // to enable predicate pushdown for index usage.
+                // Example: WHERE o.user_id = u.id -> WHERE o.user_id = 42
+                if let Some(outer_row) = ctx.outer_row() {
+                    let substituted_expr =
+                        super::utils::substitute_outer_references(where_expr, outer_row);
+                    let schema = table.schema();
+                    // Try to push down the substituted expression
+                    let (storage_expr, needs_filter) =
+                        pushdown::try_pushdown(&substituted_expr, schema, Some(ctx));
+                    if storage_expr.is_some() {
+                        // Successfully converted - can use index!
+                        // Still need memory filter for any non-pushable parts
+                        (storage_expr, needs_filter)
+                    } else {
+                        // Couldn't push down, fall back to memory filter
+                        (None, true)
+                    }
+                } else {
+                    // No outer row available, force in-memory evaluation
+                    (None, true)
+                }
             } else {
                 // Try PARTIAL PUSHDOWN: Extract pushable conjuncts from the WHERE clause.
                 // This allows queries like `WHERE indexed_col = 5 AND complex_func(x) > 0`
@@ -1221,6 +1280,25 @@ impl Executor {
         // use the table's row_count() method instead of scanning all rows
         if storage_expr.is_none() && !needs_memory_filter && stmt.group_by.columns.is_empty() {
             if let Some((result, columns)) = self.try_count_star_optimization(stmt, &*table)? {
+                return Ok((result, columns, false));
+            }
+        }
+
+        // FAST PATH: Streaming GROUP BY optimization using B-tree index
+        // For queries like `SELECT user_id, SUM(amount) FROM orders GROUP BY user_id`
+        // where user_id has a B-tree index, we iterate through the index in sorted order
+        // and aggregate each group without using a hash map (SQLite-style sorted GROUP BY)
+        if storage_expr.is_none()
+            && !needs_memory_filter
+            && !stmt.group_by.columns.is_empty()
+            && self.has_aggregation(stmt)
+            && !self.has_window_functions(stmt)
+            && stmt.order_by.is_empty()
+        // No ORDER BY to avoid re-sorting
+        {
+            if let Some((result, columns)) =
+                self.try_streaming_group_by(stmt, &*table, &all_columns, ctx)?
+            {
                 return Ok((result, columns, false));
             }
         }
@@ -1394,6 +1472,7 @@ impl Executor {
 
         // Check for subqueries in WHERE - use the actual where clause (resolved or original)
         let has_where_subqueries = where_to_use.is_some_and(Self::has_subqueries);
+
         if can_use_streaming && !has_where_subqueries {
             // Check if we have simple column projection (no complex expressions)
             let simple_projection = self.get_simple_projection_indices(&stmt.columns, &all_columns);
@@ -1553,7 +1632,80 @@ impl Executor {
             if use_parallel_path {
                 let where_expr = processed_where.as_ref().unwrap();
 
-                // Collect all rows first (sequential - storage layer limitation)
+                // EARLY TERMINATION: For LIMIT queries without ORDER BY, GROUP BY,
+                // aggregation, or window functions, use streaming filter with early
+                // termination. This is critical for NOT IN performance.
+                let can_early_terminate = stmt.order_by.is_empty()
+                    && stmt.group_by.columns.is_empty()
+                    && !self.has_aggregation(stmt)
+                    && !self.has_window_functions(stmt);
+
+                let early_termination_target = if can_early_terminate {
+                    let offset = stmt
+                        .offset
+                        .as_ref()
+                        .and_then(|offset_expr| {
+                            ExpressionEval::compile(offset_expr, &[])
+                                .ok()
+                                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                                .and_then(|v| {
+                                    if let Value::Integer(o) = v {
+                                        Some(o.max(0) as usize)
+                                    } else {
+                                        None
+                                    }
+                                })
+                        })
+                        .unwrap_or(0);
+
+                    stmt.limit.as_ref().and_then(|limit_expr| {
+                        ExpressionEval::compile(limit_expr, &[])
+                            .ok()
+                            .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                            .and_then(|v| {
+                                if let Value::Integer(l) = v {
+                                    Some(offset + l.max(0) as usize)
+                                } else {
+                                    None
+                                }
+                            })
+                    })
+                } else {
+                    None
+                };
+
+                // Use early termination path if we have a target
+                if let Some(target) = early_termination_target {
+                    // Sequential scan with filter and early termination
+                    let mut eval =
+                        ExpressionEval::compile(where_expr, &all_columns)?.with_context(ctx);
+                    let mut result_rows = Vec::with_capacity(target.min(1000));
+
+                    while scanner.next() && result_rows.len() < target {
+                        let row = scanner.take_row();
+                        if eval.eval_bool(&row) {
+                            result_rows.push(row);
+                        }
+                    }
+
+                    // Project rows and return early - LIMIT/OFFSET already applied
+                    let projected_rows = self.project_rows_with_alias(
+                        &stmt.columns,
+                        result_rows,
+                        &all_columns,
+                        ctx,
+                        table_alias.as_deref(),
+                    )?;
+                    let output_columns = self.get_output_column_names(
+                        &stmt.columns,
+                        &all_columns,
+                        table_alias.as_deref(),
+                    );
+                    let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+                    return Ok((Box::new(result), output_columns, true)); // true = LIMIT applied
+                }
+
+                // Normal path: collect all rows first (for ORDER BY, aggregation, etc.)
                 let mut all_rows = Vec::new();
                 while scanner.next() {
                     all_rows.push(scanner.take_row());
@@ -2182,125 +2334,158 @@ impl Executor {
             &join_source.condition,
         );
 
-        let (left_rows, left_columns, right_rows, right_columns) =
-            if let Some((limit_n, left_key_col, right_key_col)) = semijoin_limit {
-                // Semi-join reduction for LEFT JOIN + GROUP BY
-                // Step 1: Execute and materialize left side with limit
-                let (left_result, left_cols) = self.execute_table_expression_with_filter(
-                    &join_source.left,
-                    ctx,
-                    left_filter.as_ref(),
-                )?;
-                let mut left_rows = Self::materialize_result(left_result)?;
-                left_rows.truncate(limit_n);
+        let (left_rows, left_columns, right_rows, right_columns) = if let Some((
+            limit_n,
+            left_key_col,
+            right_key_col,
+        )) = semijoin_limit
+        {
+            // Semi-join reduction for LEFT JOIN + GROUP BY
+            // Step 1: Execute and materialize left side with limit
+            let (left_result, left_cols) = self.execute_table_expression_with_filter(
+                &join_source.left,
+                ctx,
+                left_filter.as_ref(),
+            )?;
+            let mut left_rows = Self::materialize_result(left_result)?;
+            left_rows.truncate(limit_n);
 
-                // Step 2: Extract join key values from limited left rows
-                let left_key_idx = Self::find_column_index_by_name(&left_key_col, &left_cols);
-                let join_key_values: Vec<Value> = if let Some(idx) = left_key_idx {
-                    left_rows
-                        .iter()
-                        .filter_map(|row| row.get(idx).cloned())
-                        .filter(|v| !v.is_null())
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                // Step 3: Build combined filter for right side with IN clause
-                let right_filter_with_in = if !join_key_values.is_empty() {
-                    // Create IN expression: right_key_col IN (v1, v2, ..., vN)
-                    let in_expr = self.build_in_filter_expression(&right_key_col, &join_key_values);
-                    // Combine with existing right filter if any
-                    match (right_filter.clone(), in_expr) {
-                        (Some(existing), Some(in_filter)) => {
-                            Some(Expression::Infix(InfixExpression::new(
-                                Token::new(TokenType::Keyword, "AND", Position::default()),
-                                Box::new(existing),
-                                "AND".to_string(),
-                                Box::new(in_filter),
-                            )))
-                        }
-                        (None, Some(in_filter)) => Some(in_filter),
-                        (existing, None) => existing,
-                    }
-                } else {
-                    right_filter.clone()
-                };
-
-                // Step 4: Execute right side with IN filter (uses index on right_key_col)
-                let (right_result, right_cols) = self.execute_table_expression_with_filter(
-                    &join_source.right,
-                    ctx,
-                    right_filter_with_in.as_ref(),
-                )?;
-                let right_rows = Self::materialize_result(right_result)?;
-
-                (left_rows, left_cols, right_rows, right_cols)
+            // Step 2: Extract join key values from limited left rows
+            let left_key_idx = Self::find_column_index_by_name(&left_key_col, &left_cols);
+            let join_key_values: Vec<Value> = if let Some(idx) = left_key_idx {
+                left_rows
+                    .iter()
+                    .filter_map(|row| row.get(idx).cloned())
+                    .filter(|v| !v.is_null())
+                    .collect()
             } else {
-                // Skip Index Nested Loop if query has aggregation or window functions
-                // These require full result sets and can't use early termination
-                let has_agg = self.has_aggregation(stmt);
-                let has_window = self.has_window_functions(stmt);
+                Vec::new()
+            };
 
-                // Check if we can use Index Nested Loop Join
-                // This optimization avoids materializing the right side entirely
-                // NOTE: Don't use Index NL for aggregation/window queries - they need full results
-                // and the current implementation falls through to standard path, causing double execution
-                let index_nl_info = if has_agg || has_window {
-                    None
-                } else {
-                    self.check_index_nested_loop_opportunity(
-                        &join_source.right,
-                        join_source.condition.as_ref().map(|c| c.as_ref()),
-                        &join_type,
-                        left_alias.as_deref(),
-                        right_alias.as_deref(),
-                    )
-                };
-
-                // Join reordering optimization for INNER JOINs:
-                // When one side has a filter, prefer putting filtered side as outer (left)
-                // This reduces the number of probes into the inner table.
-                // Swap if: right has filter, left doesn't, and swapped order gives Index NL on PK
-                let (index_nl_info, nl_left_filter, nl_right_filter, swapped) = if !has_agg
-                        && !has_window
-                        && join_type == "INNER"
-                        && right_filter.is_some()  // Right side has a filter
-                        && left_filter.is_none()
-                // Left side doesn't have a filter
-                {
-                    // Check if swapping gives Index NL opportunity with PK lookup
-                    // (which is more efficient than secondary index lookup)
-                    let swapped_info = self.check_index_nested_loop_opportunity(
-                        &join_source.left, // Left becomes inner (right)
-                        join_source.condition.as_ref().map(|c| c.as_ref()),
-                        &join_type,
-                        right_alias.as_deref(), // Swap aliases
-                        left_alias.as_deref(),
-                    );
-
-                    // Prefer swapped if it gives PK lookup (most efficient)
-                    let prefer_swap = matches!(
-                        &swapped_info,
-                        Some((_, join::IndexLookupStrategy::PrimaryKey, _, _))
-                    );
-
-                    if prefer_swap {
-                        // Swap: right filter becomes outer filter
-                        (
-                            swapped_info,
-                            right_filter.clone(),
-                            left_filter.clone(),
-                            true,
-                        )
-                    } else {
-                        (
-                            index_nl_info,
-                            left_filter.clone(),
-                            right_filter.clone(),
-                            false,
-                        )
+            // Step 3: Build combined filter for right side with IN clause
+            let right_filter_with_in = if !join_key_values.is_empty() {
+                // Create IN expression: right_key_col IN (v1, v2, ..., vN)
+                let in_expr = self.build_in_filter_expression(&right_key_col, &join_key_values);
+                // Combine with existing right filter if any
+                match (right_filter.clone(), in_expr) {
+                    (Some(existing), Some(in_filter)) => {
+                        Some(Expression::Infix(InfixExpression::new(
+                            Token::new(TokenType::Keyword, "AND", Position::default()),
+                            Box::new(existing),
+                            "AND".to_string(),
+                            Box::new(in_filter),
+                        )))
                     }
+                    (None, Some(in_filter)) => Some(in_filter),
+                    (existing, None) => existing,
+                }
+            } else {
+                right_filter.clone()
+            };
+
+            // Step 4: Execute right side with IN filter (uses index on right_key_col)
+            let (right_result, right_cols) = self.execute_table_expression_with_filter(
+                &join_source.right,
+                ctx,
+                right_filter_with_in.as_ref(),
+            )?;
+            let right_rows = Self::materialize_result(right_result)?;
+
+            (left_rows, left_cols, right_rows, right_cols)
+        } else {
+            // Skip Index Nested Loop if query has aggregation or window functions
+            // These require full result sets and can't use early termination
+            let has_agg = self.has_aggregation(stmt);
+            let has_window = self.has_window_functions(stmt);
+
+            // Check if we can use Index Nested Loop Join
+            // This optimization avoids materializing the right side entirely
+            // NOTE: Don't use Index NL for aggregation/window queries - they need full results
+            // and the current implementation falls through to standard path, causing double execution
+            let index_nl_info = if has_agg || has_window {
+                None
+            } else {
+                self.check_index_nested_loop_opportunity(
+                    &join_source.right,
+                    join_source.condition.as_ref().map(|c| c.as_ref()),
+                    &join_type,
+                    left_alias.as_deref(),
+                    right_alias.as_deref(),
+                )
+            };
+
+            // Subquery join optimization: When right side is a subquery (not a table)
+            // and left side is a table with PK/index, use swapped Index NL.
+            // This handles inlined CTEs: (table) JOIN (subquery) -> subquery outer, table inner
+            let (index_nl_info, force_swap) = if index_nl_info.is_none()
+                && !has_agg
+                && !has_window
+                && (join_type == "INNER" || join_type == "LEFT")
+                && !matches!(join_source.right.as_ref(), Expression::TableSource(_))
+                && !matches!(
+                    join_source.right.as_ref(),
+                    Expression::Aliased(a) if matches!(a.expression.as_ref(), Expression::TableSource(_))
+                ) {
+                // Right is subquery/CTE - check if left side has Index NL opportunity
+                let left_as_inner = self.check_index_nested_loop_opportunity(
+                    &join_source.left,
+                    join_source.condition.as_ref().map(|c| c.as_ref()),
+                    &join_type,
+                    right_alias.as_deref(), // Swap aliases for the check
+                    left_alias.as_deref(),
+                );
+                if left_as_inner.is_some() {
+                    (left_as_inner, true) // Force swap
+                } else {
+                    (None, false)
+                }
+            } else {
+                (index_nl_info, false)
+            };
+
+            // Join reordering optimization for INNER JOINs:
+            // When one side has a filter, prefer putting filtered side as outer (left)
+            // This reduces the number of probes into the inner table.
+            // Swap if: right has filter, left doesn't, and swapped order gives Index NL on PK
+            let (index_nl_info, nl_left_filter, nl_right_filter, swapped) = if force_swap {
+                // Subquery join optimization: swap is forced (right is subquery, left is table)
+                (
+                    index_nl_info,
+                    right_filter.clone(), // Subquery becomes outer, apply its filter
+                    left_filter.clone(),  // Table becomes inner
+                    true,
+                )
+            } else if !has_agg
+                    && !has_window
+                    && join_type == "INNER"
+                    && right_filter.is_some()  // Right side has a filter
+                    && left_filter.is_none()
+            // Left side doesn't have a filter
+            {
+                // Check if swapping gives Index NL opportunity with PK lookup
+                // (which is more efficient than secondary index lookup)
+                let swapped_info = self.check_index_nested_loop_opportunity(
+                    &join_source.left, // Left becomes inner (right)
+                    join_source.condition.as_ref().map(|c| c.as_ref()),
+                    &join_type,
+                    right_alias.as_deref(), // Swap aliases
+                    left_alias.as_deref(),
+                );
+
+                // Prefer swapped if it gives PK lookup (most efficient)
+                let prefer_swap = matches!(
+                    &swapped_info,
+                    Some((_, join::IndexLookupStrategy::PrimaryKey, _, _))
+                );
+
+                if prefer_swap {
+                    // Swap: right filter becomes outer filter
+                    (
+                        swapped_info,
+                        right_filter.clone(),
+                        left_filter.clone(),
+                        true,
+                    )
                 } else {
                     (
                         index_nl_info,
@@ -2308,298 +2493,301 @@ impl Executor {
                         right_filter.clone(),
                         false,
                     )
+                }
+            } else {
+                (
+                    index_nl_info,
+                    left_filter.clone(),
+                    right_filter.clone(),
+                    false,
+                )
+            };
+
+            if let Some((table_name, lookup_strategy, _inner_col, outer_col)) = index_nl_info {
+                // Index Nested Loop path: only materialize outer (left) side
+                // When swapped, execute right side as outer (with original right filter, now in nl_left_filter)
+                let outer_expr = if swapped {
+                    &join_source.right
+                } else {
+                    &join_source.left
                 };
+                let (outer_result, outer_cols) = self.execute_table_expression_with_filter(
+                    outer_expr,
+                    ctx,
+                    nl_left_filter.as_ref(),
+                )?;
+                let outer_rows = Self::materialize_result(outer_result)?;
 
-                if let Some((table_name, lookup_strategy, _inner_col, outer_col)) = index_nl_info {
-                    // Index Nested Loop path: only materialize outer (left) side
-                    // When swapped, execute right side as outer (with original right filter, now in nl_left_filter)
-                    let outer_expr = if swapped {
-                        &join_source.right
-                    } else {
-                        &join_source.left
-                    };
-                    let (outer_result, outer_cols) = self.execute_table_expression_with_filter(
-                        outer_expr,
-                        ctx,
-                        nl_left_filter.as_ref(),
-                    )?;
-                    let outer_rows = Self::materialize_result(outer_result)?;
-
-                    // Find the outer key index in outer columns
-                    let outer_col_lower = outer_col.to_lowercase();
-                    let outer_key_idx = outer_cols
-                        .iter()
-                        .position(|c| c.to_lowercase() == outer_col_lower)
-                        .or_else(|| {
-                            // Try unqualified match
-                            let outer_unqualified = outer_col_lower
+                // Find the outer key index in outer columns
+                let outer_col_lower = outer_col.to_lowercase();
+                let outer_key_idx = outer_cols
+                    .iter()
+                    .position(|c| c.to_lowercase() == outer_col_lower)
+                    .or_else(|| {
+                        // Try unqualified match
+                        let outer_unqualified = outer_col_lower
+                            .rfind('.')
+                            .map(|p| &outer_col_lower[p + 1..])
+                            .unwrap_or(&outer_col_lower);
+                        outer_cols.iter().position(|c| {
+                            let c_lower = c.to_lowercase();
+                            let c_unqualified = c_lower
                                 .rfind('.')
-                                .map(|p| &outer_col_lower[p + 1..])
-                                .unwrap_or(&outer_col_lower);
-                            outer_cols.iter().position(|c| {
-                                let c_lower = c.to_lowercase();
-                                let c_unqualified = c_lower
-                                    .rfind('.')
-                                    .map(|p| &c_lower[p + 1..])
-                                    .unwrap_or(&c_lower);
-                                c_unqualified == outer_unqualified
+                                .map(|p| &c_lower[p + 1..])
+                                .unwrap_or(&c_lower);
+                            c_unqualified == outer_unqualified
+                        })
+                    });
+
+                if let Some(outer_idx) = outer_key_idx {
+                    // Get inner table for schema and row fetching
+                    let txn = self.engine.begin_transaction()?;
+                    let inner_table = txn.get_table(&table_name)?;
+                    let inner_schema = inner_table.schema();
+
+                    // Build inner columns list (qualified)
+                    // When swapped, inner table alias is the original left alias
+                    let inner_alias = if swapped {
+                        left_alias.as_deref().unwrap_or(&table_name)
+                    } else {
+                        right_alias.as_deref().unwrap_or(&table_name)
+                    };
+                    let inner_cols: Vec<String> = inner_schema
+                        .columns
+                        .iter()
+                        .map(|col| format!("{}.{}", inner_alias, col.name))
+                        .collect();
+
+                    // Compute join limit if applicable
+                    let has_group_by = !stmt.group_by.columns.is_empty();
+                    let has_aggregation = self.has_aggregation(stmt);
+                    let can_push_limit = !join_type.contains("FULL")
+                        && stmt.order_by.is_empty()
+                        && !has_group_by
+                        && !has_aggregation;
+
+                    let join_limit = if can_push_limit {
+                        stmt.limit.as_ref().and_then(|limit_expr| {
+                            ExpressionEval::compile(limit_expr, &[])
+                                .ok()
+                                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                                .and_then(|v| match v {
+                                    Value::Integer(n) if n >= 0 => Some(n as u64),
+                                    _ => None,
+                                })
+                        })
+                    } else {
+                        None
+                    };
+
+                    // Build all columns for combined row
+                    // When swapped, result order is outer(orig_right), inner(orig_left)
+                    // But we need final order to be: orig_left, orig_right
+                    let (all_columns, _orig_left_cols, _orig_right_cols) = if swapped {
+                        // Swapped: outer=orig_right, inner=orig_left
+                        let mut all = inner_cols.clone(); // orig_left first
+                        all.extend(outer_cols.clone()); // orig_right second
+                        (all, inner_cols.clone(), outer_cols.clone())
+                    } else {
+                        // Not swapped: outer=orig_left, inner=orig_right
+                        let mut all = outer_cols.clone(); // orig_left first
+                        all.extend(inner_cols.clone()); // orig_right second
+                        (all, outer_cols.clone(), inner_cols.clone())
+                    };
+
+                    // Create residual filter from nl_right_filter if present
+                    // This allows early termination during Index Nested Loop
+                    let residual_filter = if let Some(ref rf) = nl_right_filter {
+                        // Re-qualify the filter with inner table alias
+                        let qualified_rf = add_table_qualifier(rf, inner_alias);
+                        JoinFilter::new(
+                            &qualified_rf,
+                            &outer_cols,
+                            &inner_cols,
+                            &self.function_registry,
+                        )
+                        .ok()
+                    } else {
+                        None
+                    };
+
+                    // Execute Index Nested Loop Join with residual filter
+                    let result_rows = self.execute_index_nested_loop_join(
+                        &outer_rows,
+                        inner_table.as_ref(),
+                        &lookup_strategy,
+                        outer_idx,
+                        residual_filter.as_ref(),
+                        &join_type,
+                        outer_cols.len(),
+                        inner_cols.len(),
+                        join_limit,
+                    )?;
+
+                    // When swapped, reorder columns from (outer, inner) to (orig_left, orig_right)
+                    let result_rows = if swapped {
+                        // Result is (outer=orig_right, inner=orig_left), need (orig_left, orig_right)
+                        let _orig_left_count = inner_cols.len();
+                        let orig_right_count = outer_cols.len();
+                        result_rows
+                            .into_iter()
+                            .map(|row| {
+                                let values = row.as_slice();
+                                // Reorder: [outer(orig_right), inner(orig_left)] -> [orig_left, orig_right]
+                                let mut new_values = Vec::with_capacity(values.len());
+                                // First add inner values (which are orig_left)
+                                new_values.extend(values[orig_right_count..].iter().cloned());
+                                // Then add outer values (which are orig_right)
+                                new_values.extend(values[..orig_right_count].iter().cloned());
+                                Row::from_values(new_values)
                             })
-                        });
+                            .collect()
+                    } else {
+                        result_rows
+                    };
 
-                    if let Some(outer_idx) = outer_key_idx {
-                        // Get inner table for schema and row fetching
-                        let txn = self.engine.begin_transaction()?;
-                        let inner_table = txn.get_table(&table_name)?;
-                        let inner_schema = inner_table.schema();
+                    // No need to apply right_filter again - it was applied during the join
+                    let mut final_rows = result_rows;
 
-                        // Build inner columns list (qualified)
-                        // When swapped, inner table alias is the original left alias
-                        let inner_alias = if swapped {
-                            left_alias.as_deref().unwrap_or(&table_name)
-                        } else {
-                            right_alias.as_deref().unwrap_or(&table_name)
-                        };
-                        let inner_cols: Vec<String> = inner_schema
-                            .columns
+                    // Apply cross-table WHERE filters if any
+                    if let Some(ref cross) = cross_filter {
+                        let filter = RowFilter::new(cross, &all_columns)?;
+                        final_rows.retain(|row| filter.matches(row));
+                    }
+
+                    // Apply ORDER BY if present
+                    if !stmt.order_by.is_empty() {
+                        // Build sort specs by evaluating ORDER BY expressions
+                        let mut evaluator = CompiledEvaluator::new(&self.function_registry);
+                        evaluator = evaluator.with_context(ctx);
+                        evaluator.init_columns(&all_columns);
+
+                        // Compute sort keys and indices
+                        let sort_keys: Vec<Vec<Value>> = final_rows
                             .iter()
-                            .map(|col| format!("{}.{}", inner_alias, col.name))
+                            .map(|row| {
+                                evaluator.set_row_array(row);
+                                stmt.order_by
+                                    .iter()
+                                    .map(|ob| {
+                                        evaluator
+                                            .evaluate(&ob.expression)
+                                            .unwrap_or(Value::null_unknown())
+                                    })
+                                    .collect()
+                            })
                             .collect();
 
-                        // Compute join limit if applicable
-                        let has_group_by = !stmt.group_by.columns.is_empty();
-                        let has_aggregation = self.has_aggregation(stmt);
-                        let can_push_limit = !join_type.contains("FULL")
-                            && stmt.order_by.is_empty()
-                            && !has_group_by
-                            && !has_aggregation;
+                        // Sort by indices
+                        let mut indices: Vec<usize> = (0..final_rows.len()).collect();
+                        indices.sort_by(|&a, &b| {
+                            for (i, ob) in stmt.order_by.iter().enumerate() {
+                                let av = &sort_keys[a][i];
+                                let bv = &sort_keys[b][i];
+                                let asc = ob.ascending;
+                                let nulls_first = ob.nulls_first.unwrap_or(!asc);
 
-                        let join_limit = if can_push_limit {
-                            stmt.limit.as_ref().and_then(|limit_expr| {
-                                ExpressionEval::compile(limit_expr, &[])
+                                let cmp = if av.is_null() && bv.is_null() {
+                                    Ordering::Equal
+                                } else if av.is_null() {
+                                    if nulls_first {
+                                        Ordering::Less
+                                    } else {
+                                        Ordering::Greater
+                                    }
+                                } else if bv.is_null() {
+                                    if nulls_first {
+                                        Ordering::Greater
+                                    } else {
+                                        Ordering::Less
+                                    }
+                                } else {
+                                    join::compare_values(av, bv)
+                                };
+
+                                let cmp = if asc { cmp } else { cmp.reverse() };
+                                if cmp != Ordering::Equal {
+                                    return cmp;
+                                }
+                            }
+                            Ordering::Equal
+                        });
+
+                        // Reorder rows
+                        final_rows = indices.into_iter().map(|i| final_rows[i].clone()).collect();
+
+                        // Apply LIMIT/OFFSET after sorting
+                        let offset = stmt
+                            .offset
+                            .as_ref()
+                            .and_then(|e| {
+                                ExpressionEval::compile(e, &[])
                                     .ok()
-                                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                                    .and_then(|eval| eval.with_context(ctx).eval_slice(&[]).ok())
                                     .and_then(|v| match v {
-                                        Value::Integer(n) if n >= 0 => Some(n as u64),
+                                        Value::Integer(n) if n >= 0 => Some(n as usize),
                                         _ => None,
                                     })
                             })
-                        } else {
-                            None
-                        };
+                            .unwrap_or(0);
 
-                        // Build all columns for combined row
-                        // When swapped, result order is outer(orig_right), inner(orig_left)
-                        // But we need final order to be: orig_left, orig_right
-                        let (all_columns, _orig_left_cols, _orig_right_cols) = if swapped {
-                            // Swapped: outer=orig_right, inner=orig_left
-                            let mut all = inner_cols.clone(); // orig_left first
-                            all.extend(outer_cols.clone()); // orig_right second
-                            (all, inner_cols.clone(), outer_cols.clone())
-                        } else {
-                            // Not swapped: outer=orig_left, inner=orig_right
-                            let mut all = outer_cols.clone(); // orig_left first
-                            all.extend(inner_cols.clone()); // orig_right second
-                            (all, outer_cols.clone(), inner_cols.clone())
-                        };
+                        let limit = stmt
+                            .limit
+                            .as_ref()
+                            .and_then(|e| {
+                                ExpressionEval::compile(e, &[])
+                                    .ok()
+                                    .and_then(|eval| eval.with_context(ctx).eval_slice(&[]).ok())
+                                    .and_then(|v| match v {
+                                        Value::Integer(n) if n >= 0 => Some(n as usize),
+                                        _ => None,
+                                    })
+                            })
+                            .unwrap_or(usize::MAX);
 
-                        // Create residual filter from nl_right_filter if present
-                        // This allows early termination during Index Nested Loop
-                        let residual_filter = if let Some(ref rf) = nl_right_filter {
-                            // Re-qualify the filter with inner table alias
-                            let qualified_rf = add_table_qualifier(rf, inner_alias);
-                            JoinFilter::new(
-                                &qualified_rf,
-                                &outer_cols,
-                                &inner_cols,
-                                &self.function_registry,
-                            )
-                            .ok()
-                        } else {
-                            None
-                        };
+                        final_rows = final_rows.into_iter().skip(offset).take(limit).collect();
+                    }
 
-                        // Execute Index Nested Loop Join with residual filter
-                        let result_rows = self.execute_index_nested_loop_join(
-                            &outer_rows,
-                            inner_table.as_ref(),
-                            &lookup_strategy,
-                            outer_idx,
-                            residual_filter.as_ref(),
-                            &join_type,
-                            outer_cols.len(),
-                            inner_cols.len(),
-                            join_limit,
-                        )?;
+                    // Check for aggregation/window functions that need special handling
+                    let has_agg = self.has_aggregation(stmt);
+                    let has_window = self.has_window_functions(stmt);
 
-                        // When swapped, reorder columns from (outer, inner) to (orig_left, orig_right)
-                        let result_rows = if swapped {
-                            // Result is (outer=orig_right, inner=orig_left), need (orig_left, orig_right)
-                            let _orig_left_count = inner_cols.len();
-                            let orig_right_count = outer_cols.len();
-                            result_rows
-                                .into_iter()
-                                .map(|row| {
-                                    let values = row.as_slice();
-                                    // Reorder: [outer(orig_right), inner(orig_left)] -> [orig_left, orig_right]
-                                    let mut new_values = Vec::with_capacity(values.len());
-                                    // First add inner values (which are orig_left)
-                                    new_values.extend(values[orig_right_count..].iter().cloned());
-                                    // Then add outer values (which are orig_right)
-                                    new_values.extend(values[..orig_right_count].iter().cloned());
-                                    Row::from_values(new_values)
-                                })
-                                .collect()
-                        } else {
-                            result_rows
-                        };
+                    if has_agg || has_window {
+                        // Fall through to standard path for aggregation/window handling
+                        // Don't return early - let the standard path handle these
+                    } else {
+                        // Project rows according to SELECT expressions
+                        let projected_rows =
+                            self.project_rows(&stmt.columns, final_rows, &all_columns, ctx)?;
+                        let output_columns =
+                            self.get_output_column_names(&stmt.columns, &all_columns, None);
 
-                        // No need to apply right_filter again - it was applied during the join
-                        let mut final_rows = result_rows;
-
-                        // Apply cross-table WHERE filters if any
-                        if let Some(ref cross) = cross_filter {
-                            let filter = RowFilter::new(cross, &all_columns)?;
-                            final_rows.retain(|row| filter.matches(row));
-                        }
-
-                        // Apply ORDER BY if present
-                        if !stmt.order_by.is_empty() {
-                            // Build sort specs by evaluating ORDER BY expressions
-                            let mut evaluator = CompiledEvaluator::new(&self.function_registry);
-                            evaluator = evaluator.with_context(ctx);
-                            evaluator.init_columns(&all_columns);
-
-                            // Compute sort keys and indices
-                            let sort_keys: Vec<Vec<Value>> = final_rows
-                                .iter()
-                                .map(|row| {
-                                    evaluator.set_row_array(row);
-                                    stmt.order_by
-                                        .iter()
-                                        .map(|ob| {
-                                            evaluator
-                                                .evaluate(&ob.expression)
-                                                .unwrap_or(Value::null_unknown())
-                                        })
-                                        .collect()
-                                })
-                                .collect();
-
-                            // Sort by indices
-                            let mut indices: Vec<usize> = (0..final_rows.len()).collect();
-                            indices.sort_by(|&a, &b| {
-                                for (i, ob) in stmt.order_by.iter().enumerate() {
-                                    let av = &sort_keys[a][i];
-                                    let bv = &sort_keys[b][i];
-                                    let asc = ob.ascending;
-                                    let nulls_first = ob.nulls_first.unwrap_or(!asc);
-
-                                    let cmp = if av.is_null() && bv.is_null() {
-                                        Ordering::Equal
-                                    } else if av.is_null() {
-                                        if nulls_first {
-                                            Ordering::Less
-                                        } else {
-                                            Ordering::Greater
-                                        }
-                                    } else if bv.is_null() {
-                                        if nulls_first {
-                                            Ordering::Greater
-                                        } else {
-                                            Ordering::Less
-                                        }
-                                    } else {
-                                        join::compare_values(av, bv)
-                                    };
-
-                                    let cmp = if asc { cmp } else { cmp.reverse() };
-                                    if cmp != Ordering::Equal {
-                                        return cmp;
-                                    }
-                                }
-                                Ordering::Equal
-                            });
-
-                            // Reorder rows
-                            final_rows =
-                                indices.into_iter().map(|i| final_rows[i].clone()).collect();
-
-                            // Apply LIMIT/OFFSET after sorting
-                            let offset = stmt
-                                .offset
-                                .as_ref()
-                                .and_then(|e| {
-                                    ExpressionEval::compile(e, &[])
-                                        .ok()
-                                        .and_then(|eval| {
-                                            eval.with_context(ctx).eval_slice(&[]).ok()
-                                        })
-                                        .and_then(|v| match v {
-                                            Value::Integer(n) if n >= 0 => Some(n as usize),
-                                            _ => None,
-                                        })
-                                })
-                                .unwrap_or(0);
-
-                            let limit = stmt
-                                .limit
-                                .as_ref()
-                                .and_then(|e| {
-                                    ExpressionEval::compile(e, &[])
-                                        .ok()
-                                        .and_then(|eval| {
-                                            eval.with_context(ctx).eval_slice(&[]).ok()
-                                        })
-                                        .and_then(|v| match v {
-                                            Value::Integer(n) if n >= 0 => Some(n as usize),
-                                            _ => None,
-                                        })
-                                })
-                                .unwrap_or(usize::MAX);
-
-                            final_rows = final_rows.into_iter().skip(offset).take(limit).collect();
-                        }
-
-                        // Check for aggregation/window functions that need special handling
-                        let has_agg = self.has_aggregation(stmt);
-                        let has_window = self.has_window_functions(stmt);
-
-                        if has_agg || has_window {
-                            // Fall through to standard path for aggregation/window handling
-                            // Don't return early - let the standard path handle these
-                        } else {
-                            // Project rows according to SELECT expressions
-                            let projected_rows =
-                                self.project_rows(&stmt.columns, final_rows, &all_columns, ctx)?;
-                            let output_columns =
-                                self.get_output_column_names(&stmt.columns, &all_columns, None);
-
-                            // Return with projected results
-                            let result =
-                                ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
-                            return Ok((Box::new(result), output_columns, false));
-                        }
+                        // Return with projected results
+                        let result =
+                            ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+                        return Ok((Box::new(result), output_columns, false));
                     }
                 }
+            }
 
-                // Standard path: execute both sides normally
-                let (left_result, left_cols) = self.execute_table_expression_with_filter(
-                    &join_source.left,
-                    ctx,
-                    left_filter.as_ref(),
-                )?;
+            // Standard path: execute both sides normally
+            let (left_result, left_cols) = self.execute_table_expression_with_filter(
+                &join_source.left,
+                ctx,
+                left_filter.as_ref(),
+            )?;
 
-                let (right_result, right_cols) = self.execute_table_expression_with_filter(
-                    &join_source.right,
-                    ctx,
-                    right_filter.as_ref(),
-                )?;
+            let (right_result, right_cols) = self.execute_table_expression_with_filter(
+                &join_source.right,
+                ctx,
+                right_filter.as_ref(),
+            )?;
 
-                let left_rows = Self::materialize_result(left_result)?;
-                let right_rows = Self::materialize_result(right_result)?;
+            let left_rows = Self::materialize_result(left_result)?;
+            let right_rows = Self::materialize_result(right_result)?;
 
-                (left_rows, left_cols, right_rows, right_cols)
-            };
+            (left_rows, left_cols, right_rows, right_cols)
+        };
 
         // Combine column names (qualified with table aliases)
         let mut all_columns = left_columns.clone();
@@ -2803,20 +2991,27 @@ impl Executor {
             // Compute safe LIMIT for pushdown to hash join
             // LIMIT can only be pushed when:
             // - It's an INNER JOIN, LEFT JOIN, or RIGHT JOIN (not FULL OUTER)
-            // - No residual conditions to apply after join
             // - No ORDER BY (would need all rows to sort first)
             // - No remaining cross-table WHERE conditions
             // - No GROUP BY or aggregation (needs all rows to form correct groups)
             // Note: LEFT/RIGHT JOINs can early-terminate because each probe row
             // contributes to output (either matches or NULL-padded)
+            // Note: For INNER JOINs with residual conditions, we can still push LIMIT
+            // by applying residual filters during the join probe phase
             let has_group_by = !stmt.group_by.columns.is_empty();
             let has_aggregation = self.has_aggregation(stmt);
-            let can_push_limit = !join_type.contains("FULL")
-                && residual.is_empty()
+            let is_inner_join = !join_type.contains("LEFT")
+                && !join_type.contains("RIGHT")
+                && !join_type.contains("FULL");
+
+            // For INNER JOINs, residual filters can be applied during join (allows LIMIT pushdown)
+            // For OUTER JOINs, residual must be applied after (NULL-padded rows need special handling)
+            let can_push_limit_base = !join_type.contains("FULL")
                 && stmt.order_by.is_empty()
                 && cross_filter.is_none()
                 && !has_group_by
                 && !has_aggregation;
+            let can_push_limit = can_push_limit_base && (residual.is_empty() || is_inner_join);
 
             let join_limit = if can_push_limit {
                 // Extract LIMIT value if present
@@ -2843,7 +3038,25 @@ impl Executor {
                     // - Outer join restrictions (LEFT/RIGHT/FULL joins need specific build sides)
                     // - Bloom filter optimization
                     // - Early termination when limit is pushed
-                    let mut rows = self.execute_hash_join(
+                    // - Residual filter application during probe for INNER JOINs
+
+                    // For INNER JOINs with residual, compile filters and apply during probe
+                    // This enables early termination with LIMIT
+                    let use_inline_residual = is_inner_join && !residual.is_empty();
+                    let residual_filters: Vec<RowFilter> = if use_inline_residual {
+                        residual
+                            .iter()
+                            .filter_map(|cond| {
+                                RowFilter::new(cond, &all_columns)
+                                    .ok()
+                                    .map(|f| f.with_context(ctx))
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    let mut rows = self.execute_hash_join_with_residual(
                         &left_rows,
                         &right_rows,
                         &left_key_indices,
@@ -2852,12 +3065,12 @@ impl Executor {
                         left_columns.len(),
                         right_columns.len(),
                         join_limit,
+                        &residual_filters,
                     )?;
 
-                    // Apply residual conditions (non-equality parts of ON clause)
-                    // For OUTER JOINs, we need special handling: rows with NULLs from the
-                    // padded side should be preserved even if residual conditions fail
-                    if !residual.is_empty() {
+                    // Apply residual conditions for OUTER JOINs (need special NULL-row handling)
+                    // Skip for INNER JOINs where residual was already applied during probe
+                    if !residual.is_empty() && !use_inline_residual {
                         self.apply_residual_conditions(
                             &mut rows,
                             &residual,
@@ -5329,21 +5542,100 @@ impl Executor {
             }
         }
 
-        // For NOT IN, we can't easily use the index (would need to exclude rows)
-        // Fall back to normal scan
-        if is_negated {
-            return Ok(None);
-        }
-
         // Collect row_ids: either from PK (direct) or from index probe
         let mut all_row_ids = Vec::new();
         if is_pk_column {
-            // PRIMARY KEY: the value IS the row_id (for INTEGER PK)
-            for value in &values {
-                if let Value::Integer(id) = value {
-                    all_row_ids.push(*id);
+            if is_negated {
+                // NOT IN optimization for INTEGER PRIMARY KEY:
+                // Instead of scanning the table, iterate through row_ids and exclude
+                // This is O(row_count) but with O(1) hashset lookup, which is faster
+                // than table scan because we only touch row_ids, not full rows
+                let exclusion_set: std::collections::HashSet<i64> = values
+                    .iter()
+                    .filter_map(|v| {
+                        if let Value::Integer(id) = v {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Calculate LIMIT + OFFSET to know how many row_ids we need
+                let offset = stmt
+                    .offset
+                    .as_ref()
+                    .and_then(|e| {
+                        ExpressionEval::compile(e, &[])
+                            .ok()
+                            .and_then(|eval| eval.with_context(ctx).eval_slice(&[]).ok())
+                            .and_then(|v| {
+                                if let Value::Integer(o) = v {
+                                    Some(o.max(0) as usize)
+                                } else {
+                                    None
+                                }
+                            })
+                    })
+                    .unwrap_or(0);
+
+                let limit = stmt
+                    .limit
+                    .as_ref()
+                    .and_then(|e| {
+                        ExpressionEval::compile(e, &[])
+                            .ok()
+                            .and_then(|eval| eval.with_context(ctx).eval_slice(&[]).ok())
+                            .and_then(|v| {
+                                if let Value::Integer(l) = v {
+                                    Some(l.max(0) as usize)
+                                } else {
+                                    None
+                                }
+                            })
+                    })
+                    .unwrap_or(usize::MAX);
+
+                let target = if limit == usize::MAX {
+                    usize::MAX
+                } else {
+                    offset.saturating_add(limit)
+                };
+
+                // Iterate through row_ids and collect non-excluded ones
+                // Row IDs are typically 1-based and sequential
+                let row_count = table.row_count();
+                for row_id in 1..=(row_count as i64) {
+                    if !exclusion_set.contains(&row_id) {
+                        all_row_ids.push(row_id);
+                        if all_row_ids.len() >= target {
+                            break;
+                        }
+                    }
+                }
+
+                // Apply offset
+                if offset > 0 && offset < all_row_ids.len() {
+                    all_row_ids = all_row_ids.split_off(offset);
+                } else if offset >= all_row_ids.len() {
+                    all_row_ids.clear();
+                }
+
+                // Apply limit
+                if limit < all_row_ids.len() {
+                    all_row_ids.truncate(limit);
+                }
+            } else {
+                // IN: PRIMARY KEY - the value IS the row_id (for INTEGER PK)
+                for value in &values {
+                    if let Value::Integer(id) = value {
+                        all_row_ids.push(*id);
+                    }
                 }
             }
+        } else if is_negated {
+            // NOT IN with non-PK index: fall back to normal scan
+            return Ok(None);
         } else if let Some(ref idx) = index {
             // Index probe for each value
             for value in &values {
@@ -5352,9 +5644,11 @@ impl Executor {
             }
         }
 
-        // Remove duplicates and sort for efficient batch fetch
-        all_row_ids.sort_unstable();
-        all_row_ids.dedup();
+        // Remove duplicates and sort for efficient batch fetch (only for IN, NOT IN is already ordered)
+        if !is_negated {
+            all_row_ids.sort_unstable();
+            all_row_ids.dedup();
+        }
 
         // EARLY LIMIT OPTIMIZATION: When there's no ORDER BY and no remaining predicate,
         // we can apply LIMIT early to avoid fetching unnecessary rows
@@ -5813,11 +6107,6 @@ impl Executor {
                 None => return Ok(None),
             };
 
-        // NOT IN is harder to optimize - fall back to normal scan
-        if is_negated {
-            return Ok(None);
-        }
-
         // Check if this is a PRIMARY KEY column (O(1) lookup) or has an index
         let schema = table.schema();
         let pk_indices = schema.primary_key_indices();
@@ -5827,7 +6116,13 @@ impl Executor {
             pk_col_name == column_name
         };
 
-        // If not PK, check for index
+        // For NOT IN (negated), only optimize if it's a PK column
+        // Non-PK NOT IN would require full index scan which isn't much better than table scan
+        if is_negated && !is_pk_column {
+            return Ok(None);
+        }
+
+        // If not PK, check for index (only for non-negated IN)
         let index = if !is_pk_column {
             match table.get_index_on_column(&column_name) {
                 Some(idx) => Some(idx),
@@ -5880,23 +6175,48 @@ impl Executor {
         // With early termination target, stop once we have enough
         let mut all_row_ids = Vec::new();
         if is_pk_column {
-            // PRIMARY KEY: the value IS the row_id (for INTEGER PK)
-            for value in values.iter() {
-                // Early termination check
-                if let Some(target) = early_termination_target {
-                    if all_row_ids.len() >= target {
-                        break;
-                    }
-                }
-                match value {
-                    Value::Integer(id) => all_row_ids.push(*id),
-                    Value::Float(f) => {
-                        // Handle case where integer was stored as float
-                        if f.fract() == 0.0 {
-                            all_row_ids.push(*f as i64);
+            if is_negated {
+                // NOT IN optimization for INTEGER PRIMARY KEY (from NOT EXISTS semi-join):
+                // Iterate through row_ids and exclude those in the hash set
+                let exclusion_set: std::collections::HashSet<i64> = values
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Integer(id) => Some(*id),
+                        Value::Float(f) if f.fract() == 0.0 => Some(*f as i64),
+                        _ => None,
+                    })
+                    .collect();
+
+                let target = early_termination_target.unwrap_or(usize::MAX);
+                let row_count = table.row_count();
+
+                for row_id in 1..=(row_count as i64) {
+                    if !exclusion_set.contains(&row_id) {
+                        all_row_ids.push(row_id);
+                        if all_row_ids.len() >= target {
+                            break;
                         }
                     }
-                    _ => {}
+                }
+            } else {
+                // IN: PRIMARY KEY - the value IS the row_id (for INTEGER PK)
+                for value in values.iter() {
+                    // Early termination check
+                    if let Some(target) = early_termination_target {
+                        if all_row_ids.len() >= target {
+                            break;
+                        }
+                    }
+                    match value {
+                        Value::Integer(id) => all_row_ids.push(*id),
+                        Value::Float(f) => {
+                            // Handle case where integer was stored as float
+                            if f.fract() == 0.0 {
+                                all_row_ids.push(*f as i64);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         } else if let Some(ref idx) = index {
@@ -6569,7 +6889,7 @@ impl Executor {
     ///
     /// The outer_key_idx will be determined after materializing the outer side.
     #[allow(clippy::type_complexity)]
-    fn check_index_nested_loop_opportunity(
+    pub(crate) fn check_index_nested_loop_opportunity(
         &self,
         right_expr: &Expression,
         join_condition: Option<&Expression>,
@@ -6784,6 +7104,321 @@ impl Executor {
                 false
             }
         })
+    }
+
+    /// Extract simple aggregations from SELECT columns
+    /// Returns Vec of (function_name, column_name, optional_alias)
+    fn extract_aggregations_simple(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Vec<(String, String, Option<String>)> {
+        let mut result = Vec::new();
+
+        for col in &stmt.columns {
+            match col {
+                Expression::FunctionCall(fc) => {
+                    let func_upper = fc.function.to_uppercase();
+                    if matches!(func_upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                        let col_name = if fc.arguments.is_empty() {
+                            "*".to_string()
+                        } else if let Some(Expression::Star(_)) = fc.arguments.first() {
+                            "*".to_string()
+                        } else if let Some(Expression::Identifier(id)) = fc.arguments.first() {
+                            id.value_lower.clone()
+                        } else {
+                            continue; // Skip complex expressions
+                        };
+                        result.push((func_upper, col_name, None));
+                    }
+                }
+                Expression::Aliased(aliased) => {
+                    if let Expression::FunctionCall(fc) = aliased.expression.as_ref() {
+                        let func_upper = fc.function.to_uppercase();
+                        if matches!(func_upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                            let col_name = if fc.arguments.is_empty() {
+                                "*".to_string()
+                            } else if let Some(Expression::Star(_)) = fc.arguments.first() {
+                                "*".to_string()
+                            } else if let Some(Expression::Identifier(id)) = fc.arguments.first() {
+                                id.value_lower.clone()
+                            } else {
+                                continue; // Skip complex expressions
+                            };
+                            result.push((func_upper, col_name, Some(aliased.alias.value.clone())));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        result
+    }
+
+    /// Streaming GROUP BY optimization using B-tree index
+    ///
+    /// For queries like `SELECT user_id, SUM(amount) FROM orders GROUP BY user_id`
+    /// where user_id has a B-tree index, we can iterate through the index in sorted
+    /// order and aggregate each group without using a hash map. This is similar to
+    /// SQLite's sorted GROUP BY approach.
+    ///
+    /// Benefits:
+    /// - O(1) memory per group instead of O(groups) hash map
+    /// - Better cache locality (sequential access)
+    /// - Avoids hash computation overhead
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn try_streaming_group_by(
+        &self,
+        stmt: &SelectStatement,
+        table: &dyn crate::storage::traits::Table,
+        all_columns: &[String],
+        ctx: &ExecutionContext,
+    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+        use crate::core::IndexType;
+
+        // Only single-column GROUP BY is supported for now
+        if stmt.group_by.columns.len() != 1 {
+            return Ok(None);
+        }
+
+        // Check if GROUP BY is a simple column reference
+        let group_col_name = match &stmt.group_by.columns[0] {
+            Expression::Identifier(id) => id.value_lower.clone(),
+            _ => return Ok(None),
+        };
+
+        // Check for B-tree index on GROUP BY column
+        let btree_index = match table.get_index_on_column(&group_col_name) {
+            Some(idx) if idx.index_type() == IndexType::BTree => idx,
+            _ => return Ok(None),
+        };
+
+        // Get grouped row IDs from the index (in sorted order)
+        // NOTE: get_grouped_row_ids() returns None if the index doesn't support
+        // ordered group access (e.g., index closed, or index type doesn't support it).
+        // This is intentional fallback - the caller will use the regular GROUP BY path.
+        let grouped_row_ids = match btree_index.get_grouped_row_ids() {
+            Some(groups) => groups,
+            None => return Ok(None), // Fall back to regular GROUP BY
+        };
+
+        // Extract aggregations from SELECT columns
+        let aggregations = self.extract_aggregations_simple(stmt);
+        if aggregations.is_empty() {
+            return Ok(None);
+        }
+
+        // Check for simple aggregates (SUM, COUNT) only
+        // More complex aggregates like AVG, STDDEV are not supported yet
+        #[derive(Clone, Copy)]
+        enum StreamingAgg {
+            Count,
+            Sum(usize), // column index
+        }
+
+        let mut simple_aggs: Vec<StreamingAgg> = Vec::with_capacity(aggregations.len());
+        for (func_name, col_name, _alias) in &aggregations {
+            match func_name.as_str() {
+                "COUNT" => simple_aggs.push(StreamingAgg::Count),
+                "SUM" => {
+                    // Find the column index for SUM argument
+                    let col_idx = all_columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(col_name));
+                    match col_idx {
+                        Some(idx) => simple_aggs.push(StreamingAgg::Sum(idx)),
+                        None => return Ok(None),
+                    }
+                }
+                _ => return Ok(None), // Unsupported aggregate
+            }
+        }
+
+        // Check for simple HAVING filter
+        let having_filter: Option<(usize, f64, bool)> = if let Some(ref having) = stmt.having {
+            // Only support simple comparisons: agg_expr > constant
+            match &**having {
+                Expression::Infix(infix) => {
+                    if infix.operator != ">" && infix.operator != ">=" {
+                        return Ok(None);
+                    }
+                    // Left side should be an aggregate function
+                    let agg_idx = match infix.left.as_ref() {
+                        Expression::FunctionCall(fc) => {
+                            let func_upper = fc.function.to_uppercase();
+                            aggregations
+                                .iter()
+                                .position(|(name, _, _)| name == &func_upper)
+                        }
+                        _ => None,
+                    };
+                    // Right side should be a constant
+                    let threshold = match infix.right.as_ref() {
+                        Expression::IntegerLiteral(n) => Some(n.value as f64),
+                        Expression::FloatLiteral(f) => Some(f.value),
+                        _ => None,
+                    };
+                    match (agg_idx, threshold) {
+                        (Some(idx), Some(thresh)) => Some((idx, thresh, infix.operator == ">=")),
+                        _ => return Ok(None), // Unsupported HAVING
+                    }
+                }
+                _ => return Ok(None),
+            }
+        } else {
+            None
+        };
+
+        // Build result columns
+        let mut result_columns = Vec::with_capacity(1 + aggregations.len());
+        result_columns.push(group_col_name.clone());
+        for (func_name, col_name, alias) in &aggregations {
+            let col_name = if let Some(ref a) = alias {
+                a.clone()
+            } else if col_name == "*" {
+                format!("{}(*)", func_name)
+            } else {
+                format!("{}({})", func_name, col_name)
+            };
+            result_columns.push(col_name);
+        }
+
+        // Streaming aggregation: iterate through groups in sorted order
+        let mut result_rows = Vec::new();
+        let num_aggs = simple_aggs.len();
+
+        // Parse LIMIT for early termination (only when no HAVING, since HAVING can filter groups)
+        let limit_for_early_exit = if having_filter.is_none() {
+            stmt.limit.as_ref().and_then(|limit_expr| {
+                ExpressionEval::compile(limit_expr, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|v| match v {
+                        Value::Integer(n) if n > 0 => Some(n as usize),
+                        _ => None,
+                    })
+            })
+        } else {
+            None
+        };
+
+        // Check if we need to fetch rows at all
+        // If all aggregates are COUNT, we can use row_ids.len() directly
+        let needs_row_fetch = simple_aggs
+            .iter()
+            .any(|a| matches!(a, StreamingAgg::Sum(_)));
+
+        for (group_value, row_ids) in grouped_row_ids {
+            // Early termination: if we have enough rows and no HAVING filter, stop
+            if let Some(limit) = limit_for_early_exit {
+                if result_rows.len() >= limit {
+                    break;
+                }
+            }
+
+            // Aggregate
+            let mut agg_values = vec![0.0f64; num_aggs];
+            let mut agg_has_value = vec![false; num_aggs];
+            let mut counts = vec![0i64; num_aggs];
+
+            // Optimization: For COUNT-only aggregates, use row_ids.len() directly
+            let row_count = row_ids.len() as i64;
+
+            if needs_row_fetch {
+                // Create a true expression for fetching all rows (no filter)
+                use crate::storage::expression::logical::ConstBoolExpr;
+                let true_expr = ConstBoolExpr::true_expr();
+
+                // Fetch rows for this group (returns Vec<(row_id, Row)>)
+                let fetched_rows = table.fetch_rows_by_ids(&row_ids, &true_expr);
+
+                for (_row_id, row) in &fetched_rows {
+                    for (i, agg) in simple_aggs.iter().enumerate() {
+                        match agg {
+                            StreamingAgg::Count => {
+                                counts[i] += 1;
+                            }
+                            StreamingAgg::Sum(col_idx) => {
+                                if let Some(value) = row.get(*col_idx) {
+                                    match value {
+                                        Value::Integer(v) => {
+                                            agg_values[i] += *v as f64;
+                                            agg_has_value[i] = true;
+                                        }
+                                        Value::Float(v) => {
+                                            agg_values[i] += v;
+                                            agg_has_value[i] = true;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Fast path: All aggregates are COUNT, no row fetch needed
+                for (i, agg) in simple_aggs.iter().enumerate() {
+                    if matches!(agg, StreamingAgg::Count) {
+                        counts[i] = row_count;
+                    }
+                }
+            }
+
+            // Apply HAVING filter
+            if let Some((agg_idx, threshold, inclusive)) = having_filter {
+                let agg_val = match simple_aggs[agg_idx] {
+                    StreamingAgg::Count => counts[agg_idx] as f64,
+                    StreamingAgg::Sum(_) => {
+                        if agg_has_value[agg_idx] {
+                            agg_values[agg_idx]
+                        } else {
+                            continue; // NULL doesn't pass HAVING
+                        }
+                    }
+                };
+                let passes = if inclusive {
+                    agg_val >= threshold
+                } else {
+                    agg_val > threshold
+                };
+                if !passes {
+                    continue;
+                }
+            }
+
+            // Build result row
+            let mut values = Vec::with_capacity(1 + num_aggs);
+            values.push(group_value.clone());
+            for (i, agg) in simple_aggs.iter().enumerate() {
+                let value = match agg {
+                    StreamingAgg::Count => Value::Integer(counts[i]),
+                    StreamingAgg::Sum(_) => {
+                        if agg_has_value[i] {
+                            Value::Float(agg_values[i])
+                        } else {
+                            Value::null_unknown()
+                        }
+                    }
+                };
+                values.push(value);
+            }
+            result_rows.push(Row::from_values(values));
+        }
+
+        // Apply LIMIT if present
+        if let Some(ref limit_expr) = stmt.limit {
+            if let Ok(Value::Integer(n)) = ExpressionEval::compile(limit_expr, &[])
+                .and_then(|e| e.with_context(ctx).eval_slice(&[]))
+            {
+                if n >= 0 {
+                    result_rows.truncate(n as usize);
+                }
+            }
+        }
+
+        let result = ExecutorMemoryResult::new(result_columns.clone(), result_rows);
+        Ok(Some((Box::new(result), result_columns)))
     }
 }
 

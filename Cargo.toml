@@ -34,7 +34,7 @@ anyhow = "1.0"
 
 # Concurrency
 parking_lot = "0.12"
-dashmap = "5.5"
+dashmap = "6"
 crossbeam = "0.8"
 rayon = "1.8"
 
@@ -74,8 +74,9 @@ memchr = "2.6"
 regex = "1.10"
 radsort = "0.1"  # Radix sort - O(n) for integer keys
 rand = "0.9"  # Random number generation for RANDOM() function
-ahash = "0.8"  # Fast hash for hash indexes (~30 GB/s, DOS-resistant)
+ahash = "0.8"  # Fast hash for hash indexes (DOS-resistant)
 roaring = "0.10"  # Compressed bitmap indexes (used by Lucene, Druid, Spark)
+lru = "0.12"  # O(1) LRU cache for compiled expression programs
 
 # Platform-specific file locking
 [target.'cfg(unix)'.dependencies]
@@ -88,7 +89,7 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.4"
 tempfile = "3.9"
-#rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 #duckdb = { version = "1.1", features = ["bundled"] }
 
 [features]

@@ -29,8 +29,11 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use lru::LruCache;
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use super::compiler::{CompileContext, ExprCompiler};
@@ -43,6 +46,270 @@ use crate::parser::ast::Expression;
 use crate::executor::context::ExecutionContext;
 
 // ============================================================================
+// PROGRAM CACHE - Global cache for compiled expression programs
+// ============================================================================
+
+/// Maximum number of cached programs (LRU eviction)
+const PROGRAM_CACHE_SIZE: usize = 256;
+
+/// Global cache for compiled programs using O(1) LRU eviction.
+/// Uses parking_lot::Mutex for efficient locking.
+static PROGRAM_CACHE: Mutex<Option<LruCache<u64, SharedProgram>>> = Mutex::new(None);
+
+/// Compute cache key from expression and columns using efficient recursive hashing.
+/// This avoids the overhead of Debug formatting by directly hashing expression structure.
+fn compute_cache_key(expr: &Expression, columns: &[String]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    // Use efficient recursive hashing (same as CompiledEvaluator::hash_expression)
+    hash_expression(expr, &mut hasher);
+    // Hash column names
+    columns.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Recursively hash an expression without string allocation.
+/// This is O(expression_size) and avoids Debug formatting overhead.
+fn hash_expression(expr: &Expression, hasher: &mut DefaultHasher) {
+    // First hash the discriminant to distinguish variants
+    std::mem::discriminant(expr).hash(hasher);
+
+    match expr {
+        Expression::Identifier(id) => {
+            id.value_lower.hash(hasher);
+        }
+        Expression::QualifiedIdentifier(qid) => {
+            qid.qualifier.value_lower.hash(hasher);
+            qid.name.value_lower.hash(hasher);
+        }
+        Expression::IntegerLiteral(lit) => {
+            lit.value.hash(hasher);
+        }
+        Expression::FloatLiteral(lit) => {
+            lit.value.to_bits().hash(hasher);
+        }
+        Expression::StringLiteral(lit) => {
+            lit.value.hash(hasher);
+            lit.type_hint.hash(hasher);
+        }
+        Expression::BooleanLiteral(lit) => {
+            lit.value.hash(hasher);
+        }
+        Expression::NullLiteral(_) => {
+            // Just discriminant is enough
+        }
+        Expression::IntervalLiteral(lit) => {
+            lit.value.hash(hasher);
+            lit.unit.hash(hasher);
+        }
+        Expression::Parameter(param) => {
+            param.index.hash(hasher);
+            param.name.hash(hasher);
+        }
+        Expression::Prefix(prefix) => {
+            std::mem::discriminant(&prefix.op_type).hash(hasher);
+            hash_expression(&prefix.right, hasher);
+        }
+        Expression::Infix(infix) => {
+            std::mem::discriminant(&infix.op_type).hash(hasher);
+            hash_expression(&infix.left, hasher);
+            hash_expression(&infix.right, hasher);
+        }
+        Expression::List(list) => {
+            list.elements.len().hash(hasher);
+            for val in &list.elements {
+                hash_expression(val, hasher);
+            }
+        }
+        Expression::Distinct(dist) => {
+            hash_expression(&dist.expr, hasher);
+        }
+        Expression::Exists(exists) => {
+            // Hash a stable identifier for the subquery
+            format!("{:?}", exists.subquery).hash(hasher);
+        }
+        Expression::AllAny(aa) => {
+            aa.operator.hash(hasher);
+            std::mem::discriminant(&aa.all_any_type).hash(hasher);
+            hash_expression(&aa.left, hasher);
+            format!("{:?}", aa.subquery).hash(hasher);
+        }
+        Expression::In(in_expr) => {
+            in_expr.not.hash(hasher);
+            hash_expression(&in_expr.left, hasher);
+            hash_expression(&in_expr.right, hasher);
+        }
+        Expression::InHashSet(in_hash) => {
+            in_hash.not.hash(hasher);
+            hash_expression(&in_hash.column, hasher);
+            in_hash.values.len().hash(hasher);
+        }
+        Expression::Between(between) => {
+            between.not.hash(hasher);
+            hash_expression(&between.expr, hasher);
+            hash_expression(&between.lower, hasher);
+            hash_expression(&between.upper, hasher);
+        }
+        Expression::Like(like) => {
+            like.operator.hash(hasher);
+            hash_expression(&like.left, hasher);
+            hash_expression(&like.pattern, hasher);
+            if let Some(ref escape) = like.escape {
+                true.hash(hasher);
+                hash_expression(escape, hasher);
+            } else {
+                false.hash(hasher);
+            }
+        }
+        Expression::ScalarSubquery(sq) => {
+            format!("{:?}", sq.subquery).hash(hasher);
+        }
+        Expression::ExpressionList(list) => {
+            list.expressions.len().hash(hasher);
+            for e in &list.expressions {
+                hash_expression(e, hasher);
+            }
+        }
+        Expression::Case(case) => {
+            if let Some(ref val) = case.value {
+                true.hash(hasher);
+                hash_expression(val, hasher);
+            } else {
+                false.hash(hasher);
+            }
+            case.when_clauses.len().hash(hasher);
+            for when_clause in &case.when_clauses {
+                hash_expression(&when_clause.condition, hasher);
+                hash_expression(&when_clause.then_result, hasher);
+            }
+            if let Some(ref else_val) = case.else_value {
+                true.hash(hasher);
+                hash_expression(else_val, hasher);
+            } else {
+                false.hash(hasher);
+            }
+        }
+        Expression::Cast(cast) => {
+            hash_expression(&cast.expr, hasher);
+            cast.type_name.hash(hasher);
+        }
+        Expression::FunctionCall(func) => {
+            func.function.hash(hasher);
+            func.is_distinct.hash(hasher);
+            func.arguments.len().hash(hasher);
+            for arg in &func.arguments {
+                hash_expression(arg, hasher);
+            }
+            if let Some(ref filter) = func.filter {
+                true.hash(hasher);
+                hash_expression(filter, hasher);
+            } else {
+                false.hash(hasher);
+            }
+        }
+        Expression::Aliased(aliased) => {
+            aliased.alias.value_lower.hash(hasher);
+            hash_expression(&aliased.expression, hasher);
+        }
+        Expression::Window(window) => {
+            window.function.function.hash(hasher);
+            window.function.is_distinct.hash(hasher);
+            window.function.arguments.len().hash(hasher);
+            for arg in &window.function.arguments {
+                hash_expression(arg, hasher);
+            }
+            window.partition_by.len().hash(hasher);
+            for e in &window.partition_by {
+                hash_expression(e, hasher);
+            }
+            window.order_by.len().hash(hasher);
+            for order in &window.order_by {
+                hash_expression(&order.expression, hasher);
+                order.ascending.hash(hasher);
+                order.nulls_first.hash(hasher);
+            }
+        }
+        Expression::TableSource(ts) => {
+            ts.name.value_lower.hash(hasher);
+            if let Some(ref alias) = ts.alias {
+                true.hash(hasher);
+                alias.value_lower.hash(hasher);
+            } else {
+                false.hash(hasher);
+            }
+        }
+        Expression::JoinSource(js) => {
+            format!("{:?}", js).hash(hasher);
+        }
+        Expression::SubquerySource(sq) => {
+            if let Some(ref alias) = sq.alias {
+                true.hash(hasher);
+                alias.value_lower.hash(hasher);
+            } else {
+                false.hash(hasher);
+            }
+            format!("{:?}", sq.subquery).hash(hasher);
+        }
+        Expression::ValuesSource(vs) => {
+            if let Some(ref alias) = vs.alias {
+                true.hash(hasher);
+                alias.value_lower.hash(hasher);
+            } else {
+                false.hash(hasher);
+            }
+            vs.rows.len().hash(hasher);
+        }
+        Expression::CteReference(cte) => {
+            cte.name.value_lower.hash(hasher);
+        }
+        Expression::Star(_) => {
+            // Just discriminant
+        }
+        Expression::QualifiedStar(qs) => {
+            qs.qualifier.hash(hasher);
+        }
+        Expression::Default(_) => {
+            // Just discriminant
+        }
+    }
+}
+
+/// Try to get a cached program, or compile and cache it.
+/// Uses O(1) LRU cache with parking_lot::Mutex for efficient concurrent access.
+fn compile_expression_cached(expr: &Expression, columns: &[String]) -> Result<SharedProgram> {
+    let cache_key = compute_cache_key(expr, columns);
+
+    // Try cache first (O(1) lookup and LRU update)
+    {
+        let mut guard = PROGRAM_CACHE.lock();
+        let cache = guard.get_or_insert_with(|| {
+            // SAFETY: PROGRAM_CACHE_SIZE is always > 0
+            LruCache::new(NonZeroUsize::new(PROGRAM_CACHE_SIZE).unwrap())
+        });
+        if let Some(program) = cache.get(&cache_key) {
+            return Ok(program.clone());
+        }
+    }
+
+    // Cache miss - compile the expression (outside lock to avoid blocking)
+    let ctx = CompileContext::with_global_registry(columns);
+    let compiler = ExprCompiler::new(&ctx);
+    let program: SharedProgram = compiler
+        .compile(expr)
+        .map(Arc::new)
+        .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
+
+    // Store in cache (O(1) insertion with automatic LRU eviction)
+    {
+        let mut guard = PROGRAM_CACHE.lock();
+        let cache = guard
+            .get_or_insert_with(|| LruCache::new(NonZeroUsize::new(PROGRAM_CACHE_SIZE).unwrap()));
+        cache.put(cache_key, program.clone());
+    }
+
+    Ok(program)
+}
+
+// ============================================================================
 // STANDALONE COMPILATION FUNCTIONS
 // ============================================================================
 
@@ -52,6 +319,9 @@ use crate::executor::context::ExecutionContext;
 /// or parallel execution. The returned `Arc<Program>` is `Send + Sync` and
 /// can be shared across threads efficiently.
 ///
+/// **Note:** Results are cached globally for performance. Repeated calls
+/// with the same expression and columns will return the cached program.
+///
 /// # Arguments
 /// * `expr` - The expression to compile
 /// * `columns` - Column names for the schema
@@ -59,12 +329,7 @@ use crate::executor::context::ExecutionContext;
 /// # Returns
 /// * `Arc<Program>` that can be executed with `RowFilter` or `ExprVM`
 pub fn compile_expression(expr: &Expression, columns: &[String]) -> Result<SharedProgram> {
-    let ctx = CompileContext::with_global_registry(columns);
-    let compiler = ExprCompiler::new(&ctx);
-    compiler
-        .compile(expr)
-        .map(Arc::new)
-        .map_err(|e| Error::internal(format!("Compile error: {}", e)))
+    compile_expression_cached(expr, columns)
 }
 
 /// Compile an expression with full context (parameters, outer columns, etc.)

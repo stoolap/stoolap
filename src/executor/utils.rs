@@ -82,6 +82,232 @@ pub fn value_to_expression(v: &Value) -> Expression {
     }
 }
 
+/// Substitute outer references in an expression with their actual values.
+///
+/// This is used for correlated subqueries to enable predicate pushdown.
+/// When we have a WHERE clause like `o.user_id = u.id` where `u.id` is an outer
+/// reference, this function replaces `u.id` with its actual value (e.g., 42),
+/// allowing the expression `o.user_id = 42` to be pushed down to storage
+/// for index usage.
+///
+/// # Arguments
+/// * `expr` - The expression to transform
+/// * `outer_row` - Map of outer column names to their values
+///
+/// # Returns
+/// A new expression with outer references replaced by literal values.
+/// Uses copy-on-write semantics: only clones when substitution is actually needed.
+pub fn substitute_outer_references(
+    expr: &Expression,
+    outer_row: &FxHashMap<String, Value>,
+) -> Expression {
+    // Use the internal function that returns Option for copy-on-write semantics
+    substitute_outer_references_inner(expr, outer_row).unwrap_or_else(|| expr.clone())
+}
+
+/// Internal helper that returns None if no substitution was made (avoids cloning).
+/// Returns Some(new_expr) only when a substitution occurred.
+fn substitute_outer_references_inner(
+    expr: &Expression,
+    outer_row: &FxHashMap<String, Value>,
+) -> Option<Expression> {
+    match expr {
+        // Check if this is an outer reference
+        Expression::QualifiedIdentifier(qid) => {
+            // Try qualified name: "alias.column"
+            let qualified_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+            if let Some(value) = outer_row.get(&qualified_name) {
+                return Some(value_to_expression(value));
+            }
+            // Try just the column name
+            if let Some(value) = outer_row.get(&qid.name.value_lower) {
+                return Some(value_to_expression(value));
+            }
+            // Not an outer reference, no change
+            None
+        }
+
+        // Check unqualified identifiers too
+        Expression::Identifier(id) => {
+            if let Some(value) = outer_row.get(&id.value_lower) {
+                return Some(value_to_expression(value));
+            }
+            None
+        }
+
+        // Recursively handle infix expressions (AND, OR, comparisons)
+        Expression::Infix(infix) => {
+            let new_left = substitute_outer_references_inner(&infix.left, outer_row);
+            let new_right = substitute_outer_references_inner(&infix.right, outer_row);
+
+            // Only create new expression if something changed
+            if new_left.is_some() || new_right.is_some() {
+                Some(Expression::Infix(InfixExpression {
+                    token: infix.token.clone(),
+                    left: Box::new(new_left.unwrap_or_else(|| (*infix.left).clone())),
+                    operator: infix.operator.clone(),
+                    op_type: infix.op_type,
+                    right: Box::new(new_right.unwrap_or_else(|| (*infix.right).clone())),
+                }))
+            } else {
+                None
+            }
+        }
+
+        // Recursively handle prefix expressions (NOT)
+        Expression::Prefix(prefix) => substitute_outer_references_inner(&prefix.right, outer_row)
+            .map(|new_right| {
+                Expression::Prefix(PrefixExpression {
+                    token: prefix.token.clone(),
+                    operator: prefix.operator.clone(),
+                    op_type: prefix.op_type,
+                    right: Box::new(new_right),
+                })
+            }),
+
+        // Handle IN expressions
+        Expression::In(in_expr) => {
+            let new_left = substitute_outer_references_inner(&in_expr.left, outer_row);
+            let new_right = match &*in_expr.right {
+                Expression::List(list) => {
+                    // Check if any element changed
+                    let mut any_changed = false;
+                    let new_elements: Vec<Option<Expression>> = list
+                        .elements
+                        .iter()
+                        .map(|e| {
+                            let result = substitute_outer_references_inner(e, outer_row);
+                            if result.is_some() {
+                                any_changed = true;
+                            }
+                            result
+                        })
+                        .collect();
+
+                    if any_changed {
+                        Some(Expression::List(ListExpression {
+                            token: list.token.clone(),
+                            elements: new_elements
+                                .into_iter()
+                                .zip(list.elements.iter())
+                                .map(|(new, old)| new.unwrap_or_else(|| old.clone()))
+                                .collect(),
+                        }))
+                    } else {
+                        None
+                    }
+                }
+                other => substitute_outer_references_inner(other, outer_row),
+            };
+
+            if new_left.is_some() || new_right.is_some() {
+                Some(Expression::In(InExpression {
+                    token: in_expr.token.clone(),
+                    left: Box::new(new_left.unwrap_or_else(|| (*in_expr.left).clone())),
+                    not: in_expr.not,
+                    right: Box::new(new_right.unwrap_or_else(|| (*in_expr.right).clone())),
+                }))
+            } else {
+                None
+            }
+        }
+
+        // Handle BETWEEN expressions
+        Expression::Between(between) => {
+            let new_expr = substitute_outer_references_inner(&between.expr, outer_row);
+            let new_lower = substitute_outer_references_inner(&between.lower, outer_row);
+            let new_upper = substitute_outer_references_inner(&between.upper, outer_row);
+
+            if new_expr.is_some() || new_lower.is_some() || new_upper.is_some() {
+                Some(Expression::Between(BetweenExpression {
+                    token: between.token.clone(),
+                    expr: Box::new(new_expr.unwrap_or_else(|| (*between.expr).clone())),
+                    not: between.not,
+                    lower: Box::new(new_lower.unwrap_or_else(|| (*between.lower).clone())),
+                    upper: Box::new(new_upper.unwrap_or_else(|| (*between.upper).clone())),
+                }))
+            } else {
+                None
+            }
+        }
+
+        // Handle LIKE expressions
+        Expression::Like(like) => {
+            let new_left = substitute_outer_references_inner(&like.left, outer_row);
+            let new_pattern = substitute_outer_references_inner(&like.pattern, outer_row);
+            let new_escape = like
+                .escape
+                .as_ref()
+                .and_then(|e| substitute_outer_references_inner(e, outer_row));
+
+            if new_left.is_some() || new_pattern.is_some() || new_escape.is_some() {
+                Some(Expression::Like(LikeExpression {
+                    token: like.token.clone(),
+                    left: Box::new(new_left.unwrap_or_else(|| (*like.left).clone())),
+                    operator: like.operator.clone(),
+                    pattern: Box::new(new_pattern.unwrap_or_else(|| (*like.pattern).clone())),
+                    escape: if new_escape.is_some() {
+                        new_escape.map(Box::new)
+                    } else {
+                        like.escape.clone()
+                    },
+                }))
+            } else {
+                None
+            }
+        }
+
+        // Handle function calls
+        Expression::FunctionCall(func) => {
+            // Check if any argument changed
+            let mut any_changed = false;
+            let new_args: Vec<Option<Expression>> = func
+                .arguments
+                .iter()
+                .map(|arg| {
+                    let result = substitute_outer_references_inner(arg, outer_row);
+                    if result.is_some() {
+                        any_changed = true;
+                    }
+                    result
+                })
+                .collect();
+
+            let new_filter = func
+                .filter
+                .as_ref()
+                .and_then(|f| substitute_outer_references_inner(f, outer_row));
+            if new_filter.is_some() {
+                any_changed = true;
+            }
+
+            if any_changed {
+                Some(Expression::FunctionCall(FunctionCall {
+                    token: func.token.clone(),
+                    function: func.function.clone(),
+                    arguments: new_args
+                        .into_iter()
+                        .zip(func.arguments.iter())
+                        .map(|(new, old)| new.unwrap_or_else(|| old.clone()))
+                        .collect(),
+                    is_distinct: func.is_distinct,
+                    order_by: func.order_by.clone(),
+                    filter: if new_filter.is_some() {
+                        new_filter.map(Box::new)
+                    } else {
+                        func.filter.clone()
+                    },
+                }))
+            } else {
+                None
+            }
+        }
+
+        // Literals and other expressions that don't need substitution
+        _ => None,
+    }
+}
+
 // ============================================================================
 // Column Index Utilities
 // ============================================================================

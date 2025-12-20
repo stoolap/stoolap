@@ -25,6 +25,7 @@ use crate::parser::ast::*;
 use crate::storage::traits::{Engine, QueryResult, ScanPlan};
 
 use super::context::ExecutionContext;
+use super::join;
 use super::parallel;
 use super::pushdown;
 use super::result::ExecutorMemoryResult;
@@ -367,18 +368,14 @@ impl Executor {
                 self.explain_select(&subquery.subquery, lines, indent + 1);
             }
             Expression::JoinSource(join) => {
-                // Determine join algorithm based on condition
-                let join_algorithm = if join.condition.is_none() && join.using_columns.is_empty() {
-                    "Nested Loop"
-                } else if let Some(ref cond) = join.condition {
-                    if is_equality_condition(cond) {
-                        "Hash Join"
-                    } else {
-                        "Nested Loop"
-                    }
-                } else {
-                    "Hash Join" // USING clause implies equality
-                };
+                // Determine join algorithm including INLJ check
+                let (join_algorithm, _) = self.determine_join_algorithm_for_explain(
+                    &join.left,
+                    &join.right,
+                    join.condition.as_deref(),
+                    &join.join_type.to_string(),
+                    &join.using_columns,
+                );
 
                 lines.push(format!(
                     "{}-> {} ({} Join) (actual rows={})",
@@ -622,22 +619,14 @@ impl Executor {
                 self.explain_select(&subquery.subquery, lines, indent + 1);
             }
             Expression::JoinSource(join) => {
-                // Determine join algorithm based on condition
-                let join_algorithm = if join.condition.is_none() && join.using_columns.is_empty() {
-                    // CROSS JOIN or no condition -> Nested Loop
-                    "Nested Loop"
-                } else if let Some(ref cond) = join.condition {
-                    // Check if it's an equality join (a.col = b.col)
-                    if is_equality_condition(cond) {
-                        "Hash Join"
-                    } else {
-                        // Range condition or complex join
-                        "Nested Loop"
-                    }
-                } else {
-                    // USING clause implies equality join
-                    "Hash Join"
-                };
+                // Determine join algorithm including INLJ check
+                let (join_algorithm, _) = self.determine_join_algorithm_for_explain(
+                    &join.left,
+                    &join.right,
+                    join.condition.as_deref(),
+                    &join.join_type.to_string(),
+                    &join.using_columns,
+                );
 
                 // Get cost estimate from query planner
                 let planner = self.get_query_planner();
@@ -719,6 +708,85 @@ impl Executor {
                 lines.push(format!("{}-> Scan: {}", prefix, expr));
             }
         }
+    }
+
+    /// Determine the join algorithm for EXPLAIN output
+    /// This checks for Index Nested Loop Join opportunity using the same logic as execution
+    fn determine_join_algorithm_for_explain(
+        &self,
+        join_left: &Expression,
+        join_right: &Expression,
+        join_condition: Option<&Expression>,
+        join_type: &str,
+        using_columns: &[Identifier],
+    ) -> (&'static str, Option<join::IndexLookupStrategy>) {
+        // Check for INLJ opportunity on right side (default check)
+        if let Some(cond) = join_condition {
+            // Get aliases for the check
+            let left_alias = extract_table_alias(join_left);
+            let right_alias = extract_table_alias(join_right);
+            let join_type_upper = join_type.to_uppercase();
+
+            // Check if INLJ is possible (right side has index/PK for join column)
+            let inlj_info = self.check_index_nested_loop_opportunity(
+                join_right,
+                Some(cond),
+                &join_type_upper,
+                left_alias.as_deref(),
+                right_alias.as_deref(),
+            );
+
+            if let Some((_, strategy, _, _)) = inlj_info {
+                let algo_name = match &strategy {
+                    join::IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)",
+                    join::IndexLookupStrategy::SecondaryIndex(_) => "Index Nested Loop",
+                };
+                return (algo_name, Some(strategy));
+            }
+
+            // Check swapped direction for INLJ (left side has index/PK)
+            let swapped_info = self.check_index_nested_loop_opportunity(
+                join_left,
+                Some(cond),
+                &join_type_upper,
+                right_alias.as_deref(),
+                left_alias.as_deref(),
+            );
+
+            if let Some((_, strategy, _, _)) = swapped_info {
+                let algo_name = match &strategy {
+                    join::IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)",
+                    join::IndexLookupStrategy::SecondaryIndex(_) => "Index Nested Loop",
+                };
+                return (algo_name, Some(strategy));
+            }
+
+            // Fall back to Hash Join or Nested Loop
+            if is_equality_condition(cond) {
+                return ("Hash Join", None);
+            }
+        }
+
+        if join_condition.is_none() && using_columns.is_empty() {
+            ("Nested Loop", None)
+        } else if !using_columns.is_empty() {
+            ("Hash Join", None) // USING clause implies equality
+        } else {
+            ("Nested Loop", None)
+        }
+    }
+}
+
+/// Extract table alias from a table expression
+fn extract_table_alias(expr: &Expression) -> Option<String> {
+    match expr {
+        Expression::TableSource(simple) => simple
+            .alias
+            .as_ref()
+            .map(|a| a.value.clone())
+            .or_else(|| Some(simple.name.value.clone())),
+        Expression::Aliased(aliased) => Some(aliased.alias.value.clone()),
+        _ => None,
     }
 }
 

@@ -213,6 +213,18 @@ pub trait Index: Send + Sync {
         None // Default implementation - only B-tree indexes support this
     }
 
+    /// Returns grouped row IDs in sorted order by index value (for GROUP BY optimization)
+    ///
+    /// This enables streaming GROUP BY by iterating through the B-tree in order,
+    /// processing one group at a time without needing a hash map.
+    ///
+    /// # Returns
+    /// Vector of (group_value, row_ids) pairs in sorted order,
+    /// or None if the index doesn't support ordered group access
+    fn get_grouped_row_ids(&self) -> Option<Vec<(Value, Vec<i64>)>> {
+        None // Default implementation - only B-tree indexes support this
+    }
+
     /// Closes the index and releases any resources
     fn close(&mut self) -> Result<()>;
 }

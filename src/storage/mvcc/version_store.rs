@@ -28,10 +28,15 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-use crate::common::{new_concurrent_int64_map, new_int64_map, ConcurrentInt64Map, Int64Map};
-use crate::core::{Error, Row, Schema};
+use parking_lot::RwLock;
+
+use crate::common::{
+    new_concurrent_int64_map, new_concurrent_int64_map_with_capacity, new_int64_map,
+    new_int64_map_with_capacity, ConcurrentInt64Map, Int64Map,
+};
+use crate::core::{Error, Row, Schema, Value};
 use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::RowArena;
 use crate::storage::mvcc::get_fast_timestamp;
@@ -129,6 +134,59 @@ pub struct WriteSetEntry {
     pub read_version_seq: i64,
 }
 
+/// Lightweight row index for deferred materialization
+///
+/// Instead of cloning row data during scans, we return indices that can be
+/// materialized later. This enables zero-copy filtering and limiting.
+///
+/// # Performance
+/// For `SELECT * FROM t WHERE x > 100 LIMIT 10` on 100K rows:
+/// - Old: Clone 100K rows, filter to 50K, limit to 10 (100K allocations)
+/// - New: Get 100K indices, filter to 50K, limit to 10, clone 10 (10 allocations)
+#[derive(Clone, Copy, Debug)]
+pub struct RowIndex {
+    /// Row ID
+    pub row_id: i64,
+    /// Arena index (None if row data is not in arena, must clone from version)
+    pub arena_idx: Option<usize>,
+}
+
+/// Aggregate operation type for deferred aggregation
+///
+/// Used with `compute_aggregates()` to perform multiple aggregations in a single pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggregateOp {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+/// Result of an aggregate operation
+#[derive(Clone, Debug)]
+pub enum AggregateResult {
+    /// Count result
+    Count(usize),
+    /// Sum result (sum, count of non-null values)
+    Sum(f64, usize),
+    /// Min result
+    Min(Option<Value>),
+    /// Max result
+    Max(Option<Value>),
+    /// Avg result (sum, count of non-null values) - caller computes sum/count
+    Avg(f64, usize),
+}
+
+/// Internal accumulator for aggregations
+enum AggregateAccumulator {
+    Count(usize),
+    Sum(f64, usize),
+    Min(Option<Value>),
+    Max(Option<Value>),
+    Avg(f64, usize),
+}
+
 /// Visibility checker trait - will be implemented by TransactionRegistry
 ///
 /// This allows VersionStore to check visibility without circular dependencies
@@ -190,24 +248,50 @@ pub struct VersionStore {
     /// Zone maps for segment pruning (set by ANALYZE)
     /// Uses Arc to avoid cloning on every read - critical for high QPS workloads
     zone_maps: RwLock<Option<Arc<crate::storage::mvcc::zonemap::TableZoneMap>>>,
+    /// Counter for rows added via batch commit (not in arena)
+    /// Used to disable fast path in get_visible_row_indices_unordered
+    rows_not_in_arena: AtomicI64,
 }
 
 impl VersionStore {
     /// Creates a new version store
     pub fn new(table_name: String, schema: Schema) -> Self {
+        Self::with_capacity(table_name, schema, None, 0)
+    }
+
+    /// Creates a new version store with pre-allocated capacity
+    ///
+    /// Pre-allocating capacity avoids hash map resizing during bulk inserts.
+    /// Use this when the expected row count is known (e.g., during recovery).
+    pub fn with_capacity(
+        table_name: String,
+        schema: Schema,
+        checker: Option<Arc<dyn VisibilityChecker>>,
+        expected_rows: usize,
+    ) -> Self {
         let cols = schema.column_count();
+        let (versions, row_arena_index) = if expected_rows > 0 {
+            (
+                new_concurrent_int64_map_with_capacity(expected_rows),
+                RwLock::new(new_int64_map_with_capacity(expected_rows)),
+            )
+        } else {
+            (new_concurrent_int64_map(), RwLock::new(new_int64_map()))
+        };
+
         Self {
-            versions: new_concurrent_int64_map(),
+            versions,
             table_name,
             schema: RwLock::new(schema),
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: new_concurrent_int64_map(),
-            visibility_checker: None,
+            visibility_checker: checker,
             arena: RowArena::new(cols),
-            row_arena_index: RwLock::new(new_int64_map()),
+            row_arena_index,
             zone_maps: RwLock::new(None),
+            rows_not_in_arena: AtomicI64::new(0),
         }
     }
 
@@ -217,20 +301,7 @@ impl VersionStore {
         schema: Schema,
         checker: Arc<dyn VisibilityChecker>,
     ) -> Self {
-        let cols = schema.column_count();
-        Self {
-            versions: new_concurrent_int64_map(),
-            table_name,
-            schema: RwLock::new(schema),
-            indexes: RwLock::new(FxHashMap::default()),
-            closed: AtomicBool::new(false),
-            auto_increment_counter: AtomicI64::new(0),
-            uncommitted_writes: new_concurrent_int64_map(),
-            visibility_checker: Some(checker),
-            arena: RowArena::new(cols),
-            row_arena_index: RwLock::new(new_int64_map()),
-            zone_maps: RwLock::new(None),
-        }
+        Self::with_capacity(table_name, schema, Some(checker), 0)
     }
 
     /// Sets the visibility checker
@@ -245,12 +316,12 @@ impl VersionStore {
 
     /// Returns a reference to the schema
     pub fn schema(&self) -> Schema {
-        self.schema.read().unwrap().clone()
+        self.schema.read().clone()
     }
 
     /// Returns a mutable reference to the schema (for modifications)
-    pub fn schema_mut(&self) -> std::sync::RwLockWriteGuard<'_, Schema> {
-        self.schema.write().unwrap()
+    pub fn schema_mut(&self) -> parking_lot::RwLockWriteGuard<'_, Schema> {
+        self.schema.write()
     }
 
     /// Returns the current auto-increment counter value
@@ -318,11 +389,11 @@ impl VersionStore {
                         &new_version.data,
                     );
                     // Update row -> arena index mapping
-                    self.row_arena_index.write().unwrap().insert(row_id, idx);
+                    self.row_arena_index.write().insert(row_id, idx);
                     Some(idx)
                 } else {
                     // Mark the previous arena entry as deleted
-                    if let Some(&prev_idx) = self.row_arena_index.read().unwrap().get(&row_id) {
+                    if let Some(&prev_idx) = self.row_arena_index.read().get(&row_id) {
                         self.arena.mark_deleted(prev_idx, new_version.txn_id);
                     }
                     None
@@ -350,7 +421,7 @@ impl VersionStore {
                         &version.data,
                     );
                     // Update row -> arena index mapping
-                    self.row_arena_index.write().unwrap().insert(row_id, idx);
+                    self.row_arena_index.write().insert(row_id, idx);
                     Some(idx)
                 } else {
                     None
@@ -371,11 +442,28 @@ impl VersionStore {
     /// This is faster than calling add_version() in a loop because:
     /// 1. Uses DashMap's sharded locking for concurrent access
     /// 2. Skips arena updates (arena is rebuilt lazily for scans)
+    ///
+    /// ## Performance Note
+    ///
+    /// This method increments `rows_not_in_arena` to disable the arena fast path
+    /// in `get_visible_row_indices_unordered`. Call [`sync_arena()`] after batch
+    /// loading is complete to re-enable the fast path.
+    ///
+    /// ```ignore
+    /// // Example: bulk loading data
+    /// store.add_versions_batch(batch);
+    /// store.sync_arena(); // Re-enables fast path
+    /// ```
     #[inline]
     pub fn add_versions_batch(&self, batch: Vec<(i64, RowVersion)>) {
         if self.closed.load(Ordering::Acquire) || batch.is_empty() {
             return;
         }
+
+        // Track that rows were added without arena sync
+        // This disables the fast path in get_visible_row_indices_unordered
+        self.rows_not_in_arena
+            .fetch_add(batch.len() as i64, Ordering::Release);
 
         for (row_id, version) in batch {
             // Get existing data first (if any)
@@ -418,6 +506,75 @@ impl VersionStore {
 
             self.versions.insert(row_id, entry);
         }
+    }
+
+    /// Synchronizes batch-committed rows to the arena, re-enabling the fast path.
+    ///
+    /// This method should be called after batch loading is complete to restore
+    /// optimal scan performance. It iterates through all version chains and
+    /// adds rows without arena entries to the arena.
+    ///
+    /// ## Performance
+    ///
+    /// - Time: O(n) where n = number of rows without arena entries
+    /// - After sync: `get_visible_row_indices_unordered` fast path is re-enabled
+    ///
+    /// ## Thread Safety
+    ///
+    /// This method acquires write locks on arena and row_arena_index.
+    /// It's safe to call concurrently with reads but will block briefly.
+    pub fn sync_arena(&self) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Check if sync is needed
+        let rows_missing = self.rows_not_in_arena.load(Ordering::Acquire);
+        if rows_missing == 0 {
+            return; // Already synced
+        }
+
+        let mut synced_count = 0i64;
+
+        // Single pass: iterate with mutable access to update arena_idx atomically
+        // This prevents race conditions where concurrent reads could see arena entries
+        // but not the corresponding arena_idx in the version chain
+        for mut entry in self.versions.iter_mut() {
+            let row_id = *entry.key();
+            let chain = entry.value_mut();
+
+            // Only sync if no arena_idx and not deleted
+            if chain.arena_idx.is_none() && chain.version.deleted_at_txn_id == 0 {
+                // Check if there's a previous version with an arena entry
+                // If so, mark the old arena entry as deleted to avoid duplicates
+                if let Some(ref prev) = chain.prev {
+                    if let Some(old_arena_idx) = prev.arena_idx {
+                        // Mark old arena entry as deleted so fast path skips it
+                        self.arena.mark_deleted(old_arena_idx, chain.version.txn_id);
+                    }
+                }
+
+                // Add new version to arena
+                let idx = self.arena.insert_row(
+                    row_id,
+                    chain.version.txn_id,
+                    chain.version.create_time,
+                    &chain.version.data,
+                );
+
+                // Update row -> arena index mapping
+                self.row_arena_index.write().insert(row_id, idx);
+
+                // Update arena_idx in version chain (atomic with arena insert)
+                chain.arena_idx = Some(idx);
+
+                synced_count += 1;
+            }
+        }
+
+        // Reset the counter - fast path is now re-enabled
+        self.rows_not_in_arena
+            .fetch_sub(synced_count, Ordering::Release);
     }
 
     /// Quick check if a row might exist
@@ -787,18 +944,37 @@ impl VersionStore {
                     }
 
                     // Read directly from arena (no intermediate collection)
-                    if let Some(idx) = e.arena_idx {
+                    // Falls back to version data if bounds validation fails
+                    let row_data = if let Some(idx) = e.arena_idx {
                         if idx < arena_len {
-                            // SAFETY: bounds checked above
+                            // SAFETY: idx bounds checked above
                             let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            let slice =
-                                unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                            result.push((row_id, Row::from_values(slice.to_vec())));
+                            // Validate data slice bounds to prevent UB from arena corruption
+                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                // SAFETY: bounds validated above
+                                let slice =
+                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                                Row::from_values(slice.to_vec())
+                            } else {
+                                // Arena corruption detected - fall back to version data
+                                debug_assert!(
+                                    false,
+                                    "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
+                                    row_id,
+                                    meta.start,
+                                    meta.end,
+                                    arena_data_slice.len()
+                                );
+                                e.version.data.clone()
+                            }
+                        } else {
+                            e.version.data.clone()
                         }
                     } else {
                         // No arena entry (batch-committed row) - clone from version
-                        result.push((row_id, e.version.data.clone()));
-                    }
+                        e.version.data.clone()
+                    };
+                    result.push((row_id, row_data));
                     break;
                 }
                 current = e.prev.as_ref().map(|b| b.as_ref());
@@ -874,17 +1050,36 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    // Read row data
-                    if let Some(idx) = e.arena_idx {
+                    // Read row data - falls back to version data if bounds validation fails
+                    let row_data = if let Some(idx) = e.arena_idx {
                         if idx < arena_len {
+                            // SAFETY: idx bounds checked above
                             let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            let slice =
-                                unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                            result.push((row_id, Row::from_values(slice.to_vec())));
+                            // Validate data slice bounds to prevent UB from arena corruption
+                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                // SAFETY: bounds validated above
+                                let slice =
+                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                                Row::from_values(slice.to_vec())
+                            } else {
+                                // Arena corruption detected - fall back to version data
+                                debug_assert!(
+                                    false,
+                                    "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
+                                    row_id,
+                                    meta.start,
+                                    meta.end,
+                                    arena_data_slice.len()
+                                );
+                                e.version.data.clone()
+                            }
+                        } else {
+                            e.version.data.clone()
                         }
                     } else {
-                        result.push((row_id, e.version.data.clone()));
-                    }
+                        e.version.data.clone()
+                    };
+                    result.push((row_id, row_data));
                     break;
                 }
                 current = e.prev.as_ref().map(|b| b.as_ref());
@@ -957,17 +1152,36 @@ impl VersionStore {
                         break;
                     }
 
-                    // Read row data
-                    if let Some(idx) = e.arena_idx {
+                    // Read row data - falls back to version data if bounds validation fails
+                    let row_data = if let Some(idx) = e.arena_idx {
                         if idx < arena_len {
+                            // SAFETY: idx bounds checked above
                             let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            let slice =
-                                unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                            result.push((row_id, Row::from_values(slice.to_vec())));
+                            // Validate data slice bounds to prevent UB from arena corruption
+                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                // SAFETY: bounds validated above
+                                let slice =
+                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                                Row::from_values(slice.to_vec())
+                            } else {
+                                // Arena corruption detected - fall back to version data
+                                debug_assert!(
+                                    false,
+                                    "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
+                                    row_id,
+                                    meta.start,
+                                    meta.end,
+                                    arena_data_slice.len()
+                                );
+                                e.version.data.clone()
+                            }
+                        } else {
+                            e.version.data.clone()
                         }
                     } else {
-                        result.push((row_id, e.version.data.clone()));
-                    }
+                        e.version.data.clone()
+                    };
+                    result.push((row_id, row_data));
 
                     // Early termination: we have enough rows
                     if result.len() >= limit {
@@ -1006,7 +1220,7 @@ impl VersionStore {
 
         // Compile the filter once at the start for ~3-5x speedup in hot loop
         // CompiledFilter eliminates virtual dispatch via enum-based specialization
-        let schema = self.schema.read().unwrap();
+        let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema); // Release lock early
 
@@ -1033,22 +1247,38 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    if let Some(idx) = e.arena_idx {
+                    // Get row data - falls back to version data if bounds validation fails
+                    let row = if let Some(idx) = e.arena_idx {
                         if idx < arena_len {
+                            // SAFETY: idx bounds checked above
                             let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            let slice =
-                                unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                            let row = Row::from_values(slice.to_vec());
-                            // Filter using compiled filter (eliminates virtual dispatch)
-                            if compiled_filter.matches(&row) {
-                                result.push((row_id, row));
+                            // Validate data slice bounds to prevent UB from arena corruption
+                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                // SAFETY: bounds validated above
+                                let slice =
+                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                                Row::from_values(slice.to_vec())
+                            } else {
+                                // Arena corruption detected - fall back to version data
+                                debug_assert!(
+                                    false,
+                                    "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
+                                    row_id,
+                                    meta.start,
+                                    meta.end,
+                                    arena_data_slice.len()
+                                );
+                                e.version.data.clone()
                             }
+                        } else {
+                            e.version.data.clone()
                         }
                     } else {
-                        // Non-arena row - filter using compiled filter
-                        if compiled_filter.matches(&e.version.data) {
-                            result.push((row_id, e.version.data.clone()));
-                        }
+                        e.version.data.clone()
+                    };
+                    // Filter using compiled filter (eliminates virtual dispatch)
+                    if compiled_filter.matches(&row) {
+                        result.push((row_id, row));
                     }
                     break;
                 }
@@ -1093,7 +1323,7 @@ impl VersionStore {
         };
 
         // Compile the filter once at the start
-        let schema = self.schema.read().unwrap();
+        let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema);
 
@@ -1120,13 +1350,29 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    // Read row data
+                    // Read row data - falls back to version data if bounds validation fails
                     let row = if let Some(idx) = e.arena_idx {
                         if idx < arena_len {
+                            // SAFETY: idx bounds checked above
                             let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            let slice =
-                                unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                            Row::from_values(slice.to_vec())
+                            // Validate data slice bounds to prevent UB from arena corruption
+                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                // SAFETY: bounds validated above
+                                let slice =
+                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                                Row::from_values(slice.to_vec())
+                            } else {
+                                // Arena corruption detected - fall back to version data
+                                debug_assert!(
+                                    false,
+                                    "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
+                                    row_id,
+                                    meta.start,
+                                    meta.end,
+                                    arena_data_slice.len()
+                                );
+                                e.version.data.clone()
+                            }
                         } else {
                             e.version.data.clone()
                         }
@@ -1177,7 +1423,7 @@ impl VersionStore {
         };
 
         // Compile the filter once at the start
-        let schema = self.schema.read().unwrap();
+        let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema);
 
@@ -1205,13 +1451,29 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    // Read row data
+                    // Read row data - falls back to version data if bounds validation fails
                     let row = if let Some(idx) = e.arena_idx {
                         if idx < arena_len {
+                            // SAFETY: idx bounds checked above
                             let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            let slice =
-                                unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                            Row::from_values(slice.to_vec())
+                            // Validate data slice bounds to prevent UB from arena corruption
+                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                // SAFETY: bounds validated above
+                                let slice =
+                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                                Row::from_values(slice.to_vec())
+                            } else {
+                                // Arena corruption detected - fall back to version data
+                                debug_assert!(
+                                    false,
+                                    "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
+                                    row_id,
+                                    meta.start,
+                                    meta.end,
+                                    arena_data_slice.len()
+                                );
+                                e.version.data.clone()
+                            }
                         } else {
                             e.version.data.clone()
                         }
@@ -1239,6 +1501,660 @@ impl VersionStore {
         }
 
         result
+    }
+
+    /// Get visible row indices without materializing row data (ZERO ALLOCATION SCAN!)
+    ///
+    /// This method returns lightweight `RowIndex` structs instead of cloning row data.
+    /// Callers can then filter/sort/limit these indices and only materialize the final
+    /// set of rows needed using `materialize_rows()`.
+    ///
+    /// # Performance
+    /// For `SELECT * FROM t WHERE x > 100 LIMIT 10` on 100K rows:
+    /// - Old approach: Clone 100K rows, filter, limit (100K allocations)
+    /// - New approach: Get 100K indices (0 allocations), filter, limit, clone 10 rows
+    ///
+    /// # Returns
+    /// Vector of `RowIndex` structs containing row_id and arena location
+    pub fn get_visible_row_indices(&self, txn_id: i64) -> Vec<RowIndex> {
+        let checker = self.visibility_checker.as_ref();
+
+        // Get arena metadata for fast path detection
+        let (arena_rows, _arena_data) = self.arena.read_guards();
+        let arena_len = arena_rows.len();
+
+        // FAST PATH: If uncommitted_writes is empty AND arena is in sync, scan arena directly
+        // We must check rows_not_in_arena to catch rows committed via add_versions_batch
+        // which skips arena updates for performance
+        if let Some(checker) = checker {
+            let uncommitted_empty = self.uncommitted_writes.is_empty();
+            let arena_in_sync = self.rows_not_in_arena.load(Ordering::Acquire) == 0;
+
+            if uncommitted_empty && arena_in_sync && arena_len > 0 {
+                let mut indices: Vec<RowIndex> = Vec::with_capacity(arena_len);
+
+                for (idx, meta) in arena_rows.iter().enumerate() {
+                    if meta.deleted_at_txn_id == 0 && checker.is_visible(meta.txn_id, txn_id) {
+                        indices.push(RowIndex {
+                            row_id: meta.row_id,
+                            arena_idx: Some(idx),
+                        });
+                    }
+                }
+
+                // Sort by row_id for consistent ordering
+                indices.sort_unstable_by_key(|idx| idx.row_id);
+                return indices;
+            }
+        }
+
+        // Drop arena guards before slow path to avoid holding locks
+        drop(arena_rows);
+
+        // SLOW PATH: Full DashMap iteration for complex visibility scenarios
+        let mut indices: Vec<RowIndex> = Vec::with_capacity(self.versions.len());
+
+        if let Some(checker) = checker {
+            for entry in self.versions.iter() {
+                let row_id = *entry.key();
+                let chain = entry.value();
+                let mut current: Option<&VersionChainEntry> = Some(chain);
+
+                while let Some(e) = current {
+                    let version_txn_id = e.version.txn_id;
+                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                    if checker.is_visible(version_txn_id, txn_id) {
+                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
+                        {
+                            // Found visible, non-deleted version
+                            indices.push(RowIndex {
+                                row_id,
+                                arena_idx: e.arena_idx,
+                            });
+                        }
+                        break;
+                    }
+                    current = e.prev.as_ref().map(|b| b.as_ref());
+                }
+            }
+        }
+
+        // Sort by row_id for consistent ordering
+        indices.sort_unstable_by_key(|idx| idx.row_id);
+        indices
+    }
+
+    /// Get visible row indices without sorting (O(n) instead of O(n log n))
+    ///
+    /// Use this when order doesn't matter, such as:
+    /// - Aggregations (COUNT, SUM, etc.)
+    /// - Hash joins
+    /// - Existence checks
+    ///
+    /// For ordered results, use `get_visible_row_indices()` instead.
+    pub fn get_visible_row_indices_unordered(&self, txn_id: i64) -> Vec<RowIndex> {
+        let checker = self.visibility_checker.as_ref();
+
+        // Get arena metadata for fast path detection
+        let (arena_rows, _arena_data) = self.arena.read_guards();
+        let arena_len = arena_rows.len();
+
+        // FAST PATH: If uncommitted_writes is empty AND arena is in sync, scan arena directly
+        // We must check rows_not_in_arena to catch rows committed via add_versions_batch
+        // which skips arena updates for performance
+        if let Some(checker) = checker {
+            let uncommitted_empty = self.uncommitted_writes.is_empty();
+            let arena_in_sync = self.rows_not_in_arena.load(Ordering::Acquire) == 0;
+
+            if uncommitted_empty && arena_in_sync && arena_len > 0 {
+                let mut indices: Vec<RowIndex> = Vec::with_capacity(arena_len);
+
+                for (idx, meta) in arena_rows.iter().enumerate() {
+                    if meta.deleted_at_txn_id == 0 && checker.is_visible(meta.txn_id, txn_id) {
+                        indices.push(RowIndex {
+                            row_id: meta.row_id,
+                            arena_idx: Some(idx),
+                        });
+                    }
+                }
+
+                return indices; // No sorting!
+            }
+        }
+
+        // Drop arena guards before slow path to avoid holding locks
+        drop(arena_rows);
+
+        // SLOW PATH: Full DashMap iteration
+        let mut indices: Vec<RowIndex> = Vec::with_capacity(self.versions.len());
+
+        if let Some(checker) = checker {
+            for entry in self.versions.iter() {
+                let row_id = *entry.key();
+                let chain = entry.value();
+                let mut current: Option<&VersionChainEntry> = Some(chain);
+
+                while let Some(e) = current {
+                    let version_txn_id = e.version.txn_id;
+                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                    if checker.is_visible(version_txn_id, txn_id) {
+                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
+                        {
+                            indices.push(RowIndex {
+                                row_id,
+                                arena_idx: e.arena_idx,
+                            });
+                        }
+                        break;
+                    }
+                    current = e.prev.as_ref().map(|b| b.as_ref());
+                }
+            }
+        }
+
+        indices // No sorting!
+    }
+
+    /// Materialize selected row indices into actual Row data
+    ///
+    /// This is the second step of deferred materialization. After filtering/limiting
+    /// `RowIndex` values, call this to get the actual row data.
+    ///
+    /// # Performance
+    /// - Single lock acquisition for all rows
+    /// - Only clones the rows you actually need
+    /// - Falls back to version chain for non-arena rows
+    pub fn materialize_rows(&self, indices: &[RowIndex]) -> Vec<(i64, Row)> {
+        if indices.is_empty() {
+            return Vec::new();
+        }
+
+        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
+        let arena_len = arena_rows_guard.len();
+
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(indices.len());
+
+        for idx in indices {
+            if let Some(arena_idx) = idx.arena_idx {
+                // Fast path: get from arena
+                if arena_idx < arena_len {
+                    let meta = &arena_rows_guard[arena_idx];
+                    let slice = &arena_data_guard[meta.start..meta.end];
+                    result.push((idx.row_id, Row::from_values(slice.to_vec())));
+                    continue;
+                }
+            }
+
+            // Slow path: look up in version chain
+            if let Some(chain) = self.versions.get(&idx.row_id) {
+                result.push((idx.row_id, chain.version.data.clone()));
+            }
+        }
+
+        result
+    }
+
+    /// Materialize a single row by index (for use in iterators)
+    #[inline]
+    pub fn materialize_row(&self, idx: &RowIndex) -> Option<(i64, Row)> {
+        if let Some(arena_idx) = idx.arena_idx {
+            let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
+            if arena_idx < arena_rows_guard.len() {
+                let meta = &arena_rows_guard[arena_idx];
+                let slice = &arena_data_guard[meta.start..meta.end];
+                return Some((idx.row_id, Row::from_values(slice.to_vec())));
+            }
+        }
+
+        // Slow path: look up in version chain
+        self.versions
+            .get(&idx.row_id)
+            .map(|chain| (idx.row_id, chain.version.data.clone()))
+    }
+
+    /// Get a single column value from a row index WITHOUT full row materialization
+    ///
+    /// This is the key optimization for ORDER BY + LIMIT queries:
+    /// - Load only the sort column, not all columns
+    /// - Enables sorting indices by column value before materializing
+    ///
+    /// # Performance
+    /// For `SELECT * FROM t ORDER BY col LIMIT 10` on 100K rows with 20 columns:
+    /// - Old: Clone 100K rows (2M values), sort, take 10
+    /// - New: Load 100K single values, sort indices, clone 10 rows (200 values)
+    #[inline]
+    pub fn get_column_value(&self, idx: &RowIndex, col_idx: usize) -> Option<Value> {
+        if let Some(arena_idx) = idx.arena_idx {
+            let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
+            if arena_idx < arena_rows_guard.len() {
+                let meta = &arena_rows_guard[arena_idx];
+                let pos = meta.start + col_idx;
+                if pos < meta.end {
+                    return Some(arena_data_guard[pos].clone());
+                }
+            }
+        }
+
+        // Slow path: look up in version chain
+        self.versions
+            .get(&idx.row_id)
+            .and_then(|chain| chain.version.data.get(col_idx).cloned())
+    }
+
+    /// Batch get column values for multiple indices (single lock acquisition)
+    ///
+    /// Optimized for ORDER BY: loads sort key values for all indices at once.
+    #[inline]
+    pub fn get_column_values_batch(
+        &self,
+        indices: &[RowIndex],
+        col_idx: usize,
+    ) -> Vec<Option<Value>> {
+        if indices.is_empty() {
+            return Vec::new();
+        }
+
+        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
+        let arena_len = arena_rows_guard.len();
+
+        indices
+            .iter()
+            .map(|idx| {
+                if let Some(arena_idx) = idx.arena_idx {
+                    if arena_idx < arena_len {
+                        let meta = &arena_rows_guard[arena_idx];
+                        let pos = meta.start + col_idx;
+                        if pos < meta.end {
+                            return Some(arena_data_guard[pos].clone());
+                        }
+                    }
+                }
+                // Slow path: version chain lookup
+                self.versions
+                    .get(&idx.row_id)
+                    .and_then(|chain| chain.version.data.get(col_idx).cloned())
+            })
+            .collect()
+    }
+
+    /// Optimized ORDER BY + LIMIT scan using deferred materialization
+    ///
+    /// This is the FAST PATH for queries like `SELECT * FROM t ORDER BY col LIMIT 10`:
+    /// 1. Get row indices (no cloning)
+    /// 2. Load only sort column values (not full rows)
+    /// 3. Sort indices by sort values
+    /// 4. Take top N indices
+    /// 5. Materialize only N rows
+    ///
+    /// # Performance
+    /// For 100K rows with 20 columns, LIMIT 10:
+    /// - Old: Clone 2M values, sort 100K rows, take 10 → ~100ms
+    /// - New: Load 100K values, sort indices, clone 200 values → ~10ms
+    ///
+    /// # Arguments
+    /// * `txn_id` - Transaction ID for visibility
+    /// * `sort_col_idx` - Column index to sort by
+    /// * `ascending` - Sort direction
+    /// * `limit` - Maximum rows to return
+    /// * `offset` - Rows to skip before collecting
+    pub fn get_visible_rows_sorted_limit(
+        &self,
+        txn_id: i64,
+        sort_col_idx: usize,
+        ascending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<(i64, Row)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        // Step 1: Get all visible row indices (no cloning!)
+        let indices = self.get_visible_row_indices_unordered(txn_id);
+
+        if indices.is_empty() {
+            return Vec::new();
+        }
+
+        // Step 2: Load only the sort column values (partial materialization)
+        let sort_values = self.get_column_values_batch(&indices, sort_col_idx);
+
+        // Step 3: Sort indices by sort values
+        let mut paired: Vec<(RowIndex, Option<Value>)> =
+            indices.into_iter().zip(sort_values).collect();
+
+        paired.sort_by(
+            |(_, a): &(RowIndex, Option<Value>), (_, b): &(RowIndex, Option<Value>)| {
+                let cmp = match (a, b) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Less, // NULLs first
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (Some(va), Some(vb)) => va.compare(vb).unwrap_or(std::cmp::Ordering::Equal),
+                };
+                if ascending {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
+            },
+        );
+
+        // Step 4: Take limit+offset indices, skip offset
+        let selected: Vec<RowIndex> = paired
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        // Step 5: Materialize only the selected rows
+        self.materialize_rows(&selected)
+    }
+
+    /// Compute COUNT(*) without materializing any rows
+    ///
+    /// This is the FASTEST path for `SELECT COUNT(*) FROM table`:
+    /// - No row data is loaded
+    /// - Only visibility checks are performed
+    /// - O(n) time, O(1) memory
+    #[inline]
+    pub fn count_visible(&self, txn_id: i64) -> usize {
+        self.count_visible_rows(txn_id)
+    }
+
+    /// Compute SUM(column) without materializing full rows
+    ///
+    /// Only loads the specified column values, not entire rows.
+    /// Returns (sum, count_non_null) for proper NULL handling.
+    pub fn sum_column(&self, txn_id: i64, col_idx: usize) -> (f64, usize) {
+        let indices = self.get_visible_row_indices_unordered(txn_id);
+        if indices.is_empty() {
+            return (0.0, 0);
+        }
+
+        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
+        let arena_len = arena_rows_guard.len();
+
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+
+        for idx in &indices {
+            // Try arena path first (fast)
+            if let Some(arena_idx) = idx.arena_idx {
+                if arena_idx < arena_len {
+                    let meta = &arena_rows_guard[arena_idx];
+                    let pos = meta.start + col_idx;
+                    if pos < meta.end {
+                        match &arena_data_guard[pos] {
+                            Value::Integer(i) => {
+                                sum += *i as f64;
+                                count += 1;
+                            }
+                            Value::Float(f) => {
+                                sum += *f;
+                                count += 1;
+                            }
+                            _ => {} // NULL or non-numeric
+                        }
+                        continue;
+                    }
+                }
+            }
+            // Slow path: version chain (must clone)
+            if let Some(chain) = self.versions.get(&idx.row_id) {
+                if let Some(val) = chain.version.data.get(col_idx) {
+                    match val {
+                        Value::Integer(i) => {
+                            sum += *i as f64;
+                            count += 1;
+                        }
+                        Value::Float(f) => {
+                            sum += *f;
+                            count += 1;
+                        }
+                        _ => {} // NULL or non-numeric
+                    }
+                }
+            }
+        }
+
+        (sum, count)
+    }
+
+    /// Compute MIN(column) without materializing full rows
+    pub fn min_column(&self, txn_id: i64, col_idx: usize) -> Option<Value> {
+        let indices = self.get_visible_row_indices_unordered(txn_id);
+        if indices.is_empty() {
+            return None;
+        }
+
+        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
+        let arena_len = arena_rows_guard.len();
+
+        let mut min_val: Option<Value> = None;
+
+        // Helper to update min value
+        let update_min = |min_val: &mut Option<Value>, val: &Value| {
+            if !val.is_null() {
+                match min_val {
+                    None => *min_val = Some(val.clone()),
+                    Some(current) => {
+                        if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
+                            *min_val = Some(val.clone());
+                        }
+                    }
+                }
+            }
+        };
+
+        for idx in &indices {
+            // Try arena path first (fast)
+            if let Some(arena_idx) = idx.arena_idx {
+                if arena_idx < arena_len {
+                    let meta = &arena_rows_guard[arena_idx];
+                    let pos = meta.start + col_idx;
+                    if pos < meta.end {
+                        update_min(&mut min_val, &arena_data_guard[pos]);
+                        continue;
+                    }
+                }
+            }
+            // Slow path: version chain
+            if let Some(chain) = self.versions.get(&idx.row_id) {
+                if let Some(val) = chain.version.data.get(col_idx) {
+                    update_min(&mut min_val, val);
+                }
+            }
+        }
+
+        min_val
+    }
+
+    /// Compute MAX(column) without materializing full rows
+    pub fn max_column(&self, txn_id: i64, col_idx: usize) -> Option<Value> {
+        let indices = self.get_visible_row_indices_unordered(txn_id);
+        if indices.is_empty() {
+            return None;
+        }
+
+        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
+        let arena_len = arena_rows_guard.len();
+
+        let mut max_val: Option<Value> = None;
+
+        // Helper to update max value
+        let update_max = |max_val: &mut Option<Value>, val: &Value| {
+            if !val.is_null() {
+                match max_val {
+                    None => *max_val = Some(val.clone()),
+                    Some(current) => {
+                        if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
+                            *max_val = Some(val.clone());
+                        }
+                    }
+                }
+            }
+        };
+
+        for idx in &indices {
+            // Try arena path first (fast)
+            if let Some(arena_idx) = idx.arena_idx {
+                if arena_idx < arena_len {
+                    let meta = &arena_rows_guard[arena_idx];
+                    let pos = meta.start + col_idx;
+                    if pos < meta.end {
+                        update_max(&mut max_val, &arena_data_guard[pos]);
+                        continue;
+                    }
+                }
+            }
+            // Slow path: version chain
+            if let Some(chain) = self.versions.get(&idx.row_id) {
+                if let Some(val) = chain.version.data.get(col_idx) {
+                    update_max(&mut max_val, val);
+                }
+            }
+        }
+
+        max_val
+    }
+
+    /// Compute multiple column aggregates in a single pass
+    ///
+    /// This is the most efficient path for queries like:
+    /// `SELECT SUM(a), AVG(b), MIN(c), MAX(d) FROM table`
+    ///
+    /// Returns aggregates in the order requested.
+    pub fn compute_aggregates(
+        &self,
+        txn_id: i64,
+        aggregates: &[(AggregateOp, usize)], // (operation, column_index)
+    ) -> Vec<AggregateResult> {
+        let indices = self.get_visible_row_indices_unordered(txn_id);
+        if indices.is_empty() {
+            return aggregates
+                .iter()
+                .map(|(op, _)| match op {
+                    AggregateOp::Count => AggregateResult::Count(0),
+                    AggregateOp::Sum => AggregateResult::Sum(0.0, 0),
+                    AggregateOp::Min => AggregateResult::Min(None),
+                    AggregateOp::Max => AggregateResult::Max(None),
+                    AggregateOp::Avg => AggregateResult::Avg(0.0, 0),
+                })
+                .collect();
+        }
+
+        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
+        let arena_len = arena_rows_guard.len();
+
+        // Initialize accumulators
+        let mut results: Vec<AggregateAccumulator> = aggregates
+            .iter()
+            .map(|(op, _)| match op {
+                AggregateOp::Count => AggregateAccumulator::Count(0),
+                AggregateOp::Sum => AggregateAccumulator::Sum(0.0, 0),
+                AggregateOp::Min => AggregateAccumulator::Min(None),
+                AggregateOp::Max => AggregateAccumulator::Max(None),
+                AggregateOp::Avg => AggregateAccumulator::Avg(0.0, 0),
+            })
+            .collect();
+
+        // Helper to update accumulator with a value
+        fn update_accumulator(acc: &mut AggregateAccumulator, op: &AggregateOp, val: &Value) {
+            match (acc, op) {
+                (AggregateAccumulator::Count(c), AggregateOp::Count) => {
+                    if !val.is_null() {
+                        *c += 1;
+                    }
+                }
+                (AggregateAccumulator::Sum(sum, cnt), AggregateOp::Sum) => match val {
+                    Value::Integer(i) => {
+                        *sum += *i as f64;
+                        *cnt += 1;
+                    }
+                    Value::Float(f) => {
+                        *sum += *f;
+                        *cnt += 1;
+                    }
+                    _ => {}
+                },
+                (AggregateAccumulator::Min(min), AggregateOp::Min) => {
+                    if !val.is_null() {
+                        match min {
+                            None => *min = Some(val.clone()),
+                            Some(current) => {
+                                if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
+                                    *min = Some(val.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                (AggregateAccumulator::Max(max), AggregateOp::Max) => {
+                    if !val.is_null() {
+                        match max {
+                            None => *max = Some(val.clone()),
+                            Some(current) => {
+                                if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
+                                    *max = Some(val.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                (AggregateAccumulator::Avg(sum, cnt), AggregateOp::Avg) => match val {
+                    Value::Integer(i) => {
+                        *sum += *i as f64;
+                        *cnt += 1;
+                    }
+                    Value::Float(f) => {
+                        *sum += *f;
+                        *cnt += 1;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        // Single pass through all rows
+        for idx in &indices {
+            // Try arena path first (fast)
+            if let Some(arena_idx) = idx.arena_idx {
+                if arena_idx < arena_len {
+                    let meta = &arena_rows_guard[arena_idx];
+                    for (i, (op, col_idx)) in aggregates.iter().enumerate() {
+                        let pos = meta.start + col_idx;
+                        if pos < meta.end {
+                            update_accumulator(&mut results[i], op, &arena_data_guard[pos]);
+                        }
+                    }
+                    continue;
+                }
+            }
+            // Slow path: version chain
+            if let Some(chain) = self.versions.get(&idx.row_id) {
+                for (i, (op, col_idx)) in aggregates.iter().enumerate() {
+                    if let Some(val) = chain.version.data.get(*col_idx) {
+                        update_accumulator(&mut results[i], op, val);
+                    }
+                }
+            }
+        }
+
+        // Convert accumulators to results
+        results
+            .into_iter()
+            .map(|acc| match acc {
+                AggregateAccumulator::Count(c) => AggregateResult::Count(c),
+                AggregateAccumulator::Sum(s, c) => AggregateResult::Sum(s, c),
+                AggregateAccumulator::Min(v) => AggregateResult::Min(v),
+                AggregateAccumulator::Max(v) => AggregateResult::Max(v),
+                AggregateAccumulator::Avg(s, c) => AggregateResult::Avg(s, c),
+            })
+            .collect()
     }
 
     /// Returns a zero-copy streaming iterator over visible rows
@@ -1275,7 +2191,6 @@ impl VersionStore {
         let columns: Vec<String> = self
             .schema
             .read()
-            .unwrap()
             .columns
             .iter()
             .map(|c| c.name.clone())
@@ -1387,13 +2302,13 @@ impl VersionStore {
 
     /// Check if an index exists
     pub fn index_exists(&self, index_name: &str) -> bool {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read();
         indexes.contains_key(index_name)
     }
 
     /// List all indexes
     pub fn list_indexes(&self) -> Vec<String> {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read();
         indexes.keys().cloned().collect()
     }
 
@@ -1403,7 +2318,7 @@ impl VersionStore {
     where
         F: FnMut(&str, &Arc<dyn Index>) -> crate::core::Result<()>,
     {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read();
         for (name, index) in indexes.iter() {
             if index.is_unique() {
                 f(name, index)?;
@@ -1414,25 +2329,25 @@ impl VersionStore {
 
     /// Add an index
     pub fn add_index(&self, name: String, index: Arc<dyn Index>) {
-        let mut indexes = self.indexes.write().unwrap();
+        let mut indexes = self.indexes.write();
         indexes.insert(name, index);
     }
 
     /// Remove an index
     pub fn remove_index(&self, name: &str) -> Option<Arc<dyn Index>> {
-        let mut indexes = self.indexes.write().unwrap();
+        let mut indexes = self.indexes.write();
         indexes.remove(name)
     }
 
     /// Get an index by name
     pub fn get_index(&self, name: &str) -> Option<Arc<dyn Index>> {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read();
         indexes.get(name).cloned()
     }
 
     /// Get an index by column name (single-column indexes only)
     pub fn get_index_by_column(&self, column_name: &str) -> Option<Arc<dyn Index>> {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read();
         for index in indexes.values() {
             let column_names = index.column_names();
             if column_names.len() == 1 && column_names[0] == column_name {
@@ -1454,7 +2369,7 @@ impl VersionStore {
             return None;
         }
 
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read();
         let mut best_match: Option<(Arc<dyn Index>, usize)> = None;
 
         // Create a set of predicate columns for O(1) lookup
@@ -1493,7 +2408,7 @@ impl VersionStore {
 
     /// Get all indexes (for optimizer to inspect)
     pub fn get_all_indexes(&self) -> Vec<Arc<dyn Index>> {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read();
         indexes.values().cloned().collect()
     }
 
@@ -1506,7 +2421,7 @@ impl VersionStore {
     /// Zone maps contain min/max statistics per segment, enabling the query
     /// executor to skip entire segments when predicates fall outside the range.
     pub fn set_zone_maps(&self, zone_maps: crate::storage::mvcc::zonemap::TableZoneMap) {
-        let mut guard = self.zone_maps.write().unwrap();
+        let mut guard = self.zone_maps.write();
         *guard = Some(Arc::new(zone_maps));
     }
 
@@ -1515,7 +2430,7 @@ impl VersionStore {
     /// Returns None if zone maps have not been built (ANALYZE not run)
     /// Uses Arc to avoid expensive cloning on high QPS workloads
     pub fn get_zone_maps(&self) -> Option<Arc<crate::storage::mvcc::zonemap::TableZoneMap>> {
-        let guard = self.zone_maps.read().unwrap();
+        let guard = self.zone_maps.read();
         guard.clone()
     }
 
@@ -1528,7 +2443,7 @@ impl VersionStore {
         operator: crate::core::Operator,
         value: &crate::core::Value,
     ) -> Option<Vec<u32>> {
-        let guard = self.zone_maps.read().unwrap();
+        let guard = self.zone_maps.read();
         guard
             .as_ref()
             .and_then(|zm| zm.get_segments_to_scan(column, operator, value))
@@ -1541,7 +2456,7 @@ impl VersionStore {
         operator: crate::core::Operator,
         value: &crate::core::Value,
     ) -> Option<crate::storage::mvcc::zonemap::PruneStats> {
-        let guard = self.zone_maps.read().unwrap();
+        let guard = self.zone_maps.read();
         guard
             .as_ref()
             .and_then(|zm| zm.get_prune_stats(column, operator, value))
@@ -1549,7 +2464,7 @@ impl VersionStore {
 
     /// Marks zone maps as stale (needing rebuild after data changes)
     pub fn mark_zone_maps_stale(&self) {
-        let guard = self.zone_maps.read().unwrap();
+        let guard = self.zone_maps.read();
         if let Some(ref zm) = *guard {
             zm.mark_stale();
         }
@@ -1612,7 +2527,7 @@ impl VersionStore {
 
         // Update indexes with the new row data (if not deleted)
         if !is_deleted {
-            let indexes = self.indexes.read().unwrap();
+            let indexes = self.indexes.read();
             for index in indexes.values() {
                 let column_ids = index.column_ids();
                 if column_ids.is_empty() {
@@ -1652,7 +2567,7 @@ impl VersionStore {
 
         // Remove from indexes using old row data
         if let Some(old_data) = old_row {
-            let indexes = self.indexes.read().unwrap();
+            let indexes = self.indexes.read();
             for index in indexes.values() {
                 let column_ids = index.column_ids();
                 if column_ids.is_empty() {
@@ -1824,7 +2739,7 @@ impl VersionStore {
     ///
     /// Call this after WAL replay completes with skip_population=true.
     pub fn populate_all_indexes(&self) {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read();
         if indexes.is_empty() {
             return;
         }
@@ -1922,7 +2837,7 @@ impl VersionStore {
             // Remove from indexes first
             if let Some(entry) = self.versions.get(row_id) {
                 let version = &entry.version;
-                let indexes = self.indexes.read().unwrap();
+                let indexes = self.indexes.read();
                 for index in indexes.values() {
                     let column_ids = index.column_ids();
                     if !column_ids.is_empty() {
@@ -2478,6 +3393,10 @@ impl TransactionVersionStore {
             .collect();
 
         self.parent_store.add_versions_batch(batch);
+
+        // Sync arena to re-enable fast path for scans
+        // This marks old arena entries as deleted when rows are updated
+        self.parent_store.sync_arena();
 
         // Release all claims
         self.release_all_claims();

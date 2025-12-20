@@ -1690,6 +1690,70 @@ impl Table for MVCCTable {
         Ok(self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset))
     }
 
+    fn collect_rows_sorted_with_limit(
+        &self,
+        sort_col_idx: usize,
+        ascending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Row>> {
+        // DEFERRED MATERIALIZATION OPTIMIZATION
+        // Instead of cloning all rows, sorting, and taking limit:
+        // 1. Get row indices (no cloning)
+        // 2. Load only sort column values
+        // 3. Sort indices by values
+        // 4. Take top N indices
+        // 5. Materialize only N rows
+        //
+        // Performance: For 100K rows with 20 columns, LIMIT 10:
+        // - Old: Clone 2M values, sort, take 10
+        // - New: Load 100K sort values, sort indices, clone 200 values
+
+        // Check for local versions - if present, fall back to default implementation
+        let has_local = self.txn_versions.read().unwrap().has_local_changes();
+        if has_local {
+            // Local changes exist - use slower but correct path
+            let mut rows = self.collect_visible_rows(None);
+            rows.sort_by(|(_, a), (_, b)| {
+                let va = a.get(sort_col_idx);
+                let vb = b.get(sort_col_idx);
+                let cmp = match (va, vb) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (Some(va), Some(vb)) => va.compare(vb).unwrap_or(std::cmp::Ordering::Equal),
+                };
+                if ascending {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
+            });
+            return Ok(rows
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|(_, row)| row)
+                .collect());
+        }
+
+        // FAST PATH: Use deferred materialization from version_store
+        let rows = self.version_store.get_visible_rows_sorted_limit(
+            self.txn_id,
+            sort_col_idx,
+            ascending,
+            limit,
+            offset,
+        );
+
+        // Normalize rows to schema and return
+        let schema = &self.cached_schema;
+        Ok(rows
+            .into_iter()
+            .map(|(_, row)| self.normalize_row_to_schema(row, schema))
+            .collect())
+    }
+
     fn close(&mut self) -> Result<()> {
         // Rollback any uncommitted changes
         self.txn_versions.write().unwrap().rollback();
@@ -2182,6 +2246,54 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Option<Vec<Row>> {
+        // OPTIMIZATION: Handle PRIMARY KEY column specially
+        // For INTEGER PRIMARY KEY, the row_id IS the value, so we can iterate directly
+        if let Some(pk_idx) = self.cached_schema.pk_column_index() {
+            let pk_col = &self.cached_schema.columns[pk_idx];
+            if pk_col.name.eq_ignore_ascii_case(column_name) {
+                // Get all row IDs and sort them
+                let mut row_ids = self.version_store.get_all_row_ids();
+                if ascending {
+                    row_ids.sort_unstable();
+                } else {
+                    row_ids.sort_unstable_by(|a, b| b.cmp(a));
+                }
+
+                let mut rows = Vec::with_capacity(limit.min(100));
+                let mut skipped = 0;
+
+                for row_id in row_ids {
+                    // Check visibility
+                    if let Some(version) =
+                        self.version_store.get_visible_version(row_id, self.txn_id)
+                    {
+                        if version.is_deleted() {
+                            continue;
+                        }
+
+                        // Handle offset
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+
+                        rows.push(version.data.clone());
+
+                        // Check if we've reached the limit
+                        if rows.len() >= limit {
+                            return Some(rows);
+                        }
+                    }
+                }
+
+                // Return whatever rows we collected
+                if !rows.is_empty() {
+                    return Some(rows);
+                }
+                return None;
+            }
+        }
+
         // Check if column has an index
         let index = self.version_store.get_index_by_column(column_name)?;
 
@@ -2696,6 +2808,40 @@ impl Table for MVCCTable {
     ) -> Option<Vec<u32>> {
         self.version_store
             .get_segments_to_scan(column, operator, value)
+    }
+
+    fn sum_column(&self, col_idx: usize) -> Option<(f64, usize)> {
+        // Only use deferred aggregation if no uncommitted local changes
+        // (local changes are in txn_versions, not the main version_store)
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        Some(self.version_store.sum_column(self.txn_id, col_idx))
+    }
+
+    fn min_column(&self, col_idx: usize) -> Option<Option<Value>> {
+        // Only use deferred aggregation if no uncommitted local changes
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        Some(self.version_store.min_column(self.txn_id, col_idx))
+    }
+
+    fn max_column(&self, col_idx: usize) -> Option<Option<Value>> {
+        // Only use deferred aggregation if no uncommitted local changes
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        Some(self.version_store.max_column(self.txn_id, col_idx))
     }
 }
 

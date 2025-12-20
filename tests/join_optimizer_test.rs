@@ -20,36 +20,42 @@ use stoolap::Database;
 fn test_explain_shows_hash_join() {
     let db = Database::open("memory://join_opt_hash").unwrap();
 
-    // Create tables with equality join condition
-    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ())
-        .unwrap();
+    // Create tables with non-indexed columns for join condition
+    // Using non-PK columns forces hash join instead of index nested loop
     db.execute(
-        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER)",
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, dept_id INTEGER, name TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE departments (id INTEGER PRIMARY KEY, dept_code INTEGER, name TEXT)",
         (),
     )
     .unwrap();
 
-    // EXPLAIN should show Hash Join for equality condition
+    // EXPLAIN should show Hash Join for equality condition on non-indexed columns
     let result = db
         .query(
-            "EXPLAIN SELECT * FROM users u INNER JOIN orders o ON u.id = o.user_id",
+            "EXPLAIN SELECT * FROM users u INNER JOIN departments d ON u.dept_id = d.dept_code",
             (),
         )
         .unwrap();
 
     let mut found_hash_join = false;
+    let mut all_lines = Vec::new();
     for row in result {
         let row = row.unwrap();
         let plan_line: String = row.get(0).unwrap();
+        all_lines.push(plan_line.clone());
         if plan_line.contains("Hash Join") {
             found_hash_join = true;
-            break;
         }
     }
 
     assert!(
         found_hash_join,
-        "EXPLAIN should show Hash Join for equality condition"
+        "EXPLAIN should show Hash Join for equality condition on non-indexed columns. Got:\n{}",
+        all_lines.join("\n")
     );
 }
 

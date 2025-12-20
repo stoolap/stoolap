@@ -44,6 +44,166 @@ use super::Executor;
 // Re-export for backward compatibility
 pub use super::utils::{expression_contains_aggregate, is_aggregate_function};
 
+/// Single condition in a HAVING clause
+#[derive(Clone, Debug)]
+struct HavingCondition {
+    /// Index of the aggregate in the aggregations array
+    agg_index: usize,
+    /// Comparison operator
+    op: ComparisonOp,
+    /// Threshold value
+    threshold: f64,
+}
+
+/// Simple HAVING filter for inline application during fast aggregation
+/// Supports: SUM(col) op value, COUNT(*) op value, COUNT(col) op value
+/// Also supports AND combinations: COUNT(*) > 10 AND SUM(x) > 100
+#[derive(Clone, Debug)]
+struct SimpleHavingFilter {
+    /// All conditions that must pass (AND semantics)
+    conditions: Vec<HavingCondition>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ComparisonOp {
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Eq,
+    Neq,
+}
+
+impl HavingCondition {
+    /// Check if a value passes this condition
+    fn matches(&self, value: f64) -> bool {
+        match self.op {
+            ComparisonOp::Gt => value > self.threshold,
+            ComparisonOp::Gte => value >= self.threshold,
+            ComparisonOp::Lt => value < self.threshold,
+            ComparisonOp::Lte => value <= self.threshold,
+            ComparisonOp::Eq => (value - self.threshold).abs() < f64::EPSILON,
+            ComparisonOp::Neq => (value - self.threshold).abs() >= f64::EPSILON,
+        }
+    }
+}
+
+impl SimpleHavingFilter {
+    /// Create a filter with a single condition
+    fn single(agg_index: usize, op: ComparisonOp, threshold: f64) -> Self {
+        Self {
+            conditions: vec![HavingCondition {
+                agg_index,
+                op,
+                threshold,
+            }],
+        }
+    }
+
+    /// Combine two filters with AND semantics
+    fn and(mut self, other: Self) -> Self {
+        self.conditions.extend(other.conditions);
+        self
+    }
+}
+
+/// Simple aggregate type for fast aggregation path
+/// Only supports COUNT and SUM (no DISTINCT, FILTER, ORDER BY, or expressions)
+#[derive(Clone)]
+enum SimpleAgg {
+    Count,      // COUNT(*) or COUNT(col)
+    Sum(usize), // SUM(col) - stores column index
+}
+
+/// Try to parse a simple HAVING clause for inline filtering
+/// Returns None if the HAVING is too complex for inline optimization
+/// Supports: single conditions and AND combinations
+fn try_parse_simple_having(
+    having: &Expression,
+    aggregations: &[SqlAggregateFunction],
+) -> Option<SimpleHavingFilter> {
+    // Handle AND expressions: parse both sides and combine
+    if let Expression::Infix(binop) = having {
+        if binop.operator.eq_ignore_ascii_case("AND") {
+            let left = try_parse_simple_having(&binop.left, aggregations)?;
+            let right = try_parse_simple_having(&binop.right, aggregations)?;
+            return Some(left.and(right));
+        }
+    }
+
+    // Handle single comparison: AGG(col) op value
+    try_parse_single_having_condition(having, aggregations)
+        .map(|(agg_index, op, threshold)| SimpleHavingFilter::single(agg_index, op, threshold))
+}
+
+/// Parse a single HAVING condition (not AND/OR)
+fn try_parse_single_having_condition(
+    having: &Expression,
+    aggregations: &[SqlAggregateFunction],
+) -> Option<(usize, ComparisonOp, f64)> {
+    // Handle comparison: AGG(col) op value
+    if let Expression::Infix(binop) = having {
+        let (op, threshold) = match binop.operator.as_str() {
+            ">" => (ComparisonOp::Gt, extract_numeric_value(&binop.right)?),
+            ">=" => (ComparisonOp::Gte, extract_numeric_value(&binop.right)?),
+            "<" => (ComparisonOp::Lt, extract_numeric_value(&binop.right)?),
+            "<=" => (ComparisonOp::Lte, extract_numeric_value(&binop.right)?),
+            "=" => (ComparisonOp::Eq, extract_numeric_value(&binop.right)?),
+            "!=" | "<>" => (ComparisonOp::Neq, extract_numeric_value(&binop.right)?),
+            _ => return None,
+        };
+
+        // Left side should be an aggregate function
+        if let Expression::FunctionCall(func) = &*binop.left {
+            let func_upper = func.function.to_uppercase();
+            if matches!(func_upper.as_str(), "SUM" | "COUNT" | "AVG" | "MIN" | "MAX") {
+                // Find matching aggregate
+                for (i, agg) in aggregations.iter().enumerate() {
+                    if agg.name.to_uppercase() == func_upper && !agg.distinct {
+                        // Check if column matches (for non-COUNT(*))
+                        let col_matches = if func_upper == "COUNT" {
+                            // COUNT(*) or COUNT(col)
+                            func.arguments.first().is_none_or(|arg| {
+                                matches!(arg, Expression::Star(_))
+                                    || match arg {
+                                        Expression::Identifier(id) => {
+                                            id.value_lower == agg.column_lower
+                                        }
+                                        _ => false,
+                                    }
+                            })
+                        } else {
+                            // SUM, AVG, etc. - check column
+                            func.arguments.first().is_some_and(|arg| match arg {
+                                Expression::Identifier(id) => id.value_lower == agg.column_lower,
+                                _ => false,
+                            })
+                        };
+
+                        if col_matches {
+                            return Some((i, op, threshold));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract numeric value from expression
+fn extract_numeric_value(expr: &Expression) -> Option<f64> {
+    match expr {
+        Expression::IntegerLiteral(lit) => Some(lit.value as f64),
+        Expression::FloatLiteral(lit) => Some(lit.value),
+        Expression::Prefix(unary) if unary.operator == "-" => {
+            extract_numeric_value(&unary.right).map(|v| -v)
+        }
+        _ => None,
+    }
+}
+
 /// Represents a grouping set for ROLLUP/CUBE operations
 /// Each grouping set specifies which columns are active (included in grouping)
 /// For ROLLUP(a, b), we get: [true, true], [true, false], [false, false]
@@ -262,18 +422,20 @@ impl Executor {
         };
 
         // Build result
-        let (result_columns, result_rows) = if group_by_columns.is_empty() {
+        // having_applied_inline tracks if HAVING was already applied during fast aggregation
+        let (result_columns, result_rows, having_applied_inline) = if group_by_columns.is_empty() {
             // Global aggregation (no GROUP BY)
-            self.execute_global_aggregation(
+            let (cols, rows) = self.execute_global_aggregation(
                 &aggregations,
                 &base_rows,
                 base_columns,
                 &col_index_map,
                 ctx,
-            )?
+            )?;
+            (cols, rows, false)
         } else if stmt.group_by.modifier != GroupByModifier::None {
             // ROLLUP or CUBE aggregation
-            self.execute_rollup_aggregation(
+            let (cols, rows) = self.execute_rollup_aggregation(
                 &aggregations,
                 &group_by_columns,
                 &base_rows,
@@ -281,9 +443,11 @@ impl Executor {
                 &col_index_map,
                 stmt,
                 ctx,
-            )?
+            )?;
+            (cols, rows, false)
         } else {
             // Regular grouped aggregation - pass limit for early termination
+            // May apply HAVING inline for simple cases (returns having_applied flag)
             self.execute_grouped_aggregation(
                 &aggregations,
                 &group_by_columns,
@@ -297,54 +461,60 @@ impl Executor {
         };
 
         // Apply HAVING clause BEFORE projection (HAVING may reference aggregates not in SELECT)
+        // Skip if HAVING was already applied inline during fast aggregation
         let (having_columns, having_rows) = if let Some(ref having) = stmt.having {
-            // Pre-process scalar subqueries in HAVING clause
-            // This executes subqueries like (SELECT AVG(a) FROM t) and replaces them with values
-            let processed_having = self.process_where_subqueries(having, ctx)?;
+            if having_applied_inline {
+                // HAVING already applied inline, skip separate filtering
+                (result_columns, result_rows)
+            } else {
+                // Pre-process scalar subqueries in HAVING clause
+                // This executes subqueries like (SELECT AVG(a) FROM t) and replaces them with values
+                let processed_having = self.process_where_subqueries(having, ctx)?;
 
-            // Build aggregate expression aliases for HAVING clause
-            // IMPORTANT: Include ALL aggregates, not just aliased ones,
-            // because CompiledEvaluator needs expression_aliases to match FunctionCall expressions
-            let group_by_count = group_by_columns.len();
-            let agg_aliases: Vec<(String, usize)> = aggregations
-                .iter()
-                .enumerate()
-                .map(|(i, agg)| (agg.get_expression_name(), group_by_count + i))
-                .collect();
+                // Build aggregate expression aliases for HAVING clause
+                // IMPORTANT: Include ALL aggregates, not just aliased ones,
+                // because CompiledEvaluator needs expression_aliases to match FunctionCall expressions
+                let group_by_count = group_by_columns.len();
+                let agg_aliases: Vec<(String, usize)> = aggregations
+                    .iter()
+                    .enumerate()
+                    .map(|(i, agg)| (agg.get_expression_name(), group_by_count + i))
+                    .collect();
 
-            // Build GROUP BY expression aliases for HAVING clause
-            // This maps expressions like "x + y" to their GROUP BY column indices
-            let expr_aliases: Vec<(String, usize)> = group_by_columns
-                .iter()
-                .enumerate()
-                .filter_map(|(i, item)| {
-                    if let GroupByItem::Expression { expr, .. } = item {
-                        Some((self.expression_to_string(expr), i))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+                // Build GROUP BY expression aliases for HAVING clause
+                // This maps expressions like "x + y" to their GROUP BY column indices
+                let expr_aliases: Vec<(String, usize)> = group_by_columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, item)| {
+                        if let GroupByItem::Expression { expr, .. } = item {
+                            Some((self.expression_to_string(expr), i))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
 
-            let tmp_result = Box::new(ExecutorMemoryResult::new(
-                result_columns.clone(),
-                result_rows,
-            ));
-            let mut having_result = self.apply_having(
-                tmp_result,
-                &processed_having,
-                &result_columns,
-                &agg_aliases,
-                &expr_aliases,
-                ctx,
-            )?;
+                let tmp_result = Box::new(ExecutorMemoryResult::new(
+                    result_columns.clone(),
+                    result_rows,
+                ));
+                let mut having_result = self.apply_having(
+                    tmp_result,
+                    &processed_having,
+                    &result_columns,
+                    &agg_aliases,
+                    &expr_aliases,
+                    ctx,
+                )?;
 
-            // Collect rows after HAVING filter
-            let mut filtered_rows = Vec::new();
-            while having_result.next() {
-                filtered_rows.push(having_result.take_row());
+                // Collect rows after HAVING filter
+                let mut filtered_rows = Vec::new();
+                while having_result.next() {
+                    filtered_rows.push(having_result.take_row());
+                }
+                (result_columns, filtered_rows)
             }
-            (result_columns, filtered_rows)
         } else {
             (result_columns, result_rows)
         };
@@ -968,7 +1138,8 @@ impl Executor {
             )?
         } else {
             // Grouped aggregation - no limit since window functions need all groups
-            self.execute_grouped_aggregation(
+            // Discard the having_applied flag - window functions apply HAVING separately
+            let (cols, rows, _having_applied) = self.execute_grouped_aggregation(
                 &aggregations,
                 &group_by_columns,
                 &base_rows,
@@ -977,7 +1148,8 @@ impl Executor {
                 stmt,
                 ctx,
                 None, // Window functions need all groups
-            )?
+            )?;
+            (cols, rows)
         };
 
         // Apply HAVING clause filter (in-place)
@@ -1818,14 +1990,9 @@ impl Executor {
                                             Some(&expr_values[i])
                                         }
                                         Err(e) => {
-                                            // Expression evaluation failed - skip row
-                                            #[cfg(debug_assertions)]
-                                            eprintln!(
-                                                "Warning: aggregate expression evaluation failed: {}",
-                                                e
-                                            );
-                                            let _ = e;
-                                            None
+                                            return Err(crate::core::Error::expression_evaluation(
+                                                format!("{}({}): {}", agg.name, agg.column, e),
+                                            ));
                                         }
                                     }
                                 } else {
@@ -2038,6 +2205,10 @@ impl Executor {
     ///
     /// When `limit` is provided and there's no ORDER BY, enables early termination:
     /// once we have `limit` complete groups, we stop creating new groups.
+    ///
+    /// When `having_filter` is provided, applies HAVING inline during row generation,
+    /// avoiding a separate filtering pass.
+    #[allow(clippy::too_many_arguments)]
     fn try_fast_aggregation(
         &self,
         aggregations: &[SqlAggregateFunction],
@@ -2046,6 +2217,7 @@ impl Executor {
         _columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
         limit: Option<usize>,
+        having_filter: Option<&SimpleHavingFilter>,
     ) -> Result<Option<(Vec<String>, Vec<Row>)>> {
         // Check if all GROUP BY items are simple column references
         let group_by_indices: Vec<usize> = group_by_items
@@ -2064,12 +2236,6 @@ impl Executor {
         }
 
         // Check if all aggregates are simple (SUM or COUNT without DISTINCT/FILTER/ORDER BY/expression)
-        #[derive(Clone)]
-        enum SimpleAgg {
-            Count,      // COUNT(*) or COUNT(col)
-            Sum(usize), // SUM(col) - stores column index
-        }
-
         let simple_aggs: Vec<Option<SimpleAgg>> = aggregations
             .iter()
             .map(|agg| {
@@ -2104,11 +2270,27 @@ impl Executor {
 
         let simple_aggs: Vec<SimpleAgg> = simple_aggs.into_iter().map(|a| a.unwrap()).collect();
 
-        // Fast path: single-pass streaming aggregation
+        // OPTIMIZATION: Single-column GROUP BY uses direct Value storage (no Vec allocation per row)
+        if group_by_indices.len() == 1 {
+            return self.try_fast_aggregation_single_column(
+                &group_by_indices[0],
+                &simple_aggs,
+                aggregations,
+                group_by_items,
+                rows,
+                limit,
+                having_filter,
+            );
+        }
+
+        // Fast path: single-pass streaming aggregation for multi-column GROUP BY
         // Store aggregate state directly in hash map instead of row indices
         struct FastGroupState {
             key_values: Vec<Value>,
-            agg_values: Vec<f64>,     // Running sums stored as f64
+            // Running sums stored as f64. Note: f64 can exactly represent integers
+            // up to 2^53 (~9 quadrillion). For sums exceeding this, precision loss
+            // may occur. This matches SQLite's behavior for aggregate functions.
+            agg_values: Vec<f64>,
             agg_has_value: Vec<bool>, // Track if any non-NULL value was seen (for SUM)
             counts: Vec<i64>,         // For COUNT
         }
@@ -2221,9 +2403,34 @@ impl Executor {
         }
 
         // Build result rows - flatten buckets (each bucket may have multiple groups due to collisions)
+        // OPTIMIZATION: Apply HAVING filter inline if provided, avoiding separate filtering pass
         let result_rows: Vec<Row> = groups
             .into_values()
             .flatten() // Flatten Vec<FastGroupState> from each bucket
+            .filter(|state| {
+                // Apply inline HAVING filter if provided (supports AND combinations)
+                if let Some(filter) = having_filter {
+                    // All conditions must pass (AND semantics)
+                    for cond in &filter.conditions {
+                        let agg_value = match &simple_aggs[cond.agg_index] {
+                            SimpleAgg::Count => state.counts[cond.agg_index] as f64,
+                            SimpleAgg::Sum(_) => {
+                                if state.agg_has_value[cond.agg_index] {
+                                    state.agg_values[cond.agg_index]
+                                } else {
+                                    return false; // NULL values don't pass comparison
+                                }
+                            }
+                        };
+                        if !cond.matches(agg_value) {
+                            return false;
+                        }
+                    }
+                    true
+                } else {
+                    true // No HAVING filter, include all groups
+                }
+            })
             .map(|state| {
                 let mut values = Vec::with_capacity(group_by_indices.len() + simple_aggs.len());
                 values.extend(state.key_values);
@@ -2233,6 +2440,314 @@ impl Executor {
                         SimpleAgg::Count => Value::Integer(state.counts[i]),
                         SimpleAgg::Sum(_) => {
                             // SUM returns NULL if no non-NULL values were seen
+                            if state.agg_has_value[i] {
+                                Value::Float(state.agg_values[i])
+                            } else {
+                                Value::null_unknown()
+                            }
+                        }
+                    };
+                    values.push(value);
+                }
+
+                Row::from_values(values)
+            })
+            .collect();
+
+        Ok(Some((result_columns, result_rows)))
+    }
+
+    /// Single-column GROUP BY fast aggregation - avoids Vec<Value> allocation per row
+    ///
+    /// For single-column GROUP BY (the most common case), we can store the group key
+    /// as a single Value instead of Vec<Value>, eliminating allocation overhead.
+    #[allow(clippy::too_many_arguments)]
+    fn try_fast_aggregation_single_column(
+        &self,
+        group_col_idx: &usize,
+        simple_aggs: &[SimpleAgg],
+        aggregations: &[SqlAggregateFunction],
+        group_by_items: &[GroupByItem],
+        rows: &[Row],
+        limit: Option<usize>,
+        having_filter: Option<&SimpleHavingFilter>,
+    ) -> Result<Option<(Vec<String>, Vec<Row>)>> {
+        // State for single-column GROUP BY - stores single Value instead of Vec<Value>
+        struct SingleColGroupState {
+            key_value: Value,
+            agg_values: Vec<f64>,
+            agg_has_value: Vec<bool>,
+            counts: Vec<i64>,
+        }
+
+        let estimated_groups = (rows.len() / 3).max(64);
+        let num_aggs = simple_aggs.len();
+        let col_idx = *group_col_idx;
+
+        // Track for early termination optimization
+        let group_limit = limit.unwrap_or(usize::MAX);
+        let has_limit = limit.is_some();
+
+        // OPTIMIZATION: Check if we can use Integer fast path
+        // Sample multiple rows to detect column type (first non-NULL value determines type)
+        // This handles cases where the first row might have NULL values.
+        let use_integer_fast_path = rows
+            .iter()
+            .take(16) // Sample up to 16 rows for efficiency
+            .filter_map(|r| r.get(col_idx))
+            .find(|v| !matches!(v, Value::Null(_)))
+            .map(|v| matches!(v, Value::Integer(_)))
+            .unwrap_or(false);
+
+        if use_integer_fast_path {
+            // Ultra-fast path for Integer GROUP BY: no Value cloning, no hashing overhead
+            struct IntGroupState {
+                agg_values: Vec<f64>,
+                agg_has_value: Vec<bool>,
+                counts: Vec<i64>,
+            }
+
+            let mut groups: FxHashMap<i64, IntGroupState> =
+                FxHashMap::with_capacity_and_hasher(estimated_groups, Default::default());
+            let mut current_group_count: usize = 0;
+
+            for row in rows {
+                // Extract integer key directly - no clone, no hash
+                let key = match row.get(col_idx) {
+                    Some(Value::Integer(v)) => *v,
+                    _ => continue, // Skip non-integer/NULL values
+                };
+
+                // Early termination check
+                if has_limit && !groups.contains_key(&key) && current_group_count >= group_limit {
+                    continue;
+                }
+
+                // Get or create group
+                let state = groups.entry(key).or_insert_with(|| {
+                    current_group_count += 1;
+                    IntGroupState {
+                        agg_values: vec![0.0; num_aggs],
+                        agg_has_value: vec![false; num_aggs],
+                        counts: vec![0; num_aggs],
+                    }
+                });
+
+                // Accumulate aggregates
+                for (i, agg) in simple_aggs.iter().enumerate() {
+                    match agg {
+                        SimpleAgg::Count => {
+                            state.counts[i] += 1;
+                        }
+                        SimpleAgg::Sum(sum_col_idx) => {
+                            if let Some(value) = row.get(*sum_col_idx) {
+                                match value {
+                                    Value::Integer(v) => {
+                                        state.agg_values[i] += *v as f64;
+                                        state.agg_has_value[i] = true;
+                                    }
+                                    Value::Float(v) => {
+                                        state.agg_values[i] += v;
+                                        state.agg_has_value[i] = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Build result columns
+            let mut result_columns = Vec::with_capacity(1 + aggregations.len());
+            let group_col_name = match &group_by_items[0] {
+                GroupByItem::Column(col_name) => col_name.clone(),
+                _ => "col0".to_string(),
+            };
+            result_columns.push(group_col_name);
+            for agg in aggregations {
+                let col_name = if let Some(ref alias) = agg.alias {
+                    alias.clone()
+                } else {
+                    agg.get_expression_name()
+                };
+                result_columns.push(col_name);
+            }
+
+            // Build result rows with inline HAVING filter (supports AND combinations)
+            let result_rows: Vec<Row> = groups
+                .into_iter()
+                .filter(|(_key, state)| {
+                    if let Some(filter) = having_filter {
+                        // All conditions must pass (AND semantics)
+                        for cond in &filter.conditions {
+                            let agg_value = match &simple_aggs[cond.agg_index] {
+                                SimpleAgg::Count => state.counts[cond.agg_index] as f64,
+                                SimpleAgg::Sum(_) => {
+                                    if state.agg_has_value[cond.agg_index] {
+                                        state.agg_values[cond.agg_index]
+                                    } else {
+                                        return false;
+                                    }
+                                }
+                            };
+                            if !cond.matches(agg_value) {
+                                return false;
+                            }
+                        }
+                        true
+                    } else {
+                        true
+                    }
+                })
+                .map(|(key, state)| {
+                    let mut values = Vec::with_capacity(1 + simple_aggs.len());
+                    values.push(Value::Integer(key));
+                    for (i, agg) in simple_aggs.iter().enumerate() {
+                        let value = match agg {
+                            SimpleAgg::Count => Value::Integer(state.counts[i]),
+                            SimpleAgg::Sum(_) => {
+                                if state.agg_has_value[i] {
+                                    Value::Float(state.agg_values[i])
+                                } else {
+                                    Value::null_unknown()
+                                }
+                            }
+                        };
+                        values.push(value);
+                    }
+                    Row::from_values(values)
+                })
+                .collect();
+
+            return Ok(Some((result_columns, result_rows)));
+        }
+
+        // Fallback: general single-column path with Value storage
+        // Use hash -> Vec to handle collisions (different values with same hash)
+        let mut groups: FxHashMap<u64, Vec<SingleColGroupState>> =
+            FxHashMap::with_capacity_and_hasher(estimated_groups, Default::default());
+        let mut current_group_count: usize = 0;
+
+        for row in rows {
+            // Get key value directly - no Vec allocation
+            let key_value = row
+                .get(col_idx)
+                .cloned()
+                .unwrap_or_else(Value::null_unknown);
+
+            // Hash the single value
+            let mut hasher = AHasher::default();
+            hash_value_into(&key_value, &mut hasher);
+            let hash = hasher.finish();
+
+            // Early termination check
+            let key_exists = groups
+                .get(&hash)
+                .map(|bucket| bucket.iter().any(|state| state.key_value == key_value))
+                .unwrap_or(false);
+
+            if has_limit && !key_exists && current_group_count >= group_limit {
+                continue;
+            }
+
+            // Get or create bucket for this hash
+            let bucket = groups.entry(hash).or_default();
+
+            // Find existing group or create new one
+            let state = if let Some(state) = bucket.iter_mut().find(|s| s.key_value == key_value) {
+                state
+            } else {
+                bucket.push(SingleColGroupState {
+                    key_value,
+                    agg_values: vec![0.0; num_aggs],
+                    agg_has_value: vec![false; num_aggs],
+                    counts: vec![0; num_aggs],
+                });
+                current_group_count += 1;
+                bucket.last_mut().unwrap()
+            };
+
+            // Accumulate aggregates
+            for (i, agg) in simple_aggs.iter().enumerate() {
+                match agg {
+                    SimpleAgg::Count => {
+                        state.counts[i] += 1;
+                    }
+                    SimpleAgg::Sum(sum_col_idx) => {
+                        if let Some(value) = row.get(*sum_col_idx) {
+                            match value {
+                                Value::Integer(v) => {
+                                    state.agg_values[i] += *v as f64;
+                                    state.agg_has_value[i] = true;
+                                }
+                                Value::Float(v) => {
+                                    state.agg_values[i] += v;
+                                    state.agg_has_value[i] = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build result columns
+        let mut result_columns = Vec::with_capacity(1 + aggregations.len());
+
+        // Single GROUP BY column name
+        let group_col_name = match &group_by_items[0] {
+            GroupByItem::Column(col_name) => col_name.clone(),
+            _ => "col0".to_string(),
+        };
+        result_columns.push(group_col_name);
+
+        // Add aggregate column names
+        for agg in aggregations {
+            let col_name = if let Some(ref alias) = agg.alias {
+                alias.clone()
+            } else {
+                agg.get_expression_name()
+            };
+            result_columns.push(col_name);
+        }
+
+        // Build result rows with inline HAVING filter (supports AND combinations)
+        let result_rows: Vec<Row> = groups
+            .into_values()
+            .flatten()
+            .filter(|state| {
+                if let Some(filter) = having_filter {
+                    // All conditions must pass (AND semantics)
+                    for cond in &filter.conditions {
+                        let agg_value = match &simple_aggs[cond.agg_index] {
+                            SimpleAgg::Count => state.counts[cond.agg_index] as f64,
+                            SimpleAgg::Sum(_) => {
+                                if state.agg_has_value[cond.agg_index] {
+                                    state.agg_values[cond.agg_index]
+                                } else {
+                                    return false;
+                                }
+                            }
+                        };
+                        if !cond.matches(agg_value) {
+                            return false;
+                        }
+                    }
+                    true
+                } else {
+                    true
+                }
+            })
+            .map(|state| {
+                let mut values = Vec::with_capacity(1 + simple_aggs.len());
+                values.push(state.key_value);
+
+                for (i, agg) in simple_aggs.iter().enumerate() {
+                    let value = match agg {
+                        SimpleAgg::Count => Value::Integer(state.counts[i]),
+                        SimpleAgg::Sum(_) => {
                             if state.agg_has_value[i] {
                                 Value::Float(state.agg_values[i])
                             } else {
@@ -2268,12 +2783,19 @@ impl Executor {
         rows: &[Row],
         columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
-        _stmt: &SelectStatement,
+        stmt: &SelectStatement,
         ctx: &ExecutionContext,
         limit: Option<usize>,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
+    ) -> Result<(Vec<String>, Vec<Row>, bool)> {
+        // Try to parse simple HAVING for inline filtering optimization
+        let inline_having = stmt
+            .having
+            .as_ref()
+            .and_then(|h| try_parse_simple_having(h, aggregations));
+
         // FAST PATH: For simple aggregates (SUM, COUNT without DISTINCT/FILTER/ORDER BY/expression),
         // use single-pass streaming aggregation that accumulates values directly
+        // When inline HAVING is available, it's applied during row generation
         if let Some(result) = self.try_fast_aggregation(
             aggregations,
             group_by_items,
@@ -2281,8 +2803,10 @@ impl Executor {
             columns,
             col_index_map,
             limit,
+            inline_having.as_ref(),
         )? {
-            return Ok(result);
+            // Return true for having_applied if we had an inline HAVING filter
+            return Ok((result.0, result.1, inline_having.is_some()));
         }
 
         // Check if any aggregation has an expression (e.g., SUM(val * 2)), ORDER BY, or FILTER
@@ -2775,14 +3299,9 @@ impl Executor {
                                             Some(&expr_values[i])
                                         }
                                         Err(e) => {
-                                            // Expression evaluation failed - see comment above
-                                            #[cfg(debug_assertions)]
-                                            eprintln!(
-                                                "Warning: aggregate expression evaluation failed: {}",
-                                                e
-                                            );
-                                            let _ = e;
-                                            None
+                                            return Err(crate::core::Error::expression_evaluation(
+                                                format!("{}({}): {}", agg.name, agg.column, e),
+                                            ));
                                         }
                                     }
                                 } else {
@@ -2859,7 +3378,8 @@ impl Executor {
             self.resolve_group_by_column_names_new(group_by_items, columns, col_index_map);
         result_columns.extend(aggregations.iter().map(|a| a.get_column_name()));
 
-        Ok((result_columns, result_rows))
+        // Slow path doesn't apply HAVING inline, so return false
+        Ok((result_columns, result_rows, false))
     }
 
     /// Execute ROLLUP/CUBE aggregation
@@ -3743,6 +4263,213 @@ impl Executor {
             }
             _ => false,
         }
+    }
+
+    /// Check if an expression is a PURE aggregate function call.
+    ///
+    /// Returns true only for:
+    /// - `COUNT(*)`, `SUM(col)`, `MIN(col)`, `MAX(col)`, `AVG(col)` directly
+    /// - Same with alias: `COUNT(*) AS cnt`
+    ///
+    /// Returns false for:
+    /// - `SUM(col) + 10` (wrapped in Infix)
+    /// - `-SUM(col)` (wrapped in Prefix)
+    /// - `col * 2` (not an aggregate)
+    fn is_pure_aggregate_expression(expr: &Expression) -> bool {
+        match expr {
+            Expression::FunctionCall(func) => {
+                // Check if it's an aggregate function
+                matches!(
+                    func.function.to_uppercase().as_str(),
+                    "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
+                )
+            }
+            Expression::Aliased(aliased) => {
+                // Check the inner expression
+                Self::is_pure_aggregate_expression(&aliased.expression)
+            }
+            _ => false,
+        }
+    }
+
+    /// Try to compute aggregates directly on the table without materializing rows.
+    ///
+    /// This is the "deferred aggregation" optimization for simple queries like:
+    /// - `SELECT COUNT(*) FROM table`
+    /// - `SELECT SUM(col), MIN(col), MAX(col) FROM table`
+    ///
+    /// Returns None if the optimization cannot be applied.
+    /// Returns Some(result) if the aggregates were computed directly.
+    ///
+    /// # Eligibility
+    /// - No WHERE clause (or simplified to nothing)
+    /// - No GROUP BY clause
+    /// - No HAVING clause
+    /// - No window functions
+    /// - Simple column aggregates only (no expressions like SUM(a+b))
+    /// - No DISTINCT
+    /// - No ORDER BY on aggregates (like STRING_AGG with ORDER BY)
+    /// - No FILTER clause on aggregates
+    pub(crate) fn try_aggregation_pushdown(
+        &self,
+        table: &dyn crate::storage::traits::Table,
+        stmt: &SelectStatement,
+        all_columns: &[String],
+        _ctx: &super::context::ExecutionContext,
+    ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
+        // Quick eligibility checks
+        if stmt.where_clause.is_some() {
+            return Ok(None);
+        }
+        if !stmt.group_by.columns.is_empty() {
+            return Ok(None);
+        }
+        if stmt.having.is_some() {
+            return Ok(None);
+        }
+        if self.has_window_functions(stmt) {
+            return Ok(None);
+        }
+
+        // CRITICAL: Check that each column expression is a PURE aggregate function
+        // We cannot pushdown expressions like SUM(val) + 10, -SUM(val), etc.
+        // Only handle direct function calls: SUM(val), COUNT(*), MAX(val), etc.
+        for col in &stmt.columns {
+            if !Self::is_pure_aggregate_expression(col) {
+                return Ok(None);
+            }
+        }
+
+        // Parse aggregations
+        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
+
+        // Must have only aggregations, no regular columns
+        if !non_agg_columns.is_empty() {
+            return Ok(None);
+        }
+        if aggregations.is_empty() {
+            return Ok(None);
+        }
+
+        // Check all aggregations are simple (no expression, no DISTINCT, no ORDER BY, no FILTER)
+        for agg in &aggregations {
+            if agg.expression.is_some()
+                || agg.distinct
+                || !agg.order_by.is_empty()
+                || agg.filter.is_some()
+            {
+                return Ok(None);
+            }
+            // Only support COUNT, SUM, MIN, MAX, AVG
+            match agg.name.as_str() {
+                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {}
+                _ => return Ok(None),
+            }
+        }
+
+        // Build column index map
+        let col_index_map: rustc_hash::FxHashMap<String, usize> = all_columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.to_lowercase(), i))
+            .collect();
+
+        // Compute each aggregate
+        let mut result_values: Vec<Value> = Vec::with_capacity(aggregations.len());
+        let mut result_columns: Vec<String> = Vec::with_capacity(aggregations.len());
+
+        for agg in &aggregations {
+            result_columns.push(agg.get_column_name());
+
+            match agg.name.as_str() {
+                "COUNT" => {
+                    if agg.column == "*" {
+                        // COUNT(*) - use row_count
+                        let count = table.row_count();
+                        result_values.push(Value::Integer(count as i64));
+                    } else {
+                        // COUNT(col) - need to count non-null values, can't pushdown easily
+                        return Ok(None);
+                    }
+                }
+                "SUM" => {
+                    let col_idx = col_index_map.get(&agg.column_lower).copied();
+                    if let Some(idx) = col_idx {
+                        if let Some((sum, count)) = table.sum_column(idx) {
+                            if count == 0 {
+                                result_values.push(Value::null(crate::core::DataType::Float));
+                            } else {
+                                // Check if result should be integer or float
+                                // For now, return as float if it has decimal part
+                                if sum.fract() == 0.0 && sum.abs() < i64::MAX as f64 {
+                                    result_values.push(Value::Integer(sum as i64));
+                                } else {
+                                    result_values.push(Value::Float(sum));
+                                }
+                            }
+                        } else {
+                            return Ok(None); // Pushdown not available
+                        }
+                    } else {
+                        return Ok(None); // Column not found
+                    }
+                }
+                "AVG" => {
+                    let col_idx = col_index_map.get(&agg.column_lower).copied();
+                    if let Some(idx) = col_idx {
+                        if let Some((sum, count)) = table.avg_column(idx) {
+                            if count == 0 {
+                                result_values.push(Value::null(crate::core::DataType::Float));
+                            } else {
+                                result_values.push(Value::Float(sum / count as f64));
+                            }
+                        } else {
+                            return Ok(None); // Pushdown not available
+                        }
+                    } else {
+                        return Ok(None); // Column not found
+                    }
+                }
+                "MIN" => {
+                    let col_idx = col_index_map.get(&agg.column_lower).copied();
+                    if let Some(idx) = col_idx {
+                        if let Some(min_val) = table.min_column(idx) {
+                            result_values
+                                .push(min_val.unwrap_or_else(|| {
+                                    Value::null(crate::core::DataType::Integer)
+                                }));
+                        } else {
+                            return Ok(None); // Pushdown not available
+                        }
+                    } else {
+                        return Ok(None); // Column not found
+                    }
+                }
+                "MAX" => {
+                    let col_idx = col_index_map.get(&agg.column_lower).copied();
+                    if let Some(idx) = col_idx {
+                        if let Some(max_val) = table.max_column(idx) {
+                            result_values
+                                .push(max_val.unwrap_or_else(|| {
+                                    Value::null(crate::core::DataType::Integer)
+                                }));
+                        } else {
+                            return Ok(None); // Pushdown not available
+                        }
+                    } else {
+                        return Ok(None); // Column not found
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // Build result
+        let row = Row::from_values(result_values);
+        Ok(Some(Box::new(super::result::ExecutorMemoryResult::new(
+            result_columns,
+            vec![row],
+        ))))
     }
 }
 

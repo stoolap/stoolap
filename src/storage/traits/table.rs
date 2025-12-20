@@ -365,6 +365,49 @@ pub trait Table: Send + Sync {
         self.collect_rows_with_limit(where_expr, limit, offset)
     }
 
+    /// Collect rows with ORDER BY + LIMIT using deferred materialization
+    ///
+    /// This is an optimization for `SELECT * FROM t ORDER BY col LIMIT n`:
+    /// - Loads only the sort column values (not full rows)
+    /// - Sorts indices by those values
+    /// - Materializes only the top N rows
+    ///
+    /// # Arguments
+    /// * `sort_col_idx` - Column index to sort by
+    /// * `ascending` - Sort direction (true = ASC, false = DESC)
+    /// * `limit` - Maximum rows to return
+    /// * `offset` - Rows to skip before collecting
+    ///
+    /// # Returns
+    /// A vector of rows sorted by the specified column
+    fn collect_rows_sorted_with_limit(
+        &self,
+        sort_col_idx: usize,
+        ascending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Row>> {
+        // Default implementation: collect all, sort, take limit
+        // Concrete implementations can override with deferred materialization
+        let mut rows = self.collect_all_rows(None)?;
+        rows.sort_by(|a, b| {
+            let va = a.get(sort_col_idx);
+            let vb = b.get(sort_col_idx);
+            let cmp = match (va, vb) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(va), Some(vb)) => va.compare(vb).unwrap_or(std::cmp::Ordering::Equal),
+            };
+            if ascending {
+                cmp
+            } else {
+                cmp.reverse()
+            }
+        });
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
+    }
+
     /// Closes the table and releases any resources
     fn close(&mut self) -> Result<()>;
 
@@ -789,6 +832,56 @@ pub trait Table: Send + Sync {
         _operator: crate::core::Operator,
         _value: &Value,
     ) -> Option<Vec<u32>> {
+        None // Default implementation - override in concrete tables
+    }
+
+    // ---- Deferred Aggregation Methods ----
+    // These methods enable aggregation pushdown to avoid full row materialization.
+    // For `SELECT SUM(col) FROM table`, we can compute SUM directly from arena data
+    // without cloning any rows.
+
+    /// Compute SUM of a column without materializing rows (deferred aggregation)
+    ///
+    /// Returns (sum, count_non_null) for proper NULL handling.
+    /// Returns None if the optimization is not available.
+    ///
+    /// # Arguments
+    /// * `col_idx` - Column index to sum
+    fn sum_column(&self, _col_idx: usize) -> Option<(f64, usize)> {
+        None // Default implementation - override in concrete tables
+    }
+
+    /// Compute AVG of a column without materializing rows (deferred aggregation)
+    ///
+    /// Returns (sum, count_non_null) for computing average as sum/count.
+    /// Returns None if the optimization is not available.
+    ///
+    /// # Arguments
+    /// * `col_idx` - Column index to average
+    fn avg_column(&self, _col_idx: usize) -> Option<(f64, usize)> {
+        // Default: use sum_column if available
+        self.sum_column(_col_idx)
+    }
+
+    /// Compute MIN of a column without materializing rows (deferred aggregation)
+    ///
+    /// Returns the minimum value, or None if no non-NULL values exist.
+    /// Returns None for the outer Option if the optimization is not available.
+    ///
+    /// # Arguments
+    /// * `col_idx` - Column index to find minimum
+    fn min_column(&self, _col_idx: usize) -> Option<Option<Value>> {
+        None // Default implementation - override in concrete tables
+    }
+
+    /// Compute MAX of a column without materializing rows (deferred aggregation)
+    ///
+    /// Returns the maximum value, or None if no non-NULL values exist.
+    /// Returns None for the outer Option if the optimization is not available.
+    ///
+    /// # Arguments
+    /// * `col_idx` - Column index to find maximum
+    fn max_column(&self, _col_idx: usize) -> Option<Option<Value>> {
         None // Default implementation - override in concrete tables
     }
 }

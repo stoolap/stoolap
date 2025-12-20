@@ -2040,6 +2040,18 @@ impl Executor {
         // The LIMIT early termination in the sequential path makes this efficient
         const SMALL_LIMIT_THRESHOLD: i64 = 500;
 
+        // For NOT EXISTS with an additional predicate, prefer semi-join.
+        // Reason: NOT EXISTS must check ALL matching rows to confirm none satisfy
+        // the predicate. With semi-join, we build a hash set once and do O(1) lookups.
+        // With index-nested-loop, each outer row requires O(k) checks where k = rows per key.
+        // Example: NOT EXISTS (SELECT 1 FROM orders WHERE user_id = u.id AND status = 'cancelled')
+        // Semi-join: build set of user_ids with cancelled orders once (O(cancelled_count))
+        // Then O(1) lookup per outer row
+        // Index-nested-loop: for each outer row, probe index, fetch all orders, check status
+        if info.is_negated && info.non_correlated_where.is_some() {
+            return false;
+        }
+
         // For small LIMIT, per-row EXISTS with index probe is faster
         // Complexity: O(LIMIT × log(inner)) vs O(inner) for semi-join hash build
         if let Some(limit) = outer_limit {

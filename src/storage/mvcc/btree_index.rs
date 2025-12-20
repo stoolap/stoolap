@@ -70,6 +70,17 @@ type RowIdSet = SmallVec<[i64; 4]>;
 ///   via BTreeMap. For memory-constrained environments, consider using only
 ///   BTreeMap (O(log n) equality lookups are still fast).
 ///
+/// ## Lock Ordering (Deadlock Prevention)
+///
+/// When acquiring multiple write locks simultaneously, always use this order:
+/// 1. `value_to_rows` (hash index)
+/// 2. `sorted_values` (B-tree index)
+/// 3. `row_to_value` (reverse mapping)
+///
+/// When locks are acquired in separate scopes (not held simultaneously), the order
+/// doesn't affect deadlock safety, but this ordering should still be preferred
+/// for consistency. See `add()` for the canonical pattern.
+///
 /// B-tree index for single-column ordered access and range queries
 pub struct BTreeIndex {
     /// Index name
@@ -917,6 +928,22 @@ impl Index for BTreeIndex {
                 }
             }
         }
+
+        Some(result)
+    }
+
+    fn get_grouped_row_ids(&self) -> Option<Vec<(Value, Vec<i64>)>> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return None;
+        }
+
+        let sorted_values = self.sorted_values.read().unwrap();
+
+        // Convert BTreeMap entries to (Value, Vec<i64>) pairs in sorted order
+        let result: Vec<(Value, Vec<i64>)> = sorted_values
+            .iter()
+            .map(|(value, row_ids)| (value.clone(), row_ids.to_vec()))
+            .collect();
 
         Some(result)
     }

@@ -596,4 +596,564 @@ fn main() {
     );
 
     println!("============================================================");
+    println!(
+        "\n{:<25} | {:>12} | {:>12}",
+        "Bottleneck Hunters", "Avg (μs)", "ops/sec"
+    );
+    println!("------------------------------------------------------------");
+
+    // DISTINCT without ORDER BY
+    let distinct_stmt = db.prepare("SELECT DISTINCT age FROM users").unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = distinct_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "DISTINCT (no ORDER)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // DISTINCT with ORDER BY
+    let distinct_order_stmt = db
+        .prepare("SELECT DISTINCT age FROM users ORDER BY age")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = distinct_order_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "DISTINCT + ORDER BY",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // COUNT DISTINCT
+    let count_distinct_stmt = db.prepare("SELECT COUNT(DISTINCT age) FROM users").unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = count_distinct_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "COUNT DISTINCT",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // String LIKE pattern (prefix)
+    let like_prefix_stmt = db
+        .prepare("SELECT * FROM users WHERE name LIKE 'User_1%' LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = like_prefix_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "LIKE prefix (User_1%)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // String LIKE pattern (contains) - harder to optimize
+    let like_contains_stmt = db
+        .prepare("SELECT * FROM users WHERE email LIKE '%50%' LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = like_contains_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "LIKE contains (%50%)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // OR condition (often hard to optimize)
+    let or_stmt = db
+        .prepare("SELECT * FROM users WHERE age = 25 OR age = 50 OR age = 75 LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = or_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "OR conditions (3 vals)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // IN list
+    let in_list_stmt = db
+        .prepare("SELECT * FROM users WHERE age IN (20, 25, 30, 35, 40, 45, 50) LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = in_list_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "IN list (7 values)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // NOT IN subquery (often slow - anti-join)
+    let not_in_stmt = db
+        .prepare("SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE status = 'cancelled') LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..10 {
+        let start = Instant::now();
+        let rows = not_in_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / 10.0;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "NOT IN subquery",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // NOT EXISTS (alternative anti-join)
+    let not_exists_stmt = db
+        .prepare("SELECT * FROM users u WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.status = 'cancelled') LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..10 {
+        let start = Instant::now();
+        let rows = not_exists_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / 10.0;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "NOT EXISTS subquery",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // OFFSET pagination (often slow for large offsets)
+    let offset_stmt = db
+        .prepare("SELECT * FROM users ORDER BY id LIMIT 100 OFFSET 5000")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = offset_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "OFFSET pagination (5000)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Multi-column ORDER BY
+    let multi_order_stmt = db
+        .prepare("SELECT * FROM users ORDER BY age DESC, balance ASC, name LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = multi_order_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Multi-col ORDER BY (3)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Self-join (users with same age)
+    let self_join_stmt = db
+        .prepare("SELECT u1.name, u2.name, u1.age FROM users u1 INNER JOIN users u2 ON u1.age = u2.age AND u1.id < u2.id LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..20 {
+        let start = Instant::now();
+        let rows = self_join_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / 20.0;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Self JOIN (same age)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Multiple window functions
+    let multi_window_stmt = db
+        .prepare("SELECT name, balance, ROW_NUMBER() OVER (ORDER BY balance DESC) as rn, RANK() OVER (ORDER BY balance DESC) as rnk, LAG(balance) OVER (ORDER BY balance DESC) as prev_bal FROM users LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = multi_window_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Multi window funcs (3)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Nested subquery (3 levels)
+    let nested_stmt = db
+        .prepare("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > (SELECT AVG(amount) FROM orders)) LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..20 {
+        let start = Instant::now();
+        let rows = nested_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / 20.0;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Nested subquery (3 lvl)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Multiple aggregates in one query
+    let multi_agg_stmt = db
+        .prepare("SELECT COUNT(*), SUM(balance), AVG(balance), MIN(balance), MAX(balance), COUNT(DISTINCT age) FROM users")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = multi_agg_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Multi aggregates (6)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // COALESCE / NULL handling
+    let coalesce_stmt = db
+        .prepare("SELECT name, COALESCE(balance, 0) as bal FROM users WHERE balance IS NOT NULL LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = coalesce_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "COALESCE + IS NOT NULL",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Expression in WHERE (function call)
+    let expr_where_stmt = db
+        .prepare(
+            "SELECT * FROM users WHERE LENGTH(name) > 7 AND UPPER(name) LIKE 'USER_%' LIMIT 100",
+        )
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = expr_where_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Expr in WHERE (funcs)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Math expressions
+    let math_stmt = db
+        .prepare("SELECT name, balance * 1.1 as new_bal, ROUND(balance / 1000, 2) as k_bal, ABS(balance - 50000) as diff FROM users LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = math_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Math expressions",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // String concatenation
+    let concat_stmt = db
+        .prepare("SELECT name || ' (' || email || ')' as full_info FROM users LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = concat_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "String concat (||)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Large result set (no LIMIT)
+    let large_result_stmt = db
+        .prepare("SELECT id, name, balance FROM users WHERE active = true")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..20 {
+        let start = Instant::now();
+        let rows = large_result_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / 20.0;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Large result (no LIMIT)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Multiple CTEs
+    let multi_cte_stmt = db
+        .prepare("WITH young AS (SELECT * FROM users WHERE age < 30), rich AS (SELECT * FROM users WHERE balance > 70000) SELECT y.name, r.name FROM young y INNER JOIN rich r ON y.id = r.id LIMIT 50")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..20 {
+        let start = Instant::now();
+        let rows = multi_cte_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / 20.0;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Multiple CTEs (2)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Correlated subquery in SELECT
+    let corr_select_stmt = db
+        .prepare("SELECT u.name, (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) as order_count FROM users u LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..10 {
+        let start = Instant::now();
+        let rows = corr_select_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / 10.0;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Correlated in SELECT",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // BETWEEN range
+    let between_stmt = db
+        .prepare("SELECT * FROM users WHERE balance BETWEEN 25000 AND 75000 LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = between_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "BETWEEN (non-indexed)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // GROUP BY with multiple columns
+    let multi_group_stmt = db
+        .prepare("SELECT age, active, COUNT(*), AVG(balance) FROM users GROUP BY age, active")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = multi_group_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "GROUP BY (2 columns)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Cross join (cartesian product) - limited
+    let cross_join_stmt = db
+        .prepare("SELECT u.name, o.status FROM users u CROSS JOIN (SELECT DISTINCT status FROM orders) o LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = cross_join_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "CROSS JOIN (limited)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Derived table (subquery in FROM)
+    let derived_stmt = db
+        .prepare("SELECT t.age_group, COUNT(*) FROM (SELECT CASE WHEN age < 30 THEN 'young' WHEN age < 50 THEN 'middle' ELSE 'senior' END as age_group FROM users) t GROUP BY t.age_group")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = derived_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Derived table (FROM sub)",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Window with frame clause
+    let window_frame_stmt = db
+        .prepare("SELECT name, balance, SUM(balance) OVER (ORDER BY balance ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as rolling_sum FROM users LIMIT 100")
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = window_frame_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Window ROWS frame",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // HAVING without GROUP BY columns in SELECT
+    let having_stmt = db
+        .prepare(
+            "SELECT age FROM users GROUP BY age HAVING COUNT(*) > 100 AND AVG(balance) > 40000",
+        )
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = having_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "HAVING complex",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    // Comparison with subquery result
+    let compare_sub_stmt = db
+        .prepare(
+            "SELECT * FROM users WHERE balance > (SELECT AVG(amount) * 100 FROM orders) LIMIT 100",
+        )
+        .unwrap();
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let rows = compare_sub_stmt.query(()).unwrap();
+        for _ in rows {}
+        total += start.elapsed();
+    }
+    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    println!(
+        "{:<25} | {:>12.1} | {:>12.0}",
+        "Compare with subquery",
+        avg_us,
+        1_000_000.0 / avg_us
+    );
+
+    println!("============================================================");
 }
