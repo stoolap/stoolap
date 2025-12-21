@@ -560,18 +560,16 @@ impl Executor {
                 // Create indices and sort them based on sort_keys
                 let mut indices: Vec<usize> = (0..rows.len()).collect();
 
-                // Build order specs: (key_index, ascending, nulls_first)
-                let order_specs: Vec<(usize, bool, Option<bool>)> = (0..num_order_cols)
-                    .map(|i| (i, stmt.order_by[i].ascending, stmt.order_by[i].nulls_first))
-                    .collect();
-
-                indices.sort_by(|&a_idx, &b_idx| {
+                // Use sort_unstable_by for ~10-20% speedup (stability not needed for ORDER BY)
+                indices.sort_unstable_by(|&a_idx, &b_idx| {
                     let a_keys = &sort_keys[a_idx];
                     let b_keys = &sort_keys[b_idx];
 
-                    for &(key_idx, ascending, nulls_first) in &order_specs {
-                        let a_val = a_keys.get(key_idx);
-                        let b_val = b_keys.get(key_idx);
+                    for i in 0..num_order_cols {
+                        let ascending = stmt.order_by[i].ascending;
+                        let nulls_first = stmt.order_by[i].nulls_first;
+                        let a_val = a_keys.get(i);
+                        let b_val = b_keys.get(i);
 
                         // Check if either value is NULL
                         let a_is_null =
@@ -2728,9 +2726,9 @@ impl Executor {
                             })
                             .collect();
 
-                        // Sort by indices
+                        // Sort by indices using sort_unstable_by for ~10-20% speedup
                         let mut indices: Vec<usize> = (0..final_rows.len()).collect();
-                        indices.sort_by(|&a, &b| {
+                        indices.sort_unstable_by(|&a, &b| {
                             for (i, ob) in stmt.order_by.iter().enumerate() {
                                 let av = &sort_keys[a][i];
                                 let bv = &sort_keys[b][i];

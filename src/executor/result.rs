@@ -911,8 +911,8 @@ impl OrderedResult {
             rows.push(inner.take_row());
         }
 
-        // Sort rows
-        rows.sort_by(compare);
+        // Sort rows (use sort_unstable_by for ~10-20% speedup, stability not needed)
+        rows.sort_unstable_by(compare);
 
         // Create memory result
         let memory_result = ExecutorMemoryResult::new(columns, rows);
@@ -970,8 +970,8 @@ impl OrderedResult {
             }
         }
 
-        // Fallback to comparison sort
-        rows.sort_by(fallback_compare);
+        // Fallback to comparison sort (use sort_unstable_by for better performance)
+        rows.sort_unstable_by(fallback_compare);
 
         Self {
             inner: ExecutorMemoryResult::new(columns, rows),
@@ -1190,7 +1190,8 @@ impl TopNResult {
         let mut rows: Vec<Row> = heap.into_iter().map(|hr| hr.row).collect();
 
         // Sort to get correct order (heap gives reverse order)
-        rows.sort_by(|a, b| compare(a, b));
+        // Use sort_unstable_by for better performance (stability not needed)
+        rows.sort_unstable_by(|a, b| compare(a, b));
 
         // Apply offset - use drain to avoid extra allocation
         if offset > 0 && offset < rows.len() {

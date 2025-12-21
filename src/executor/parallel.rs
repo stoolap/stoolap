@@ -249,17 +249,18 @@ pub fn parallel_filter_owned(
     rows.into_par_iter().filter(|r| predicate(r)).collect()
 }
 
-/// Parallel sort using rayon's par_sort_by
+/// Parallel sort using rayon's par_sort_unstable_by
 ///
 /// For large datasets, parallel sort can provide 2-4x speedup.
+/// Uses unstable sort (faster, doesn't preserve order of equal elements).
 pub fn parallel_sort<F>(rows: &mut [Row], compare: F, config: &ParallelConfig)
 where
     F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
 {
     if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_by(compare);
+        rows.par_sort_unstable_by(compare);
     } else {
-        rows.sort_by(compare);
+        rows.sort_unstable_by(compare);
     }
 }
 
@@ -1148,23 +1149,24 @@ pub fn parallel_order_by(rows: &mut [Row], sort_specs: &[SortSpec], config: &Par
     };
 
     if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_by(compare);
+        rows.par_sort_unstable_by(compare);
     } else {
-        rows.sort_by(compare);
+        rows.sort_unstable_by(compare);
     }
 }
 
 /// Parallel ORDER BY with a custom comparator function
 ///
 /// More flexible version that accepts any comparison function.
+/// Uses unstable sort for better performance.
 pub fn parallel_order_by_fn<F>(rows: &mut [Row], compare: F, config: &ParallelConfig)
 where
     F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
 {
     if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_by(compare);
+        rows.par_sort_unstable_by(compare);
     } else {
-        rows.sort_by(compare);
+        rows.sort_unstable_by(compare);
     }
 }
 

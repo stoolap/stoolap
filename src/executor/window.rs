@@ -2090,7 +2090,8 @@ impl Executor {
 
     /// Sort row indices using precomputed ORDER BY values
     fn sort_by_order_values(row_indices: &mut [usize], order_by_values: &[Vec<(Value, bool)>]) {
-        row_indices.sort_by(|&a, &b| {
+        // Use sort_unstable_by for ~10-20% speedup (stability not needed)
+        row_indices.sort_unstable_by(|&a, &b| {
             for (idx, ((a_val, ascending), (b_val, _))) in order_by_values[a]
                 .iter()
                 .zip(order_by_values[b].iter())
