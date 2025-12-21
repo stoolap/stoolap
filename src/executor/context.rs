@@ -171,8 +171,8 @@ pub fn cache_exists_index(key: String, index: std::sync::Arc<dyn Index>) {
     });
 }
 
-// Type alias for row fetcher function
-type RowFetcher = Box<dyn Fn(&[i64]) -> Vec<(i64, crate::core::Row)> + Send + Sync>;
+/// Type alias for row fetcher function used in EXISTS/COUNT optimization.
+pub type RowFetcher = Box<dyn Fn(&[i64]) -> Vec<(i64, crate::core::Row)> + Send + Sync>;
 
 // Cache for EXISTS row fetchers to avoid repeated version store lookups.
 // The key is the table name, the value is the row fetcher function.

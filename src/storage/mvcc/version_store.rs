@@ -248,9 +248,6 @@ pub struct VersionStore {
     /// Zone maps for segment pruning (set by ANALYZE)
     /// Uses Arc to avoid cloning on every read - critical for high QPS workloads
     zone_maps: RwLock<Option<Arc<crate::storage::mvcc::zonemap::TableZoneMap>>>,
-    /// Counter for rows added via batch commit (not in arena)
-    /// Used to disable fast path in get_visible_row_indices_unordered
-    rows_not_in_arena: AtomicI64,
 }
 
 impl VersionStore {
@@ -291,7 +288,6 @@ impl VersionStore {
             arena: RowArena::new(cols),
             row_arena_index,
             zone_maps: RwLock::new(None),
-            rows_not_in_arena: AtomicI64::new(0),
         }
     }
 
@@ -380,7 +376,12 @@ impl VersionStore {
                     new_version.data = existing_version.data.clone();
                 }
 
-                // Store in arena and get index (only for non-deleted versions)
+                // Mark old arena entry as deleted to avoid double-counting
+                if let Some(old_arena_idx) = existing_arena_idx {
+                    self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
+                }
+
+                // Store in arena (only for non-deleted versions)
                 let arena_idx = if new_version.deleted_at_txn_id == 0 {
                     let idx = self.arena.insert_row(
                         row_id,
@@ -392,10 +393,6 @@ impl VersionStore {
                     self.row_arena_index.write().insert(row_id, idx);
                     Some(idx)
                 } else {
-                    // Mark the previous arena entry as deleted
-                    if let Some(&prev_idx) = self.row_arena_index.read().get(&row_id) {
-                        self.arena.mark_deleted(prev_idx, new_version.txn_id);
-                    }
                     None
                 };
 
@@ -437,33 +434,19 @@ impl VersionStore {
         self.versions.insert(row_id, entry);
     }
 
-    /// Adds multiple versions in batch - optimized for commit
+    /// Adds multiple versions in batch - used by commit
     ///
-    /// This is faster than calling add_version() in a loop because:
-    /// 1. Uses DashMap's sharded locking for concurrent access
-    /// 2. Skips arena updates (arena is rebuilt lazily for scans)
-    ///
-    /// ## Performance Note
-    ///
-    /// This method increments `rows_not_in_arena` to disable the arena fast path
-    /// in `get_visible_row_indices_unordered`. Call [`sync_arena()`] after batch
-    /// loading is complete to re-enable the fast path.
-    ///
-    /// ```ignore
-    /// // Example: bulk loading data
-    /// store.add_versions_batch(batch);
-    /// store.sync_arena(); // Re-enables fast path
-    /// ```
+    /// Updates both the version store and the arena atomically per row.
+    /// Arena updates are O(1) per row (just an insert), so this is efficient.
+    /// Row arena index updates are batched under a single lock acquisition.
     #[inline]
     pub fn add_versions_batch(&self, batch: Vec<(i64, RowVersion)>) {
         if self.closed.load(Ordering::Acquire) || batch.is_empty() {
             return;
         }
 
-        // Track that rows were added without arena sync
-        // This disables the fast path in get_visible_row_indices_unordered
-        self.rows_not_in_arena
-            .fetch_add(batch.len() as i64, Ordering::Release);
+        // Collect arena index updates to batch them under a single lock
+        let mut arena_index_updates: Vec<(i64, usize)> = Vec::with_capacity(batch.len());
 
         for (row_id, version) in batch {
             // Get existing data first (if any)
@@ -482,7 +465,25 @@ impl VersionStore {
                     new_version.data = existing_version.data.clone();
                 }
 
-                // Skip arena updates for batch operations (arena rebuilt lazily)
+                // Mark old arena entry as deleted to avoid double-counting
+                if let Some(old_arena_idx) = existing_arena_idx {
+                    self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
+                }
+
+                // Update arena (O(1) per row - just an insert, not a scan)
+                let arena_idx = if new_version.deleted_at_txn_id == 0 {
+                    let idx = self.arena.insert_row(
+                        row_id,
+                        new_version.txn_id,
+                        new_version.create_time,
+                        &new_version.data,
+                    );
+                    arena_index_updates.push((row_id, idx));
+                    Some(idx)
+                } else {
+                    None
+                };
+
                 // Use Arc to share the previous chain - O(1) instead of deep clone
                 let prev_chain = Arc::new(VersionChainEntry {
                     version: existing_version,
@@ -493,88 +494,40 @@ impl VersionStore {
                 VersionChainEntry {
                     version: new_version,
                     prev: Some(prev_chain),
-                    arena_idx: None, // Skip arena for batch
+                    arena_idx,
                 }
             } else {
-                // First version for this row
+                // First version for this row - store in arena
+                let arena_idx = if version.deleted_at_txn_id == 0 {
+                    let idx = self.arena.insert_row(
+                        row_id,
+                        version.txn_id,
+                        version.create_time,
+                        &version.data,
+                    );
+                    arena_index_updates.push((row_id, idx));
+                    Some(idx)
+                } else {
+                    None
+                };
+
                 VersionChainEntry {
                     version,
                     prev: None,
-                    arena_idx: None, // Skip arena for batch
+                    arena_idx,
                 }
             };
 
             self.versions.insert(row_id, entry);
         }
-    }
 
-    /// Synchronizes batch-committed rows to the arena, re-enabling the fast path.
-    ///
-    /// This method should be called after batch loading is complete to restore
-    /// optimal scan performance. It iterates through all version chains and
-    /// adds rows without arena entries to the arena.
-    ///
-    /// ## Performance
-    ///
-    /// - Time: O(n) where n = number of rows without arena entries
-    /// - After sync: `get_visible_row_indices_unordered` fast path is re-enabled
-    ///
-    /// ## Thread Safety
-    ///
-    /// This method acquires write locks on arena and row_arena_index.
-    /// It's safe to call concurrently with reads but will block briefly.
-    pub fn sync_arena(&self) {
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-
-        // Check if sync is needed
-        let rows_missing = self.rows_not_in_arena.load(Ordering::Acquire);
-        if rows_missing == 0 {
-            return; // Already synced
-        }
-
-        let mut synced_count = 0i64;
-
-        // Single pass: iterate with mutable access to update arena_idx atomically
-        // This prevents race conditions where concurrent reads could see arena entries
-        // but not the corresponding arena_idx in the version chain
-        for mut entry in self.versions.iter_mut() {
-            let row_id = *entry.key();
-            let chain = entry.value_mut();
-
-            // Only sync if no arena_idx and not deleted
-            if chain.arena_idx.is_none() && chain.version.deleted_at_txn_id == 0 {
-                // Check if there's a previous version with an arena entry
-                // If so, mark the old arena entry as deleted to avoid duplicates
-                if let Some(ref prev) = chain.prev {
-                    if let Some(old_arena_idx) = prev.arena_idx {
-                        // Mark old arena entry as deleted so fast path skips it
-                        self.arena.mark_deleted(old_arena_idx, chain.version.txn_id);
-                    }
-                }
-
-                // Add new version to arena
-                let idx = self.arena.insert_row(
-                    row_id,
-                    chain.version.txn_id,
-                    chain.version.create_time,
-                    &chain.version.data,
-                );
-
-                // Update row -> arena index mapping
-                self.row_arena_index.write().insert(row_id, idx);
-
-                // Update arena_idx in version chain (atomic with arena insert)
-                chain.arena_idx = Some(idx);
-
-                synced_count += 1;
+        // Batch update row_arena_index under a single lock acquisition
+        if !arena_index_updates.is_empty() {
+            let mut index = self.row_arena_index.write();
+            for (row_id, idx) in arena_index_updates {
+                index.insert(row_id, idx);
             }
         }
-
-        // Reset the counter - fast path is now re-enabled
-        self.rows_not_in_arena
-            .fetch_sub(synced_count, Ordering::Release);
     }
 
     /// Quick check if a row might exist
@@ -989,6 +942,76 @@ impl VersionStore {
         // Critical for FIRST/LAST aggregate functions
         sort_by_key(&mut result, |(row_id, _)| *row_id);
 
+        result
+    }
+
+    /// Returns all visible rows WITHOUT sorting.
+    ///
+    /// This is optimized for GROUP BY queries where row order doesn't matter.
+    /// Skipping the O(n log n) sort provides significant speedup for large tables.
+    /// The rows are returned in DashMap iteration order (non-deterministic).
+    ///
+    /// Note: DO NOT use this for queries that need deterministic ordering
+    /// (e.g., FIRST/LAST aggregates, LIMIT without ORDER BY).
+    #[inline]
+    pub fn get_all_visible_rows_unsorted(&self, txn_id: i64) -> Vec<(i64, Row)> {
+        if self.closed.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+
+        // Pre-acquire arena locks ONCE for the entire operation
+        let (arena_rows, arena_data) = self.arena.read_guards();
+        let arena_rows_slice = arena_rows.as_slice();
+        let arena_data_slice = arena_data.as_slice();
+        let arena_len = arena_rows_slice.len();
+
+        // Single-pass: read directly from arena during visibility check
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(self.versions.len());
+
+        for entry in self.versions.iter() {
+            let row_id = *entry.key();
+            let chain = entry.value();
+            let mut current: Option<&VersionChainEntry> = Some(chain);
+
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                if checker.is_visible(version_txn_id, txn_id) {
+                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
+                        break; // Row is deleted
+                    }
+
+                    // Read directly from arena (no intermediate collection)
+                    let row_data = if let Some(idx) = e.arena_idx {
+                        if idx < arena_len {
+                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
+                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                let slice =
+                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                                Row::from_values(slice.to_vec())
+                            } else {
+                                e.version.data.clone()
+                            }
+                        } else {
+                            e.version.data.clone()
+                        }
+                    } else {
+                        e.version.data.clone()
+                    };
+                    result.push((row_id, row_data));
+                    break;
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
+            }
+        }
+
+        // NO SORTING - returns rows in iteration order
         result
     }
 
@@ -1523,14 +1546,11 @@ impl VersionStore {
         let (arena_rows, _arena_data) = self.arena.read_guards();
         let arena_len = arena_rows.len();
 
-        // FAST PATH: If uncommitted_writes is empty AND arena is in sync, scan arena directly
-        // We must check rows_not_in_arena to catch rows committed via add_versions_batch
-        // which skips arena updates for performance
+        // FAST PATH: If uncommitted_writes is empty, scan arena directly
         if let Some(checker) = checker {
             let uncommitted_empty = self.uncommitted_writes.is_empty();
-            let arena_in_sync = self.rows_not_in_arena.load(Ordering::Acquire) == 0;
 
-            if uncommitted_empty && arena_in_sync && arena_len > 0 {
+            if uncommitted_empty && arena_len > 0 {
                 let mut indices: Vec<RowIndex> = Vec::with_capacity(arena_len);
 
                 for (idx, meta) in arena_rows.iter().enumerate() {
@@ -1600,14 +1620,11 @@ impl VersionStore {
         let (arena_rows, _arena_data) = self.arena.read_guards();
         let arena_len = arena_rows.len();
 
-        // FAST PATH: If uncommitted_writes is empty AND arena is in sync, scan arena directly
-        // We must check rows_not_in_arena to catch rows committed via add_versions_batch
-        // which skips arena updates for performance
+        // FAST PATH: If uncommitted_writes is empty, scan arena directly
         if let Some(checker) = checker {
             let uncommitted_empty = self.uncommitted_writes.is_empty();
-            let arena_in_sync = self.rows_not_in_arena.load(Ordering::Acquire) == 0;
 
-            if uncommitted_empty && arena_in_sync && arena_len > 0 {
+            if uncommitted_empty && arena_len > 0 {
                 let mut indices: Vec<RowIndex> = Vec::with_capacity(arena_len);
 
                 for (idx, meta) in arena_rows.iter().enumerate() {
@@ -3393,10 +3410,6 @@ impl TransactionVersionStore {
             .collect();
 
         self.parent_store.add_versions_batch(batch);
-
-        // Sync arena to re-enable fast path for scans
-        // This marks old arena entries as deleted when rows are updated
-        self.parent_store.sync_arena();
 
         // Release all claims
         self.release_all_claims();

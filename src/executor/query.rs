@@ -1046,6 +1046,7 @@ impl Executor {
         // - SELECT SUM(col), MIN(col), MAX(col) FROM table
         // Must check before any row collection happens
         if self.has_aggregation(stmt) && !self.has_window_functions(stmt) {
+            // First try global aggregation pushdown (no GROUP BY)
             if let Some(result) =
                 self.try_aggregation_pushdown(table.as_ref(), stmt, &all_columns, ctx)?
             {
@@ -1473,7 +1474,18 @@ impl Executor {
         // Check for subqueries in WHERE - use the actual where clause (resolved or original)
         let has_where_subqueries = where_to_use.is_some_and(Self::has_subqueries);
 
-        if can_use_streaming && !has_where_subqueries {
+        // CRITICAL OPTIMIZATION: When needs_memory_filter is true AND we have LIMIT,
+        // skip the streaming path. The streaming path pre-materializes ALL rows from
+        // storage (via collect_visible_rows) before FilteredResult applies the filter.
+        // This defeats early termination for LIMIT queries.
+        // Fall through to the parallel/sequential path which has proper early termination.
+        let skip_streaming_for_memory_filter_with_limit =
+            needs_memory_filter && stmt.limit.is_some() && stmt.order_by.is_empty();
+
+        if can_use_streaming
+            && !has_where_subqueries
+            && !skip_streaming_for_memory_filter_with_limit
+        {
             // Check if we have simple column projection (no complex expressions)
             let simple_projection = self.get_simple_projection_indices(&stmt.columns, &all_columns);
 
@@ -1537,7 +1549,10 @@ impl Executor {
             // Path 1: Need in-memory filtering (subqueries or complex expressions)
             // For memory filter, we need all columns to evaluate the WHERE clause
             let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
-            let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
+
+            // OPTIMIZATION: Delay scanner creation until we know we need all rows.
+            // For early termination path, we'll collect rows directly with a limit.
+            // This avoids materializing all rows upfront when we only need a few.
 
             // Check if WHERE contains correlated subqueries
             let has_correlated = if let Some(where_expr) = where_to_use {
@@ -1676,15 +1691,38 @@ impl Executor {
 
                 // Use early termination path if we have a target
                 if let Some(target) = early_termination_target {
-                    // Sequential scan with filter and early termination
+                    // OPTIMIZATION: For memory-filter + LIMIT, use iterative fetching
+                    // with early termination. We fetch in batches to avoid loading
+                    // all rows when only a few are needed.
                     let mut eval =
                         ExpressionEval::compile(where_expr, &all_columns)?.with_context(ctx);
                     let mut result_rows = Vec::with_capacity(target.min(1000));
 
-                    while scanner.next() && result_rows.len() < target {
-                        let row = scanner.take_row();
-                        if eval.eval_bool(&row) {
-                            result_rows.push(row);
+                    // If storage expression exists (partial pushdown), use it to reduce rows
+                    // Otherwise, fetch rows in batches with increasing size
+                    if storage_expr.is_some() {
+                        // Partial pushdown: storage handles some filtering
+                        let storage_rows = table.collect_all_rows(storage_expr.as_deref())?;
+                        for row in storage_rows {
+                            if result_rows.len() >= target {
+                                break;
+                            }
+                            if eval.eval_bool(&row) {
+                                result_rows.push(row);
+                            }
+                        }
+                    } else {
+                        // No pushdown: function-based filter only (e.g., LENGTH(name) > 7)
+                        // Use scanner for O(n) single-pass iteration with early termination
+                        let mut scanner = table.scan(&column_idx_vec, None)?;
+                        while scanner.next() {
+                            if result_rows.len() >= target {
+                                break; // Early termination - got enough rows
+                            }
+                            let row = scanner.take_row();
+                            if eval.eval_bool(&row) {
+                                result_rows.push(row);
+                            }
                         }
                     }
 
@@ -1706,6 +1744,8 @@ impl Executor {
                 }
 
                 // Normal path: collect all rows first (for ORDER BY, aggregation, etc.)
+                // Now we create the scanner since we need all rows
+                let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
                 let mut all_rows = Vec::new();
                 while scanner.next() {
                     all_rows.push(scanner.take_row());
@@ -1811,6 +1851,11 @@ impl Executor {
                     } else {
                         None
                     };
+
+                // Create scanner for the correlated subquery path
+                // For correlated subqueries, we can't push down the WHERE clause to storage
+                // because it depends on outer row values that change per row
+                let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
 
                 let mut rows = Vec::new();
                 let mut row_count = 0u64;
@@ -2124,7 +2169,7 @@ impl Executor {
                     self.get_query_planner().record_feedback(
                         table_name,
                         where_expr,
-                        None, // TODO: Extract column name from predicate if single-column
+                        None, // Column-specific feedback not yet implemented
                         estimated_rows,
                         actual_rows,
                     );
@@ -2511,11 +2556,16 @@ impl Executor {
                 } else {
                     &join_source.left
                 };
+
+                // NOTE: LIMIT pushdown to outer table is NOT safe for INNER JOIN
+                // because we don't know how many outer rows will produce matches.
+                // Only LEFT JOIN guarantees every outer row produces at least one result.
                 let (outer_result, outer_cols) = self.execute_table_expression_with_filter(
                     outer_expr,
                     ctx,
                     nl_left_filter.as_ref(),
                 )?;
+
                 let outer_rows = Self::materialize_result(outer_result)?;
 
                 // Find the outer key index in outer columns
@@ -7232,6 +7282,23 @@ impl Executor {
                 }
                 _ => return Ok(None), // Unsupported aggregate
             }
+        }
+
+        // OPTIMIZATION: Don't use streaming GROUP BY when row fetch is needed.
+        // Fetching rows group-by-group has high overhead (1 fetch per group).
+        // For SUM/AVG, the regular non-streaming path is faster because it
+        // fetches all rows in a single bulk operation.
+        //
+        // Streaming is only beneficial when:
+        // 1. All aggregates are COUNT (no row fetch needed)
+        // 2. We have LIMIT with sorted output (early termination)
+        let needs_row_fetch = simple_aggs
+            .iter()
+            .any(|a| matches!(a, StreamingAgg::Sum(_)));
+
+        // Only use streaming for COUNT-only queries or when LIMIT allows early termination
+        if needs_row_fetch && stmt.limit.is_none() {
+            return Ok(None); // Fall back to non-streaming (faster for SUM/AVG)
         }
 
         // Check for simple HAVING filter

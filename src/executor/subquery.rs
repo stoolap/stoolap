@@ -39,6 +39,18 @@ use super::utils::{dummy_token, value_to_expression};
 use super::Executor;
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum number of row IDs to check when verifying visibility for EXISTS/COUNT.
+/// We batch up to this many to balance between:
+/// - Wasted work if first row is visible (checking extra rows)
+/// - Overhead if most row IDs point to deleted rows (need multiple round trips)
+///
+/// A value of 10 provides reasonable tradeoff for typical workloads.
+const VISIBILITY_CHECK_BATCH_SIZE: usize = 10;
+
+// ============================================================================
 // Semi-Join Optimization for EXISTS Subqueries
 // ============================================================================
 
@@ -436,12 +448,22 @@ impl Executor {
             return Ok(Some(false)); // No matches from index
         }
 
-        // If there's no additional predicate, any match means EXISTS is true
-        // (we found at least one matching row_id in the index)
+        // If there's no additional predicate, check if at least one row is visible
+        // Note: Index may contain row_ids for deleted rows, so we must verify visibility
         if correlation.additional_predicate.is_none() {
-            // The index returned row_ids, which means rows exist
-            // For EXISTS we just need to know at least one exists
-            return Ok(Some(true));
+            let row_fetcher = match self.get_or_create_row_fetcher(&correlation.inner_table) {
+                Some(f) => f,
+                None => return Ok(None), // Fall back if fetcher creation fails
+            };
+            // Check batches until we find a visible row or exhaust all row_ids
+            // We can't stop after first batch because deleted rows may precede visible ones
+            for chunk in row_ids.chunks(VISIBILITY_CHECK_BATCH_SIZE) {
+                let visible = row_fetcher(chunk);
+                if !visible.is_empty() {
+                    return Ok(Some(true)); // Found at least one visible row
+                }
+            }
+            return Ok(Some(false)); // No visible rows in any batch
         }
 
         // With additional predicate, we need to check each matching row
@@ -511,20 +533,9 @@ impl Executor {
         };
 
         // Get or create a cached row fetcher for this table
-        // This avoids repeated version store lookups per EXISTS probe
-        let row_fetcher = match get_cached_exists_fetcher(&correlation.inner_table) {
+        let row_fetcher = match self.get_or_create_row_fetcher(&correlation.inner_table) {
             Some(f) => f,
-            None => {
-                let fetcher = match self.engine.get_row_fetcher(&correlation.inner_table) {
-                    Ok(f) => f,
-                    Err(_) => return Ok(None), // Fall back if fetcher creation fails
-                };
-                cache_exists_fetcher(correlation.inner_table.clone(), fetcher);
-                match get_cached_exists_fetcher(&correlation.inner_table) {
-                    Some(f) => f,
-                    None => return Ok(None), // Should not happen, but be safe
-                }
-            }
+            None => return Ok(None), // Fall back if fetcher creation fails
         };
 
         // Fetch rows by their IDs using the cached row fetcher
@@ -628,6 +639,154 @@ impl Executor {
 
             _ => None,
         }
+    }
+
+    /// Try to execute a correlated scalar COUNT subquery using index probe.
+    ///
+    /// This optimization handles patterns like:
+    /// `(SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id)`
+    ///
+    /// Instead of running a full query for each outer row, we:
+    /// 1. Extract the correlation info (user_id = u.id)
+    /// 2. Probe the index on user_id with the outer value
+    /// 3. Return the count of matching row IDs directly
+    ///
+    /// This is O(1) index lookup per row vs O(n) query execution.
+    fn try_execute_scalar_count_with_index(
+        &self,
+        subquery: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<i64>> {
+        // Need outer row context for correlated subquery
+        let outer_row = match ctx.outer_row() {
+            Some(row) => row,
+            None => return Ok(None), // Not a correlated context
+        };
+
+        // Check if this is a COUNT(*) or COUNT(col) aggregate
+        if subquery.columns.len() != 1 {
+            return Ok(None);
+        }
+
+        let is_count = match &subquery.columns[0] {
+            Expression::Aliased(a) => Self::is_count_expression(&a.expression),
+            expr => Self::is_count_expression(expr),
+        };
+
+        if !is_count {
+            return Ok(None);
+        }
+
+        // Must not have GROUP BY (scalar COUNT must return single value)
+        if !subquery.group_by.columns.is_empty() {
+            return Ok(None);
+        }
+
+        // Extract correlation info from subquery
+        let correlation = match Self::extract_index_nested_loop_info(subquery) {
+            Some(info) => info,
+            None => return Ok(None), // Can't use index optimization
+        };
+
+        // Get the outer value from the outer row hashmap
+        let outer_value = if let Some(tbl) = &correlation.outer_table {
+            let qualified = format!("{}.{}", tbl, &correlation.outer_column);
+            outer_row
+                .get(&qualified.to_lowercase())
+                .or_else(|| outer_row.get(&correlation.outer_column.to_lowercase()))
+        } else {
+            outer_row.get(&correlation.outer_column.to_lowercase())
+        };
+
+        let outer_value = match outer_value {
+            Some(v) if !v.is_null() => v.clone(),
+            Some(_) => return Ok(Some(0)), // NULL never matches, count is 0
+            None => return Ok(None),       // Column not found, fall back
+        };
+
+        // Use cached index lookup (same as EXISTS optimization)
+        let index_cache_key = format!("{}:{}", correlation.inner_table, correlation.inner_column);
+
+        let index = match get_cached_exists_index(&index_cache_key) {
+            Some(idx) => idx,
+            None => {
+                // First time: get index from engine and cache it
+                let indexes = match self.engine.get_all_indexes(&correlation.inner_table) {
+                    Ok(idxs) => idxs,
+                    Err(_) => return Ok(None), // Table not found, fall back
+                };
+
+                // Find the index on the correlation column
+                let idx = indexes
+                    .into_iter()
+                    .find(|idx| idx.column_names().contains(&correlation.inner_column));
+
+                match idx {
+                    Some(idx) => {
+                        cache_exists_index(index_cache_key, idx.clone());
+                        idx
+                    }
+                    None => return Ok(None), // No index, fall back to full query
+                }
+            }
+        };
+
+        // Probe the index for matching row IDs
+        let row_ids = index.get_row_ids_equal(std::slice::from_ref(&outer_value));
+
+        // If there's no additional predicate, count only visible rows
+        // Note: Index may contain row_ids for deleted rows, so we must verify visibility
+        if correlation.additional_predicate.is_none() {
+            if row_ids.is_empty() {
+                return Ok(Some(0));
+            }
+            // Get or create a cached row fetcher for this table
+            let row_fetcher = match get_cached_exists_fetcher(&correlation.inner_table) {
+                Some(f) => f,
+                None => match self.get_or_create_row_fetcher(&correlation.inner_table) {
+                    Some(f) => f,
+                    None => return Ok(None),
+                },
+            };
+            // Count visible rows
+            let visible_rows = row_fetcher(&row_ids);
+            return Ok(Some(visible_rows.len() as i64));
+        }
+
+        // With additional predicate, we need to filter the matching rows
+        // Fall back to full query execution for complex cases
+        Ok(None)
+    }
+
+    /// Check if an expression is a COUNT aggregate function.
+    fn is_count_expression(expr: &Expression) -> bool {
+        match expr {
+            Expression::FunctionCall(func) => func.function.eq_ignore_ascii_case("COUNT"),
+            Expression::Aliased(a) => Self::is_count_expression(&a.expression),
+            _ => false,
+        }
+    }
+
+    /// Get or create a cached row fetcher for the given table.
+    ///
+    /// This helper reduces code duplication for the pattern of:
+    /// 1. Check cache for existing fetcher
+    /// 2. If not found, create from engine and cache it
+    /// 3. Return the fetcher or None if creation fails
+    fn get_or_create_row_fetcher(
+        &self,
+        table_name: &str,
+    ) -> Option<std::sync::Arc<super::context::RowFetcher>> {
+        if let Some(f) = get_cached_exists_fetcher(table_name) {
+            return Some(f);
+        }
+
+        let fetcher = match self.engine.get_row_fetcher(table_name) {
+            Ok(f) => f,
+            Err(_) => return None, // Fall back if fetcher creation fails
+        };
+        cache_exists_fetcher(table_name.to_string(), fetcher);
+        get_cached_exists_fetcher(table_name)
     }
 
     /// Extract correlation pair from two expressions.
@@ -916,6 +1075,15 @@ impl Executor {
         } else {
             None
         };
+
+        // OPTIMIZATION: Try index-based COUNT for correlated scalar subqueries
+        // This handles patterns like: (SELECT COUNT(*) FROM orders WHERE user_id = u.id)
+        // Instead of running a full query per row, we probe the index directly
+        if !is_non_correlated {
+            if let Some(count) = self.try_execute_scalar_count_with_index(subquery, ctx)? {
+                return Ok(crate::core::Value::Integer(count));
+            }
+        }
 
         // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();

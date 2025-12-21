@@ -365,6 +365,18 @@ pub trait Table: Send + Sync {
         self.collect_rows_with_limit(where_expr, limit, offset)
     }
 
+    /// Collects all rows WITHOUT guaranteeing deterministic order.
+    ///
+    /// This is an optimization for GROUP BY queries where row order doesn't matter.
+    /// By skipping the O(n log n) sort, this provides significant speedup for large tables.
+    ///
+    /// # Returns
+    /// A vector of all rows in arbitrary (storage iteration) order
+    fn collect_all_rows_unsorted(&self) -> Result<Vec<Row>> {
+        // Default implementation: delegate to ordered version
+        self.collect_all_rows(None)
+    }
+
     /// Collect rows with ORDER BY + LIMIT using deferred materialization
     ///
     /// This is an optimization for `SELECT * FROM t ORDER BY col LIMIT n`:
