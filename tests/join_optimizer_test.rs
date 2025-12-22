@@ -33,6 +33,26 @@ fn test_explain_shows_hash_join() {
     )
     .unwrap();
 
+    // Insert enough data to make hash join beneficial (planner uses nested loop for < 200 rows)
+    for i in 0..300 {
+        db.execute(
+            "INSERT INTO users (id, dept_id, name) VALUES (?, ?, ?)",
+            (i, i % 10, format!("User {}", i)),
+        )
+        .unwrap();
+    }
+    for i in 0..50 {
+        db.execute(
+            "INSERT INTO departments (id, dept_code, name) VALUES (?, ?, ?)",
+            (i, i, format!("Dept {}", i)),
+        )
+        .unwrap();
+    }
+
+    // Collect statistics so the planner can make informed decisions
+    db.execute("ANALYZE users", ()).unwrap();
+    db.execute("ANALYZE departments", ()).unwrap();
+
     // EXPLAIN should show Hash Join for equality condition on non-indexed columns
     let result = db
         .query(

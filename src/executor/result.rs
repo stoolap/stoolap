@@ -368,96 +368,6 @@ impl QueryResult for FilteredResult {
     }
 }
 
-/// Mapped result that transforms each row using a mapper function
-///
-/// Similar to FilteredResult but maps/transforms rows instead of filtering them.
-/// Useful for evaluating expressions and projecting computed columns.
-pub struct MappedResult {
-    /// Underlying result
-    inner: Box<dyn QueryResult>,
-    /// Mapper function that transforms a row into a new row
-    mapper: Box<dyn Fn(&Row) -> Row + Send + Sync>,
-    /// Current mapped row
-    current_row: Row,
-    /// Output column names
-    output_columns: Vec<String>,
-}
-
-impl MappedResult {
-    /// Create a new mapped result
-    ///
-    /// # Arguments
-    /// * `inner` - The source result
-    /// * `output_columns` - Names for the output columns
-    /// * `mapper` - Function that transforms each source row into an output row
-    pub fn new(
-        inner: Box<dyn QueryResult>,
-        output_columns: Vec<String>,
-        mapper: Box<dyn Fn(&Row) -> Row + Send + Sync>,
-    ) -> Self {
-        Self {
-            inner,
-            mapper,
-            current_row: Row::new(),
-            output_columns,
-        }
-    }
-}
-
-impl QueryResult for MappedResult {
-    fn columns(&self) -> &[String] {
-        &self.output_columns
-    }
-
-    fn next(&mut self) -> bool {
-        if self.inner.next() {
-            let source_row = self.inner.row();
-            self.current_row = (self.mapper)(source_row);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        if dest.len() != self.current_row.len() {
-            return Err(crate::core::Error::internal(format!(
-                "scan destination has {} values but row has {} columns",
-                dest.len(),
-                self.current_row.len()
-            )));
-        }
-        for (i, value) in self.current_row.iter().enumerate() {
-            dest[i] = value.clone();
-        }
-        Ok(())
-    }
-
-    fn row(&self) -> &Row {
-        &self.current_row
-    }
-
-    fn take_row(&mut self) -> Row {
-        std::mem::take(&mut self.current_row)
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.inner.close()
-    }
-
-    fn rows_affected(&self) -> i64 {
-        0
-    }
-
-    fn last_insert_id(&self) -> i64 {
-        0
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
-    }
-}
-
 /// Expression-based filtered result that uses RowFilter for efficient reuse
 ///
 /// Unlike FilteredResult which takes a closure, this struct owns a pre-compiled
@@ -601,8 +511,8 @@ enum CompiledProjection {
 
 /// Expression-based mapped result with pre-compiled projections
 ///
-/// Unlike MappedResult which takes a closure, this struct pre-compiles all
-/// expressions during construction, providing efficient per-row evaluation.
+/// This struct pre-compiles all expressions during construction, providing
+/// efficient per-row evaluation through the Expression VM.
 pub struct ExprMappedResult {
     /// Underlying result
     inner: Box<dyn QueryResult>,

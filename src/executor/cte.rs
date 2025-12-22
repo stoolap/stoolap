@@ -39,8 +39,12 @@ use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 
 use super::context::ExecutionContext;
 use super::expression::ExpressionEval;
-use super::join::{self, build_column_index_map};
+use super::join_executor::{JoinExecutor, JoinRequest};
+use super::operator::{ColumnInfo, Operator, QueryResultOperator};
+use super::operators::hash_join::JoinType as OperatorJoinType;
+use super::operators::index_nested_loop::{IndexLookupStrategy, IndexNestedLoopJoinOperator};
 use super::result::ExecutorMemoryResult;
+use super::utils::{build_column_index_map, extract_join_keys_and_residual, is_sorted_on_keys};
 use super::Executor;
 
 /// Type alias for CTE data map
@@ -627,73 +631,42 @@ impl Executor {
             None
         };
 
-        // Use hash join for better performance (O(n+m) instead of O(n*m))
-        let result_rows = if let Some(condition) = join_source.condition.as_deref() {
-            // Extract equality keys for hash join
-            let (left_key_indices, right_key_indices, residual) =
-                join::extract_join_keys_and_residual(condition, &left_qualified, &right_qualified);
-
-            if !left_key_indices.is_empty() {
-                // Disable LIMIT pushdown if there are residual conditions (they filter after join)
-                let join_limit = if residual.is_empty() {
-                    effective_limit
-                } else {
-                    None
-                };
-
-                // Use hash join with equality keys
-                let mut rows = self.execute_hash_join(
-                    &left_rows,
-                    &right_rows,
-                    &left_key_indices,
-                    &right_key_indices,
-                    &join_type,
-                    left_qualified.len(),
-                    right_qualified.len(),
-                    join_limit,
-                )?;
-
-                // Apply residual conditions (non-equality parts of ON clause)
-                if !residual.is_empty() {
-                    self.apply_residual_conditions(
-                        &mut rows,
-                        &residual,
-                        &all_columns,
-                        &join_type,
-                        left_qualified.len(),
-                        right_qualified.len(),
-                        ctx,
-                    )?;
-                }
-                rows
+        // Get join algorithm decision from QueryPlanner (same as query.rs)
+        let (left_key_indices, right_key_indices, _) =
+            if let Some(cond) = join_source.condition.as_ref() {
+                extract_join_keys_and_residual(cond, &left_qualified, &right_qualified)
             } else {
-                // Fall back to nested loop for non-equality joins
-                self.execute_nested_loop_join(
-                    &left_rows,
-                    &right_rows,
-                    Some(condition),
-                    &all_columns,
-                    &left_qualified,
-                    &right_qualified,
-                    &join_type,
-                    ctx,
-                    effective_limit,
-                )?
-            }
-        } else {
-            // CROSS JOIN (no condition)
-            self.execute_nested_loop_join(
-                &left_rows,
-                &right_rows,
-                None,
-                &all_columns,
-                &left_qualified,
-                &right_qualified,
-                &join_type,
-                ctx,
-                effective_limit,
-            )?
-        };
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+        let has_equality_keys = !left_key_indices.is_empty();
+
+        // Check if inputs are sorted on join keys
+        let left_sorted = has_equality_keys && is_sorted_on_keys(&left_rows, &left_key_indices);
+        let right_sorted = has_equality_keys && is_sorted_on_keys(&right_rows, &right_key_indices);
+
+        // Get algorithm decision from QueryPlanner
+        let algorithm_decision = self.get_query_planner().plan_runtime_join_with_sort_info(
+            left_rows.len(),
+            right_rows.len(),
+            has_equality_keys,
+            left_sorted,
+            right_sorted,
+        );
+
+        // Use JoinExecutor for consistent join execution (takes ownership of rows)
+        let join_executor = JoinExecutor::new();
+        let join_result = join_executor.execute(JoinRequest {
+            left_rows,
+            right_rows,
+            left_columns: &left_qualified,
+            right_columns: &right_qualified,
+            condition: join_source.condition.as_deref(),
+            join_type: &join_type,
+            limit: effective_limit,
+            ctx,
+            algorithm_hint: Some(&algorithm_decision),
+        })?;
+        let result_rows = join_result.rows;
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
@@ -1696,14 +1669,14 @@ impl Executor {
         let lookup_strategy = if let Some(pk_idx) = schema.pk_column_index() {
             if schema.columns[pk_idx].name.to_lowercase() == table_col_lower {
                 // It's a primary key lookup - most efficient!
-                join::IndexLookupStrategy::PrimaryKey
+                IndexLookupStrategy::PrimaryKey
             } else if let Some(index) = table.get_index_on_column(&table_col_unqualified) {
-                join::IndexLookupStrategy::SecondaryIndex(index)
+                IndexLookupStrategy::SecondaryIndex(index)
             } else {
                 return Ok(None);
             }
         } else if let Some(index) = table.get_index_on_column(&table_col_unqualified) {
-            join::IndexLookupStrategy::SecondaryIndex(index)
+            IndexLookupStrategy::SecondaryIndex(index)
         } else {
             return Ok(None);
         };
@@ -1767,18 +1740,44 @@ impl Executor {
             )
         };
 
-        // Execute Index Nested Loop Join
-        let result_rows = self.execute_index_nested_loop_join(
-            outer_rows,
-            table.as_ref(),
-            &lookup_strategy,
+        // Execute Index Nested Loop Join using operator
+        // Wrap outer rows as a QueryResult/Operator
+        let outer_result: Box<dyn QueryResult> = Box::new(ExecutorMemoryResult::new(
+            outer_cols.clone(),
+            outer_rows.clone(),
+        ));
+        let outer_op: Box<dyn Operator> =
+            Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
+
+        // Build inner schema info
+        let inner_schema_info: Vec<ColumnInfo> = inner_cols.iter().map(ColumnInfo::new).collect();
+
+        // Parse join type
+        let op_join_type = OperatorJoinType::parse(&join_type);
+
+        // Create the Index Nested Loop Join operator
+        let mut join_op: Box<dyn Operator> = Box::new(IndexNestedLoopJoinOperator::new(
+            outer_op,
+            table,
+            inner_schema_info,
+            op_join_type,
             outer_key_idx,
+            lookup_strategy,
             None, // No residual filter for now (handled later if needed)
-            &join_type,
-            outer_cols.len(),
-            inner_cols.len(),
-            effective_limit,
-        )?;
+        ));
+
+        // Execute and collect results
+        join_op.open()?;
+        let mut result_rows = Vec::new();
+        while let Some(row_ref) = join_op.next()? {
+            result_rows.push(row_ref.into_owned());
+            if let Some(lim) = effective_limit {
+                if result_rows.len() >= lim as usize {
+                    break;
+                }
+            }
+        }
+        join_op.close()?;
 
         // Store column counts before moving vectors
         let cte_col_count = cte_qualified.len();

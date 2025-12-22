@@ -2212,10 +2212,6 @@ impl Executor {
         // Reason: NOT EXISTS must check ALL matching rows to confirm none satisfy
         // the predicate. With semi-join, we build a hash set once and do O(1) lookups.
         // With index-nested-loop, each outer row requires O(k) checks where k = rows per key.
-        // Example: NOT EXISTS (SELECT 1 FROM orders WHERE user_id = u.id AND status = 'cancelled')
-        // Semi-join: build set of user_ids with cancelled orders once (O(cancelled_count))
-        // Then O(1) lookup per outer row
-        // Index-nested-loop: for each outer row, probe index, fetch all orders, check status
         if info.is_negated && info.non_correlated_where.is_some() {
             return false;
         }

@@ -36,9 +36,8 @@ use super::context::ExecutionContext;
 #[allow(deprecated)]
 use super::expression::CompiledEvaluator;
 use super::expression::{ExpressionEval, RowFilter};
-use super::join::build_column_index_map;
 use super::result::ExecutorMemoryResult;
-use super::utils::hash_value_into;
+use super::utils::{build_column_index_map, hash_value_into};
 use super::Executor;
 
 // Re-export for backward compatibility

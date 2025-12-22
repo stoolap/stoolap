@@ -29,15 +29,12 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use crate::core::{IndexType, Operator, Result, Value};
+use crate::core::{Operator, Result, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::optimizer::workload::{EdgeAwarePlanner, EdgeJoinRecommendation};
-use crate::optimizer::{
-    AccessMethod, BuildSide, CostEstimator, JoinAlgorithm, JoinStats, PlanCost,
-};
 use crate::parser::ast::Expression;
 use crate::storage::mvcc::engine::MVCCEngine;
-use crate::storage::mvcc::zonemap::{PruneStats, TableZoneMap};
+use crate::storage::mvcc::zonemap::TableZoneMap;
 use crate::storage::statistics::{
     Histogram, HistogramOp, TableStats, SYS_COLUMN_STATS, SYS_TABLE_STATS,
 };
@@ -47,8 +44,6 @@ use crate::storage::traits::{Engine, Table, Transaction};
 pub struct QueryPlanner {
     /// Reference to the storage engine for reading statistics
     engine: Arc<MVCCEngine>,
-    /// Cost estimator for evaluating access methods
-    cost_estimator: CostEstimator,
     /// Cache of table statistics to avoid repeated lookups
     stats_cache: std::sync::RwLock<FxHashMap<String, CachedStats>>,
 }
@@ -104,38 +99,11 @@ pub struct ColumnStatsCache {
     pub histogram: Option<Histogram>,
 }
 
-/// Result of access method selection
-#[derive(Debug, Clone)]
-pub struct AccessPlan {
-    /// Selected access method
-    pub method: AccessMethod,
-    /// Estimated cost
-    pub cost: PlanCost,
-    /// Zone map pruning info (segments to scan)
-    pub prune_stats: Option<PruneStats>,
-    /// Recommendation explanation
-    pub explanation: String,
-}
-
-/// Result of join planning
-#[derive(Debug, Clone)]
-pub struct JoinPlan {
-    /// Selected join algorithm
-    pub algorithm: JoinAlgorithm,
-    /// Estimated cost
-    pub cost: PlanCost,
-    /// Which table should be the build side (for hash join)
-    pub build_side: Option<String>,
-    /// Explanation of the choice
-    pub explanation: String,
-}
-
 impl QueryPlanner {
     /// Create a new query planner
     pub fn new(engine: Arc<MVCCEngine>) -> Self {
         Self {
             engine,
-            cost_estimator: CostEstimator::new(),
             stats_cache: std::sync::RwLock::new(FxHashMap::default()),
         }
     }
@@ -415,286 +383,6 @@ impl QueryPlanner {
         Ok(stats)
     }
 
-    /// Choose the best access method for a table scan
-    ///
-    /// Considers:
-    /// - Table statistics (row count, selectivity)
-    /// - Available indexes
-    /// - Zone maps for segment pruning
-    /// - Predicate columns and operators
-    pub fn choose_access_method(
-        &self,
-        table: &dyn Table,
-        predicate_column: Option<&str>,
-        predicate_op: Option<Operator>,
-        predicate_value: Option<&Value>,
-    ) -> AccessPlan {
-        let table_name = table.name();
-
-        // Get statistics (from cache or system tables)
-        let table_stats = self.get_table_stats(table_name).unwrap_or_default();
-
-        // Get zone map pruning info
-        let prune_stats = if let (Some(col), Some(op), Some(val)) =
-            (predicate_column, predicate_op, predicate_value)
-        {
-            table
-                .get_zone_maps()
-                .and_then(|zm| zm.get_prune_stats(col, op, val))
-        } else {
-            None
-        };
-
-        // Check for available indexes on predicate column and get the index
-        let index_info = predicate_column.and_then(|col| {
-            table.get_index_on_column(col).map(|idx| {
-                let idx_type = idx.index_type();
-                let idx_name = idx.name().to_string();
-                (idx_name, idx_type)
-            })
-        });
-
-        // Check if this is a range query (not equality)
-        let is_range_query = matches!(
-            predicate_op,
-            Some(Operator::Lt | Operator::Lte | Operator::Gt | Operator::Gte)
-        );
-
-        // Determine if we can use the index
-        // Hash indexes don't support range queries - skip them for non-equality predicates
-        let usable_index = index_info.as_ref().and_then(|(name, idx_type)| {
-            if *idx_type == IndexType::Hash && is_range_query {
-                // Hash index cannot handle range queries - fall back to seq scan
-                None
-            } else {
-                Some((name.clone(), *idx_type))
-            }
-        });
-
-        // Check if predicate column is primary key
-        let is_pk_lookup = predicate_column
-            .map(|col| {
-                table
-                    .schema()
-                    .columns
-                    .iter()
-                    .any(|c| c.name.eq_ignore_ascii_case(col) && c.primary_key)
-            })
-            .unwrap_or(false);
-
-        // Get column stats for selectivity estimation
-        let col_stats = predicate_column.and_then(|col| self.get_column_stats(table_name, col));
-
-        // Estimate selectivity based on operator and value
-        let selectivity = self.estimate_selectivity(
-            predicate_op,
-            predicate_value,
-            col_stats.as_ref(),
-            &table_stats,
-        );
-
-        // Use zone map info to further refine selectivity
-        let adjusted_selectivity = if let Some(ref prune) = prune_stats {
-            if prune.total_segments > 0 {
-                let segment_selectivity =
-                    prune.scanned_segments as f64 / prune.total_segments as f64;
-                // Combined selectivity: segments * rows within segments
-                selectivity * segment_selectivity
-            } else {
-                selectivity
-            }
-        } else {
-            selectivity
-        };
-
-        // Choose access method based on cost
-        let (method, cost, explanation) = if is_pk_lookup
-            && matches!(predicate_op, Some(Operator::Eq))
-        {
-            // Primary key point lookup - always best
-            let cost = self.cost_estimator.estimate_pk_lookup();
-            (
-                AccessMethod::PkLookup,
-                cost,
-                "Primary key equality lookup - O(1) access".to_string(),
-            )
-        } else if let Some((idx_name, idx_type)) = usable_index {
-            if adjusted_selectivity < 0.15 {
-                // Low selectivity - index scan is better
-                let col_name = predicate_column.unwrap_or("unknown").to_string();
-                let cost = self.cost_estimator.estimate_index_scan(
-                    &table_stats,
-                    None, // No detailed column stats for now
-                    adjusted_selectivity,
-                    &col_name,
-                    idx_type,
-                );
-                (
-                    AccessMethod::IndexScan {
-                        index_name: idx_name,
-                        column: col_name,
-                        selectivity: adjusted_selectivity,
-                        index_type: idx_type,
-                    },
-                    cost,
-                    format!(
-                        "{} index scan: ~{:.1}% selectivity",
-                        idx_type.as_str().to_uppercase(),
-                        adjusted_selectivity * 100.0
-                    ),
-                )
-            } else {
-                // High selectivity - sequential scan is better
-                let cost = self.cost_estimator.estimate_seq_scan(&table_stats);
-                let explanation = if let Some(ref prune) = prune_stats {
-                    format!(
-                        "Sequential scan with zone map pruning: scanning {}/{} segments ({:.1}% pruned)",
-                        prune.scanned_segments,
-                        prune.total_segments,
-                        (prune.pruned_segments as f64 / prune.total_segments as f64) * 100.0
-                    )
-                } else {
-                    format!(
-                        "Sequential scan: {} rows, {} pages",
-                        table_stats.row_count, table_stats.page_count
-                    )
-                };
-                (AccessMethod::SeqScan, cost, explanation)
-            }
-        } else {
-            // Sequential scan (possibly with zone map pruning)
-            let cost = self.cost_estimator.estimate_seq_scan(&table_stats);
-            let explanation = if let Some(ref prune) = prune_stats {
-                format!(
-                    "Sequential scan with zone map pruning: scanning {}/{} segments ({:.1}% pruned)",
-                    prune.scanned_segments,
-                    prune.total_segments,
-                    (prune.pruned_segments as f64 / prune.total_segments as f64) * 100.0
-                )
-            } else {
-                format!(
-                    "Sequential scan: {} rows, {} pages",
-                    table_stats.row_count, table_stats.page_count
-                )
-            };
-            (AccessMethod::SeqScan, cost, explanation)
-        };
-
-        AccessPlan {
-            method,
-            cost,
-            prune_stats,
-            explanation,
-        }
-    }
-
-    /// Choose the best join algorithm
-    pub fn choose_join_algorithm(
-        &self,
-        left_table: &dyn Table,
-        right_table: &dyn Table,
-        join_column_left: &str,
-        join_column_right: &str,
-    ) -> JoinPlan {
-        let left_stats = self.get_table_stats(left_table.name()).unwrap_or_default();
-        let right_stats = self.get_table_stats(right_table.name()).unwrap_or_default();
-
-        let left_col_stats = self.get_column_stats(left_table.name(), join_column_left);
-        let right_col_stats = self.get_column_stats(right_table.name(), join_column_right);
-
-        let join_stats = JoinStats {
-            left_stats: left_stats.clone(),
-            right_stats: right_stats.clone(),
-            left_distinct: left_col_stats
-                .as_ref()
-                .map(|s| s.distinct_count)
-                .unwrap_or(0),
-            right_distinct: right_col_stats
-                .as_ref()
-                .map(|s| s.distinct_count)
-                .unwrap_or(0),
-        };
-
-        // Evaluate different join algorithms
-        let hash_cost = self.cost_estimator.estimate_hash_join(&join_stats);
-        let nested_loop_cost = self.cost_estimator.estimate_nested_loop_join(&join_stats);
-        // Assume unsorted inputs by default
-        let merge_cost = self
-            .cost_estimator
-            .estimate_merge_join(&join_stats, false, false);
-
-        let left_rows = left_stats.row_count;
-        let right_rows = right_stats.row_count;
-
-        // Choose the cheapest
-        let (algorithm, cost, build_side, explanation) =
-            if hash_cost.total <= nested_loop_cost.total && hash_cost.total <= merge_cost.total {
-                // Hash join - build side should be smaller table
-                let (build_name, bs, build_rows, probe_rows) = if left_rows <= right_rows {
-                    (
-                        left_table.name().to_string(),
-                        BuildSide::Left,
-                        left_rows,
-                        right_rows,
-                    )
-                } else {
-                    (
-                        right_table.name().to_string(),
-                        BuildSide::Right,
-                        right_rows,
-                        left_rows,
-                    )
-                };
-                (
-                    JoinAlgorithm::HashJoin {
-                        build_side: bs,
-                        build_rows,
-                        probe_rows,
-                    },
-                    hash_cost,
-                    Some(build_name),
-                    format!(
-                        "Hash join: build on smaller table (L:{} R:{} rows)",
-                        left_rows, right_rows
-                    ),
-                )
-            } else if merge_cost.total <= nested_loop_cost.total {
-                (
-                    JoinAlgorithm::MergeJoin {
-                        left_rows,
-                        right_rows,
-                        left_sorted: false,
-                        right_sorted: false,
-                    },
-                    merge_cost,
-                    None,
-                    "Merge join: efficient for sorted inputs".to_string(),
-                )
-            } else {
-                (
-                    JoinAlgorithm::NestedLoop {
-                        outer_rows: left_rows,
-                        inner_rows: right_rows,
-                    },
-                    nested_loop_cost,
-                    None,
-                    format!(
-                        "Nested loop join: {} x {} = {} comparisons",
-                        left_rows,
-                        right_rows,
-                        left_rows * right_rows
-                    ),
-                )
-            };
-
-        JoinPlan {
-            algorithm,
-            cost,
-            build_side,
-            explanation,
-        }
-    }
-
     /// Estimate selectivity for a predicate
     fn estimate_selectivity(
         &self,
@@ -833,20 +521,6 @@ impl QueryPlanner {
         }
     }
 
-    /// Get segments to scan based on zone maps
-    ///
-    /// Returns list of segment IDs that need to be scanned, or None if
-    /// zone maps are not available or predicate cannot be evaluated.
-    pub fn get_segments_to_scan(
-        &self,
-        table: &dyn Table,
-        column: &str,
-        op: Operator,
-        value: &Value,
-    ) -> Option<Vec<u32>> {
-        table.get_segments_to_scan(column, op, value)
-    }
-
     /// Check if zone maps indicate that no rows can possibly match the expression
     ///
     /// Returns true if the entire scan can be skipped (zone maps show no match possible).
@@ -891,38 +565,6 @@ impl QueryPlanner {
 
         // All comparisons indicate no segments match - can skip entire scan
         true
-    }
-
-    /// Get zone map prune statistics for an expression
-    ///
-    /// Returns aggregated pruning statistics across all comparisons in the expression.
-    /// Useful for EXPLAIN output to show zone map effectiveness.
-    pub fn get_zone_map_prune_stats(
-        &self,
-        table: &dyn Table,
-        expr: &dyn crate::storage::expression::Expression,
-    ) -> Option<crate::storage::mvcc::zonemap::PruneStats> {
-        let zone_maps = table.get_zone_maps()?;
-
-        // Get the first comparison that has zone map info
-        let comparisons = expr.collect_comparisons();
-        for (column, op, value) in comparisons {
-            if let Some(stats) = zone_maps.get_prune_stats(column, op, value) {
-                return Some(stats);
-            }
-        }
-
-        None
-    }
-
-    /// Clear cached statistics (call after ANALYZE or schema changes)
-    pub fn invalidate_cache(&self, table_name: Option<&str>) {
-        let mut cache = self.stats_cache.write().unwrap();
-        if let Some(name) = table_name {
-            cache.remove(&name.to_lowercase());
-        } else {
-            cache.clear();
-        }
     }
 
     /// Get overall health of statistics for a table

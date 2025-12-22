@@ -48,6 +48,9 @@ use crate::parser::ast::Expression;
 use super::expression::{ExpressionEval, RowFilter};
 use super::utils::{hash_composite_key, hash_row, rows_equal, verify_composite_key_equality};
 
+// Re-export JoinType from operators::hash_join - single source of truth
+pub use super::operators::hash_join::JoinType;
+
 // Default thresholds for parallel execution - single source of truth
 // These are used by both ParallelConfig and CostEstimator
 pub const DEFAULT_PARALLEL_FILTER_THRESHOLD: usize = 10_000;
@@ -643,51 +646,7 @@ pub fn verify_key_match(
     verify_composite_key_equality(probe_row, build_row, probe_key_indices, build_key_indices)
 }
 
-/// Join type for parallel hash join
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JoinType {
-    Inner,
-    Left,
-    Right,
-    Full,
-}
-
-impl JoinType {
-    /// Parse join type from string
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
-        let upper = s.to_uppercase();
-        if upper.contains("FULL") {
-            JoinType::Full
-        } else if upper.contains("LEFT") {
-            JoinType::Left
-        } else if upper.contains("RIGHT") {
-            JoinType::Right
-        } else {
-            JoinType::Inner
-        }
-    }
-
-    /// Check if this join needs unmatched probe rows (NULL-extended)
-    fn needs_unmatched_probe(&self, swapped: bool) -> bool {
-        match self {
-            JoinType::Inner => false,
-            JoinType::Left => !swapped, // LEFT JOIN: unmatched left (probe when not swapped)
-            JoinType::Right => swapped, // RIGHT JOIN: unmatched right (probe when swapped)
-            JoinType::Full => true,     // FULL JOIN: always needs unmatched rows
-        }
-    }
-
-    /// Check if this join needs unmatched build rows (NULL-extended)
-    fn needs_unmatched_build(&self, swapped: bool) -> bool {
-        match self {
-            JoinType::Inner => false,
-            JoinType::Left => swapped, // LEFT JOIN: unmatched left (build when swapped)
-            JoinType::Right => !swapped, // RIGHT JOIN: unmatched right (build when not swapped)
-            JoinType::Full => true,    // FULL JOIN: always needs unmatched rows
-        }
-    }
-}
+// JoinType is imported from operators::hash_join - single source of truth
 
 /// Parallel hash join result
 pub struct ParallelJoinResult {

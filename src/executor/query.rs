@@ -46,7 +46,12 @@ use super::context::{
     get_cached_in_subquery, ExecutionContext, TimeoutGuard,
 };
 use super::expression::{CompiledEvaluator, ExpressionEval, JoinFilter, RowFilter};
-use super::join::{self, build_column_index_map};
+use super::join_executor::JoinExecutor;
+use super::operator::{ColumnInfo, Operator, QueryResultOperator};
+use super::operators::hash_join::JoinType as OperatorJoinType;
+use super::operators::index_nested_loop::{
+    BatchIndexNestedLoopJoinOperator, IndexLookupStrategy, IndexNestedLoopJoinOperator,
+};
 use super::parallel::{self, ParallelConfig};
 use super::pushdown;
 use super::result::{
@@ -55,14 +60,13 @@ use super::result::{
     StreamingProjectionResult, TopNResult,
 };
 use super::utils::{
-    add_table_qualifier, collect_table_qualifiers, combine_predicates_with_and, dummy_token,
-    expression_contains_aggregate, expression_has_parameters, extract_base_column_name,
+    add_table_qualifier, build_column_index_map, collect_table_qualifiers,
+    combine_predicates_with_and, compare_values, dummy_token, expression_contains_aggregate,
+    expression_has_parameters, extract_base_column_name, extract_join_keys_and_residual,
     flatten_and_predicates, get_table_alias_from_expr, strip_table_qualifier,
 };
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
-use crate::optimizer::aqe::{decide_join_algorithm, AqeJoinDecision, JoinAqeContext};
-use crate::optimizer::{BuildSide, JoinAlgorithm};
 
 /// Pre-computed column name mappings for correlated subqueries.
 /// Avoids repeated string allocations per row in the inner loop.
@@ -2518,7 +2522,7 @@ impl Executor {
                 // Prefer swapped if it gives PK lookup (most efficient)
                 let prefer_swap = matches!(
                     &swapped_info,
-                    Some((_, join::IndexLookupStrategy::PrimaryKey, _, _))
+                    Some((_, IndexLookupStrategy::PrimaryKey, _, _))
                 );
 
                 if prefer_swap {
@@ -2547,7 +2551,7 @@ impl Executor {
             };
 
             if let Some((table_name, lookup_strategy, _inner_col, outer_col)) = index_nl_info {
-                // Index Nested Loop path: only materialize outer (left) side
+                // Index Nested Loop path: stream outer side for early termination
                 // When swapped, execute right side as outer (with original right filter, now in nl_left_filter)
                 let outer_expr = if swapped {
                     &join_source.right
@@ -2555,16 +2559,40 @@ impl Executor {
                     &join_source.left
                 };
 
-                // NOTE: LIMIT pushdown to outer table is NOT safe for INNER JOIN
-                // because we don't know how many outer rows will produce matches.
-                // Only LEFT JOIN guarantees every outer row produces at least one result.
-                let (outer_result, outer_cols) = self.execute_table_expression_with_filter(
+                // Compute join limit EARLY so we can use it for outer table optimization
+                let has_group_by = !stmt.group_by.columns.is_empty();
+                let has_aggregation = self.has_aggregation(stmt);
+                let can_push_limit = !join_type.contains("FULL")
+                    && stmt.order_by.is_empty()
+                    && !has_group_by
+                    && !has_aggregation;
+
+                let join_limit = if can_push_limit {
+                    stmt.limit.as_ref().and_then(|limit_expr| {
+                        ExpressionEval::compile(limit_expr, &[])
+                            .ok()
+                            .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                            .and_then(|v| match v {
+                                Value::Integer(n) if n >= 0 => Some(n as u64),
+                                _ => None,
+                            })
+                    })
+                } else {
+                    None
+                };
+
+                // For outer table, use a reasonable limit multiplier
+                // We need enough rows to produce join_limit results, assuming some miss rate
+                // Use 4x multiplier as heuristic (handles up to 75% miss rate)
+                let outer_limit = join_limit.map(|l| (l as usize).saturating_mul(4).max(100));
+
+                // Execute outer side with limit optimization for true early termination
+                let (outer_result, outer_cols) = self.execute_table_expression_with_filter_limit(
                     outer_expr,
                     ctx,
                     nl_left_filter.as_ref(),
+                    outer_limit,
                 )?;
-
-                let outer_rows = Self::materialize_result(outer_result)?;
 
                 // Find the outer key index in outer columns
                 let outer_col_lower = outer_col.to_lowercase();
@@ -2606,28 +2634,6 @@ impl Executor {
                         .map(|col| format!("{}.{}", inner_alias, col.name))
                         .collect();
 
-                    // Compute join limit if applicable
-                    let has_group_by = !stmt.group_by.columns.is_empty();
-                    let has_aggregation = self.has_aggregation(stmt);
-                    let can_push_limit = !join_type.contains("FULL")
-                        && stmt.order_by.is_empty()
-                        && !has_group_by
-                        && !has_aggregation;
-
-                    let join_limit = if can_push_limit {
-                        stmt.limit.as_ref().and_then(|limit_expr| {
-                            ExpressionEval::compile(limit_expr, &[])
-                                .ok()
-                                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
-                                .and_then(|v| match v {
-                                    Value::Integer(n) if n >= 0 => Some(n as u64),
-                                    _ => None,
-                                })
-                        })
-                    } else {
-                        None
-                    };
-
                     // Build all columns for combined row
                     // When swapped, result order is outer(orig_right), inner(orig_left)
                     // But we need final order to be: orig_left, orig_right
@@ -2659,18 +2665,55 @@ impl Executor {
                         None
                     };
 
-                    // Execute Index Nested Loop Join with residual filter
-                    let result_rows = self.execute_index_nested_loop_join(
-                        &outer_rows,
-                        inner_table.as_ref(),
-                        &lookup_strategy,
-                        outer_idx,
-                        residual_filter.as_ref(),
-                        &join_type,
-                        outer_cols.len(),
-                        inner_cols.len(),
-                        join_limit,
-                    )?;
+                    // Execute Index Nested Loop Join using operators
+                    // Use batch version for NO LIMIT (reduces lock overhead from O(N) to O(1))
+                    // Use streaming version for LIMIT queries (supports early termination)
+
+                    // Convert to operator types
+                    let outer_op: Box<dyn Operator> =
+                        Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
+                    let inner_schema_info: Vec<ColumnInfo> =
+                        inner_cols.iter().map(ColumnInfo::new).collect();
+                    let op_join_type = OperatorJoinType::parse(&join_type);
+
+                    let mut join_op: Box<dyn Operator> = if join_limit.is_some() {
+                        // Streaming INL for early termination with LIMIT
+                        Box::new(IndexNestedLoopJoinOperator::new(
+                            outer_op,
+                            inner_table,
+                            inner_schema_info,
+                            op_join_type,
+                            outer_idx,
+                            lookup_strategy.clone(),
+                            residual_filter,
+                        ))
+                    } else {
+                        // Batch INL for NO LIMIT - single batch fetch, O(1) lock overhead
+                        Box::new(BatchIndexNestedLoopJoinOperator::new(
+                            outer_op,
+                            inner_table,
+                            inner_schema_info,
+                            op_join_type,
+                            outer_idx,
+                            lookup_strategy.clone(),
+                            residual_filter,
+                        ))
+                    };
+
+                    // Execute and collect results
+                    join_op.open()?;
+                    let mut result_rows = Vec::new();
+                    while let Some(row_ref) = join_op.next()? {
+                        result_rows.push(row_ref.into_owned());
+                        if let Some(lim) = join_limit {
+                            if result_rows.len() >= lim as usize {
+                                break;
+                            }
+                        }
+                    }
+                    join_op.close()?;
+
+                    let result_rows = result_rows;
 
                     // When swapped, reorder columns from (outer, inner) to (orig_left, orig_right)
                     let result_rows = if swapped {
@@ -2750,7 +2793,7 @@ impl Executor {
                                         Ordering::Less
                                     }
                                 } else {
-                                    join::compare_values(av, bv)
+                                    compare_values(av, bv)
                                 };
 
                                 let cmp = if asc { cmp } else { cmp.reverse() };
@@ -2818,7 +2861,7 @@ impl Executor {
                 }
             }
 
-            // Standard path: execute both sides normally
+            // Execute both sides
             let (left_result, left_cols) = self.execute_table_expression_with_filter(
                 &join_source.left,
                 ctx,
@@ -2947,270 +2990,80 @@ impl Executor {
             .as_ref()
             .or(join_source.condition.as_ref().map(|c| c.as_ref()));
 
-        // Cost-based join algorithm selection using the query planner
-        // The planner considers actual row counts for optimal algorithm choice
-        let result_rows = if let Some(condition) = effective_condition {
-            // Extract equality keys and non-equality residual conditions
-            let (left_key_indices, right_key_indices, residual) =
-                join::extract_join_keys_and_residual(condition, &left_columns, &right_columns);
+        // =================================================================
+        // Execute JOIN using streaming JoinExecutor
+        // =================================================================
+        // JoinExecutor handles:
+        // - Algorithm selection (Hash Join, Merge Join, Nested Loop)
+        // - Build/probe side optimization for hash joins
+        // - Merge join for pre-sorted inputs
+        // - Residual filter application (non-equality conditions)
+        // - Early termination with LIMIT
 
-            // Use the query planner for cost-based join decision
-            let has_equality_keys = !left_key_indices.is_empty();
+        // Compute LIMIT for early termination pushdown
+        // Safe to push when: no ORDER BY, no GROUP BY/aggregation, no FULL OUTER
+        let has_group_by = !stmt.group_by.columns.is_empty();
+        let has_aggregation = self.has_aggregation(stmt);
+        let can_push_limit = !join_type.contains("FULL")
+            && stmt.order_by.is_empty()
+            && cross_filter.is_none()
+            && !has_group_by
+            && !has_aggregation;
 
-            // Detect if inputs are sorted on join keys for potential merge join optimization
-            // This check is O(n) but enables O(n+m) merge join vs O(n*m) nested loop
-            let left_sorted =
-                has_equality_keys && join::is_sorted_on_keys(&left_rows, &left_key_indices);
-            let right_sorted =
-                has_equality_keys && join::is_sorted_on_keys(&right_rows, &right_key_indices);
-
-            // Get estimated cardinalities from statistics (if available)
-            // These are used by AQE to detect significant estimation errors
-            let (estimated_left, estimated_right) = self.get_join_estimates(
-                &join_source.left,
-                &join_source.right,
-                left_rows.len() as u64,
-                right_rows.len() as u64,
-            );
-
-            let join_decision = self.get_query_planner().plan_runtime_join_with_sort_info(
-                left_rows.len(),
-                right_rows.len(),
-                has_equality_keys,
-                left_sorted,
-                right_sorted,
-            );
-
-            // Convert planner's runtime algorithm to optimizer's JoinAlgorithm for AQE
-            use crate::executor::planner::RuntimeJoinAlgorithm;
-            let planned_algorithm = match join_decision.algorithm {
-                RuntimeJoinAlgorithm::HashJoin => JoinAlgorithm::HashJoin {
-                    build_side: if join_decision.swap_sides {
-                        BuildSide::Right
-                    } else {
-                        BuildSide::Left
-                    },
-                    build_rows: if join_decision.swap_sides {
-                        right_rows.len() as u64
-                    } else {
-                        left_rows.len() as u64
-                    },
-                    probe_rows: if join_decision.swap_sides {
-                        left_rows.len() as u64
-                    } else {
-                        right_rows.len() as u64
-                    },
-                },
-                RuntimeJoinAlgorithm::MergeJoin => JoinAlgorithm::MergeJoin {
-                    left_rows: left_rows.len() as u64,
-                    right_rows: right_rows.len() as u64,
-                    left_sorted,
-                    right_sorted,
-                },
-                RuntimeJoinAlgorithm::NestedLoop => JoinAlgorithm::NestedLoop {
-                    outer_rows: left_rows.len() as u64,
-                    inner_rows: right_rows.len() as u64,
-                },
-            };
-
-            // Create AQE context with estimated vs actual cardinalities
-            let aqe_context = JoinAqeContext::new(
-                estimated_left,
-                estimated_right,
-                left_rows.len() as u64,
-                right_rows.len() as u64,
-                has_equality_keys,
-                planned_algorithm.clone(),
-            );
-
-            // Let AQE decide if we should switch algorithms based on estimation error
-            let aqe_decision = decide_join_algorithm(&aqe_context);
-
-            // Determine final algorithm based on AQE decision
-            let final_algorithm = match aqe_decision {
-                AqeJoinDecision::KeepPlanned => join_decision.algorithm,
-                AqeJoinDecision::SwitchToHashJoin { build_side: _ } => {
-                    // AQE recommends hash join (build side handled by execute_hash_join)
-                    RuntimeJoinAlgorithm::HashJoin
-                }
-                AqeJoinDecision::SwitchToNestedLoop => RuntimeJoinAlgorithm::NestedLoop,
-            };
-
-            // Compute safe LIMIT for pushdown to hash join
-            // LIMIT can only be pushed when:
-            // - It's an INNER JOIN, LEFT JOIN, or RIGHT JOIN (not FULL OUTER)
-            // - No ORDER BY (would need all rows to sort first)
-            // - No remaining cross-table WHERE conditions
-            // - No GROUP BY or aggregation (needs all rows to form correct groups)
-            // Note: LEFT/RIGHT JOINs can early-terminate because each probe row
-            // contributes to output (either matches or NULL-padded)
-            // Note: For INNER JOINs with residual conditions, we can still push LIMIT
-            // by applying residual filters during the join probe phase
-            let has_group_by = !stmt.group_by.columns.is_empty();
-            let has_aggregation = self.has_aggregation(stmt);
-            let is_inner_join = !join_type.contains("LEFT")
-                && !join_type.contains("RIGHT")
-                && !join_type.contains("FULL");
-
-            // For INNER JOINs, residual filters can be applied during join (allows LIMIT pushdown)
-            // For OUTER JOINs, residual must be applied after (NULL-padded rows need special handling)
-            let can_push_limit_base = !join_type.contains("FULL")
-                && stmt.order_by.is_empty()
-                && cross_filter.is_none()
-                && !has_group_by
-                && !has_aggregation;
-            let can_push_limit = can_push_limit_base && (residual.is_empty() || is_inner_join);
-
-            let join_limit = if can_push_limit {
-                // Extract LIMIT value if present
-                stmt.limit.as_ref().and_then(|limit_expr| {
-                    ExpressionEval::compile(limit_expr, &[])
-                        .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
-                        .and_then(|v| match v {
-                            Value::Integer(n) if n >= 0 => Some(n as u64),
-                            _ => None,
-                        })
-                })
-            } else {
-                None
-            };
-
-            // Select join algorithm based on final decision (planner or AQE-overridden)
-            match final_algorithm {
-                RuntimeJoinAlgorithm::HashJoin => {
-                    // Hash Join: O(N + M) instead of O(N * M)
-                    // Supports multiple keys: ON a.x = b.x AND a.y = b.y
-                    // Use execute_hash_join which handles:
-                    // - Build side optimization (smaller table as build)
-                    // - Outer join restrictions (LEFT/RIGHT/FULL joins need specific build sides)
-                    // - Bloom filter optimization
-                    // - Early termination when limit is pushed
-                    // - Residual filter application during probe for INNER JOINs
-
-                    // For INNER JOINs with residual, compile filters and apply during probe
-                    // This enables early termination with LIMIT
-                    let use_inline_residual = is_inner_join && !residual.is_empty();
-                    let residual_filters: Vec<RowFilter> = if use_inline_residual {
-                        residual
-                            .iter()
-                            .filter_map(|cond| {
-                                RowFilter::new(cond, &all_columns)
-                                    .ok()
-                                    .map(|f| f.with_context(ctx))
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-
-                    let mut rows = self.execute_hash_join_with_residual(
-                        &left_rows,
-                        &right_rows,
-                        &left_key_indices,
-                        &right_key_indices,
-                        &join_type,
-                        left_columns.len(),
-                        right_columns.len(),
-                        join_limit,
-                        &residual_filters,
-                    )?;
-
-                    // Apply residual conditions for OUTER JOINs (need special NULL-row handling)
-                    // Skip for INNER JOINs where residual was already applied during probe
-                    if !residual.is_empty() && !use_inline_residual {
-                        self.apply_residual_conditions(
-                            &mut rows,
-                            &residual,
-                            &all_columns,
-                            &join_type,
-                            left_columns.len(),
-                            right_columns.len(),
-                            ctx,
-                        )?;
-                    }
-                    rows
-                }
-                RuntimeJoinAlgorithm::MergeJoin => {
-                    // Merge Join: O(N + M) - optimal when inputs are sorted on join keys
-                    // Currently triggered when both inputs are pre-sorted
-                    let mut rows = self.execute_merge_join(
-                        &left_rows,
-                        &right_rows,
-                        &left_key_indices,
-                        &right_key_indices,
-                        &join_type,
-                        left_columns.len(),
-                        right_columns.len(),
-                    )?;
-
-                    // Apply residual conditions
-                    if !residual.is_empty() {
-                        self.apply_residual_conditions(
-                            &mut rows,
-                            &residual,
-                            &all_columns,
-                            &join_type,
-                            left_columns.len(),
-                            right_columns.len(),
-                            ctx,
-                        )?;
-                    }
-                    rows
-                }
-                RuntimeJoinAlgorithm::NestedLoop => {
-                    // Nested Loop: O(N * M) - used for small tables or non-equality joins
-                    self.execute_nested_loop_join(
-                        &left_rows,
-                        &right_rows,
-                        Some(condition),
-                        &all_columns,
-                        &left_columns,
-                        &right_columns,
-                        &join_type,
-                        ctx,
-                        join_limit,
-                    )?
-                }
-            }
+        let join_limit = if can_push_limit {
+            stmt.limit.as_ref().and_then(|limit_expr| {
+                ExpressionEval::compile(limit_expr, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|v| match v {
+                        Value::Integer(n) if n >= 0 => Some(n as u64),
+                        _ => None,
+                    })
+            })
         } else {
-            // CROSS JOIN - no condition
-            // For CROSS JOIN, compute limit directly since we don't have join keys
-            // Don't push limit when there's aggregation (needs all rows for grouping)
-            let cross_has_group_by = !stmt.group_by.columns.is_empty();
-            let cross_has_aggregation = self.has_aggregation(stmt);
-            let cross_join_limit = if !join_type.contains("LEFT")
-                && !join_type.contains("RIGHT")
-                && !join_type.contains("FULL")
-                && stmt.order_by.is_empty()
-                && stmt.where_clause.is_none()
-                && !cross_has_group_by
-                && !cross_has_aggregation
-            {
-                stmt.limit.as_ref().and_then(|limit_expr| {
-                    ExpressionEval::compile(limit_expr, &[])
-                        .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
-                        .and_then(|v| match v {
-                            Value::Integer(n) if n >= 0 => Some(n as u64),
-                            _ => None,
-                        })
-                })
-            } else {
-                None
-            };
-            self.execute_nested_loop_join(
-                &left_rows,
-                &right_rows,
-                None,
-                &all_columns,
-                &left_columns,
-                &right_columns,
-                &join_type,
-                ctx,
-                cross_join_limit,
-            )?
+            None
         };
+
+        // Get join algorithm decision from QueryPlanner
+        // This uses cost-based optimization with edge-aware heuristics
+        let (left_key_indices, right_key_indices, _) = if let Some(cond) = effective_condition {
+            extract_join_keys_and_residual(cond, &left_columns, &right_columns)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        let has_equality_keys = !left_key_indices.is_empty();
+
+        // Check if inputs are sorted on join keys
+        let left_sorted =
+            has_equality_keys && super::utils::is_sorted_on_keys(&left_rows, &left_key_indices);
+        let right_sorted =
+            has_equality_keys && super::utils::is_sorted_on_keys(&right_rows, &right_key_indices);
+
+        // Get algorithm decision from QueryPlanner
+        let algorithm_decision = self.get_query_planner().plan_runtime_join_with_sort_info(
+            left_rows.len(),
+            right_rows.len(),
+            has_equality_keys,
+            left_sorted,
+            right_sorted,
+        );
+
+        // Execute join using JoinExecutor (takes ownership of rows)
+        let join_executor = JoinExecutor::new();
+        let join_request = super::join_executor::JoinRequest {
+            left_rows,
+            right_rows,
+            left_columns: &left_columns,
+            right_columns: &right_columns,
+            condition: effective_condition,
+            join_type: &join_type,
+            limit: join_limit,
+            ctx,
+            algorithm_hint: Some(&algorithm_decision),
+        };
+
+        let join_result = join_executor.execute(join_request)?;
+        let result_rows = join_result.rows;
 
         // Build alias map for alias substitution
         let alias_map = Self::build_alias_map(&stmt.columns);
@@ -3523,7 +3376,7 @@ impl Executor {
 
         // Determine if we have any complex expressions (not just column references)
         // If all expressions are simple column references, use fast StreamingProjectionResult
-        // Otherwise, use MappedResult with expression evaluation
+        // Otherwise, use ExprMappedResult with pre-compiled expression evaluation
         let mut has_complex_expressions = false;
         let mut column_indices = Vec::with_capacity(stmt.columns.len());
         let mut output_columns = Vec::with_capacity(stmt.columns.len());
@@ -3577,7 +3430,7 @@ impl Executor {
                             return Err(Error::ColumnNotFoundNamed(id.value.clone()));
                         }
                     } else {
-                        // Complex expression in alias - need MappedResult
+                        // Complex expression in alias - need ExprMappedResult
                         has_complex_expressions = true;
                     }
                 }
@@ -4159,6 +4012,78 @@ impl Executor {
                 "Unsupported table expression type".to_string(),
             )),
         }
+    }
+
+    /// Execute a table expression with optional filter and row limit.
+    /// For simple table sources, adds LIMIT to enable true early termination.
+    /// This is optimized for Index Nested Loop joins where we need only enough rows
+    /// to produce the requested LIMIT results.
+    pub(crate) fn execute_table_expression_with_filter_limit(
+        &self,
+        expr: &Expression,
+        ctx: &ExecutionContext,
+        filter: Option<&Expression>,
+        row_limit: Option<usize>,
+    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
+        // Only optimize for simple TableSource with a limit
+        if let Expression::TableSource(ts) = expr {
+            if let Some(limit) = row_limit {
+                let table_name = ts.name.value.to_lowercase();
+
+                // Skip if this is a CTE reference - CTEs are already materialized
+                if ctx.get_cte(&table_name).is_some() {
+                    return self.execute_table_expression_with_filter(expr, ctx, filter);
+                }
+
+                // Skip if this is a view
+                if self.engine.get_view_lowercase(&table_name)?.is_some() {
+                    return self.execute_table_expression_with_filter(expr, ctx, filter);
+                }
+
+                // Create a SELECT * statement with WHERE clause AND LIMIT
+                // This triggers the LIMIT pushdown optimization in execute_simple_table_scan
+                let select_all = SelectStatement {
+                    token: dummy_token("SELECT", TokenType::Keyword),
+                    distinct: false,
+                    columns: vec![Expression::Star(StarExpression {
+                        token: dummy_token("*", TokenType::Punctuator),
+                    })],
+                    with: None,
+                    table_expr: Some(Box::new(Expression::TableSource(ts.clone()))),
+                    where_clause: filter.map(|f| Box::new(f.clone())),
+                    group_by: GroupByClause::default(),
+                    having: None,
+                    window_defs: vec![],
+                    order_by: vec![],
+                    limit: Some(Box::new(Expression::IntegerLiteral(
+                        crate::parser::ast::IntegerLiteral {
+                            token: dummy_token(&limit.to_string(), TokenType::Integer),
+                            value: limit as i64,
+                        },
+                    ))),
+                    offset: None,
+                    set_operations: vec![],
+                };
+                let (result, columns, _) = self.execute_simple_table_scan(ts, &select_all, ctx)?;
+
+                // Prefix column names with table alias (or table name if no alias)
+                let table_alias = ts
+                    .alias
+                    .as_ref()
+                    .map(|a| a.value.clone())
+                    .unwrap_or_else(|| ts.name.value.clone());
+
+                let qualified_columns: Vec<String> = columns
+                    .iter()
+                    .map(|col| format!("{}.{}", table_alias, col))
+                    .collect();
+
+                return Ok((result, qualified_columns));
+            }
+        }
+
+        // Fall back to standard execution for other cases
+        self.execute_table_expression_with_filter(expr, ctx, filter)
     }
 
     /// Materialize a result into a vector of rows
@@ -6945,10 +6870,10 @@ impl Executor {
         left_alias: Option<&str>,
         right_alias: Option<&str>,
     ) -> Option<(
-        String,                    // table_name
-        join::IndexLookupStrategy, // lookup strategy (index or PK)
-        String,                    // inner_key_column (unqualified)
-        String,                    // outer_key_column (qualified)
+        String,              // table_name
+        IndexLookupStrategy, // lookup strategy (index or PK)
+        String,              // inner_key_column (unqualified)
+        String,              // outer_key_column (qualified)
     )> {
         // Only for INNER or LEFT joins (not RIGHT or FULL)
         // RIGHT joins would need to track all unmatched inner rows
@@ -7029,7 +6954,7 @@ impl Executor {
                 // It's a primary key lookup - most efficient!
                 return Some((
                     table_name.clone(),
-                    join::IndexLookupStrategy::PrimaryKey,
+                    IndexLookupStrategy::PrimaryKey,
                     inner_col_unqualified,
                     outer_col,
                 ));
@@ -7040,7 +6965,7 @@ impl Executor {
         if let Some(index) = table.get_index_on_column(&inner_col_unqualified) {
             return Some((
                 table_name.clone(),
-                join::IndexLookupStrategy::SecondaryIndex(index),
+                IndexLookupStrategy::SecondaryIndex(index),
                 inner_col_unqualified,
                 outer_col,
             ));

@@ -25,8 +25,9 @@ use crate::parser::ast::*;
 use crate::storage::traits::{Engine, QueryResult, ScanPlan};
 
 use super::context::ExecutionContext;
-use super::join;
+use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
+use super::planner::RuntimeJoinAlgorithm;
 use super::pushdown;
 use super::result::ExecutorMemoryResult;
 use super::Executor;
@@ -711,7 +712,7 @@ impl Executor {
     }
 
     /// Determine the join algorithm for EXPLAIN output
-    /// This checks for Index Nested Loop Join opportunity using the same logic as execution
+    /// This uses the same QueryPlanner logic as actual execution for consistency
     fn determine_join_algorithm_for_explain(
         &self,
         join_left: &Expression,
@@ -719,7 +720,7 @@ impl Executor {
         join_condition: Option<&Expression>,
         join_type: &str,
         using_columns: &[Identifier],
-    ) -> (&'static str, Option<join::IndexLookupStrategy>) {
+    ) -> (String, Option<IndexLookupStrategy>) {
         // Check for INLJ opportunity on right side (default check)
         if let Some(cond) = join_condition {
             // Get aliases for the check
@@ -738,8 +739,8 @@ impl Executor {
 
             if let Some((_, strategy, _, _)) = inlj_info {
                 let algo_name = match &strategy {
-                    join::IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)",
-                    join::IndexLookupStrategy::SecondaryIndex(_) => "Index Nested Loop",
+                    IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)".to_string(),
+                    IndexLookupStrategy::SecondaryIndex(_) => "Index Nested Loop".to_string(),
                 };
                 return (algo_name, Some(strategy));
             }
@@ -755,25 +756,60 @@ impl Executor {
 
             if let Some((_, strategy, _, _)) = swapped_info {
                 let algo_name = match &strategy {
-                    join::IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)",
-                    join::IndexLookupStrategy::SecondaryIndex(_) => "Index Nested Loop",
+                    IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)".to_string(),
+                    IndexLookupStrategy::SecondaryIndex(_) => "Index Nested Loop".to_string(),
                 };
                 return (algo_name, Some(strategy));
             }
-
-            // Fall back to Hash Join or Nested Loop
-            if is_equality_condition(cond) {
-                return ("Hash Join", None);
-            }
         }
 
-        if join_condition.is_none() && using_columns.is_empty() {
-            ("Nested Loop", None)
-        } else if !using_columns.is_empty() {
-            ("Hash Join", None) // USING clause implies equality
+        // Use QueryPlanner for algorithm selection (same as execution path)
+        let planner = self.get_query_planner();
+        let left_table_name = extract_table_name(join_left);
+        let right_table_name = extract_table_name(join_right);
+
+        // Get row counts from statistics (or use defaults)
+        let left_rows = left_table_name
+            .as_ref()
+            .and_then(|name| planner.get_table_stats(name))
+            .map(|s| s.row_count as usize)
+            .unwrap_or(1000);
+        let right_rows = right_table_name
+            .as_ref()
+            .and_then(|name| planner.get_table_stats(name))
+            .map(|s| s.row_count as usize)
+            .unwrap_or(1000);
+
+        // Determine if we have equality keys
+        let has_equality_keys = if let Some(cond) = join_condition {
+            is_equality_condition(cond)
         } else {
-            ("Nested Loop", None)
-        }
+            !using_columns.is_empty()
+        };
+
+        // Get the runtime join decision from QueryPlanner
+        let decision = planner.plan_runtime_join_with_sort_info(
+            left_rows,
+            right_rows,
+            has_equality_keys,
+            false, // Can't determine sort status from AST alone
+            false,
+        );
+
+        // Format the algorithm name with details
+        let algo_name = match decision.algorithm {
+            RuntimeJoinAlgorithm::HashJoin => {
+                if decision.swap_sides {
+                    "Hash Join (build: right)".to_string()
+                } else {
+                    "Hash Join (build: left)".to_string()
+                }
+            }
+            RuntimeJoinAlgorithm::MergeJoin => "Merge Join".to_string(),
+            RuntimeJoinAlgorithm::NestedLoop => "Nested Loop".to_string(),
+        };
+
+        (algo_name, None)
     }
 }
 

@@ -97,9 +97,6 @@ pub struct CompileContext<'a> {
     /// Tables that belong to row2 (for tracking which tables are from second row)
     row2_tables: HashSet<String>,
 
-    /// Column offset for second row in combined index space (for fallback)
-    column2_offset: u16,
-
     /// Outer query columns (for correlated subqueries)
     outer_columns: Option<FxHashMap<Arc<str>, u16>>,
 
@@ -144,7 +141,6 @@ impl<'a> CompileContext<'a> {
             qualified_columns: qualified_map,
             columns2: None,
             row2_tables: HashSet::new(),
-            column2_offset: columns.len() as u16,
             outer_columns: None,
             functions,
             expression_aliases: FxHashMap::default(),
@@ -208,26 +204,26 @@ impl<'a> CompileContext<'a> {
         self
     }
 
-    /// Resolve a column name to its index
-    fn resolve_column(&self, name: &str) -> Option<u16> {
+    /// Resolve a column name to its source (Row1 or Row2)
+    fn resolve_column(&self, name: &str) -> Option<ColumnSource> {
         let lower = name.to_lowercase();
 
         // Check column aliases first
         if let Some(original) = self.column_aliases.get(&lower) {
             if let Some(&idx) = self.columns.get(original) {
-                return Some(idx);
+                return Some(ColumnSource::Row1(idx));
             }
         }
 
-        // Direct lookup
+        // Direct lookup in primary columns (Row1)
         if let Some(&idx) = self.columns.get(&lower) {
-            return Some(idx);
+            return Some(ColumnSource::Row1(idx));
         }
 
-        // Try second row if available
+        // Try second row if available (Row2)
         if let Some(ref cols2) = self.columns2 {
             if let Some(&idx) = cols2.get(&lower) {
-                return Some(self.column2_offset + idx);
+                return Some(ColumnSource::Row2(idx));
             }
         }
 
@@ -257,7 +253,7 @@ impl<'a> CompileContext<'a> {
         }
 
         // Qualified name not in outer context - safe to fall back to unqualified lookup
-        self.resolve_column(&column_lower).map(ColumnSource::Row1)
+        self.resolve_column(&column_lower)
     }
 
     /// Resolve outer column (for correlated subqueries)
@@ -415,8 +411,11 @@ impl<'a> ExprCompiler<'a> {
                     } else {
                         return Err(CompileError::ColumnNotFound(id.value.clone()));
                     }
-                } else if let Some(idx) = self.ctx.resolve_column(&id.value_lower) {
-                    builder.emit(Op::LoadColumn(idx));
+                } else if let Some(source) = self.ctx.resolve_column(&id.value_lower) {
+                    match source {
+                        ColumnSource::Row1(idx) => builder.emit(Op::LoadColumn(idx)),
+                        ColumnSource::Row2(idx) => builder.emit(Op::LoadColumn2(idx)),
+                    }
                 } else if let Some(name) = self.ctx.resolve_outer_column(&id.value_lower) {
                     builder.emit(Op::LoadOuterColumn(name));
                 } else {

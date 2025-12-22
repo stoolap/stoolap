@@ -1060,14 +1060,19 @@ pub fn extract_column_name_with_qualifier(expr: &Expression) -> Option<(Option<S
 }
 
 /// Find column index in column list, handling qualified names.
-/// Supports exact match, qualified match (table.column), and suffix match.
+/// Supports exact match and qualified match (table.column).
+///
+/// IMPORTANT: When a qualifier is provided (e.g., "t2" for "t2.id"),
+/// we ONLY match columns that have that exact qualifier. This prevents
+/// incorrectly matching "t1.id" when looking for "t2.id".
 pub fn find_column_index(col_info: &(Option<String>, String), columns: &[String]) -> Option<usize> {
     let (qualifier, col_name) = col_info;
 
+    // First pass: try exact or qualified match
     for (idx, column) in columns.iter().enumerate() {
         let col_lower = column.to_lowercase();
 
-        // Try exact match first
+        // Try exact match (unqualified column name)
         if col_lower == *col_name {
             return Some(idx);
         }
@@ -1079,10 +1084,16 @@ pub fn find_column_index(col_info: &(Option<String>, String), columns: &[String]
                 return Some(idx);
             }
         }
+    }
 
-        // Try suffix match (column might be stored as table.column)
-        if col_lower.ends_with(&format!(".{}", col_name)) {
-            return Some(idx);
+    // Second pass: ONLY if no qualifier was provided, try suffix match
+    // This allows matching "id" against "t1.id" when the column ref is just "id"
+    if qualifier.is_none() {
+        for (idx, column) in columns.iter().enumerate() {
+            let col_lower = column.to_lowercase();
+            if col_lower.ends_with(&format!(".{}", col_name)) {
+                return Some(idx);
+            }
         }
     }
 
@@ -1097,63 +1108,103 @@ pub fn find_column_index(col_info: &(Option<String>, String), columns: &[String]
 ///
 /// This is used to detect when merge join can be used efficiently.
 /// Returns true if the rows are sorted (ascending) on all key columns.
-/// For large inputs (>10000 rows), uses sampling for efficiency.
+///
+/// # Strategy
+///
+/// - For small datasets (<= 50,000 rows): Check all consecutive pairs (O(n))
+/// - For larger datasets: Use strategic sampling with boundary checks
+///
+/// The sampling approach checks:
+/// 1. First and last 100 pairs (catch boundary issues)
+/// 2. 100 random pairs in the middle (catch random discontinuities)
+///
+/// This catches most unsorted data while keeping the check O(1) for large datasets.
+/// False positives (thinking unsorted data is sorted) are rare but possible;
+/// however, merge join will still produce correct results - it will just be slower
+/// than hash join for truly unsorted data.
 pub fn is_sorted_on_keys(rows: &[Row], key_indices: &[usize]) -> bool {
     if rows.len() <= 1 || key_indices.is_empty() {
         return true; // Trivially sorted
     }
 
-    // For large inputs, sample check is sufficient
-    let check_limit = if rows.len() > 10000 { 1000 } else { rows.len() };
+    // For small datasets, check all pairs - O(n) is acceptable
+    if rows.len() <= 50_000 {
+        return is_sorted_all_pairs(rows, key_indices);
+    }
 
-    // Check if rows are sorted by comparing consecutive pairs
-    for i in 1..check_limit.min(rows.len()) {
-        let prev = &rows[i - 1];
-        let curr = &rows[i];
+    // For larger datasets, use sampling to avoid O(n) overhead
+    is_sorted_sampled(rows, key_indices)
+}
 
-        for &idx in key_indices {
-            match (prev.get(idx), curr.get(idx)) {
-                (Some(v1), Some(v2)) => {
-                    let cmp = compare_values(v1, v2);
-                    match cmp {
-                        Ordering::Less => break,           // prev < curr, sorted so far
-                        Ordering::Greater => return false, // prev > curr, not sorted
-                        Ordering::Equal => continue,       // Check next key
-                    }
-                }
-                (None, Some(_)) => break, // NULL < value (NULL first)
-                (Some(_), None) => return false, // value > NULL
-                (None, None) => continue, // Both NULL, check next key
-            }
+/// Check all consecutive pairs - O(n) but complete coverage.
+fn is_sorted_all_pairs(rows: &[Row], key_indices: &[usize]) -> bool {
+    for i in 1..rows.len() {
+        if !is_pair_sorted(&rows[i - 1], &rows[i], key_indices) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Sampling-based sorted check - O(1) for large datasets.
+/// Checks first/last boundaries plus random samples in the middle.
+fn is_sorted_sampled(rows: &[Row], key_indices: &[usize]) -> bool {
+    let n = rows.len();
+    const BOUNDARY_CHECK: usize = 100;
+    const MIDDLE_SAMPLES: usize = 100;
+
+    // Check first BOUNDARY_CHECK pairs
+    let first_check = BOUNDARY_CHECK.min(n - 1);
+    for i in 1..=first_check {
+        if !is_pair_sorted(&rows[i - 1], &rows[i], key_indices) {
+            return false;
         }
     }
 
-    // Also check last portion for large inputs
-    if rows.len() > 10000 {
-        let start = rows.len() - check_limit;
-        for i in (start + 1)..rows.len() {
-            let prev = &rows[i - 1];
-            let curr = &rows[i];
+    // Check last BOUNDARY_CHECK pairs
+    let last_start = n.saturating_sub(BOUNDARY_CHECK);
+    for i in last_start.max(first_check + 1)..n {
+        if !is_pair_sorted(&rows[i - 1], &rows[i], key_indices) {
+            return false;
+        }
+    }
 
-            for &idx in key_indices {
-                match (prev.get(idx), curr.get(idx)) {
-                    (Some(v1), Some(v2)) => {
-                        let cmp = compare_values(v1, v2);
-                        match cmp {
-                            Ordering::Less => break,
-                            Ordering::Greater => return false,
-                            Ordering::Equal => continue,
-                        }
-                    }
-                    (None, Some(_)) => break,
-                    (Some(_), None) => return false,
-                    (None, None) => continue,
-                }
+    // Sample middle section with deterministic stride
+    // (Using stride instead of random to ensure reproducibility)
+    let middle_start = first_check + 1;
+    let middle_end = last_start.saturating_sub(1);
+    if middle_end > middle_start {
+        let middle_len = middle_end - middle_start;
+        let stride = (middle_len / MIDDLE_SAMPLES).max(1);
+        for i in (middle_start..middle_end).step_by(stride) {
+            if !is_pair_sorted(&rows[i - 1], &rows[i], key_indices) {
+                return false;
             }
         }
     }
 
     true
+}
+
+/// Check if two consecutive rows are in sorted order on the given keys.
+#[inline]
+fn is_pair_sorted(prev: &Row, curr: &Row, key_indices: &[usize]) -> bool {
+    for &idx in key_indices {
+        match (prev.get(idx), curr.get(idx)) {
+            (Some(v1), Some(v2)) => {
+                let cmp = compare_values(v1, v2);
+                match cmp {
+                    Ordering::Less => return true,     // prev < curr, sorted
+                    Ordering::Greater => return false, // prev > curr, not sorted
+                    Ordering::Equal => continue,       // Check next key
+                }
+            }
+            (None, Some(_)) => return true, // NULL < value (NULL first)
+            (Some(_), None) => return false, // value > NULL
+            (None, None) => continue,       // Both NULL, check next key
+        }
+    }
+    true // All keys equal - considered sorted
 }
 
 // ============================================================================
@@ -1203,5 +1254,99 @@ pub fn expression_to_string(expr: &Expression) -> String {
             )
         }
         _ => format!("{}", expr),
+    }
+}
+
+// ============================================================================
+// Join Key Extraction
+// ============================================================================
+
+/// Extract equality join keys and residual conditions from a join condition.
+///
+/// Returns (left_indices, right_indices, residual_conditions) where residual
+/// contains non-equality conditions that must be applied after the hash join.
+pub fn extract_join_keys_and_residual(
+    condition: &Expression,
+    left_columns: &[String],
+    right_columns: &[String],
+) -> (Vec<usize>, Vec<usize>, Vec<Expression>) {
+    let mut left_indices = Vec::new();
+    let mut right_indices = Vec::new();
+    let mut residual = Vec::new();
+
+    extract_join_keys_recursive(
+        condition,
+        left_columns,
+        right_columns,
+        &mut left_indices,
+        &mut right_indices,
+        &mut residual,
+    );
+
+    (left_indices, right_indices, residual)
+}
+
+/// Recursively extract equality join keys from AND expressions.
+fn extract_join_keys_recursive(
+    condition: &Expression,
+    left_columns: &[String],
+    right_columns: &[String],
+    left_indices: &mut Vec<usize>,
+    right_indices: &mut Vec<usize>,
+    residual: &mut Vec<Expression>,
+) {
+    match condition {
+        Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
+            // Recurse into AND branches
+            extract_join_keys_recursive(
+                &infix.left,
+                left_columns,
+                right_columns,
+                left_indices,
+                right_indices,
+                residual,
+            );
+            extract_join_keys_recursive(
+                &infix.right,
+                left_columns,
+                right_columns,
+                left_indices,
+                right_indices,
+                residual,
+            );
+        }
+        Expression::Infix(infix) if infix.op_type == InfixOperator::Equal => {
+            // Extract equality condition
+            if let (Some(left_col), Some(right_col)) = (
+                extract_column_name_with_qualifier(&infix.left),
+                extract_column_name_with_qualifier(&infix.right),
+            ) {
+                // Case 1: left.col = right.col
+                if let (Some(left_idx), Some(right_idx)) = (
+                    find_column_index(&left_col, left_columns),
+                    find_column_index(&right_col, right_columns),
+                ) {
+                    left_indices.push(left_idx);
+                    right_indices.push(right_idx);
+                    return;
+                }
+
+                // Case 2: right.col = left.col (swapped)
+                if let (Some(left_idx), Some(right_idx)) = (
+                    find_column_index(&right_col, left_columns),
+                    find_column_index(&left_col, right_columns),
+                ) {
+                    left_indices.push(left_idx);
+                    right_indices.push(right_idx);
+                    return;
+                }
+            }
+            // Non-join equality (e.g., a.x = 5) - add to residual
+            residual.push(condition.clone());
+        }
+        _ => {
+            // Non-equality condition - add to residual filters
+            residual.push(condition.clone());
+        }
     }
 }

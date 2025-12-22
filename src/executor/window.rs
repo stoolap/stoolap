@@ -45,8 +45,8 @@ use crate::storage::traits::{QueryResult, Table};
 
 use super::context::ExecutionContext;
 use super::expression::{ExpressionEval, MultiExpressionEval};
-use super::join::build_column_index_map;
 use super::result::ExecutorMemoryResult;
+use super::utils::build_column_index_map;
 use super::Executor;
 
 /// Information about a window function call in a SELECT list

@@ -24,9 +24,9 @@
 //! ```text
 //! Table.Scan()
 //!   ↓
-//! FilteredResult (WHERE clause)
+//! ExprFilteredResult (WHERE clause with pre-compiled RowFilter)
 //!   ↓
-//! JoinResult (JOIN operations)
+//! HashJoinOperator (JOIN operations)
 //!   ↓
 //! AggregateResult (GROUP BY)
 //!   ↓
@@ -40,12 +40,16 @@
 //! # Components
 //!
 //! - [`Executor`] - Main executor orchestrating query execution
-//! - [`Evaluator`] - Expression evaluation engine
+//! - [`ExprVM`] - Expression virtual machine for evaluation
 //! - [`ExecResult`] - Base result type for DML operations
 //! - Various result wrappers for query pipeline
 
 pub mod context;
 pub mod expression;
+pub mod hash_table;
+pub mod join_executor;
+pub mod operator;
+pub mod operators;
 pub mod parallel;
 pub mod pattern_cache;
 pub mod planner;
@@ -59,7 +63,6 @@ mod cte;
 mod ddl;
 mod dml;
 mod explain;
-mod join;
 pub mod pushdown;
 mod query;
 mod set_ops;
@@ -105,8 +108,7 @@ pub use parallel::{
     DEFAULT_PARALLEL_SORT_THRESHOLD,
 };
 pub use planner::{
-    AccessPlan, ColumnStatsCache, JoinPlan, QueryPlanner, RuntimeJoinAlgorithm,
-    RuntimeJoinDecision, StatsHealth,
+    ColumnStatsCache, QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision, StatsHealth,
 };
 pub use query_cache::{CacheStats, CachedQueryPlan, QueryCache, DEFAULT_CACHE_SIZE};
 pub use result::{ExecResult, ExecutorMemoryResult};
@@ -115,6 +117,18 @@ pub use semantic_cache::{
     SemanticCacheStatsSnapshot, SubsumptionResult, DEFAULT_CACHE_TTL_SECS, DEFAULT_MAX_CACHED_ROWS,
     DEFAULT_SEMANTIC_CACHE_SIZE,
 };
+
+// New streaming operator infrastructure
+pub use hash_table::{hash_row_keys, verify_key_equality, JoinHashTable};
+pub use join_executor::{JoinAnalysis, JoinExecutor, JoinRequest, JoinResult};
+pub use operator::{
+    ColumnInfo, CompositeRow, EmptyOperator, MaterializedOperator, Operator, RowRef,
+};
+pub use operators::{
+    BatchIndexNestedLoopJoinOperator, HashJoinOperator, IndexLookupStrategy,
+    IndexNestedLoopJoinOperator, JoinSide, JoinType, MergeJoinOperator, NestedLoopJoinOperator,
+};
+pub use utils::extract_join_keys_and_residual;
 
 /// Active transaction state for explicit transaction control (BEGIN/COMMIT/ROLLBACK)
 struct ActiveTransaction {
