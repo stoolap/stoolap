@@ -2520,22 +2520,6 @@ impl Executor {
         Ok(results)
     }
 
-    /// Check if a SELECT statement has window functions
-    pub(crate) fn has_window_functions(&self, stmt: &SelectStatement) -> bool {
-        for col_expr in &stmt.columns {
-            if self.expression_has_window_function(col_expr) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Check if an expression contains window functions
-    /// Uses find_window_in_expression for recursive checking
-    fn expression_has_window_function(&self, expr: &Expression) -> bool {
-        Self::find_window_in_expression(expr).is_some()
-    }
-
     /// Extract aggregate function patterns from an expression (including nested ones)
     /// This handles cases like COALESCE(SUM(val), 0) where SUM(val) is nested
     fn extract_aggregate_patterns(expr: &Expression, executor: &Executor) -> Vec<String> {
@@ -2731,13 +2715,14 @@ mod tests {
 
     #[test]
     fn test_has_window_functions() {
-        let executor = create_test_executor();
+        use crate::executor::query_classification::get_classification;
 
         // Test with window function
         let mut parser = crate::parser::Parser::new("SELECT ROW_NUMBER() OVER () FROM test");
         if let Ok(program) = parser.parse_program() {
             if let crate::parser::ast::Statement::Select(stmt) = &program.statements[0] {
-                assert!(executor.has_window_functions(stmt));
+                let classification = get_classification(stmt);
+                assert!(classification.has_window_functions);
             }
         }
 
@@ -2745,7 +2730,8 @@ mod tests {
         let mut parser2 = crate::parser::Parser::new("SELECT * FROM test");
         if let Ok(program) = parser2.parse_program() {
             if let crate::parser::ast::Statement::Select(stmt) = &program.statements[0] {
-                assert!(!executor.has_window_functions(stmt));
+                let classification = get_classification(stmt);
+                assert!(!classification.has_window_functions);
             }
         }
     }

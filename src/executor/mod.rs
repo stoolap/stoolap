@@ -63,8 +63,10 @@ mod cte;
 mod ddl;
 mod dml;
 mod explain;
+mod pk_fast_path;
 pub mod pushdown;
 mod query;
+mod query_classification;
 mod set_ops;
 mod show;
 mod subquery;
@@ -472,8 +474,15 @@ impl Executor {
             Statement::Delete(stmt) => self.execute_delete(stmt, &ctx),
             Statement::Truncate(stmt) => self.execute_truncate(stmt, &ctx),
 
-            // Query statements
-            Statement::Select(stmt) => self.execute_select(stmt, &ctx),
+            // Query statements - try fast-path first for simple PK lookups
+            Statement::Select(stmt) => {
+                // Fast-path for simple PK lookups (bypasses full planner)
+                if let Some(result) = self.try_fast_pk_lookup(stmt, &ctx) {
+                    return result;
+                }
+                // Fall back to full query execution
+                self.execute_select(stmt, &ctx)
+            }
 
             // Transaction control
             Statement::Begin(stmt) => self.execute_begin(stmt, &ctx),

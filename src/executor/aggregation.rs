@@ -36,6 +36,7 @@ use super::context::ExecutionContext;
 #[allow(deprecated)]
 use super::expression::CompiledEvaluator;
 use super::expression::{ExpressionEval, RowFilter};
+use super::query_classification::QueryClassification;
 use super::result::ExecutorMemoryResult;
 use super::utils::{build_column_index_map, hash_value_into};
 use super::Executor;
@@ -4208,62 +4209,6 @@ impl Executor {
         }
     }
 
-    /// Check if a SELECT statement has aggregation
-    pub(crate) fn has_aggregation(&self, stmt: &SelectStatement) -> bool {
-        // Check if there are aggregate functions in SELECT
-        for col_expr in &stmt.columns {
-            if self.expression_has_aggregation(col_expr) {
-                return true;
-            }
-        }
-
-        // Check if there's a GROUP BY clause
-        !stmt.group_by.columns.is_empty()
-    }
-
-    /// Check if an expression contains aggregate functions (recursively)
-    #[allow(clippy::only_used_in_recursion)]
-    fn expression_has_aggregation(&self, expr: &Expression) -> bool {
-        match expr {
-            Expression::FunctionCall(func) => {
-                // Check if this function is an aggregate
-                if is_aggregate_function(&func.function) {
-                    return true;
-                }
-                // Check arguments recursively (e.g., COALESCE(SUM(val), 0))
-                for arg in &func.arguments {
-                    if self.expression_has_aggregation(arg) {
-                        return true;
-                    }
-                }
-                false
-            }
-            Expression::Aliased(aliased) => self.expression_has_aggregation(&aliased.expression),
-            Expression::Infix(infix) => {
-                self.expression_has_aggregation(&infix.left)
-                    || self.expression_has_aggregation(&infix.right)
-            }
-            Expression::Prefix(prefix) => self.expression_has_aggregation(&prefix.right),
-            Expression::Cast(cast) => self.expression_has_aggregation(&cast.expr),
-            Expression::Case(case) => {
-                for when_clause in &case.when_clauses {
-                    if self.expression_has_aggregation(&when_clause.condition)
-                        || self.expression_has_aggregation(&when_clause.then_result)
-                    {
-                        return true;
-                    }
-                }
-                if let Some(ref else_val) = case.else_value {
-                    if self.expression_has_aggregation(else_val) {
-                        return true;
-                    }
-                }
-                false
-            }
-            _ => false,
-        }
-    }
-
     /// Check if an expression is a PURE aggregate function call.
     ///
     /// Returns true only for:
@@ -4315,18 +4260,21 @@ impl Executor {
         stmt: &SelectStatement,
         all_columns: &[String],
         _ctx: &super::context::ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
-        // Quick eligibility checks
-        if stmt.where_clause.is_some() {
+        // classification is passed from caller to avoid redundant cache lookups
+
+        // Quick eligibility checks using cached classification
+        if classification.has_where {
             return Ok(None);
         }
-        if !stmt.group_by.columns.is_empty() {
+        if classification.has_group_by {
             return Ok(None);
         }
-        if stmt.having.is_some() {
+        if classification.has_having {
             return Ok(None);
         }
-        if self.has_window_functions(stmt) {
+        if classification.has_window_functions {
             return Ok(None);
         }
 

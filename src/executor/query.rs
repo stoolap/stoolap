@@ -54,6 +54,7 @@ use super::operators::index_nested_loop::{
 };
 use super::parallel::{self, ParallelConfig};
 use super::pushdown;
+use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
     DistinctResult, ExecResult, ExecutorMemoryResult, ExprFilteredResult, ExprMappedResult,
     FilteredResult, LimitedResult, OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult,
@@ -62,8 +63,8 @@ use super::result::{
 use super::utils::{
     add_table_qualifier, build_column_index_map, collect_table_qualifiers,
     combine_predicates_with_and, compare_values, dummy_token, expression_contains_aggregate,
-    expression_has_parameters, extract_base_column_name, extract_join_keys_and_residual,
-    flatten_and_predicates, get_table_alias_from_expr, strip_table_qualifier,
+    extract_base_column_name, extract_join_keys_and_residual, flatten_and_predicates,
+    get_table_alias_from_expr, strip_table_qualifier,
 };
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
@@ -196,6 +197,11 @@ impl Executor {
             return self.execute_select_with_ctes(stmt, ctx);
         }
 
+        // OPTIMIZATION: Get cached query classification ONCE at entry point
+        // This classification is passed through the call chain to avoid
+        // redundant hash computations and cache lookups (was 10+ calls per query)
+        let classification = get_classification(stmt);
+
         // Evaluate LIMIT/OFFSET early (needed for set operations optimization)
         let limit = if let Some(ref limit_expr) = stmt.limit {
             match ExpressionEval::compile(limit_expr, &[])?
@@ -271,7 +277,7 @@ impl Executor {
         // Execute the main query
         // The third return value indicates if LIMIT/OFFSET was already applied (by storage-level pushdown)
         let (mut result, columns, limit_offset_applied) =
-            self.execute_select_internal(stmt, ctx)?;
+            self.execute_select_internal(stmt, ctx, &classification)?;
 
         // Apply set operations (UNION, INTERSECT, EXCEPT)
         // Pass limit+offset to enable early termination for UNION ALL
@@ -316,6 +322,7 @@ impl Executor {
         // Apply ORDER BY (with TOP-N optimization if LIMIT is present)
         // Note: LIMIT/OFFSET was already evaluated earlier for set operations optimization
         // Skip ORDER BY if storage-level optimization already applied sorting + LIMIT/OFFSET
+        // classification was already obtained at entry point and passed through
         if !stmt.order_by.is_empty() && !limit_offset_applied {
             // Helper to format aggregate function call as column name
             let format_agg_column = |func: &crate::parser::ast::FunctionCall| -> String {
@@ -468,10 +475,8 @@ impl Executor {
                 evaluator.init_columns(&columns);
 
                 // Check if any ORDER BY expression contains a correlated subquery
-                let has_correlated_order_by = stmt
-                    .order_by
-                    .iter()
-                    .any(|ob| Self::has_correlated_subqueries(&ob.expression));
+                // Use cached classification to avoid expensive AST traversal
+                let has_correlated_order_by = classification.order_by_has_correlated_subqueries;
 
                 // OPTIMIZATION: Instead of cloning rows and appending sort keys,
                 // compute sort keys separately and use index-based sorting.
@@ -765,13 +770,14 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
         // Get table source
         let table_expr = match &stmt.table_expr {
             Some(expr) => expr.as_ref(),
             None => {
                 // SELECT without FROM (e.g., SELECT 1+1)
-                return self.execute_expression_select(stmt, ctx);
+                return self.execute_expression_select(stmt, ctx, classification);
             }
         };
 
@@ -792,16 +798,18 @@ impl Executor {
 
                 // Check if this is actually a view (single lookup, no double RwLock acquisition)
                 if let Some(view_def) = self.engine.get_view_lowercase(table_name)? {
-                    return self.execute_view_query(&view_def, stmt, ctx);
+                    return self.execute_view_query(&view_def, stmt, ctx, classification);
                 }
-                self.execute_simple_table_scan(table_source, stmt, ctx)
+                self.execute_simple_table_scan(table_source, stmt, ctx, classification)
             }
-            Expression::JoinSource(join_source) => self.execute_join_source(join_source, stmt, ctx),
+            Expression::JoinSource(join_source) => {
+                self.execute_join_source(join_source, stmt, ctx, classification)
+            }
             Expression::SubquerySource(subquery_source) => {
-                self.execute_subquery_source(subquery_source, stmt, ctx)
+                self.execute_subquery_source(subquery_source, stmt, ctx, classification)
             }
             Expression::ValuesSource(values_source) => {
-                self.execute_values_source(values_source, stmt, ctx)
+                self.execute_values_source(values_source, stmt, ctx, classification)
             }
             _ => Err(Error::NotSupportedMessage(
                 "Unsupported FROM clause type".to_string(),
@@ -814,7 +822,10 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+        // classification is passed from caller to avoid redundant cache lookups
+
         // Check WHERE clause first - if it evaluates to false, return empty result
         if let Some(where_clause) = &stmt.where_clause {
             // Pre-process subqueries in WHERE clause (EXISTS, IN, ALL/ANY, scalar subqueries)
@@ -846,7 +857,7 @@ impl Executor {
 
         // Check if we have aggregations - if so, use aggregation path with single dummy row
         // This handles cases like SELECT SUM(3+5) or SELECT COALESCE(SUM(1), 0)
-        if self.has_aggregation(stmt) {
+        if classification.has_aggregation {
             // Create a single dummy row for aggregation to process
             let dummy_rows = vec![Row::from_values(vec![])];
             let empty_columns: Vec<String> = vec![];
@@ -980,18 +991,13 @@ impl Executor {
         }
     }
 
-    /// Check if a SELECT statement has DISTINCT
-    #[inline]
-    fn has_distinct(&self, stmt: &SelectStatement) -> bool {
-        stmt.distinct
-    }
-
     /// Execute a simple table scan
     fn execute_simple_table_scan(
         &self,
         table_source: &SimpleTableSource,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &table_source.name.value_lower;
@@ -1019,7 +1025,14 @@ impl Executor {
 
             // Check for AS OF (temporal query)
             if let Some(ref as_of) = table_source.as_of {
-                return self.execute_temporal_query(table_name, as_of, stmt, ctx, &*tx);
+                return self.execute_temporal_query(
+                    table_name,
+                    as_of,
+                    stmt,
+                    ctx,
+                    &*tx,
+                    classification,
+                );
             }
 
             let table = tx.get_table(table_name).map_err(|e| {
@@ -1042,23 +1055,30 @@ impl Executor {
             .map(|a| a.value_lower.clone())
             .or_else(|| Some(table_name.clone()));
 
+        // classification is passed from caller to avoid redundant cache lookups
+
         // AGGREGATION PUSHDOWN: Try to compute simple aggregates directly on storage
         // This avoids all row materialization for queries like:
         // - SELECT COUNT(*) FROM table
         // - SELECT SUM(col), MIN(col), MAX(col) FROM table
         // Must check before any row collection happens
-        if self.has_aggregation(stmt) && !self.has_window_functions(stmt) {
+        if classification.has_aggregation && !classification.has_window_functions {
             // First try global aggregation pushdown (no GROUP BY)
-            if let Some(result) =
-                self.try_aggregation_pushdown(table.as_ref(), stmt, &all_columns, ctx)?
-            {
+            if let Some(result) = self.try_aggregation_pushdown(
+                table.as_ref(),
+                stmt,
+                &all_columns,
+                ctx,
+                classification,
+            )? {
                 let columns = result.columns().to_vec();
                 return Ok((result, columns, false));
             }
         }
 
         // Check if we need aggregation/window functions (need all columns)
-        let needs_all_columns = self.has_aggregation(stmt) || self.has_window_functions(stmt);
+        let needs_all_columns =
+            classification.has_aggregation || classification.has_window_functions;
 
         // Check if ORDER BY references columns not in SELECT
         let order_by_needs_extra_columns = self.order_by_needs_extra_columns(stmt, &all_columns);
@@ -1110,13 +1130,14 @@ impl Executor {
 
         // SEMANTIC CACHE: Check if we can serve this query from cache
         // Eligible queries: simple column projections with WHERE, no aggregation/window/grouping, no outer context
-        let is_select_star =
-            stmt.columns.len() == 1 && matches!(stmt.columns.first(), Some(Expression::Star(_)));
+        // Use cached classification for is_select_star check
+        let is_select_star = classification.is_select_star;
 
-        let has_aggregation_window_grouping = self.has_aggregation(stmt)
-            || self.has_window_functions(stmt)
-            || !stmt.group_by.columns.is_empty();
-        let has_subqueries_in_where = where_to_use.is_some_and(Self::has_subqueries);
+        let has_aggregation_window_grouping = classification.has_aggregation
+            || classification.has_window_functions
+            || classification.has_group_by;
+        // Use cached classification for subquery detection (avoids AST traversal)
+        let has_subqueries_in_where = classification.where_has_subqueries;
 
         // CRITICAL: Check if WHERE clause contains parameters ($1, $2, etc.)
         // Parameterized queries CANNOT be cached because:
@@ -1127,7 +1148,8 @@ impl Executor {
         // - Cache misses on every lookup (unique predicates)
         // - Streaming disabled for cache-eligible queries
         // - Cache insertions (write locks) on every query execution
-        let has_parameters_in_where = where_to_use.is_some_and(expression_has_parameters);
+        // Use cached classification for parameter detection (avoids AST traversal)
+        let has_parameters_in_where = classification.where_has_parameters;
 
         // Cache eligibility: We cache SELECT * queries because:
         // 1. The cache stores full table rows with their original column layout
@@ -1143,9 +1165,9 @@ impl Executor {
             && !has_outer_context
             && !has_subqueries_in_where
             && !has_parameters_in_where // Parameters can't be cached (values not in AST)
-            && stmt.order_by.is_empty()
-            && !stmt.distinct
-            && stmt.limit.is_none()
+            && !classification.has_order_by
+            && !classification.has_distinct
+            && !classification.has_limit
             && !in_explicit_transaction; // MVCC safety: no caching in transactions
 
         // Try cache lookup for eligible queries
@@ -1203,7 +1225,8 @@ impl Executor {
 
         let (storage_expr, needs_memory_filter) = if let Some(where_expr) = where_to_use {
             // If there are subqueries, we must filter in memory
-            if Self::has_subqueries(where_expr) {
+            // Use cached classification to avoid AST traversal
+            if classification.where_has_subqueries {
                 (None, true)
             } else if has_outer_context {
                 // If we have outer row context, this is a correlated subquery
@@ -1245,9 +1268,9 @@ impl Executor {
         // the WHERE clause predicates are outside all segment ranges
         // IMPORTANT: Don't short-circuit if we have aggregation, window functions, or GROUP BY
         // because aggregation on empty results needs to produce output (e.g., COUNT=0)
-        let has_aggregation_or_grouping = self.has_aggregation(stmt)
-            || self.has_window_functions(stmt)
-            || !stmt.group_by.columns.is_empty();
+        let has_aggregation_or_grouping = classification.has_aggregation
+            || classification.has_window_functions
+            || classification.has_group_by;
 
         if !has_aggregation_or_grouping {
             if let Some(ref expr) = storage_expr {
@@ -1270,7 +1293,7 @@ impl Executor {
         // FAST PATH: MIN/MAX index optimization
         // For queries like `SELECT MIN(col) FROM table` or `SELECT MAX(col) FROM table`
         // without WHERE or GROUP BY, use the index directly (O(1) instead of O(n))
-        if storage_expr.is_none() && !needs_memory_filter && stmt.group_by.columns.is_empty() {
+        if storage_expr.is_none() && !needs_memory_filter && !classification.has_group_by {
             if let Some((result, columns)) =
                 self.try_min_max_index_optimization(stmt, &*table, &all_columns)?
             {
@@ -1281,7 +1304,7 @@ impl Executor {
         // FAST PATH: COUNT(*) pushdown optimization
         // For queries like `SELECT COUNT(*) FROM table` without WHERE or GROUP BY,
         // use the table's row_count() method instead of scanning all rows
-        if storage_expr.is_none() && !needs_memory_filter && stmt.group_by.columns.is_empty() {
+        if storage_expr.is_none() && !needs_memory_filter && !classification.has_group_by {
             if let Some((result, columns)) = self.try_count_star_optimization(stmt, &*table)? {
                 return Ok((result, columns, false));
             }
@@ -1293,10 +1316,10 @@ impl Executor {
         // and aggregate each group without using a hash map (SQLite-style sorted GROUP BY)
         if storage_expr.is_none()
             && !needs_memory_filter
-            && !stmt.group_by.columns.is_empty()
-            && self.has_aggregation(stmt)
-            && !self.has_window_functions(stmt)
-            && stmt.order_by.is_empty()
+            && classification.has_group_by
+            && classification.has_aggregation
+            && !classification.has_window_functions
+            && !classification.has_order_by
         // No ORDER BY to avoid re-sorting
         {
             if let Some((result, columns)) =
@@ -1309,12 +1332,12 @@ impl Executor {
         // FAST PATH: ORDER BY + LIMIT optimization (TOP-N)
         // For queries like `SELECT * FROM table ORDER BY indexed_col LIMIT 10`,
         // use index to get rows in sorted order directly, avoiding full table sort
-        if stmt.limit.is_some()
+        if classification.has_limit
             && stmt.order_by.len() == 1
-            && stmt.group_by.columns.is_empty()
-            && !self.has_aggregation(stmt)
-            && !self.has_window_functions(stmt)
-            && !self.has_distinct(stmt)
+            && !classification.has_group_by
+            && !classification.has_aggregation
+            && !classification.has_window_functions
+            && !classification.has_distinct
             && storage_expr.is_none()
             && !needs_memory_filter
         {
@@ -1329,7 +1352,7 @@ impl Executor {
         // FAST PATH: IN subquery index optimization
         // For queries like `SELECT * FROM table WHERE id IN (SELECT col FROM other_table WHERE ...)`
         // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows
-        if needs_memory_filter && !has_outer_context && stmt.group_by.columns.is_empty() {
+        if needs_memory_filter && !has_outer_context && !classification.has_group_by {
             if let Some(where_expr) = where_to_use {
                 if let Some((result, columns)) = self.try_in_subquery_index_optimization(
                     stmt,
@@ -1338,6 +1361,7 @@ impl Executor {
                     &all_columns,
                     table_alias.as_deref(),
                     ctx,
+                    classification,
                 )? {
                     return Ok((result, columns, false));
                 }
@@ -1347,7 +1371,7 @@ impl Executor {
         // FAST PATH: IN list literal index optimization
         // For queries like `SELECT * FROM table WHERE id IN (1, 2, 3, 5, 8)`
         // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows
-        if needs_memory_filter && !has_outer_context && stmt.group_by.columns.is_empty() {
+        if needs_memory_filter && !has_outer_context && !classification.has_group_by {
             if let Some(where_expr) = where_to_use {
                 if let Some((result, columns)) = self.try_in_list_index_optimization(
                     stmt,
@@ -1356,6 +1380,7 @@ impl Executor {
                     &all_columns,
                     table_alias.as_deref(),
                     ctx,
+                    classification,
                 )? {
                     return Ok((result, columns, false));
                 }
@@ -1366,12 +1391,12 @@ impl Executor {
         // For simple queries like `SELECT * FROM table LIMIT 10` or
         // `SELECT * FROM table WHERE indexed_col = value LIMIT 10` without ORDER BY,
         // we can stop scanning early at the storage layer
-        let can_pushdown_limit = stmt.limit.is_some()
-            && stmt.order_by.is_empty()
-            && stmt.group_by.columns.is_empty()
-            && !self.has_aggregation(stmt)
-            && !self.has_window_functions(stmt)
-            && !self.has_distinct(stmt)
+        let can_pushdown_limit = classification.has_limit
+            && !classification.has_order_by
+            && !classification.has_group_by
+            && !classification.has_aggregation
+            && !classification.has_window_functions
+            && !classification.has_distinct
             && !needs_memory_filter; // Allow with storage_expr (WHERE on indexed columns)
 
         if can_pushdown_limit {
@@ -1465,10 +1490,10 @@ impl Executor {
             table_row_count <= super::semantic_cache::DEFAULT_MAX_CACHED_ROWS
         };
 
-        let can_use_streaming = stmt.order_by.is_empty()
-            && stmt.group_by.columns.is_empty()
-            && !self.has_aggregation(stmt)
-            && !self.has_window_functions(stmt)
+        let can_use_streaming = !classification.has_order_by
+            && !classification.has_group_by
+            && !classification.has_aggregation
+            && !classification.has_window_functions
             && !order_by_needs_extra_columns
             && !has_outer_context // Can't stream with outer context (correlated subqueries)
             && !should_disable_streaming_for_cache; // Only disable streaming for small cacheable queries
@@ -1557,15 +1582,13 @@ impl Executor {
             // This avoids materializing all rows upfront when we only need a few.
 
             // Check if WHERE contains correlated subqueries
-            let has_correlated = if let Some(where_expr) = where_to_use {
-                Self::has_subqueries(where_expr) && Self::has_correlated_subqueries(where_expr)
-            } else {
-                false
-            };
+            // Use cached classification to avoid expensive AST traversal
+            let has_correlated = classification.where_has_subqueries
+                && classification.where_has_correlated_subqueries;
 
             // Check if WHERE contains any subqueries (correlated or not)
-            // Cache this result to avoid redundant traversal of the expression tree
-            let has_subqueries = where_to_use.is_some_and(Self::has_subqueries);
+            // Use cached classification to avoid redundant traversal of the expression tree
+            let has_subqueries = classification.where_has_subqueries;
 
             // SEMI-JOIN OPTIMIZATION: Try to optimize correlated EXISTS subqueries
             // This transforms EXISTS (SELECT ... WHERE outer.col = inner.col AND ...)
@@ -1618,21 +1641,21 @@ impl Executor {
             // If EXISTS was transformed to InHashSet and the column is PK/indexed,
             // probe directly instead of scanning all rows
             // Skip if there are correlated subqueries in SELECT columns
-            if !has_correlated && stmt.group_by.columns.is_empty() {
-                let has_correlated_select =
-                    stmt.columns.iter().any(Self::has_correlated_subqueries);
-                if !has_correlated_select {
-                    if let Some(ref where_expr) = processed_where {
-                        if let Some((result, columns)) = self.try_in_hashset_index_optimization(
-                            stmt,
-                            where_expr,
-                            &*table,
-                            &all_columns,
-                            table_alias.as_deref(),
-                            ctx,
-                        )? {
-                            return Ok((result, columns, false));
-                        }
+            // Use cached classification to avoid AST traversal
+            if !has_correlated
+                && !classification.has_group_by
+                && !classification.select_has_correlated_subqueries
+            {
+                if let Some(ref where_expr) = processed_where {
+                    if let Some((result, columns)) = self.try_in_hashset_index_optimization(
+                        stmt,
+                        where_expr,
+                        &*table,
+                        &all_columns,
+                        table_alias.as_deref(),
+                        ctx,
+                    )? {
+                        return Ok((result, columns, false));
                     }
                 }
             }
@@ -1652,10 +1675,10 @@ impl Executor {
                 // EARLY TERMINATION: For LIMIT queries without ORDER BY, GROUP BY,
                 // aggregation, or window functions, use streaming filter with early
                 // termination. This is critical for NOT IN performance.
-                let can_early_terminate = stmt.order_by.is_empty()
-                    && stmt.group_by.columns.is_empty()
-                    && !self.has_aggregation(stmt)
-                    && !self.has_window_functions(stmt);
+                let can_early_terminate = !classification.has_order_by
+                    && !classification.has_group_by
+                    && !classification.has_aggregation
+                    && !classification.has_window_functions;
 
                 let early_termination_target = if can_early_terminate {
                     let offset = stmt
@@ -2032,8 +2055,8 @@ impl Executor {
             // OPTIMIZATION: For window functions, check if we can use index-based fetching:
             // 1. PARTITION BY on indexed column -> fetch rows grouped by partition
             // 2. ORDER BY on indexed column -> fetch rows in sorted order
-            let has_window = self.has_window_functions(stmt);
-            let has_agg = self.has_aggregation(stmt);
+            let has_window = classification.has_window_functions;
+            let has_agg = classification.has_aggregation;
 
             if has_window && !has_agg {
                 // First try PARTITION BY optimization (bigger speedup, avoids O(n) hashing)
@@ -2181,8 +2204,8 @@ impl Executor {
 
         // Handle the combination of window functions and aggregation
         // Order: Aggregation first (GROUP BY), then window functions
-        let has_window = self.has_window_functions(stmt);
-        let has_agg = self.has_aggregation(stmt);
+        let has_window = classification.has_window_functions;
+        let has_agg = classification.has_aggregation;
 
         if has_agg && has_window {
             // Both aggregation and window functions:
@@ -2312,7 +2335,10 @@ impl Executor {
         join_source: &JoinTableSource,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+        // classification is passed from caller to avoid redundant cache lookups
+
         // Get table aliases for filter pushdown
         let left_alias = get_table_alias_from_expr(&join_source.left);
         let right_alias = get_table_alias_from_expr(&join_source.right);
@@ -2442,8 +2468,8 @@ impl Executor {
         } else {
             // Skip Index Nested Loop if query has aggregation or window functions
             // These require full result sets and can't use early termination
-            let has_agg = self.has_aggregation(stmt);
-            let has_window = self.has_window_functions(stmt);
+            let has_agg = classification.has_aggregation;
+            let has_window = classification.has_window_functions;
 
             // Check if we can use Index Nested Loop Join
             // This optimization avoids materializing the right side entirely
@@ -2560,12 +2586,10 @@ impl Executor {
                 };
 
                 // Compute join limit EARLY so we can use it for outer table optimization
-                let has_group_by = !stmt.group_by.columns.is_empty();
-                let has_aggregation = self.has_aggregation(stmt);
                 let can_push_limit = !join_type.contains("FULL")
-                    && stmt.order_by.is_empty()
-                    && !has_group_by
-                    && !has_aggregation;
+                    && !classification.has_order_by
+                    && !classification.has_group_by
+                    && !classification.has_aggregation;
 
                 let join_limit = if can_push_limit {
                     stmt.limit.as_ref().and_then(|limit_expr| {
@@ -2840,8 +2864,8 @@ impl Executor {
                     }
 
                     // Check for aggregation/window functions that need special handling
-                    let has_agg = self.has_aggregation(stmt);
-                    let has_window = self.has_window_functions(stmt);
+                    let has_agg = classification.has_aggregation;
+                    let has_window = classification.has_window_functions;
 
                     if has_agg || has_window {
                         // Fall through to standard path for aggregation/window handling
@@ -3002,13 +3026,11 @@ impl Executor {
 
         // Compute LIMIT for early termination pushdown
         // Safe to push when: no ORDER BY, no GROUP BY/aggregation, no FULL OUTER
-        let has_group_by = !stmt.group_by.columns.is_empty();
-        let has_aggregation = self.has_aggregation(stmt);
         let can_push_limit = !join_type.contains("FULL")
-            && stmt.order_by.is_empty()
+            && !classification.has_order_by
             && cross_filter.is_none()
-            && !has_group_by
-            && !has_aggregation;
+            && !classification.has_group_by
+            && !classification.has_aggregation;
 
         let join_limit = if can_push_limit {
             stmt.limit.as_ref().and_then(|limit_expr| {
@@ -3093,7 +3115,8 @@ impl Executor {
         // Apply WHERE clause if present
         let filtered_rows = if let Some(ref where_clause) = resolved_where_clause {
             // Process subqueries (EXISTS, scalar subqueries) before evaluation
-            let processed_where = if Self::has_subqueries(where_clause) {
+            // Use cached classification to avoid AST traversal
+            let processed_where = if classification.where_has_subqueries {
                 self.process_where_subqueries(where_clause, ctx)?
             } else {
                 (**where_clause).clone()
@@ -3162,8 +3185,8 @@ impl Executor {
             (all_columns.clone(), filtered_rows)
         };
 
-        let has_agg = self.has_aggregation(stmt);
-        let has_window = self.has_window_functions(stmt);
+        let has_agg = classification.has_aggregation;
+        let has_window = classification.has_window_functions;
 
         // Check if we have both aggregation and window functions
         if has_agg && has_window {
@@ -3215,7 +3238,11 @@ impl Executor {
         subquery_source: &SubqueryTableSource,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+        // classification is passed from caller for the outer stmt
+        // Note: The inner subquery will get its own classification via execute_select
+
         // Execute subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
         let result = self.execute_select(&subquery_source.subquery, &subquery_ctx)?;
@@ -3236,7 +3263,7 @@ impl Executor {
         };
 
         // Check if we need window functions
-        if self.has_window_functions(stmt) {
+        if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, filtered_rows, &columns)?;
             let out_columns = result.columns().to_vec();
@@ -3244,7 +3271,7 @@ impl Executor {
         }
 
         // Check if we need aggregation
-        if self.has_aggregation(stmt) {
+        if classification.has_aggregation {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &columns)?;
             let out_columns = result.columns().to_vec();
@@ -3314,7 +3341,11 @@ impl Executor {
         view_def: &ViewDefinition,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+        // classification is passed from caller for the outer stmt
+        // Note: The view's inner query will get its own classification via execute_select
+
         // Check view depth to prevent stack overflow from deeply nested views
         let depth = ctx.view_depth();
         if depth >= MAX_VIEW_DEPTH {
@@ -3346,7 +3377,7 @@ impl Executor {
         }
 
         // Handle aggregation: if outer query has aggregates, materialize view result and aggregate
-        if self.has_aggregation(stmt) {
+        if classification.has_aggregation {
             // Materialize the view result into rows
             let mut rows = Vec::new();
             while result.next() {
@@ -3522,7 +3553,10 @@ impl Executor {
         values_source: &ValuesTableSource,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+        // classification is passed from caller to avoid redundant cache lookups
+
         // Determine column names
         let num_columns = if values_source.rows.is_empty() {
             0
@@ -3607,7 +3641,7 @@ impl Executor {
         }
 
         // Check if we need window functions
-        if self.has_window_functions(stmt) {
+        if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, result_rows, &column_names)?;
             let columns = result.columns().to_vec();
@@ -3615,7 +3649,7 @@ impl Executor {
         }
 
         // Check if we need aggregation
-        if self.has_aggregation(stmt) {
+        if classification.has_aggregation {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, result_rows, &column_names)?;
             let columns = result.columns().to_vec();
@@ -3930,7 +3964,10 @@ impl Executor {
                     offset: None,
                     set_operations: vec![],
                 };
-                let (result, columns, _) = self.execute_simple_table_scan(ts, &select_all, ctx)?;
+                // Get classification for the synthetic SELECT statement
+                let classification = get_classification(&select_all);
+                let (result, columns, _) =
+                    self.execute_simple_table_scan(ts, &select_all, ctx, &classification)?;
 
                 // Prefix column names with table alias (or table name if no alias)
                 // This is needed for proper qualified identifier resolution in JOINs
@@ -3965,7 +4002,10 @@ impl Executor {
                     offset: None,
                     set_operations: vec![],
                 };
-                let (result, columns, _) = self.execute_join_source(js, &select_all, ctx)?;
+                // Get classification for the synthetic SELECT statement
+                let classification = get_classification(&select_all);
+                let (result, columns, _) =
+                    self.execute_join_source(js, &select_all, ctx, &classification)?;
                 Ok((result, columns))
             }
             Expression::SubquerySource(ss) => {
@@ -4005,7 +4045,10 @@ impl Executor {
                     offset: None,
                     set_operations: vec![],
                 };
-                let (result, columns, _) = self.execute_values_source(vs, &select_all, ctx)?;
+                // Get classification for the synthetic SELECT statement
+                let classification = get_classification(&select_all);
+                let (result, columns, _) =
+                    self.execute_values_source(vs, &select_all, ctx, &classification)?;
                 Ok((result, columns))
             }
             _ => Err(Error::NotSupportedMessage(
@@ -4064,7 +4107,10 @@ impl Executor {
                     offset: None,
                     set_operations: vec![],
                 };
-                let (result, columns, _) = self.execute_simple_table_scan(ts, &select_all, ctx)?;
+                // Get classification for the synthetic SELECT statement
+                let classification = get_classification(&select_all);
+                let (result, columns, _) =
+                    self.execute_simple_table_scan(ts, &select_all, ctx, &classification)?;
 
                 // Prefix column names with table alias (or table name if no alias)
                 let table_alias = ts
@@ -5430,6 +5476,7 @@ impl Executor {
     /// where `id` has an index, probe the index for each subquery value instead of scanning all rows.
     /// This is O(k log n) where k = subquery result size, vs O(n) for full table scan.
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     fn try_in_subquery_index_optimization(
         &self,
         stmt: &SelectStatement,
@@ -5438,6 +5485,7 @@ impl Executor {
         all_columns: &[String],
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
         // Extract IN subquery info: (column_name, subquery, is_negated, remaining_predicate)
         let (column_name, subquery, is_negated, remaining_predicate) =
@@ -5452,10 +5500,9 @@ impl Executor {
         }
 
         // Skip if SELECT columns have correlated subqueries (need per-row context)
-        for col in &stmt.columns {
-            if Self::has_correlated_subqueries(col) {
-                return Ok(None);
-            }
+        // classification is passed from caller to avoid redundant cache lookups
+        if classification.select_has_correlated_subqueries {
+            return Ok(None);
         }
 
         // Check if this is a PRIMARY KEY column (O(1) lookup) or has an index
@@ -5748,6 +5795,7 @@ impl Executor {
     /// where `id` has an index or is PRIMARY KEY, probe the index directly for each value
     /// instead of scanning all rows. This is O(k log n) where k = list size.
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     fn try_in_list_index_optimization(
         &self,
         stmt: &SelectStatement,
@@ -5756,6 +5804,7 @@ impl Executor {
         all_columns: &[String],
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
         // Extract IN list info: (column_name, values, is_negated, remaining_predicate)
         let (column_name, values, is_negated, remaining_predicate) =
@@ -5765,10 +5814,9 @@ impl Executor {
             };
 
         // Skip if SELECT columns have correlated subqueries (need per-row context)
-        for col in &stmt.columns {
-            if Self::has_correlated_subqueries(col) {
-                return Ok(None);
-            }
+        // classification is passed from caller to avoid redundant cache lookups
+        if classification.select_has_correlated_subqueries {
+            return Ok(None);
         }
 
         // Check if this is a PRIMARY KEY column (O(1) lookup) or has an index
@@ -6381,7 +6429,10 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         tx: &dyn crate::storage::traits::Transaction,
+        classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+        // classification is passed from caller to avoid redundant cache lookups
+
         // Get table schema
         let table = tx.get_table(table_name)?;
         let schema = table.schema().clone();
@@ -6431,7 +6482,7 @@ impl Executor {
         }
 
         // Check for window functions
-        if self.has_window_functions(stmt) {
+        if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, rows, &all_columns)?;
             let columns = result.columns().to_vec();
@@ -6439,7 +6490,7 @@ impl Executor {
         }
 
         // Check for aggregation
-        if self.has_aggregation(stmt) {
+        if classification.has_aggregation {
             let result = self.execute_select_with_aggregation(stmt, ctx, rows, &all_columns)?;
             let columns = result.columns().to_vec();
             return Ok((result, columns, false));

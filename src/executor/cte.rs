@@ -43,6 +43,7 @@ use super::join_executor::{JoinExecutor, JoinRequest};
 use super::operator::{ColumnInfo, Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{IndexLookupStrategy, IndexNestedLoopJoinOperator};
+use super::query_classification::get_classification;
 use super::result::ExecutorMemoryResult;
 use super::utils::{build_column_index_map, extract_join_keys_and_residual, is_sorted_on_keys};
 use super::Executor;
@@ -449,6 +450,9 @@ impl Executor {
         join_source: &JoinTableSource,
         cte_registry: &CteRegistry,
     ) -> Result<Option<Box<dyn QueryResult>>> {
+        // OPTIMIZATION: Get cached query classification to avoid repeated AST traversals
+        let classification = get_classification(stmt);
+
         // Try to resolve left side - either from CTE registry or regular table
         let left_data = self.resolve_table_or_cte(&join_source.left, ctx, cte_registry)?;
         let right_data = self.resolve_table_or_cte(&join_source.right, ctx, cte_registry)?;
@@ -483,9 +487,9 @@ impl Executor {
             };
 
             // Calculate effective limit for Index Nested Loop (same logic as later)
-            let can_push_limit = stmt.order_by.is_empty()
-                && !self.has_aggregation(stmt)
-                && !self.has_window_functions(stmt)
+            let can_push_limit = !classification.has_order_by
+                && !classification.has_aggregation
+                && !classification.has_window_functions
                 && stmt.where_clause.is_none();
 
             let effective_limit = if can_push_limit {
@@ -611,9 +615,9 @@ impl Executor {
         // Determine if we can safely push LIMIT down to the JOIN
         // Safe conditions: INNER/CROSS JOIN, no ORDER BY, no aggregation, no window functions
         let can_push_limit = (join_type == "INNER" || join_type == "CROSS" || join_type.is_empty())
-            && stmt.order_by.is_empty()
-            && !self.has_aggregation(stmt)
-            && !self.has_window_functions(stmt)
+            && !classification.has_order_by
+            && !classification.has_aggregation
+            && !classification.has_window_functions
             && stmt.where_clause.is_none(); // WHERE could filter rows, so we need all rows first
 
         // Calculate effective limit (LIMIT + OFFSET since we need offset rows too)
@@ -685,14 +689,14 @@ impl Executor {
         };
 
         // Check for window functions (must handle before projection)
-        if self.has_window_functions(stmt) {
+        if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, filtered_rows, &all_columns)?;
             return Ok(Some(result));
         }
 
         // Check for aggregation (must handle before projection)
-        if self.has_aggregation(stmt) {
+        if classification.has_aggregation {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &all_columns)?;
 
@@ -946,10 +950,14 @@ impl Executor {
         cte_columns: Vec<String>,
         cte_rows: Vec<Row>,
     ) -> Result<(Vec<String>, Vec<Row>)> {
+        // OPTIMIZATION: Get cached query classification to avoid repeated AST traversals
+        let classification = get_classification(stmt);
+
         // Apply WHERE clause filter
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
             // Process subqueries in WHERE clause (e.g., IN subqueries on CTEs)
-            let processed_where = if Self::has_subqueries(where_clause) {
+            // Use cached classification to avoid AST traversal
+            let processed_where = if classification.where_has_subqueries {
                 self.process_where_subqueries(where_clause, ctx)?
             } else {
                 (**where_clause).clone()
@@ -971,7 +979,7 @@ impl Executor {
         };
 
         // Check for aggregation
-        if self.has_aggregation(stmt) {
+        if classification.has_aggregation {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &cte_columns)?;
             let columns = result.columns().to_vec();
@@ -981,7 +989,7 @@ impl Executor {
         }
 
         // Check for window functions
-        if self.has_window_functions(stmt) {
+        if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, filtered_rows, &cte_columns)?;
             let columns = result.columns().to_vec();
@@ -1006,34 +1014,38 @@ impl Executor {
         };
 
         // Apply ORDER BY sorting
-        if !stmt.order_by.is_empty() {
+        if classification.has_order_by {
             result_rows =
                 self.apply_order_by_to_rows(result_rows, &stmt.order_by, &output_columns)?;
         }
 
-        // Apply LIMIT and OFFSET
-        if let Some(ref offset_expr) = stmt.offset {
-            let offset = match offset_expr.as_ref() {
-                Expression::IntegerLiteral(lit) => lit.value as usize,
-                Expression::FloatLiteral(lit) => lit.value as usize,
-                _ => 0,
-            };
-            // Use drain to avoid extra allocation from skip().collect()
-            if offset > 0 && offset < result_rows.len() {
-                result_rows.drain(..offset);
-            } else if offset >= result_rows.len() {
-                result_rows.clear();
+        // Apply LIMIT and OFFSET (using classification for quick check)
+        if classification.has_offset {
+            if let Some(ref offset_expr) = stmt.offset {
+                let offset = match offset_expr.as_ref() {
+                    Expression::IntegerLiteral(lit) => lit.value as usize,
+                    Expression::FloatLiteral(lit) => lit.value as usize,
+                    _ => 0,
+                };
+                // Use drain to avoid extra allocation from skip().collect()
+                if offset > 0 && offset < result_rows.len() {
+                    result_rows.drain(..offset);
+                } else if offset >= result_rows.len() {
+                    result_rows.clear();
+                }
             }
         }
 
-        if let Some(ref limit_expr) = stmt.limit {
-            let limit = match limit_expr.as_ref() {
-                Expression::IntegerLiteral(lit) => lit.value as usize,
-                Expression::FloatLiteral(lit) => lit.value as usize,
-                _ => usize::MAX,
-            };
-            if limit < result_rows.len() {
-                result_rows.truncate(limit);
+        if classification.has_limit {
+            if let Some(ref limit_expr) = stmt.limit {
+                let limit = match limit_expr.as_ref() {
+                    Expression::IntegerLiteral(lit) => lit.value as usize,
+                    Expression::FloatLiteral(lit) => lit.value as usize,
+                    _ => usize::MAX,
+                };
+                if limit < result_rows.len() {
+                    result_rows.truncate(limit);
+                }
             }
         }
 
@@ -1609,6 +1621,9 @@ impl Executor {
         table_alias: Option<String>,
         effective_limit: Option<u64>,
     ) -> Result<Option<Box<dyn QueryResult>>> {
+        // OPTIMIZATION: Get cached query classification to avoid repeated AST traversals
+        let classification = get_classification(stmt);
+
         let join_type = join_source.join_type.to_uppercase();
 
         // Only for INNER or LEFT joins (not RIGHT or FULL)
@@ -1834,14 +1849,14 @@ impl Executor {
         };
 
         // Check for window functions
-        if self.has_window_functions(stmt) {
+        if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, filtered_rows, &all_columns)?;
             return Ok(Some(result));
         }
 
         // Check for aggregation
-        if self.has_aggregation(stmt) {
+        if classification.has_aggregation {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &all_columns)?;
 
