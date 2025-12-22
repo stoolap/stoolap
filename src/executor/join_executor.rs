@@ -41,25 +41,31 @@
 //!
 //! # Design Decisions & Tradeoffs
 //!
-//! ## Volcano-Style Single-Threaded Operators
+//! ## Hybrid Execution: Streaming vs Parallel
 //!
-//! This executor uses Volcano-style (iterator) operators rather than parallel bulk
-//! processing. This is an intentional design choice:
+//! This executor uses a **hybrid approach** that dynamically chooses between
+//! Volcano-style streaming and parallel bulk processing based on query characteristics:
 //!
-//! **Benefits:**
-//! - **Streaming Memory**: Only one row in flight at a time, enabling O(1) memory
-//!   for the probe side of hash joins (vs O(N+M) for bulk materialization)
-//! - **Early Termination**: LIMIT queries stop immediately after N rows
-//! - **Composability**: Operators chain naturally (Filter → Join → Project → Limit)
-//! - **Predictable Latency**: First row returned quickly (important for interactive queries)
+//! ### Streaming Volcano Path (default for small datasets or small LIMIT)
+//! - **When**: Build side < 10,000 rows OR LIMIT ≤ 1,000
+//! - **Benefits**:
+//!   - O(1) memory for probe side (streaming, not materialized)
+//!   - Early termination: LIMIT 10 stops after 10 rows
+//!   - Low latency to first row (important for interactive queries)
+//!   - Composable operators (Filter → Join → Project → Limit)
 //!
-//! **Tradeoffs:**
-//! - Single-threaded probe phase (parallel build is still possible in future)
-//! - Cannot use SIMD for bulk operations within a single operator
+//! ### Parallel Hash Join Path (for large analytical queries)
+//! - **When**: Build side ≥ 10,000 rows AND (no LIMIT or LIMIT > 1,000)
+//! - **Benefits**:
+//!   - Parallel hash build using DashMap (concurrent, lock-free)
+//!   - Parallel probe with Rayon work-stealing
+//!   - 2-4x speedup on multi-core systems for large joins
+//!   - Atomic tracking for OUTER join unmatched rows
 //!
-//! For large analytical queries where parallelism matters more than streaming,
-//! the parallel execution path in `parallel.rs` provides DashMap-based parallel
-//! hash joins. The optimizer chooses between these based on query characteristics.
+//! ### Why Not Always Parallel?
+//! Parallel execution has overhead (task scheduling, synchronization). For:
+//! - Small datasets: overhead exceeds benefit
+//! - Small LIMIT: streaming stops early; parallel computes full result then truncates
 //!
 //! ## Merge Join Materialization
 //!
@@ -93,9 +99,23 @@ use crate::executor::operator::{ColumnInfo, MaterializedOperator, Operator};
 use crate::executor::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
 use crate::executor::operators::merge_join::MergeJoinOperator;
 use crate::executor::operators::nested_loop_join::NestedLoopJoinOperator;
+use crate::executor::parallel::{
+    parallel_hash_join, ParallelConfig, DEFAULT_PARALLEL_JOIN_THRESHOLD,
+};
 use crate::executor::planner::{RuntimeJoinAlgorithm, RuntimeJoinDecision};
 use crate::executor::utils::{extract_join_keys_and_residual, is_sorted_on_keys};
 use crate::parser::ast::Expression;
+
+/// LIMIT threshold below which streaming execution is preferred over parallel.
+///
+/// When LIMIT is small (≤ this value), streaming Volcano-style execution benefits from
+/// early termination - we can stop after producing just N rows without processing
+/// the entire join. Parallel execution would compute the full join result before
+/// truncating, wasting work.
+///
+/// When LIMIT is large (> this value), the early termination benefit is minimal,
+/// so parallel execution's throughput advantage dominates.
+const STREAMING_LIMIT_THRESHOLD: u64 = 1000;
 
 /// Result of a streaming join execution.
 #[derive(Debug)]
@@ -366,7 +386,13 @@ impl JoinExecutor {
         }
     }
 
-    /// Execute hash join using streaming HashJoinOperator.
+    /// Execute hash join using streaming HashJoinOperator or parallel execution.
+    ///
+    /// Chooses between:
+    /// - **Parallel hash join**: When build side exceeds threshold (10,000 rows) and
+    ///   LIMIT is absent or large (> 1,000). Better for bulk analytics.
+    /// - **Streaming Volcano**: When LIMIT is small (early termination benefit) or
+    ///   data is below parallel threshold. Better for interactive queries.
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join(
         &self,
@@ -383,13 +409,172 @@ impl JoinExecutor {
         let left_col_count = left_columns.len();
         let right_col_count = right_columns.len();
 
-        // Build schema for operators from column names
-        let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
-        let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
-
         // Build combined column list for residual filter compilation
         let mut all_columns = left_columns.to_vec();
         all_columns.extend(right_columns.iter().cloned());
+
+        // Decide between parallel and streaming execution
+        // Parallel is beneficial when:
+        // 1. Build side row count exceeds threshold (parallel overhead worthwhile)
+        // 2. No small LIMIT (streaming benefits from early termination)
+        let build_row_count = if build_left {
+            left_rows.len()
+        } else {
+            right_rows.len()
+        };
+        let use_parallel = build_row_count >= DEFAULT_PARALLEL_JOIN_THRESHOLD
+            && limit.is_none_or(|l| l > STREAMING_LIMIT_THRESHOLD);
+
+        if use_parallel {
+            // Parallel execution path
+            self.execute_hash_join_parallel(
+                left_rows,
+                right_rows,
+                analysis,
+                left_col_count,
+                right_col_count,
+                &all_columns,
+                build_left,
+                limit,
+                ctx,
+            )
+        } else {
+            // Streaming Volcano execution path
+            self.execute_hash_join_streaming(
+                left_rows,
+                right_rows,
+                analysis,
+                left_columns,
+                right_columns,
+                left_col_count,
+                right_col_count,
+                &all_columns,
+                build_left,
+                limit,
+                ctx,
+            )
+        }
+    }
+
+    /// Execute hash join using parallel execution (DashMap + Rayon).
+    ///
+    /// Uses parallel hash build and probe phases for bulk analytics workloads.
+    /// Better for large datasets without small LIMIT constraints.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_hash_join_parallel(
+        &self,
+        left_rows: Vec<Row>,
+        right_rows: Vec<Row>,
+        analysis: &JoinAnalysis,
+        left_col_count: usize,
+        right_col_count: usize,
+        all_columns: &[String],
+        build_left: bool,
+        limit: Option<u64>,
+        ctx: &ExecutionContext,
+    ) -> Result<Vec<Row>> {
+        let config = ParallelConfig::default();
+
+        // Determine probe and build sides
+        let (probe_rows, build_rows, probe_key_indices, build_key_indices, swapped) = if build_left
+        {
+            // Build on left: probe is right, build is left
+            (
+                right_rows,
+                left_rows,
+                &analysis.right_key_indices,
+                &analysis.left_key_indices,
+                true, // swapped: left is build, right is probe
+            )
+        } else {
+            // Build on right (default): probe is left, build is right
+            (
+                left_rows,
+                right_rows,
+                &analysis.left_key_indices,
+                &analysis.right_key_indices,
+                false, // not swapped: left is probe, right is build
+            )
+        };
+
+        let (probe_col_count, build_col_count) = if swapped {
+            (right_col_count, left_col_count)
+        } else {
+            (left_col_count, right_col_count)
+        };
+
+        // Execute parallel hash join
+        let result = parallel_hash_join(
+            &probe_rows,
+            &build_rows,
+            probe_key_indices,
+            build_key_indices,
+            analysis.join_type,
+            probe_col_count,
+            build_col_count,
+            swapped,
+            &config,
+        );
+
+        let mut rows = result.rows;
+
+        // Apply residual conditions FIRST (before LIMIT)
+        // This ensures correct semantics: filter matching rows, then limit
+        let is_inner = !analysis.join_type_str.contains("LEFT")
+            && !analysis.join_type_str.contains("RIGHT")
+            && !analysis.join_type_str.contains("FULL");
+
+        if !analysis.residual_conditions.is_empty() {
+            if is_inner {
+                // For INNER joins, simply filter rows
+                for cond in &analysis.residual_conditions {
+                    let filter = RowFilter::new(cond, all_columns)?.with_context(ctx);
+                    rows.retain(|row| filter.matches(row));
+                }
+            } else {
+                // For OUTER joins, need special NULL-padding handling
+                rows = self.apply_residual_post_join(
+                    rows,
+                    &analysis.residual_conditions,
+                    all_columns,
+                    &analysis.join_type_str,
+                    left_col_count,
+                    right_col_count,
+                    ctx,
+                )?;
+            }
+        }
+
+        // Apply LIMIT after filtering (correct order)
+        if let Some(max) = limit {
+            rows.truncate(max as usize);
+        }
+
+        Ok(rows)
+    }
+
+    /// Execute hash join using streaming Volcano-style operators.
+    ///
+    /// Uses iterator-based execution for low latency to first row and
+    /// early termination with LIMIT.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_hash_join_streaming(
+        &self,
+        left_rows: Vec<Row>,
+        right_rows: Vec<Row>,
+        analysis: &JoinAnalysis,
+        left_columns: &[String],
+        right_columns: &[String],
+        left_col_count: usize,
+        right_col_count: usize,
+        all_columns: &[String],
+        build_left: bool,
+        limit: Option<u64>,
+        ctx: &ExecutionContext,
+    ) -> Result<Vec<Row>> {
+        // Build schema for operators from column names
+        let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
+        let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
 
         // Create input operators - takes ownership, no clone
         let left_op = Box::new(MaterializedOperator::new(left_rows, left_schema));
@@ -420,7 +605,7 @@ impl JoinExecutor {
             analysis
                 .residual_conditions
                 .iter()
-                .map(|cond| RowFilter::new(cond, &all_columns).map(|f| f.with_context(ctx)))
+                .map(|cond| RowFilter::new(cond, all_columns).map(|f| f.with_context(ctx)))
                 .collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
@@ -434,7 +619,7 @@ impl JoinExecutor {
             self.apply_residual_post_join(
                 rows,
                 &analysis.residual_conditions,
-                &all_columns,
+                all_columns,
                 &analysis.join_type_str,
                 left_col_count,
                 right_col_count,

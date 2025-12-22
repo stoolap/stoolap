@@ -35,7 +35,7 @@
 //! - Table scan + filter: 10,000+ rows
 //! - Aggregation: 100,000+ rows (already in aggregation.rs)
 //! - ORDER BY: 50,000+ rows
-//! - Hash join: 5,000+ build rows
+//! - Hash join: 10,000+ build rows
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -55,7 +55,7 @@ pub use super::operators::hash_join::JoinType;
 // These are used by both ParallelConfig and CostEstimator
 pub const DEFAULT_PARALLEL_FILTER_THRESHOLD: usize = 10_000;
 pub const DEFAULT_PARALLEL_SORT_THRESHOLD: usize = 50_000;
-pub const DEFAULT_PARALLEL_JOIN_THRESHOLD: usize = 5_000;
+pub const DEFAULT_PARALLEL_JOIN_THRESHOLD: usize = 10_000;
 pub const DEFAULT_PARALLEL_CHUNK_SIZE: usize = 2048;
 
 /// Configuration for parallel execution

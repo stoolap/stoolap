@@ -2806,9 +2806,9 @@ mod tests {
         assert!(estimator.should_parallel_scan(10_000));
         assert!(estimator.should_parallel_filter(50_000));
 
-        // Join threshold
-        assert!(!estimator.should_parallel_join(3_000));
-        assert!(estimator.should_parallel_join(5_000));
+        // Join threshold (10,000 rows)
+        assert!(!estimator.should_parallel_join(5_000));
+        assert!(estimator.should_parallel_join(10_000));
 
         // Sort threshold
         assert!(!estimator.should_parallel_sort(40_000));

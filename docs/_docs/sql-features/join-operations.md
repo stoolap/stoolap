@@ -37,6 +37,36 @@ FROM customers AS c
 LEFT JOIN orders AS o ON c.id = o.customer_id;
 ```
 
+### RIGHT JOIN (or RIGHT OUTER JOIN)
+
+A RIGHT JOIN returns all rows from the right table, and the matched rows from the left table. When no match is found, NULL values are returned for columns from the left table.
+
+```sql
+SELECT o.id, o.order_date, c.name
+FROM orders AS o
+RIGHT JOIN customers AS c ON o.customer_id = c.id;
+```
+
+### FULL OUTER JOIN
+
+A FULL OUTER JOIN returns all rows when there is a match in either table. Non-matching rows from both tables are included with NULL values for the missing side.
+
+```sql
+SELECT c.id, c.name, o.order_date
+FROM customers AS c
+FULL OUTER JOIN orders AS o ON c.id = o.customer_id;
+```
+
+### CROSS JOIN
+
+A CROSS JOIN returns the Cartesian product of both tables - every row from the first table combined with every row from the second table. No ON clause is used.
+
+```sql
+SELECT p.name AS product, c.name AS color
+FROM products AS p
+CROSS JOIN colors AS c;
+```
+
 ## JOIN Syntax
 
 The basic syntax for JOIN operations in Stoolap is:
@@ -49,8 +79,8 @@ ON table1.column_name = table2.column_name;
 ```
 
 Where:
-- `JOIN_TYPE` is the type of join (INNER, LEFT)
-- The `ON` clause specifies the join condition
+- `JOIN_TYPE` is the type of join (INNER, LEFT, RIGHT, FULL OUTER, CROSS)
+- The `ON` clause specifies the join condition (not used for CROSS JOIN)
 
 ## Examples
 
@@ -183,8 +213,10 @@ Based on the implementation and test files:
 
 ## JOIN with NULL Values
 
-- In INNER JOIN, rows with NULL values in the join columns do not match
+- In INNER JOIN, rows with NULL values in the join columns do not match (NULL ≠ NULL)
 - In LEFT JOIN, all rows from the left table are included, with NULLs for non-matching right table values
+- In RIGHT JOIN, all rows from the right table are included, with NULLs for non-matching left table values
+- In FULL OUTER JOIN, unmatched rows from both sides are included with NULL padding
 - The IS NULL operator can be used in join conditions for special cases
 
 ## Best Practices
@@ -200,3 +232,17 @@ Based on the implementation and test files:
 
 - Large joins can be memory-intensive, especially without proper filtering
 - Complex joins with many tables may require careful optimization
+- NATURAL JOIN is supported but converts to explicit column matching internally
+- Implicit CROSS JOIN (comma syntax: `FROM a, b`) is supported
+
+## Join Algorithm Selection
+
+Stoolap automatically selects the optimal join algorithm based on data characteristics:
+
+| Algorithm | Used When | Complexity |
+|-----------|-----------|------------|
+| **Hash Join** | Equality conditions, larger tables | O(N+M) |
+| **Merge Join** | Pre-sorted inputs on join keys | O(N+M) |
+| **Nested Loop** | Non-equality conditions, CROSS JOIN, small tables | O(N*M) |
+
+The query optimizer considers table sizes, available indexes, and sort order when choosing algorithms.
