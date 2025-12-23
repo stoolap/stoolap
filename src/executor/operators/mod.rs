@@ -42,7 +42,7 @@
 //! # Note
 //!
 //! For filtering and projection, use the Result Wrapper pattern:
-//! - `ExprFilteredResult` with `RowFilter` for WHERE clauses
+//! - `FilteredResult` with `RowFilter` for WHERE clauses
 //! - `StreamingProjectionResult` for column projection
 //!
 //! See `executor/result.rs` and `expression/evaluator_bridge.rs` for the
@@ -52,6 +52,7 @@ pub mod hash_join;
 pub mod index_nested_loop;
 pub mod merge_join;
 pub mod nested_loop_join;
+pub mod streaming_group_by;
 
 // Re-export all operators and types
 pub use hash_join::{HashJoinOperator, JoinSide, JoinType};
@@ -60,3 +61,4 @@ pub use index_nested_loop::{
 };
 pub use merge_join::MergeJoinOperator;
 pub use nested_loop_join::NestedLoopJoinOperator;
+pub use streaming_group_by::{HavingFilter, StreamingAgg, StreamingGroupByOperator};

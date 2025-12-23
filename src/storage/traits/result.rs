@@ -68,13 +68,25 @@ pub trait QueryResult: Send {
     }
 
     /// Closes the result set and releases resources
-    fn close(&mut self) -> Result<()>;
+    ///
+    /// Default implementation does nothing. Override if cleanup is needed.
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Returns the number of rows affected by an INSERT, UPDATE, or DELETE
-    fn rows_affected(&self) -> i64;
+    ///
+    /// Default implementation returns 0. Override for DML results.
+    fn rows_affected(&self) -> i64 {
+        0
+    }
 
     /// Returns the last inserted ID for an INSERT operation
-    fn last_insert_id(&self) -> i64;
+    ///
+    /// Default implementation returns 0. Override for INSERT results.
+    fn last_insert_id(&self) -> i64 {
+        0
+    }
 
     /// Sets column aliases for this result
     ///

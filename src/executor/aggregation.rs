@@ -108,11 +108,14 @@ impl SimpleHavingFilter {
 }
 
 /// Simple aggregate type for fast aggregation path
-/// Only supports COUNT and SUM (no DISTINCT, FILTER, ORDER BY, or expressions)
+/// Supports COUNT, SUM, AVG, MIN, MAX (no DISTINCT, FILTER, ORDER BY, or expressions)
 #[derive(Clone)]
 enum SimpleAgg {
     Count,      // COUNT(*) or COUNT(col)
     Sum(usize), // SUM(col) - stores column index
+    Avg(usize), // AVG(col) - stores column index
+    Min(usize), // MIN(col) - stores column index
+    Max(usize), // MAX(col) - stores column index
 }
 
 /// Try to parse a simple HAVING clause for inline filtering
@@ -2201,7 +2204,7 @@ impl Executor {
     /// Returns Some((columns, rows)) if fast path was used, None otherwise.
     /// Fast path is used when:
     /// - All GROUP BY items are simple column references
-    /// - All aggregates are SUM or COUNT (no DISTINCT, no FILTER, no ORDER BY, no expression)
+    /// - All aggregates are COUNT, SUM, AVG, MIN, or MAX (no DISTINCT, FILTER, ORDER BY, or expression)
     ///
     /// When `limit` is provided and there's no ORDER BY, enables early termination:
     /// once we have `limit` complete groups, we stop creating new groups.
@@ -2235,7 +2238,7 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check if all aggregates are simple (SUM or COUNT without DISTINCT/FILTER/ORDER BY/expression)
+        // Check if all aggregates are simple (COUNT/SUM/AVG/MIN/MAX without DISTINCT/FILTER/ORDER BY/expression)
         let simple_aggs: Vec<Option<SimpleAgg>> = aggregations
             .iter()
             .map(|agg| {
@@ -2256,6 +2259,30 @@ impl Executor {
                         } else {
                             Self::lookup_column_index(&agg.column_lower, col_index_map)
                                 .map(SimpleAgg::Sum)
+                        }
+                    }
+                    "AVG" => {
+                        if agg.column == "*" {
+                            None // AVG(*) is not valid
+                        } else {
+                            Self::lookup_column_index(&agg.column_lower, col_index_map)
+                                .map(SimpleAgg::Avg)
+                        }
+                    }
+                    "MIN" => {
+                        if agg.column == "*" {
+                            None // MIN(*) is not valid
+                        } else {
+                            Self::lookup_column_index(&agg.column_lower, col_index_map)
+                                .map(SimpleAgg::Min)
+                        }
+                    }
+                    "MAX" => {
+                        if agg.column == "*" {
+                            None // MAX(*) is not valid
+                        } else {
+                            Self::lookup_column_index(&agg.column_lower, col_index_map)
+                                .map(SimpleAgg::Max)
                         }
                     }
                     _ => None, // Other aggregates not supported in fast path
@@ -2291,8 +2318,10 @@ impl Executor {
             // up to 2^53 (~9 quadrillion). For sums exceeding this, precision loss
             // may occur. This matches SQLite's behavior for aggregate functions.
             agg_values: Vec<f64>,
-            agg_has_value: Vec<bool>, // Track if any non-NULL value was seen (for SUM)
-            counts: Vec<i64>,         // For COUNT
+            agg_has_value: Vec<bool>, // Track if any non-NULL value was seen (for SUM/AVG)
+            counts: Vec<i64>,         // For COUNT and AVG divisor
+            min_values: Vec<Option<Value>>, // For MIN
+            max_values: Vec<Option<Value>>, // For MAX
         }
 
         // Pre-allocate hash map with estimated capacity to reduce resizing.
@@ -2310,48 +2339,55 @@ impl Executor {
         let mut current_group_count: usize = 0; // Track actual group count for O(1) LIMIT checks
 
         for row in rows {
-            // Build key values for this row (needed for collision detection)
-            let key_values: Vec<Value> = group_by_indices
-                .iter()
-                .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
-                .collect();
-
-            // Hash the group key with AHasher (optimal for Value types)
+            // OPTIMIZATION: Hash directly from row references (no clone for hashing)
             let mut hasher = AHasher::default();
-            for value in &key_values {
-                hash_value_into(value, &mut hasher);
+            for &idx in &group_by_indices {
+                if let Some(value) = row.get(idx) {
+                    hash_value_into(value, &mut hasher);
+                } else {
+                    hash_value_into(&Value::null_unknown(), &mut hasher);
+                }
             }
             let hash = hasher.finish();
-
-            // Early termination: check if this key exists before checking limit
-            // CRITICAL: Must check actual key equality, not just hash (handle collisions)
-            let key_exists = groups
-                .get(&hash)
-                .map(|bucket| bucket.iter().any(|state| state.key_values == key_values))
-                .unwrap_or(false);
-
-            if has_limit && !key_exists && current_group_count >= group_limit {
-                // Would create a new group, but we're at limit - skip this row
-                continue;
-            }
 
             // Get or create bucket for this hash
             let bucket = groups.entry(hash).or_default();
 
-            // Find existing group or create new one (handles hash collisions)
-            let state = if let Some(state) = bucket.iter_mut().find(|s| s.key_values == key_values)
-            {
-                // Existing group - reuse it
-                state
+            // OPTIMIZATION: Compare row values directly against stored keys (no clone for lookup)
+            // Only clone when creating a new group
+            let existing_idx = bucket.iter().position(|s| {
+                s.key_values.len() == group_by_indices.len()
+                    && s.key_values
+                        .iter()
+                        .zip(group_by_indices.iter())
+                        .all(|(stored, &idx)| match row.get(idx) {
+                            Some(row_val) => stored == row_val,
+                            None => stored.is_null(),
+                        })
+            });
+
+            let state = if let Some(idx) = existing_idx {
+                // Existing group - reuse it (no clone needed!)
+                &mut bucket[idx]
             } else {
-                // New group - create and add to bucket
+                // New group - check limit before creating
+                if has_limit && current_group_count >= group_limit {
+                    continue;
+                }
+                // Only clone values when creating a new group
+                let key_values: Vec<Value> = group_by_indices
+                    .iter()
+                    .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
+                    .collect();
                 bucket.push(FastGroupState {
                     key_values,
                     agg_values: vec![0.0; num_aggs],
                     agg_has_value: vec![false; num_aggs],
                     counts: vec![0; num_aggs],
+                    min_values: vec![None; num_aggs],
+                    max_values: vec![None; num_aggs],
                 });
-                current_group_count += 1; // Track for O(1) LIMIT checks
+                current_group_count += 1;
                 bucket.last_mut().unwrap()
             };
 
@@ -2361,18 +2397,46 @@ impl Executor {
                     SimpleAgg::Count => {
                         state.counts[i] += 1;
                     }
-                    SimpleAgg::Sum(col_idx) => {
+                    SimpleAgg::Sum(col_idx) | SimpleAgg::Avg(col_idx) => {
                         if let Some(value) = row.get(*col_idx) {
                             match value {
                                 Value::Integer(v) => {
                                     state.agg_values[i] += *v as f64;
                                     state.agg_has_value[i] = true;
+                                    state.counts[i] += 1; // For AVG divisor
                                 }
                                 Value::Float(v) => {
                                     state.agg_values[i] += v;
                                     state.agg_has_value[i] = true;
+                                    state.counts[i] += 1;
                                 }
                                 _ => {} // Skip non-numeric and NULL
+                            }
+                        }
+                    }
+                    SimpleAgg::Min(col_idx) => {
+                        if let Some(value) = row.get(*col_idx) {
+                            if !value.is_null() {
+                                match &state.min_values[i] {
+                                    None => state.min_values[i] = Some(value.clone()),
+                                    Some(current) if value < current => {
+                                        state.min_values[i] = Some(value.clone())
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    SimpleAgg::Max(col_idx) => {
+                        if let Some(value) = row.get(*col_idx) {
+                            if !value.is_null() {
+                                match &state.max_values[i] {
+                                    None => state.max_values[i] = Some(value.clone()),
+                                    Some(current) if value > current => {
+                                        state.max_values[i] = Some(value.clone())
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -2413,17 +2477,38 @@ impl Executor {
                     // All conditions must pass (AND semantics)
                     for cond in &filter.conditions {
                         let agg_value = match &simple_aggs[cond.agg_index] {
-                            SimpleAgg::Count => state.counts[cond.agg_index] as f64,
+                            SimpleAgg::Count => Some(state.counts[cond.agg_index] as f64),
                             SimpleAgg::Sum(_) => {
                                 if state.agg_has_value[cond.agg_index] {
-                                    state.agg_values[cond.agg_index]
+                                    Some(state.agg_values[cond.agg_index])
                                 } else {
-                                    return false; // NULL values don't pass comparison
+                                    None // NULL values don't pass comparison
                                 }
                             }
+                            SimpleAgg::Avg(_) => {
+                                if state.counts[cond.agg_index] > 0 {
+                                    Some(
+                                        state.agg_values[cond.agg_index]
+                                            / state.counts[cond.agg_index] as f64,
+                                    )
+                                } else {
+                                    None
+                                }
+                            }
+                            SimpleAgg::Min(_) => state.min_values[cond.agg_index]
+                                .as_ref()
+                                .and_then(|v| v.as_float64()),
+                            SimpleAgg::Max(_) => state.max_values[cond.agg_index]
+                                .as_ref()
+                                .and_then(|v| v.as_float64()),
                         };
-                        if !cond.matches(agg_value) {
-                            return false;
+                        match agg_value {
+                            Some(val) => {
+                                if !cond.matches(val) {
+                                    return false;
+                                }
+                            }
+                            None => return false, // NULL values don't pass comparison
                         }
                     }
                     true
@@ -2431,7 +2516,7 @@ impl Executor {
                     true // No HAVING filter, include all groups
                 }
             })
-            .map(|state| {
+            .map(|mut state| {
                 let mut values = Vec::with_capacity(group_by_indices.len() + simple_aggs.len());
                 values.extend(state.key_values);
 
@@ -2446,6 +2531,19 @@ impl Executor {
                                 Value::null_unknown()
                             }
                         }
+                        SimpleAgg::Avg(_) => {
+                            if state.counts[i] > 0 {
+                                Value::Float(state.agg_values[i] / state.counts[i] as f64)
+                            } else {
+                                Value::null_unknown()
+                            }
+                        }
+                        SimpleAgg::Min(_) => state.min_values[i]
+                            .take()
+                            .unwrap_or_else(Value::null_unknown),
+                        SimpleAgg::Max(_) => state.max_values[i]
+                            .take()
+                            .unwrap_or_else(Value::null_unknown),
                     };
                     values.push(value);
                 }
@@ -2478,6 +2576,8 @@ impl Executor {
             agg_values: Vec<f64>,
             agg_has_value: Vec<bool>,
             counts: Vec<i64>,
+            min_values: Vec<Option<Value>>,
+            max_values: Vec<Option<Value>>,
         }
 
         let estimated_groups = (rows.len() / 3).max(64);
@@ -2505,6 +2605,8 @@ impl Executor {
                 agg_values: Vec<f64>,
                 agg_has_value: Vec<bool>,
                 counts: Vec<i64>,
+                min_values: Vec<Option<Value>>,
+                max_values: Vec<Option<Value>>,
             }
 
             let mut groups: FxHashMap<i64, IntGroupState> =
@@ -2530,6 +2632,8 @@ impl Executor {
                         agg_values: vec![0.0; num_aggs],
                         agg_has_value: vec![false; num_aggs],
                         counts: vec![0; num_aggs],
+                        min_values: vec![None; num_aggs],
+                        max_values: vec![None; num_aggs],
                     }
                 });
 
@@ -2539,18 +2643,46 @@ impl Executor {
                         SimpleAgg::Count => {
                             state.counts[i] += 1;
                         }
-                        SimpleAgg::Sum(sum_col_idx) => {
+                        SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                             if let Some(value) = row.get(*sum_col_idx) {
                                 match value {
                                     Value::Integer(v) => {
                                         state.agg_values[i] += *v as f64;
                                         state.agg_has_value[i] = true;
+                                        state.counts[i] += 1;
                                     }
                                     Value::Float(v) => {
                                         state.agg_values[i] += v;
                                         state.agg_has_value[i] = true;
+                                        state.counts[i] += 1;
                                     }
                                     _ => {}
+                                }
+                            }
+                        }
+                        SimpleAgg::Min(min_col_idx) => {
+                            if let Some(value) = row.get(*min_col_idx) {
+                                if !value.is_null() {
+                                    match &state.min_values[i] {
+                                        None => state.min_values[i] = Some(value.clone()),
+                                        Some(current) if value < current => {
+                                            state.min_values[i] = Some(value.clone())
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        SimpleAgg::Max(max_col_idx) => {
+                            if let Some(value) = row.get(*max_col_idx) {
+                                if !value.is_null() {
+                                    match &state.max_values[i] {
+                                        None => state.max_values[i] = Some(value.clone()),
+                                        Some(current) if value > current => {
+                                            state.max_values[i] = Some(value.clone())
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
@@ -2582,17 +2714,38 @@ impl Executor {
                         // All conditions must pass (AND semantics)
                         for cond in &filter.conditions {
                             let agg_value = match &simple_aggs[cond.agg_index] {
-                                SimpleAgg::Count => state.counts[cond.agg_index] as f64,
+                                SimpleAgg::Count => Some(state.counts[cond.agg_index] as f64),
                                 SimpleAgg::Sum(_) => {
                                     if state.agg_has_value[cond.agg_index] {
-                                        state.agg_values[cond.agg_index]
+                                        Some(state.agg_values[cond.agg_index])
                                     } else {
+                                        None
+                                    }
+                                }
+                                SimpleAgg::Avg(_) => {
+                                    if state.counts[cond.agg_index] > 0 {
+                                        Some(
+                                            state.agg_values[cond.agg_index]
+                                                / state.counts[cond.agg_index] as f64,
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                }
+                                SimpleAgg::Min(_) => state.min_values[cond.agg_index]
+                                    .as_ref()
+                                    .and_then(|v| v.as_float64()),
+                                SimpleAgg::Max(_) => state.max_values[cond.agg_index]
+                                    .as_ref()
+                                    .and_then(|v| v.as_float64()),
+                            };
+                            match agg_value {
+                                Some(val) => {
+                                    if !cond.matches(val) {
                                         return false;
                                     }
                                 }
-                            };
-                            if !cond.matches(agg_value) {
-                                return false;
+                                None => return false, // NULL values don't pass comparison
                             }
                         }
                         true
@@ -2600,7 +2753,7 @@ impl Executor {
                         true
                     }
                 })
-                .map(|(key, state)| {
+                .map(|(key, mut state)| {
                     let mut values = Vec::with_capacity(1 + simple_aggs.len());
                     values.push(Value::Integer(key));
                     for (i, agg) in simple_aggs.iter().enumerate() {
@@ -2613,6 +2766,19 @@ impl Executor {
                                     Value::null_unknown()
                                 }
                             }
+                            SimpleAgg::Avg(_) => {
+                                if state.counts[i] > 0 {
+                                    Value::Float(state.agg_values[i] / state.counts[i] as f64)
+                                } else {
+                                    Value::null_unknown()
+                                }
+                            }
+                            SimpleAgg::Min(_) => state.min_values[i]
+                                .take()
+                                .unwrap_or_else(Value::null_unknown),
+                            SimpleAgg::Max(_) => state.max_values[i]
+                                .take()
+                                .unwrap_or_else(Value::null_unknown),
                         };
                         values.push(value);
                     }
@@ -2630,39 +2796,42 @@ impl Executor {
         let mut current_group_count: usize = 0;
 
         for row in rows {
-            // Get key value directly - no Vec allocation
-            let key_value = row
-                .get(col_idx)
-                .cloned()
-                .unwrap_or_else(Value::null_unknown);
-
-            // Hash the single value
+            // OPTIMIZATION: Hash directly from row reference (no clone for hashing)
+            let row_value = row.get(col_idx);
             let mut hasher = AHasher::default();
-            hash_value_into(&key_value, &mut hasher);
-            let hash = hasher.finish();
-
-            // Early termination check
-            let key_exists = groups
-                .get(&hash)
-                .map(|bucket| bucket.iter().any(|state| state.key_value == key_value))
-                .unwrap_or(false);
-
-            if has_limit && !key_exists && current_group_count >= group_limit {
-                continue;
+            if let Some(value) = row_value {
+                hash_value_into(value, &mut hasher);
+            } else {
+                hash_value_into(&Value::null_unknown(), &mut hasher);
             }
+            let hash = hasher.finish();
 
             // Get or create bucket for this hash
             let bucket = groups.entry(hash).or_default();
 
-            // Find existing group or create new one
-            let state = if let Some(state) = bucket.iter_mut().find(|s| s.key_value == key_value) {
-                state
+            // OPTIMIZATION: Compare row value directly against stored keys (no clone for lookup)
+            let existing_idx = bucket.iter().position(|s| match row_value {
+                Some(rv) => &s.key_value == rv,
+                None => s.key_value.is_null(),
+            });
+
+            let state = if let Some(idx) = existing_idx {
+                // Existing group - no clone needed!
+                &mut bucket[idx]
             } else {
+                // New group - check limit before creating
+                if has_limit && current_group_count >= group_limit {
+                    continue;
+                }
+                // Only clone when creating a new group
+                let key_value = row_value.cloned().unwrap_or_else(Value::null_unknown);
                 bucket.push(SingleColGroupState {
                     key_value,
                     agg_values: vec![0.0; num_aggs],
                     agg_has_value: vec![false; num_aggs],
                     counts: vec![0; num_aggs],
+                    min_values: vec![None; num_aggs],
+                    max_values: vec![None; num_aggs],
                 });
                 current_group_count += 1;
                 bucket.last_mut().unwrap()
@@ -2674,18 +2843,46 @@ impl Executor {
                     SimpleAgg::Count => {
                         state.counts[i] += 1;
                     }
-                    SimpleAgg::Sum(sum_col_idx) => {
+                    SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                         if let Some(value) = row.get(*sum_col_idx) {
                             match value {
                                 Value::Integer(v) => {
                                     state.agg_values[i] += *v as f64;
                                     state.agg_has_value[i] = true;
+                                    state.counts[i] += 1;
                                 }
                                 Value::Float(v) => {
                                     state.agg_values[i] += v;
                                     state.agg_has_value[i] = true;
+                                    state.counts[i] += 1;
                                 }
                                 _ => {}
+                            }
+                        }
+                    }
+                    SimpleAgg::Min(min_col_idx) => {
+                        if let Some(value) = row.get(*min_col_idx) {
+                            if !value.is_null() {
+                                match &state.min_values[i] {
+                                    None => state.min_values[i] = Some(value.clone()),
+                                    Some(current) if value < current => {
+                                        state.min_values[i] = Some(value.clone())
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    SimpleAgg::Max(max_col_idx) => {
+                        if let Some(value) = row.get(*max_col_idx) {
+                            if !value.is_null() {
+                                match &state.max_values[i] {
+                                    None => state.max_values[i] = Some(value.clone()),
+                                    Some(current) if value > current => {
+                                        state.max_values[i] = Some(value.clone())
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -2722,17 +2919,38 @@ impl Executor {
                     // All conditions must pass (AND semantics)
                     for cond in &filter.conditions {
                         let agg_value = match &simple_aggs[cond.agg_index] {
-                            SimpleAgg::Count => state.counts[cond.agg_index] as f64,
+                            SimpleAgg::Count => Some(state.counts[cond.agg_index] as f64),
                             SimpleAgg::Sum(_) => {
                                 if state.agg_has_value[cond.agg_index] {
-                                    state.agg_values[cond.agg_index]
+                                    Some(state.agg_values[cond.agg_index])
                                 } else {
+                                    None
+                                }
+                            }
+                            SimpleAgg::Avg(_) => {
+                                if state.counts[cond.agg_index] > 0 {
+                                    Some(
+                                        state.agg_values[cond.agg_index]
+                                            / state.counts[cond.agg_index] as f64,
+                                    )
+                                } else {
+                                    None
+                                }
+                            }
+                            SimpleAgg::Min(_) => state.min_values[cond.agg_index]
+                                .as_ref()
+                                .and_then(|v| v.as_float64()),
+                            SimpleAgg::Max(_) => state.max_values[cond.agg_index]
+                                .as_ref()
+                                .and_then(|v| v.as_float64()),
+                        };
+                        match agg_value {
+                            Some(val) => {
+                                if !cond.matches(val) {
                                     return false;
                                 }
                             }
-                        };
-                        if !cond.matches(agg_value) {
-                            return false;
+                            None => return false, // NULL values don't pass comparison
                         }
                     }
                     true
@@ -2740,7 +2958,7 @@ impl Executor {
                     true
                 }
             })
-            .map(|state| {
+            .map(|mut state| {
                 let mut values = Vec::with_capacity(1 + simple_aggs.len());
                 values.push(state.key_value);
 
@@ -2754,6 +2972,19 @@ impl Executor {
                                 Value::null_unknown()
                             }
                         }
+                        SimpleAgg::Avg(_) => {
+                            if state.counts[i] > 0 {
+                                Value::Float(state.agg_values[i] / state.counts[i] as f64)
+                            } else {
+                                Value::null_unknown()
+                            }
+                        }
+                        SimpleAgg::Min(_) => state.min_values[i]
+                            .take()
+                            .unwrap_or_else(Value::null_unknown),
+                        SimpleAgg::Max(_) => state.max_values[i]
+                            .take()
+                            .unwrap_or_else(Value::null_unknown),
                     };
                     values.push(value);
                 }
@@ -2793,7 +3024,7 @@ impl Executor {
             .as_ref()
             .and_then(|h| try_parse_simple_having(h, aggregations));
 
-        // FAST PATH: For simple aggregates (SUM, COUNT without DISTINCT/FILTER/ORDER BY/expression),
+        // FAST PATH: For simple aggregates (COUNT/SUM/AVG/MIN/MAX without DISTINCT/FILTER/ORDER BY/expression),
         // use single-pass streaming aggregation that accumulates values directly
         // When inline HAVING is available, it's applied during row generation
         if let Some(result) = self.try_fast_aggregation(
@@ -2957,49 +3188,42 @@ impl Executor {
                     // Compute hash once (8-byte key instead of cloning entire Vec<Value>)
                     let hash = hash_group_key(&key_buffer);
 
-                    // Early termination: if we've reached the limit, check before adding new groups
-                    // CRITICAL: Must check if key exists in bucket to distinguish new group vs existing group
-                    // Count actual groups, not buckets (hash collisions create multiple groups per bucket)
-                    if has_limit {
-                        let key_exists_in_bucket = groups
-                            .get(&hash)
-                            .map(|bucket| bucket.iter().any(|entry| entry.key_values == key_buffer))
-                            .unwrap_or(false);
-
-                        if !key_exists_in_bucket && current_group_count >= group_limit {
-                            // This would create a new group, but we're at limit - skip
-                            continue;
-                        }
-                    }
-
-                    // Handle bucket with proper collision detection
+                    // OPTIMIZATION: Single scan to find existing group OR check limit
+                    // Previously we scanned twice: once for key_exists check, once for find()
                     match groups.entry(hash) {
                         std::collections::hash_map::Entry::Occupied(mut e) => {
                             let bucket = e.get_mut();
-                            // Search bucket for matching group (handles hash collisions)
-                            if let Some(entry) = bucket
-                                .iter_mut()
-                                .find(|entry| entry.key_values == key_buffer)
-                            {
+                            // Single scan: find position of matching group
+                            let existing_idx = bucket
+                                .iter()
+                                .position(|entry| entry.key_values == key_buffer);
+
+                            if let Some(idx) = existing_idx {
                                 // Existing group - just add this row to it
-                                entry.row_indices.push(row_idx);
+                                bucket[idx].row_indices.push(row_idx);
                             } else {
-                                // Hash collision: different key with same hash - add new group
-                                // (limit already checked above)
+                                // Hash collision: different key with same hash
+                                // Check limit before creating new group
+                                if has_limit && current_group_count >= group_limit {
+                                    continue;
+                                }
                                 bucket.push(GroupEntry {
                                     key_values: key_buffer.clone(),
                                     row_indices: vec![row_idx],
                                 });
-                                current_group_count += 1; // Track new group for LIMIT optimization
+                                current_group_count += 1;
                             }
                         }
                         std::collections::hash_map::Entry::Vacant(e) => {
-                            // First entry for this hash (limit already checked above)
+                            // First entry for this hash - check limit before creating
+                            if has_limit && current_group_count >= group_limit {
+                                continue;
+                            }
                             e.insert(vec![GroupEntry {
                                 key_values: key_buffer.clone(),
                                 row_indices: vec![row_idx],
                             }]);
-                            current_group_count += 1; // Track new group for LIMIT optimization
+                            current_group_count += 1;
                         }
                     }
                 }
@@ -3043,49 +3267,42 @@ impl Executor {
                 // Compute hash of key (8-byte key for fast lookups)
                 let hash = hash_group_key(&key_buffer);
 
-                // Early termination: if we've reached the limit, check before adding new groups
-                // CRITICAL: Must check if key exists in bucket to distinguish new group vs existing group
-                // Count actual groups, not buckets (hash collisions create multiple groups per bucket)
-                if has_limit {
-                    let key_exists_in_bucket = groups
-                        .get(&hash)
-                        .map(|bucket| bucket.iter().any(|entry| entry.key_values == key_buffer))
-                        .unwrap_or(false);
-
-                    if !key_exists_in_bucket && current_group_count >= group_limit {
-                        // This would create a new group, but we're at limit - skip
-                        continue;
-                    }
-                }
-
-                // Handle bucket with proper collision detection
+                // OPTIMIZATION: Single scan to find existing group OR check limit
+                // Previously we scanned twice: once for key_exists check, once for find()
                 match groups.entry(hash) {
                     std::collections::hash_map::Entry::Occupied(mut e) => {
                         let bucket = e.get_mut();
-                        // Search bucket for matching group (handles hash collisions)
-                        if let Some(entry) = bucket
-                            .iter_mut()
-                            .find(|entry| entry.key_values == key_buffer)
-                        {
+                        // Single scan: find position of matching group
+                        let existing_idx = bucket
+                            .iter()
+                            .position(|entry| entry.key_values == key_buffer);
+
+                        if let Some(idx) = existing_idx {
                             // Existing group - just add this row to it
-                            entry.row_indices.push(row_idx);
+                            bucket[idx].row_indices.push(row_idx);
                         } else {
-                            // Hash collision: different key with same hash - add new group
-                            // (limit already checked above)
+                            // Hash collision: different key with same hash
+                            // Check limit before creating new group
+                            if has_limit && current_group_count >= group_limit {
+                                continue;
+                            }
                             bucket.push(GroupEntry {
                                 key_values: key_buffer.clone(),
                                 row_indices: vec![row_idx],
                             });
-                            current_group_count += 1; // Track new group for LIMIT optimization
+                            current_group_count += 1;
                         }
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        // First entry for this hash (limit already checked above)
+                        // First entry for this hash - check limit before creating
+                        if has_limit && current_group_count >= group_limit {
+                            continue;
+                        }
                         e.insert(vec![GroupEntry {
                             key_values: key_buffer.clone(),
                             row_indices: vec![row_idx],
                         }]);
-                        current_group_count += 1; // Track new group for LIMIT optimization
+                        current_group_count += 1;
                     }
                 }
             }

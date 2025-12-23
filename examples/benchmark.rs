@@ -89,14 +89,15 @@ fn main() {
 
     // SELECT by ID (prepared statement)
     let select_by_id = db.prepare("SELECT * FROM users WHERE id = $1").unwrap();
-    let mut total = std::time::Duration::ZERO;
-    for i in 0..ITERATIONS {
-        let id = ((i % ROW_COUNT) + 1) as i64;
-        let start = Instant::now();
+    let ids: Vec<i64> = (0..ITERATIONS)
+        .map(|i| ((i % ROW_COUNT) + 1) as i64)
+        .collect();
+    let start = Instant::now();
+    for &id in &ids {
         let rows = select_by_id.query((id,)).unwrap();
         let _ = rows.into_iter().next();
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -107,14 +108,13 @@ fn main() {
 
     // SELECT by index (exact match on age)
     let select_by_index = db.prepare("SELECT * FROM users WHERE age = $1").unwrap();
-    let mut total = std::time::Duration::ZERO;
-    for i in 0..ITERATIONS {
-        let age = ((i % 62) + 18) as i64; // Ages 18-79
-        let start = Instant::now();
+    let ages: Vec<i64> = (0..ITERATIONS).map(|i| ((i % 62) + 18) as i64).collect();
+    let start = Instant::now();
+    for &age in &ages {
         let rows = select_by_index.query((age,)).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -127,13 +127,12 @@ fn main() {
     let select_by_index_range = db
         .prepare("SELECT * FROM users WHERE age >= $1 AND age <= $2")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = select_by_index_range.query((30_i64, 40_i64)).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -146,13 +145,12 @@ fn main() {
     let select_complex = db
         .prepare("SELECT id, name, balance FROM users WHERE age >= 25 AND age <= 45 AND active = true ORDER BY balance DESC LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = select_complex.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -163,13 +161,12 @@ fn main() {
 
     // SELECT * (full scan) (prepared statement)
     let select_all = db.prepare("SELECT * FROM users").unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = select_all.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -182,14 +179,19 @@ fn main() {
     let update_by_id = db
         .prepare("UPDATE users SET balance = $1 WHERE id = $2")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
-    for i in 0..ITERATIONS {
-        let id = ((i % ROW_COUNT) + 1) as i64;
-        let new_balance: f64 = rng.random_range(0.0..100000.0);
-        let start = Instant::now();
-        update_by_id.execute((new_balance, id)).unwrap();
-        total += start.elapsed();
+    let update_params: Vec<(f64, i64)> = (0..ITERATIONS)
+        .map(|i| {
+            (
+                rng.random_range(0.0..100000.0),
+                ((i % ROW_COUNT) + 1) as i64,
+            )
+        })
+        .collect();
+    let start = Instant::now();
+    for &(balance, id) in &update_params {
+        update_by_id.execute((balance, id)).unwrap();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -202,15 +204,14 @@ fn main() {
     let update_complex = db
         .prepare("UPDATE users SET balance = $1 WHERE age >= $2 AND age <= $3 AND active = true")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
-    for _ in 0..ITERATIONS {
-        let new_balance: f64 = rng.random_range(0.0..100000.0);
-        let start = Instant::now();
-        update_complex
-            .execute((new_balance, 27_i64, 28_i64))
-            .unwrap(); // Small range like DELETE
-        total += start.elapsed();
+    let update_complex_balances: Vec<f64> = (0..ITERATIONS)
+        .map(|_| rng.random_range(0.0..100000.0))
+        .collect();
+    let start = Instant::now();
+    for &balance in &update_complex_balances {
+        update_complex.execute((balance, 27_i64, 28_i64)).unwrap(); // Small range like DELETE
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -223,26 +224,32 @@ fn main() {
     let insert_single = db
         .prepare("INSERT INTO users (id, name, email, age, balance, active, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
-    for i in 0..ITERATIONS {
-        let id = (ROW_COUNT + 1000 + i) as i64;
-        let age = rng.random_range(18..80);
-        let name = format!("New_{}", id);
-        let email = format!("new{}@example.com", id);
-        let start = Instant::now();
+    let insert_params: Vec<(i64, String, String, i64)> = (0..ITERATIONS)
+        .map(|i| {
+            let id = (ROW_COUNT + 1000 + i) as i64;
+            (
+                id,
+                format!("New_{}", id),
+                format!("new{}@example.com", id),
+                rng.random_range(18..80),
+            )
+        })
+        .collect();
+    let start = Instant::now();
+    for (id, name, email, age) in &insert_params {
         insert_single
             .execute((
-                id,
-                &name,
-                &email,
-                age,
+                *id,
+                name,
+                email,
+                *age,
                 100.0_f64,
                 true,
                 "2024-01-01 00:00:00",
             ))
             .unwrap();
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -253,13 +260,14 @@ fn main() {
 
     // DELETE by ID (prepared statement)
     let delete_by_id = db.prepare("DELETE FROM users WHERE id = $1").unwrap();
-    let mut total = std::time::Duration::ZERO;
-    for i in 0..ITERATIONS {
-        let id = (ROW_COUNT + 1000 + i) as i64;
-        let start = Instant::now();
+    let delete_ids: Vec<i64> = (0..ITERATIONS)
+        .map(|i| (ROW_COUNT + 1000 + i) as i64)
+        .collect();
+    let start = Instant::now();
+    for &id in &delete_ids {
         delete_by_id.execute((id,)).unwrap();
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -272,12 +280,11 @@ fn main() {
     let delete_complex = db
         .prepare("DELETE FROM users WHERE age >= $1 AND age <= $2 AND active = true")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         delete_complex.execute((25_i64, 26_i64)).unwrap(); // Small range to not delete too many
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -290,13 +297,12 @@ fn main() {
     let agg_stmt = db
         .prepare("SELECT age, COUNT(*), AVG(balance) FROM users GROUP BY age")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = agg_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -349,13 +355,12 @@ fn main() {
     let join_stmt = db
         .prepare("SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.status = 'completed' LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..20 {
-        let start = Instant::now();
         let rows = join_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 20.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -368,13 +373,12 @@ fn main() {
     let left_join_stmt = db
         .prepare("SELECT u.name, COUNT(o.id) as order_count, SUM(o.amount) as total FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..20 {
-        let start = Instant::now();
         let rows = left_join_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 20.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -387,13 +391,12 @@ fn main() {
     let subquery_stmt = db
         .prepare("SELECT name, balance, (SELECT AVG(balance) FROM users) as avg_balance FROM users WHERE balance > (SELECT AVG(balance) FROM users) LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = subquery_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -406,13 +409,12 @@ fn main() {
     let in_subquery_stmt = db
         .prepare("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE status = 'completed') LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..10 {
-        let start = Instant::now();
         let rows = in_subquery_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 10.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -425,13 +427,12 @@ fn main() {
     let exists_stmt = db
         .prepare("SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > 500) LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..10 {
-        let start = Instant::now();
         let rows = exists_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 10.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -444,13 +445,12 @@ fn main() {
     let cte_stmt = db
         .prepare("WITH high_value AS (SELECT user_id, SUM(amount) as total FROM orders GROUP BY user_id HAVING SUM(amount) > 1000) SELECT u.name, h.total FROM users u INNER JOIN high_value h ON u.id = h.user_id LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..20 {
-        let start = Instant::now();
         let rows = cte_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 20.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -463,13 +463,12 @@ fn main() {
     let window_stmt = db
         .prepare("SELECT name, balance, ROW_NUMBER() OVER (ORDER BY balance DESC) as rank FROM users LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = window_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -482,13 +481,12 @@ fn main() {
     let window_pk_stmt = db
         .prepare("SELECT name, ROW_NUMBER() OVER (ORDER BY id) as rank FROM users LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = window_pk_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -501,13 +499,12 @@ fn main() {
     let window_partition_stmt = db
         .prepare("SELECT name, age, balance, RANK() OVER (PARTITION BY age ORDER BY balance DESC) as age_rank FROM users LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = window_partition_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -520,13 +517,12 @@ fn main() {
     let union_stmt = db
         .prepare("SELECT name, 'high' as category FROM users WHERE balance > 50000 UNION ALL SELECT name, 'low' as category FROM users WHERE balance <= 50000 LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = union_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -539,13 +535,12 @@ fn main() {
     let case_stmt = db
         .prepare("SELECT name, CASE WHEN balance > 75000 THEN 'platinum' WHEN balance > 50000 THEN 'gold' WHEN balance > 25000 THEN 'silver' ELSE 'bronze' END as tier FROM users LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = case_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -558,13 +553,12 @@ fn main() {
     let multi_join_stmt = db
         .prepare("SELECT u.name, COUNT(DISTINCT o.id) as orders, SUM(o.amount) as total FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE u.active = true AND o.status IN ('completed', 'shipped') GROUP BY u.id, u.name HAVING COUNT(o.id) > 1 LIMIT 50")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..20 {
-        let start = Instant::now();
         let rows = multi_join_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 20.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -574,10 +568,11 @@ fn main() {
     );
 
     // Batch INSERT in transaction (100 individual INSERTs wrapped in BEGIN/COMMIT)
-    let mut total = std::time::Duration::ZERO;
-    for iter in 0..ITERATIONS {
-        let base_id = (ROW_COUNT * 10 + iter * 100) as i64;
-        let start = Instant::now();
+    let batch_base_ids: Vec<i64> = (0..ITERATIONS)
+        .map(|iter| (ROW_COUNT * 10 + iter * 100) as i64)
+        .collect();
+    let start = Instant::now();
+    for &base_id in &batch_base_ids {
         db.execute("BEGIN", ()).unwrap();
         for i in 0..100 {
             insert_order
@@ -585,8 +580,8 @@ fn main() {
                 .unwrap();
         }
         db.execute("COMMIT", ()).unwrap();
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -604,13 +599,12 @@ fn main() {
 
     // DISTINCT without ORDER BY
     let distinct_stmt = db.prepare("SELECT DISTINCT age FROM users").unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = distinct_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -623,13 +617,12 @@ fn main() {
     let distinct_order_stmt = db
         .prepare("SELECT DISTINCT age FROM users ORDER BY age")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = distinct_order_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -640,13 +633,12 @@ fn main() {
 
     // COUNT DISTINCT
     let count_distinct_stmt = db.prepare("SELECT COUNT(DISTINCT age) FROM users").unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = count_distinct_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -659,13 +651,12 @@ fn main() {
     let like_prefix_stmt = db
         .prepare("SELECT * FROM users WHERE name LIKE 'User_1%' LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = like_prefix_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -678,13 +669,12 @@ fn main() {
     let like_contains_stmt = db
         .prepare("SELECT * FROM users WHERE email LIKE '%50%' LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = like_contains_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -697,13 +687,12 @@ fn main() {
     let or_stmt = db
         .prepare("SELECT * FROM users WHERE age = 25 OR age = 50 OR age = 75 LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = or_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -716,13 +705,12 @@ fn main() {
     let in_list_stmt = db
         .prepare("SELECT * FROM users WHERE age IN (20, 25, 30, 35, 40, 45, 50) LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = in_list_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -735,13 +723,12 @@ fn main() {
     let not_in_stmt = db
         .prepare("SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE status = 'cancelled') LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..10 {
-        let start = Instant::now();
         let rows = not_in_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 10.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -754,13 +741,12 @@ fn main() {
     let not_exists_stmt = db
         .prepare("SELECT * FROM users u WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.status = 'cancelled') LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..10 {
-        let start = Instant::now();
         let rows = not_exists_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 10.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -773,13 +759,12 @@ fn main() {
     let offset_stmt = db
         .prepare("SELECT * FROM users ORDER BY id LIMIT 100 OFFSET 5000")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = offset_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -792,13 +777,12 @@ fn main() {
     let multi_order_stmt = db
         .prepare("SELECT * FROM users ORDER BY age DESC, balance ASC, name LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = multi_order_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -811,13 +795,12 @@ fn main() {
     let self_join_stmt = db
         .prepare("SELECT u1.name, u2.name, u1.age FROM users u1 INNER JOIN users u2 ON u1.age = u2.age AND u1.id < u2.id LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..20 {
-        let start = Instant::now();
         let rows = self_join_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 20.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -830,13 +813,12 @@ fn main() {
     let multi_window_stmt = db
         .prepare("SELECT name, balance, ROW_NUMBER() OVER (ORDER BY balance DESC) as rn, RANK() OVER (ORDER BY balance DESC) as rnk, LAG(balance) OVER (ORDER BY balance DESC) as prev_bal FROM users LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = multi_window_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -849,13 +831,12 @@ fn main() {
     let nested_stmt = db
         .prepare("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > (SELECT AVG(amount) FROM orders)) LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..20 {
-        let start = Instant::now();
         let rows = nested_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 20.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -868,13 +849,12 @@ fn main() {
     let multi_agg_stmt = db
         .prepare("SELECT COUNT(*), SUM(balance), AVG(balance), MIN(balance), MAX(balance), COUNT(DISTINCT age) FROM users")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = multi_agg_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -887,13 +867,12 @@ fn main() {
     let coalesce_stmt = db
         .prepare("SELECT name, COALESCE(balance, 0) as bal FROM users WHERE balance IS NOT NULL LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = coalesce_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -908,13 +887,12 @@ fn main() {
             "SELECT * FROM users WHERE LENGTH(name) > 7 AND UPPER(name) LIKE 'USER_%' LIMIT 100",
         )
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = expr_where_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -927,13 +905,12 @@ fn main() {
     let math_stmt = db
         .prepare("SELECT name, balance * 1.1 as new_bal, ROUND(balance / 1000, 2) as k_bal, ABS(balance - 50000) as diff FROM users LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = math_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -946,13 +923,12 @@ fn main() {
     let concat_stmt = db
         .prepare("SELECT name || ' (' || email || ')' as full_info FROM users LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = concat_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -965,13 +941,12 @@ fn main() {
     let large_result_stmt = db
         .prepare("SELECT id, name, balance FROM users WHERE active = true")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..20 {
-        let start = Instant::now();
         let rows = large_result_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 20.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -984,13 +959,12 @@ fn main() {
     let multi_cte_stmt = db
         .prepare("WITH young AS (SELECT * FROM users WHERE age < 30), rich AS (SELECT * FROM users WHERE balance > 70000) SELECT y.name, r.name FROM young y INNER JOIN rich r ON y.id = r.id LIMIT 50")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..20 {
-        let start = Instant::now();
         let rows = multi_cte_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 20.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -1003,13 +977,12 @@ fn main() {
     let corr_select_stmt = db
         .prepare("SELECT u.name, (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) as order_count FROM users u LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..10 {
-        let start = Instant::now();
         let rows = corr_select_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / 10.0;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -1022,13 +995,12 @@ fn main() {
     let between_stmt = db
         .prepare("SELECT * FROM users WHERE balance BETWEEN 25000 AND 75000 LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = between_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -1041,13 +1013,12 @@ fn main() {
     let multi_group_stmt = db
         .prepare("SELECT age, active, COUNT(*), AVG(balance) FROM users GROUP BY age, active")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = multi_group_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -1060,13 +1031,12 @@ fn main() {
     let cross_join_stmt = db
         .prepare("SELECT u.name, o.status FROM users u CROSS JOIN (SELECT DISTINCT status FROM orders) o LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = cross_join_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -1079,13 +1049,12 @@ fn main() {
     let derived_stmt = db
         .prepare("SELECT t.age_group, COUNT(*) FROM (SELECT CASE WHEN age < 30 THEN 'young' WHEN age < 50 THEN 'middle' ELSE 'senior' END as age_group FROM users) t GROUP BY t.age_group")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = derived_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -1098,13 +1067,12 @@ fn main() {
     let window_frame_stmt = db
         .prepare("SELECT name, balance, SUM(balance) OVER (ORDER BY balance ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as rolling_sum FROM users LIMIT 100")
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = window_frame_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -1119,13 +1087,12 @@ fn main() {
             "SELECT age FROM users GROUP BY age HAVING COUNT(*) > 100 AND AVG(balance) > 40000",
         )
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = having_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",
@@ -1140,13 +1107,12 @@ fn main() {
             "SELECT * FROM users WHERE balance > (SELECT AVG(amount) * 100 FROM orders) LIMIT 100",
         )
         .unwrap();
-    let mut total = std::time::Duration::ZERO;
+    let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let start = Instant::now();
         let rows = compare_sub_stmt.query(()).unwrap();
         for _ in rows {}
-        total += start.elapsed();
     }
+    let total = start.elapsed();
     let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
     println!(
         "{:<25} | {:>12.1} | {:>12.0}",

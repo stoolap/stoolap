@@ -54,6 +54,62 @@ pub type CteDataMap = FxHashMap<String, (Vec<String>, Vec<Row>)>;
 /// Type alias for join data result (left_columns, left_rows, right_columns, right_rows)
 type JoinDataResult = (Vec<String>, Vec<Row>, Vec<String>, Vec<Row>);
 
+/// Convert an expression to a normalized lowercase string for ORDER BY matching.
+/// Handles nested function calls, multiple arguments, and various expression types.
+fn expr_to_normalized_string(expr: &Expression) -> String {
+    match expr {
+        Expression::Identifier(id) => id.value.to_lowercase(),
+        Expression::QualifiedIdentifier(qi) => {
+            format!(
+                "{}.{}",
+                qi.qualifier.value.to_lowercase(),
+                qi.name.value.to_lowercase()
+            )
+        }
+        Expression::FunctionCall(fc) => {
+            let func_name = fc.function.to_lowercase();
+            if fc.arguments.is_empty() {
+                // Handle COUNT(*) style
+                format!("{}(*)", func_name)
+            } else {
+                // Handle all arguments recursively
+                let args: Vec<String> =
+                    fc.arguments.iter().map(expr_to_normalized_string).collect();
+                format!("{}({})", func_name, args.join(", "))
+            }
+        }
+        Expression::IntegerLiteral(lit) => lit.value.to_string(),
+        Expression::FloatLiteral(lit) => lit.value.to_string(),
+        Expression::StringLiteral(lit) => format!("'{}'", lit.value),
+        Expression::Infix(infix) => {
+            // Handle expressions like col + 1, a * b
+            format!(
+                "{} {} {}",
+                expr_to_normalized_string(&infix.left),
+                infix.operator.to_lowercase(),
+                expr_to_normalized_string(&infix.right)
+            )
+        }
+        Expression::Prefix(prefix) => {
+            format!(
+                "{}{}",
+                prefix.operator.to_lowercase(),
+                expr_to_normalized_string(&prefix.right)
+            )
+        }
+        Expression::Star(_) => "*".to_string(),
+        // Default: convert to debug string and lowercase
+        _ => format!("{:?}", expr).to_lowercase(),
+    }
+}
+
+/// Hint for CTE optimization including LIMIT and optional ORDER BY pushdown
+#[derive(Clone)]
+struct CtePushdownHint {
+    limit: u64,
+    order_by: Vec<OrderByExpression>,
+}
+
 /// Registry for CTE results during query execution
 ///
 /// Uses Arc with COW (copy-on-write) semantics to avoid cloning:
@@ -139,11 +195,19 @@ impl Executor {
             return self.execute_select(&inlined_stmt, ctx);
         }
 
+        // LAZY CTE OPTIMIZATION:
+        // For single-use CTEs in INNER JOIN with LIMIT, push LIMIT into CTE
+        // This enables streaming GROUP BY early termination
+        let cte_limit_hints = self.compute_cte_limit_hints(stmt, with_clause);
+
         // Create CTE registry
         let mut cte_registry = CteRegistry::new();
 
         // Execute each CTE in order
         for cte in &with_clause.ctes {
+            // Check if we have a pushdown hint for this CTE
+            let pushdown_hint = cte_limit_hints.get(&cte.name.value.to_lowercase());
+
             // Execute the CTE query (handles recursive CTEs)
             let (columns, rows) = if cte.is_recursive {
                 // Pass column aliases to recursive CTE execution so they're available during iteration
@@ -159,6 +223,9 @@ impl Executor {
                     &mut cte_registry,
                     aliases,
                 )?
+            } else if let Some(hint) = pushdown_hint {
+                // Execute CTE with pushed-down LIMIT and optional ORDER BY
+                self.execute_cte_query_with_hint(&cte.query, ctx, &mut cte_registry, hint)?
             } else {
                 self.execute_cte_query(&cte.query, ctx, &mut cte_registry)?
             };
@@ -1319,6 +1386,67 @@ impl Executor {
     // CTE INLINING OPTIMIZATION
     // =========================================================================
 
+    /// Check if LIMIT pushdown would be more beneficial than CTE inlining.
+    ///
+    /// Returns true when streaming aggregation with limit pushdown will be faster
+    /// than inlining as a subquery.
+    fn should_use_limit_pushdown_instead(
+        &self,
+        stmt: &SelectStatement,
+        with_clause: &WithClause,
+    ) -> bool {
+        // Must have LIMIT without ORDER BY
+        if stmt.limit.is_none() || !stmt.order_by.is_empty() {
+            return false;
+        }
+
+        // Must have a JOIN
+        let join_source = match &stmt.table_expr {
+            Some(expr) => match expr.as_ref() {
+                Expression::JoinSource(js) => js,
+                _ => return false,
+            },
+            None => return false,
+        };
+
+        let join_type = join_source.join_type.to_uppercase();
+        let is_inner_join = join_type == "INNER" || join_type.is_empty() || join_type == "JOIN";
+        let is_left_join = join_type == "LEFT" || join_type == "LEFT OUTER";
+        let is_right_join = join_type == "RIGHT" || join_type == "RIGHT OUTER";
+
+        if !is_inner_join && !is_left_join && !is_right_join {
+            return false;
+        }
+
+        // Check if exactly one side is a CTE with GROUP BY
+        let cte_names: AHashSet<String> = with_clause
+            .ctes
+            .iter()
+            .filter(|c| !c.is_recursive && !c.query.group_by.columns.is_empty())
+            .map(|c| c.name.value.to_lowercase())
+            .collect();
+
+        if cte_names.is_empty() {
+            return false;
+        }
+
+        let left_cte = self
+            .extract_cte_name_for_lookup(&join_source.left)
+            .filter(|n| cte_names.contains(&n.to_lowercase()));
+        let right_cte = self
+            .extract_cte_name_for_lookup(&join_source.right)
+            .filter(|n| cte_names.contains(&n.to_lowercase()));
+
+        // For INNER JOIN: either side can be CTE
+        // For LEFT JOIN: CTE must be on the RIGHT (each CTE row produces at most one result)
+        // For RIGHT JOIN: CTE must be on the LEFT (each CTE row produces at most one result)
+        match (&left_cte, &right_cte) {
+            (Some(_), None) if is_inner_join || is_right_join => true,
+            (None, Some(_)) if is_inner_join || is_left_join => true,
+            _ => false,
+        }
+    }
+
     /// Try to inline single-use, non-recursive CTEs as subqueries.
     /// Returns Some(rewritten_stmt) if all CTEs can be inlined, None otherwise.
     ///
@@ -1331,6 +1459,15 @@ impl Executor {
         stmt: &SelectStatement,
         with_clause: &WithClause,
     ) -> Option<SelectStatement> {
+        // Skip inlining if LIMIT pushdown with streaming would be more beneficial.
+        // This happens when:
+        // 1. Main query has LIMIT (no ORDER BY)
+        // 2. CTE has GROUP BY (can use streaming aggregation)
+        // 3. CTE is in INNER JOIN (limit pushdown is safe)
+        if self.should_use_limit_pushdown_instead(stmt, with_clause) {
+            return None;
+        }
+
         // Build map of CTE definitions
         let mut cte_defs: FxHashMap<String, &CommonTableExpression> = FxHashMap::default();
         for cte in &with_clause.ctes {
@@ -1891,6 +2028,256 @@ impl Executor {
             output_columns,
             final_rows,
         ))))
+    }
+
+    // =========================================================================
+    // LAZY CTE LIMIT PUSHDOWN
+    // =========================================================================
+
+    /// Compute LIMIT hints for CTEs that can benefit from early termination.
+    ///
+    /// Returns a map from CTE name to the hint (LIMIT + optional ORDER BY).
+    /// This is safe when:
+    /// 1. CTE is used exactly once in INNER/LEFT/RIGHT JOIN
+    /// 2. Main query has LIMIT
+    /// 3. ORDER BY (if present) references only CTE columns
+    fn compute_cte_limit_hints(
+        &self,
+        stmt: &SelectStatement,
+        with_clause: &WithClause,
+    ) -> FxHashMap<String, CtePushdownHint> {
+        let mut hints = FxHashMap::default();
+
+        // Must have a LIMIT on the main query
+        let main_limit = match &stmt.limit {
+            Some(lim) => match lim.as_ref() {
+                Expression::IntegerLiteral(lit) if lit.value > 0 => lit.value as u64,
+                _ => return hints,
+            },
+            None => return hints,
+        };
+
+        // Add OFFSET to limit if present
+        let main_limit = match &stmt.offset {
+            Some(off) => match off.as_ref() {
+                Expression::IntegerLiteral(lit) => main_limit.saturating_add(lit.value as u64),
+                _ => main_limit,
+            },
+            None => main_limit,
+        };
+
+        // Check for JOIN pattern in main query
+        let join_source = match &stmt.table_expr {
+            Some(expr) => match expr.as_ref() {
+                Expression::JoinSource(js) => js,
+                _ => return hints,
+            },
+            None => return hints,
+        };
+
+        let join_type = join_source.join_type.to_uppercase();
+        let is_inner_join = join_type == "INNER" || join_type.is_empty() || join_type == "JOIN";
+        let is_left_join = join_type == "LEFT" || join_type == "LEFT OUTER";
+        let is_right_join = join_type == "RIGHT" || join_type == "RIGHT OUTER";
+
+        if !is_inner_join && !is_left_join && !is_right_join {
+            return hints;
+        }
+
+        // Build set of CTE names
+        let cte_names: AHashSet<String> = with_clause
+            .ctes
+            .iter()
+            .filter(|c| !c.is_recursive) // Skip recursive CTEs
+            .map(|c| c.name.value.to_lowercase())
+            .collect();
+
+        // Check if one side of the join is a CTE
+        let left_cte = self
+            .extract_cte_name_for_lookup(&join_source.left)
+            .filter(|n| cte_names.contains(&n.to_lowercase()));
+        let right_cte = self
+            .extract_cte_name_for_lookup(&join_source.right)
+            .filter(|n| cte_names.contains(&n.to_lowercase()));
+
+        // For INNER JOIN: either side can be CTE
+        // For LEFT JOIN: CTE must be on the RIGHT
+        // For RIGHT JOIN: CTE must be on the LEFT
+        let cte_name = match (&left_cte, &right_cte) {
+            (Some(name), None) if is_inner_join || is_right_join => name.to_lowercase(),
+            (None, Some(name)) if is_inner_join || is_left_join => name.to_lowercase(),
+            _ => return hints,
+        };
+
+        // Check that the CTE has GROUP BY (the pattern we're optimizing)
+        let cte = with_clause
+            .ctes
+            .iter()
+            .find(|c| c.name.value.to_lowercase() == cte_name);
+
+        if let Some(cte) = cte {
+            // CTE must have GROUP BY for streaming optimization to help
+            if !cte.query.group_by.columns.is_empty() {
+                // Check if ORDER BY can be pushed down (all columns from CTE)
+                let cte_alias = match (&left_cte, &right_cte) {
+                    (Some(name), None) => name.clone(),
+                    (None, Some(name)) => name.clone(),
+                    _ => cte_name.clone(),
+                };
+
+                let order_by_for_cte = self.extract_pushable_order_by(stmt, &cte_alias, cte);
+
+                // CORRECTNESS FIX: Don't push LIMIT if ORDER BY exists but can't be pushed.
+                // If the main query has ORDER BY on non-CTE columns, pushing LIMIT to CTE
+                // would incorrectly limit results before the final ordering.
+                // Example: WITH stats AS (...) SELECT * FROM t JOIN stats ORDER BY t.name LIMIT 10
+                // The CTE needs ALL matching rows, not just the first N, because the final
+                // ORDER BY t.name determines which rows appear in the result.
+                if !stmt.order_by.is_empty() && order_by_for_cte.is_empty() {
+                    return hints; // Can't safely push LIMIT without ORDER BY
+                }
+
+                hints.insert(
+                    cte_name,
+                    CtePushdownHint {
+                        limit: main_limit,
+                        order_by: order_by_for_cte,
+                    },
+                );
+            }
+        }
+
+        hints
+    }
+
+    /// Extract ORDER BY items that can be pushed to a CTE.
+    /// Returns empty vec if ORDER BY cannot be pushed (references non-CTE columns).
+    fn extract_pushable_order_by(
+        &self,
+        stmt: &SelectStatement,
+        cte_alias: &str,
+        cte: &CommonTableExpression,
+    ) -> Vec<OrderByExpression> {
+        if stmt.order_by.is_empty() {
+            return vec![];
+        }
+
+        // Get CTE output column names
+        let cte_columns: Vec<String> = if !cte.column_names.is_empty() {
+            cte.column_names
+                .iter()
+                .map(|n| n.value.to_lowercase())
+                .collect()
+        } else {
+            // Extract from SELECT columns
+            cte.query
+                .columns
+                .iter()
+                .filter_map(|col| {
+                    // Handle Aliased expressions (e.g., SUM(amount) AS total)
+                    if let Expression::Aliased(aliased) = col {
+                        return Some(aliased.alias.value.to_lowercase());
+                    }
+                    // Handle plain identifiers
+                    if let Expression::Identifier(id) = col {
+                        return Some(id.value_lower.clone());
+                    }
+                    // Handle function calls (e.g., SUM(amount), ROUND(SUM(x), 2))
+                    // Use expr_to_normalized_string for robust handling of nested functions,
+                    // multiple arguments, and proper case normalization
+                    if matches!(col, Expression::FunctionCall(_)) {
+                        return Some(expr_to_normalized_string(col));
+                    }
+                    None
+                })
+                .collect()
+        };
+
+        let cte_alias_lower = cte_alias.to_lowercase();
+        let mut result = Vec::new();
+
+        for order_item in &stmt.order_by {
+            // Check if this ORDER BY item references a CTE column
+            let col_name = match &order_item.expression {
+                Expression::Identifier(id) => Some(id.value_lower.clone()),
+                Expression::QualifiedIdentifier(qi) => {
+                    // table.column format
+                    let table = qi.qualifier.value.to_lowercase();
+                    if table == cte_alias_lower {
+                        Some(qi.name.value.to_lowercase())
+                    } else {
+                        // References different table - can't push
+                        return vec![];
+                    }
+                }
+                Expression::FunctionCall(_) => {
+                    // Handle ORDER BY SUM(amount), ROUND(AVG(x), 2), etc.
+                    Some(expr_to_normalized_string(&order_item.expression))
+                }
+                _ => None,
+            };
+
+            if let Some(col) = col_name {
+                // Check if column exists in CTE (exact match only)
+                if cte_columns.iter().any(|c| c == &col) {
+                    // Create ORDER BY item without table qualifier
+                    let new_expr = Expression::Identifier(Identifier {
+                        token: Token::new(
+                            TokenType::Identifier,
+                            col.clone(),
+                            Position::new(0, 0, 0),
+                        ),
+                        value: col.clone(),
+                        value_lower: col,
+                    });
+                    result.push(OrderByExpression {
+                        expression: new_expr,
+                        ascending: order_item.ascending,
+                        nulls_first: order_item.nulls_first,
+                    });
+                } else {
+                    // Column not in CTE - can't push ORDER BY
+                    return vec![];
+                }
+            } else {
+                // Complex expression - can't push
+                return vec![];
+            }
+        }
+
+        result
+    }
+
+    /// Execute a CTE query with pushed-down LIMIT and optional ORDER BY.
+    fn execute_cte_query_with_hint(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        cte_registry: &mut CteRegistry,
+        hint: &CtePushdownHint,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        // Create a modified statement with LIMIT and ORDER BY pushed down
+        let mut modified_stmt = stmt.clone();
+
+        // Push ORDER BY if provided and CTE doesn't have one
+        if !hint.order_by.is_empty() && modified_stmt.order_by.is_empty() {
+            modified_stmt.order_by = hint.order_by.clone();
+        }
+
+        // Push LIMIT if CTE doesn't already have one
+        if modified_stmt.limit.is_none() {
+            modified_stmt.limit = Some(Box::new(Expression::IntegerLiteral(IntegerLiteral {
+                token: Token::new(
+                    TokenType::Integer,
+                    hint.limit.to_string(),
+                    Position::new(0, 0, 0),
+                ),
+                value: hint.limit as i64,
+            })));
+        }
+
+        // Execute with the pushed optimizations
+        self.execute_cte_query(&modified_stmt, ctx, cte_registry)
     }
 }
 

@@ -576,8 +576,8 @@ impl VersionStore {
 
     /// Gets multiple visible versions in a single batch operation
     ///
-    /// This is much faster than calling get_visible_version for each row_id
-    /// because it uses DashMap's sharded locking for concurrent access.
+    /// Optimized to use arena-based storage for zero-copy reading,
+    /// with pre-acquired locks for minimal overhead.
     pub fn get_visible_versions_batch(&self, row_ids: &[i64], txn_id: i64) -> Vec<(i64, Row)> {
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
@@ -587,6 +587,12 @@ impl VersionStore {
             Some(c) => c,
             None => return Vec::new(),
         };
+
+        // Pre-acquire arena locks ONCE for all lookups (same optimization as full scan)
+        let (arena_rows, arena_data) = self.arena.read_guards();
+        let arena_rows_slice = arena_rows.as_slice();
+        let arena_data_slice = arena_data.as_slice();
+        let arena_len = arena_rows_slice.len();
 
         let mut results = Vec::with_capacity(row_ids.len());
 
@@ -601,7 +607,26 @@ impl VersionStore {
                     if checker.is_visible(version_txn_id, txn_id) {
                         if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
                         {
-                            results.push((row_id, e.version.data.clone()));
+                            // Read from arena if available (same as get_all_visible_rows_arena)
+                            let row_data = if let Some(idx) = e.arena_idx {
+                                if idx < arena_len {
+                                    let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
+                                    if meta.start <= meta.end && meta.end <= arena_data_slice.len()
+                                    {
+                                        let slice = unsafe {
+                                            arena_data_slice.get_unchecked(meta.start..meta.end)
+                                        };
+                                        Row::from_values(slice.to_vec())
+                                    } else {
+                                        e.version.data.clone()
+                                    }
+                                } else {
+                                    e.version.data.clone()
+                                }
+                            } else {
+                                e.version.data.clone()
+                            };
+                            results.push((row_id, row_data));
                         }
                         break;
                     }

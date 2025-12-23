@@ -24,7 +24,7 @@
 //! ```text
 //! Table.Scan()
 //!   ↓
-//! ExprFilteredResult (WHERE clause with pre-compiled RowFilter)
+//! FilteredResult (WHERE clause with pre-compiled RowFilter)
 //!   ↓
 //! HashJoinOperator (JOIN operations)
 //!   ↓
@@ -63,6 +63,7 @@ mod cte;
 mod ddl;
 mod dml;
 mod explain;
+mod index_optimizer;
 mod pk_fast_path;
 pub mod pushdown;
 mod query;

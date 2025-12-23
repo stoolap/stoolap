@@ -273,107 +273,10 @@ impl QueryResult for ExecutorMemoryResult {
 }
 
 /// Filtered result that applies a WHERE clause to an underlying result
-pub struct FilteredResult {
-    /// Underlying result
-    inner: Box<dyn QueryResult>,
-    /// Filter predicate function
-    predicate: Box<dyn Fn(&Row) -> bool + Send + Sync>,
-    /// Current row (cached after filter passes)
-    current_row: Option<Row>,
-    /// Columns cached
-    columns: Vec<String>,
-}
-
-impl FilteredResult {
-    /// Create a new filtered result
-    pub fn new(
-        inner: Box<dyn QueryResult>,
-        predicate: Box<dyn Fn(&Row) -> bool + Send + Sync>,
-    ) -> Self {
-        let columns = inner.columns().to_vec();
-        Self {
-            inner,
-            predicate,
-            current_row: None,
-            columns,
-        }
-    }
-}
-
-impl QueryResult for FilteredResult {
-    fn columns(&self) -> &[String] {
-        &self.columns
-    }
-
-    fn next(&mut self) -> bool {
-        // Keep advancing until we find a row that passes the filter
-        while self.inner.next() {
-            let row = self.inner.row();
-            if (self.predicate)(row) {
-                // OPTIMIZATION: Use take_row() to avoid clone when possible
-                self.current_row = Some(self.inner.take_row());
-                return true;
-            }
-        }
-        self.current_row = None;
-        false
-    }
-
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        if let Some(ref row) = self.current_row {
-            if dest.len() != row.len() {
-                return Err(crate::core::Error::internal(format!(
-                    "scan destination has {} values but row has {} columns",
-                    dest.len(),
-                    row.len()
-                )));
-            }
-            for (i, value) in row.iter().enumerate() {
-                dest[i] = value.clone();
-            }
-            Ok(())
-        } else {
-            Err(crate::core::Error::internal(
-                "scan() called without successful next()",
-            ))
-        }
-    }
-
-    fn row(&self) -> &Row {
-        self.current_row
-            .as_ref()
-            .expect("row() called without successful next()")
-    }
-
-    fn take_row(&mut self) -> Row {
-        self.current_row
-            .take()
-            .expect("take_row() called without successful next()")
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.inner.close()
-    }
-
-    fn rows_affected(&self) -> i64 {
-        self.inner.rows_affected()
-    }
-
-    fn last_insert_id(&self) -> i64 {
-        self.inner.last_insert_id()
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
-    }
-}
-
-/// Expression-based filtered result that uses RowFilter for efficient reuse
 ///
-/// Unlike FilteredResult which takes a closure, this struct owns a pre-compiled
-/// RowFilter, avoiding per-row compilation. The filter is compiled once during
-/// construction and reused for every row.
-pub struct ExprFilteredResult {
+/// This struct owns a pre-compiled RowFilter, avoiding per-row compilation.
+/// The filter is compiled once during construction and reused for every row.
+pub struct FilteredResult {
     /// Underlying result
     inner: Box<dyn QueryResult>,
     /// Pre-compiled row filter (thread-safe, reusable)
@@ -384,13 +287,13 @@ pub struct ExprFilteredResult {
     columns: Vec<String>,
 }
 
-// ExprFilteredResult is Send because all fields are Send:
+// FilteredResult is Send because all fields are Send:
 // - Box<dyn QueryResult> is Send (trait bound)
 // - RowFilter is Send+Sync (uses Arc internally)
 // - Option<Row> and Vec<String> are Send
-unsafe impl Send for ExprFilteredResult {}
+unsafe impl Send for FilteredResult {}
 
-impl ExprFilteredResult {
+impl FilteredResult {
     /// Create a new expression-filtered result
     ///
     /// # Arguments
@@ -408,6 +311,20 @@ impl ExprFilteredResult {
             current_row: None,
             columns,
         })
+    }
+
+    /// Create from a pre-built RowFilter
+    ///
+    /// Use this when you have a RowFilter that was constructed with specific
+    /// context (e.g., with_context for correlated subqueries).
+    pub fn from_filter(inner: Box<dyn QueryResult>, filter: RowFilter) -> Self {
+        let columns = inner.columns().to_vec();
+        Self {
+            inner,
+            filter,
+            current_row: None,
+            columns,
+        }
     }
 
     /// Create with default function registry (static lifetime)
@@ -428,7 +345,7 @@ impl ExprFilteredResult {
     }
 }
 
-impl QueryResult for ExprFilteredResult {
+impl QueryResult for FilteredResult {
     fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -1679,16 +1596,27 @@ mod tests {
 
         let inner = Box::new(ExecutorMemoryResult::new(columns, rows));
 
-        // Filter for value > 15
-        let predicate = Box::new(|row: &Row| {
-            if let Some(Value::Integer(v)) = row.get(1) {
-                *v > 15
-            } else {
-                false
-            }
+        // Filter for value > 15 using Expression
+        use crate::executor::utils::dummy_token;
+        use crate::parser::ast::{Identifier, InfixExpression, InfixOperator, IntegerLiteral};
+        use crate::parser::token::TokenType;
+
+        let filter_expr = Expression::Infix(InfixExpression {
+            token: dummy_token(">", TokenType::Operator),
+            left: Box::new(Expression::Identifier(Identifier {
+                token: dummy_token("value", TokenType::Identifier),
+                value: "value".to_string(),
+                value_lower: "value".to_string(),
+            })),
+            operator: ">".to_string(),
+            op_type: InfixOperator::GreaterThan,
+            right: Box::new(Expression::IntegerLiteral(IntegerLiteral {
+                token: dummy_token("15", TokenType::Integer),
+                value: 15,
+            })),
         });
 
-        let mut result = FilteredResult::new(inner, predicate);
+        let mut result = FilteredResult::with_defaults(inner, filter_expr);
 
         // Should get rows with value 20 and 30
         assert!(result.next());

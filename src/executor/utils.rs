@@ -1350,3 +1350,256 @@ fn extract_join_keys_recursive(
         }
     }
 }
+
+// ============================================================================
+// Join Key Equivalence - Column Substitution
+// ============================================================================
+
+/// Recursively check if an expression contains a reference to a specific column.
+/// This handles nested expressions including function calls, AND/OR, prefix, etc.
+fn expression_contains_column(expr: &Expression, target_lower: &str) -> bool {
+    match expr {
+        // Direct column reference
+        Expression::Identifier(ident) => {
+            let col_lower = ident.value.to_lowercase();
+            col_lower == target_lower || extract_base_column_name(&ident.value) == target_lower
+        }
+        Expression::QualifiedIdentifier(qi) => {
+            let col_lower = qi.name.value.to_lowercase();
+            col_lower == target_lower || extract_base_column_name(&qi.name.value) == target_lower
+        }
+
+        // Function calls - check all arguments (e.g., LOWER(col), COALESCE(col, 0))
+        Expression::FunctionCall(fc) => fc
+            .arguments
+            .iter()
+            .any(|arg| expression_contains_column(arg, target_lower)),
+
+        // Infix expressions - check both sides (e.g., col + 1, col = value)
+        Expression::Infix(infix) => {
+            expression_contains_column(&infix.left, target_lower)
+                || expression_contains_column(&infix.right, target_lower)
+        }
+
+        // Prefix expressions - check inner (e.g., NOT col, -col)
+        Expression::Prefix(prefix) => expression_contains_column(&prefix.right, target_lower),
+
+        // IN expression - check the left side
+        Expression::In(in_expr) => expression_contains_column(&in_expr.left, target_lower),
+
+        // BETWEEN expression - check the main expression
+        Expression::Between(between) => expression_contains_column(&between.expr, target_lower),
+
+        // LIKE expression - check the left side
+        Expression::Like(like) => expression_contains_column(&like.left, target_lower),
+
+        // CASE expression - check condition and all branches
+        Expression::Case(case) => {
+            let in_value = case
+                .value
+                .as_ref()
+                .map(|e| expression_contains_column(e, target_lower))
+                .unwrap_or(false);
+            let in_branches = case.when_clauses.iter().any(|clause| {
+                expression_contains_column(&clause.condition, target_lower)
+                    || expression_contains_column(&clause.then_result, target_lower)
+            });
+            let in_else = case
+                .else_value
+                .as_ref()
+                .map(|e| expression_contains_column(e, target_lower))
+                .unwrap_or(false);
+            in_value || in_branches || in_else
+        }
+
+        // Cast expression - check inner expression
+        Expression::Cast(cast) => expression_contains_column(&cast.expr, target_lower),
+
+        // Subqueries - don't recurse into subqueries for this optimization
+        Expression::ScalarSubquery(_) | Expression::SubquerySource(_) => false,
+
+        // Literals and other terminals - no column reference
+        _ => false,
+    }
+}
+
+/// Check if a filter expression references a specific column (the join key).
+/// Returns true if the filter's main column matches the target column name.
+/// Handles IN, comparison, BETWEEN, LIKE, function calls, and nested expressions.
+///
+/// This is used for join key equivalence optimization: when a filter on the
+/// inner table's join key can be pushed to the outer table.
+pub fn filter_references_column(expr: &Expression, target_col: &str) -> bool {
+    let target_lower = target_col.to_lowercase();
+
+    match expr {
+        Expression::In(in_expr) => {
+            // Check if IN expression references the target column (direct or nested)
+            expression_contains_column(&in_expr.left, &target_lower)
+        }
+        Expression::Infix(infix) => {
+            // Handle AND/OR by checking both sides recursively
+            if infix.operator == "AND" || infix.operator == "OR" {
+                return filter_references_column(&infix.left, target_col)
+                    || filter_references_column(&infix.right, target_col);
+            }
+
+            // Check comparison expressions: col = value, LOWER(col) = 'x', etc.
+            expression_contains_column(&infix.left, &target_lower)
+                || expression_contains_column(&infix.right, &target_lower)
+        }
+        Expression::Between(between) => {
+            // Check if BETWEEN expression references the target column
+            expression_contains_column(&between.expr, &target_lower)
+        }
+        Expression::Like(like) => {
+            // Check if LIKE expression references the target column
+            expression_contains_column(&like.left, &target_lower)
+        }
+        Expression::Prefix(prefix) => {
+            // Handle NOT expression by checking inner (e.g., NOT col IS NULL)
+            filter_references_column(&prefix.right, target_col)
+        }
+        Expression::FunctionCall(fc) => {
+            // Function call at top level (rare, but handle it)
+            fc.arguments
+                .iter()
+                .any(|arg| expression_contains_column(arg, &target_lower))
+        }
+        _ => false,
+    }
+}
+
+/// Substitute a column reference in a filter expression with a new column name.
+/// This is used for join key equivalence: when filter `o.user_id IN (1,2,3)`
+/// can be transformed to `u.id IN (1,2,3)` based on join condition `u.id = o.user_id`.
+///
+/// Only handles simple cases where the column is directly referenced.
+/// Returns None if substitution is not possible.
+pub fn substitute_filter_column(
+    expr: &Expression,
+    from_col: &str,
+    to_col: &str,
+) -> Option<Expression> {
+    let from_lower = from_col.to_lowercase();
+    let from_base = extract_base_column_name(from_col);
+
+    match expr {
+        Expression::In(in_expr) => {
+            // Substitute column in IN expression
+            if let Some(col_name) = extract_column_name(&in_expr.left) {
+                let col_lower = col_name.to_lowercase();
+                let col_base = extract_base_column_name(&col_name);
+
+                if col_lower == from_lower || col_base == from_base {
+                    // Create new identifier with the target column name
+                    let new_left = create_column_identifier(to_col);
+                    return Some(Expression::In(InExpression {
+                        token: in_expr.token.clone(),
+                        left: Box::new(new_left),
+                        right: in_expr.right.clone(),
+                        not: in_expr.not,
+                    }));
+                }
+            }
+        }
+        Expression::Infix(infix) => {
+            // Substitute column in comparison expression
+            let left_col = extract_column_name(&infix.left);
+            let right_col = extract_column_name(&infix.right);
+
+            // Check if left side is the target column
+            if let Some(col_name) = &left_col {
+                let col_lower = col_name.to_lowercase();
+                let col_base = extract_base_column_name(col_name);
+
+                if col_lower == from_lower || col_base == from_base {
+                    let new_left = create_column_identifier(to_col);
+                    return Some(Expression::Infix(InfixExpression::new(
+                        infix.token.clone(),
+                        Box::new(new_left),
+                        infix.operator.clone(),
+                        infix.right.clone(),
+                    )));
+                }
+            }
+
+            // Check if right side is the target column (for value = col cases)
+            if let Some(col_name) = &right_col {
+                let col_lower = col_name.to_lowercase();
+                let col_base = extract_base_column_name(col_name);
+
+                if col_lower == from_lower || col_base == from_base {
+                    let new_right = create_column_identifier(to_col);
+                    return Some(Expression::Infix(InfixExpression::new(
+                        infix.token.clone(),
+                        infix.left.clone(),
+                        infix.operator.clone(),
+                        Box::new(new_right),
+                    )));
+                }
+            }
+        }
+        Expression::Between(between) => {
+            if let Some(col_name) = extract_column_name(&between.expr) {
+                let col_lower = col_name.to_lowercase();
+                let col_base = extract_base_column_name(&col_name);
+
+                if col_lower == from_lower || col_base == from_base {
+                    let new_expr = create_column_identifier(to_col);
+                    return Some(Expression::Between(BetweenExpression {
+                        token: between.token.clone(),
+                        expr: Box::new(new_expr),
+                        lower: between.lower.clone(),
+                        upper: between.upper.clone(),
+                        not: between.not,
+                    }));
+                }
+            }
+        }
+        Expression::Like(like) => {
+            if let Some(col_name) = extract_column_name(&like.left) {
+                let col_lower = col_name.to_lowercase();
+                let col_base = extract_base_column_name(&col_name);
+
+                if col_lower == from_lower || col_base == from_base {
+                    let new_left = create_column_identifier(to_col);
+                    return Some(Expression::Like(LikeExpression {
+                        token: like.token.clone(),
+                        left: Box::new(new_left),
+                        pattern: like.pattern.clone(),
+                        operator: like.operator.clone(),
+                        escape: like.escape.clone(),
+                    }));
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Create a column identifier expression from a column name.
+/// Handles qualified names (table.column) and unqualified names (column).
+fn create_column_identifier(col_name: &str) -> Expression {
+    if let Some(dot_idx) = col_name.find('.') {
+        let qualifier = &col_name[..dot_idx];
+        let name = &col_name[dot_idx + 1..];
+        Expression::QualifiedIdentifier(QualifiedIdentifier {
+            token: dummy_token(col_name, TokenType::Identifier),
+            qualifier: Box::new(Identifier::new(
+                dummy_token(qualifier, TokenType::Identifier),
+                qualifier.to_string(),
+            )),
+            name: Box::new(Identifier::new(
+                dummy_token(name, TokenType::Identifier),
+                name.to_string(),
+            )),
+        })
+    } else {
+        Expression::Identifier(Identifier::new(
+            dummy_token(col_name, TokenType::Identifier),
+            col_name.to_string(),
+        ))
+    }
+}

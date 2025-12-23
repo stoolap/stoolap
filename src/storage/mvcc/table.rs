@@ -272,6 +272,52 @@ impl MVCCTable {
             return Some(result);
         }
 
+        // OPTIMIZATION: Handle AND expressions with recursive index lookup
+        // For '(col1 IN (...)) AND (col2 IN (...))', process each operand and intersect results
+        // This is critical for semi-join optimization where we combine right_filter with IN clause
+        if let Some(and_operands) = expr.get_and_operands() {
+            let mut indexed_row_ids: Vec<Vec<i64>> = Vec::with_capacity(and_operands.len());
+
+            for operand in and_operands {
+                // Recursively try index lookup for each AND operand
+                // OPTIMIZATION: Don't sort here - defer sorting until we know intersection is needed
+                if let Some(row_ids) = self.try_index_lookup(operand.as_ref(), schema) {
+                    indexed_row_ids.push(row_ids);
+                }
+                // If an operand can't use an index, we'll still proceed with available indexes
+                // and the executor will handle memory filtering for the rest
+            }
+
+            // If at least one operand used an index, intersect and return the most restrictive result
+            // The executor will handle memory filtering for operands without index support
+            if !indexed_row_ids.is_empty() {
+                if indexed_row_ids.len() == 1 {
+                    // OPTIMIZATION: Single operand - no intersection needed, no sorting needed
+                    return Some(indexed_row_ids.into_iter().next().unwrap());
+                }
+
+                // OPTIMIZATION: Sort only when intersection is actually needed
+                // and use swap_remove(0) to take ownership instead of clone()
+                for row_ids in &mut indexed_row_ids {
+                    row_ids.sort_unstable();
+                }
+                indexed_row_ids.sort_by_key(|v| v.len());
+                let mut result = indexed_row_ids.swap_remove(0); // Take ownership, not clone
+                for other in &indexed_row_ids {
+                    result = intersect_sorted_ids(&result, other);
+                    // Early termination if intersection is empty
+                    if result.is_empty() {
+                        return Some(Vec::new());
+                    }
+                }
+                return Some(result);
+            }
+
+            // No operands could use indexes - fall through to other strategies
+            // Note: We don't return None here because the subsequent code might
+            // still be able to extract simple comparisons from the AND expression
+        }
+
         // OPTIMIZATION: Handle IN list expressions with direct index lookup
         // For 'col IN (a, b, c)', use get_row_ids_in for efficient multi-value lookup
         if let Some(in_list) = expr
