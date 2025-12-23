@@ -27,6 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use compact_str::CompactString;
+
 use crate::core::{DataType, Error, IndexType, Result, Row, Schema, Value};
 use crate::storage::mvcc::version_store::RowVersion;
 use crate::storage::mvcc::wal_manager::{WALEntry, WALManager, WALOperationType};
@@ -764,7 +766,7 @@ pub fn deserialize_value(data: &[u8]) -> Result<Value> {
             }
             let s = String::from_utf8(rest[4..4 + len].to_vec())
                 .map_err(|e| Error::internal(format!("invalid text: {}", e)))?;
-            Ok(Value::Text(Arc::from(s.as_str())))
+            Ok(Value::Text(CompactString::from(s.as_str())))
         }
         5 => {
             // Legacy timestamp format (RFC3339 string) - for backward compatibility

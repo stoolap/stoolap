@@ -21,10 +21,10 @@
 //! - `DashMap` for concurrent access (sharded, lock-free reads)
 
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::collections::BTreeMap;
 use std::hash::BuildHasherDefault;
-use std::sync::RwLock;
 
 /// Type alias for FxHash's BuildHasher
 pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
@@ -84,25 +84,24 @@ pub type ConcurrentUInt64Map<V> = DashMap<u64, V, FxBuildHasher>;
 /// Concurrent hash map for usize keys
 pub type ConcurrentUsizeMap<V> = DashMap<usize, V, FxBuildHasher>;
 
-/// Ordered concurrent map for i64 keys using RwLock<BTreeMap>
+/// Ordered concurrent map for i64 keys using parking_lot::RwLock<BTreeMap>
 ///
-/// Provides ordered iteration without sorting overhead. Best for workloads
-/// that need ordered scans but have single-writer semantics (like MVCC).
+/// Uses BTreeMap for ordered iteration and O(log n) lookups.
+/// Better for large datasets (1M+ rows) due to memory efficiency.
 ///
 /// Performance characteristics:
 /// - Ordered iteration: O(n) - no sorting needed
 /// - Point lookup: O(log n)
-/// - Insert: O(log n) under write lock
+/// - Insert: O(log n)
 ///
 /// # Example
 /// ```
 /// use stoolap::common::OrderedInt64Map;
-/// use std::collections::BTreeMap;
-/// use std::sync::RwLock;
+/// use stoolap::common::new_ordered_int64_map;
 ///
-/// let map: OrderedInt64Map<String> = RwLock::new(BTreeMap::new());
-/// map.write().unwrap().insert(42, "hello".to_string());
-/// assert_eq!(map.read().unwrap().get(&42), Some(&"hello".to_string()));
+/// let map: OrderedInt64Map<String> = new_ordered_int64_map();
+/// map.write().insert(42, "hello".to_string());
+/// assert_eq!(map.read().get(&42), Some(&"hello".to_string()));
 /// ```
 pub type OrderedInt64Map<V> = RwLock<BTreeMap<i64, V>>;
 

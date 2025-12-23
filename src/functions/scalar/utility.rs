@@ -336,7 +336,7 @@ impl ScalarFunction for IifFunction {
             Value::Boolean(b) => *b,
             Value::Integer(i) => *i != 0,
             Value::Float(f) => *f != 0.0,
-            Value::Text(s) => !s.is_empty() && s.to_lowercase() != "false" && s.as_ref() != "0",
+            Value::Text(s) => !s.is_empty() && s.to_lowercase() != "false" && s.as_str() != "0",
             Value::Null(_) => false,
             _ => false,
         };

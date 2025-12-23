@@ -21,6 +21,8 @@
 
 use std::sync::Arc;
 
+use compact_str::CompactString;
+
 use crate::core::{Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
@@ -73,7 +75,7 @@ impl ScalarFunction for CastFunction {
         // Handle NULL values
         if value.is_null() {
             return match target_type.as_str() {
-                "STRING" | "TEXT" | "VARCHAR" | "CHAR" => Ok(Value::Text(Arc::from(""))),
+                "STRING" | "TEXT" | "VARCHAR" | "CHAR" => Ok(Value::Text(CompactString::from(""))),
                 "INT" | "INTEGER" => Ok(Value::Integer(0)),
                 "FLOAT" | "REAL" | "DOUBLE" => Ok(Value::Float(0.0)),
                 "BOOLEAN" | "BOOL" => Ok(Value::Boolean(false)),
@@ -156,15 +158,17 @@ fn cast_to_float(value: &Value) -> Result<Value> {
 fn cast_to_string(value: &Value) -> Result<Value> {
     match value {
         Value::Text(s) => Ok(Value::Text(s.clone())),
-        Value::Integer(i) => Ok(Value::Text(Arc::from(i.to_string().as_str()))),
+        Value::Integer(i) => Ok(Value::Text(CompactString::from(i.to_string().as_str()))),
         Value::Float(f) => {
             // Format with up to 6 decimal places
-            Ok(Value::Text(Arc::from(format!("{:.6}", f).as_str())))
+            Ok(Value::Text(CompactString::from(
+                format!("{:.6}", f).as_str(),
+            )))
         }
-        Value::Boolean(b) => Ok(Value::Text(Arc::from(b.to_string().as_str()))),
-        Value::Timestamp(t) => Ok(Value::Text(Arc::from(t.to_rfc3339().as_str()))),
-        Value::Json(j) => Ok(Value::Text(j.clone())),
-        Value::Null(_) => Ok(Value::Text(Arc::from(""))),
+        Value::Boolean(b) => Ok(Value::Text(CompactString::from(b.to_string().as_str()))),
+        Value::Timestamp(t) => Ok(Value::Text(CompactString::from(t.to_rfc3339().as_str()))),
+        Value::Json(j) => Ok(Value::Text(CompactString::from(j.as_ref()))),
+        Value::Null(_) => Ok(Value::Text(CompactString::from(""))),
     }
 }
 
@@ -226,7 +230,7 @@ fn cast_to_timestamp(value: &Value) -> Result<Value> {
 fn cast_to_json(value: &Value) -> Result<Value> {
     match value {
         Value::Json(j) => Ok(Value::Json(j.clone())),
-        Value::Text(s) => Ok(Value::Json(s.clone())),
+        Value::Text(s) => Ok(Value::Json(Arc::from(s.as_str()))),
         Value::Integer(i) => Ok(Value::Json(Arc::from(i.to_string().as_str()))),
         Value::Float(f) => Ok(Value::Json(Arc::from(f.to_string().as_str()))),
         Value::Boolean(b) => Ok(Value::Json(Arc::from(b.to_string().as_str()))),
@@ -299,7 +303,7 @@ impl ScalarFunction for CollateFunction {
 
         // Apply collation
         let result = apply_collation(&s, &collation)?;
-        Ok(Value::Text(Arc::from(result.as_str())))
+        Ok(Value::Text(CompactString::from(result.as_str())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {

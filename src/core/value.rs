@@ -23,6 +23,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use compact_str::CompactString;
 
 use super::error::{Error, Result};
 use super::types::DataType;
@@ -54,8 +55,9 @@ const TIME_FORMATS: &[&str] = &[
 /// Each variant carries its data directly, avoiding the need for interface
 /// indirection or separate value references.
 ///
-/// Note: Text and Json use Arc<str> for cheap cloning during row operations.
-/// This is critical for scan performance where rows are cloned frequently.
+/// Note: Text uses CompactString for inline storage of strings up to 24 bytes.
+/// This avoids heap allocation for most typical database column values.
+/// Json still uses Arc<str> for potentially large documents.
 #[derive(Debug, Clone)]
 pub enum Value {
     /// NULL value with optional type hint
@@ -67,8 +69,8 @@ pub enum Value {
     /// 64-bit floating point
     Float(f64),
 
-    /// UTF-8 text string (Arc for cheap cloning)
-    Text(Arc<str>),
+    /// UTF-8 text string (CompactString for inline small strings)
+    Text(CompactString),
 
     /// Boolean value
     Boolean(bool),
@@ -107,12 +109,12 @@ impl Value {
 
     /// Create a text value
     pub fn text(value: impl Into<String>) -> Self {
-        Value::Text(Arc::from(value.into().as_str()))
+        Value::Text(CompactString::from(value.into().as_str()))
     }
 
-    /// Create a text value from Arc<str> (zero-copy)
+    /// Create a text value from Arc<str>
     pub fn text_arc(value: Arc<str>) -> Self {
-        Value::Text(value)
+        Value::Text(CompactString::from(value.as_ref()))
     }
 
     /// Create a boolean value
@@ -244,15 +246,17 @@ impl Value {
     /// Extract as string reference (avoids clone for Text/Json)
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Value::Text(s) | Value::Json(s) => Some(s),
+            Value::Text(s) => Some(s.as_str()),
+            Value::Json(s) => Some(s.as_ref()),
             _ => None,
         }
     }
 
-    /// Extract as Arc<str> (cheap clone for Text/Json)
+    /// Extract as Arc<str> (creates Arc for Text, cheap clone for Json)
     pub fn as_arc_str(&self) -> Option<Arc<str>> {
         match self {
-            Value::Text(s) | Value::Json(s) => Some(Arc::clone(s)),
+            Value::Text(s) => Some(Arc::from(s.as_str())),
+            Value::Json(s) => Some(Arc::clone(s)),
             _ => None,
         }
     }
@@ -377,9 +381,9 @@ impl Value {
                     }
                     DataType::Text => {
                         if let Some(s) = v.downcast_ref::<String>() {
-                            Value::Text(Arc::from(s.as_str()))
+                            Value::Text(CompactString::from(s.as_str()))
                         } else if let Some(&s) = v.downcast_ref::<&str>() {
-                            Value::Text(Arc::from(s))
+                            Value::Text(CompactString::from(s))
                         } else {
                             Value::Null(data_type)
                         }
@@ -478,12 +482,14 @@ impl Value {
             DataType::Text => {
                 // Convert to TEXT - everything can become text
                 match self {
-                    Value::Text(s) => Value::Text(Arc::clone(s)),
-                    Value::Integer(v) => Value::Text(Arc::from(v.to_string().as_str())),
-                    Value::Float(v) => Value::Text(Arc::from(format_float(*v).as_str())),
-                    Value::Boolean(b) => Value::Text(Arc::from(if *b { "true" } else { "false" })),
-                    Value::Timestamp(t) => Value::Text(Arc::from(t.to_rfc3339().as_str())),
-                    Value::Json(s) => Value::Text(Arc::clone(s)),
+                    Value::Text(s) => Value::Text(s.clone()),
+                    Value::Integer(v) => Value::Text(CompactString::from(v.to_string())),
+                    Value::Float(v) => Value::Text(CompactString::from(format_float(*v))),
+                    Value::Boolean(b) => {
+                        Value::Text(CompactString::from(if *b { "true" } else { "false" }))
+                    }
+                    Value::Timestamp(t) => Value::Text(CompactString::from(t.to_rfc3339())),
+                    Value::Json(s) => Value::Text(CompactString::from(s.as_ref())),
                     Value::Null(_) => Value::Null(target_type),
                 }
             }
@@ -542,8 +548,8 @@ impl Value {
                     Value::Json(s) => Value::Json(Arc::clone(s)),
                     Value::Text(s) => {
                         // Validate JSON
-                        if serde_json::from_str::<serde_json::Value>(s).is_ok() {
-                            Value::Json(Arc::clone(s))
+                        if serde_json::from_str::<serde_json::Value>(s.as_str()).is_ok() {
+                            Value::Json(Arc::from(s.as_str()))
                         } else {
                             Value::Null(target_type)
                         }
@@ -596,11 +602,13 @@ impl Value {
             },
             DataType::Text => match self {
                 Value::Text(s) => Value::Text(s),
-                Value::Integer(v) => Value::Text(Arc::from(v.to_string().as_str())),
-                Value::Float(v) => Value::Text(Arc::from(format_float(v).as_str())),
-                Value::Boolean(b) => Value::Text(Arc::from(if b { "true" } else { "false" })),
-                Value::Timestamp(t) => Value::Text(Arc::from(t.to_rfc3339().as_str())),
-                Value::Json(s) => Value::Text(s),
+                Value::Integer(v) => Value::Text(CompactString::from(v.to_string())),
+                Value::Float(v) => Value::Text(CompactString::from(format_float(v))),
+                Value::Boolean(b) => {
+                    Value::Text(CompactString::from(if b { "true" } else { "false" }))
+                }
+                Value::Timestamp(t) => Value::Text(CompactString::from(t.to_rfc3339())),
+                Value::Json(s) => Value::Text(CompactString::from(s.as_ref())),
                 Value::Null(_) => Value::Null(target_type),
             },
             DataType::Boolean => match &self {
@@ -645,8 +653,8 @@ impl Value {
             DataType::Json => match self {
                 Value::Json(s) => Value::Json(s),
                 Value::Text(s) => {
-                    if serde_json::from_str::<serde_json::Value>(&s).is_ok() {
-                        Value::Json(s)
+                    if serde_json::from_str::<serde_json::Value>(s.as_str()).is_ok() {
+                        Value::Json(Arc::from(s.as_str()))
                     } else {
                         Value::Null(target_type)
                     }
@@ -925,19 +933,19 @@ impl From<f32> for Value {
 
 impl From<String> for Value {
     fn from(v: String) -> Self {
-        Value::Text(Arc::from(v.as_str()))
+        Value::Text(CompactString::from(v))
     }
 }
 
 impl From<&str> for Value {
     fn from(v: &str) -> Self {
-        Value::Text(Arc::from(v))
+        Value::Text(CompactString::from(v))
     }
 }
 
 impl From<Arc<str>> for Value {
     fn from(v: Arc<str>) -> Self {
-        Value::Text(v)
+        Value::Text(CompactString::from(v.as_ref()))
     }
 }
 

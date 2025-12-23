@@ -157,6 +157,43 @@ impl JoinHashTable {
         table
     }
 
+    /// Build hash table and populate bloom filter in a single pass.
+    ///
+    /// This is more efficient than building separately because we only
+    /// extract and hash key values once for both structures.
+    ///
+    /// # Arguments
+    /// * `rows` - Build side rows
+    /// * `key_indices` - Indices of join key columns
+    /// * `bloom_builder` - Bloom filter builder to populate
+    ///
+    /// # Returns
+    /// The built hash table (bloom filter is populated in-place)
+    pub fn build_with_bloom(
+        rows: &[Row],
+        key_indices: &[usize],
+        bloom_builder: &mut crate::optimizer::bloom::BloomFilterBuilder,
+    ) -> Self {
+        let mut table = Self::with_capacity(rows.len());
+
+        for (idx, row) in rows.iter().enumerate() {
+            // Extract keys and compute hash once
+            let hash = hash_row_keys(row, key_indices);
+
+            // Insert into hash table
+            table.insert(hash, idx as u32);
+
+            // Insert into bloom filter using the same key values
+            for &key_idx in key_indices {
+                if let Some(value) = row.get(key_idx) {
+                    bloom_builder.insert(value);
+                }
+            }
+        }
+
+        table
+    }
+
     /// Insert a row index with its pre-computed hash.
     ///
     /// # Arguments

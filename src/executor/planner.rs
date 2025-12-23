@@ -374,7 +374,7 @@ impl QueryPlanner {
                             avg_width: row.get(7).and_then(|v| v.as_int64()).unwrap_or(8) as usize,
                             histogram,
                         };
-                        stats.insert(col_name.to_lowercase(), col_stats);
+                        stats.insert(col_name.to_lowercase().to_string(), col_stats);
                     }
                 }
             }

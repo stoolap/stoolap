@@ -48,6 +48,7 @@
 //! See `executor/result.rs` and `expression/evaluator_bridge.rs` for the
 //! recommended execution model.
 
+pub mod bloom_filter;
 pub mod hash_join;
 pub mod index_nested_loop;
 pub mod merge_join;
@@ -55,6 +56,7 @@ pub mod nested_loop_join;
 pub mod streaming_group_by;
 
 // Re-export all operators and types
+pub use bloom_filter::BloomFilterOperator;
 pub use hash_join::{HashJoinOperator, JoinSide, JoinType};
 pub use index_nested_loop::{
     BatchIndexNestedLoopJoinOperator, IndexLookupStrategy, IndexNestedLoopJoinOperator,

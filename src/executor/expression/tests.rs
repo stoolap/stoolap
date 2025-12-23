@@ -18,6 +18,8 @@ use ahash::AHashSet;
 
 use std::sync::Arc;
 
+use compact_str::CompactString;
+
 use super::compiler::{CompileContext, ExprCompiler};
 use super::ops::{CompiledPattern, Op};
 use super::program::Program;
@@ -237,13 +239,13 @@ fn test_like_pattern() {
     ]);
 
     // Match
-    let row = vec![Value::Text(Arc::from("testing"))];
+    let row = vec![Value::Text(CompactString::from("testing"))];
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
     // No match
-    let row = vec![Value::Text(Arc::from("other"))];
+    let row = vec![Value::Text(CompactString::from("other"))];
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
@@ -277,28 +279,28 @@ fn test_coalesce() {
     let program = Program::new(vec![
         Op::LoadColumn(0),
         Op::LoadColumn(1),
-        Op::LoadConst(Value::Text(Arc::from("default"))),
+        Op::LoadConst(Value::Text(CompactString::from("default"))),
         Op::Coalesce(3),
         Op::Return,
     ]);
 
     // First non-null
     let row = vec![
-        Value::Text(Arc::from("first")),
-        Value::Text(Arc::from("second")),
+        Value::Text(CompactString::from("first")),
+        Value::Text(CompactString::from("second")),
     ];
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
-    assert_eq!(result, Value::Text(Arc::from("first")));
+    assert_eq!(result, Value::Text(CompactString::from("first")));
 
     // Second non-null
     let row = vec![
         Value::Null(crate::core::DataType::Text),
-        Value::Text(Arc::from("second")),
+        Value::Text(CompactString::from("second")),
     ];
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
-    assert_eq!(result, Value::Text(Arc::from("second")));
+    assert_eq!(result, Value::Text(CompactString::from("second")));
 
     // Default
     let row = vec![
@@ -307,7 +309,7 @@ fn test_coalesce() {
     ];
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
-    assert_eq!(result, Value::Text(Arc::from("default")));
+    assert_eq!(result, Value::Text(CompactString::from("default")));
 }
 
 #[test]

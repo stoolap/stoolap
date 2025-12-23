@@ -95,6 +95,7 @@
 use crate::core::{Result, Row, Value};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::RowFilter;
+use crate::executor::hash_table::JoinHashTable;
 use crate::executor::operator::{ColumnInfo, MaterializedOperator, Operator};
 use crate::executor::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
 use crate::executor::operators::merge_join::MergeJoinOperator;
@@ -104,6 +105,7 @@ use crate::executor::parallel::{
 };
 use crate::executor::planner::{RuntimeJoinAlgorithm, RuntimeJoinDecision};
 use crate::executor::utils::{extract_join_keys_and_residual, is_sorted_on_keys};
+use crate::optimizer::bloom::RuntimeBloomFilter;
 use crate::parser::ast::Expression;
 
 /// LIMIT threshold below which streaming execution is preferred over parallel.
@@ -181,6 +183,50 @@ pub struct JoinRequest<'a> {
     pub algorithm_hint: Option<&'a RuntimeJoinDecision>,
 }
 
+/// Request to execute a streaming hash join.
+///
+/// Unlike `JoinRequest`, this takes a streaming operator for the probe side,
+/// enabling true streaming without full materialization. This is optimal for
+/// LIMIT queries where early termination can stop the probe scan early.
+///
+/// # Memory Model
+///
+/// - **Build side**: Fully materialized (required for hash table construction)
+/// - **Probe side**: Streams row-by-row from the operator (O(1) memory)
+///
+/// # When to Use
+///
+/// Use `StreamingJoinRequest` when:
+/// - Query has LIMIT (early termination benefit)
+/// - Probe side is large (avoid full materialization)
+/// - Join algorithm is Hash Join
+pub struct StreamingJoinRequest<'a> {
+    /// Build side rows (must be materialized for hash table construction).
+    pub build_rows: Vec<Row>,
+    /// Build side column names.
+    pub build_columns: &'a [String],
+    /// Probe side as streaming operator (NOT materialized).
+    pub probe_source: Box<dyn Operator>,
+    /// Probe side column names.
+    pub probe_columns: Vec<String>,
+    /// Join condition (if any).
+    pub condition: Option<&'a Expression>,
+    /// Join type string (INNER, LEFT, RIGHT, FULL, CROSS).
+    pub join_type: &'a str,
+    /// Whether build side is left (false = build is right).
+    pub build_is_left: bool,
+    /// LIMIT for early termination.
+    pub limit: Option<u64>,
+    /// Execution context for expression evaluation.
+    pub ctx: &'a ExecutionContext,
+    /// Optional bloom filter built from build side keys.
+    /// When provided, probe rows are filtered before hash lookup.
+    pub bloom_filter: Option<RuntimeBloomFilter>,
+    /// Pre-built hash table (if available). When provided, skips the hash table
+    /// build phase in HashJoinOperator, avoiding double iteration of build_rows.
+    pub pre_built_hash_table: Option<JoinHashTable>,
+}
+
 /// Modern streaming join executor.
 ///
 /// Uses Volcano-style operators for efficient join execution with:
@@ -252,6 +298,131 @@ impl JoinExecutor {
                 &analysis.join_type_str,
                 request.limit,
             )?,
+        };
+
+        Ok(JoinResult {
+            rows,
+            columns: all_columns,
+        })
+    }
+
+    /// Execute a streaming hash join where probe side streams from an operator.
+    ///
+    /// This is the optimized path for LIMIT queries:
+    /// - Build side is materialized (required for hash table)
+    /// - Probe side streams row-by-row (O(1) memory)
+    /// - Early termination stops probe scan immediately when LIMIT is reached
+    ///
+    /// # Performance
+    ///
+    /// For `SELECT ... JOIN ... LIMIT 10`:
+    /// - **Old path**: Materialize 10M + 10M rows, then return 10
+    /// - **This path**: Materialize 10M rows, stream until 10 matches
+    ///
+    /// Memory usage is halved, and early termination actually stops work.
+    pub fn execute_streaming(&self, request: StreamingJoinRequest<'_>) -> Result<JoinResult> {
+        // Build combined column list based on build side position
+        let (left_columns, right_columns) = if request.build_is_left {
+            (
+                request.build_columns.to_vec(),
+                request.probe_columns.clone(),
+            )
+        } else {
+            (
+                request.probe_columns.clone(),
+                request.build_columns.to_vec(),
+            )
+        };
+
+        let mut all_columns = left_columns.clone();
+        all_columns.extend(right_columns.iter().cloned());
+
+        // Analyze the join condition
+        let analysis = self.analyze(
+            &left_columns,
+            &right_columns,
+            request.condition,
+            request.join_type,
+        );
+
+        // Probe side is already a streaming operator
+        let probe_op = request.probe_source;
+
+        let build_side = if request.build_is_left {
+            JoinSide::Left
+        } else {
+            JoinSide::Right
+        };
+
+        // Create hash join operator - use pre-built hash table if available
+        let mut join_op = if let Some(hash_table) = request.pre_built_hash_table {
+            // Fast path: hash table already built (avoids double iteration of build_rows)
+            HashJoinOperator::with_prebuilt(
+                probe_op,
+                request.build_rows,
+                hash_table,
+                analysis.join_type,
+                analysis.left_key_indices.clone(),
+                analysis.right_key_indices.clone(),
+                request.build_is_left,
+            )
+        } else {
+            // Standard path: build hash table during open()
+            let build_schema: Vec<ColumnInfo> =
+                request.build_columns.iter().map(ColumnInfo::new).collect();
+            let build_op = Box::new(MaterializedOperator::new(request.build_rows, build_schema));
+
+            let (left_op, right_op): (Box<dyn Operator>, Box<dyn Operator>) =
+                if request.build_is_left {
+                    (build_op, probe_op)
+                } else {
+                    (probe_op, build_op)
+                };
+
+            HashJoinOperator::new(
+                left_op,
+                right_op,
+                analysis.join_type,
+                analysis.left_key_indices.clone(),
+                analysis.right_key_indices.clone(),
+                build_side,
+            )
+        };
+
+        // Compile residual filters for inline application (INNER JOINs only)
+        let is_inner = !analysis.join_type_str.contains("LEFT")
+            && !analysis.join_type_str.contains("RIGHT")
+            && !analysis.join_type_str.contains("FULL");
+
+        let residual_filters: Vec<RowFilter> = if is_inner {
+            analysis
+                .residual_conditions
+                .iter()
+                .map(|cond| RowFilter::new(cond, &all_columns).map(|f| f.with_context(request.ctx)))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+
+        // Execute with Volcano model - this is where true streaming happens!
+        let rows =
+            self.execute_operator_with_filter(&mut join_op, request.limit, &residual_filters)?;
+
+        // Apply residual conditions for OUTER joins (after iteration)
+        let left_col_count = left_columns.len();
+        let right_col_count = right_columns.len();
+        let rows = if !is_inner && !analysis.residual_conditions.is_empty() {
+            self.apply_residual_post_join(
+                rows,
+                &analysis.residual_conditions,
+                &all_columns,
+                &analysis.join_type_str,
+                left_col_count,
+                right_col_count,
+                request.ctx,
+            )?
+        } else {
+            rows
         };
 
         Ok(JoinResult {

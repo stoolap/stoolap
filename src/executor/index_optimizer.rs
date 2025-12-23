@@ -256,6 +256,184 @@ impl Executor {
         None
     }
 
+    /// Check if all window functions in the statement are safe for LIMIT pushdown.
+    ///
+    /// Safe functions (don't depend on total row count):
+    /// - ROW_NUMBER, RANK, DENSE_RANK
+    /// - LAG, LEAD
+    /// - FIRST_VALUE, LAST_VALUE, NTH_VALUE
+    ///
+    /// Unsafe functions (depend on total row count):
+    /// - NTILE (bucket size depends on total count)
+    /// - PERCENT_RANK (formula: (rank-1)/(total-1))
+    /// - CUME_DIST (formula: rows_up_to_current/total)
+    pub(crate) fn is_window_safe_for_limit_pushdown(stmt: &SelectStatement) -> bool {
+        for col_expr in &stmt.columns {
+            if !Self::is_expr_window_safe(col_expr) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Check if a single expression's window function (if any) is safe for LIMIT pushdown
+    /// Recursively checks all nested expressions for unsafe window functions
+    fn is_expr_window_safe(expr: &Expression) -> bool {
+        match expr {
+            Expression::Window(window_expr) => {
+                let func_name = window_expr.function.function.to_uppercase();
+                // These functions depend on total row count - NOT safe
+                !matches!(func_name.as_str(), "NTILE" | "PERCENT_RANK" | "CUME_DIST")
+            }
+            Expression::Aliased(aliased) => Self::is_expr_window_safe(&aliased.expression),
+            // Recursively check expressions that can contain window functions
+            Expression::Case(case_expr) => {
+                // Check operand if present (simple CASE expression)
+                if let Some(value) = &case_expr.value {
+                    if !Self::is_expr_window_safe(value) {
+                        return false;
+                    }
+                }
+                // Check all WHEN conditions and results
+                for when_clause in &case_expr.when_clauses {
+                    if !Self::is_expr_window_safe(&when_clause.condition)
+                        || !Self::is_expr_window_safe(&when_clause.then_result)
+                    {
+                        return false;
+                    }
+                }
+                // Check ELSE clause if present
+                if let Some(else_expr) = &case_expr.else_value {
+                    if !Self::is_expr_window_safe(else_expr) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Expression::FunctionCall(func) => {
+                // Check all function arguments
+                func.arguments.iter().all(Self::is_expr_window_safe)
+            }
+            Expression::Infix(infix) => {
+                // Check both sides of binary expression (e.g., window_func + 1)
+                Self::is_expr_window_safe(&infix.left) && Self::is_expr_window_safe(&infix.right)
+            }
+            Expression::Cast(cast) => Self::is_expr_window_safe(&cast.expr),
+            Expression::Prefix(prefix) => Self::is_expr_window_safe(&prefix.right),
+            Expression::ScalarSubquery(_) => {
+                // Scalar subqueries have their own evaluation context, their window functions
+                // don't affect the outer query's LIMIT pushdown safety
+                true
+            }
+            Expression::In(in_expr) => {
+                // Check the left expression and right expression (which contains the list)
+                Self::is_expr_window_safe(&in_expr.left)
+                    && Self::is_expr_window_safe(&in_expr.right)
+            }
+            Expression::Between(between) => {
+                Self::is_expr_window_safe(&between.expr)
+                    && Self::is_expr_window_safe(&between.lower)
+                    && Self::is_expr_window_safe(&between.upper)
+            }
+            Expression::List(list) => {
+                // Check all expressions in the list
+                list.elements.iter().all(Self::is_expr_window_safe)
+            }
+            Expression::ExpressionList(expr_list) => {
+                // Check all expressions in the list
+                expr_list.expressions.iter().all(Self::is_expr_window_safe)
+            }
+            Expression::Like(like) => {
+                Self::is_expr_window_safe(&like.left)
+                    && Self::is_expr_window_safe(&like.pattern)
+                    && like
+                        .escape
+                        .as_ref()
+                        .is_none_or(|e| Self::is_expr_window_safe(e))
+            }
+            Expression::Exists(_) | Expression::AllAny(_) => {
+                // EXISTS and ALL/ANY have their own subquery context
+                true
+            }
+            Expression::Distinct(distinct) => Self::is_expr_window_safe(&distinct.expr),
+            // Leaf expressions - no nested window functions
+            Expression::Identifier(_)
+            | Expression::QualifiedIdentifier(_)
+            | Expression::IntegerLiteral(_)
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::Parameter(_)
+            | Expression::IntervalLiteral(_)
+            | Expression::Star(_)
+            | Expression::QualifiedStar(_)
+            | Expression::Default(_)
+            | Expression::InHashSet(_)
+            | Expression::TableSource(_)
+            | Expression::JoinSource(_)
+            | Expression::SubquerySource(_)
+            | Expression::ValuesSource(_)
+            | Expression::CteReference(_) => true,
+        }
+    }
+
+    /// Check if an expression contains an equality condition (for hash join eligibility).
+    ///
+    /// Returns true if the expression contains at least one `=` comparison
+    /// that is NOT `!=`, `<>`, `>=`, or `<=`. This is used to determine if
+    /// streaming hash join can be used.
+    pub(crate) fn has_equality_condition(expr: &Expression) -> bool {
+        match expr {
+            // Direct equality comparison: col1 = col2
+            Expression::Infix(infix) => {
+                let op = infix.operator.as_str();
+                if op == "=" {
+                    // This is a pure equality, not >=, <=, !=, <>
+                    return true;
+                }
+                // Recurse into AND/OR branches
+                if op.eq_ignore_ascii_case("AND") || op.eq_ignore_ascii_case("OR") {
+                    return Self::has_equality_condition(&infix.left)
+                        || Self::has_equality_condition(&infix.right);
+                }
+                false
+            }
+            // Note: The parser inlines parenthesized expressions, so no Grouped variant needed
+            _ => false,
+        }
+    }
+
+    /// Estimate cardinality of a table expression for join build side selection.
+    ///
+    /// Uses table statistics and filter selectivity to estimate output rows.
+    /// Returns u64::MAX for complex expressions (subqueries, CTEs) that can't be estimated.
+    ///
+    /// This is used to choose the smaller side as build in streaming hash joins.
+    pub(crate) fn estimate_table_expr_cardinality(
+        &self,
+        expr: &Expression,
+        filter: Option<&Expression>,
+    ) -> u64 {
+        // Extract table name from expression
+        let table_name = match expr {
+            Expression::TableSource(ts) => ts.name.value.to_lowercase(),
+            Expression::Aliased(aliased) => {
+                if let Expression::TableSource(ts) = aliased.expression.as_ref() {
+                    ts.name.value.to_lowercase()
+                } else {
+                    return u64::MAX; // Can't estimate subqueries/complex sources
+                }
+            }
+            _ => return u64::MAX, // Can't estimate joins, subqueries, CTEs
+        };
+
+        // Use the planner's estimate_scan_rows for accurate estimation
+        self.get_query_planner()
+            .estimate_scan_rows(&table_name, filter)
+            .unwrap_or(u64::MAX)
+    }
+
     /// Find window ORDER BY info in an expression
     fn find_window_order_in_expr(expr: &Expression) -> Option<(String, bool)> {
         match expr {

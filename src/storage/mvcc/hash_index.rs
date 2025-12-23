@@ -61,7 +61,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
-use ahash::AHashMap;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
@@ -114,16 +114,16 @@ pub struct HashIndex {
     /// Hash -> row IDs mapping
     /// Uses u64 hash key to avoid storing full values (memory efficient)
     /// SmallVec<[i64; 4]> avoids heap allocation for 1-4 matches (common case)
-    hash_to_rows: RwLock<AHashMap<u64, SmallVec<[i64; 4]>>>,
+    hash_to_rows: RwLock<FxHashMap<u64, SmallVec<[i64; 4]>>>,
 
     /// Row ID -> hash mapping for efficient removal
-    /// Needed because we can't recompute hash from row_id alone
-    row_to_hash: RwLock<AHashMap<i64, u64>>,
+    /// Uses FxHashMap for O(1) lookups (optimized for integer keys)
+    row_to_hash: RwLock<FxHashMap<i64, u64>>,
 
     /// Full values storage for hash collision handling and unique constraint checking
     /// Maps hash -> (values, row_ids) for collision resolution
     #[allow(clippy::type_complexity)]
-    hash_to_values: RwLock<AHashMap<u64, Vec<(Vec<Value>, SmallVec<[i64; 4]>)>>>,
+    hash_to_values: RwLock<FxHashMap<u64, Vec<(Vec<Value>, SmallVec<[i64; 4]>)>>>,
 }
 
 impl std::fmt::Debug for HashIndex {
@@ -157,9 +157,9 @@ impl HashIndex {
             data_types,
             is_unique,
             closed: AtomicBool::new(false),
-            hash_to_rows: RwLock::new(AHashMap::new()),
-            row_to_hash: RwLock::new(AHashMap::new()),
-            hash_to_values: RwLock::new(AHashMap::new()),
+            hash_to_rows: RwLock::new(FxHashMap::default()),
+            row_to_hash: RwLock::new(FxHashMap::default()),
+            hash_to_values: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -170,7 +170,7 @@ impl HashIndex {
         values: &[Value],
         row_id: i64,
         hash: u64,
-        hash_to_values: &AHashMap<u64, Vec<(Vec<Value>, SmallVec<[i64; 4]>)>>,
+        hash_to_values: &FxHashMap<u64, Vec<(Vec<Value>, SmallVec<[i64; 4]>)>>,
     ) -> Result<()> {
         if !self.is_unique {
             return Ok(());

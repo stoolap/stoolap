@@ -33,8 +33,8 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::common::{
-    new_concurrent_int64_map, new_concurrent_int64_map_with_capacity, new_int64_map,
-    new_int64_map_with_capacity, ConcurrentInt64Map, Int64Map,
+    new_concurrent_int64_map, new_int64_map, new_int64_map_with_capacity, new_ordered_int64_map,
+    ConcurrentInt64Map, Int64Map, OrderedInt64Map,
 };
 use crate::core::{Error, Row, Schema, Value};
 use crate::storage::expression::CompiledFilter;
@@ -42,7 +42,7 @@ use crate::storage::mvcc::arena::RowArena;
 use crate::storage::mvcc::get_fast_timestamp;
 use crate::storage::mvcc::streaming_result::{StreamingResult, VisibleRowInfo};
 use crate::storage::Index;
-use radsort::sort_by_key;
+// radsort removed - BTreeMap iteration is already ordered
 use rustc_hash::FxHashMap;
 
 /// Represents a specific version of a row with complete data
@@ -225,8 +225,8 @@ pub trait VisibilityChecker: Send + Sync {
 /// - Returning slices instead of clones during iteration
 /// - Eliminating per-row allocation overhead
 pub struct VersionStore {
-    /// Row versions indexed by row ID (concurrent hash map for fast lookups)
-    versions: ConcurrentInt64Map<VersionChainEntry>,
+    /// Row versions indexed by row ID (ordered map for sorted iteration)
+    versions: OrderedInt64Map<VersionChainEntry>,
     /// The name of the table this store belongs to
     table_name: String,
     /// Table schema
@@ -267,14 +267,13 @@ impl VersionStore {
         expected_rows: usize,
     ) -> Self {
         let cols = schema.column_count();
-        let (versions, row_arena_index) = if expected_rows > 0 {
-            (
-                new_concurrent_int64_map_with_capacity(expected_rows),
-                RwLock::new(new_int64_map_with_capacity(expected_rows)),
-            )
+        // BTreeMap doesn't support capacity hints, but row_arena_index (HashMap) does
+        let row_arena_index = if expected_rows > 0 {
+            RwLock::new(new_int64_map_with_capacity(expected_rows))
         } else {
-            (new_concurrent_int64_map(), RwLock::new(new_int64_map()))
+            RwLock::new(new_int64_map())
         };
+        let versions = new_ordered_int64_map();
 
         Self {
             versions,
@@ -361,9 +360,11 @@ impl VersionStore {
             return;
         }
 
+        // Use write lock for the entire operation (MVCC single-writer semantics)
+        let mut versions = self.versions.write();
+
         // Check if existing version exists first
-        let existing_data = self
-            .versions
+        let existing_data = versions
             .get(&row_id)
             .map(|e| (e.version.clone(), e.prev.clone(), e.arena_idx));
 
@@ -431,7 +432,7 @@ impl VersionStore {
                 }
             };
 
-        self.versions.insert(row_id, entry);
+        versions.insert(row_id, entry);
     }
 
     /// Adds multiple versions in batch - used by commit
@@ -445,13 +446,15 @@ impl VersionStore {
             return;
         }
 
+        // Use write lock for the entire batch operation (MVCC single-writer semantics)
+        let mut versions = self.versions.write();
+
         // Collect arena index updates to batch them under a single lock
         let mut arena_index_updates: Vec<(i64, usize)> = Vec::with_capacity(batch.len());
 
         for (row_id, version) in batch {
             // Get existing data first (if any)
-            let existing_data = self
-                .versions
+            let existing_data = versions
                 .get(&row_id)
                 .map(|e| (e.version.clone(), e.prev.clone(), e.arena_idx));
 
@@ -518,7 +521,7 @@ impl VersionStore {
                 }
             };
 
-            self.versions.insert(row_id, entry);
+            versions.insert(row_id, entry);
         }
 
         // Batch update row_arena_index under a single lock acquisition
@@ -536,7 +539,7 @@ impl VersionStore {
             return false;
         }
 
-        self.versions.contains_key(&row_id)
+        self.versions.read().contains_key(&row_id)
     }
 
     /// Gets the latest visible version of a row
@@ -547,10 +550,13 @@ impl VersionStore {
 
         let checker = self.visibility_checker.as_ref()?;
 
+        // Hold read lock for the duration of chain walk
+        let versions = self.versions.read();
+
         // First pass: find which version is visible (only need txn_ids, no cloning)
         // Then clone only that one version
-        let entry_ref = self.versions.get(&row_id)?;
-        let mut current: Option<&VersionChainEntry> = Some(&*entry_ref);
+        let entry = versions.get(&row_id)?;
+        let mut current: Option<&VersionChainEntry> = Some(entry);
         let mut result = None;
 
         while let Some(e) = current {
@@ -594,11 +600,14 @@ impl VersionStore {
         let arena_data_slice = arena_data.as_slice();
         let arena_len = arena_rows_slice.len();
 
+        // Pre-acquire versions lock ONCE for all lookups
+        let versions = self.versions.read();
+
         let mut results = Vec::with_capacity(row_ids.len());
 
         for &row_id in row_ids {
-            if let Some(entry_ref) = self.versions.get(&row_id) {
-                let mut current: Option<&VersionChainEntry> = Some(&*entry_ref);
+            if let Some(entry) = versions.get(&row_id) {
+                let mut current: Option<&VersionChainEntry> = Some(entry);
 
                 while let Some(e) = current {
                     let version_txn_id = e.version.txn_id;
@@ -664,9 +673,11 @@ impl VersionStore {
         let current_seq = checker.get_current_sequence();
         let mut results = Vec::with_capacity(row_ids.len());
 
+        // Pre-acquire versions lock ONCE for all lookups
+        let versions = self.versions.read();
         for &row_id in row_ids {
-            if let Some(entry_ref) = self.versions.get(&row_id) {
-                let mut current: Option<&VersionChainEntry> = Some(&*entry_ref);
+            if let Some(entry) = versions.get(&row_id) {
+                let mut current: Option<&VersionChainEntry> = Some(entry);
 
                 while let Some(e) = current {
                     let version_txn_id = e.version.txn_id;
@@ -710,10 +721,11 @@ impl VersionStore {
             return None;
         }
 
-        let entry_ref = self.versions.get(&row_id)?;
+        let versions = self.versions.read();
+        let entry = versions.get(&row_id)?;
 
         // Traverse version chain from newest to oldest
-        let mut current: Option<&VersionChainEntry> = Some(&*entry_ref);
+        let mut current: Option<&VersionChainEntry> = Some(entry);
         while let Some(e) = current {
             // Check if this version was created before or at the asOf transaction
             if e.version.txn_id <= as_of_txn_id {
@@ -739,10 +751,11 @@ impl VersionStore {
             return None;
         }
 
-        let entry_ref = self.versions.get(&row_id)?;
+        let versions = self.versions.read();
+        let entry = versions.get(&row_id)?;
 
         // Traverse version chain from newest to oldest
-        let mut current: Option<&VersionChainEntry> = Some(&*entry_ref);
+        let mut current: Option<&VersionChainEntry> = Some(entry);
         while let Some(e) = current {
             // Check if this version was created before or at the asOf timestamp
             if e.version.create_time <= as_of_timestamp {
@@ -759,13 +772,13 @@ impl VersionStore {
         None
     }
 
-    /// Returns all row IDs in the version store
+    /// Returns all row IDs in the version store (already sorted by BTreeMap)
     pub fn get_all_row_ids(&self) -> Vec<i64> {
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
         }
 
-        self.versions.iter().map(|e| *e.key()).collect()
+        self.versions.read().keys().copied().collect()
     }
 
     /// Returns all row IDs that are visible to the given transaction
@@ -774,8 +787,8 @@ impl VersionStore {
             return Vec::new();
         }
 
-        // First, collect all row IDs
-        let all_row_ids: Vec<i64> = self.versions.iter().map(|e| *e.key()).collect();
+        // First, collect all row IDs (already sorted by OrderedInt64Map)
+        let all_row_ids: Vec<i64> = self.versions.read().keys().copied().collect();
 
         // Now check visibility for each row ID without holding any version store locks
         let mut visible_row_ids = Vec::with_capacity(all_row_ids.len());
@@ -803,9 +816,9 @@ impl VersionStore {
 
         let mut count = 0;
 
-        // Single pass through all versions - no per-row lock acquisition
-        for entry in self.versions.iter() {
-            let chain = entry.value();
+        // Single pass through all versions (already sorted by BTreeMap)
+        let versions = self.versions.read();
+        for (_, chain) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain);
 
             while let Some(e) = current {
@@ -850,12 +863,11 @@ impl VersionStore {
             None => return Vec::new(),
         };
 
-        // Collect all versions in one pass using DashMap's iteration
-        let mut results = Vec::with_capacity(self.versions.len());
+        // Collect all versions in one pass (BTreeMap iteration is already sorted by row_id)
+        let versions = self.versions.read();
+        let mut results = Vec::with_capacity(versions.len());
 
-        for entry in self.versions.iter() {
-            let row_id = *entry.key();
-            let chain = entry.value();
+        for (&row_id, chain) in versions.iter() {
             // Find the first visible version in the chain
             let mut current: Option<&VersionChainEntry> = Some(chain);
             while let Some(e) = current {
@@ -875,9 +887,7 @@ impl VersionStore {
             }
         }
 
-        // DashMap iteration order is not guaranteed, sort by row_id
-        // Use radix sort - O(n) for integer keys vs O(n log n) for comparison sort
-        sort_by_key(&mut results, |(row_id, _)| *row_id);
+        // BTreeMap iteration is already sorted by row_id - no sort needed!
         results
     }
 
@@ -904,12 +914,13 @@ impl VersionStore {
         let arena_data_slice = arena_data.as_slice();
         let arena_len = arena_rows_slice.len();
 
-        // Single-pass: read directly from arena during visibility check
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(self.versions.len());
+        // Pre-acquire versions lock (BTreeMap iteration is already sorted by row_id)
+        let versions = self.versions.read();
 
-        for entry in self.versions.iter() {
-            let row_id = *entry.key();
-            let chain = entry.value();
+        // Single-pass: read directly from arena during visibility check
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(versions.len());
+
+        for (&row_id, chain) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain);
 
             while let Some(e) = current {
@@ -959,25 +970,14 @@ impl VersionStore {
             }
         }
 
-        // Drop arena locks before sorting
-        drop(arena_rows);
-        drop(arena_data);
-
-        // Sort by row_id to maintain insertion order
-        // Critical for FIRST/LAST aggregate functions
-        sort_by_key(&mut result, |(row_id, _)| *row_id);
-
+        // BTreeMap iteration is already sorted by row_id - no sort needed!
         result
     }
 
-    /// Returns all visible rows WITHOUT sorting.
+    /// Returns all visible rows (BTreeMap iteration is already sorted by row_id).
     ///
-    /// This is optimized for GROUP BY queries where row order doesn't matter.
-    /// Skipping the O(n log n) sort provides significant speedup for large tables.
-    /// The rows are returned in DashMap iteration order (non-deterministic).
-    ///
-    /// Note: DO NOT use this for queries that need deterministic ordering
-    /// (e.g., FIRST/LAST aggregates, LIMIT without ORDER BY).
+    /// Note: With BTreeMap, this is functionally identical to get_all_visible_rows_arena
+    /// since BTreeMap iteration is inherently ordered.
     #[inline]
     pub fn get_all_visible_rows_unsorted(&self, txn_id: i64) -> Vec<(i64, Row)> {
         if self.closed.load(Ordering::Acquire) {
@@ -995,12 +995,13 @@ impl VersionStore {
         let arena_data_slice = arena_data.as_slice();
         let arena_len = arena_rows_slice.len();
 
-        // Single-pass: read directly from arena during visibility check
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(self.versions.len());
+        // Pre-acquire versions lock (BTreeMap iteration is sorted by row_id)
+        let versions = self.versions.read();
 
-        for entry in self.versions.iter() {
-            let row_id = *entry.key();
-            let chain = entry.value();
+        // Single-pass: read directly from arena during visibility check
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(versions.len());
+
+        for (&row_id, chain) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain);
 
             while let Some(e) = current {
@@ -1036,23 +1037,16 @@ impl VersionStore {
             }
         }
 
-        // NO SORTING - returns rows in iteration order
+        // BTreeMap iteration is already sorted by row_id
         result
     }
 
     /// Get visible rows with limit and offset applied at the storage layer.
     ///
-    /// # Current Limitations (NOT True Early Termination)
-    /// Due to DashMap's concurrent design, iteration order is non-deterministic.
-    /// To maintain consistent results (e.g., LIMIT 1 returns first inserted row),
-    /// this function:
-    /// 1. Iterates ALL visible rows (O(n) scan)
-    /// 2. Sorts by row_id (O(n log n))
-    /// 3. Applies offset/limit (O(limit))
-    ///
-    /// This is NOT early termination - it still scans the full table. The benefit
-    /// is reduced data transfer to the executor (only `limit` rows returned vs all).
-    /// True early termination would require ordered storage (B-tree on row_id).
+    /// # True Early Termination
+    /// With BTreeMap, iteration is already ordered by row_id. We can now do true
+    /// early termination: skip `offset` visible rows, then collect `limit` rows
+    /// and stop iterating.
     ///
     /// # Arguments
     /// * `txn_id` - Transaction ID for visibility check
@@ -1079,14 +1073,14 @@ impl VersionStore {
         let arena_data_slice = arena_data.as_slice();
         let arena_len = arena_rows_slice.len();
 
-        // Collect all visible rows (we need to sort to maintain insertion order)
-        // For tables smaller than 2x the needed rows, this is efficient
-        let needed = limit + offset;
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(self.versions.len().min(needed * 2));
+        // Pre-acquire versions lock (BTreeMap iteration is sorted by row_id)
+        let versions = self.versions.read();
 
-        for entry in self.versions.iter() {
-            let row_id = *entry.key();
-            let chain = entry.value();
+        // True early termination with BTreeMap's ordered iteration
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit.min(1024));
+        let mut skipped = 0usize;
+
+        for (&row_id, chain) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain);
 
             while let Some(e) = current {
@@ -1098,105 +1092,9 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    // Read row data - falls back to version data if bounds validation fails
-                    let row_data = if let Some(idx) = e.arena_idx {
-                        if idx < arena_len {
-                            // SAFETY: idx bounds checked above
-                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            // Validate data slice bounds to prevent UB from arena corruption
-                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                                // SAFETY: bounds validated above
-                                let slice =
-                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                                Row::from_values(slice.to_vec())
-                            } else {
-                                // Arena corruption detected - fall back to version data
-                                debug_assert!(
-                                    false,
-                                    "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
-                                    row_id,
-                                    meta.start,
-                                    meta.end,
-                                    arena_data_slice.len()
-                                );
-                                e.version.data.clone()
-                            }
-                        } else {
-                            e.version.data.clone()
-                        }
-                    } else {
-                        e.version.data.clone()
-                    };
-                    result.push((row_id, row_data));
-                    break;
-                }
-                current = e.prev.as_ref().map(|b| b.as_ref());
-            }
-        }
-
-        // Drop arena locks before sorting
-        drop(arena_rows);
-        drop(arena_data);
-
-        // Sort by row_id to maintain insertion order (critical for deterministic LIMIT)
-        sort_by_key(&mut result, |(row_id, _)| *row_id);
-
-        // Apply offset and limit
-        result.into_iter().skip(offset).take(limit).collect()
-    }
-
-    /// Get visible rows with LIMIT but without sorting (for LIMIT without ORDER BY).
-    ///
-    /// This is an optimized version that enables true early termination by skipping
-    /// the sort step. Since SQL doesn't guarantee order for LIMIT without ORDER BY,
-    /// returning rows in arbitrary order is correct and much faster.
-    ///
-    /// # Performance
-    /// - For LIMIT 100 on 10K rows: ~50x speedup vs sorted version
-    /// - Stops iterating once limit+offset rows are collected
-    pub fn get_visible_rows_with_limit_unordered(
-        &self,
-        txn_id: i64,
-        limit: usize,
-        offset: usize,
-    ) -> Vec<(i64, Row)> {
-        if self.closed.load(Ordering::Acquire) || limit == 0 {
-            return Vec::new();
-        }
-
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-
-        // Pre-acquire arena locks ONCE for the entire operation
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
-
-        let needed = limit + offset;
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(needed.min(1024));
-        let mut count = 0usize;
-
-        // Early termination: stop once we have enough rows
-        for entry in self.versions.iter() {
-            let row_id = *entry.key();
-            let chain = entry.value();
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
-                        break; // Row is deleted
-                    }
-
-                    // Handle offset: skip first `offset` rows
-                    if count < offset {
-                        count += 1;
+                    // Handle offset: skip first `offset` visible rows
+                    if skipped < offset {
+                        skipped += 1;
                         break;
                     }
 
@@ -1241,7 +1139,23 @@ impl VersionStore {
             }
         }
 
+        // BTreeMap iteration is already sorted - no sort needed!
         result
+    }
+
+    /// Get visible rows with LIMIT (with early termination).
+    ///
+    /// Note: With BTreeMap, this is functionally identical to get_visible_rows_with_limit
+    /// since BTreeMap iteration is inherently ordered by row_id. Kept for API compatibility.
+    #[inline]
+    pub fn get_visible_rows_with_limit_unordered(
+        &self,
+        txn_id: i64,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<(i64, Row)> {
+        // Delegate to the sorted version - BTreeMap is always sorted
+        self.get_visible_rows_with_limit(txn_id, limit, offset)
     }
 
     /// Get all visible rows with filter applied during collection
@@ -1278,12 +1192,13 @@ impl VersionStore {
         let arena_data_slice = arena_data.as_slice();
         let arena_len = arena_rows_slice.len();
 
-        // Single-pass: read, filter, and collect in one loop
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(self.versions.len());
+        // Pre-acquire versions lock (BTreeMap iteration is sorted by row_id)
+        let versions = self.versions.read();
 
-        for entry in self.versions.iter() {
-            let row_id = *entry.key();
-            let chain = entry.value();
+        // Single-pass: read, filter, and collect in one loop
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(versions.len());
+
+        for (&row_id, chain) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain);
 
             while let Some(e) = current {
@@ -1334,20 +1249,15 @@ impl VersionStore {
             }
         }
 
-        // Drop locks before sorting
-        drop(arena_rows);
-        drop(arena_data);
-
-        sort_by_key(&mut result, |(row_id, _)| *row_id);
+        // BTreeMap iteration is already sorted by row_id - no sort needed!
         result
     }
 
     /// Get visible rows with filter, limit and offset applied at the storage layer.
     ///
-    /// # Current Limitations (NOT True Early Termination)
-    /// Like `get_visible_rows_with_limit`, this scans all rows due to DashMap's
-    /// non-deterministic iteration order. The filter is applied during iteration,
-    /// but all matching rows are collected before sorting and applying limit.
+    /// # True Early Termination
+    /// With BTreeMap, we get ordered iteration. After collecting `limit` matching rows
+    /// (after skipping `offset`), we can stop iterating.
     ///
     /// # Arguments
     /// * `txn_id` - Transaction ID for visibility check
@@ -1381,12 +1291,14 @@ impl VersionStore {
         let arena_data_slice = arena_data.as_slice();
         let arena_len = arena_rows_slice.len();
 
-        // Collect all matching rows (need to sort for deterministic order)
-        let mut result: Vec<(i64, Row)> = Vec::new();
+        // Pre-acquire versions lock (BTreeMap iteration is sorted by row_id)
+        let versions = self.versions.read();
 
-        for entry in self.versions.iter() {
-            let row_id = *entry.key();
-            let chain = entry.value();
+        // True early termination with BTreeMap's ordered iteration
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit.min(1024));
+        let mut skipped = 0usize;
+
+        for (&row_id, chain) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain);
 
             while let Some(e) = current {
@@ -1430,110 +1342,9 @@ impl VersionStore {
 
                     // Apply filter - only collect matching rows
                     if compiled_filter.matches(&row) {
-                        result.push((row_id, row));
-                    }
-                    break;
-                }
-                current = e.prev.as_ref().map(|b| b.as_ref());
-            }
-        }
-
-        // Drop arena locks before sorting
-        drop(arena_rows);
-        drop(arena_data);
-
-        // Sort by row_id to maintain insertion order
-        sort_by_key(&mut result, |(row_id, _)| *row_id);
-
-        // Apply offset and limit
-        result.into_iter().skip(offset).take(limit).collect()
-    }
-
-    /// Get visible rows with filter and LIMIT but without sorting (for LIMIT without ORDER BY).
-    ///
-    /// This is an optimized version that enables true early termination by skipping
-    /// the sort step. Since SQL doesn't guarantee order for LIMIT without ORDER BY,
-    /// returning rows in arbitrary order is correct and much faster.
-    pub fn get_visible_rows_filtered_with_limit_unordered(
-        &self,
-        txn_id: i64,
-        filter: &dyn crate::storage::expression::Expression,
-        limit: usize,
-        offset: usize,
-    ) -> Vec<(i64, Row)> {
-        if self.closed.load(Ordering::Acquire) || limit == 0 {
-            return Vec::new();
-        }
-
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-
-        // Compile the filter once at the start
-        let schema = self.schema.read();
-        let compiled_filter = CompiledFilter::compile(filter, &schema);
-        drop(schema);
-
-        // Pre-acquire arena locks ONCE
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
-
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity((limit + offset).min(1024));
-        let mut count = 0usize;
-
-        // Early termination: stop once we have enough matching rows
-        for entry in self.versions.iter() {
-            let row_id = *entry.key();
-            let chain = entry.value();
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
-                        break; // Row is deleted
-                    }
-
-                    // Read row data - falls back to version data if bounds validation fails
-                    let row = if let Some(idx) = e.arena_idx {
-                        if idx < arena_len {
-                            // SAFETY: idx bounds checked above
-                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            // Validate data slice bounds to prevent UB from arena corruption
-                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                                // SAFETY: bounds validated above
-                                let slice =
-                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                                Row::from_values(slice.to_vec())
-                            } else {
-                                // Arena corruption detected - fall back to version data
-                                debug_assert!(
-                                    false,
-                                    "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
-                                    row_id,
-                                    meta.start,
-                                    meta.end,
-                                    arena_data_slice.len()
-                                );
-                                e.version.data.clone()
-                            }
-                        } else {
-                            e.version.data.clone()
-                        }
-                    } else {
-                        e.version.data.clone()
-                    };
-
-                    // Apply filter - only count matching rows
-                    if compiled_filter.matches(&row) {
                         // Handle offset: skip first `offset` matching rows
-                        if count < offset {
-                            count += 1;
+                        if skipped < offset {
+                            skipped += 1;
                         } else {
                             result.push((row_id, row));
                             // Early termination: we have enough rows
@@ -1548,7 +1359,24 @@ impl VersionStore {
             }
         }
 
+        // BTreeMap iteration is already sorted by row_id - no sort needed!
         result
+    }
+
+    /// Get visible rows with filter and LIMIT (with early termination).
+    ///
+    /// Note: With BTreeMap, this is functionally identical to get_visible_rows_filtered_with_limit
+    /// since BTreeMap iteration is inherently ordered by row_id. Kept for API compatibility.
+    #[inline]
+    pub fn get_visible_rows_filtered_with_limit_unordered(
+        &self,
+        txn_id: i64,
+        filter: &dyn crate::storage::expression::Expression,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<(i64, Row)> {
+        // Delegate to the sorted version - BTreeMap is always sorted
+        self.get_visible_rows_filtered_with_limit(txn_id, filter, limit, offset)
     }
 
     /// Get visible row indices without materializing row data (ZERO ALLOCATION SCAN!)
@@ -1596,13 +1424,12 @@ impl VersionStore {
         // Drop arena guards before slow path to avoid holding locks
         drop(arena_rows);
 
-        // SLOW PATH: Full DashMap iteration for complex visibility scenarios
-        let mut indices: Vec<RowIndex> = Vec::with_capacity(self.versions.len());
+        // SLOW PATH: Full BTreeMap iteration (already sorted by row_id)
+        let versions = self.versions.read();
+        let mut indices: Vec<RowIndex> = Vec::with_capacity(versions.len());
 
         if let Some(checker) = checker {
-            for entry in self.versions.iter() {
-                let row_id = *entry.key();
-                let chain = entry.value();
+            for (&row_id, chain) in versions.iter() {
                 let mut current: Option<&VersionChainEntry> = Some(chain);
 
                 while let Some(e) = current {
@@ -1625,78 +1452,18 @@ impl VersionStore {
             }
         }
 
-        // Sort by row_id for consistent ordering
-        indices.sort_unstable_by_key(|idx| idx.row_id);
+        // BTreeMap iteration is already sorted by row_id - no sort needed!
         indices
     }
 
-    /// Get visible row indices without sorting (O(n) instead of O(n log n))
+    /// Get visible row indices (BTreeMap iteration is already sorted).
     ///
-    /// Use this when order doesn't matter, such as:
-    /// - Aggregations (COUNT, SUM, etc.)
-    /// - Hash joins
-    /// - Existence checks
-    ///
-    /// For ordered results, use `get_visible_row_indices()` instead.
+    /// Note: With BTreeMap, this is functionally identical to get_visible_row_indices
+    /// since BTreeMap iteration is inherently ordered by row_id. Kept for API compatibility.
+    #[inline]
     pub fn get_visible_row_indices_unordered(&self, txn_id: i64) -> Vec<RowIndex> {
-        let checker = self.visibility_checker.as_ref();
-
-        // Get arena metadata for fast path detection
-        let (arena_rows, _arena_data) = self.arena.read_guards();
-        let arena_len = arena_rows.len();
-
-        // FAST PATH: If uncommitted_writes is empty, scan arena directly
-        if let Some(checker) = checker {
-            let uncommitted_empty = self.uncommitted_writes.is_empty();
-
-            if uncommitted_empty && arena_len > 0 {
-                let mut indices: Vec<RowIndex> = Vec::with_capacity(arena_len);
-
-                for (idx, meta) in arena_rows.iter().enumerate() {
-                    if meta.deleted_at_txn_id == 0 && checker.is_visible(meta.txn_id, txn_id) {
-                        indices.push(RowIndex {
-                            row_id: meta.row_id,
-                            arena_idx: Some(idx),
-                        });
-                    }
-                }
-
-                return indices; // No sorting!
-            }
-        }
-
-        // Drop arena guards before slow path to avoid holding locks
-        drop(arena_rows);
-
-        // SLOW PATH: Full DashMap iteration
-        let mut indices: Vec<RowIndex> = Vec::with_capacity(self.versions.len());
-
-        if let Some(checker) = checker {
-            for entry in self.versions.iter() {
-                let row_id = *entry.key();
-                let chain = entry.value();
-                let mut current: Option<&VersionChainEntry> = Some(chain);
-
-                while let Some(e) = current {
-                    let version_txn_id = e.version.txn_id;
-                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                    if checker.is_visible(version_txn_id, txn_id) {
-                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
-                        {
-                            indices.push(RowIndex {
-                                row_id,
-                                arena_idx: e.arena_idx,
-                            });
-                        }
-                        break;
-                    }
-                    current = e.prev.as_ref().map(|b| b.as_ref());
-                }
-            }
-        }
-
-        indices // No sorting!
+        // Delegate to the sorted version - BTreeMap is always sorted
+        self.get_visible_row_indices(txn_id)
     }
 
     /// Materialize selected row indices into actual Row data
@@ -1716,6 +1483,9 @@ impl VersionStore {
         let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
         let arena_len = arena_rows_guard.len();
 
+        // Pre-acquire versions lock for slow path lookups
+        let versions = self.versions.read();
+
         let mut result: Vec<(i64, Row)> = Vec::with_capacity(indices.len());
 
         for idx in indices {
@@ -1730,7 +1500,7 @@ impl VersionStore {
             }
 
             // Slow path: look up in version chain
-            if let Some(chain) = self.versions.get(&idx.row_id) {
+            if let Some(chain) = versions.get(&idx.row_id) {
                 result.push((idx.row_id, chain.version.data.clone()));
             }
         }
@@ -1752,6 +1522,7 @@ impl VersionStore {
 
         // Slow path: look up in version chain
         self.versions
+            .read()
             .get(&idx.row_id)
             .map(|chain| (idx.row_id, chain.version.data.clone()))
     }
@@ -1781,6 +1552,7 @@ impl VersionStore {
 
         // Slow path: look up in version chain
         self.versions
+            .read()
             .get(&idx.row_id)
             .and_then(|chain| chain.version.data.get(col_idx).cloned())
     }
@@ -1801,6 +1573,9 @@ impl VersionStore {
         let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
         let arena_len = arena_rows_guard.len();
 
+        // Pre-acquire versions lock for slow path lookups
+        let versions = self.versions.read();
+
         indices
             .iter()
             .map(|idx| {
@@ -1814,7 +1589,7 @@ impl VersionStore {
                     }
                 }
                 // Slow path: version chain lookup
-                self.versions
+                versions
                     .get(&idx.row_id)
                     .and_then(|chain| chain.version.data.get(col_idx).cloned())
             })
@@ -1919,6 +1694,9 @@ impl VersionStore {
         let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
         let arena_len = arena_rows_guard.len();
 
+        // Pre-acquire versions lock for slow path lookups
+        let versions = self.versions.read();
+
         let mut sum = 0.0f64;
         let mut count = 0usize;
 
@@ -1945,7 +1723,7 @@ impl VersionStore {
                 }
             }
             // Slow path: version chain (must clone)
-            if let Some(chain) = self.versions.get(&idx.row_id) {
+            if let Some(chain) = versions.get(&idx.row_id) {
                 if let Some(val) = chain.version.data.get(col_idx) {
                     match val {
                         Value::Integer(i) => {
@@ -1974,6 +1752,9 @@ impl VersionStore {
 
         let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
         let arena_len = arena_rows_guard.len();
+
+        // Pre-acquire versions lock for slow path lookups
+        let versions = self.versions.read();
 
         let mut min_val: Option<Value> = None;
 
@@ -2004,7 +1785,7 @@ impl VersionStore {
                 }
             }
             // Slow path: version chain
-            if let Some(chain) = self.versions.get(&idx.row_id) {
+            if let Some(chain) = versions.get(&idx.row_id) {
                 if let Some(val) = chain.version.data.get(col_idx) {
                     update_min(&mut min_val, val);
                 }
@@ -2040,6 +1821,9 @@ impl VersionStore {
             }
         };
 
+        // Pre-acquire versions lock for slow path
+        let versions = self.versions.read();
+
         for idx in &indices {
             // Try arena path first (fast)
             if let Some(arena_idx) = idx.arena_idx {
@@ -2053,7 +1837,7 @@ impl VersionStore {
                 }
             }
             // Slow path: version chain
-            if let Some(chain) = self.versions.get(&idx.row_id) {
+            if let Some(chain) = versions.get(&idx.row_id) {
                 if let Some(val) = chain.version.data.get(col_idx) {
                     update_max(&mut max_val, val);
                 }
@@ -2161,6 +1945,9 @@ impl VersionStore {
             }
         }
 
+        // Pre-acquire versions lock for slow path
+        let versions = self.versions.read();
+
         // Single pass through all rows
         for idx in &indices {
             // Try arena path first (fast)
@@ -2177,7 +1964,7 @@ impl VersionStore {
                 }
             }
             // Slow path: version chain
-            if let Some(chain) = self.versions.get(&idx.row_id) {
+            if let Some(chain) = versions.get(&idx.row_id) {
                 for (i, (op, col_idx)) in aggregates.iter().enumerate() {
                     if let Some(val) = chain.version.data.get(*col_idx) {
                         update_accumulator(&mut results[i], op, val);
@@ -2268,13 +2055,12 @@ impl VersionStore {
             }
         }
 
-        // SLOW PATH: Full DashMap iteration for complex visibility scenarios
-        let mut visible_indices: Vec<VisibleRowInfo> = Vec::with_capacity(self.versions.len());
+        // SLOW PATH: Full BTreeMap iteration for complex visibility scenarios
+        let versions = self.versions.read();
+        let mut visible_indices: Vec<VisibleRowInfo> = Vec::with_capacity(versions.len());
 
         if let Some(checker) = checker {
-            for entry in self.versions.iter() {
-                let row_id = *entry.key();
-                let chain = entry.value();
+            for (&row_id, chain) in versions.iter() {
                 let mut current: Option<&VersionChainEntry> = Some(chain);
 
                 while let Some(e) = current {
@@ -2301,15 +2087,15 @@ impl VersionStore {
             }
         }
 
-        // Sort by row_id for consistent ordering
-        visible_indices.sort_unstable_by_key(|info| info.row_id);
+        // BTreeMap iteration is already ordered by row_id - no sort needed
+        drop(versions);
 
         StreamingResult::new(arena_rows, arena_data, visible_indices, columns)
     }
 
     /// Returns the count of rows
     pub fn row_count(&self) -> usize {
-        self.versions.len()
+        self.versions.read().len()
     }
     /// Tries to claim a row for update (dirty write prevention)
     pub fn try_claim_row(&self, row_id: i64, txn_id: i64) -> Result<(), Error> {
@@ -2545,16 +2331,19 @@ impl VersionStore {
         // Check for duplicate: if row already exists with identical data, skip adding
         // This prevents duplicate version chain entries when both snapshot and WAL
         // contain the same row data (can happen due to race conditions during snapshot)
-        if let Some(existing_entry) = self.versions.get(&row_id) {
-            let existing = &existing_entry.version;
-            // Check if data is identical (both deleted status and row data)
-            if existing.is_deleted() == is_deleted && existing.data == row_data {
-                // Identical data already exists, skip to avoid duplicate
-                // Still update auto_increment counter
-                if row_id > 0 {
-                    self.set_auto_increment_counter(row_id);
+        {
+            let versions = self.versions.read();
+            if let Some(existing_entry) = versions.get(&row_id) {
+                let existing = &existing_entry.version;
+                // Check if data is identical (both deleted status and row data)
+                if existing.is_deleted() == is_deleted && existing.data == row_data {
+                    // Identical data already exists, skip to avoid duplicate
+                    // Still update auto_increment counter
+                    if row_id > 0 {
+                        self.set_auto_increment_counter(row_id);
+                    }
+                    return;
                 }
-                return;
             }
         }
 
@@ -2719,9 +2508,8 @@ impl VersionStore {
             // Populate the index with existing data unless deferred
             if !skip_population {
                 let col_idx = column_id as usize;
-                for entry in self.versions.iter() {
-                    let row_id = *entry.key();
-                    let version_chain = entry.value();
+                let versions = self.versions.read();
+                for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
                     if !version.is_deleted() {
                         if let Some(value) = version.data.get(col_idx) {
@@ -2749,9 +2537,8 @@ impl VersionStore {
             if !skip_population {
                 let col_indices: Vec<usize> =
                     meta.column_ids.iter().map(|&id| id as usize).collect();
-                for entry in self.versions.iter() {
-                    let row_id = *entry.key();
-                    let version_chain = entry.value();
+                let versions = self.versions.read();
+                for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
                     if !version.is_deleted() {
                         let values: Vec<crate::core::Value> =
@@ -2808,9 +2595,8 @@ impl VersionStore {
         }
 
         // Single pass over all rows
-        for entry in self.versions.iter() {
-            let row_id = *entry.key();
-            let version_chain = entry.value();
+        let versions = self.versions.read();
+        for (&row_id, version_chain) in versions.iter() {
             let version = &version_chain.version;
 
             if version.is_deleted() {
@@ -2861,52 +2647,57 @@ impl VersionStore {
         let mut rows_to_delete = Vec::new();
 
         // First pass: identify deleted rows older than retention period
-        self.versions.iter().for_each(|entry| {
-            let row_id = *entry.key();
-            let version = &entry.value().version;
-
-            // Only process rows that are actually deleted and old enough
-            if version.is_deleted() && version.create_time < cutoff_time {
-                // Check if safe to remove (no active transaction can see it)
-                if self.can_safely_remove(version) {
-                    rows_to_delete.push(row_id);
+        {
+            let versions = self.versions.read();
+            for (&row_id, chain) in versions.iter() {
+                let version = &chain.version;
+                // Only process rows that are actually deleted and old enough
+                if version.is_deleted() && version.create_time < cutoff_time {
+                    // Check if safe to remove (no active transaction can see it)
+                    if self.can_safely_remove(version) {
+                        rows_to_delete.push(row_id);
+                    }
                 }
             }
-        });
+        }
 
         // Second pass: remove the identified rows
         for row_id in &rows_to_delete {
             // Remove from indexes first
-            if let Some(entry) = self.versions.get(row_id) {
-                let version = &entry.version;
-                let indexes = self.indexes.read();
-                for index in indexes.values() {
-                    let column_ids = index.column_ids();
-                    if !column_ids.is_empty() {
-                        if column_ids.len() == 1 {
-                            // Single-column index
-                            let col_id = column_ids[0] as usize;
-                            if let Some(value) = version.data.get(col_id) {
-                                let _ = index.remove(std::slice::from_ref(value), *row_id, *row_id);
+            {
+                let versions = self.versions.read();
+                if let Some(entry) = versions.get(row_id) {
+                    let version = &entry.version;
+                    let indexes = self.indexes.read();
+                    for index in indexes.values() {
+                        let column_ids = index.column_ids();
+                        if !column_ids.is_empty() {
+                            if column_ids.len() == 1 {
+                                // Single-column index
+                                let col_id = column_ids[0] as usize;
+                                if let Some(value) = version.data.get(col_id) {
+                                    let _ =
+                                        index.remove(std::slice::from_ref(value), *row_id, *row_id);
+                                }
+                            } else {
+                                // Multi-column index
+                                let values: Vec<crate::core::Value> = column_ids
+                                    .iter()
+                                    .map(|&col_id| {
+                                        version.data.get(col_id as usize).cloned().unwrap_or(
+                                            crate::core::Value::Null(crate::core::DataType::Null),
+                                        )
+                                    })
+                                    .collect();
+                                let _ = index.remove(&values, *row_id, *row_id);
                             }
-                        } else {
-                            // Multi-column index
-                            let values: Vec<crate::core::Value> = column_ids
-                                .iter()
-                                .map(|&col_id| {
-                                    version.data.get(col_id as usize).cloned().unwrap_or(
-                                        crate::core::Value::Null(crate::core::DataType::Null),
-                                    )
-                                })
-                                .collect();
-                            let _ = index.remove(&values, *row_id, *row_id);
                         }
                     }
                 }
             }
 
             // Now remove from version store
-            self.versions.remove(row_id);
+            self.versions.write().remove(row_id);
         }
 
         rows_to_delete.len() as i32
@@ -2963,9 +2754,8 @@ impl VersionStore {
         let mut cleaned = 0;
 
         // Iterate through all rows
-        self.versions.iter_mut().for_each(|mut entry| {
-            let chain_entry = entry.value_mut();
-
+        let mut versions = self.versions.write();
+        for (_, chain_entry) in versions.iter_mut() {
             // Find the oldest version we need to keep
             let mut current = chain_entry.prev.as_ref();
             let mut versions_to_check = Vec::new();
@@ -3024,7 +2814,7 @@ impl VersionStore {
                     }
                 }
             }
-        });
+        }
 
         cleaned
     }
@@ -3072,10 +2862,8 @@ impl VersionStore {
         let use_cutoff = commit_seq_cutoff > 0;
 
         // Iterate all versions
-        for entry in self.versions.iter() {
-            let row_id = *entry.key();
-            let chain_entry = entry.value();
-
+        let versions = self.versions.read();
+        for (&row_id, chain_entry) in versions.iter() {
             // Walk the version chain to find the visible version
             let mut current: Option<&VersionChainEntry> = Some(chain_entry);
 
@@ -3130,8 +2918,8 @@ impl VersionStore {
         let snapshot_txn_id = i64::MAX;
         let mut count = 0;
 
-        for entry in self.versions.iter() {
-            let chain_entry = entry.value();
+        let versions = self.versions.read();
+        for (_, chain_entry) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain_entry);
 
             while let Some(e) = current {

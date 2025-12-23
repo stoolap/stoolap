@@ -14,11 +14,11 @@
 
 //! String scalar functions
 
-use std::sync::Arc;
+use compact_str::CompactString;
 
 use crate::core::{Error, Result, Value};
 use crate::functions::{
-    FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+    FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, NativeFn1, ScalarFunction,
 };
 use crate::validate_arg_count;
 
@@ -31,6 +31,46 @@ use super::{value_to_i64, value_to_string};
 /// UPPER function - converts a string to uppercase
 #[derive(Default)]
 pub struct UpperFunction;
+
+impl UpperFunction {
+    /// Native implementation with in-place mutation
+    /// Uses fast ASCII path when possible, falls back to Unicode for non-ASCII
+    #[inline]
+    fn native(v: &mut Value) {
+        match v {
+            Value::Text(s) => {
+                if s.is_ascii() {
+                    s.make_ascii_uppercase();
+                } else {
+                    *v = Value::Text(s.to_uppercase());
+                }
+            }
+            Value::Null(_) => {}
+            _ => {
+                let str_val = v.to_string();
+                *v = Value::Text(CompactString::from(str_val.to_uppercase()));
+            }
+        }
+    }
+
+    /// For evaluate() - returns a new value
+    /// Uses fast ASCII path when possible, falls back to Unicode for non-ASCII
+    fn evaluate_impl(arg: &Value) -> Value {
+        match arg {
+            Value::Text(s) => {
+                if s.is_ascii() {
+                    let mut result = s.clone();
+                    result.make_ascii_uppercase();
+                    Value::Text(result)
+                } else {
+                    Value::Text(s.to_uppercase())
+                }
+            }
+            Value::Null(_) => Value::null_unknown(),
+            other => Value::Text(CompactString::from(other.to_string().to_uppercase())),
+        }
+    }
+}
 
 impl ScalarFunction for UpperFunction {
     fn name(&self) -> &str {
@@ -48,17 +88,15 @@ impl ScalarFunction for UpperFunction {
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
         validate_arg_count!(args, "UPPER", 1);
-
-        if args[0].is_null() {
-            return Ok(Value::null_unknown());
-        }
-
-        let s = value_to_string(&args[0]);
-        Ok(Value::Text(Arc::from(s.to_uppercase().as_str())))
+        Ok(Self::evaluate_impl(&args[0]))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
         Box::new(UpperFunction)
+    }
+
+    fn native_fn1(&self) -> Option<NativeFn1> {
+        Some(Self::native)
     }
 }
 
@@ -69,6 +107,46 @@ impl ScalarFunction for UpperFunction {
 /// LOWER function - converts a string to lowercase
 #[derive(Default)]
 pub struct LowerFunction;
+
+impl LowerFunction {
+    /// Native implementation with in-place mutation
+    /// Uses fast ASCII path when possible, falls back to Unicode for non-ASCII
+    #[inline]
+    fn native(v: &mut Value) {
+        match v {
+            Value::Text(s) => {
+                if s.is_ascii() {
+                    s.make_ascii_lowercase();
+                } else {
+                    *v = Value::Text(s.to_lowercase());
+                }
+            }
+            Value::Null(_) => {}
+            _ => {
+                let str_val = v.to_string();
+                *v = Value::Text(CompactString::from(str_val.to_lowercase()));
+            }
+        }
+    }
+
+    /// For evaluate() - returns a new value
+    /// Uses fast ASCII path when possible, falls back to Unicode for non-ASCII
+    fn evaluate_impl(arg: &Value) -> Value {
+        match arg {
+            Value::Text(s) => {
+                if s.is_ascii() {
+                    let mut result = s.clone();
+                    result.make_ascii_lowercase();
+                    Value::Text(result)
+                } else {
+                    Value::Text(s.to_lowercase())
+                }
+            }
+            Value::Null(_) => Value::null_unknown(),
+            other => Value::Text(CompactString::from(other.to_string().to_lowercase())),
+        }
+    }
+}
 
 impl ScalarFunction for LowerFunction {
     fn name(&self) -> &str {
@@ -86,17 +164,15 @@ impl ScalarFunction for LowerFunction {
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
         validate_arg_count!(args, "LOWER", 1);
-
-        if args[0].is_null() {
-            return Ok(Value::null_unknown());
-        }
-
-        let s = value_to_string(&args[0]);
-        Ok(Value::Text(Arc::from(s.to_lowercase().as_str())))
+        Ok(Self::evaluate_impl(&args[0]))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
         Box::new(LowerFunction)
+    }
+
+    fn native_fn1(&self) -> Option<NativeFn1> {
+        Some(Self::native)
     }
 }
 
@@ -107,6 +183,49 @@ impl ScalarFunction for LowerFunction {
 /// LENGTH function - returns the length of a string
 #[derive(Default)]
 pub struct LengthFunction;
+
+impl LengthFunction {
+    /// Native implementation with in-place mutation
+    /// Returns character count (not byte count) for Unicode correctness
+    #[inline]
+    fn native(v: &mut Value) {
+        let result = match v {
+            Value::Text(s) => {
+                // Fast path for ASCII - byte length equals char count
+                let len = if s.is_ascii() {
+                    s.len() as i64
+                } else {
+                    s.chars().count() as i64
+                };
+                Some(Value::Integer(len))
+            }
+            Value::Null(_) => None,
+            _ => {
+                let len = v.to_string().chars().count() as i64;
+                Some(Value::Integer(len))
+            }
+        };
+        if let Some(new_val) = result {
+            *v = new_val;
+        }
+    }
+
+    /// For evaluate() - returns a new value
+    fn evaluate_impl(arg: &Value) -> Value {
+        match arg {
+            Value::Text(s) => {
+                let len = if s.is_ascii() {
+                    s.len() as i64
+                } else {
+                    s.chars().count() as i64
+                };
+                Value::Integer(len)
+            }
+            Value::Null(_) => Value::null_unknown(),
+            other => Value::Integer(other.to_string().chars().count() as i64),
+        }
+    }
+}
 
 impl ScalarFunction for LengthFunction {
     fn name(&self) -> &str {
@@ -124,17 +243,15 @@ impl ScalarFunction for LengthFunction {
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
         validate_arg_count!(args, "LENGTH", 1);
-
-        if args[0].is_null() {
-            return Ok(Value::null_unknown());
-        }
-
-        let s = value_to_string(&args[0]);
-        Ok(Value::Integer(s.chars().count() as i64))
+        Ok(Self::evaluate_impl(&args[0]))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
         Box::new(LengthFunction)
+    }
+
+    fn native_fn1(&self) -> Option<NativeFn1> {
+        Some(Self::native)
     }
 }
 
@@ -174,7 +291,7 @@ impl ScalarFunction for ConcatFunction {
             }
         }
 
-        Ok(Value::Text(Arc::from(result.as_str())))
+        Ok(Value::Text(CompactString::from(result.as_str())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -232,7 +349,7 @@ impl ScalarFunction for SubstringFunction {
         let start_idx = if start < 1 { 0 } else { (start - 1) as usize };
 
         if start_idx >= chars.len() {
-            return Ok(Value::Text(Arc::from("")));
+            return Ok(Value::Text(CompactString::from("")));
         }
 
         let result: String = if args.len() == 3 {
@@ -240,7 +357,7 @@ impl ScalarFunction for SubstringFunction {
                 .ok_or_else(|| Error::invalid_argument("SUBSTRING length must be an integer"))?;
 
             if length < 0 {
-                return Ok(Value::Text(Arc::from("")));
+                return Ok(Value::Text(CompactString::from("")));
             }
 
             let end_idx = std::cmp::min(start_idx + length as usize, chars.len());
@@ -249,7 +366,7 @@ impl ScalarFunction for SubstringFunction {
             chars[start_idx..].iter().collect()
         };
 
-        Ok(Value::Text(Arc::from(result.as_str())))
+        Ok(Value::Text(CompactString::from(result.as_str())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -328,7 +445,7 @@ impl ScalarFunction for TrimFunction {
         }
 
         let s = value_to_string(&args[0]);
-        Ok(Value::Text(Arc::from(s.trim())))
+        Ok(Value::Text(CompactString::from(s.trim())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -366,7 +483,7 @@ impl ScalarFunction for LtrimFunction {
         }
 
         let s = value_to_string(&args[0]);
-        Ok(Value::Text(Arc::from(s.trim_start())))
+        Ok(Value::Text(CompactString::from(s.trim_start())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -404,7 +521,7 @@ impl ScalarFunction for RtrimFunction {
         }
 
         let s = value_to_string(&args[0]);
-        Ok(Value::Text(Arc::from(s.trim_end())))
+        Ok(Value::Text(CompactString::from(s.trim_end())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -455,7 +572,9 @@ impl ScalarFunction for ReplaceFunction {
         let from = value_to_string(&args[1]);
         let to = value_to_string(&args[2]);
 
-        Ok(Value::Text(Arc::from(s.replace(&from, &to).as_str())))
+        Ok(Value::Text(CompactString::from(
+            s.replace(&from, &to).as_str(),
+        )))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -494,7 +613,7 @@ impl ScalarFunction for ReverseFunction {
 
         let s = value_to_string(&args[0]);
         let reversed: String = s.chars().rev().collect();
-        Ok(Value::Text(Arc::from(reversed.as_str())))
+        Ok(Value::Text(CompactString::from(reversed.as_str())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -542,11 +661,11 @@ impl ScalarFunction for LeftFunction {
             .ok_or_else(|| Error::invalid_argument("LEFT length must be an integer"))?;
 
         if n < 0 {
-            return Ok(Value::Text(Arc::from("")));
+            return Ok(Value::Text(CompactString::from("")));
         }
 
         let result: String = s.chars().take(n as usize).collect();
-        Ok(Value::Text(Arc::from(result.as_str())))
+        Ok(Value::Text(CompactString::from(result.as_str())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -594,14 +713,14 @@ impl ScalarFunction for RightFunction {
             .ok_or_else(|| Error::invalid_argument("RIGHT length must be an integer"))?;
 
         if n < 0 {
-            return Ok(Value::Text(Arc::from("")));
+            return Ok(Value::Text(CompactString::from("")));
         }
 
         let chars: Vec<char> = s.chars().collect();
         let len = chars.len();
         let start = len.saturating_sub(n as usize);
         let result: String = chars[start..].iter().collect();
-        Ok(Value::Text(Arc::from(result.as_str())))
+        Ok(Value::Text(CompactString::from(result.as_str())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -649,7 +768,7 @@ impl ScalarFunction for RepeatFunction {
             .ok_or_else(|| Error::invalid_argument("REPEAT count must be an integer"))?;
 
         if n < 0 {
-            return Ok(Value::Text(Arc::from("")));
+            return Ok(Value::Text(CompactString::from("")));
         }
 
         // Limit to prevent memory exhaustion (max 10MB result)
@@ -663,7 +782,7 @@ impl ScalarFunction for RepeatFunction {
         }
 
         let result = s.repeat(n as usize);
-        Ok(Value::Text(Arc::from(result.as_str())))
+        Ok(Value::Text(CompactString::from(result.as_str())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -725,10 +844,10 @@ impl ScalarFunction for SplitPartFunction {
         let idx = (n - 1) as usize;
 
         if idx >= parts.len() {
-            return Ok(Value::Text(Arc::from("")));
+            return Ok(Value::Text(CompactString::from("")));
         }
 
-        Ok(Value::Text(Arc::from(parts[idx])))
+        Ok(Value::Text(CompactString::from(parts[idx])))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -981,7 +1100,7 @@ impl ScalarFunction for LpadFunction {
             .ok_or_else(|| Error::invalid_argument("LPAD length must be an integer"))?;
 
         if len < 0 {
-            return Ok(Value::Text(Arc::from("")));
+            return Ok(Value::Text(CompactString::from("")));
         }
 
         let target_len = len as usize;
@@ -994,7 +1113,7 @@ impl ScalarFunction for LpadFunction {
         let current_len = s.chars().count();
         if current_len >= target_len {
             let result: String = s.chars().take(target_len).collect();
-            return Ok(Value::Text(Arc::from(result.as_str())));
+            return Ok(Value::Text(CompactString::from(result.as_str())));
         }
 
         let pad_needed = target_len - current_len;
@@ -1009,7 +1128,7 @@ impl ScalarFunction for LpadFunction {
         }
 
         result.push_str(&s);
-        Ok(Value::Text(Arc::from(result.as_str())))
+        Ok(Value::Text(CompactString::from(result.as_str())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -1065,7 +1184,7 @@ impl ScalarFunction for RpadFunction {
             .ok_or_else(|| Error::invalid_argument("RPAD length must be an integer"))?;
 
         if len < 0 {
-            return Ok(Value::Text(Arc::from("")));
+            return Ok(Value::Text(CompactString::from("")));
         }
 
         let target_len = len as usize;
@@ -1078,7 +1197,7 @@ impl ScalarFunction for RpadFunction {
         let current_len = s.chars().count();
         if current_len >= target_len {
             let result: String = s.chars().take(target_len).collect();
-            return Ok(Value::Text(Arc::from(result.as_str())));
+            return Ok(Value::Text(CompactString::from(result.as_str())));
         }
 
         let pad_needed = target_len - current_len;
@@ -1094,7 +1213,7 @@ impl ScalarFunction for RpadFunction {
             }
         }
 
-        Ok(Value::Text(Arc::from(result.as_str())))
+        Ok(Value::Text(CompactString::from(result.as_str())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -1150,7 +1269,7 @@ impl ScalarFunction for CharFunction {
         }
 
         match char::from_u32(code as u32) {
-            Some(c) => Ok(Value::Text(Arc::from(c.to_string().as_str()))),
+            Some(c) => Ok(Value::Text(CompactString::from(c.to_string().as_str()))),
             None => Ok(Value::null_unknown()),
         }
     }
@@ -1241,7 +1360,9 @@ impl ScalarFunction for ConcatWsFunction {
             .map(value_to_string)
             .collect();
 
-        Ok(Value::Text(Arc::from(parts.join(&separator).as_str())))
+        Ok(Value::Text(CompactString::from(
+            parts.join(&separator).as_str(),
+        )))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {

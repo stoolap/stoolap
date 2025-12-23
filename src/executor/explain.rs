@@ -17,7 +17,7 @@
 //! This module handles EXPLAIN and EXPLAIN ANALYZE query plan output,
 //! showing the execution strategy and cost estimates for SQL statements.
 
-use std::sync::Arc;
+use compact_str::CompactString;
 
 use crate::core::{Result, Row, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
@@ -113,7 +113,7 @@ impl Executor {
             let columns = vec!["plan".to_string()];
             let rows: Vec<Row> = plan_lines
                 .into_iter()
-                .map(|line| Row::from_values(vec![Value::Text(Arc::from(line.as_str()))]))
+                .map(|line| Row::from_values(vec![Value::Text(CompactString::from(line.as_str()))]))
                 .collect();
 
             Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
@@ -125,7 +125,7 @@ impl Executor {
             let columns = vec!["plan".to_string()];
             let rows: Vec<Row> = plan_lines
                 .into_iter()
-                .map(|line| Row::from_values(vec![Value::Text(Arc::from(line.as_str()))]))
+                .map(|line| Row::from_values(vec![Value::Text(CompactString::from(line.as_str()))]))
                 .collect();
 
             Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))

@@ -24,11 +24,11 @@ pub const MAJOR: u32 = 0;
 pub const MINOR: u32 = 1;
 
 /// Patch version number
-pub const PATCH: u32 = 0;
+pub const PATCH: u32 = 1;
 
 use std::sync::OnceLock;
 
-/// Full version string in semver format (e.g., "0.1.0")
+/// Full version string in semver format (e.g., "0.1.1")
 static VERSION: OnceLock<String> = OnceLock::new();
 
 /// Get the version string
@@ -132,19 +132,19 @@ mod tests {
     fn test_version_constants() {
         assert_eq!(MAJOR, 0);
         assert_eq!(MINOR, 1);
-        assert_eq!(PATCH, 0);
+        assert_eq!(PATCH, 1);
     }
 
     #[test]
     fn test_version_string() {
-        assert_eq!(version(), "0.1.0");
+        assert_eq!(version(), "0.1.1");
     }
 
     #[test]
     fn test_version_info() {
         let info = version_info();
         assert!(info.contains("stoolap"));
-        assert!(info.contains("0.1.0"));
+        assert!(info.contains("0.1.1"));
     }
 
     #[test]
@@ -187,7 +187,7 @@ mod tests {
         let v: SemVer = "1.2.3".parse().unwrap();
         assert_eq!(v, SemVer::new(1, 2, 3));
 
-        let v: SemVer = "0.1.0".parse().unwrap();
+        let v: SemVer = "0.1.1".parse().unwrap();
         assert_eq!(v, SemVer::current());
     }
 

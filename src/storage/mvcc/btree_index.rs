@@ -107,7 +107,7 @@ pub struct BTreeIndex {
     value_to_rows: RwLock<AHashMap<Value, RowIdSet>>,
 
     /// Row ID to value mapping (for removal operations)
-    /// Uses FxHashMap for O(1) lookups with fast integer hashing
+    /// Uses FxHashMap for O(1) lookups
     row_to_value: RwLock<FxHashMap<i64, Value>>,
 
     /// Cached minimum value (excluding NULLs)
@@ -809,8 +809,8 @@ impl Index for BTreeIndex {
             let pairs: Vec<_> = row_to_value.iter().collect();
             pairs
                 .par_iter()
-                .filter_map(|(&row_id, value)| {
-                    let row = crate::core::Row::from_values(vec![(*value).clone()]);
+                .filter_map(|&(&row_id, value)| {
+                    let row = crate::core::Row::from_values(vec![value.clone()]);
                     if expr.evaluate(&row).unwrap_or(false) {
                         Some(row_id)
                     } else {
@@ -822,7 +822,7 @@ impl Index for BTreeIndex {
             // Sequential for small datasets
             let mut results = Vec::with_capacity(row_to_value.len() / 4);
             for (&row_id, value) in row_to_value.iter() {
-                let row = crate::core::Row::from_values(vec![(*value).clone()]);
+                let row = crate::core::Row::from_values(vec![value.clone()]);
                 if expr.evaluate(&row).unwrap_or(false) {
                     results.push(row_id);
                 }

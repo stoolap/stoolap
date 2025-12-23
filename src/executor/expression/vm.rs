@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -702,7 +703,7 @@ impl ExprVM {
                         (Value::Timestamp(t1), Value::Timestamp(t2)) => {
                             // Return interval text
                             let duration = t1.signed_duration_since(*t2);
-                            Value::Text(Arc::from(
+                            Value::Text(CompactString::from(
                                 self.format_duration_as_interval(duration).as_str(),
                             ))
                         }
@@ -844,7 +845,7 @@ impl ExprVM {
                             _ => format!("{}", b),
                         };
                         let s = format!("{}{}", a_str, b_str);
-                        Value::Text(Arc::from(s.as_str()))
+                        Value::Text(CompactString::from(s.as_str()))
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -939,7 +940,7 @@ impl ExprVM {
                     let result = match (&ts1, &ts2) {
                         (Value::Timestamp(t1), Value::Timestamp(t2)) => {
                             let duration = t1.signed_duration_since(*t2);
-                            Value::Text(Arc::from(
+                            Value::Text(CompactString::from(
                                 self.format_duration_as_interval(duration).as_str(),
                             ))
                         }
@@ -1196,6 +1197,17 @@ impl ExprVM {
                         .min()
                         .unwrap_or_else(Value::null_unknown);
                     self.stack.push(result);
+                    pc += 1;
+                }
+
+                // =============================================================
+                // NATIVE SCALAR FUNCTIONS (direct function pointer call)
+                // In-place mutation - no pop/push overhead
+                // =============================================================
+                Op::NativeFn1(func) => {
+                    if let Some(v) = self.stack.last_mut() {
+                        func(v);
+                    }
                     pc += 1;
                 }
 
@@ -1641,7 +1653,7 @@ impl ExprVM {
 
         // Access by key or index
         let result = match key {
-            Value::Text(k) => parsed.get(k.as_ref()),
+            Value::Text(k) => parsed.get(k.as_str()),
             Value::Integer(i) => {
                 if *i >= 0 {
                     parsed.get(*i as usize)
@@ -1657,9 +1669,11 @@ impl ExprVM {
                 if as_text {
                     // ->> returns text
                     match v {
-                        serde_json::Value::String(s) => Value::Text(Arc::from(s.as_str())),
+                        serde_json::Value::String(s) => {
+                            Value::Text(CompactString::from(s.as_str()))
+                        }
                         serde_json::Value::Null => Value::Null(DataType::Text),
-                        other => Value::Text(Arc::from(other.to_string().as_str())),
+                        other => Value::Text(CompactString::from(other.to_string().as_str())),
                     }
                 } else {
                     // -> returns JSON

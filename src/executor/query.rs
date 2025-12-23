@@ -45,12 +45,14 @@ use super::context::{
     clear_scalar_subquery_cache, clear_semi_join_cache, ExecutionContext, TimeoutGuard,
 };
 use super::expression::{CompiledEvaluator, ExpressionEval, JoinFilter, RowFilter};
-use super::join_executor::JoinExecutor;
+use super::hash_table::JoinHashTable;
+use super::join_executor::{JoinExecutor, StreamingJoinRequest};
 use super::operator::{ColumnInfo, Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{
     BatchIndexNestedLoopJoinOperator, IndexLookupStrategy, IndexNestedLoopJoinOperator,
 };
+use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
 use super::pushdown;
 use super::query_classification::{get_classification, QueryClassification};
@@ -68,6 +70,7 @@ use super::utils::{
 };
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
+use crate::optimizer::bloom::BloomFilterBuilder;
 
 /// Pre-computed column name mappings for correlated subqueries.
 /// Avoids repeated string allocations per row in the inner loop.
@@ -1608,18 +1611,41 @@ impl Executor {
                         }
                     });
 
-                    // Try semi-join optimization
+                    // Try semi-join optimizations for both EXISTS and IN subqueries
+                    // These transform O(outer × inner) to O(inner + outer)
+                    let mut current_expr = where_expr.clone();
+                    let mut any_optimized = false;
+
+                    // 1. Try EXISTS semi-join optimization
                     if let Ok(Some(optimized)) = self.try_optimize_exists_to_semi_join(
-                        where_expr,
+                        &current_expr,
                         ctx,
                         &outer_tables,
                         outer_limit,
                     ) {
-                        // Successfully transformed EXISTS to IN - no longer correlated!
-                        // The optimized expression uses a hash set lookup instead of per-row subquery
-                        (Some(optimized), false)
+                        current_expr = optimized;
+                        any_optimized = true;
+                    }
+
+                    // 2. Try IN semi-join optimization (for non-correlated IN subqueries)
+                    if let Ok(Some(optimized)) =
+                        self.try_optimize_in_to_semi_join(&current_expr, ctx, &outer_tables)
+                    {
+                        current_expr = optimized;
+                        any_optimized = true;
+                    }
+
+                    // Check if there are still correlated subqueries after optimizations
+                    let still_correlated = Self::has_correlated_subqueries(&current_expr);
+
+                    if any_optimized && !still_correlated {
+                        // All correlated subqueries were optimized away
+                        (Some(current_expr), false)
+                    } else if any_optimized {
+                        // Some optimizations applied but still have correlated parts
+                        (Some(current_expr), true)
                     } else {
-                        // Couldn't optimize - keep original for per-row processing
+                        // No optimizations applied - keep original for per-row processing
                         (Some(where_expr.clone()), true)
                     }
                 } else {
@@ -2155,10 +2181,38 @@ impl Executor {
                     let has_index = is_pk || table.get_index_on_column(&col_name).is_some();
 
                     if has_index {
+                        // OPTIMIZATION: If we have LIMIT without top-level ORDER BY,
+                        // push the limit down to fetch only needed rows.
+                        // This is safe ONLY for window functions that don't depend on total row count.
+                        // Safe: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE
+                        // Unsafe: NTILE, PERCENT_RANK, CUME_DIST (need total count)
+                        let has_order_by = !stmt.order_by.is_empty();
+                        let is_window_safe = Self::is_window_safe_for_limit_pushdown(stmt);
+                        let fetch_limit = if !has_order_by && is_window_safe {
+                            if let Some(limit_expr) = &stmt.limit {
+                                if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
+                                    if lit.value > 0 {
+                                        lit.value as usize
+                                    } else {
+                                        usize::MAX
+                                    }
+                                } else {
+                                    usize::MAX
+                                }
+                            } else {
+                                usize::MAX
+                            }
+                        } else {
+                            usize::MAX
+                        };
+
                         // Fetch rows in sorted order from the index (no re-fetch needed)
-                        if let Some(sorted_rows) =
-                            table.collect_rows_ordered_by_index(&col_name, ascending, usize::MAX, 0)
-                        {
+                        if let Some(sorted_rows) = table.collect_rows_ordered_by_index(
+                            &col_name,
+                            ascending,
+                            fetch_limit,
+                            0,
+                        ) {
                             (
                                 sorted_rows,
                                 Some(WindowPreSortedState {
@@ -2998,6 +3052,178 @@ impl Executor {
                     }
                 }
             }
+
+            // =================================================================
+            // STREAMING HASH JOIN OPTIMIZATION
+            // =================================================================
+            // For queries with small LIMIT, use streaming execution to avoid
+            // materializing the probe side. This enables true early termination.
+            //
+            // Eligibility:
+            // - LIMIT ≤ 100 (small limit benefits from early termination)
+            // - INNER JOIN (simpler, no NULL padding needed)
+            // - Has equality keys (hash join applicable)
+            // - No ORDER BY, GROUP BY, aggregation (would negate early termination)
+            // - No cross-table predicates (applied after join)
+
+            let streaming_limit = if !join_type.contains("FULL")
+                && !join_type.contains("LEFT")
+                && !join_type.contains("RIGHT")
+                && !classification.has_order_by
+                && !classification.has_group_by
+                && !classification.has_aggregation
+                && cross_filter.is_none()
+            {
+                // Compute limit value
+                stmt.limit.as_ref().and_then(|limit_expr| {
+                    ExpressionEval::compile(limit_expr, &[])
+                        .ok()
+                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|v| match v {
+                            Value::Integer(n) if (0..=100).contains(&n) => Some(n as u64),
+                            _ => None,
+                        })
+                })
+            } else {
+                None
+            };
+
+            // Check if we have equality keys for hash join using AST analysis
+            let has_equality_keys_for_streaming = join_source
+                .condition
+                .as_ref()
+                .map(|cond| Self::has_equality_condition(cond))
+                .unwrap_or(false);
+
+            // Use streaming path if eligible
+            if let Some(limit) = streaming_limit {
+                if has_equality_keys_for_streaming {
+                    // Estimate cardinalities to choose optimal build side (smaller = build)
+                    let left_card = self
+                        .estimate_table_expr_cardinality(&join_source.left, left_filter.as_ref());
+                    let right_card = self
+                        .estimate_table_expr_cardinality(&join_source.right, right_filter.as_ref());
+                    let build_left = left_card < right_card;
+
+                    // Execute both sides
+                    let (left_result, left_cols) = self.execute_table_expression_with_filter(
+                        &join_source.left,
+                        ctx,
+                        left_filter.as_ref(),
+                    )?;
+
+                    let (right_result, right_cols) = self.execute_table_expression_with_filter(
+                        &join_source.right,
+                        ctx,
+                        right_filter.as_ref(),
+                    )?;
+
+                    // Extract join keys BEFORE moving columns (uses original left/right positions)
+                    let (left_key_indices, right_key_indices, _) =
+                        if let Some(cond) = join_source.condition.as_ref() {
+                            extract_join_keys_and_residual(cond, &left_cols, &right_cols)
+                        } else {
+                            (Vec::new(), Vec::new(), Vec::new())
+                        };
+
+                    // Build combined columns (always left-first for consistent output schema)
+                    let mut all_cols = left_cols.clone();
+                    all_cols.extend(right_cols.iter().cloned());
+
+                    // Materialize the smaller side as build, stream the larger as probe
+                    let (build_rows, build_cols, probe_result, probe_cols, build_is_left) =
+                        if build_left {
+                            let build = Self::materialize_result(left_result)?;
+                            (build, left_cols, right_result, right_cols, true)
+                        } else {
+                            let build = Self::materialize_result(right_result)?;
+                            (build, right_cols, left_result, left_cols, false)
+                        };
+
+                    // Map key indices based on which side is build
+                    let (build_key_indices, probe_key_indices) = if build_is_left {
+                        (left_key_indices, right_key_indices)
+                    } else {
+                        (right_key_indices, left_key_indices)
+                    };
+
+                    // Convert probe side to streaming operator
+                    let probe_source: Box<dyn Operator> =
+                        Box::new(QueryResultOperator::new(probe_result, probe_cols.clone()));
+
+                    // Build hash table and bloom filter together in a single pass
+                    // This avoids iterating build_rows twice (once for bloom, once for hash table)
+                    let (bloom_filter, pre_built_hash_table) =
+                        if build_rows.len() >= 100 && !build_key_indices.is_empty() {
+                            let mut builder = BloomFilterBuilder::new(
+                                "join_key".to_string(),
+                                "build".to_string(),
+                                build_rows.len(),
+                            );
+                            // Single-pass: build hash table and populate bloom filter
+                            let hash_table = JoinHashTable::build_with_bloom(
+                                &build_rows,
+                                &build_key_indices,
+                                &mut builder,
+                            );
+                            let bf = builder.build();
+                            let bloom = if bf.is_effective() { Some(bf) } else { None };
+                            (bloom, Some(hash_table))
+                        } else if !build_key_indices.is_empty() {
+                            // No bloom filter, but still pre-build hash table
+                            let hash_table = JoinHashTable::build(&build_rows, &build_key_indices);
+                            (None, Some(hash_table))
+                        } else {
+                            (None, None)
+                        };
+
+                    // Wrap probe with bloom filter if available
+                    let probe_source: Box<dyn Operator> = if let Some(ref bf) = bloom_filter {
+                        if !probe_key_indices.is_empty() {
+                            Box::new(BloomFilterOperator::new(
+                                probe_source,
+                                bf.clone(),
+                                probe_key_indices[0],
+                            ))
+                        } else {
+                            probe_source
+                        }
+                    } else {
+                        probe_source
+                    };
+
+                    // Execute streaming hash join
+                    let join_executor = JoinExecutor::new();
+                    let streaming_request = StreamingJoinRequest {
+                        build_rows,
+                        build_columns: &build_cols,
+                        probe_source,
+                        probe_columns: probe_cols.clone(),
+                        condition: join_source.condition.as_ref().map(|c| c.as_ref()),
+                        join_type: &join_type,
+                        build_is_left,
+                        limit: Some(limit),
+                        ctx,
+                        bloom_filter,
+                        pre_built_hash_table,
+                    };
+
+                    let join_result = join_executor.execute_streaming(streaming_request)?;
+
+                    // Project and return results
+                    let projected_rows =
+                        self.project_rows(&stmt.columns, join_result.rows, &all_cols, ctx)?;
+                    let output_columns =
+                        self.get_output_column_names(&stmt.columns, &all_cols, None);
+
+                    let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+                    return Ok((Box::new(result), output_columns, false));
+                }
+            }
+
+            // =================================================================
+            // STANDARD PATH: Materialize both sides
+            // =================================================================
 
             // Execute both sides
             let (left_result, left_cols) = self.execute_table_expression_with_filter(

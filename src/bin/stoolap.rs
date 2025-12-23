@@ -1229,7 +1229,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Null(_) => serde_json::Value::Null,
         Value::Integer(i) => serde_json::json!(i),
         Value::Float(f) => serde_json::json!(f),
-        Value::Text(s) => serde_json::json!(s.as_ref()),
+        Value::Text(s) => serde_json::json!(s.as_str()),
         Value::Boolean(b) => serde_json::json!(b),
         Value::Timestamp(ts) => serde_json::json!(ts.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
         Value::Json(s) => serde_json::json!(s.as_ref()),

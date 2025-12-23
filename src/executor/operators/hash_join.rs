@@ -215,6 +215,112 @@ impl HashJoinOperator {
         }
     }
 
+    /// Create a hash join operator with pre-built hash table and rows.
+    ///
+    /// This avoids the build phase in `open()` since the hash table is already
+    /// constructed. Used by streaming joins where hash table and bloom filter
+    /// are built together in a single pass for efficiency.
+    ///
+    /// # Arguments
+    /// * `probe` - Probe side operator (will be iterated during join)
+    /// * `build_rows` - Pre-materialized build side rows
+    /// * `hash_table` - Pre-built hash table for build side
+    /// * `join_type` - Type of join
+    /// * `probe_key_indices` - Key indices for probe side
+    /// * `build_key_indices` - Key indices for build side
+    /// * `build_is_left` - Whether build side is left (for schema ordering)
+    pub fn with_prebuilt(
+        probe: Box<dyn Operator>,
+        build_rows: Vec<Row>,
+        hash_table: crate::executor::hash_table::JoinHashTable,
+        join_type: JoinType,
+        probe_key_indices: Vec<usize>,
+        build_key_indices: Vec<usize>,
+        build_is_left: bool,
+    ) -> Self {
+        let probe_col_count = probe.schema().len();
+        let build_col_count = if build_rows.is_empty() {
+            0
+        } else {
+            build_rows[0].len()
+        };
+
+        // Build schema based on build side position
+        let mut schema = Vec::new();
+        let (left_col_count, right_col_count) = if build_is_left {
+            // Build is left: [build_cols, probe_cols]
+            for i in 0..build_col_count {
+                schema.push(ColumnInfo::new(format!("build_{}", i)));
+            }
+            schema.extend(probe.schema().iter().cloned());
+            (build_col_count, probe_col_count)
+        } else {
+            // Build is right: [probe_cols, build_cols]
+            schema.extend(probe.schema().iter().cloned());
+            for i in 0..build_col_count {
+                schema.push(ColumnInfo::new(format!("build_{}", i)));
+            }
+            (probe_col_count, build_col_count)
+        };
+
+        let (left_key_indices, right_key_indices, build_side) = if build_is_left {
+            (build_key_indices, probe_key_indices, JoinSide::Left)
+        } else {
+            (probe_key_indices, build_key_indices, JoinSide::Right)
+        };
+
+        // Track matched builds for OUTER joins
+        let build_matched = if matches!(join_type, JoinType::Full)
+            || (matches!(join_type, JoinType::Left) && build_is_left)
+            || (matches!(join_type, JoinType::Right) && !build_is_left)
+        {
+            vec![false; build_rows.len()]
+        } else {
+            Vec::new()
+        };
+
+        // Store probe operator in the non-build side slot
+        let (left, right) = if build_is_left {
+            // Build is left, probe is right
+            (
+                Box::new(crate::executor::operator::EmptyOperator::new()) as Box<dyn Operator>,
+                probe,
+            )
+        } else {
+            // Build is right, probe is left
+            (
+                probe,
+                Box::new(crate::executor::operator::EmptyOperator::new()) as Box<dyn Operator>,
+            )
+        };
+
+        Self {
+            left,
+            right,
+            join_type,
+            build_side,
+            left_key_indices,
+            right_key_indices,
+            build_rows,
+            hash_table: Some(hash_table),
+            schema,
+            left_col_count,
+            right_col_count,
+            current_probe_row: None,
+            current_probe_hash: 0,
+            current_match_idx: 0,
+            current_matches: Vec::new(),
+            probe_had_match: false,
+            build_matched,
+            returning_unmatched_build: false,
+            unmatched_build_idx: 0,
+            is_self_join: false,
+            self_join_probe_idx: 0,
+            opened: false,
+            probe_exhausted: false,
+        }
+    }
+
     /// Create an optimized self-join operator.
     ///
     /// For self-joins (t1 JOIN t1), this avoids scanning the table twice
@@ -345,7 +451,20 @@ impl HashJoinOperator {
 
 impl Operator for HashJoinOperator {
     fn open(&mut self) -> Result<()> {
-        // Open both inputs
+        // Check if hash table was pre-built (via with_prebuilt constructor)
+        if self.hash_table.is_some() {
+            // Pre-built case: only need to open the probe side
+            // Build side is already materialized
+            let probe_op = match self.build_side {
+                JoinSide::Left => &mut self.right,
+                JoinSide::Right => &mut self.left,
+            };
+            probe_op.open()?;
+            self.opened = true;
+            return Ok(());
+        }
+
+        // Standard case: open both inputs and build hash table
         self.left.open()?;
         if !self.is_self_join {
             self.right.open()?;

@@ -20,9 +20,9 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use compact_str::CompactString;
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::core::{DataType, Error, Operator, Result, Row, Schema, Value};
@@ -78,7 +78,7 @@ impl ComparisonValue {
             ComparisonValue::Null => Value::Null(DataType::Text),
             ComparisonValue::Integer(i) => Value::Integer(*i),
             ComparisonValue::Float(f) => Value::Float(*f),
-            ComparisonValue::Text(s) => Value::Text(Arc::from(s.as_str())),
+            ComparisonValue::Text(s) => Value::Text(CompactString::from(s.as_str())),
             ComparisonValue::Boolean(b) => Value::Boolean(*b),
             ComparisonValue::Timestamp(t) => Value::Timestamp(*t),
         }

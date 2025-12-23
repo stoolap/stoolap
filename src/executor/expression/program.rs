@@ -289,7 +289,8 @@ impl Program {
                 | Op::ExecExists(_)
                 | Op::ExecInSubquery(_)
                 | Op::ExecAll(_, _)
-                | Op::ExecAny(_, _) => 0,
+                | Op::ExecAny(_, _)
+                | Op::NativeFn1(_) => 0,
 
                 // Multi-column IN: pop N, push 1
                 Op::InTupleSet { tuple_size, .. } => 1 - (*tuple_size as i32),

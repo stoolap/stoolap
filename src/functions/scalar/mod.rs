@@ -115,6 +115,16 @@ macro_rules! validate_arg_count {
     };
 }
 
+/// Borrow a Value as a string slice if it's Text (zero allocation)
+/// Returns None for non-Text values
+#[inline]
+pub fn value_as_str(value: &Value) -> Option<&str> {
+    match value {
+        Value::Text(s) => Some(s.as_ref()),
+        _ => None,
+    }
+}
+
 /// Convert a Value to a string representation
 pub fn value_to_string(value: &Value) -> String {
     if value.is_null() {

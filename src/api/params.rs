@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use compact_str::CompactString;
 
 use crate::core::Value;
 
@@ -123,19 +124,19 @@ impl ToParam for bool {
 
 impl ToParam for String {
     fn to_param(&self) -> Value {
-        Value::Text(Arc::from(self.as_str()))
+        Value::Text(CompactString::from(self.as_str()))
     }
 }
 
 impl ToParam for &str {
     fn to_param(&self) -> Value {
-        Value::Text(Arc::from(*self))
+        Value::Text(CompactString::from(*self))
     }
 }
 
 impl ToParam for Arc<str> {
     fn to_param(&self) -> Value {
-        Value::Text(Arc::clone(self))
+        Value::Text(CompactString::from(self.as_ref()))
     }
 }
 

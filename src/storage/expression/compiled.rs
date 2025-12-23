@@ -972,49 +972,49 @@ impl CompiledFilter {
             // String comparisons
             CompiledFilter::StringEq { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.as_ref() == value.as_ref()
+                    s.as_str() == value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::StringNe { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.as_ref() != value.as_ref()
+                    s.as_str() != value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::StringGt { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.as_ref() > value.as_ref()
+                    s.as_str() > value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::StringGte { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.as_ref() >= value.as_ref()
+                    s.as_str() >= value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::StringLt { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.as_ref() < value.as_ref()
+                    s.as_str() < value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::StringLte { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.as_ref() <= value.as_ref()
+                    s.as_str() <= value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::StringIn { col_idx, values } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    values.iter().any(|v| s.as_ref() == v.as_ref())
+                    values.iter().any(|v| s.as_str() == v.as_ref())
                 } else {
                     false
                 }
@@ -1026,7 +1026,7 @@ impl CompiledFilter {
                 negated,
             } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    let matches = pattern.matches(s.as_ref(), *case_insensitive);
+                    let matches = pattern.matches(s.as_str(), *case_insensitive);
                     if *negated {
                         !matches
                     } else {

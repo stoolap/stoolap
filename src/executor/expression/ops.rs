@@ -25,7 +25,7 @@ use std::sync::Arc;
 use ahash::AHashSet;
 
 use crate::core::{DataType, Value};
-use crate::functions::ScalarFunction;
+use crate::functions::{NativeFn1, ScalarFunction};
 
 /// Compiled LIKE/ILIKE pattern for fast matching
 #[derive(Debug, Clone)]
@@ -591,6 +591,13 @@ pub enum Op {
     Least(u8),
 
     // =========================================================================
+    // NATIVE SCALAR FUNCTIONS (function pointer, no dynamic dispatch)
+    // =========================================================================
+    /// Native scalar function - single argument, direct function pointer call
+    /// Stack: [value] -> [result]
+    NativeFn1(NativeFn1),
+
+    // =========================================================================
     // TYPE OPERATIONS
     // =========================================================================
     /// Cast value to target type
@@ -885,6 +892,7 @@ impl std::fmt::Debug for Op {
             Op::ReturnTrue => write!(f, "ReturnTrue"),
             Op::ReturnFalse => write!(f, "ReturnFalse"),
             Op::ReturnNull(dt) => write!(f, "ReturnNull({:?})", dt),
+            Op::NativeFn1(_) => write!(f, "NativeFn1(...)"),
         }
     }
 }

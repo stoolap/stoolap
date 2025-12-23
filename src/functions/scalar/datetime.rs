@@ -15,6 +15,7 @@
 //! Date/Time scalar functions
 
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use compact_str::CompactString;
 
 use crate::core::{parse_timestamp, Error, Result, Value};
 use crate::functions::{
@@ -370,7 +371,7 @@ impl ScalarFunction for VersionFunction {
         }
 
         // Use the version info from common module
-        Ok(Value::Text(std::sync::Arc::from(
+        Ok(Value::Text(CompactString::from(
             crate::common::version::version_info().as_str(),
         )))
     }
@@ -821,7 +822,7 @@ impl ScalarFunction for DateAddFunction {
             "day".to_string()
         } else {
             match &args[2] {
-                Value::Text(s) => s.to_lowercase(),
+                Value::Text(s) => s.to_lowercase().to_string(),
                 _ if args[2].is_null() => return Ok(Value::null_unknown()),
                 _ => {
                     return Err(Error::invalid_argument(

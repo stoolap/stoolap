@@ -1,6 +1,6 @@
 [package]
 name = "stoolap"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Stoolap Contributors"]
 description = "High-performance embedded SQL database with MVCC, time-travel queries, and full ACID compliance"
@@ -67,6 +67,7 @@ lz4_flex = "0.11"
 # Utilities
 bytes = "1.5"
 smallvec = "1.11"
+compact_str = "0.9"  # Inline strings up to 24 bytes - avoids heap allocation
 ordered-float = "4.2"
 indexmap = "2.1"
 rustc-hash = "1.1"

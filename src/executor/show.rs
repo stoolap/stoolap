@@ -22,7 +22,7 @@
 //! - SHOW INDEXES
 //! - DESCRIBE
 
-use std::sync::Arc;
+use compact_str::CompactString;
 
 use crate::core::{Error, Result, Row, Value};
 use crate::parser::ast::*;
@@ -45,7 +45,7 @@ impl Executor {
         let columns = vec!["table_name".to_string()];
         let rows: Vec<Row> = tables
             .into_iter()
-            .map(|name| Row::from_values(vec![Value::Text(Arc::from(name.as_str()))]))
+            .map(|name| Row::from_values(vec![Value::Text(CompactString::from(name.as_str()))]))
             .collect();
 
         Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
@@ -62,7 +62,7 @@ impl Executor {
         let columns = vec!["view_name".to_string()];
         let rows: Vec<Row> = views
             .into_iter()
-            .map(|name| Row::from_values(vec![Value::Text(Arc::from(name.as_str()))]))
+            .map(|name| Row::from_values(vec![Value::Text(CompactString::from(name.as_str()))]))
             .collect();
 
         Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
@@ -131,8 +131,8 @@ impl Executor {
 
         let columns = vec!["Table".to_string(), "Create Table".to_string()];
         let rows = vec![Row::from_values(vec![
-            Value::Text(Arc::from(table_name.as_str())),
-            Value::Text(Arc::from(create_sql.as_str())),
+            Value::Text(CompactString::from(table_name.as_str())),
+            Value::Text(CompactString::from(create_sql.as_str())),
         ])];
 
         Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
@@ -160,8 +160,8 @@ impl Executor {
 
         let columns = vec!["View".to_string(), "Create View".to_string()];
         let rows = vec![Row::from_values(vec![
-            Value::Text(Arc::from(view_def.original_name.as_str())),
-            Value::Text(Arc::from(create_sql.as_str())),
+            Value::Text(CompactString::from(view_def.original_name.as_str())),
+            Value::Text(CompactString::from(create_sql.as_str())),
         ])];
 
         Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
@@ -212,10 +212,10 @@ impl Executor {
                 let index_type = index.index_type().as_str().to_uppercase();
 
                 rows.push(Row::from_values(vec![
-                    Value::Text(Arc::from(table_name.as_str())),
-                    Value::Text(Arc::from(index_name.as_str())),
-                    Value::Text(Arc::from(column_name.as_str())),
-                    Value::Text(Arc::from(index_type)),
+                    Value::Text(CompactString::from(table_name.as_str())),
+                    Value::Text(CompactString::from(index_name.as_str())),
+                    Value::Text(CompactString::from(column_name.as_str())),
+                    Value::Text(CompactString::from(index_type)),
                     Value::Boolean(is_unique),
                 ]));
             }
@@ -272,12 +272,12 @@ impl Executor {
                 };
 
             rows.push(Row::from_values(vec![
-                Value::Text(Arc::from(col.name.as_str())),
-                Value::Text(Arc::from(type_str.as_str())),
-                Value::Text(Arc::from(null_str)),
-                Value::Text(Arc::from(key_str)),
-                Value::Text(Arc::from(default_str.as_str())),
-                Value::Text(Arc::from(extra_str)),
+                Value::Text(CompactString::from(col.name.as_str())),
+                Value::Text(CompactString::from(type_str.as_str())),
+                Value::Text(CompactString::from(null_str)),
+                Value::Text(CompactString::from(key_str)),
+                Value::Text(CompactString::from(default_str.as_str())),
+                Value::Text(CompactString::from(extra_str)),
             ]));
         }
 

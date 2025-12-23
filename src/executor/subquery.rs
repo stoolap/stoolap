@@ -2533,6 +2533,199 @@ impl Executor {
         }
     }
 
+    // ============================================================================
+    // IN Subquery Semi-Join Optimization
+    // ============================================================================
+
+    /// Try to optimize IN subqueries to semi-join (execute once, hash lookup per row).
+    ///
+    /// This transforms:
+    /// ```sql
+    /// WHERE outer.col IN (SELECT inner_col FROM t WHERE non_correlated_pred)
+    /// ```
+    /// Into:
+    /// ```sql
+    /// WHERE outer.col IN (hash_set_of_inner_col_values)
+    /// ```
+    ///
+    /// # Optimization Criteria
+    ///
+    /// 1. IN right side must be a scalar subquery
+    /// 2. Subquery must SELECT exactly one column
+    /// 3. Subquery must have a simple table source (no joins)
+    /// 4. Subquery WHERE clause must NOT reference outer tables (non-correlated)
+    ///
+    /// # Performance Impact
+    ///
+    /// - **Before**: O(N×M) - executes subquery for each outer row
+    /// - **After**: O(N+M) - executes subquery once, O(1) hash lookup per row
+    pub fn try_optimize_in_to_semi_join(
+        &self,
+        expr: &Expression,
+        ctx: &ExecutionContext,
+        outer_tables: &[String],
+    ) -> Result<Option<Expression>> {
+        match expr {
+            Expression::In(in_expr) => {
+                // Check if right side is a scalar subquery
+                if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
+                    if let Some(info) = Self::try_extract_in_semi_join_info(
+                        in_expr,
+                        &subquery.subquery,
+                        outer_tables,
+                    ) {
+                        // Execute subquery once and build hash set
+                        let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
+                        return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
+                    }
+                }
+                Ok(None)
+            }
+
+            Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("AND") => {
+                // Try to optimize IN in either branch of AND
+                let left_opt = self.try_optimize_in_to_semi_join(&infix.left, ctx, outer_tables)?;
+                let right_opt =
+                    self.try_optimize_in_to_semi_join(&infix.right, ctx, outer_tables)?;
+
+                match (left_opt, right_opt) {
+                    (Some(new_left), Some(new_right)) => {
+                        Ok(Some(Expression::Infix(InfixExpression {
+                            token: infix.token.clone(),
+                            left: Box::new(new_left),
+                            operator: infix.operator.clone(),
+                            op_type: infix.op_type,
+                            right: Box::new(new_right),
+                        })))
+                    }
+                    (Some(new_left), None) => Ok(Some(Expression::Infix(InfixExpression {
+                        token: infix.token.clone(),
+                        left: Box::new(new_left),
+                        operator: infix.operator.clone(),
+                        op_type: infix.op_type,
+                        right: infix.right.clone(),
+                    }))),
+                    (None, Some(new_right)) => Ok(Some(Expression::Infix(InfixExpression {
+                        token: infix.token.clone(),
+                        left: infix.left.clone(),
+                        operator: infix.operator.clone(),
+                        op_type: infix.op_type,
+                        right: Box::new(new_right),
+                    }))),
+                    (None, None) => Ok(None),
+                }
+            }
+
+            Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("OR") => {
+                // Try to optimize IN in either branch of OR
+                let left_opt = self.try_optimize_in_to_semi_join(&infix.left, ctx, outer_tables)?;
+                let right_opt =
+                    self.try_optimize_in_to_semi_join(&infix.right, ctx, outer_tables)?;
+
+                match (left_opt, right_opt) {
+                    (Some(new_left), Some(new_right)) => {
+                        Ok(Some(Expression::Infix(InfixExpression {
+                            token: infix.token.clone(),
+                            left: Box::new(new_left),
+                            operator: infix.operator.clone(),
+                            op_type: infix.op_type,
+                            right: Box::new(new_right),
+                        })))
+                    }
+                    (Some(new_left), None) => Ok(Some(Expression::Infix(InfixExpression {
+                        token: infix.token.clone(),
+                        left: Box::new(new_left),
+                        operator: infix.operator.clone(),
+                        op_type: infix.op_type,
+                        right: infix.right.clone(),
+                    }))),
+                    (None, Some(new_right)) => Ok(Some(Expression::Infix(InfixExpression {
+                        token: infix.token.clone(),
+                        left: infix.left.clone(),
+                        operator: infix.operator.clone(),
+                        op_type: infix.op_type,
+                        right: Box::new(new_right),
+                    }))),
+                    (None, None) => Ok(None),
+                }
+            }
+
+            _ => Ok(None),
+        }
+    }
+
+    /// Extract semi-join info from an IN expression with subquery.
+    ///
+    /// Pattern: `outer.col IN (SELECT inner_col FROM t WHERE pred)`
+    ///
+    /// Returns None if:
+    /// - Subquery has more than one SELECT column
+    /// - Subquery has joins or derived tables
+    /// - WHERE clause references outer tables (correlated)
+    fn try_extract_in_semi_join_info(
+        in_expr: &InExpression,
+        subquery: &SelectStatement,
+        outer_tables: &[String],
+    ) -> Option<SemiJoinInfo> {
+        // 1. Extract outer column from left side of IN
+        let (outer_column, outer_table) = match in_expr.left.as_ref() {
+            Expression::QualifiedIdentifier(qid) => {
+                (qid.name.value.clone(), Some(qid.qualifier.value.clone()))
+            }
+            Expression::Identifier(id) => (id.value.clone(), None),
+            _ => return None, // Complex expression on left side, can't optimize
+        };
+
+        // 2. Subquery must SELECT exactly one column (not *)
+        if subquery.columns.len() != 1 {
+            return None;
+        }
+
+        // Extract inner column name from SELECT
+        let inner_column = match &subquery.columns[0] {
+            Expression::Identifier(id) => id.value.clone(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+            Expression::Aliased(a) => match a.expression.as_ref() {
+                Expression::Identifier(id) => id.value.clone(),
+                Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+                _ => return None,
+            },
+            _ => return None, // Can't handle expressions in SELECT
+        };
+
+        // 3. Check for simple table source (not a join)
+        let (inner_table, inner_alias) = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
+            Some(Expression::TableSource(ts)) => {
+                let alias = ts.alias.as_ref().map(|a| a.value.clone());
+                (ts.name.value.clone(), alias)
+            }
+            _ => return None, // Can't optimize subquery joins or derived tables
+        };
+
+        // 4. Get inner table identifiers
+        let inner_tables = vec![inner_alias
+            .clone()
+            .unwrap_or_else(|| inner_table.to_lowercase())
+            .to_lowercase()];
+
+        // 5. Check if WHERE clause references outer tables
+        if let Some(ref where_clause) = subquery.where_clause {
+            if Self::expression_references_outer_tables(where_clause, outer_tables, &inner_tables) {
+                return None; // Correlated WHERE, can't optimize
+            }
+        }
+
+        Some(SemiJoinInfo {
+            outer_column,
+            outer_table,
+            inner_column,
+            inner_table,
+            inner_alias,
+            non_correlated_where: subquery.where_clause.as_ref().map(|b| b.as_ref().clone()),
+            is_negated: in_expr.not,
+        })
+    }
+
     /// Get outer table names from a table expression (for semi-join optimization).
     pub fn collect_outer_table_names(table_expr: &Option<Box<Expression>>) -> Vec<String> {
         let mut tables = Vec::new();

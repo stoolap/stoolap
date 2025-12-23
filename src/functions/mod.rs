@@ -234,6 +234,10 @@ pub trait AggregateFunction: Send + Sync {
     fn clone_box(&self) -> Box<dyn AggregateFunction>;
 }
 
+/// Function pointer type for single-argument native functions (no dynamic dispatch)
+/// Uses in-place mutation to avoid allocation overhead.
+pub type NativeFn1 = fn(&mut Value);
+
 /// Trait for scalar functions
 pub trait ScalarFunction: Send + Sync {
     /// Get the function name
@@ -247,6 +251,13 @@ pub trait ScalarFunction: Send + Sync {
 
     /// Clone the function into a new instance
     fn clone_box(&self) -> Box<dyn ScalarFunction>;
+
+    /// Optional: Return a direct function pointer for single-arg functions.
+    /// When Some, compiler emits direct call (no dynamic dispatch).
+    /// Default is None (uses evaluate() with dynamic dispatch).
+    fn native_fn1(&self) -> Option<NativeFn1> {
+        None
+    }
 }
 
 /// Trait for window functions
