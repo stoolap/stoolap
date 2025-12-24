@@ -1356,6 +1356,32 @@ impl Executor {
             }
         }
 
+        // FAST PATH: Keyset pagination optimization
+        // For queries like `SELECT * FROM table WHERE id > X ORDER BY id LIMIT Y`,
+        // use the PK's BTreeMap ordering to start iteration from X directly.
+        // This provides O(limit) complexity instead of O(n) for full scans.
+        // Note: OFFSET is not supported - queries with OFFSET fall through to regular execution.
+        if classification.has_limit
+            && stmt.offset.is_none()
+            && stmt.order_by.len() == 1
+            && !classification.has_group_by
+            && !classification.has_aggregation
+            && !classification.has_window_functions
+            && !classification.has_distinct
+            && !needs_memory_filter
+        {
+            if let Some((result, columns)) = self.try_keyset_pagination_optimization(
+                stmt,
+                where_to_use,
+                &*table,
+                &all_columns,
+                table_alias.as_deref(),
+                ctx,
+            )? {
+                return Ok((result, columns, true));
+            }
+        }
+
         // FAST PATH: IN subquery index optimization
         // For queries like `SELECT * FROM table WHERE id IN (SELECT col FROM other_table WHERE ...)`
         // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows

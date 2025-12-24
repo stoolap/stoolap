@@ -244,6 +244,219 @@ impl Executor {
         Ok(None)
     }
 
+    /// Keyset pagination optimization for PRIMARY KEY columns
+    ///
+    /// For queries like `SELECT * FROM table WHERE id > X ORDER BY id LIMIT Y`,
+    /// uses the PK's BTreeMap natural ordering to start iteration from X and return only Y rows.
+    /// This provides O(limit) complexity instead of O(n) for full table scans.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn try_keyset_pagination_optimization(
+        &self,
+        stmt: &SelectStatement,
+        where_expr: Option<&Expression>,
+        table: &dyn Table,
+        all_columns: &[String],
+        table_alias: Option<&str>,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+        // Must have WHERE clause
+        let where_clause = match where_expr {
+            Some(expr) => expr,
+            None => return Ok(None),
+        };
+
+        // Get the ORDER BY column name - must be single column
+        let order_by = &stmt.order_by[0];
+        let order_column = match &order_by.expression {
+            Expression::Identifier(id) => id.value.clone(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+            _ => return Ok(None),
+        };
+
+        // Must be ascending order (most common case for keyset pagination)
+        let ascending = order_by.ascending;
+
+        // Get table schema to check if ORDER BY is on PK
+        let schema = table.schema();
+        let pk_indices = schema.primary_key_indices();
+        if pk_indices.len() != 1 {
+            return Ok(None); // Only single-column PK supported
+        }
+
+        let pk_idx = pk_indices[0];
+        let pk_column = &schema.columns[pk_idx].name;
+
+        // ORDER BY must be on PK column
+        if !order_column.eq_ignore_ascii_case(pk_column) {
+            return Ok(None);
+        }
+
+        // Extract keyset condition from WHERE clause
+        // Supports: id > X, id >= X, id < X, id <= X
+        let (start_after, start_from, is_pure_keyset) =
+            self.extract_pk_keyset_bounds(where_clause, pk_column, ctx)?;
+
+        // Must have at least one bound AND be a pure keyset predicate
+        // (no additional predicates like `AND status = 'active'`)
+        if start_after.is_none() && start_from.is_none() {
+            return Ok(None);
+        }
+        if !is_pure_keyset {
+            return Ok(None);
+        }
+
+        // Evaluate limit
+        let limit = if let Some(ref limit_expr) = stmt.limit {
+            match ExpressionEval::compile(limit_expr, &[])
+                .ok()
+                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+            {
+                Some(Value::Integer(l)) => l as usize,
+                Some(Value::Float(f)) => f as usize,
+                _ => return Ok(None),
+            }
+        } else {
+            return Ok(None);
+        };
+
+        // Use keyset pagination from storage layer
+        if let Some(rows) = table.collect_rows_pk_keyset(start_after, start_from, ascending, limit)
+        {
+            // Project rows according to SELECT expressions
+            let projected_rows =
+                self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
+            let output_columns =
+                self.get_output_column_names(&stmt.columns, all_columns, table_alias);
+
+            let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+            return Ok(Some((Box::new(result), output_columns)));
+        }
+
+        Ok(None)
+    }
+
+    /// Extract PK keyset bounds from a WHERE clause
+    ///
+    /// Returns (start_after, start_from, is_pure_keyset) where:
+    /// - start_after is for `id > X` (exclusive bound)
+    /// - start_from is for `id >= X` (inclusive bound)
+    /// - is_pure_keyset is true if the expression ONLY contains keyset predicates
+    ///   (no additional predicates like `AND status = 'active'`)
+    fn extract_pk_keyset_bounds(
+        &self,
+        expr: &Expression,
+        pk_column: &str,
+        ctx: &ExecutionContext,
+    ) -> Result<(Option<i64>, Option<i64>, bool)> {
+        if let Expression::Infix(infix) = expr {
+            let op = infix.operator.as_str();
+
+            // Handle comparison operators
+            match op {
+                ">" | ">=" | "<" | "<=" => {
+                    // Check if left side is the PK column
+                    let left_is_pk = match &*infix.left {
+                        Expression::Identifier(id) => id.value.eq_ignore_ascii_case(pk_column),
+                        Expression::QualifiedIdentifier(qid) => {
+                            qid.name.value.eq_ignore_ascii_case(pk_column)
+                        }
+                        _ => false,
+                    };
+
+                    if left_is_pk {
+                        // pk OP value
+                        if let Some(value) = self.eval_to_i64(&infix.right, ctx) {
+                            return Ok(match op {
+                                ">" => (Some(value), None, true),
+                                ">=" => (None, Some(value), true),
+                                // For < and <=, we'd need end bounds which we don't support yet
+                                _ => (None, None, false),
+                            });
+                        }
+                    } else {
+                        // value OP pk (reversed)
+                        let right_is_pk = match &*infix.right {
+                            Expression::Identifier(id) => id.value.eq_ignore_ascii_case(pk_column),
+                            Expression::QualifiedIdentifier(qid) => {
+                                qid.name.value.eq_ignore_ascii_case(pk_column)
+                            }
+                            _ => false,
+                        };
+
+                        if right_is_pk {
+                            if let Some(value) = self.eval_to_i64(&infix.left, ctx) {
+                                return Ok(match op {
+                                    // value > pk means pk < value (not supported for keyset start)
+                                    // value >= pk means pk <= value (not supported for keyset start)
+                                    "<" => (Some(value), None, true), // value < pk means pk > value
+                                    "<=" => (None, Some(value), true), // value <= pk means pk >= value
+                                    _ => (None, None, false),
+                                });
+                            }
+                        }
+                    }
+                }
+                "AND" => {
+                    // For AND, try to extract bounds from both sides
+                    let (left_after, left_from, left_pure) =
+                        self.extract_pk_keyset_bounds(&infix.left, pk_column, ctx)?;
+                    let (right_after, right_from, right_pure) =
+                        self.extract_pk_keyset_bounds(&infix.right, pk_column, ctx)?;
+
+                    // Combine bounds - take the first non-None from each side
+                    let start_after = left_after.or(right_after);
+                    let start_from = left_from.or(right_from);
+
+                    // Expression is pure keyset only if BOTH sides are pure keyset predicates
+                    // (e.g., `id > 100 AND id < 200` is pure, `id > 100 AND status = 'active'` is not)
+                    let is_pure = left_pure && right_pure;
+
+                    return Ok((start_after, start_from, is_pure));
+                }
+                _ => {}
+            }
+        }
+
+        // Not a keyset predicate - this is an additional filter
+        Ok((None, None, false))
+    }
+
+    /// Evaluate an expression to an i64 value
+    fn eval_to_i64(&self, expr: &Expression, ctx: &ExecutionContext) -> Option<i64> {
+        match expr {
+            Expression::IntegerLiteral(lit) => Some(lit.value),
+            Expression::FloatLiteral(lit) => Some(lit.value as i64),
+            Expression::Parameter(param) => {
+                let params = ctx.params();
+                let param_idx = if param.index > 0 {
+                    param.index - 1
+                } else {
+                    param.index
+                };
+                if param_idx < params.len() {
+                    match &params[param_idx] {
+                        Value::Integer(i) => Some(*i),
+                        Value::Float(f) => Some(*f as i64),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => {
+                // Try to evaluate the expression
+                ExpressionEval::compile(expr, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|v| match v {
+                        Value::Integer(i) => Some(i),
+                        Value::Float(f) => Some(f as i64),
+                        _ => None,
+                    })
+            }
+        }
+    }
+
     /// Extract window ORDER BY information for optimization
     /// Returns (column_name, ascending) if a simple optimizable case is found
     pub(crate) fn extract_window_order_info(stmt: &SelectStatement) -> Option<(String, bool)> {

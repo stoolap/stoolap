@@ -1158,6 +1158,328 @@ impl VersionStore {
         self.get_visible_rows_with_limit(txn_id, limit, offset)
     }
 
+    /// Get a batch of visible rows starting after a given row_id (cursor-based pagination).
+    ///
+    /// This is designed for lazy/streaming scanners that fetch rows in batches.
+    /// Uses BTreeMap's range() for efficient cursor-based iteration.
+    ///
+    /// # Arguments
+    /// * `txn_id` - Transaction ID for visibility check
+    /// * `after_row_id` - Start fetching rows AFTER this row_id (use i64::MIN to start from beginning)
+    /// * `batch_size` - Maximum number of rows to return in this batch
+    ///
+    /// # Returns
+    /// A tuple of (rows, has_more) where has_more indicates if there are more rows to fetch
+    pub fn get_visible_rows_batch(
+        &self,
+        txn_id: i64,
+        after_row_id: i64,
+        batch_size: usize,
+    ) -> (Vec<(i64, Row)>, bool) {
+        if self.closed.load(Ordering::Acquire) || batch_size == 0 {
+            return (Vec::new(), false);
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return (Vec::new(), false),
+        };
+
+        // Pre-acquire arena locks ONCE for this batch
+        let (arena_rows, arena_data) = self.arena.read_guards();
+        let arena_rows_slice = arena_rows.as_slice();
+        let arena_data_slice = arena_data.as_slice();
+        let arena_len = arena_rows_slice.len();
+
+        // Pre-acquire versions lock
+        let versions = self.versions.read();
+
+        // Use range() to efficiently start from after_row_id
+        // Bound::Excluded means we start AFTER the given row_id
+        use std::ops::Bound;
+        let range_start = if after_row_id == i64::MIN {
+            Bound::Unbounded
+        } else {
+            Bound::Excluded(after_row_id)
+        };
+
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(batch_size);
+
+        for (&row_id, chain) in versions.range((range_start, Bound::Unbounded)) {
+            let mut current: Option<&VersionChainEntry> = Some(chain);
+
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                if checker.is_visible(version_txn_id, txn_id) {
+                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
+                        break; // Row is deleted
+                    }
+
+                    // Read row data from arena or version
+                    let row_data = if let Some(idx) = e.arena_idx {
+                        if idx < arena_len {
+                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
+                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                let slice =
+                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                                Row::from_values(slice.to_vec())
+                            } else {
+                                e.version.data.clone()
+                            }
+                        } else {
+                            e.version.data.clone()
+                        }
+                    } else {
+                        e.version.data.clone()
+                    };
+                    result.push((row_id, row_data));
+
+                    // Check if we've collected enough rows
+                    if result.len() >= batch_size {
+                        // Check if there are more rows after this batch
+                        // We do a quick peek to see if there's at least one more row
+                        let has_more = versions
+                            .range((Bound::Excluded(row_id), Bound::Unbounded))
+                            .next()
+                            .is_some();
+                        return (result, has_more);
+                    }
+                    break;
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
+            }
+        }
+
+        (result, false)
+    }
+
+    /// Collect visible rows ordered by row_id (PRIMARY KEY) with efficient OFFSET/LIMIT
+    ///
+    /// This method uses BTreeMap range iteration to efficiently skip OFFSET rows
+    /// without cloning them, providing O(offset + limit) complexity instead of
+    /// O(n) for full materialization.
+    ///
+    /// # Arguments
+    /// * `txn_id` - Transaction ID for visibility checks
+    /// * `ascending` - If true, iterate from smallest to largest row_id
+    /// * `limit` - Maximum number of rows to return
+    /// * `offset` - Number of visible rows to skip before collecting
+    ///
+    /// # Returns
+    /// Vector of rows in row_id order, or None if iteration fails
+    pub fn collect_rows_pk_ordered(
+        &self,
+        txn_id: i64,
+        ascending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Option<Vec<Row>> {
+        if self.closed.load(Ordering::Acquire) || limit == 0 {
+            return Some(Vec::new());
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return Some(Vec::new()),
+        };
+
+        // Pre-acquire arena locks ONCE for this entire operation
+        let (arena_rows, arena_data) = self.arena.read_guards();
+        let arena_rows_slice = arena_rows.as_slice();
+        let arena_data_slice = arena_data.as_slice();
+        let arena_len = arena_rows_slice.len();
+
+        // Pre-acquire versions lock
+        let versions = self.versions.read();
+
+        let mut result: Vec<Row> = Vec::with_capacity(limit.min(1000));
+        let mut skipped = 0usize;
+
+        // Macro to process a single chain entry - avoids code duplication for asc/desc
+        // Phase 1: Check visibility only (no cloning) - O(1) per row
+        // Phase 2: Clone only if we're past the offset - avoids wasted allocations
+        macro_rules! process_chain {
+            ($chain:expr) => {{
+                // Phase 1: Find visible entry without cloning
+                let mut current: Option<&VersionChainEntry> = Some($chain);
+                let mut visible_entry: Option<&VersionChainEntry> = None;
+
+                while let Some(e) = current {
+                    if checker.is_visible(e.version.txn_id, txn_id) {
+                        if e.version.deleted_at_txn_id == 0
+                            || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
+                        {
+                            visible_entry = Some(e);
+                        }
+                        break;
+                    }
+                    current = e.prev.as_ref().map(|b| b.as_ref());
+                }
+
+                if let Some(entry) = visible_entry {
+                    if skipped < offset {
+                        skipped += 1;
+                        // Skip without cloning - this is the key optimization
+                    } else {
+                        // Phase 2: Clone only rows we're keeping
+                        let row = if let Some(idx) = entry.arena_idx {
+                            if idx < arena_len {
+                                let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
+                                if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                    let slice = unsafe {
+                                        arena_data_slice.get_unchecked(meta.start..meta.end)
+                                    };
+                                    Row::from_values(slice.to_vec())
+                                } else {
+                                    entry.version.data.clone()
+                                }
+                            } else {
+                                entry.version.data.clone()
+                            }
+                        } else {
+                            entry.version.data.clone()
+                        };
+                        result.push(row);
+                        if result.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }};
+        }
+
+        if ascending {
+            for (_, chain) in versions.iter() {
+                process_chain!(chain);
+            }
+        } else {
+            for (_, chain) in versions.iter().rev() {
+                process_chain!(chain);
+            }
+        }
+
+        Some(result)
+    }
+
+    /// Collect visible rows using keyset pagination (WHERE id > X ORDER BY id LIMIT Y)
+    ///
+    /// This method uses BTreeMap range iteration starting from a specific row_id,
+    /// providing O(limit) complexity instead of O(n) for full table scans.
+    ///
+    /// # Arguments
+    /// * `txn_id` - Transaction ID for visibility checks
+    /// * `start_after_row_id` - Start iteration after this row_id (exclusive, for id > X)
+    /// * `start_from_row_id` - Start iteration from this row_id (inclusive, for id >= X)
+    /// * `ascending` - If true, iterate from smallest to largest row_id
+    /// * `limit` - Maximum number of rows to return
+    ///
+    /// # Returns
+    /// Vector of (row_id, row) pairs in row_id order
+    pub fn collect_rows_keyset(
+        &self,
+        txn_id: i64,
+        start_after_row_id: Option<i64>,
+        start_from_row_id: Option<i64>,
+        ascending: bool,
+        limit: usize,
+    ) -> Vec<(i64, Row)> {
+        use std::ops::Bound;
+
+        if self.closed.load(Ordering::Acquire) || limit == 0 {
+            return Vec::new();
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+
+        // Pre-acquire arena locks ONCE for this entire operation
+        let (arena_rows, arena_data) = self.arena.read_guards();
+        let arena_rows_slice = arena_rows.as_slice();
+        let arena_data_slice = arena_data.as_slice();
+        let arena_len = arena_rows_slice.len();
+
+        // Pre-acquire versions lock
+        let versions = self.versions.read();
+
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit.min(1000));
+
+        // Determine range start bound
+        let range_start = if let Some(after_id) = start_after_row_id {
+            Bound::Excluded(after_id)
+        } else if let Some(from_id) = start_from_row_id {
+            Bound::Included(from_id)
+        } else {
+            Bound::Unbounded
+        };
+
+        // Helper to process a version chain and get visible row
+        let process_entry = |row_id: i64, chain: &VersionChainEntry| -> Option<(i64, Row)> {
+            let mut current: Option<&VersionChainEntry> = Some(chain);
+
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                if checker.is_visible(version_txn_id, txn_id) {
+                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
+                        return None; // Row is deleted
+                    }
+
+                    // Read row data from arena or version
+                    let row_data = if let Some(idx) = e.arena_idx {
+                        if idx < arena_len {
+                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
+                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                let slice =
+                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                                Row::from_values(slice.to_vec())
+                            } else {
+                                e.version.data.clone()
+                            }
+                        } else {
+                            e.version.data.clone()
+                        }
+                    } else {
+                        e.version.data.clone()
+                    };
+                    return Some((row_id, row_data));
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
+            }
+            None
+        };
+
+        if ascending {
+            // Forward iteration starting from range_start
+            // For `WHERE id > X ORDER BY id ASC`, iterates from X+1 upward
+            for (&row_id, chain) in versions.range((range_start, Bound::Unbounded)) {
+                if let Some(row_pair) = process_entry(row_id, chain) {
+                    result.push(row_pair);
+                    if result.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Reverse iteration - same range but iterate backward
+            // For `WHERE id > X ORDER BY id DESC`, get rows > X from largest to smallest
+            for (&row_id, chain) in versions.range((range_start, Bound::Unbounded)).rev() {
+                if let Some(row_pair) = process_entry(row_id, chain) {
+                    result.push(row_pair);
+                    if result.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
     /// Get all visible rows with filter applied during collection
     /// This saves memory by not allocating space for non-matching rows
     ///

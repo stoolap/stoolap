@@ -17,9 +17,13 @@
 //! Provides scanner implementations for MVCC query results.
 //!
 
+use std::sync::Arc;
+
 use crate::core::{Result, Row, Schema};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Scanner;
+
+use super::version_store::VersionStore;
 
 /// MVCC Scanner for iterating over versioned rows
 pub struct MVCCScanner {
@@ -436,6 +440,197 @@ impl Scanner for SingleRowScanner {
 
     fn close(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Default batch size for lazy scanner (rows per batch)
+const LAZY_SCANNER_BATCH_SIZE: usize = 256;
+
+/// Lazy MVCC Scanner that fetches rows on-demand in batches.
+///
+/// Unlike `MVCCScanner` which materializes all rows upfront, this scanner:
+/// 1. Fetches rows in small batches (default 256 rows)
+/// 2. Releases locks between batches (allowing concurrent writes)
+/// 3. Stops fetching when consumer stops asking (early termination for LIMIT)
+///
+/// This is designed for streaming query execution where early termination
+/// is important (e.g., EXISTS with LIMIT, correlated subqueries).
+pub struct LazyMVCCScanner {
+    /// Reference to the version store for fetching batches
+    version_store: Arc<VersionStore>,
+    /// Transaction ID for visibility checks
+    txn_id: i64,
+    /// Column indices for projection
+    column_indices: Vec<usize>,
+    /// Current batch of rows
+    batch: Vec<(i64, Row)>,
+    /// Current index within the batch
+    batch_index: isize,
+    /// Last row_id fetched (cursor for next batch)
+    cursor_row_id: i64,
+    /// Whether there are more rows to fetch
+    has_more: bool,
+    /// Whether the scanner has been closed
+    closed: bool,
+    /// Any error that occurred
+    error: Option<crate::core::Error>,
+    /// Batch size (configurable for testing)
+    batch_size: usize,
+    /// Whether projection is needed (cached for performance)
+    needs_projection: bool,
+}
+
+impl LazyMVCCScanner {
+    /// Creates a new lazy scanner that fetches rows on-demand.
+    pub fn new(
+        version_store: Arc<VersionStore>,
+        txn_id: i64,
+        schema: Schema,
+        column_indices: Vec<usize>,
+    ) -> Self {
+        // Pre-compute projection check once
+        let num_schema_cols = schema.columns.len();
+        let needs_projection = !column_indices.is_empty()
+            && column_indices.len() < num_schema_cols
+            && !column_indices.iter().enumerate().all(|(i, &idx)| i == idx);
+
+        Self {
+            version_store,
+            txn_id,
+            column_indices,
+            batch: Vec::new(),
+            batch_index: -1,
+            cursor_row_id: i64::MIN,
+            has_more: true,
+            closed: false,
+            error: None,
+            batch_size: LAZY_SCANNER_BATCH_SIZE,
+            needs_projection,
+        }
+    }
+
+    /// Creates a lazy scanner with a custom batch size (for testing).
+    #[allow(dead_code)]
+    pub fn with_batch_size(
+        version_store: Arc<VersionStore>,
+        txn_id: i64,
+        schema: Schema,
+        column_indices: Vec<usize>,
+        batch_size: usize,
+    ) -> Self {
+        // Pre-compute projection check once
+        let num_schema_cols = schema.columns.len();
+        let needs_projection = !column_indices.is_empty()
+            && column_indices.len() < num_schema_cols
+            && !column_indices.iter().enumerate().all(|(i, &idx)| i == idx);
+
+        Self {
+            version_store,
+            txn_id,
+            column_indices,
+            batch: Vec::new(),
+            batch_index: -1,
+            cursor_row_id: i64::MIN,
+            has_more: true,
+            closed: false,
+            error: None,
+            batch_size,
+            needs_projection,
+        }
+    }
+
+    /// Fetches the next batch of rows from the version store.
+    fn fetch_next_batch(&mut self) {
+        if !self.has_more {
+            return;
+        }
+
+        let (rows, more) = self.version_store.get_visible_rows_batch(
+            self.txn_id,
+            self.cursor_row_id,
+            self.batch_size,
+        );
+
+        // Apply projection if needed (using cached flag)
+        if self.needs_projection {
+            self.batch = rows
+                .into_iter()
+                .map(|(id, row)| {
+                    let projected_values: Vec<crate::core::Value> = self
+                        .column_indices
+                        .iter()
+                        .map(|&idx| {
+                            row.get(idx)
+                                .cloned()
+                                .unwrap_or_else(crate::core::Value::null_unknown)
+                        })
+                        .collect();
+                    (id, Row::from_values(projected_values))
+                })
+                .collect();
+        } else {
+            self.batch = rows;
+        }
+
+        // Update cursor to last row_id in batch
+        if let Some((last_id, _)) = self.batch.last() {
+            self.cursor_row_id = *last_id;
+        }
+
+        self.has_more = more;
+        self.batch_index = -1;
+    }
+}
+
+impl Scanner for LazyMVCCScanner {
+    fn next(&mut self) -> bool {
+        if self.closed || self.error.is_some() {
+            return false;
+        }
+
+        self.batch_index += 1;
+
+        // Check if we need to fetch the next batch
+        if (self.batch_index as usize) >= self.batch.len() {
+            if !self.has_more {
+                return false;
+            }
+            self.fetch_next_batch();
+            self.batch_index = 0;
+
+            if self.batch.is_empty() {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn row(&self) -> &Row {
+        if self.batch_index < 0 || (self.batch_index as usize) >= self.batch.len() {
+            static EMPTY_ROW: std::sync::OnceLock<Row> = std::sync::OnceLock::new();
+            return EMPTY_ROW.get_or_init(|| Row::from_values(vec![]));
+        }
+
+        &self.batch[self.batch_index as usize].1
+    }
+
+    fn err(&self) -> Option<&crate::core::Error> {
+        self.error.as_ref()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.closed = true;
+        self.batch.clear();
+        Ok(())
+    }
+
+    fn take_row(&mut self) -> Row {
+        if self.batch_index < 0 || (self.batch_index as usize) >= self.batch.len() {
+            return Row::new();
+        }
+        let idx = self.batch_index as usize;
+        std::mem::take(&mut self.batch[idx].1)
     }
 }
 

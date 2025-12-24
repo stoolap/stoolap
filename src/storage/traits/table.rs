@@ -659,6 +659,31 @@ pub trait Table: Send + Sync {
         None // Default implementation - override in concrete tables
     }
 
+    /// Keyset pagination optimization for PRIMARY KEY columns
+    ///
+    /// For queries like `WHERE id > X ORDER BY id LIMIT Y`, this uses the PK's
+    /// natural ordering (BTreeMap) to start iteration from X and return only Y rows.
+    /// This provides O(limit) complexity instead of O(n) for full table scans.
+    ///
+    /// # Arguments
+    /// * `start_after` - For `id > X` (exclusive bound)
+    /// * `start_from` - For `id >= X` (inclusive bound)
+    /// * `ascending` - True for ASC, false for DESC
+    /// * `limit` - Maximum number of rows to return
+    ///
+    /// # Returns
+    /// Some(Vec<Row>) if the table has an INTEGER PRIMARY KEY, None otherwise
+    fn collect_rows_pk_keyset(
+        &self,
+        start_after: Option<i64>,
+        start_from: Option<i64>,
+        ascending: bool,
+        limit: usize,
+    ) -> Option<Vec<Row>> {
+        let _ = (start_after, start_from, ascending, limit);
+        None // Default implementation - override in concrete tables
+    }
+
     /// Collects rows grouped by an indexed partition column (PARTITION BY optimization)
     ///
     /// For window functions with `PARTITION BY col` where col is indexed, this uses the

@@ -17,7 +17,6 @@
 //! Provides MVCC isolation for table operations.
 //!
 
-use radsort::sort_by_key;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, RwLock};
 
@@ -28,7 +27,7 @@ use crate::storage::mvcc::bitmap_index::BitmapIndex;
 use crate::storage::mvcc::btree_index::BTreeIndex;
 use crate::storage::mvcc::hash_index::HashIndex;
 use crate::storage::mvcc::multi_column_index::MultiColumnIndex;
-use crate::storage::mvcc::scanner::MVCCScanner;
+use crate::storage::mvcc::scanner::{LazyMVCCScanner, MVCCScanner};
 use crate::storage::mvcc::{TransactionVersionStore, VersionStore};
 use crate::storage::traits::{Index, QueryResult, ScanPlan, Scanner, Table};
 use crate::storage::MemoryResult;
@@ -1799,7 +1798,23 @@ impl Table for MVCCTable {
             }
         }
 
-        // Fall back to full scan - collect visible rows efficiently
+        // Fall back to full scan
+        // Check if we can use lazy scanning (no local uncommitted changes)
+        let has_local = self.txn_versions.read().unwrap().has_local_changes();
+
+        if !has_local && where_expr.is_none() {
+            // Use lazy scanner for unfiltered full scans with no local changes
+            // This enables early termination and reduced memory usage
+            let scanner = LazyMVCCScanner::new(
+                Arc::clone(&self.version_store),
+                self.txn_id,
+                schema,
+                column_indices.to_vec(),
+            );
+            return Ok(Box::new(scanner));
+        }
+
+        // Fall back to eager scanning with filtering
         let rows = self.collect_visible_rows(where_expr);
         let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
         Ok(Box::new(scanner))
@@ -2416,183 +2431,21 @@ impl Table for MVCCTable {
         offset: usize,
     ) -> Option<Vec<Row>> {
         // OPTIMIZATION: Handle PRIMARY KEY column specially
-        // For INTEGER PRIMARY KEY, the row_id IS the value, so we can iterate directly
+        // For INTEGER PRIMARY KEY, the row_id IS the value, so we can iterate
+        // the BTreeMap directly in order without any sorting.
+        // This uses efficient BTreeMap iteration with skip/take semantics.
         if let Some(pk_idx) = self.cached_schema.pk_column_index() {
             let pk_col = &self.cached_schema.columns[pk_idx];
             if pk_col.name.eq_ignore_ascii_case(column_name) {
-                // Get row count and auto-increment counter
-                let row_count = self.version_store.row_count();
-                let max_row_id = self.version_store.get_auto_increment_counter();
-
-                // FAST PATH: For mostly contiguous row_ids (common case with auto-increment),
-                // iterate directly by row_id value instead of collecting and sorting.
-                // This is O(offset + limit) instead of O(n log n).
-                //
-                // Heuristic: if max_row_id <= row_count * 1.5, rows are mostly contiguous
-                // Use checked arithmetic to avoid overflow on very large tables
-                let threshold = row_count
-                    .checked_mul(3)
-                    .map(|x| x / 2)
-                    .unwrap_or(usize::MAX) as i64;
-                let is_contiguous = max_row_id > 0 && max_row_id <= threshold;
-
-                // Miss-rate threshold: if we see this many consecutive misses before
-                // finding any rows, fall back to the sorted approach
-                const MISS_THRESHOLD: usize = 100;
-
-                if is_contiguous && ascending {
-                    // Direct iteration from 1 to max_row_id (ascending)
-                    let mut rows = Vec::with_capacity(limit.min(100));
-                    let mut skipped = 0;
-                    let mut consecutive_misses = 0;
-
-                    for row_id in 1..=max_row_id {
-                        if let Some(version) =
-                            self.version_store.get_visible_version(row_id, self.txn_id)
-                        {
-                            if version.is_deleted() {
-                                consecutive_misses += 1;
-                                // High miss rate before finding any rows - fallback
-                                if rows.is_empty()
-                                    && skipped == 0
-                                    && consecutive_misses > MISS_THRESHOLD
-                                {
-                                    break;
-                                }
-                                continue;
-                            }
-
-                            consecutive_misses = 0; // Reset on hit
-
-                            if skipped < offset {
-                                skipped += 1;
-                                continue;
-                            }
-
-                            rows.push(version.data.clone());
-
-                            if rows.len() >= limit {
-                                return Some(rows);
-                            }
-                        } else {
-                            consecutive_misses += 1;
-                            // High miss rate before finding any rows - fallback
-                            if rows.is_empty()
-                                && skipped == 0
-                                && consecutive_misses > MISS_THRESHOLD
-                            {
-                                break;
-                            }
-                        }
-                    }
-
-                    if !rows.is_empty() {
-                        return Some(rows);
-                    }
-                    // Fall through to fallback if we broke out early or found nothing
-                } else if is_contiguous && !ascending {
-                    // Direct iteration from max_row_id down to 1 (descending)
-                    let mut rows = Vec::with_capacity(limit.min(100));
-                    let mut skipped = 0;
-                    let mut consecutive_misses = 0;
-
-                    for row_id in (1..=max_row_id).rev() {
-                        if let Some(version) =
-                            self.version_store.get_visible_version(row_id, self.txn_id)
-                        {
-                            if version.is_deleted() {
-                                consecutive_misses += 1;
-                                // High miss rate before finding any rows - fallback
-                                if rows.is_empty()
-                                    && skipped == 0
-                                    && consecutive_misses > MISS_THRESHOLD
-                                {
-                                    break;
-                                }
-                                continue;
-                            }
-
-                            consecutive_misses = 0; // Reset on hit
-
-                            if skipped < offset {
-                                skipped += 1;
-                                continue;
-                            }
-
-                            rows.push(version.data.clone());
-
-                            if rows.len() >= limit {
-                                return Some(rows);
-                            }
-                        } else {
-                            consecutive_misses += 1;
-                            // High miss rate before finding any rows - fallback
-                            if rows.is_empty()
-                                && skipped == 0
-                                && consecutive_misses > MISS_THRESHOLD
-                            {
-                                break;
-                            }
-                        }
-                    }
-
-                    if !rows.is_empty() {
-                        return Some(rows);
-                    }
-                    // Fall through to fallback if we broke out early or found nothing
-                }
-
-                // FALLBACK: Non-contiguous row_ids - use partial sort approach
-                let mut row_ids = self.version_store.get_all_row_ids();
-                let total = row_ids.len();
-                let need_count = offset.saturating_add(limit);
-
-                if need_count < total && need_count > 0 {
-                    if ascending {
-                        row_ids.select_nth_unstable(need_count - 1);
-                        row_ids.truncate(need_count);
-                        sort_by_key(&mut row_ids, |&id| id);
-                    } else {
-                        row_ids.select_nth_unstable_by(need_count - 1, |a, b| b.cmp(a));
-                        row_ids.truncate(need_count);
-                        sort_by_key(&mut row_ids, |&id| id);
-                        row_ids.reverse();
-                    }
-                } else {
-                    sort_by_key(&mut row_ids, |&id| id);
-                    if !ascending {
-                        row_ids.reverse();
-                    }
-                }
-
-                let mut rows = Vec::with_capacity(limit.min(100));
-                let mut skipped = 0;
-
-                for row_id in row_ids {
-                    if let Some(version) =
-                        self.version_store.get_visible_version(row_id, self.txn_id)
-                    {
-                        if version.is_deleted() {
-                            continue;
-                        }
-
-                        if skipped < offset {
-                            skipped += 1;
-                            continue;
-                        }
-
-                        rows.push(version.data.clone());
-
-                        if rows.len() >= limit {
-                            return Some(rows);
-                        }
-                    }
-                }
-
-                if !rows.is_empty() {
-                    return Some(rows);
-                }
-                return None;
+                // Use efficient BTreeMap iteration with OFFSET/LIMIT
+                // This iterates the BTreeMap directly (already sorted by row_id)
+                // and only clones rows that are actually returned (not skipped)
+                return self.version_store.collect_rows_pk_ordered(
+                    self.txn_id,
+                    ascending,
+                    limit,
+                    offset,
+                );
             }
         }
 
@@ -2682,6 +2535,29 @@ impl Table for MVCCTable {
         }
 
         Some(rows)
+    }
+
+    fn collect_rows_pk_keyset(
+        &self,
+        start_after: Option<i64>,
+        start_from: Option<i64>,
+        ascending: bool,
+        limit: usize,
+    ) -> Option<Vec<Row>> {
+        // Only works if table has a single-column INTEGER PRIMARY KEY
+        self.cached_schema.pk_column_index()?;
+
+        // Use the efficient keyset iteration from version store
+        let rows = self.version_store.collect_rows_keyset(
+            self.txn_id,
+            start_after,
+            start_from,
+            ascending,
+            limit,
+        );
+
+        // Return rows only (discard row_ids)
+        Some(rows.into_iter().map(|(_, row)| row).collect())
     }
 
     fn collect_rows_grouped_by_partition(
