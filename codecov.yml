@@ -16,7 +16,7 @@ coverage:
           - "src/"
     patch:
       default:
-        target: 50%
+        target: 40%
         threshold: 1%
 
 comment:

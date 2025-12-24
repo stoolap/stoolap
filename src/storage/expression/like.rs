@@ -19,6 +19,7 @@
 //! - `_` matches any single character
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -26,6 +27,28 @@ use regex::Regex;
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::core::{Result, Row, Schema};
+
+// Thread-local cache for compiled regex patterns
+thread_local! {
+    static LIKE_REGEX_CACHE: RefCell<HashMap<String, Regex>> = RefCell::new(HashMap::new());
+}
+
+/// Get or compile a regex pattern, using thread-local cache
+fn get_or_compile_like_regex(pattern: &str) -> Option<Regex> {
+    LIKE_REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(regex) = cache.get(pattern) {
+            return Some(regex.clone());
+        }
+        match Regex::new(pattern) {
+            Ok(regex) => {
+                cache.insert(pattern.to_string(), regex.clone());
+                Some(regex)
+            }
+            Err(_) => None,
+        }
+    })
+}
 
 /// LIKE expression for SQL pattern matching
 ///
@@ -104,8 +127,8 @@ impl LikeExpr {
         expr
     }
 
-    /// Compile SQL LIKE pattern to regex
-    fn compile_pattern(pattern: &str, case_insensitive: bool) -> Option<Regex> {
+    /// Compile SQL LIKE pattern to regex (with caching)
+    pub fn compile_pattern(pattern: &str, case_insensitive: bool) -> Option<Regex> {
         // Build regex pattern character by character
         // We need to handle % and _ specially while escaping everything else
         let mut regex_pattern = String::with_capacity(pattern.len() * 2);
@@ -135,7 +158,8 @@ impl LikeExpr {
             regex_pattern
         };
 
-        Regex::new(&regex_str).ok()
+        // Use cached compilation to avoid recompiling same patterns
+        get_or_compile_like_regex(&regex_str)
     }
 
     /// Check if a string matches the pattern

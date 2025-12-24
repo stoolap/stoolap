@@ -21,6 +21,7 @@
 // - Reusable across rows (clear() between uses)
 // - No recursion
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use compact_str::CompactString;
@@ -30,6 +31,9 @@ use smallvec::SmallVec;
 use super::ops::{CompareOp, Op};
 use super::program::Program;
 use crate::core::{DataType, Result, Value};
+
+/// Stack value that can be borrowed (from row/constants) or owned (from operations)
+type StackValue<'a> = Cow<'a, Value>;
 
 /// Stack capacity for inline storage (avoids heap allocation for simple expressions)
 /// Most expressions need 4-8 stack slots, so 8 covers the common case.
@@ -1692,6 +1696,329 @@ impl ExprVM {
         Ok(self.stack.pop().unwrap_or_else(Value::null_unknown))
     }
 
+    /// Execute a program using borrowed values where possible (Cow-based stack)
+    ///
+    /// This version avoids cloning values from the row when possible.
+    /// Values are only cloned when they need to be modified or passed to functions.
+    #[inline]
+    pub fn execute_cow<'a>(
+        &mut self,
+        program: &'a Program,
+        ctx: &'a ExecuteContext<'a>,
+    ) -> Result<Value> {
+        // Local stack with borrowed values - lifetime tied to this execution
+        let mut stack: SmallVec<[StackValue<'a>; STACK_INLINE_CAPACITY]> = SmallVec::new();
+
+        let ops = program.ops();
+        if ops.is_empty() {
+            return Ok(Value::null_unknown());
+        }
+
+        let null_value = Value::null_unknown();
+        let mut pc: usize = 0;
+
+        loop {
+            if pc >= ops.len() {
+                break;
+            }
+
+            match &ops[pc] {
+                // LOAD OPERATIONS - borrow instead of clone
+                Op::LoadColumn(idx) => {
+                    let idx = *idx as usize;
+                    let value = ctx
+                        .row
+                        .get(idx)
+                        .map(Cow::Borrowed)
+                        .unwrap_or(Cow::Owned(Value::null_unknown()));
+                    stack.push(value);
+                    pc += 1;
+                }
+
+                Op::LoadColumn2(idx) => {
+                    let idx = *idx as usize;
+                    let value = ctx
+                        .row2
+                        .and_then(|r| r.get(idx))
+                        .map(Cow::Borrowed)
+                        .unwrap_or(Cow::Owned(Value::null_unknown()));
+                    stack.push(value);
+                    pc += 1;
+                }
+
+                Op::LoadConst(value) => {
+                    stack.push(Cow::Borrowed(value));
+                    pc += 1;
+                }
+
+                Op::LoadParam(idx) => {
+                    let idx = *idx as usize;
+                    let value = ctx
+                        .params
+                        .get(idx)
+                        .map(Cow::Borrowed)
+                        .unwrap_or(Cow::Owned(Value::null_unknown()));
+                    stack.push(value);
+                    pc += 1;
+                }
+
+                Op::LoadNull(dt) => {
+                    stack.push(Cow::Owned(Value::Null(*dt)));
+                    pc += 1;
+                }
+
+                Op::LoadAggregateResult(idx) => {
+                    let idx = *idx as usize;
+                    let value = ctx
+                        .row
+                        .get(idx)
+                        .map(Cow::Borrowed)
+                        .unwrap_or(Cow::Owned(Value::null_unknown()));
+                    stack.push(value);
+                    pc += 1;
+                }
+
+                // COMPARISON OPERATIONS - work with references
+                Op::Eq => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let result = if a.is_null() || b.is_null() {
+                        Value::Null(DataType::Boolean)
+                    } else {
+                        Value::Boolean(*a == *b)
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                Op::Ne => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let result = if a.is_null() || b.is_null() {
+                        Value::Null(DataType::Boolean)
+                    } else {
+                        Value::Boolean(*a != *b)
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                Op::Lt => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let result = match (&*a, &*b) {
+                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x < *y),
+                        (Value::Float(x), Value::Float(y)) => Value::Boolean(*x < *y),
+                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) < *y),
+                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x < (*y as f64)),
+                        _ => self.compare_values(&a, &b, std::cmp::Ordering::Less),
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                Op::Le => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let result = match (&*a, &*b) {
+                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x <= *y),
+                        (Value::Float(x), Value::Float(y)) => Value::Boolean(*x <= *y),
+                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) <= *y),
+                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x <= (*y as f64)),
+                        _ => match (*a).partial_cmp(&*b) {
+                            Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
+                                Value::Boolean(true)
+                            }
+                            Some(std::cmp::Ordering::Greater) => Value::Boolean(false),
+                            None => Value::Null(DataType::Boolean),
+                        },
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                Op::Gt => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let result = match (&*a, &*b) {
+                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x > *y),
+                        (Value::Float(x), Value::Float(y)) => Value::Boolean(*x > *y),
+                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) > *y),
+                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x > (*y as f64)),
+                        _ => self.compare_values(&a, &b, std::cmp::Ordering::Greater),
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                Op::Ge => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let result = match (&*a, &*b) {
+                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x >= *y),
+                        (Value::Float(x), Value::Float(y)) => Value::Boolean(*x >= *y),
+                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) >= *y),
+                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x >= (*y as f64)),
+                        _ => match (*a).partial_cmp(&*b) {
+                            Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
+                                Value::Boolean(true)
+                            }
+                            Some(std::cmp::Ordering::Less) => Value::Boolean(false),
+                            None => Value::Null(DataType::Boolean),
+                        },
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                Op::IsNull => {
+                    let v = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    stack.push(Cow::Owned(Value::Boolean(v.is_null())));
+                    pc += 1;
+                }
+
+                Op::IsNotNull => {
+                    let v = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    stack.push(Cow::Owned(Value::Boolean(!v.is_null())));
+                    pc += 1;
+                }
+
+                // LOGICAL OPERATIONS
+                Op::And(jump_target) => {
+                    let top = stack.last().map(|v| &**v).unwrap_or(&null_value);
+                    match top {
+                        Value::Boolean(false) => pc = *jump_target as usize,
+                        Value::Null(_) => pc += 1,
+                        _ => pc += 1,
+                    }
+                }
+
+                Op::Or(jump_target) => {
+                    let top = stack.last().map(|v| &**v).unwrap_or(&null_value);
+                    match top {
+                        Value::Boolean(true) => pc = *jump_target as usize,
+                        Value::Null(_) => pc += 1,
+                        _ => pc += 1,
+                    }
+                }
+
+                Op::AndFinalize => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
+                        (Some(false), _) | (_, Some(false)) => Value::Boolean(false),
+                        (Some(true), Some(true)) => Value::Boolean(true),
+                        _ => Value::Null(DataType::Boolean),
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                Op::OrFinalize => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
+                        (Some(true), _) | (_, Some(true)) => Value::Boolean(true),
+                        (Some(false), Some(false)) => Value::Boolean(false),
+                        _ => Value::Null(DataType::Boolean),
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                Op::Not => {
+                    let v = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let result = match Self::to_tribool(&v) {
+                        Some(b) => Value::Boolean(!b),
+                        None => Value::Null(DataType::Boolean),
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                // FUNCTION CALLS - need to convert to owned
+                Op::CallScalar { func, arg_count } => {
+                    let arg_count = *arg_count as usize;
+                    let start = stack.len().saturating_sub(arg_count);
+
+                    // Convert Cow values to owned for function call
+                    self.args_buffer.clear();
+                    for cow_val in stack.drain(start..) {
+                        self.args_buffer.push(cow_val.into_owned());
+                    }
+
+                    let result = func
+                        .evaluate(&self.args_buffer)
+                        .unwrap_or_else(|_| Value::null_unknown());
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                // FUSED OPERATIONS (already optimized, no stack involvement)
+                Op::GtColumnConst(idx, val) => {
+                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&null_value);
+                    let result = match val {
+                        Value::Integer(threshold) => Self::gt_int(col_val, *threshold),
+                        Value::Float(threshold) => Self::gt_float(col_val, *threshold),
+                        _ => self.compare_values(col_val, val, std::cmp::Ordering::Greater),
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                Op::LtColumnConst(idx, val) => {
+                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&null_value);
+                    let result = match val {
+                        Value::Integer(threshold) => Self::lt_int(col_val, *threshold),
+                        Value::Float(threshold) => Self::lt_float(col_val, *threshold),
+                        _ => self.compare_values(col_val, val, std::cmp::Ordering::Less),
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                Op::EqColumnConst(idx, val) => {
+                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&null_value);
+                    let result = match val {
+                        Value::Integer(v) => Self::eq_int(col_val, *v),
+                        Value::Float(v) => Self::eq_float(col_val, *v),
+                        _ => {
+                            if col_val.is_null() || val.is_null() {
+                                Value::Null(DataType::Boolean)
+                            } else {
+                                Value::Boolean(col_val == val)
+                            }
+                        }
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                Op::Return => break,
+                Op::ReturnTrue => {
+                    return Ok(Value::Boolean(true));
+                }
+                Op::ReturnFalse => {
+                    return Ok(Value::Boolean(false));
+                }
+                Op::ReturnNull(dt) => {
+                    return Ok(Value::Null(*dt));
+                }
+
+                // For any unhandled operation, fall back to the regular execute
+                _ => {
+                    return self.execute(program, ctx);
+                }
+            }
+        }
+
+        // Return top of stack or NULL
+        Ok(stack
+            .pop()
+            .map(Cow::into_owned)
+            .unwrap_or_else(Value::null_unknown))
+    }
+
     /// Execute and return boolean result (for WHERE clauses)
     ///
     /// This method is optimized for common filter patterns, avoiding
@@ -1734,8 +2061,8 @@ impl ExprVM {
             }
         }
 
-        // General path: full VM execution
-        match self.execute(program, ctx) {
+        // General path: full VM execution with Cow-based stack (avoids cloning)
+        match self.execute_cow(program, ctx) {
             Ok(Value::Boolean(b)) => b,
             Ok(Value::Integer(i)) => i != 0,
             Ok(Value::Null(_)) => false,

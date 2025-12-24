@@ -1744,36 +1744,53 @@ impl Executor {
                     // OPTIMIZATION: For memory-filter + LIMIT, use iterative fetching
                     // with early termination. We fetch in batches to avoid loading
                     // all rows when only a few are needed.
-                    let mut eval =
-                        ExpressionEval::compile(where_expr, &all_columns)?.with_context(ctx);
                     let mut result_rows = Vec::with_capacity(target.min(1000));
 
-                    // If storage expression exists (partial pushdown), use it to reduce rows
-                    // Otherwise, fetch rows in batches with increasing size
-                    if storage_expr.is_some() {
-                        // Partial pushdown: storage handles some filtering
-                        let storage_rows = table.collect_all_rows(storage_expr.as_deref())?;
-                        for row in storage_rows {
+                    if needs_memory_filter {
+                        // PARTIAL PUSHDOWN: Storage handles some filtering, memory handles rest.
+                        // Use batched fetching with increasing batch sizes to minimize work.
+                        let mut batch_size = target.max(100); // Start with at least target rows
+                        let mut offset = 0usize;
+
+                        // Pre-compile filter ONCE outside the loop
+                        let mut memory_eval =
+                            ExpressionEval::compile(where_expr, &all_columns)?.with_context(ctx);
+
+                        loop {
+                            // Fetch batch from storage with storage filter + limit
+                            let batch = table.collect_rows_with_limit(
+                                storage_expr.as_deref(),
+                                batch_size,
+                                offset,
+                            )?;
+
+                            if batch.is_empty() {
+                                break; // No more rows from storage
+                            }
+
+                            // Apply full WHERE filter (includes both pushed and non-pushed parts)
+                            for row in batch {
+                                if memory_eval.eval_bool(&row) {
+                                    result_rows.push(row);
+                                    if result_rows.len() >= target {
+                                        break;
+                                    }
+                                }
+                            }
+
                             if result_rows.len() >= target {
-                                break;
+                                break; // Got enough rows
                             }
-                            if eval.eval_bool(&row) {
-                                result_rows.push(row);
-                            }
+
+                            // Need more rows - increase batch size and offset
+                            offset += batch_size;
+                            batch_size *= 2; // Exponential backoff
                         }
                     } else {
-                        // No pushdown: function-based filter only (e.g., LENGTH(name) > 7)
-                        // Use scanner for O(n) single-pass iteration with early termination
-                        let mut scanner = table.scan(&column_idx_vec, None)?;
-                        while scanner.next() {
-                            if result_rows.len() >= target {
-                                break; // Early termination - got enough rows
-                            }
-                            let row = scanner.take_row();
-                            if eval.eval_bool(&row) {
-                                result_rows.push(row);
-                            }
-                        }
+                        // NO MEMORY FILTER NEEDED: Full filter pushed to storage.
+                        // Use storage-level limit directly.
+                        result_rows =
+                            table.collect_rows_with_limit(storage_expr.as_deref(), target, 0)?;
                     }
 
                     // Project rows and return early - LIMIT/OFFSET already applied

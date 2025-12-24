@@ -41,6 +41,8 @@
 //! }
 //! ```
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -55,6 +57,24 @@ use super::like::LikeExpr;
 use super::logical::{AndExpr, ConstBoolExpr, NotExpr, OrExpr};
 use super::null_check::NullCheckExpr;
 use super::Expression;
+
+// Thread-local cache for compiled regex patterns to avoid recompilation
+thread_local! {
+    static REGEX_CACHE: RefCell<HashMap<String, regex::Regex>> = RefCell::new(HashMap::new());
+}
+
+/// Get or compile a regex pattern, using thread-local cache
+fn get_or_compile_regex(pattern: &str) -> regex::Regex {
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(regex) = cache.get(pattern) {
+            return regex.clone();
+        }
+        let regex = regex::Regex::new(pattern).unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
+        cache.insert(pattern.to_string(), regex.clone());
+        regex
+    })
+}
 
 /// Compiled pattern for LIKE expressions
 #[derive(Debug, Clone)]
@@ -147,29 +167,21 @@ impl CompiledPattern {
                     let flags = if case_insensitive { "(?i)" } else { "" };
                     let full_rest_pattern = format!("^{}{}$", flags, rest_regex_pattern);
 
-                    if let Ok(rest_regex) = regex::Regex::new(&full_rest_pattern) {
-                        return CompiledPattern::PrefixWithPattern {
-                            prefix: Arc::from(prefix),
-                            prefix_len: prefix.len(),
-                            rest_regex,
-                        };
-                    }
+                    // Use cached regex compilation
+                    let rest_regex = get_or_compile_regex(&full_rest_pattern);
+                    return CompiledPattern::PrefixWithPattern {
+                        prefix: Arc::from(prefix),
+                        prefix_len: prefix.len(),
+                        rest_regex,
+                    };
                 }
             }
 
-            // Complex pattern - fall back to full regex
+            // Complex pattern - fall back to full regex (with caching)
             let regex_pattern = like_to_regex(&pattern);
             let flags = if case_insensitive { "(?i)" } else { "" };
             let full_pattern = format!("^{}{}$", flags, regex_pattern);
-            CompiledPattern::Regex(regex::Regex::new(&full_pattern).unwrap_or_else(|_e| {
-                // Fallback to match-nothing regex on error
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "Warning: Failed to compile LIKE pattern '{}' as regex '{}': {}",
-                    pattern, full_pattern, _e
-                );
-                regex::Regex::new("^$").unwrap()
-            }))
+            CompiledPattern::Regex(get_or_compile_regex(&full_pattern))
         }
     }
 
@@ -1118,42 +1130,69 @@ impl CompiledFilter {
             }
             CompiledFilter::LengthEq { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.chars().count() as i64 == *value
+                    let len = if s.is_ascii() {
+                        s.len()
+                    } else {
+                        s.chars().count()
+                    };
+                    len as i64 == *value
                 } else {
                     false
                 }
             }
             CompiledFilter::LengthNe { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.chars().count() as i64 != *value
+                    let len = if s.is_ascii() {
+                        s.len()
+                    } else {
+                        s.chars().count()
+                    };
+                    len as i64 != *value
                 } else {
                     false
                 }
             }
             CompiledFilter::LengthGt { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.chars().count() as i64 > *value
+                    // Fast path for ASCII (most common), correct path for UTF-8
+                    if s.is_ascii() {
+                        s.len() as i64 > *value
+                    } else {
+                        s.chars().count() as i64 > *value
+                    }
                 } else {
                     false
                 }
             }
             CompiledFilter::LengthGte { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.chars().count() as i64 >= *value
+                    if s.is_ascii() {
+                        s.len() as i64 >= *value
+                    } else {
+                        s.chars().count() as i64 >= *value
+                    }
                 } else {
                     false
                 }
             }
             CompiledFilter::LengthLt { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    (s.chars().count() as i64) < *value
+                    if s.is_ascii() {
+                        (s.len() as i64) < *value
+                    } else {
+                        (s.chars().count() as i64) < *value
+                    }
                 } else {
                     false
                 }
             }
             CompiledFilter::LengthLte { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.chars().count() as i64 <= *value
+                    if s.is_ascii() {
+                        s.len() as i64 <= *value
+                    } else {
+                        s.chars().count() as i64 <= *value
+                    }
                 } else {
                     false
                 }
@@ -1362,6 +1401,7 @@ impl CompiledFilter {
             // Scalar function expressions
             CompiledFilter::UpperEq { col_idx, value } => {
                 if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    // Unicode-aware uppercase comparison
                     s.to_uppercase() == value.as_ref()
                 } else {
                     false
@@ -1369,6 +1409,7 @@ impl CompiledFilter {
             }
             CompiledFilter::LowerEq { col_idx, value } => {
                 if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    // Unicode-aware lowercase comparison
                     s.to_lowercase() == value.as_ref()
                 } else {
                     false
@@ -1383,42 +1424,72 @@ impl CompiledFilter {
             }
             CompiledFilter::LengthEq { col_idx, value } => {
                 if let Some(Value::Text(s)) = values.get(*col_idx) {
-                    s.chars().count() as i64 == *value
+                    let len = if s.is_ascii() {
+                        s.len()
+                    } else {
+                        s.chars().count()
+                    };
+                    len as i64 == *value
                 } else {
                     false
                 }
             }
             CompiledFilter::LengthNe { col_idx, value } => {
                 if let Some(Value::Text(s)) = values.get(*col_idx) {
-                    s.chars().count() as i64 != *value
+                    let len = if s.is_ascii() {
+                        s.len()
+                    } else {
+                        s.chars().count()
+                    };
+                    len as i64 != *value
                 } else {
                     false
                 }
             }
             CompiledFilter::LengthGt { col_idx, value } => {
                 if let Some(Value::Text(s)) = values.get(*col_idx) {
-                    s.chars().count() as i64 > *value
+                    let len = if s.is_ascii() {
+                        s.len()
+                    } else {
+                        s.chars().count()
+                    };
+                    len as i64 > *value
                 } else {
                     false
                 }
             }
             CompiledFilter::LengthGte { col_idx, value } => {
                 if let Some(Value::Text(s)) = values.get(*col_idx) {
-                    s.chars().count() as i64 >= *value
+                    let len = if s.is_ascii() {
+                        s.len()
+                    } else {
+                        s.chars().count()
+                    };
+                    len as i64 >= *value
                 } else {
                     false
                 }
             }
             CompiledFilter::LengthLt { col_idx, value } => {
                 if let Some(Value::Text(s)) = values.get(*col_idx) {
-                    (s.chars().count() as i64) < *value
+                    let len = if s.is_ascii() {
+                        s.len()
+                    } else {
+                        s.chars().count()
+                    };
+                    (len as i64) < *value
                 } else {
                     false
                 }
             }
             CompiledFilter::LengthLte { col_idx, value } => {
                 if let Some(Value::Text(s)) = values.get(*col_idx) {
-                    s.chars().count() as i64 <= *value
+                    let len = if s.is_ascii() {
+                        s.len()
+                    } else {
+                        s.chars().count()
+                    };
+                    len as i64 <= *value
                 } else {
                     false
                 }

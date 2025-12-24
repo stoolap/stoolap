@@ -60,6 +60,11 @@ pub struct FunctionExpr {
     prepared: bool,
 }
 
+// Thread-local buffer for function arguments (avoids allocation per row)
+thread_local! {
+    static ARG_BUFFER: std::cell::RefCell<Vec<Value>> = std::cell::RefCell::new(Vec::with_capacity(4));
+}
+
 /// Argument to a function in a FunctionExpr
 #[derive(Clone)]
 pub enum FunctionArg {
@@ -213,18 +218,36 @@ impl Debug for FunctionExpr {
 
 impl Expression for FunctionExpr {
     fn evaluate(&self, row: &Row) -> Result<bool> {
-        // Evaluate all arguments
-        let mut arg_values = Vec::with_capacity(self.arguments.len());
-        for (i, arg) in self.arguments.iter().enumerate() {
-            let value = self.evaluate_arg(arg, self.arg_indices.get(i).copied().flatten(), row)?;
-            arg_values.push(value);
+        // Fast path for single-argument column functions (most common case)
+        // This avoids function call overhead and directly extracts from row
+        if self.arguments.len() == 1 {
+            if let FunctionArg::Column(_) = &self.arguments[0] {
+                if let Some(idx) = self.arg_indices.first().copied().flatten() {
+                    let value = row.get(idx).cloned().unwrap_or_else(Value::null_unknown);
+                    let result = self.function.evaluate(std::slice::from_ref(&value))?;
+                    return Ok(self.compare(&result, &self.compare_value));
+                }
+            }
         }
 
-        // Call the function
-        let result = self.function.evaluate(&arg_values)?;
+        // Use thread-local buffer for multi-arg functions
+        ARG_BUFFER.with(|buf_cell| {
+            let mut arg_values = buf_cell.borrow_mut();
+            arg_values.clear();
 
-        // Compare with target value
-        Ok(self.compare(&result, &self.compare_value))
+            // Evaluate all arguments into the buffer
+            for (i, arg) in self.arguments.iter().enumerate() {
+                let value =
+                    self.evaluate_arg(arg, self.arg_indices.get(i).copied().flatten(), row)?;
+                arg_values.push(value);
+            }
+
+            // Call the function
+            let result = self.function.evaluate(&arg_values)?;
+
+            // Compare with target value
+            Ok(self.compare(&result, &self.compare_value))
+        })
     }
 
     fn evaluate_fast(&self, row: &Row) -> bool {

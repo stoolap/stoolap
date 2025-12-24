@@ -18,11 +18,13 @@
 //! a storage-layer expression when possible.
 
 use crate::core::Value;
+use crate::functions::global_registry;
 use crate::parser::ast::{self as ast, InfixOperator, PrefixOperator};
 use crate::storage::expression::{
-    AndExpr, BetweenExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr, InListExpr,
-    LikeExpr, NotExpr, NullCheckExpr, OrExpr,
+    AndExpr, BetweenExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr, FunctionArg,
+    FunctionExpr, InListExpr, LikeExpr, NotExpr, NullCheckExpr, OrExpr,
 };
+use std::sync::Arc;
 
 use super::{registry, PushdownContext, PushdownResult, PushdownRule};
 use crate::executor::utils::{
@@ -129,10 +131,11 @@ impl PushdownRule for ComparisonRule {
         };
 
         // Extract column and value
+        // If extraction fails, return NotApplicable so FunctionRule can try
         let (column, value, flipped) =
             match extract_comparison_parts(&infix.left, &infix.right, ctx) {
                 Some(parts) => parts,
-                None => return PushdownResult::CannotPush,
+                None => return PushdownResult::NotApplicable,
             };
 
         let operator = if flipped {
@@ -421,9 +424,13 @@ impl LikeRule {
             return PushdownResult::CannotPush;
         }
 
-        let column = match extract_column_name(&like.left) {
-            Some(c) => c,
-            None => return PushdownResult::CannotPush,
+        // Check for UPPER(col) or LOWER(col) LIKE pattern -> case-insensitive LIKE
+        let (column, force_ilike) = if let Some(col) = extract_column_name(&like.left) {
+            (col, false)
+        } else if let Some(col) = self.extract_upper_lower_column(&like.left) {
+            (col, true) // UPPER/LOWER(col) LIKE -> ILIKE
+        } else {
+            return PushdownResult::CannotPush;
         };
 
         let pattern = match &*like.pattern {
@@ -432,7 +439,7 @@ impl LikeRule {
         };
 
         let is_not = op_upper.contains("NOT");
-        let is_ilike = op_upper.contains("ILIKE");
+        let is_ilike = force_ilike || op_upper.contains("ILIKE");
 
         let mut expr = match (is_not, is_ilike) {
             (true, true) => LikeExpr::not_ilike(column, pattern),
@@ -444,57 +451,56 @@ impl LikeRule {
         PushdownResult::Converted(Box::new(expr))
     }
 
+    /// Extract column name from UPPER(col) or LOWER(col) function call
+    fn extract_upper_lower_column(&self, expr: &ast::Expression) -> Option<String> {
+        if let ast::Expression::FunctionCall(fc) = expr {
+            let func_name = fc.function.to_uppercase();
+            if (func_name == "UPPER" || func_name == "LOWER") && fc.arguments.len() == 1 {
+                return extract_column_name(&fc.arguments[0]);
+            }
+        }
+        None
+    }
+
     fn convert_infix_like(
         &self,
         infix: &ast::InfixExpression,
         ctx: &PushdownContext<'_>,
     ) -> PushdownResult {
-        let (column, pattern, is_ilike, is_not) = match infix.op_type {
-            InfixOperator::Like => {
-                let col = match extract_column_name(&infix.left) {
-                    Some(c) => c,
-                    None => return PushdownResult::CannotPush,
-                };
-                let pattern = match extract_pattern(&infix.right) {
-                    Some(p) => p,
-                    None => return PushdownResult::CannotPush,
-                };
-                (col, pattern, false, false)
-            }
-            InfixOperator::ILike => {
-                let col = match extract_column_name(&infix.left) {
-                    Some(c) => c,
-                    None => return PushdownResult::CannotPush,
-                };
-                let pattern = match extract_pattern(&infix.right) {
-                    Some(p) => p,
-                    None => return PushdownResult::CannotPush,
-                };
-                (col, pattern, true, false)
-            }
-            InfixOperator::NotLike => {
-                let col = match extract_column_name(&infix.left) {
-                    Some(c) => c,
-                    None => return PushdownResult::CannotPush,
-                };
-                let pattern = match extract_pattern(&infix.right) {
-                    Some(p) => p,
-                    None => return PushdownResult::CannotPush,
-                };
-                (col, pattern, false, true)
-            }
-            InfixOperator::NotILike => {
-                let col = match extract_column_name(&infix.left) {
-                    Some(c) => c,
-                    None => return PushdownResult::CannotPush,
-                };
-                let pattern = match extract_pattern(&infix.right) {
-                    Some(p) => p,
-                    None => return PushdownResult::CannotPush,
-                };
-                (col, pattern, true, true)
-            }
-            _ => return PushdownResult::NotApplicable,
+        // Check operator type FIRST - must be a LIKE operator
+        // This is critical: we must return NotApplicable for non-LIKE operators
+        // so that ComparisonRule gets a chance to handle them
+        let is_like_op = matches!(
+            infix.op_type,
+            InfixOperator::Like
+                | InfixOperator::ILike
+                | InfixOperator::NotLike
+                | InfixOperator::NotILike
+        );
+        if !is_like_op {
+            return PushdownResult::NotApplicable;
+        }
+
+        // Extract column, checking for UPPER/LOWER wrapper
+        let (column, force_ilike) = if let Some(col) = extract_column_name(&infix.left) {
+            (col, false)
+        } else if let Some(col) = self.extract_upper_lower_column(&infix.left) {
+            (col, true) // UPPER/LOWER(col) -> force case-insensitive
+        } else {
+            return PushdownResult::CannotPush;
+        };
+
+        let pattern = match extract_pattern(&infix.right) {
+            Some(p) => p,
+            None => return PushdownResult::CannotPush,
+        };
+
+        let (is_ilike, is_not) = match infix.op_type {
+            InfixOperator::Like => (force_ilike, false),
+            InfixOperator::ILike => (true, false),
+            InfixOperator::NotLike => (force_ilike, true),
+            InfixOperator::NotILike => (true, true),
+            _ => return PushdownResult::NotApplicable, // Should never reach here due to check above
         };
 
         let mut like_expr = if is_ilike {
@@ -641,5 +647,127 @@ impl PushdownRule for BooleanLiteralRule {
             }
             _ => PushdownResult::NotApplicable,
         }
+    }
+}
+
+// =============================================================================
+// Function Rule: LENGTH(col) > 5, UPPER(col) = 'X', etc.
+// =============================================================================
+
+pub struct FunctionRule;
+
+impl PushdownRule for FunctionRule {
+    fn name(&self) -> &'static str {
+        "function"
+    }
+
+    fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
+        // Handle: FUNC(col) op value or value op FUNC(col)
+        let infix = match expr {
+            ast::Expression::Infix(i) => i,
+            _ => return PushdownResult::NotApplicable,
+        };
+
+        // Check if this is a comparison operator
+        let base_op = match infix_to_operator(infix.op_type) {
+            Some(op) => op,
+            None => return PushdownResult::NotApplicable,
+        };
+
+        // Try: FUNC(args) op value
+        if let Some((func_expr, flipped)) =
+            self.try_extract_function_comparison(&infix.left, &infix.right, base_op, ctx)
+        {
+            let _ = flipped; // We handle flipping in try_extract_function_comparison
+            return PushdownResult::Converted(func_expr);
+        }
+
+        // Try: value op FUNC(args) - need to flip operator since operands are reversed
+        // e.g., "5 < LENGTH(name)" becomes "LENGTH(name) > 5"
+        if let Some((func_expr, _)) = self.try_extract_function_comparison(
+            &infix.right,
+            &infix.left,
+            flip_operator(base_op),
+            ctx,
+        ) {
+            return PushdownResult::Converted(func_expr);
+        }
+
+        PushdownResult::NotApplicable
+    }
+}
+
+impl FunctionRule {
+    /// Try to extract a function comparison expression
+    /// Returns (FunctionExpr, flipped) if successful
+    fn try_extract_function_comparison(
+        &self,
+        func_side: &ast::Expression,
+        value_side: &ast::Expression,
+        operator: crate::core::Operator,
+        ctx: &PushdownContext<'_>,
+    ) -> Option<(Box<dyn StorageExpr>, bool)> {
+        // Check if func_side is a function call
+        let func_call = match func_side {
+            ast::Expression::FunctionCall(fc) => fc,
+            _ => return None,
+        };
+
+        // Get the scalar function from registry
+        let func_name = func_call.function.to_uppercase();
+        let scalar_func = global_registry().get_scalar(&func_name)?;
+
+        // Convert function arguments to FunctionArg
+        let mut args = Vec::with_capacity(func_call.arguments.len());
+        for arg in &func_call.arguments {
+            match self.convert_func_arg(arg, ctx) {
+                Some(fa) => args.push(fa),
+                None => return None, // Can't convert argument, bail out
+            }
+        }
+
+        // Get the comparison value
+        let compare_value = extract_literal_with_ctx(value_side, ctx)?;
+
+        // Create FunctionExpr
+        let mut func_expr =
+            FunctionExpr::new(Arc::from(scalar_func), args, operator, compare_value);
+        func_expr.prepare_for_schema(ctx.schema);
+
+        Some((Box::new(func_expr), false))
+    }
+
+    /// Convert AST expression to FunctionArg
+    fn convert_func_arg(
+        &self,
+        expr: &ast::Expression,
+        ctx: &PushdownContext<'_>,
+    ) -> Option<FunctionArg> {
+        // Column reference
+        if let Some(col_name) = extract_column_name(expr) {
+            return Some(FunctionArg::Column(col_name));
+        }
+
+        // Literal value
+        if let Some(value) = extract_literal_with_ctx(expr, ctx) {
+            return Some(FunctionArg::Literal(value));
+        }
+
+        // Nested function call
+        if let ast::Expression::FunctionCall(fc) = expr {
+            let func_name = fc.function.to_uppercase();
+            if let Some(scalar_func) = global_registry().get_scalar(&func_name) {
+                let mut nested_args = Vec::with_capacity(fc.arguments.len());
+                for arg in &fc.arguments {
+                    nested_args.push(self.convert_func_arg(arg, ctx)?);
+                }
+                return Some(FunctionArg::Function {
+                    function: Arc::from(scalar_func),
+                    arguments: nested_args,
+                });
+            }
+        }
+
+        None
     }
 }

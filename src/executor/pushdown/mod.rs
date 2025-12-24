@@ -148,6 +148,9 @@ impl PushdownRegistry {
         // Comparison operators (most common, should be fast)
         registry.register(Box::new(ComparisonRule));
 
+        // Function expressions (LENGTH(col) > 5, etc.)
+        registry.register(Box::new(FunctionRule));
+
         // Boolean literals (constant expressions)
         registry.register(Box::new(BooleanLiteralRule));
 
@@ -324,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn test_function_not_pushable() {
+    fn test_function_pushable() {
         let schema = test_schema();
         let func = ast::Expression::FunctionCall(ast::FunctionCall {
             token: dummy_token(),
@@ -337,12 +340,13 @@ mod tests {
         let expr = make_infix(func, ">", make_int(5));
 
         let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);
-        assert!(storage_expr.is_none());
-        assert!(needs_mem);
+        // Functions are now pushable to storage layer
+        assert!(storage_expr.is_some());
+        assert!(!needs_mem);
     }
 
     #[test]
-    fn test_partial_pushdown() {
+    fn test_full_pushdown_with_function() {
         let schema = test_schema();
         // id = 1 AND LENGTH(name) > 5
         let pushable = make_infix(make_ident("id"), "=", make_int(1));
@@ -354,17 +358,18 @@ mod tests {
             order_by: vec![],
             filter: None,
         });
-        let not_pushable = make_infix(func, ">", make_int(5));
-        let expr = make_infix(pushable, "AND", not_pushable);
+        let also_pushable = make_infix(func, ">=", make_int(5)); // "Alice" has length 5
+        let expr = make_infix(pushable, "AND", also_pushable);
 
         let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);
-        // Should push the id = 1 part
+        // Both parts should be pushed now (functions are pushable)
         assert!(storage_expr.is_some());
-        // But still need memory filter for LENGTH() part
-        assert!(needs_mem);
+        // No memory filter needed
+        assert!(!needs_mem);
 
         let mut expr = storage_expr.unwrap();
         expr.prepare_for_schema(&schema);
+        // id=1 AND LENGTH("Alice")>=5 should be true (1=1 AND 5>=5)
         assert!(expr.evaluate(&test_row()).unwrap());
     }
 
@@ -464,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn test_or_not_pushable() {
+    fn test_or_with_function_pushable() {
         let schema = test_schema();
         let left = make_infix(make_ident("id"), "=", make_int(1));
         let func = ast::Expression::FunctionCall(ast::FunctionCall {
@@ -478,9 +483,14 @@ mod tests {
         let right = make_infix(func, ">", make_int(5));
         let expr = make_infix(left, "OR", right);
 
-        // OR with non-pushable part cannot be pushed (would change semantics)
+        // Both sides are pushable, so OR can be fully pushed
         let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);
-        assert!(storage_expr.is_none());
-        assert!(needs_mem);
+        assert!(storage_expr.is_some());
+        assert!(!needs_mem);
+
+        let mut expr = storage_expr.unwrap();
+        expr.prepare_for_schema(&schema);
+        // id=1 OR LENGTH("Alice")>5 should be true (1=1, so left side is true)
+        assert!(expr.evaluate(&test_row()).unwrap());
     }
 }

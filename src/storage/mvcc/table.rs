@@ -1021,8 +1021,38 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Vec<Row> {
-        let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
+
+        // FAST PATH: Check if this is a primary key equality lookup (WHERE id = X)
+        // This is O(1) and skips all scanning
+        if let Some(expr) = filter {
+            if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
+                // Direct O(1) lookup by primary key
+                let txn_versions = self.txn_versions.read().unwrap();
+                let row = if let Some(row) = txn_versions.get(pk_id) {
+                    Some(row)
+                } else if let Some(version) =
+                    self.version_store.get_visible_version(pk_id, self.txn_id)
+                {
+                    if !version.is_deleted() {
+                        Some(version.data.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                return match row {
+                    Some(r) if offset == 0 && limit >= 1 => {
+                        vec![self.normalize_row_to_schema(r, schema)]
+                    }
+                    _ => Vec::new(),
+                };
+            }
+        }
+
+        let txn_versions = self.txn_versions.read().unwrap();
 
         // Check if we have local versions (uncommitted changes in this transaction)
         let has_local = txn_versions.has_local_changes();
@@ -1116,8 +1146,38 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Vec<Row> {
-        let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
+
+        // FAST PATH: Check if this is a primary key equality lookup (WHERE id = X)
+        // This is O(1) and skips all scanning
+        if let Some(expr) = filter {
+            if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
+                // Direct O(1) lookup by primary key
+                let txn_versions = self.txn_versions.read().unwrap();
+                let row = if let Some(row) = txn_versions.get(pk_id) {
+                    Some(row)
+                } else if let Some(version) =
+                    self.version_store.get_visible_version(pk_id, self.txn_id)
+                {
+                    if !version.is_deleted() {
+                        Some(version.data.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                return match row {
+                    Some(r) if offset == 0 && limit >= 1 => {
+                        vec![self.normalize_row_to_schema(r, schema)]
+                    }
+                    _ => Vec::new(),
+                };
+            }
+        }
+
+        let txn_versions = self.txn_versions.read().unwrap();
 
         // Check if we have local versions (uncommitted changes in this transaction)
         let has_local = txn_versions.has_local_changes();

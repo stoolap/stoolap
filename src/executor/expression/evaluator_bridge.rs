@@ -535,11 +535,11 @@ impl RowFilter {
             // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
             // If the VM is already borrowed, create a temporary one for this call.
             if let Ok(mut borrowed_vm) = vm.try_borrow_mut() {
-                borrowed_vm.execute(&self.program, &ctx)
+                borrowed_vm.execute_cow(&self.program, &ctx)
             } else {
                 // Fallback: create a fresh VM for recursive calls
                 let mut temp_vm = ExprVM::new();
-                temp_vm.execute(&self.program, &ctx)
+                temp_vm.execute_cow(&self.program, &ctx)
             }
         })
     }
@@ -837,7 +837,7 @@ impl ExpressionEval {
         }
         ctx = ctx.with_transaction_id(self.transaction_id);
 
-        self.vm.execute(&self.program, &ctx)
+        self.vm.execute_cow(&self.program, &ctx)
     }
 
     /// Evaluate as boolean (for WHERE/HAVING).
@@ -864,7 +864,7 @@ impl ExpressionEval {
     #[inline]
     pub fn eval_join(&mut self, left: &Row, right: &Row) -> Result<Value> {
         let ctx = ExecuteContext::for_join(left.as_slice(), right.as_slice());
-        self.vm.execute(&self.program, &ctx)
+        self.vm.execute_cow(&self.program, &ctx)
     }
 
     /// Evaluate join as boolean.
@@ -890,7 +890,7 @@ impl ExpressionEval {
         }
         ctx = ctx.with_transaction_id(self.transaction_id);
 
-        self.vm.execute(&self.program, &ctx)
+        self.vm.execute_cow(&self.program, &ctx)
     }
 
     /// Evaluate slice as boolean.
@@ -1039,7 +1039,7 @@ impl MultiExpressionEval {
 
         self.programs
             .iter()
-            .map(|prog| self.vm.execute(prog, &ctx))
+            .map(|prog| self.vm.execute_cow(prog, &ctx))
             .collect()
     }
 
@@ -1059,7 +1059,7 @@ impl MultiExpressionEval {
 
         output.clear();
         for prog in &self.programs {
-            output.push(self.vm.execute(prog, &ctx)?);
+            output.push(self.vm.execute_cow(prog, &ctx)?);
         }
         Ok(())
     }
@@ -1711,7 +1711,7 @@ impl<'a> CompiledEvaluator<'a> {
         ctx = ctx.with_transaction_id(self.transaction_id);
 
         // Execute
-        self.vm.execute(&program, &ctx)
+        self.vm.execute_cow(&program, &ctx)
     }
 
     /// Evaluate an expression as a boolean (for WHERE/HAVING clauses)
