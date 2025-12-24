@@ -2600,6 +2600,14 @@ impl Table for MVCCTable {
     }
 
     fn get_partition_values(&self, column_name: &str) -> Option<Vec<Value>> {
+        // Only use index-based distinct values if no uncommitted local changes
+        // (local changes are in txn_versions, not reflected in the index)
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
         // Get index for the column
         let index = self.version_store.get_index_by_column(column_name)?;
         // Return all distinct values from the index

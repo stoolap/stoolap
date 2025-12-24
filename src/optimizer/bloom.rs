@@ -47,8 +47,9 @@
 //! - Fast hash computation (using FNV-1a)
 //! - Configurable false positive rate based on available memory
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+use ahash::AHasher;
 
 use crate::core::Value;
 
@@ -202,9 +203,9 @@ impl BloomFilter {
         combined % self.num_bits
     }
 
-    /// Hash a Value using FNV-1a (fast and good distribution)
+    /// Hash a Value using AHash (fast and good distribution)
     fn hash_value(&self, value: &Value) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = AHasher::default();
         // Use discriminant to ensure different types hash differently
         std::mem::discriminant(value).hash(&mut hasher);
         match value {

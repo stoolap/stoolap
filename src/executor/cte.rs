@@ -1454,7 +1454,7 @@ impl Executor {
     /// - Preserves index access (materialized CTEs lose all indexes)
     /// - Enables LIMIT pushdown through subqueries
     /// - Avoids memory overhead of full CTE materialization
-    fn try_inline_ctes(
+    pub(crate) fn try_inline_ctes(
         &self,
         stmt: &SelectStatement,
         with_clause: &WithClause,

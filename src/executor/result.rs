@@ -106,11 +106,46 @@ impl QueryResult for ExecResult {
 ///
 /// This result type stores all rows in memory, suitable for
 /// small to medium result sets.
+/// Storage for result rows - either owned or shared via Arc
+enum RowStorage {
+    /// Owned rows - can be modified/taken
+    Owned(Vec<Row>),
+    /// Shared rows from cache - read-only, clone on take
+    Shared(Arc<Vec<Row>>),
+}
+
+impl RowStorage {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            RowStorage::Owned(rows) => rows.len(),
+            RowStorage::Shared(rows) => rows.len(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Option<&Row> {
+        match self {
+            RowStorage::Owned(rows) => rows.get(index),
+            RowStorage::Shared(rows) => rows.get(index),
+        }
+    }
+
+    #[inline]
+    fn take(&mut self, index: usize) -> Row {
+        match self {
+            RowStorage::Owned(rows) => std::mem::take(&mut rows[index]),
+            // For shared storage, we must clone since we can't take ownership
+            RowStorage::Shared(rows) => rows[index].clone(),
+        }
+    }
+}
+
 pub struct ExecutorMemoryResult {
     /// Column names (Arc for zero-copy sharing with API layer)
     columns: Arc<Vec<String>>,
-    /// Result rows
-    rows: Vec<Row>,
+    /// Result rows - either owned or shared
+    rows: RowStorage,
     /// Current row index (None before first next())
     current_index: Option<usize>,
     /// Whether the result is closed
@@ -126,7 +161,7 @@ impl ExecutorMemoryResult {
     pub fn new(columns: Vec<String>, rows: Vec<Row>) -> Self {
         Self {
             columns: Arc::new(columns),
-            rows,
+            rows: RowStorage::Owned(rows),
             current_index: None,
             closed: false,
             affected: 0,
@@ -138,7 +173,20 @@ impl ExecutorMemoryResult {
     pub fn with_arc_columns(columns: Arc<Vec<String>>, rows: Vec<Row>) -> Self {
         Self {
             columns,
-            rows,
+            rows: RowStorage::Owned(rows),
+            current_index: None,
+            closed: false,
+            affected: 0,
+            insert_id: 0,
+        }
+    }
+
+    /// Create a new memory result with shared rows from cache (zero-copy)
+    /// This avoids cloning the entire Vec<Row> when reading from semantic cache
+    pub fn with_shared_rows(columns: Vec<String>, rows: Arc<Vec<Row>>) -> Self {
+        Self {
+            columns: Arc::new(columns),
+            rows: RowStorage::Shared(rows),
             current_index: None,
             closed: false,
             affected: 0,
@@ -163,7 +211,13 @@ impl ExecutorMemoryResult {
 
     /// Add a row to the result
     pub fn add_row(&mut self, row: Row) {
-        self.rows.push(row);
+        // Convert to owned if needed
+        if let RowStorage::Shared(arc_rows) = &self.rows {
+            self.rows = RowStorage::Owned(arc_rows.as_ref().clone());
+        }
+        if let RowStorage::Owned(rows) = &mut self.rows {
+            rows.push(row);
+        }
     }
 
     /// Get the number of rows
@@ -173,12 +227,21 @@ impl ExecutorMemoryResult {
 
     /// Get all rows
     pub fn rows(&self) -> &[Row] {
-        &self.rows
+        match &self.rows {
+            RowStorage::Owned(rows) => rows,
+            RowStorage::Shared(rows) => rows,
+        }
     }
 
     /// Take ownership of all rows
     pub fn into_rows(self) -> Vec<Row> {
-        self.rows
+        match self.rows {
+            RowStorage::Owned(rows) => rows,
+            RowStorage::Shared(rows) => {
+                // Must clone if shared
+                Arc::try_unwrap(rows).unwrap_or_else(|arc| (*arc).clone())
+            }
+        }
     }
 
     /// Reset the cursor to the beginning
@@ -244,17 +307,17 @@ impl QueryResult for ExecutorMemoryResult {
 
     fn row(&self) -> &Row {
         match self.current_index {
-            Some(i) if i < self.rows.len() => &self.rows[i],
+            Some(i) => self
+                .rows
+                .get(i)
+                .expect("row() called without successful next()"),
             _ => panic!("row() called without successful next()"),
         }
     }
 
     fn take_row(&mut self) -> Row {
         match self.current_index {
-            Some(i) if i < self.rows.len() => {
-                // Swap out the row with an empty one
-                std::mem::take(&mut self.rows[i])
-            }
+            Some(i) if i < self.rows.len() => self.rows.take(i),
             _ => panic!("take_row() called without successful next()"),
         }
     }
@@ -564,11 +627,12 @@ impl QueryResult for ExprMappedResult {
                         }
                     }
                     CompiledProjection::Compiled(program) => {
-                        // Execute pre-compiled expression
+                        // Execute pre-compiled expression using Cow-based evaluation
+                        // to avoid cloning row values when possible
                         let ctx = ExecuteContext::new(row_data);
                         let value = self
                             .vm
-                            .execute(program, &ctx)
+                            .execute_cow(program, &ctx)
                             .unwrap_or(Value::null_unknown());
                         result_row.push(value);
                     }

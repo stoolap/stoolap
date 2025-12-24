@@ -998,6 +998,96 @@ impl Executor {
         }
     }
 
+    /// Try to get distinct values directly from an index
+    ///
+    /// This optimization works for queries like:
+    /// - SELECT DISTINCT col FROM table (where col is indexed)
+    ///
+    /// Conditions:
+    /// - Single column in SELECT (not *, not expression)
+    /// - No WHERE clause
+    /// - No GROUP BY, HAVING
+    /// - No ORDER BY (could be extended later)
+    /// - No LIMIT/OFFSET (could be extended later)
+    /// - The column must have an index
+    fn try_distinct_pushdown(
+        &self,
+        table: &dyn crate::storage::traits::Table,
+        stmt: &SelectStatement,
+        all_columns: &[String],
+        classification: &std::sync::Arc<QueryClassification>,
+    ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
+        // Must be DISTINCT
+        if !stmt.distinct {
+            return Ok(None);
+        }
+
+        // Quick eligibility checks using cached classification
+        if classification.has_where {
+            return Ok(None);
+        }
+        if classification.has_group_by {
+            return Ok(None);
+        }
+        if classification.has_having {
+            return Ok(None);
+        }
+        if classification.has_aggregation {
+            return Ok(None);
+        }
+        if classification.has_window_functions {
+            return Ok(None);
+        }
+        // ORDER BY is OK - we can sort the distinct values after
+
+        // Must have exactly one column
+        if stmt.columns.len() != 1 {
+            return Ok(None);
+        }
+
+        // Get the column name (must be a simple identifier, not an expression)
+        let column_name = match &stmt.columns[0] {
+            Expression::Identifier(id) => id.value_lower.clone(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value_lower.clone(),
+            Expression::Aliased(aliased) => match &*aliased.expression {
+                Expression::Identifier(id) => id.value_lower.clone(),
+                Expression::QualifiedIdentifier(qid) => qid.name.value_lower.clone(),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        // Verify this column exists in the table
+        let column_exists = all_columns
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&column_name));
+        if !column_exists {
+            return Ok(None);
+        }
+
+        // Try to get distinct values from the index
+        if let Some(distinct_values) = table.get_partition_values(&column_name) {
+            // Build output column name (use alias if present)
+            let output_name = match &stmt.columns[0] {
+                Expression::Aliased(aliased) => aliased.alias.value.clone(),
+                Expression::Identifier(id) => id.value.clone(),
+                Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+                _ => column_name,
+            };
+
+            // Convert values to rows
+            let rows: Vec<Row> = distinct_values
+                .into_iter()
+                .map(|v| Row::from_values(vec![v]))
+                .collect();
+
+            let result = ExecutorMemoryResult::new(vec![output_name], rows);
+            return Ok(Some(Box::new(result)));
+        }
+
+        Ok(None)
+    }
+
     /// Execute a simple table scan
     fn execute_simple_table_scan(
         &self,
@@ -1078,6 +1168,19 @@ impl Executor {
                 ctx,
                 classification,
             )? {
+                let columns = result.columns().to_vec();
+                return Ok((result, columns, false));
+            }
+        }
+
+        // DISTINCT PUSHDOWN: Try to get distinct values directly from index
+        // This avoids all row materialization for queries like:
+        // - SELECT DISTINCT col FROM table (where col is indexed)
+        // Returns distinct values in O(unique values) instead of O(rows)
+        if classification.has_distinct {
+            if let Some(result) =
+                self.try_distinct_pushdown(table.as_ref(), stmt, &all_columns, classification)?
+            {
                 let columns = result.columns().to_vec();
                 return Ok((result, columns, false));
             }
@@ -1187,16 +1290,16 @@ impl Executor {
                     .lookup(table_name, &all_columns, Some(where_expr))
                 {
                     CacheLookupResult::ExactHit(rows_arc) => {
-                        // Exact cache hit - return cached rows
-                        // Try to unwrap Arc if we're the only owner, otherwise clone
-                        let rows = std::sync::Arc::try_unwrap(rows_arc)
-                            .unwrap_or_else(|arc| (*arc).clone());
+                        // Exact cache hit - return cached rows with zero-copy sharing
                         let output_columns = self.get_output_column_names(
                             &stmt.columns,
                             &all_columns,
                             table_alias.as_deref(),
                         );
-                        let result = ExecutorMemoryResult::new(output_columns.clone(), rows);
+                        let result = ExecutorMemoryResult::with_shared_rows(
+                            output_columns.clone(),
+                            rows_arc,
+                        );
                         return Ok((Box::new(result), output_columns, false));
                     }
                     CacheLookupResult::SubsumptionHit {

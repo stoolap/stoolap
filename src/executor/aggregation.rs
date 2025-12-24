@@ -4515,13 +4515,14 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check all aggregations are simple (no expression, no DISTINCT, no ORDER BY, no FILTER)
+        // Check all aggregations are simple (no expression, no ORDER BY, no FILTER)
+        // COUNT(DISTINCT col) is allowed if column has an index
         for agg in &aggregations {
-            if agg.expression.is_some()
-                || agg.distinct
-                || !agg.order_by.is_empty()
-                || agg.filter.is_some()
-            {
+            if agg.expression.is_some() || !agg.order_by.is_empty() || agg.filter.is_some() {
+                return Ok(None);
+            }
+            // COUNT(DISTINCT col) is allowed, other DISTINCT aggregates are not
+            if agg.distinct && agg.name != "COUNT" {
                 return Ok(None);
             }
             // Only support COUNT, SUM, MIN, MAX, AVG
@@ -4547,7 +4548,19 @@ impl Executor {
 
             match agg.name.as_str() {
                 "COUNT" => {
-                    if agg.column == "*" {
+                    if agg.distinct {
+                        // COUNT(DISTINCT col) - try to get count from index
+                        if let Some(distinct_values) = table.get_partition_values(&agg.column_lower)
+                        {
+                            // Per SQL standard, COUNT(DISTINCT col) excludes NULL values
+                            let non_null_count =
+                                distinct_values.iter().filter(|v| !v.is_null()).count();
+                            result_values.push(Value::Integer(non_null_count as i64));
+                        } else {
+                            // No index on this column, can't pushdown
+                            return Ok(None);
+                        }
+                    } else if agg.column == "*" {
                         // COUNT(*) - use row_count
                         let count = table.row_count();
                         result_values.push(Value::Integer(count as i64));

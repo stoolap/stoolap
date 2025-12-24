@@ -41,6 +41,22 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         let mut plan_lines: Vec<String> = Vec::new();
 
+        // For SELECT statements with CTEs, try to get the inlined version for accurate EXPLAIN
+        let inlined_statement: Option<Box<Statement>> =
+            if let Statement::Select(select) = &*stmt.statement {
+                if let Some(ref with_clause) = select.with {
+                    self.try_inline_ctes(select, with_clause)
+                        .map(|inlined| Box::new(Statement::Select(inlined)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        // Use inlined statement if available, otherwise original
+        let explain_stmt = inlined_statement.as_ref().unwrap_or(&stmt.statement);
+
         if stmt.analyze {
             // EXPLAIN ANALYZE: Execute the query and collect statistics
             let start = std::time::Instant::now();
@@ -100,9 +116,9 @@ impl Executor {
                 }
             }
 
-            // Generate plan with actual statistics
+            // Generate plan with actual statistics (using inlined version if available)
             self.explain_statement_with_stats(
-                &stmt.statement,
+                explain_stmt,
                 &mut plan_lines,
                 0,
                 row_count,
@@ -118,8 +134,8 @@ impl Executor {
 
             Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
         } else {
-            // Regular EXPLAIN: Just show the plan without executing
-            self.explain_statement(&stmt.statement, &mut plan_lines, 0);
+            // Regular EXPLAIN: Just show the plan without executing (using inlined version if available)
+            self.explain_statement(explain_stmt, &mut plan_lines, 0);
 
             // Return as a single-column result
             let columns = vec!["plan".to_string()];
