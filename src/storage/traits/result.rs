@@ -16,6 +16,7 @@
 //!
 
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 use crate::core::{Result, Row, Value};
 
@@ -40,6 +41,15 @@ pub trait QueryResult: Send {
     ///
     /// If aliases are set, this returns the aliased column names.
     fn columns(&self) -> &[String];
+
+    /// Returns column names as Arc for zero-copy sharing
+    ///
+    /// This is an optimization for the API layer to avoid cloning column names.
+    /// Default implementation returns None, meaning caller should fall back to
+    /// cloning from columns().
+    fn columns_arc(&self) -> Option<Arc<Vec<String>>> {
+        None
+    }
 
     /// Moves the cursor to the next row
     ///

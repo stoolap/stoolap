@@ -17,6 +17,8 @@
 
 use rustc_hash::FxHashMap;
 
+use std::sync::Arc;
+
 use crate::core::{IsolationLevel, Result, Row, Schema};
 use crate::storage::config::Config;
 use crate::storage::traits::{Index, Transaction};
@@ -78,7 +80,10 @@ pub trait Engine: Send + Sync {
     fn get_index(&self, table_name: &str, index_name: &str) -> Result<Box<dyn Index>>;
 
     /// Gets the schema for a table
-    fn get_table_schema(&self, table_name: &str) -> Result<Schema>;
+    ///
+    /// Returns an Arc to avoid cloning the schema on every access.
+    /// This is a critical optimization for hot paths like PK lookups.
+    fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>>;
 
     /// Lists all indexes for a table
     ///

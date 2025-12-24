@@ -191,15 +191,31 @@ pub struct Schema {
 
 impl Clone for Schema {
     fn clone(&self) -> Self {
+        // Clone caches if already computed to avoid recomputation
+        let column_names_cache = OnceLock::new();
+        if let Some(names) = self.column_names_cache.get() {
+            let _ = column_names_cache.set(names.clone());
+        }
+
+        let pk_column_index_cache = OnceLock::new();
+        if let Some(pk_idx) = self.pk_column_index_cache.get() {
+            let _ = pk_column_index_cache.set(*pk_idx);
+        }
+
+        let column_index_map_cache = OnceLock::new();
+        if let Some(map) = self.column_index_map_cache.get() {
+            let _ = column_index_map_cache.set(map.clone());
+        }
+
         Self {
             table_name: self.table_name.clone(),
             table_name_lower: self.table_name_lower.clone(),
             columns: self.columns.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
-            column_names_cache: OnceLock::new(), // Don't clone cache, it's recomputed lazily
-            pk_column_index_cache: OnceLock::new(), // Don't clone cache, it's recomputed lazily
-            column_index_map_cache: OnceLock::new(), // Don't clone cache, it's recomputed lazily
+            column_names_cache,
+            pk_column_index_cache,
+            column_index_map_cache,
         }
     }
 }
@@ -221,15 +237,37 @@ impl Schema {
         let now = Utc::now();
         let name = table_name.into();
         let name_lower = name.to_lowercase();
+
+        // Eagerly compute caches to avoid recomputation on clone
+        let column_names_cache = OnceLock::new();
+        let _ = column_names_cache.set(columns.iter().map(|c| c.name.clone()).collect());
+
+        let pk_column_index_cache = OnceLock::new();
+        let pk_idx = columns
+            .iter()
+            .enumerate()
+            .find(|(_, col)| col.primary_key && col.data_type == DataType::Integer)
+            .map(|(i, _)| i);
+        let _ = pk_column_index_cache.set(pk_idx);
+
+        let column_index_map_cache = OnceLock::new();
+        let _ = column_index_map_cache.set(
+            columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.name.to_lowercase(), i))
+                .collect(),
+        );
+
         Self {
             table_name: name,
             table_name_lower: name_lower,
             columns,
             created_at: now,
             updated_at: now,
-            column_names_cache: OnceLock::new(),
-            pk_column_index_cache: OnceLock::new(),
-            column_index_map_cache: OnceLock::new(),
+            column_names_cache,
+            pk_column_index_cache,
+            column_index_map_cache,
         }
     }
 
@@ -242,15 +280,37 @@ impl Schema {
     ) -> Self {
         let name = table_name.into();
         let name_lower = name.to_lowercase();
+
+        // Eagerly compute caches to avoid recomputation on clone
+        let column_names_cache = OnceLock::new();
+        let _ = column_names_cache.set(columns.iter().map(|c| c.name.clone()).collect());
+
+        let pk_column_index_cache = OnceLock::new();
+        let pk_idx = columns
+            .iter()
+            .enumerate()
+            .find(|(_, col)| col.primary_key && col.data_type == DataType::Integer)
+            .map(|(i, _)| i);
+        let _ = pk_column_index_cache.set(pk_idx);
+
+        let column_index_map_cache = OnceLock::new();
+        let _ = column_index_map_cache.set(
+            columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.name.to_lowercase(), i))
+                .collect(),
+        );
+
         Self {
             table_name: name,
             table_name_lower: name_lower,
             columns,
             created_at,
             updated_at,
-            column_names_cache: OnceLock::new(),
-            pk_column_index_cache: OnceLock::new(),
-            column_index_map_cache: OnceLock::new(),
+            column_names_cache,
+            pk_column_index_cache,
+            column_index_map_cache,
         }
     }
 
@@ -375,6 +435,36 @@ impl Schema {
         self.updated_at = Utc::now();
     }
 
+    /// Rebuild all caches after schema mutation
+    /// This replaces the OnceLock fields with fresh ones containing updated values
+    fn rebuild_caches(&mut self) {
+        // Rebuild column names cache
+        self.column_names_cache = OnceLock::new();
+        let _ = self
+            .column_names_cache
+            .set(self.columns.iter().map(|c| c.name.clone()).collect());
+
+        // Rebuild PK cache
+        self.pk_column_index_cache = OnceLock::new();
+        let pk_idx = self
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, col)| col.primary_key && col.data_type == DataType::Integer)
+            .map(|(i, _)| i);
+        let _ = self.pk_column_index_cache.set(pk_idx);
+
+        // Rebuild column index map cache
+        self.column_index_map_cache = OnceLock::new();
+        let _ = self.column_index_map_cache.set(
+            self.columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.name.to_lowercase(), i))
+                .collect(),
+        );
+    }
+
     /// Add a column to the schema
     pub fn add_column(&mut self, column: SchemaColumn) -> Result<()> {
         // Check for duplicate column name
@@ -383,6 +473,7 @@ impl Schema {
         }
         self.columns.push(column);
         self.mark_updated();
+        self.rebuild_caches();
         Ok(())
     }
 
@@ -397,6 +488,7 @@ impl Schema {
         }
 
         self.mark_updated();
+        self.rebuild_caches();
         Ok(column)
     }
 
@@ -415,6 +507,7 @@ impl Schema {
 
         self.columns[idx].name = new_name;
         self.mark_updated();
+        self.rebuild_caches();
         Ok(())
     }
 
@@ -435,6 +528,7 @@ impl Schema {
         }
 
         self.mark_updated();
+        self.rebuild_caches();
         Ok(())
     }
 }

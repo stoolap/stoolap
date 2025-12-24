@@ -232,7 +232,10 @@ pub struct Rows {
 impl Rows {
     /// Create a new Rows iterator from a QueryResult
     pub(crate) fn new(result: Box<dyn QueryResult>) -> Self {
-        let columns = std::sync::Arc::new(result.columns().to_vec());
+        // Use columns_arc() if available (zero-copy), otherwise clone
+        let columns = result
+            .columns_arc()
+            .unwrap_or_else(|| std::sync::Arc::new(result.columns().to_vec()));
         Self {
             result,
             columns,

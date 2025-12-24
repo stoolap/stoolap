@@ -18,10 +18,24 @@
 //!
 
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use std::path::Path;
+
+/// Returns lowercase version of string, avoiding allocation if already lowercase.
+/// This is a hot-path optimization - most table names are already lowercase.
+#[inline]
+fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
+    // Fast path: check if all bytes are already lowercase ASCII
+    // This avoids allocation for the common case
+    if s.bytes().all(|b| !b.is_ascii_uppercase()) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(s.to_lowercase())
+    }
+}
 
 use super::file_lock::FileLock;
 
@@ -257,7 +271,8 @@ pub struct MVCCEngine {
     /// Configuration
     config: RwLock<Config>,
     /// Table schemas (Arc-wrapped for safe sharing with transactions)
-    schemas: Arc<RwLock<FxHashMap<String, Schema>>>,
+    /// Each schema is also Arc-wrapped to avoid cloning on lookup (critical for PK fast path)
+    schemas: Arc<RwLock<FxHashMap<String, Arc<Schema>>>>,
     /// Version stores for each table (Arc-wrapped for safe sharing with transactions)
     version_stores: Arc<RwLock<FxHashMap<String, Arc<VersionStore>>>>,
     /// Transaction registry
@@ -474,7 +489,7 @@ impl MVCCEngine {
         // Store the schema and version store
         {
             let mut schemas = self.schemas.write().unwrap();
-            schemas.insert(table_name_lower.clone(), schema);
+            schemas.insert(table_name_lower.clone(), Arc::new(schema));
         }
         {
             let mut stores = self.version_stores.write().unwrap();
@@ -548,7 +563,7 @@ impl MVCCEngine {
 
                     {
                         let mut schemas = self.schemas.write().unwrap();
-                        schemas.insert(table_name.clone(), schema);
+                        schemas.insert(table_name.clone(), Arc::new(schema));
                     }
                     {
                         let mut stores = self.version_stores.write().unwrap();
@@ -1169,17 +1184,7 @@ impl MVCCEngine {
             Arc::clone(&self.registry) as Arc<dyn VisibilityChecker>,
         ));
 
-        // Store schema and version store
-        {
-            let mut schemas = self.schemas.write().unwrap();
-            schemas.insert(table_name.clone(), schema.clone());
-        }
-        {
-            let mut stores = self.version_stores.write().unwrap();
-            stores.insert(table_name, version_store);
-        }
-
-        // Record DDL operation in WAL
+        // Record DDL operation in WAL (before inserting into map)
         let schema_data = Self::serialize_schema(&schema);
         self.record_ddl(
             &schema.table_name,
@@ -1187,7 +1192,19 @@ impl MVCCEngine {
             &schema_data,
         );
 
-        Ok(schema)
+        // Store schema and version store
+        // Clone schema for return before wrapping in Arc (avoids failed try_unwrap clone)
+        let return_schema = schema.clone();
+        {
+            let mut schemas = self.schemas.write().unwrap();
+            schemas.insert(table_name.clone(), Arc::new(schema));
+        }
+        {
+            let mut stores = self.version_stores.write().unwrap();
+            stores.insert(table_name, version_store);
+        }
+
+        Ok(return_schema)
     }
 
     /// Drops a table
@@ -1232,10 +1249,13 @@ impl MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
 
-        let table_name = name.to_lowercase();
+        let table_name = to_lowercase_cow(name);
 
         let stores = self.version_stores.read().unwrap();
-        stores.get(&table_name).cloned().ok_or(Error::TableNotFound)
+        stores
+            .get(table_name.as_ref())
+            .cloned()
+            .ok_or(Error::TableNotFound)
     }
 
     /// Creates a column in a table
@@ -1252,18 +1272,19 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema
+        // Get and modify schema (using Arc::make_mut for copy-on-write)
         let mut schemas = self.schemas.write().unwrap();
-        let schema = schemas
+        let schema_arc = schemas
             .get_mut(&table_name_lower)
             .ok_or(Error::TableNotFound)?;
 
         // Check if column already exists
-        if schema.has_column(column_name) {
+        if schema_arc.has_column(column_name) {
             return Err(Error::DuplicateColumn);
         }
 
-        // Add column to schema
+        // Add column to schema (Arc::make_mut clones only if there are other refs)
+        let schema = Arc::make_mut(schema_arc);
         let column = crate::core::SchemaColumn::new(
             schema.columns.len(),
             column_name,
@@ -1276,7 +1297,8 @@ impl MVCCEngine {
         // Also update version store schema
         let stores = self.version_stores.read().unwrap();
         if let Some(store) = stores.get(&table_name_lower) {
-            let mut vs_schema = store.schema_mut();
+            let mut vs_schema_guard = store.schema_mut();
+            let vs_schema = Arc::make_mut(&mut *vs_schema_guard);
             let col = crate::core::SchemaColumn::new(
                 vs_schema.columns.len(),
                 column_name,
@@ -1305,18 +1327,19 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema
+        // Get and modify schema (using Arc::make_mut for copy-on-write)
         let mut schemas = self.schemas.write().unwrap();
-        let schema = schemas
+        let schema_arc = schemas
             .get_mut(&table_name_lower)
             .ok_or(Error::TableNotFound)?;
 
         // Check if column already exists
-        if schema.has_column(column_name) {
+        if schema_arc.has_column(column_name) {
             return Err(Error::DuplicateColumn);
         }
 
-        // Add column to schema with default expression
+        // Add column to schema with default expression (Arc::make_mut clones only if there are other refs)
+        let schema = Arc::make_mut(schema_arc);
         let mut column = crate::core::SchemaColumn::new(
             schema.columns.len(),
             column_name,
@@ -1330,7 +1353,8 @@ impl MVCCEngine {
         // Also update version store schema
         let stores = self.version_stores.read().unwrap();
         if let Some(store) = stores.get(&table_name_lower) {
-            let mut vs_schema = store.schema_mut();
+            let mut vs_schema_guard = store.schema_mut();
+            let vs_schema = Arc::make_mut(&mut *vs_schema_guard);
             let mut col = crate::core::SchemaColumn::new(
                 vs_schema.columns.len(),
                 column_name,
@@ -1353,14 +1377,14 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema
+        // Get and modify schema (using Arc::make_mut for copy-on-write)
         let mut schemas = self.schemas.write().unwrap();
-        let schema = schemas
+        let schema_arc = schemas
             .get_mut(&table_name_lower)
             .ok_or(Error::TableNotFound)?;
 
         // Check if column is primary key
-        if let Some((_, col)) = schema.find_column(column_name) {
+        if let Some((_, col)) = schema_arc.find_column(column_name) {
             if col.primary_key {
                 return Err(Error::CannotDropPrimaryKey);
             }
@@ -1368,14 +1392,14 @@ impl MVCCEngine {
             return Err(Error::ColumnNotFound);
         }
 
-        // Remove column from schema
-        schema.remove_column(column_name)?;
+        // Remove column from schema (Arc::make_mut clones only if there are other refs)
+        Arc::make_mut(schema_arc).remove_column(column_name)?;
 
         // Also update version store schema
         let stores = self.version_stores.read().unwrap();
         if let Some(store) = stores.get(&table_name_lower) {
-            let mut vs_schema = store.schema_mut();
-            vs_schema.remove_column(column_name)?;
+            let mut vs_schema_guard = store.schema_mut();
+            Arc::make_mut(&mut *vs_schema_guard).remove_column(column_name)?;
         }
 
         Ok(())
@@ -1389,30 +1413,30 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema
+        // Get and modify schema (using Arc::make_mut for copy-on-write)
         let mut schemas = self.schemas.write().unwrap();
-        let schema = schemas
+        let schema_arc = schemas
             .get_mut(&table_name_lower)
             .ok_or(Error::TableNotFound)?;
 
         // Check if old column exists
-        if !schema.has_column(old_name) {
+        if !schema_arc.has_column(old_name) {
             return Err(Error::ColumnNotFound);
         }
 
         // Check if new column name already exists
-        if schema.has_column(new_name) {
+        if schema_arc.has_column(new_name) {
             return Err(Error::DuplicateColumn);
         }
 
-        // Rename column in schema
-        schema.rename_column(old_name, new_name)?;
+        // Rename column in schema (Arc::make_mut clones only if there are other refs)
+        Arc::make_mut(schema_arc).rename_column(old_name, new_name)?;
 
         // Also update version store schema
         let stores = self.version_stores.read().unwrap();
         if let Some(store) = stores.get(&table_name_lower) {
-            let mut vs_schema = store.schema_mut();
-            vs_schema.rename_column(old_name, new_name)?;
+            let mut vs_schema_guard = store.schema_mut();
+            Arc::make_mut(&mut *vs_schema_guard).rename_column(old_name, new_name)?;
         }
 
         Ok(())
@@ -1432,25 +1456,29 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema
+        // Get and modify schema (using Arc::make_mut for copy-on-write)
         let mut schemas = self.schemas.write().unwrap();
-        let schema = schemas
+        let schema_arc = schemas
             .get_mut(&table_name_lower)
             .ok_or(Error::TableNotFound)?;
 
         // Check if column exists
-        if !schema.has_column(column_name) {
+        if !schema_arc.has_column(column_name) {
             return Err(Error::ColumnNotFound);
         }
 
-        // Modify column in schema
-        schema.modify_column(column_name, Some(data_type), Some(nullable))?;
+        // Modify column in schema (Arc::make_mut clones only if there are other refs)
+        Arc::make_mut(schema_arc).modify_column(column_name, Some(data_type), Some(nullable))?;
 
         // Also update version store schema
         let stores = self.version_stores.read().unwrap();
         if let Some(store) = stores.get(&table_name_lower) {
-            let mut vs_schema = store.schema_mut();
-            vs_schema.modify_column(column_name, Some(data_type), Some(nullable))?;
+            let mut vs_schema_guard = store.schema_mut();
+            Arc::make_mut(&mut *vs_schema_guard).modify_column(
+                column_name,
+                Some(data_type),
+                Some(nullable),
+            )?;
         }
 
         Ok(())
@@ -1479,9 +1507,9 @@ impl MVCCEngine {
         // Update schemas map
         {
             let mut schemas = self.schemas.write().unwrap();
-            if let Some(mut schema) = schemas.remove(&old_name_lower) {
-                schema.table_name = new_name.to_string();
-                schemas.insert(new_name_lower.clone(), schema);
+            if let Some(mut schema_arc) = schemas.remove(&old_name_lower) {
+                Arc::make_mut(&mut schema_arc).table_name = new_name.to_string();
+                schemas.insert(new_name_lower.clone(), schema_arc);
             }
         }
 
@@ -1491,8 +1519,8 @@ impl MVCCEngine {
             if let Some(store) = stores.remove(&old_name_lower) {
                 // Update the schema's table name within the store
                 {
-                    let mut vs_schema = store.schema_mut();
-                    vs_schema.table_name = new_name.to_string();
+                    let mut vs_schema_guard = store.schema_mut();
+                    Arc::make_mut(&mut *vs_schema_guard).table_name = new_name.to_string();
                 }
                 stores.insert(new_name_lower, store);
             }
@@ -1706,8 +1734,9 @@ impl Engine for MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
 
+        let name = to_lowercase_cow(table_name);
         let schemas = self.schemas.read().unwrap();
-        Ok(schemas.contains_key(&table_name.to_lowercase()))
+        Ok(schemas.contains_key(name.as_ref()))
     }
 
     fn index_exists(&self, index_name: &str, table_name: &str) -> Result<bool> {
@@ -1740,14 +1769,15 @@ impl Engine for MVCCEngine {
         )))
     }
 
-    fn get_table_schema(&self, table_name: &str) -> Result<Schema> {
+    fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
 
+        let name = to_lowercase_cow(table_name);
         let schemas = self.schemas.read().unwrap();
         schemas
-            .get(&table_name.to_lowercase())
+            .get(name.as_ref())
             .cloned()
             .ok_or(Error::TableNotFound)
     }
@@ -2430,8 +2460,8 @@ impl Drop for CleanupHandle {
 /// Holds Arc references to shared engine state, allowing safe access
 /// from transactions without raw pointers.
 struct EngineOperations {
-    /// Shared reference to schemas
-    schemas: Arc<RwLock<FxHashMap<String, Schema>>>,
+    /// Shared reference to schemas (each schema is Arc-wrapped to avoid cloning on lookup)
+    schemas: Arc<RwLock<FxHashMap<String, Arc<Schema>>>>,
     /// Shared reference to version stores
     version_stores: Arc<RwLock<FxHashMap<String, Arc<VersionStore>>>>,
     /// Shared reference to registry
@@ -2458,7 +2488,7 @@ impl EngineOperations {
         }
     }
 
-    fn schemas(&self) -> &RwLock<FxHashMap<String, Schema>> {
+    fn schemas(&self) -> &RwLock<FxHashMap<String, Arc<Schema>>> {
         &self.schemas
     }
 
@@ -2537,7 +2567,7 @@ impl TransactionEngineOperations for EngineOperations {
         // Store schema and version store
         {
             let mut schemas = self.schemas().write().unwrap();
-            schemas.insert(table_name.clone(), schema);
+            schemas.insert(table_name.clone(), Arc::new(schema));
         }
         {
             let mut stores = self.version_stores().write().unwrap();
@@ -2596,9 +2626,9 @@ impl TransactionEngineOperations for EngineOperations {
         // Rename in schemas
         {
             let mut schemas = self.schemas().write().unwrap();
-            if let Some(mut schema) = schemas.remove(&old_name_lower) {
-                schema.table_name = new_name.to_string();
-                schemas.insert(new_name_lower.clone(), schema);
+            if let Some(mut schema_arc) = schemas.remove(&old_name_lower) {
+                Arc::make_mut(&mut schema_arc).table_name = new_name.to_string();
+                schemas.insert(new_name_lower.clone(), schema_arc);
             }
         }
 

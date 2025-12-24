@@ -35,7 +35,7 @@ pub struct MVCCScanner {
     column_indices: Vec<usize>,
     /// Table schema (kept for future projection improvements)
     #[allow(dead_code)]
-    schema: Schema,
+    schema: Arc<Schema>,
     /// Filter expression (optional, kept for streaming filter support)
     #[allow(dead_code)]
     filter: Option<Box<dyn Expression>>,
@@ -52,7 +52,7 @@ impl MVCCScanner {
     /// Creates a new MVCC scanner with filtering (legacy method)
     pub fn new(
         rows: Vec<(i64, Row)>,
-        schema: Schema,
+        schema: Arc<Schema>,
         column_indices: Vec<usize>,
         filter: Option<Box<dyn Expression>>,
     ) -> Self {
@@ -73,7 +73,11 @@ impl MVCCScanner {
     /// If column_indices is a proper subset of columns, projects rows upfront
     /// to avoid repeated projection on each row() call.
     #[inline]
-    pub fn from_rows(rows: Vec<(i64, Row)>, schema: Schema, column_indices: Vec<usize>) -> Self {
+    pub fn from_rows(
+        rows: Vec<(i64, Row)>,
+        schema: Arc<Schema>,
+        column_indices: Vec<usize>,
+    ) -> Self {
         let num_schema_cols = schema.columns.len();
 
         // Check if we need projection (column_indices is a proper subset)
@@ -118,7 +122,7 @@ impl MVCCScanner {
 
     /// Creates an empty scanner
     #[inline]
-    pub fn empty(schema: Schema, column_indices: Vec<usize>) -> Self {
+    pub fn empty(schema: Arc<Schema>, column_indices: Vec<usize>) -> Self {
         Self {
             rows: Vec::new(),
             current_index: -1,
@@ -132,7 +136,7 @@ impl MVCCScanner {
     }
 
     /// Creates a scanner with a single row
-    pub fn single(row: Row, schema: Schema, column_indices: Vec<usize>) -> Self {
+    pub fn single(row: Row, schema: Arc<Schema>, column_indices: Vec<usize>) -> Self {
         Self {
             rows: vec![(0, row)],
             current_index: -1,
@@ -261,7 +265,7 @@ pub struct RangeScanner {
     column_indices: Vec<usize>,
     /// Table schema (kept for future projection improvements)
     #[allow(dead_code)]
-    schema: Schema,
+    schema: Arc<Schema>,
     /// Any scanning error
     error: Option<crate::core::Error>,
     /// Pre-allocated projected row buffer (kept for future optimization)
@@ -280,7 +284,7 @@ impl RangeScanner {
         end_id: i64,
         inclusive: bool,
         txn_id: i64,
-        schema: Schema,
+        schema: Arc<Schema>,
         column_indices: Vec<usize>,
         rows: Vec<(i64, Row)>,
     ) -> Self {
@@ -485,7 +489,7 @@ impl LazyMVCCScanner {
     pub fn new(
         version_store: Arc<VersionStore>,
         txn_id: i64,
-        schema: Schema,
+        schema: &Schema,
         column_indices: Vec<usize>,
     ) -> Self {
         // Pre-compute projection check once
@@ -514,7 +518,7 @@ impl LazyMVCCScanner {
     pub fn with_batch_size(
         version_store: Arc<VersionStore>,
         txn_id: i64,
-        schema: Schema,
+        schema: &Schema,
         column_indices: Vec<usize>,
         batch_size: usize,
     ) -> Self {
@@ -639,10 +643,12 @@ mod tests {
     use super::*;
     use crate::core::{DataType, SchemaBuilder, Value};
 
-    fn test_schema() -> Schema {
-        SchemaBuilder::new("test")
-            .column("id", DataType::Integer, false, false)
-            .build()
+    fn test_schema() -> Arc<Schema> {
+        Arc::new(
+            SchemaBuilder::new("test")
+                .column("id", DataType::Integer, false, false)
+                .build(),
+        )
     }
 
     #[test]

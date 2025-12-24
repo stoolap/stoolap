@@ -26,7 +26,9 @@
 //! For Index Nested Loop joins that perform thousands of PK lookups,
 //! this fast-path can provide significant speedups by amortizing less overhead.
 
-use crate::core::{Error, Result, Value};
+use std::sync::Arc;
+
+use crate::core::{Result, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement, SimpleTableSource};
 use crate::storage::traits::{Engine, QueryResult};
 
@@ -35,12 +37,13 @@ use super::result::ExecutorMemoryResult;
 use super::Executor;
 
 /// Information extracted from a simple PK lookup query
-#[derive(Debug)]
 struct PkLookupInfo {
-    /// Table name
+    /// Table name (already lowercased for storage lookups)
     table_name: String,
     /// PK value to look up
     pk_value: i64,
+    /// Cached schema to avoid second lookup
+    schema: Arc<Schema>,
 }
 
 impl Executor {
@@ -90,8 +93,9 @@ impl Executor {
         }
 
         // Extract table name (must be a simple table reference, not a join or subquery)
+        // Lowercase once here to avoid repeated to_lowercase() calls in storage layer
         let table_name = match table_expr.as_ref() {
-            Expression::TableSource(SimpleTableSource { name, .. }) => name.value.clone(),
+            Expression::TableSource(SimpleTableSource { name, .. }) => name.value.to_lowercase(),
             _ => return None, // Join, subquery, or other complex source
         };
 
@@ -137,6 +141,7 @@ impl Executor {
         Some(PkLookupInfo {
             table_name: table_name.to_string(),
             pk_value,
+            schema,
         })
     }
 
@@ -215,15 +220,12 @@ impl Executor {
 
     /// Execute the fast-path PK lookup using Engine::fetch_rows_by_ids
     fn execute_pk_lookup(&self, info: PkLookupInfo) -> Result<Box<dyn QueryResult>> {
-        // Get the table schema for column names
-        let schema = self
-            .engine
-            .get_table_schema(&info.table_name)
-            .map_err(|_| Error::TableNotFoundByName(info.table_name.clone()))?;
-        let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        // Use cached schema for column names (already fetched in extract_pk_lookup_info)
+        let columns: Vec<String> = info.schema.columns.iter().map(|c| c.name.clone()).collect();
 
         // Use engine's fetch_rows_by_ids for direct MVCC lookup
         // This bypasses the full query planner and goes straight to version store
+        // Note: table_name is already lowercased, so storage layer won't call to_lowercase again
         let rows = self
             .engine
             .fetch_rows_by_ids(&info.table_name, &[info.pk_value])?;

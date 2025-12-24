@@ -16,6 +16,8 @@
 //!
 //! This module provides result types for SQL query execution.
 
+use std::sync::Arc;
+
 use crate::core::{Result, Row, Value};
 use crate::parser::ast::Expression;
 use crate::storage::traits::QueryResult;
@@ -105,8 +107,8 @@ impl QueryResult for ExecResult {
 /// This result type stores all rows in memory, suitable for
 /// small to medium result sets.
 pub struct ExecutorMemoryResult {
-    /// Column names
-    columns: Vec<String>,
+    /// Column names (Arc for zero-copy sharing with API layer)
+    columns: Arc<Vec<String>>,
     /// Result rows
     rows: Vec<Row>,
     /// Current row index (None before first next())
@@ -122,6 +124,18 @@ pub struct ExecutorMemoryResult {
 impl ExecutorMemoryResult {
     /// Create a new memory result with columns and rows
     pub fn new(columns: Vec<String>, rows: Vec<Row>) -> Self {
+        Self {
+            columns: Arc::new(columns),
+            rows,
+            current_index: None,
+            closed: false,
+            affected: 0,
+            insert_id: 0,
+        }
+    }
+
+    /// Create a new memory result with Arc columns (zero-copy)
+    pub fn with_arc_columns(columns: Arc<Vec<String>>, rows: Vec<Row>) -> Self {
         Self {
             columns,
             rows,
@@ -186,6 +200,10 @@ impl ExecutorMemoryResult {
 impl QueryResult for ExecutorMemoryResult {
     fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    fn columns_arc(&self) -> Option<Arc<Vec<String>>> {
+        Some(Arc::clone(&self.columns))
     }
 
     fn next(&mut self) -> bool {
@@ -258,8 +276,9 @@ impl QueryResult for ExecutorMemoryResult {
         mut self: Box<Self>,
         aliases: FxHashMap<String, String>,
     ) -> Box<dyn QueryResult> {
-        // Apply aliases to column names
-        for col in &mut self.columns {
+        // Apply aliases to column names (use Arc::make_mut for copy-on-write)
+        let columns = Arc::make_mut(&mut self.columns);
+        for col in columns {
             // Find if this column has an alias (reverse lookup)
             for (alias, original) in &aliases {
                 if col == original {

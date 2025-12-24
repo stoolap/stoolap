@@ -40,8 +40,8 @@ pub struct MVCCTable {
     version_store: Arc<VersionStore>,
     /// Transaction-local version store (shared between multiple MVCCTable instances for same txn+table)
     txn_versions: Arc<RwLock<TransactionVersionStore>>,
-    /// Cached schema for returning references (cloned from version_store)
-    cached_schema: Schema,
+    /// Cached schema for returning references (Arc clone from version_store - O(1) instead of cloning)
+    cached_schema: Arc<Schema>,
 }
 
 impl MVCCTable {
@@ -52,7 +52,8 @@ impl MVCCTable {
         version_store: Arc<VersionStore>,
         txn_versions: TransactionVersionStore,
     ) -> Self {
-        let cached_schema = version_store.schema();
+        // Arc clone - O(1) reference count increment, not full schema clone
+        let cached_schema = Arc::clone(&version_store.schema());
         Self {
             txn_id,
             version_store,
@@ -68,7 +69,8 @@ impl MVCCTable {
         version_store: Arc<VersionStore>,
         txn_versions: Arc<RwLock<TransactionVersionStore>>,
     ) -> Self {
-        let cached_schema = version_store.schema();
+        // Arc clone - O(1) reference count increment, not full schema clone
+        let cached_schema = Arc::clone(&version_store.schema());
         Self {
             txn_id,
             version_store,
@@ -1302,20 +1304,20 @@ impl Table for MVCCTable {
             None, // check_expr
         );
         {
-            let mut schema = self.version_store.schema_mut();
-            schema.add_column(column.clone())?;
+            let mut schema_guard = self.version_store.schema_mut();
+            Arc::make_mut(&mut *schema_guard).add_column(column.clone())?;
         }
-        self.cached_schema.add_column(column)?;
+        Arc::make_mut(&mut self.cached_schema).add_column(column)?;
         Ok(())
     }
 
     fn drop_column(&mut self, name: &str) -> Result<()> {
         // Remove column from both version store and cached schema
         {
-            let mut schema = self.version_store.schema_mut();
-            schema.remove_column(name)?;
+            let mut schema_guard = self.version_store.schema_mut();
+            Arc::make_mut(&mut *schema_guard).remove_column(name)?;
         }
-        self.cached_schema.remove_column(name)?;
+        Arc::make_mut(&mut self.cached_schema).remove_column(name)?;
         Ok(())
     }
 
@@ -1746,9 +1748,8 @@ impl Table for MVCCTable {
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
-        // NOTE: Scanner needs to own the schema because it may outlive the table reference.
-        // This clone is necessary for the current design.
-        let schema = self.cached_schema.clone();
+        // Arc clone - O(1) reference count increment instead of full Schema clone
+        let schema = Arc::clone(&self.cached_schema);
 
         // Fast path: Check if this is a primary key equality lookup (WHERE id = X)
         if let Some(expr) = where_expr {
@@ -1808,7 +1809,7 @@ impl Table for MVCCTable {
             let scanner = LazyMVCCScanner::new(
                 Arc::clone(&self.version_store),
                 self.txn_id,
-                schema,
+                &schema,
                 column_indices.to_vec(),
             );
             return Ok(Box::new(scanner));

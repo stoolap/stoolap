@@ -229,8 +229,8 @@ pub struct VersionStore {
     versions: OrderedInt64Map<VersionChainEntry>,
     /// The name of the table this store belongs to
     table_name: String,
-    /// Table schema
-    schema: RwLock<Schema>,
+    /// Table schema (Arc for zero-cost cloning on read)
+    schema: RwLock<Arc<Schema>>,
     /// Indexes on this table (FxHashMap for fast string key lookups)
     indexes: RwLock<FxHashMap<String, Arc<dyn Index>>>,
     /// Whether this store has been closed
@@ -278,7 +278,7 @@ impl VersionStore {
         Self {
             versions,
             table_name,
-            schema: RwLock::new(schema),
+            schema: RwLock::new(Arc::new(schema)),
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
@@ -309,13 +309,14 @@ impl VersionStore {
         &self.table_name
     }
 
-    /// Returns a reference to the schema
-    pub fn schema(&self) -> Schema {
-        self.schema.read().clone()
+    /// Returns the schema (cheap Arc clone)
+    pub fn schema(&self) -> Arc<Schema> {
+        Arc::clone(&*self.schema.read())
     }
 
     /// Returns a mutable reference to the schema (for modifications)
-    pub fn schema_mut(&self) -> parking_lot::RwLockWriteGuard<'_, Schema> {
+    /// Callers must use Arc::make_mut() to get &mut Schema
+    pub fn schema_mut(&self) -> parking_lot::RwLockWriteGuard<'_, Arc<Schema>> {
         self.schema.write()
     }
 
