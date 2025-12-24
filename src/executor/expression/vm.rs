@@ -352,7 +352,14 @@ impl ExprVM {
                 Op::Lt => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = self.compare_values(&a, &b, std::cmp::Ordering::Less);
+                    // Fast path for integer/float comparisons
+                    let result = match (&a, &b) {
+                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x < *y),
+                        (Value::Float(x), Value::Float(y)) => Value::Boolean(*x < *y),
+                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) < *y),
+                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x < (*y as f64)),
+                        _ => self.compare_values(&a, &b, std::cmp::Ordering::Less),
+                    };
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -360,12 +367,19 @@ impl ExprVM {
                 Op::Le => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match a.partial_cmp(&b) {
-                        Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
-                            Value::Boolean(true)
-                        }
-                        Some(std::cmp::Ordering::Greater) => Value::Boolean(false),
-                        None => Value::Null(DataType::Boolean),
+                    // Fast path for integer/float comparisons
+                    let result = match (&a, &b) {
+                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x <= *y),
+                        (Value::Float(x), Value::Float(y)) => Value::Boolean(*x <= *y),
+                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) <= *y),
+                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x <= (*y as f64)),
+                        _ => match a.partial_cmp(&b) {
+                            Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
+                                Value::Boolean(true)
+                            }
+                            Some(std::cmp::Ordering::Greater) => Value::Boolean(false),
+                            None => Value::Null(DataType::Boolean),
+                        },
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -374,7 +388,14 @@ impl ExprVM {
                 Op::Gt => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = self.compare_values(&a, &b, std::cmp::Ordering::Greater);
+                    // Fast path for integer/float comparisons
+                    let result = match (&a, &b) {
+                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x > *y),
+                        (Value::Float(x), Value::Float(y)) => Value::Boolean(*x > *y),
+                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) > *y),
+                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x > (*y as f64)),
+                        _ => self.compare_values(&a, &b, std::cmp::Ordering::Greater),
+                    };
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -382,12 +403,19 @@ impl ExprVM {
                 Op::Ge => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match a.partial_cmp(&b) {
-                        Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
-                            Value::Boolean(true)
-                        }
-                        Some(std::cmp::Ordering::Less) => Value::Boolean(false),
-                        None => Value::Null(DataType::Boolean),
+                    // Fast path for integer/float comparisons
+                    let result = match (&a, &b) {
+                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x >= *y),
+                        (Value::Float(x), Value::Float(y)) => Value::Boolean(*x >= *y),
+                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) >= *y),
+                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x >= (*y as f64)),
+                        _ => match a.partial_cmp(&b) {
+                            Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
+                                Value::Boolean(true)
+                            }
+                            Some(std::cmp::Ordering::Less) => Value::Boolean(false),
+                            None => Value::Null(DataType::Boolean),
+                        },
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -442,10 +470,17 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    let result = if col_val.is_null() || val.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(col_val == val)
+                    // Fast path for integer/float comparisons
+                    let result = match val {
+                        Value::Integer(v) => Self::eq_int(col_val, *v),
+                        Value::Float(v) => Self::eq_float(col_val, *v),
+                        _ => {
+                            if col_val.is_null() || val.is_null() {
+                                Value::Null(DataType::Boolean)
+                            } else {
+                                Value::Boolean(col_val == val)
+                            }
+                        }
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -456,10 +491,17 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    let result = if col_val.is_null() || val.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(col_val != val)
+                    // Fast path for integer/float comparisons
+                    let result = match val {
+                        Value::Integer(v) => Self::ne_int(col_val, *v),
+                        Value::Float(v) => Self::ne_float(col_val, *v),
+                        _ => {
+                            if col_val.is_null() || val.is_null() {
+                                Value::Null(DataType::Boolean)
+                            } else {
+                                Value::Boolean(col_val != val)
+                            }
+                        }
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -470,7 +512,12 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    let result = self.compare_values(col_val, val, std::cmp::Ordering::Less);
+                    // Fast path for integer/float comparisons
+                    let result = match val {
+                        Value::Integer(threshold) => Self::lt_int(col_val, *threshold),
+                        Value::Float(threshold) => Self::lt_float(col_val, *threshold),
+                        _ => self.compare_values(col_val, val, std::cmp::Ordering::Less),
+                    };
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -480,12 +527,17 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    let result = match col_val.partial_cmp(val) {
-                        Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
-                            Value::Boolean(true)
-                        }
-                        Some(std::cmp::Ordering::Greater) => Value::Boolean(false),
-                        None => Value::Null(DataType::Boolean),
+                    // Fast path for integer/float comparisons
+                    let result = match val {
+                        Value::Integer(threshold) => Self::le_int(col_val, *threshold),
+                        Value::Float(threshold) => Self::le_float(col_val, *threshold),
+                        _ => match col_val.partial_cmp(val) {
+                            Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
+                                Value::Boolean(true)
+                            }
+                            Some(std::cmp::Ordering::Greater) => Value::Boolean(false),
+                            None => Value::Null(DataType::Boolean),
+                        },
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -496,7 +548,12 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    let result = self.compare_values(col_val, val, std::cmp::Ordering::Greater);
+                    // Fast path for integer/float comparisons
+                    let result = match val {
+                        Value::Integer(threshold) => Self::gt_int(col_val, *threshold),
+                        Value::Float(threshold) => Self::gt_float(col_val, *threshold),
+                        _ => self.compare_values(col_val, val, std::cmp::Ordering::Greater),
+                    };
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -506,12 +563,17 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    let result = match col_val.partial_cmp(val) {
-                        Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
-                            Value::Boolean(true)
-                        }
-                        Some(std::cmp::Ordering::Less) => Value::Boolean(false),
-                        None => Value::Null(DataType::Boolean),
+                    // Fast path for integer/float comparisons
+                    let result = match val {
+                        Value::Integer(threshold) => Self::ge_int(col_val, *threshold),
+                        Value::Float(threshold) => Self::ge_float(col_val, *threshold),
+                        _ => match col_val.partial_cmp(val) {
+                            Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
+                                Value::Boolean(true)
+                            }
+                            Some(std::cmp::Ordering::Less) => Value::Boolean(false),
+                            None => Value::Null(DataType::Boolean),
+                        },
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -572,10 +634,24 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    let result = if col_val.is_null() || low.is_null() || high.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(col_val >= low && col_val <= high)
+                    // Fast path for integer/float BETWEEN
+                    let result = match (low, high) {
+                        (Value::Integer(lo), Value::Integer(hi)) => {
+                            Self::between_int(col_val, *lo, *hi)
+                        }
+                        (Value::Float(lo), Value::Float(hi)) => {
+                            Self::between_float(col_val, *lo, *hi)
+                        }
+                        (Value::Integer(lo), Value::Float(hi)) => {
+                            Self::between_float(col_val, *lo as f64, *hi)
+                        }
+                        (Value::Float(lo), Value::Integer(hi)) => {
+                            Self::between_float(col_val, *lo, *hi as f64)
+                        }
+                        _ if col_val.is_null() || low.is_null() || high.is_null() => {
+                            Value::Null(DataType::Boolean)
+                        }
+                        _ => Value::Boolean(col_val >= low && col_val <= high),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -761,12 +837,16 @@ impl ExprVM {
                 }
 
                 // =============================================================
-                // BITWISE OPERATIONS
+                // BITWISE OPERATIONS (inlined for performance)
                 // =============================================================
                 Op::BitAnd => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = Self::bitwise_op(&a, &b, |x, y| x & y);
+                    let result = match (&a, &b) {
+                        (Value::Integer(x), Value::Integer(y)) => Value::Integer(x & y),
+                        _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
+                        _ => Value::Null(DataType::Null),
+                    };
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -774,7 +854,11 @@ impl ExprVM {
                 Op::BitOr => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = Self::bitwise_op(&a, &b, |x, y| x | y);
+                    let result = match (&a, &b) {
+                        (Value::Integer(x), Value::Integer(y)) => Value::Integer(x | y),
+                        _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
+                        _ => Value::Null(DataType::Null),
+                    };
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -782,7 +866,11 @@ impl ExprVM {
                 Op::BitXor => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = Self::bitwise_op(&a, &b, |x, y| x ^ y);
+                    let result = match (&a, &b) {
+                        (Value::Integer(x), Value::Integer(y)) => Value::Integer(x ^ y),
+                        _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
+                        _ => Value::Null(DataType::Null),
+                    };
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -835,17 +923,39 @@ impl ExprVM {
                     let result = if a.is_null() || b.is_null() {
                         Value::Null(DataType::Text)
                     } else {
-                        // Convert values to strings for concatenation
-                        let a_str = match &a {
-                            Value::Text(s) => s.to_string(),
-                            _ => format!("{}", a),
-                        };
-                        let b_str = match &b {
-                            Value::Text(s) => s.to_string(),
-                            _ => format!("{}", b),
-                        };
-                        let s = format!("{}{}", a_str, b_str);
-                        Value::Text(CompactString::from(s.as_str()))
+                        // Fast path: both are Text - avoid intermediate allocations
+                        match (&a, &b) {
+                            (Value::Text(a_str), Value::Text(b_str)) => {
+                                // Pre-allocate with exact capacity
+                                let mut s = String::with_capacity(a_str.len() + b_str.len());
+                                s.push_str(a_str);
+                                s.push_str(b_str);
+                                Value::Text(CompactString::from(s.as_str()))
+                            }
+                            (Value::Text(a_str), _) => {
+                                // a is Text, b needs conversion
+                                use std::fmt::Write;
+                                let mut s = String::with_capacity(a_str.len() + 32);
+                                s.push_str(a_str);
+                                let _ = write!(s, "{}", b);
+                                Value::Text(CompactString::from(s.as_str()))
+                            }
+                            (_, Value::Text(b_str)) => {
+                                // a needs conversion, b is Text
+                                use std::fmt::Write;
+                                let mut s = String::with_capacity(32 + b_str.len());
+                                let _ = write!(s, "{}", a);
+                                s.push_str(b_str);
+                                Value::Text(CompactString::from(s.as_str()))
+                            }
+                            _ => {
+                                // Both need conversion - rare case
+                                use std::fmt::Write;
+                                let mut s = String::with_capacity(64);
+                                let _ = write!(s, "{}{}", a, b);
+                                Value::Text(CompactString::from(s.as_str()))
+                            }
+                        }
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -1017,10 +1127,36 @@ impl ExprVM {
                     let low = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let val = self.stack.pop().unwrap_or_else(Value::null_unknown);
 
-                    let result = if val.is_null() || low.is_null() || high.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(val >= low && val <= high)
+                    // Fast path for integer/float comparisons
+                    let result = match (&val, &low, &high) {
+                        (Value::Integer(v), Value::Integer(lo), Value::Integer(hi)) => {
+                            Value::Boolean(*v >= *lo && *v <= *hi)
+                        }
+                        (Value::Float(v), Value::Float(lo), Value::Float(hi)) => {
+                            Value::Boolean(*v >= *lo && *v <= *hi)
+                        }
+                        (Value::Integer(v), Value::Integer(lo), Value::Float(hi)) => {
+                            Value::Boolean((*v as f64) >= (*lo as f64) && (*v as f64) <= *hi)
+                        }
+                        (Value::Integer(v), Value::Float(lo), Value::Integer(hi)) => {
+                            Value::Boolean((*v as f64) >= *lo && (*v as f64) <= (*hi as f64))
+                        }
+                        (Value::Float(v), Value::Integer(lo), Value::Integer(hi)) => {
+                            Value::Boolean(*v >= (*lo as f64) && *v <= (*hi as f64))
+                        }
+                        (Value::Float(v), Value::Integer(lo), Value::Float(hi)) => {
+                            Value::Boolean(*v >= (*lo as f64) && *v <= *hi)
+                        }
+                        (Value::Float(v), Value::Float(lo), Value::Integer(hi)) => {
+                            Value::Boolean(*v >= *lo && *v <= (*hi as f64))
+                        }
+                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => {
+                            Value::Boolean((*v as f64) >= *lo && (*v as f64) <= *hi)
+                        }
+                        _ if val.is_null() || low.is_null() || high.is_null() => {
+                            Value::Null(DataType::Boolean)
+                        }
+                        _ => Value::Boolean(val >= low && val <= high),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -1031,10 +1167,36 @@ impl ExprVM {
                     let low = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let val = self.stack.pop().unwrap_or_else(Value::null_unknown);
 
-                    let result = if val.is_null() || low.is_null() || high.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(val < low || val > high)
+                    // Fast path for integer/float comparisons
+                    let result = match (&val, &low, &high) {
+                        (Value::Integer(v), Value::Integer(lo), Value::Integer(hi)) => {
+                            Value::Boolean(*v < *lo || *v > *hi)
+                        }
+                        (Value::Float(v), Value::Float(lo), Value::Float(hi)) => {
+                            Value::Boolean(*v < *lo || *v > *hi)
+                        }
+                        (Value::Integer(v), Value::Integer(lo), Value::Float(hi)) => {
+                            Value::Boolean((*v as f64) < (*lo as f64) || (*v as f64) > *hi)
+                        }
+                        (Value::Integer(v), Value::Float(lo), Value::Integer(hi)) => {
+                            Value::Boolean((*v as f64) < *lo || (*v as f64) > (*hi as f64))
+                        }
+                        (Value::Float(v), Value::Integer(lo), Value::Integer(hi)) => {
+                            Value::Boolean(*v < (*lo as f64) || *v > (*hi as f64))
+                        }
+                        (Value::Float(v), Value::Integer(lo), Value::Float(hi)) => {
+                            Value::Boolean(*v < (*lo as f64) || *v > *hi)
+                        }
+                        (Value::Float(v), Value::Float(lo), Value::Integer(hi)) => {
+                            Value::Boolean(*v < *lo || *v > (*hi as f64))
+                        }
+                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => {
+                            Value::Boolean((*v as f64) < *lo || (*v as f64) > *hi)
+                        }
+                        _ if val.is_null() || low.is_null() || high.is_null() => {
+                            Value::Null(DataType::Boolean)
+                        }
+                        _ => Value::Boolean(val < low || val > high),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -1143,15 +1305,23 @@ impl ExprVM {
                     let n = *n as usize;
                     let start = self.stack.len().saturating_sub(n);
 
-                    // Reuse args_buffer to avoid allocation
-                    self.args_buffer.clear();
-                    self.args_buffer.extend(self.stack.drain(start..));
+                    // Find first non-null using slice iteration (no intermediate buffer)
+                    let result_idx = self.stack[start..]
+                        .iter()
+                        .position(|v| !v.is_null())
+                        .map(|i| start + i);
 
-                    let result = self
-                        .args_buffer
-                        .drain(..)
-                        .find(|v| !v.is_null())
-                        .unwrap_or_else(Value::null_unknown);
+                    let result = if let Some(idx) = result_idx {
+                        // Swap the result to end, pop it, then truncate the rest
+                        let last = self.stack.len() - 1;
+                        self.stack.swap(idx, last);
+                        let result = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                        self.stack.truncate(start);
+                        result
+                    } else {
+                        self.stack.truncate(start);
+                        Value::null_unknown()
+                    };
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -1168,16 +1338,32 @@ impl ExprVM {
                     let n = *n as usize;
                     let start = self.stack.len().saturating_sub(n);
 
-                    // Reuse args_buffer to avoid allocation
-                    self.args_buffer.clear();
-                    self.args_buffer.extend(self.stack.drain(start..));
+                    // Find max using slice iteration (no intermediate buffer)
+                    let mut max_idx: Option<usize> = None;
+                    for (i, v) in self.stack[start..].iter().enumerate() {
+                        if !v.is_null() {
+                            match max_idx {
+                                None => max_idx = Some(start + i),
+                                Some(mi) => {
+                                    if v > &self.stack[mi] {
+                                        max_idx = Some(start + i);
+                                    }
+                                }
+                            }
+                        }
+                    }
 
-                    let result = self
-                        .args_buffer
-                        .drain(..)
-                        .filter(|v| !v.is_null())
-                        .max()
-                        .unwrap_or_else(Value::null_unknown);
+                    let result = if let Some(idx) = max_idx {
+                        // Swap the result to end, pop it, then truncate the rest
+                        let last = self.stack.len() - 1;
+                        self.stack.swap(idx, last);
+                        let result = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                        self.stack.truncate(start);
+                        result
+                    } else {
+                        self.stack.truncate(start);
+                        Value::null_unknown()
+                    };
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -1186,16 +1372,32 @@ impl ExprVM {
                     let n = *n as usize;
                     let start = self.stack.len().saturating_sub(n);
 
-                    // Reuse args_buffer to avoid allocation
-                    self.args_buffer.clear();
-                    self.args_buffer.extend(self.stack.drain(start..));
+                    // Find min using slice iteration (no intermediate buffer)
+                    let mut min_idx: Option<usize> = None;
+                    for (i, v) in self.stack[start..].iter().enumerate() {
+                        if !v.is_null() {
+                            match min_idx {
+                                None => min_idx = Some(start + i),
+                                Some(mi) => {
+                                    if v < &self.stack[mi] {
+                                        min_idx = Some(start + i);
+                                    }
+                                }
+                            }
+                        }
+                    }
 
-                    let result = self
-                        .args_buffer
-                        .drain(..)
-                        .filter(|v| !v.is_null())
-                        .min()
-                        .unwrap_or_else(Value::null_unknown);
+                    let result = if let Some(idx) = min_idx {
+                        // Swap the result to end, pop it, then truncate the rest
+                        let last = self.stack.len() - 1;
+                        self.stack.swap(idx, last);
+                        let result = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                        self.stack.truncate(start);
+                        result
+                    } else {
+                        self.stack.truncate(start);
+                        Value::null_unknown()
+                    };
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -1297,15 +1499,12 @@ impl ExprVM {
 
                 Op::CaseCompare => {
                     let when_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let case_val = self
-                        .stack
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(Value::null_unknown);
-                    let result = if case_val.is_null() || when_val.is_null() {
-                        Value::Boolean(false)
-                    } else {
-                        Value::Boolean(case_val == when_val)
+                    // Use reference to avoid clone - case_val stays on stack for next comparison
+                    let result = match self.stack.last() {
+                        Some(case_val) if !case_val.is_null() && !when_val.is_null() => {
+                            Value::Boolean(case_val == &when_val)
+                        }
+                        _ => Value::Boolean(false),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -1494,13 +1693,322 @@ impl ExprVM {
     }
 
     /// Execute and return boolean result (for WHERE clauses)
+    ///
+    /// This method is optimized for common filter patterns, avoiding
+    /// the full VM loop overhead for simple comparisons.
     #[inline]
     pub fn execute_bool(&mut self, program: &Program, ctx: &ExecuteContext) -> bool {
+        let ops = program.ops();
+
+        // Fast path: Single comparison + Return (most common filter)
+        // Pattern: [GtColumnConst(idx, val), Return]
+        if ops.len() == 2 {
+            if let Op::Return = &ops[1] {
+                return Self::eval_single_op_bool(&ops[0], ctx);
+            }
+        }
+
+        // Fast path: Two comparisons with AND (range filter)
+        // Pattern: [Compare1, And(_), Compare2, AndFinalize, Return]
+        if ops.len() == 5 {
+            if let (Op::And(_), Op::AndFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
+                let a = Self::eval_single_op_tribool(&ops[0], ctx);
+                // Short-circuit: if first is false, result is false
+                if a == Some(false) {
+                    return false;
+                }
+                let b = Self::eval_single_op_tribool(&ops[2], ctx);
+                // AND logic: true && true = true, anything else = false (for boolean result)
+                return a == Some(true) && b == Some(true);
+            }
+            // Pattern: [Compare1, Or(_), Compare2, OrFinalize, Return]
+            if let (Op::Or(_), Op::OrFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
+                let a = Self::eval_single_op_tribool(&ops[0], ctx);
+                // Short-circuit: if first is true, result is true
+                if a == Some(true) {
+                    return true;
+                }
+                let b = Self::eval_single_op_tribool(&ops[2], ctx);
+                // OR logic: true || anything = true, false || true = true
+                return a == Some(true) || b == Some(true);
+            }
+        }
+
+        // General path: full VM execution
         match self.execute(program, ctx) {
             Ok(Value::Boolean(b)) => b,
             Ok(Value::Integer(i)) => i != 0,
             Ok(Value::Null(_)) => false,
             _ => false,
+        }
+    }
+
+    /// Evaluate a single comparison op and return bool (for fast path)
+    #[inline]
+    fn eval_single_op_bool(op: &Op, ctx: &ExecuteContext) -> bool {
+        match op {
+            Op::GtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => *v > *threshold,
+                Some(Value::Float(v)) => *v > *threshold as f64,
+                _ => false,
+            },
+            Op::GtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => *v > *threshold,
+                Some(Value::Integer(v)) => (*v as f64) > *threshold,
+                _ => false,
+            },
+            Op::LtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => *v < *threshold,
+                Some(Value::Float(v)) => *v < *threshold as f64,
+                _ => false,
+            },
+            Op::LtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => *v < *threshold,
+                Some(Value::Integer(v)) => (*v as f64) < *threshold,
+                _ => false,
+            },
+            Op::GeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => *v >= *threshold,
+                Some(Value::Float(v)) => *v >= *threshold as f64,
+                _ => false,
+            },
+            Op::GeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => *v >= *threshold,
+                Some(Value::Integer(v)) => (*v as f64) >= *threshold,
+                _ => false,
+            },
+            Op::LeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => *v <= *threshold,
+                Some(Value::Float(v)) => *v <= *threshold as f64,
+                _ => false,
+            },
+            Op::LeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => *v <= *threshold,
+                Some(Value::Integer(v)) => (*v as f64) <= *threshold,
+                _ => false,
+            },
+            Op::EqColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => *v == *val,
+                Some(Value::Float(v)) => *v == *val as f64,
+                _ => false,
+            },
+            Op::EqColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => *v == *val,
+                Some(Value::Integer(v)) => (*v as f64) == *val,
+                _ => false,
+            },
+            Op::NeColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => *v != *val,
+                Some(Value::Float(v)) => *v != *val as f64,
+                Some(Value::Null(_)) => false,
+                _ => true,
+            },
+            Op::NeColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => *v != *val,
+                Some(Value::Integer(v)) => (*v as f64) != *val,
+                Some(Value::Null(_)) => false,
+                _ => true,
+            },
+            Op::IsNullColumn(idx) => ctx.row.get(*idx as usize).is_some_and(|v| v.is_null()),
+            Op::IsNotNullColumn(idx) => ctx.row.get(*idx as usize).is_some_and(|v| !v.is_null()),
+            Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Integer(hi)) => {
+                match ctx.row.get(*idx as usize) {
+                    Some(Value::Integer(v)) => *v >= *lo && *v <= *hi,
+                    Some(Value::Float(v)) => *v >= *lo as f64 && *v <= *hi as f64,
+                    _ => false,
+                }
+            }
+            Op::BetweenColumnConst(idx, Value::Float(lo), Value::Float(hi)) => {
+                match ctx.row.get(*idx as usize) {
+                    Some(Value::Float(v)) => *v >= *lo && *v <= *hi,
+                    Some(Value::Integer(v)) => (*v as f64) >= *lo && (*v as f64) <= *hi,
+                    _ => false,
+                }
+            }
+            Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Float(hi)) => {
+                match ctx.row.get(*idx as usize) {
+                    Some(Value::Float(v)) => *v >= *lo as f64 && *v <= *hi,
+                    Some(Value::Integer(v)) => (*v as f64) >= *lo as f64 && (*v as f64) <= *hi,
+                    _ => false,
+                }
+            }
+            Op::BetweenColumnConst(idx, Value::Float(lo), Value::Integer(hi)) => {
+                match ctx.row.get(*idx as usize) {
+                    Some(Value::Float(v)) => *v >= *lo && *v <= *hi as f64,
+                    Some(Value::Integer(v)) => (*v as f64) >= *lo && (*v as f64) <= *hi as f64,
+                    _ => false,
+                }
+            }
+            Op::InSetColumn(idx, set, has_null) => {
+                match ctx.row.get(*idx as usize) {
+                    Some(v) if v.is_null() => false, // NULL IN set -> NULL -> false in bool context
+                    Some(v) if set.contains(v) => true,
+                    Some(_) if *has_null => false, // val not in set, but set has NULL -> NULL -> false
+                    Some(_) => false,
+                    None => false,
+                }
+            }
+            // Handle LIKE pattern matching (e.g., fruit LIKE 'a%')
+            Op::LikeColumn(idx, pattern, case_insensitive) => {
+                match ctx.row.get(*idx as usize) {
+                    Some(Value::Text(s)) => pattern.matches(s, *case_insensitive),
+                    _ => false, // NULL or non-text -> false
+                }
+            }
+            // For other ops, fall back to tribool and convert
+            _ => Self::eval_single_op_tribool(op, ctx) == Some(true),
+        }
+    }
+
+    /// Evaluate a single comparison op and return Option<bool> (tribool)
+    /// None = NULL, Some(true) = true, Some(false) = false
+    #[inline]
+    fn eval_single_op_tribool(op: &Op, ctx: &ExecuteContext) -> Option<bool> {
+        match op {
+            Op::GtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => Some(*v > *threshold),
+                Some(Value::Float(v)) => Some(*v > *threshold as f64),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            Op::GtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => Some(*v > *threshold),
+                Some(Value::Integer(v)) => Some((*v as f64) > *threshold),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            Op::LtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => Some(*v < *threshold),
+                Some(Value::Float(v)) => Some(*v < *threshold as f64),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            Op::LtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => Some(*v < *threshold),
+                Some(Value::Integer(v)) => Some((*v as f64) < *threshold),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            Op::GeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => Some(*v >= *threshold),
+                Some(Value::Float(v)) => Some(*v >= *threshold as f64),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            Op::GeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => Some(*v >= *threshold),
+                Some(Value::Integer(v)) => Some((*v as f64) >= *threshold),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            Op::LeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => Some(*v <= *threshold),
+                Some(Value::Float(v)) => Some(*v <= *threshold as f64),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            Op::LeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => Some(*v <= *threshold),
+                Some(Value::Integer(v)) => Some((*v as f64) <= *threshold),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            Op::EqColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => Some(*v == *val),
+                Some(Value::Float(v)) => Some(*v == *val as f64),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            Op::EqColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => Some(*v == *val),
+                Some(Value::Integer(v)) => Some((*v as f64) == *val),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            Op::NeColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Integer(v)) => Some(*v != *val),
+                Some(Value::Float(v)) => Some(*v != *val as f64),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(true),
+            },
+            Op::NeColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Float(v)) => Some(*v != *val),
+                Some(Value::Integer(v)) => Some((*v as f64) != *val),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(true),
+            },
+            Op::IsNullColumn(idx) => Some(ctx.row.get(*idx as usize).is_some_and(|v| v.is_null())),
+            Op::IsNotNullColumn(idx) => {
+                Some(ctx.row.get(*idx as usize).is_some_and(|v| !v.is_null()))
+            }
+            Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Integer(hi)) => {
+                match ctx.row.get(*idx as usize) {
+                    Some(Value::Integer(v)) => Some(*v >= *lo && *v <= *hi),
+                    Some(Value::Float(v)) => Some(*v >= *lo as f64 && *v <= *hi as f64),
+                    Some(Value::Null(_)) | None => None,
+                    _ => Some(false),
+                }
+            }
+            Op::BetweenColumnConst(idx, Value::Float(lo), Value::Float(hi)) => {
+                match ctx.row.get(*idx as usize) {
+                    Some(Value::Float(v)) => Some(*v >= *lo && *v <= *hi),
+                    Some(Value::Integer(v)) => Some((*v as f64) >= *lo && (*v as f64) <= *hi),
+                    Some(Value::Null(_)) | None => None,
+                    _ => Some(false),
+                }
+            }
+            Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Float(hi)) => {
+                match ctx.row.get(*idx as usize) {
+                    Some(Value::Float(v)) => Some(*v >= *lo as f64 && *v <= *hi),
+                    Some(Value::Integer(v)) => {
+                        Some((*v as f64) >= *lo as f64 && (*v as f64) <= *hi)
+                    }
+                    Some(Value::Null(_)) | None => None,
+                    _ => Some(false),
+                }
+            }
+            Op::BetweenColumnConst(idx, Value::Float(lo), Value::Integer(hi)) => {
+                match ctx.row.get(*idx as usize) {
+                    Some(Value::Float(v)) => Some(*v >= *lo && *v <= *hi as f64),
+                    Some(Value::Integer(v)) => {
+                        Some((*v as f64) >= *lo && (*v as f64) <= *hi as f64)
+                    }
+                    Some(Value::Null(_)) | None => None,
+                    _ => Some(false),
+                }
+            }
+            Op::InSetColumn(idx, set, has_null) => {
+                match ctx.row.get(*idx as usize) {
+                    Some(v) if v.is_null() => None, // NULL IN set -> NULL
+                    Some(v) if set.contains(v) => Some(true),
+                    Some(_) if *has_null => None, // val not in set, but set has NULL -> NULL
+                    Some(_) => Some(false),
+                    None => None,
+                }
+            }
+            // Handle boolean constants (from processed subqueries like NOT EXISTS)
+            Op::LoadConst(Value::Boolean(b)) => Some(*b),
+            Op::LoadConst(Value::Integer(i)) => Some(*i != 0),
+            Op::LoadConst(Value::Null(_)) => None,
+            // Handle text comparisons (e.g., country = 'USA')
+            Op::EqColumnConst(idx, Value::Text(val)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Text(v)) => Some(v == val),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            Op::NeColumnConst(idx, Value::Text(val)) => match ctx.row.get(*idx as usize) {
+                Some(Value::Text(v)) => Some(v != val),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(true),
+            },
+            // Handle LIKE pattern matching (e.g., fruit LIKE 'a%')
+            Op::LikeColumn(idx, pattern, case_insensitive) => match ctx.row.get(*idx as usize) {
+                Some(Value::Text(s)) => Some(pattern.matches(s, *case_insensitive)),
+                Some(Value::Null(_)) | None => None,
+                _ => Some(false),
+            },
+            // For other comparisons, return None to fall back to full VM
+            _ => None,
         }
     }
 
@@ -1534,6 +2042,166 @@ impl ExprVM {
             Some(ord) if ord == expected => Value::Boolean(true),
             Some(_) => Value::Boolean(false),
             None => Value::Null(DataType::Boolean),
+        }
+    }
+
+    // =========================================================================
+    // INLINE COMPARISON HELPERS
+    // These avoid the overhead of partial_cmp → compare → compare_same_type
+    // for the common case of integer/float column vs constant comparisons.
+    // =========================================================================
+
+    /// Inline greater-than comparison for integer constant
+    #[inline(always)]
+    fn gt_int(col_val: &Value, threshold: i64) -> Value {
+        match col_val {
+            Value::Integer(v) => Value::Boolean(*v > threshold),
+            Value::Float(v) => Value::Boolean(*v > threshold as f64),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// Inline greater-than comparison for float constant
+    #[inline(always)]
+    fn gt_float(col_val: &Value, threshold: f64) -> Value {
+        match col_val {
+            Value::Float(v) => Value::Boolean(*v > threshold),
+            Value::Integer(v) => Value::Boolean((*v as f64) > threshold),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// Inline less-than comparison for integer constant
+    #[inline(always)]
+    fn lt_int(col_val: &Value, threshold: i64) -> Value {
+        match col_val {
+            Value::Integer(v) => Value::Boolean(*v < threshold),
+            Value::Float(v) => Value::Boolean(*v < (threshold as f64)),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// Inline less-than comparison for float constant
+    #[inline(always)]
+    fn lt_float(col_val: &Value, threshold: f64) -> Value {
+        match col_val {
+            Value::Float(v) => Value::Boolean(*v < threshold),
+            Value::Integer(v) => Value::Boolean((*v as f64) < threshold),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// Inline greater-or-equal comparison for integer constant
+    #[inline(always)]
+    fn ge_int(col_val: &Value, threshold: i64) -> Value {
+        match col_val {
+            Value::Integer(v) => Value::Boolean(*v >= threshold),
+            Value::Float(v) => Value::Boolean(*v >= threshold as f64),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// Inline greater-or-equal comparison for float constant
+    #[inline(always)]
+    fn ge_float(col_val: &Value, threshold: f64) -> Value {
+        match col_val {
+            Value::Float(v) => Value::Boolean(*v >= threshold),
+            Value::Integer(v) => Value::Boolean((*v as f64) >= threshold),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// Inline less-or-equal comparison for integer constant
+    #[inline(always)]
+    fn le_int(col_val: &Value, threshold: i64) -> Value {
+        match col_val {
+            Value::Integer(v) => Value::Boolean(*v <= threshold),
+            Value::Float(v) => Value::Boolean(*v <= threshold as f64),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// Inline less-or-equal comparison for float constant
+    #[inline(always)]
+    fn le_float(col_val: &Value, threshold: f64) -> Value {
+        match col_val {
+            Value::Float(v) => Value::Boolean(*v <= threshold),
+            Value::Integer(v) => Value::Boolean((*v as f64) <= threshold),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// Inline equality comparison for integer constant
+    #[inline(always)]
+    fn eq_int(col_val: &Value, val: i64) -> Value {
+        match col_val {
+            Value::Integer(v) => Value::Boolean(*v == val),
+            Value::Float(v) => Value::Boolean(*v == val as f64),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// Inline equality comparison for float constant
+    #[inline(always)]
+    fn eq_float(col_val: &Value, val: f64) -> Value {
+        match col_val {
+            Value::Float(v) => Value::Boolean(*v == val),
+            Value::Integer(v) => Value::Boolean((*v as f64) == val),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// Inline not-equal comparison for integer constant
+    #[inline(always)]
+    fn ne_int(col_val: &Value, val: i64) -> Value {
+        match col_val {
+            Value::Integer(v) => Value::Boolean(*v != val),
+            Value::Float(v) => Value::Boolean(*v != val as f64),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(true),
+        }
+    }
+
+    /// Inline not-equal comparison for float constant
+    #[inline(always)]
+    fn ne_float(col_val: &Value, val: f64) -> Value {
+        match col_val {
+            Value::Float(v) => Value::Boolean(*v != val),
+            Value::Integer(v) => Value::Boolean((*v as f64) != val),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(true),
+        }
+    }
+
+    /// Inline BETWEEN check for integer bounds
+    #[inline(always)]
+    fn between_int(col_val: &Value, low: i64, high: i64) -> Value {
+        match col_val {
+            Value::Integer(v) => Value::Boolean(*v >= low && *v <= high),
+            Value::Float(v) => Value::Boolean(*v >= low as f64 && *v <= high as f64),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// Inline BETWEEN check for float bounds
+    #[inline(always)]
+    fn between_float(col_val: &Value, low: f64, high: f64) -> Value {
+        match col_val {
+            Value::Float(v) => Value::Boolean(*v >= low && *v <= high),
+            Value::Integer(v) => Value::Boolean((*v as f64) >= low && (*v as f64) <= high),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
         }
     }
 
@@ -1598,18 +2266,6 @@ impl ExprVM {
             (Value::Integer(x), Value::Float(y)) if *y != 0.0 => Value::Float(*x as f64 % y),
             (Value::Float(x), Value::Integer(y)) if *y != 0 => Value::Float(x % *y as f64),
             _ if a.is_null() || b.is_null() => Value::Null(DataType::Float),
-            _ => Value::Null(DataType::Null),
-        }
-    }
-
-    #[inline]
-    fn bitwise_op<F>(a: &Value, b: &Value, op: F) -> Value
-    where
-        F: Fn(i64, i64) -> i64,
-    {
-        match (a, b) {
-            (Value::Integer(x), Value::Integer(y)) => Value::Integer(op(*x, *y)),
-            _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
             _ => Value::Null(DataType::Null),
         }
     }

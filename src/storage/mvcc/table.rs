@@ -2343,6 +2343,11 @@ impl Table for MVCCTable {
         MVCCTable::row_count(self)
     }
 
+    fn row_count_hint(&self) -> usize {
+        // O(1) upper bound: just return versions.len() without visibility checks
+        self.version_store.row_count()
+    }
+
     fn collect_rows_ordered_by_index(
         &self,
         column_name: &str,

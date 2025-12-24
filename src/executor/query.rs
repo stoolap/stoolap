@@ -1489,11 +1489,11 @@ impl Executor {
         // enough to potentially benefit from caching. Large tables (>100K rows) would
         // exceed the cache limit anyway, so we allow streaming for them.
         //
-        // CRITICAL OPTIMIZATION: Only call row_count() when cache_eligible is true.
-        // row_count() is O(n) and was causing 100x slowdown for parameterized queries
-        // that don't even use the cache.
+        // OPTIMIZATION: Use row_count_hint() which is O(1) instead of row_count() which
+        // is O(n) with visibility checks. The hint returns an upper bound (versions.len())
+        // which is safe for this decision - if hint > threshold, actual count is also large.
         let should_disable_streaming_for_cache = cache_eligible && {
-            let table_row_count = table.row_count();
+            let table_row_count = table.row_count_hint();
             table_row_count <= super::semantic_cache::DEFAULT_MAX_CACHED_ROWS
         };
 

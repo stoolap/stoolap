@@ -298,7 +298,7 @@ impl Executor {
                         // Check if parallel execution would be used based on TABLE's row count (not output rows)
                         // Parallel decision is based on input size, not filtered output
                         let parallel_config = parallel::ParallelConfig::default();
-                        let table_row_count = table.row_count();
+                        let table_row_count = table.row_count_hint();
                         let would_use_parallel = where_clause.is_some()
                             && parallel_config.should_parallel_filter(table_row_count);
 

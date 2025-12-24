@@ -2090,22 +2090,249 @@ impl Executor {
 
     /// Sort row indices using precomputed ORDER BY values
     fn sort_by_order_values(row_indices: &mut [usize], order_by_values: &[Vec<(Value, bool)>]) {
-        // Use sort_unstable_by for ~10-20% speedup (stability not needed)
-        row_indices.sort_unstable_by(|&a, &b| {
-            for (idx, ((a_val, ascending), (b_val, _))) in order_by_values[a]
-                .iter()
-                .zip(order_by_values[b].iter())
-                .enumerate()
-            {
-                let _ = idx; // Suppress warning
-                let cmp = a_val.partial_cmp(b_val).unwrap_or(Ordering::Equal);
-                let cmp = if !ascending { cmp.reverse() } else { cmp };
-                if cmp != Ordering::Equal {
-                    return cmp;
+        if row_indices.len() < 2 {
+            return;
+        }
+
+        // Check if single ORDER BY column (most common case) - use fast path
+        let is_single_order_by = order_by_values
+            .first()
+            .map(|v| v.len() == 1)
+            .unwrap_or(false);
+
+        if is_single_order_by {
+            // Fast path: single ORDER BY column with type-specific comparison
+            let ascending = order_by_values
+                .first()
+                .and_then(|v| v.first())
+                .map(|(_, asc)| *asc)
+                .unwrap_or(true);
+
+            // Detect column type from first non-null value (single pass instead of double sampling)
+            #[derive(Clone, Copy, PartialEq)]
+            enum DetectedType {
+                Unknown,
+                Integer,
+                Float,
+                Mixed,
+            }
+
+            let mut detected = DetectedType::Unknown;
+            for &idx in row_indices.iter().take(100) {
+                if let Some(val) = order_by_values
+                    .get(idx)
+                    .and_then(|v| v.first())
+                    .map(|(val, _)| val)
+                {
+                    match val {
+                        Value::Integer(_) => {
+                            if detected == DetectedType::Unknown {
+                                detected = DetectedType::Integer;
+                            } else if detected != DetectedType::Integer {
+                                detected = DetectedType::Mixed;
+                                break;
+                            }
+                        }
+                        Value::Float(_) => {
+                            if detected == DetectedType::Unknown {
+                                detected = DetectedType::Float;
+                            } else if detected != DetectedType::Float {
+                                detected = DetectedType::Mixed;
+                                break;
+                            }
+                        }
+                        Value::Null(_) => {
+                            // Skip nulls, they're handled by unwrap_or in sort functions
+                        }
+                        _ => {
+                            detected = DetectedType::Mixed;
+                            break;
+                        }
+                    }
                 }
             }
-            Ordering::Equal
-        });
+
+            match detected {
+                DetectedType::Integer => {
+                    Self::sort_by_integer_key(row_indices, order_by_values, ascending);
+                    return;
+                }
+                DetectedType::Float => {
+                    Self::sort_by_float_key(row_indices, order_by_values, ascending);
+                    return;
+                }
+                _ => {
+                    // Mixed types or unknown - use generic single column sort
+                    Self::sort_single_column(row_indices, order_by_values, ascending);
+                    return;
+                }
+            }
+        }
+
+        // Multi-column ORDER BY: use parallel sort for large partitions
+        const PARALLEL_THRESHOLD: usize = 10_000;
+
+        if row_indices.len() >= PARALLEL_THRESHOLD {
+            row_indices
+                .par_sort_unstable_by(|&a, &b| Self::compare_order_values(order_by_values, a, b));
+        } else {
+            row_indices
+                .sort_unstable_by(|&a, &b| Self::compare_order_values(order_by_values, a, b));
+        }
+    }
+
+    /// Compare two rows by their ORDER BY values
+    #[inline]
+    fn compare_order_values(
+        order_by_values: &[Vec<(Value, bool)>],
+        a: usize,
+        b: usize,
+    ) -> Ordering {
+        let a_vals = &order_by_values[a];
+        let b_vals = &order_by_values[b];
+
+        for i in 0..a_vals.len() {
+            let (a_val, ascending) = &a_vals[i];
+            let (b_val, _) = &b_vals[i];
+
+            let cmp = Self::compare_values_fast(a_val, b_val);
+            let cmp = if !ascending { cmp.reverse() } else { cmp };
+            if cmp != Ordering::Equal {
+                return cmp;
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// Fast value comparison with type-specific paths
+    #[inline]
+    fn compare_values_fast(a: &Value, b: &Value) -> Ordering {
+        match (a, b) {
+            (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+            (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+            (Value::Integer(x), Value::Float(y)) => {
+                (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
+            }
+            (Value::Float(x), Value::Integer(y)) => {
+                x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
+            }
+            (Value::Null(_), Value::Null(_)) => Ordering::Equal,
+            (Value::Null(_), _) => Ordering::Greater, // NULLs last
+            (_, Value::Null(_)) => Ordering::Less,
+            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        }
+    }
+
+    /// Ultra-fast sort for integer ORDER BY column
+    fn sort_by_integer_key(
+        row_indices: &mut [usize],
+        order_by_values: &[Vec<(Value, bool)>],
+        ascending: bool,
+    ) {
+        const PARALLEL_THRESHOLD: usize = 50_000;
+
+        let get_key = |idx: usize| -> i64 {
+            order_by_values
+                .get(idx)
+                .and_then(|v| v.first())
+                .and_then(|(val, _)| {
+                    if let Value::Integer(i) = val {
+                        Some(*i)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(i64::MAX) // NULLs sort last
+        };
+
+        if row_indices.len() >= PARALLEL_THRESHOLD {
+            if ascending {
+                row_indices.par_sort_unstable_by_key(|&idx| get_key(idx));
+            } else {
+                row_indices.par_sort_unstable_by_key(|&idx| std::cmp::Reverse(get_key(idx)));
+            }
+        } else if ascending {
+            row_indices.sort_unstable_by_key(|&idx| get_key(idx));
+        } else {
+            row_indices.sort_unstable_by_key(|&idx| std::cmp::Reverse(get_key(idx)));
+        }
+    }
+
+    /// Fast sort for float ORDER BY column
+    fn sort_by_float_key(
+        row_indices: &mut [usize],
+        order_by_values: &[Vec<(Value, bool)>],
+        ascending: bool,
+    ) {
+        const PARALLEL_THRESHOLD: usize = 50_000;
+
+        let get_float = |idx: usize| -> f64 {
+            order_by_values
+                .get(idx)
+                .and_then(|v| v.first())
+                .and_then(|(val, _)| {
+                    if let Value::Float(f) = val {
+                        Some(*f)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(f64::MAX) // NULLs sort last
+        };
+
+        // Use total_cmp for proper float ordering (handles NaN, -0.0, etc.)
+        let compare = |&a: &usize, &b: &usize| -> Ordering {
+            let cmp = get_float(a).total_cmp(&get_float(b));
+            if ascending {
+                cmp
+            } else {
+                cmp.reverse()
+            }
+        };
+
+        if row_indices.len() >= PARALLEL_THRESHOLD {
+            row_indices.par_sort_unstable_by(compare);
+        } else {
+            row_indices.sort_unstable_by(compare);
+        }
+    }
+
+    /// Single column generic sort (faster than multi-column loop)
+    fn sort_single_column(
+        row_indices: &mut [usize],
+        order_by_values: &[Vec<(Value, bool)>],
+        ascending: bool,
+    ) {
+        const PARALLEL_THRESHOLD: usize = 10_000;
+
+        let compare = |&a: &usize, &b: &usize| -> Ordering {
+            let a_val = order_by_values
+                .get(a)
+                .and_then(|v| v.first())
+                .map(|(v, _)| v);
+            let b_val = order_by_values
+                .get(b)
+                .and_then(|v| v.first())
+                .map(|(v, _)| v);
+
+            let cmp = match (a_val, b_val) {
+                (Some(a), Some(b)) => Self::compare_values_fast(a, b),
+                (None, None) => Ordering::Equal,
+                (None, _) => Ordering::Greater,
+                (_, None) => Ordering::Less,
+            };
+            if ascending {
+                cmp
+            } else {
+                cmp.reverse()
+            }
+        };
+
+        if row_indices.len() >= PARALLEL_THRESHOLD {
+            row_indices.par_sort_unstable_by(compare);
+        } else {
+            row_indices.sort_unstable_by(compare);
+        }
     }
 
     /// Compute aggregate function as window function (SUM, COUNT, AVG, MIN, MAX)

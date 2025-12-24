@@ -168,8 +168,8 @@ impl QueryPlanner {
             }
         }
 
-        // Fallback: compute basic stats from table
-        let row_count = table.row_count() as u64;
+        // Fallback: compute basic stats from table (use hint for O(1))
+        let row_count = table.row_count_hint() as u64;
         TableStats {
             table_name: table_name.to_string(),
             row_count,

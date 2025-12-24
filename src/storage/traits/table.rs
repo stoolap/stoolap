@@ -626,6 +626,14 @@ pub trait Table: Send + Sync {
         0 // Default implementation - override in concrete tables
     }
 
+    /// Fast O(1) row count hint for optimizer decisions
+    ///
+    /// Returns an upper bound estimate without expensive visibility checks.
+    /// Use for cache eligibility and similar decisions where exact count isn't needed.
+    fn row_count_hint(&self) -> usize {
+        self.row_count() // Default falls back to row_count
+    }
+
     /// Collects rows sorted by an indexed column with limit (ORDER BY + LIMIT pushdown)
     ///
     /// For queries like `SELECT * FROM table ORDER BY col LIMIT 10`, this uses the

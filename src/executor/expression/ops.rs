@@ -896,3 +896,25 @@ impl std::fmt::Debug for Op {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem;
+
+    #[test]
+    fn test_op_size() {
+        let size = mem::size_of::<Op>();
+        println!("Op enum size: {} bytes", size);
+        println!("Op alignment: {} bytes", mem::align_of::<Op>());
+
+        // The Op enum contains large variants like:
+        // - InTupleSet { tuple_size: u8, values: Arc<Vec<Vec<Value>>>, negated: bool }
+        // - CallScalar { func: Arc<dyn ScalarFunction>, arg_count: u8 }
+        // - GtColumnConst(u16, Value) where Value is 24 bytes
+
+        // We want to keep Op small for cache efficiency
+        // Ideally under 32 bytes, definitely under 64 bytes
+        assert!(size <= 64, "Op enum is too large: {} bytes", size);
+    }
+}

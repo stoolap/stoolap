@@ -913,7 +913,7 @@ impl CompiledFilter {
     /// Evaluate the filter against a row
     ///
     /// This is the hot path - all type checks are eliminated through enum matching.
-    #[inline(always)]
+    #[inline]
     pub fn matches(&self, row: &Row) -> bool {
         match self {
             // Integer comparisons
@@ -1097,7 +1097,6 @@ impl CompiledFilter {
             // Scalar function expressions
             CompiledFilter::UpperEq { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    // UPPER(col) = value: convert column to uppercase and compare
                     s.to_uppercase() == value.as_ref()
                 } else {
                     false
@@ -1105,7 +1104,6 @@ impl CompiledFilter {
             }
             CompiledFilter::LowerEq { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    // LOWER(col) = value: convert column to lowercase and compare
                     s.to_lowercase() == value.as_ref()
                 } else {
                     false
@@ -1113,7 +1111,6 @@ impl CompiledFilter {
             }
             CompiledFilter::TrimEq { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    // TRIM(col) = value: trim whitespace and compare
                     s.trim() == value.as_ref()
                 } else {
                     false
@@ -1164,6 +1161,274 @@ impl CompiledFilter {
 
             // Dynamic fallback
             CompiledFilter::Dynamic(expr) => expr.evaluate_fast(row),
+        }
+    }
+
+    /// Evaluate the filter against a value slice (avoids Row allocation)
+    ///
+    /// This is the zero-copy hot path for storage layer filtering.
+    /// By operating directly on &[Value], we avoid cloning rows that don't match.
+    #[inline]
+    pub fn matches_slice(&self, values: &[Value]) -> bool {
+        match self {
+            // Integer comparisons
+            CompiledFilter::IntegerEq { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i == *value)
+            }
+            CompiledFilter::IntegerNe { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i != *value)
+            }
+            CompiledFilter::IntegerGt { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i > *value)
+            }
+            CompiledFilter::IntegerGte { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i >= *value)
+            }
+            CompiledFilter::IntegerLt { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i < *value)
+            }
+            CompiledFilter::IntegerLte { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i <= *value)
+            }
+            CompiledFilter::IntegerBetween { col_idx, min, max } => {
+                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i >= *min && *i <= *max)
+            }
+            CompiledFilter::IntegerIn {
+                col_idx,
+                values: set,
+            } => {
+                if let Some(Value::Integer(i)) = values.get(*col_idx) {
+                    set.contains(i)
+                } else {
+                    false
+                }
+            }
+
+            // Float comparisons
+            CompiledFilter::FloatEq { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f == *value)
+            }
+            CompiledFilter::FloatNe { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f != *value)
+            }
+            CompiledFilter::FloatGt { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f > *value)
+            }
+            CompiledFilter::FloatGte { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f >= *value)
+            }
+            CompiledFilter::FloatLt { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f < *value)
+            }
+            CompiledFilter::FloatLte { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f <= *value)
+            }
+            CompiledFilter::FloatBetween { col_idx, min, max } => {
+                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f >= *min && *f <= *max)
+            }
+
+            // String comparisons
+            CompiledFilter::StringEq { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.as_str() == value.as_ref()
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::StringNe { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.as_str() != value.as_ref()
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::StringGt { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.as_str() > value.as_ref()
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::StringGte { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.as_str() >= value.as_ref()
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::StringLt { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.as_str() < value.as_ref()
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::StringLte { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.as_str() <= value.as_ref()
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::StringIn {
+                col_idx,
+                values: set,
+            } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    set.iter().any(|v| s.as_str() == v.as_ref())
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::StringLike {
+                col_idx,
+                pattern,
+                case_insensitive,
+                negated,
+            } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    let matches = pattern.matches(s.as_str(), *case_insensitive);
+                    if *negated {
+                        !matches
+                    } else {
+                        matches
+                    }
+                } else {
+                    false
+                }
+            }
+
+            // Boolean comparisons
+            CompiledFilter::BooleanEq { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Boolean(b)) if *b == *value)
+            }
+            CompiledFilter::BooleanNe { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Boolean(b)) if *b != *value)
+            }
+
+            // Timestamp comparisons
+            CompiledFilter::TimestampEq { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t == *value)
+            }
+            CompiledFilter::TimestampNe { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t != *value)
+            }
+            CompiledFilter::TimestampGt { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t > *value)
+            }
+            CompiledFilter::TimestampGte { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t >= *value)
+            }
+            CompiledFilter::TimestampLt { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t < *value)
+            }
+            CompiledFilter::TimestampLte { col_idx, value } => {
+                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t <= *value)
+            }
+            CompiledFilter::TimestampBetween { col_idx, min, max } => {
+                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t >= *min && *t <= *max)
+            }
+
+            // NULL checks
+            CompiledFilter::IsNull { col_idx } => {
+                values.get(*col_idx).map(|v| v.is_null()).unwrap_or(true)
+            }
+            CompiledFilter::IsNotNull { col_idx } => {
+                values.get(*col_idx).map(|v| !v.is_null()).unwrap_or(false)
+            }
+
+            // Logical operators (recursive)
+            CompiledFilter::And(left, right) => {
+                left.matches_slice(values) && right.matches_slice(values)
+            }
+            CompiledFilter::AndN(filters) => filters.iter().all(|f| f.matches_slice(values)),
+            CompiledFilter::Or(left, right) => {
+                left.matches_slice(values) || right.matches_slice(values)
+            }
+            CompiledFilter::OrN(filters) => filters.iter().any(|f| f.matches_slice(values)),
+            CompiledFilter::Not(inner) => {
+                // Three-valued logic: NOT(UNKNOWN) = UNKNOWN (false for filtering)
+                // Check if inner's false result is due to NULL (UNKNOWN)
+                if inner.is_unknown_due_to_null_slice(values) {
+                    return false;
+                }
+                !inner.matches_slice(values)
+            }
+
+            // Constants
+            CompiledFilter::True => true,
+            CompiledFilter::False => false,
+
+            // Scalar function expressions
+            CompiledFilter::UpperEq { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.to_uppercase() == value.as_ref()
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::LowerEq { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.to_lowercase() == value.as_ref()
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::TrimEq { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.trim() == value.as_ref()
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::LengthEq { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.chars().count() as i64 == *value
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::LengthNe { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.chars().count() as i64 != *value
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::LengthGt { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.chars().count() as i64 > *value
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::LengthGte { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.chars().count() as i64 >= *value
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::LengthLt { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    (s.chars().count() as i64) < *value
+                } else {
+                    false
+                }
+            }
+            CompiledFilter::LengthLte { col_idx, value } => {
+                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                    s.chars().count() as i64 <= *value
+                } else {
+                    false
+                }
+            }
+
+            // Dynamic fallback - needs Row, so create temporary
+            CompiledFilter::Dynamic(expr) => {
+                let row = Row::from_values(values.to_vec());
+                expr.evaluate_fast(&row)
+            }
         }
     }
 
@@ -1260,6 +1525,78 @@ impl CompiledFilter {
 
             // Dynamic expressions have their own is_unknown_due_to_null implementation
             CompiledFilter::Dynamic(expr) => expr.is_unknown_due_to_null(row),
+        }
+    }
+
+    /// Check if the filter result would be UNKNOWN (NULL) due to NULL column values
+    /// This is the slice-based version for zero-copy filtering.
+    #[inline(always)]
+    pub fn is_unknown_due_to_null_slice(&self, values: &[Value]) -> bool {
+        match self {
+            // Comparison with NULL column produces UNKNOWN
+            CompiledFilter::IntegerEq { col_idx, .. }
+            | CompiledFilter::IntegerNe { col_idx, .. }
+            | CompiledFilter::IntegerGt { col_idx, .. }
+            | CompiledFilter::IntegerGte { col_idx, .. }
+            | CompiledFilter::IntegerLt { col_idx, .. }
+            | CompiledFilter::IntegerLte { col_idx, .. }
+            | CompiledFilter::IntegerBetween { col_idx, .. }
+            | CompiledFilter::IntegerIn { col_idx, .. }
+            | CompiledFilter::FloatEq { col_idx, .. }
+            | CompiledFilter::FloatNe { col_idx, .. }
+            | CompiledFilter::FloatGt { col_idx, .. }
+            | CompiledFilter::FloatGte { col_idx, .. }
+            | CompiledFilter::FloatLt { col_idx, .. }
+            | CompiledFilter::FloatLte { col_idx, .. }
+            | CompiledFilter::FloatBetween { col_idx, .. }
+            | CompiledFilter::StringEq { col_idx, .. }
+            | CompiledFilter::StringNe { col_idx, .. }
+            | CompiledFilter::StringGt { col_idx, .. }
+            | CompiledFilter::StringGte { col_idx, .. }
+            | CompiledFilter::StringLt { col_idx, .. }
+            | CompiledFilter::StringLte { col_idx, .. }
+            | CompiledFilter::StringIn { col_idx, .. }
+            | CompiledFilter::StringLike { col_idx, .. }
+            | CompiledFilter::BooleanEq { col_idx, .. }
+            | CompiledFilter::BooleanNe { col_idx, .. }
+            | CompiledFilter::TimestampEq { col_idx, .. }
+            | CompiledFilter::TimestampNe { col_idx, .. }
+            | CompiledFilter::TimestampGt { col_idx, .. }
+            | CompiledFilter::TimestampGte { col_idx, .. }
+            | CompiledFilter::TimestampLt { col_idx, .. }
+            | CompiledFilter::TimestampLte { col_idx, .. }
+            | CompiledFilter::TimestampBetween { col_idx, .. }
+            | CompiledFilter::UpperEq { col_idx, .. }
+            | CompiledFilter::LowerEq { col_idx, .. }
+            | CompiledFilter::TrimEq { col_idx, .. }
+            | CompiledFilter::LengthEq { col_idx, .. }
+            | CompiledFilter::LengthNe { col_idx, .. }
+            | CompiledFilter::LengthGt { col_idx, .. }
+            | CompiledFilter::LengthGte { col_idx, .. }
+            | CompiledFilter::LengthLt { col_idx, .. }
+            | CompiledFilter::LengthLte { col_idx, .. } => {
+                // Result is UNKNOWN if the column value is NULL
+                values.get(*col_idx).map(|v| v.is_null()).unwrap_or(true)
+            }
+
+            // IS NULL / IS NOT NULL - never produces UNKNOWN
+            CompiledFilter::IsNull { .. } | CompiledFilter::IsNotNull { .. } => false,
+
+            // AND/OR: Match original Expression behavior
+            CompiledFilter::And(_, _) | CompiledFilter::AndN(_) => false,
+            CompiledFilter::Or(_, _) | CompiledFilter::OrN(_) => false,
+
+            // NOT(UNKNOWN) = UNKNOWN
+            CompiledFilter::Not(inner) => inner.is_unknown_due_to_null_slice(values),
+
+            // Constants never produce UNKNOWN
+            CompiledFilter::True | CompiledFilter::False => false,
+
+            // Dynamic expressions - fall back to Row-based check
+            CompiledFilter::Dynamic(expr) => {
+                let row = Row::from_values(values.to_vec());
+                expr.is_unknown_due_to_null(&row)
+            }
         }
     }
 }

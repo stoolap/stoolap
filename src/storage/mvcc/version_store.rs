@@ -1210,38 +1210,26 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    // Get row data - falls back to version data if bounds validation fails
-                    let row = if let Some(idx) = e.arena_idx {
+                    // OPTIMIZATION: Filter BEFORE cloning to avoid allocation for non-matching rows
+                    // Try arena path first (zero-copy filter check)
+                    if let Some(idx) = e.arena_idx {
                         if idx < arena_len {
-                            // SAFETY: idx bounds checked above
                             let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            // Validate data slice bounds to prevent UB from arena corruption
                             if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                                // SAFETY: bounds validated above
                                 let slice =
                                     unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                                Row::from_values(slice.to_vec())
-                            } else {
-                                // Arena corruption detected - fall back to version data
-                                debug_assert!(
-                                    false,
-                                    "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
-                                    row_id,
-                                    meta.start,
-                                    meta.end,
-                                    arena_data_slice.len()
-                                );
-                                e.version.data.clone()
+                                // Filter on raw slice - no allocation!
+                                if compiled_filter.matches_slice(slice) {
+                                    // Only clone if filter matched
+                                    result.push((row_id, Row::from_values(slice.to_vec())));
+                                }
+                                break;
                             }
-                        } else {
-                            e.version.data.clone()
                         }
-                    } else {
-                        e.version.data.clone()
-                    };
-                    // Filter using compiled filter (eliminates virtual dispatch)
-                    if compiled_filter.matches(&row) {
-                        result.push((row_id, row));
+                    }
+                    // Fallback: filter on version data (already allocated)
+                    if compiled_filter.matches(&e.version.data) {
+                        result.push((row_id, e.version.data.clone()));
                     }
                     break;
                 }
@@ -1310,44 +1298,35 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    // Read row data - falls back to version data if bounds validation fails
-                    let row = if let Some(idx) = e.arena_idx {
+                    // OPTIMIZATION: Filter BEFORE cloning to avoid allocation for non-matching rows
+                    // Try arena path first (zero-copy filter check)
+                    if let Some(idx) = e.arena_idx {
                         if idx < arena_len {
-                            // SAFETY: idx bounds checked above
                             let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            // Validate data slice bounds to prevent UB from arena corruption
                             if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                                // SAFETY: bounds validated above
                                 let slice =
                                     unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                                Row::from_values(slice.to_vec())
-                            } else {
-                                // Arena corruption detected - fall back to version data
-                                debug_assert!(
-                                    false,
-                                    "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
-                                    row_id,
-                                    meta.start,
-                                    meta.end,
-                                    arena_data_slice.len()
-                                );
-                                e.version.data.clone()
+                                // Filter on raw slice - no allocation!
+                                if compiled_filter.matches_slice(slice) {
+                                    if skipped < offset {
+                                        skipped += 1;
+                                    } else {
+                                        result.push((row_id, Row::from_values(slice.to_vec())));
+                                        if result.len() >= limit {
+                                            return result;
+                                        }
+                                    }
+                                }
+                                break;
                             }
-                        } else {
-                            e.version.data.clone()
                         }
-                    } else {
-                        e.version.data.clone()
-                    };
-
-                    // Apply filter - only collect matching rows
-                    if compiled_filter.matches(&row) {
-                        // Handle offset: skip first `offset` matching rows
+                    }
+                    // Fallback: filter on version data (already allocated)
+                    if compiled_filter.matches(&e.version.data) {
                         if skipped < offset {
                             skipped += 1;
                         } else {
-                            result.push((row_id, row));
-                            // Early termination: we have enough rows
+                            result.push((row_id, e.version.data.clone()));
                             if result.len() >= limit {
                                 return result;
                             }
