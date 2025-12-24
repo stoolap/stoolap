@@ -1071,17 +1071,31 @@ impl QueryResult for TopNResult {
     }
 }
 
-/// Distinct result that removes duplicate rows
+/// Streaming distinct result that removes duplicate rows on-the-fly
+///
+/// This streams rows and only stores seen row values for deduplication. This enables:
+/// - Early termination with LIMIT (no need to scan all rows)
+/// - Lower latency to first row
+/// - Streaming output
 pub struct DistinctResult {
-    /// Materialized unique rows
-    inner: ExecutorMemoryResult,
+    /// Underlying result source
+    inner: Box<dyn QueryResult>,
+    /// Columns from inner result
+    columns: Vec<String>,
+    /// Number of columns to consider for distinctness
+    /// (may be less than total columns when ORDER BY adds extra columns)
+    distinct_column_count: usize,
+    /// Seen rows for deduplication: hash -> list of row values (for collision handling)
+    /// We only store the distinct columns, not the full row
+    seen: FxHashMap<u64, Vec<Vec<Value>>>,
+    /// Current row (stored for row() method)
+    current_row: Row,
+    /// Whether we have a valid current row
+    has_current: bool,
 }
 
 impl DistinctResult {
-    /// Create a new distinct result by materializing and deduplicating rows
-    ///
-    /// OPTIMIZATION: Uses direct value hashing instead of string serialization.
-    /// This reduces allocations from O(rows × columns) to O(unique_rows).
+    /// Create a new streaming distinct result
     pub fn new(inner: Box<dyn QueryResult>) -> Self {
         Self::with_column_count(inner, None)
     }
@@ -1092,79 +1106,93 @@ impl DistinctResult {
     /// For example: SELECT DISTINCT a FROM t ORDER BY b
     /// - The result has columns [a, b] for sorting
     /// - But distinctness should only compare column [a]
-    /// - After DISTINCT, extra columns are removed
-    pub fn with_column_count(
-        mut inner: Box<dyn QueryResult>,
-        distinct_columns: Option<usize>,
-    ) -> Self {
-        use std::hash::{Hash, Hasher};
-
+    pub fn with_column_count(inner: Box<dyn QueryResult>, distinct_columns: Option<usize>) -> Self {
         let columns = inner.columns().to_vec();
-        let num_distinct_cols = distinct_columns.unwrap_or(columns.len());
-
-        // OPTIMIZATION: Use hash map with collision handling for correct DISTINCT behavior
-        // Maps: hash -> list of indices into result vec (handles hash collisions)
-        // Hash values directly instead of converting to strings (600K fewer allocations for 100K rows)
-        let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-        let mut rows = Vec::new();
-
-        while inner.next() {
-            // Hash only the columns that matter for distinctness
-            let mut hasher = FxHasher::default();
-            let row = inner.row();
-            for value in row.as_slice().iter().take(num_distinct_cols) {
-                value.hash(&mut hasher);
-            }
-            let hash = hasher.finish();
-
-            // Check if this exact row already exists (handle hash collisions)
-            let indices = hash_to_indices.entry(hash).or_default();
-            let is_duplicate = indices.iter().any(|&idx| {
-                // Compare only the first num_distinct_cols columns
-                let existing_row: &Row = &rows[idx];
-                for i in 0..num_distinct_cols {
-                    match (row.get(i), existing_row.get(i)) {
-                        (Some(v1), Some(v2)) if v1 == v2 => continue,
-                        (None, None) => continue,
-                        _ => return false,
-                    }
-                }
-                true
-            });
-
-            if !is_duplicate {
-                indices.push(rows.len());
-                rows.push(inner.take_row());
-            }
-        }
-
-        let memory_result = ExecutorMemoryResult::new(columns, rows);
+        let distinct_column_count = distinct_columns.unwrap_or(columns.len());
 
         Self {
-            inner: memory_result,
+            inner,
+            columns,
+            distinct_column_count,
+            seen: FxHashMap::default(),
+            current_row: Row::new(),
+            has_current: false,
         }
+    }
+
+    /// Compute hash for the distinct columns of a row
+    fn hash_row(&self, row: &Row) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = FxHasher::default();
+        for value in row.as_slice().iter().take(self.distinct_column_count) {
+            value.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Extract distinct column values from a row
+    fn extract_distinct_values(&self, row: &Row) -> Vec<Value> {
+        row.as_slice()
+            .iter()
+            .take(self.distinct_column_count)
+            .cloned()
+            .collect()
     }
 }
 
 impl QueryResult for DistinctResult {
     fn columns(&self) -> &[String] {
-        self.inner.columns()
+        &self.columns
     }
 
     fn next(&mut self) -> bool {
-        self.inner.next()
+        // Keep getting rows until we find a non-duplicate
+        while self.inner.next() {
+            let row = self.inner.row();
+            let hash = self.hash_row(row);
+
+            // Extract distinct values first for duplicate check
+            let values = self.extract_distinct_values(row);
+
+            // Check if we've seen this combination before
+            let is_dup = if let Some(seen_rows) = self.seen.get(&hash) {
+                seen_rows.contains(&values)
+            } else {
+                false
+            };
+
+            if !is_dup {
+                // New unique row found - take ownership and mark as seen
+                self.current_row = self.inner.take_row();
+                self.seen.entry(hash).or_default().push(values);
+                self.has_current = true;
+                return true;
+            }
+            // Duplicate - continue to next row
+        }
+
+        // No more rows
+        self.has_current = false;
+        false
     }
 
     fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        self.inner.scan(dest)
+        if !self.has_current {
+            return Ok(());
+        }
+        let src = self.current_row.as_slice();
+        let len = dest.len().min(src.len());
+        dest[..len].clone_from_slice(&src[..len]);
+        Ok(())
     }
 
     fn row(&self) -> &Row {
-        self.inner.row()
+        &self.current_row
     }
 
     fn take_row(&mut self) -> Row {
-        self.inner.take_row()
+        self.has_current = false;
+        std::mem::take(&mut self.current_row)
     }
 
     fn close(&mut self) -> Result<()> {

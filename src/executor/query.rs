@@ -6084,7 +6084,7 @@ impl Executor {
     /// Check if Index Nested Loop Join can be used.
     ///
     /// Returns Some((table_name, index, inner_key_column, outer_key_column, outer_key_idx)) if:
-    /// - Right side is a simple TableSource (not CTE, view, subquery, or nested join)
+    /// - Right side is a simple TableSource OR a simple passthrough SubquerySource
     /// - There's an equality join condition on a column that has an index on the right table
     /// - Join type is INNER or LEFT (not RIGHT or FULL)
     ///
@@ -6109,20 +6109,39 @@ impl Executor {
             return None;
         }
 
-        // Right side must be a simple TableSource (possibly wrapped in Aliased)
-        let table_source = match right_expr {
-            Expression::TableSource(ts) => ts,
+        // Extract table name and effective alias from right side
+        // Supports: TableSource, Aliased TableSource, and simple SubquerySource
+        let (table_name, effective_alias) = match right_expr {
+            Expression::TableSource(ts) => (ts.name.value_lower.clone(), None),
             Expression::Aliased(aliased) => {
-                // Unwrap the alias to get the underlying TableSource
                 match aliased.expression.as_ref() {
-                    Expression::TableSource(ts) => ts,
+                    Expression::TableSource(ts) => (ts.name.value_lower.clone(), None),
+                    Expression::SubquerySource(sq) => {
+                        // Check if subquery is a simple passthrough
+                        if let Some(underlying) = self.extract_simple_subquery_table(&sq.subquery) {
+                            // Use the subquery's alias as the effective alias for join condition matching
+                            let alias = sq.alias.as_ref().map(|a| a.value.clone());
+                            (underlying, alias)
+                        } else {
+                            return None;
+                        }
+                    }
                     _ => return None,
+                }
+            }
+            Expression::SubquerySource(sq) => {
+                // Check if subquery is a simple passthrough
+                if let Some(underlying) = self.extract_simple_subquery_table(&sq.subquery) {
+                    let alias = sq.alias.as_ref().map(|a| a.value.clone());
+                    (underlying, alias)
+                } else {
+                    return None;
                 }
             }
             _ => return None,
         };
 
-        let table_name = &table_source.name.value_lower;
+        let table_name_ref = &table_name;
 
         // Check if it's a CTE (CTEs don't have indexes)
         // We can't check CTEs here without context, but we'll verify when we try to get the table
@@ -6137,8 +6156,11 @@ impl Executor {
         let left_col_lower = left_col.to_lowercase();
         let right_col_lower = right_col.to_lowercase();
 
-        // Get the right table alias (or table name if no alias)
-        let right_table_alias = right_alias.unwrap_or(table_name);
+        // Get the right table alias - prefer effective_alias (from subquery), then right_alias, then table name
+        let right_table_alias = effective_alias
+            .as_deref()
+            .or(right_alias)
+            .unwrap_or(table_name_ref);
 
         // Check if left_col is from right table and right_col is from left table (swapped)
         let (inner_col, outer_col) = if left_col_lower
@@ -6172,7 +6194,7 @@ impl Executor {
 
         // Try to get the table and check for index or PK
         let txn = self.engine.begin_transaction().ok()?;
-        let table = txn.get_table(table_name).ok()?;
+        let table = txn.get_table(table_name_ref).ok()?;
         let schema = table.schema();
 
         // First check if inner column is the PRIMARY KEY (direct row_id lookup)
@@ -6181,7 +6203,7 @@ impl Executor {
             if schema.columns[pk_idx].name.to_lowercase() == inner_col_lower {
                 // It's a primary key lookup - most efficient!
                 return Some((
-                    table_name.clone(),
+                    table_name,
                     IndexLookupStrategy::PrimaryKey,
                     inner_col_unqualified,
                     outer_col,
@@ -6192,7 +6214,7 @@ impl Executor {
         // Check if there's a secondary index on the inner column
         if let Some(index) = table.get_index_on_column(&inner_col_unqualified) {
             return Some((
-                table_name.clone(),
+                table_name,
                 IndexLookupStrategy::SecondaryIndex(index),
                 inner_col_unqualified,
                 outer_col,
@@ -6201,6 +6223,78 @@ impl Executor {
 
         // No index or PK available
         None
+    }
+
+    /// Extract the underlying table name from a simple passthrough subquery.
+    ///
+    /// A "simple passthrough" subquery is one that:
+    /// - Selects from a single table (no joins)
+    /// - Has no WHERE, GROUP BY, ORDER BY, LIMIT, HAVING, DISTINCT
+    /// - Has no CTEs, set operations, or window definitions
+    ///
+    /// Note: WHERE clauses are rejected because Index Nested Loop would
+    /// bypass the subquery and query the raw table directly.
+    ///
+    /// Returns Some(table_name) if the subquery is simple, None otherwise.
+    fn extract_simple_subquery_table(&self, stmt: &SelectStatement) -> Option<String> {
+        // Must not have CTEs
+        if stmt.with.is_some() {
+            return None;
+        }
+
+        // Must not have set operations (UNION, INTERSECT, EXCEPT)
+        if !stmt.set_operations.is_empty() {
+            return None;
+        }
+
+        // Must not have GROUP BY
+        if !stmt.group_by.columns.is_empty() {
+            return None;
+        }
+
+        // Must not have HAVING
+        if stmt.having.is_some() {
+            return None;
+        }
+
+        // Must not have ORDER BY (would affect result order)
+        if !stmt.order_by.is_empty() {
+            return None;
+        }
+
+        // Must not have LIMIT or OFFSET (would affect which rows are returned)
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            return None;
+        }
+
+        // Must not have WHERE clause (Index NL would bypass it and query raw table)
+        if stmt.where_clause.is_some() {
+            return None;
+        }
+
+        // Must not be DISTINCT
+        if stmt.distinct {
+            return None;
+        }
+
+        // Must not have window definitions
+        if !stmt.window_defs.is_empty() {
+            return None;
+        }
+
+        // Must have a table expression that is a simple TableSource
+        let table_expr = stmt.table_expr.as_ref()?;
+        match table_expr.as_ref() {
+            Expression::TableSource(ts) => Some(ts.name.value_lower.clone()),
+            Expression::Aliased(aliased) => {
+                if let Expression::TableSource(ts) = aliased.expression.as_ref() {
+                    Some(ts.name.value_lower.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Build an IN filter expression: column_name IN (v1, v2, ..., vN)

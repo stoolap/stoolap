@@ -62,42 +62,37 @@ pub use string_agg::{GroupConcatFunction, StringAggFunction};
 pub use sum::SumFunction;
 
 use crate::core::Value;
-use std::collections::HashSet;
-
-/// Helper to convert Value to a hashable key for distinct tracking
-fn value_to_distinct_key(value: &Value) -> Option<String> {
-    if value.is_null() {
-        return None; // NULL values don't contribute to distinct
-    }
-
-    match value {
-        Value::Null(_) => None,
-        Value::Integer(i) => Some(format!("i:{}", i)),
-        Value::Float(f) => Some(format!("f:{}", f)),
-        Value::Text(s) => Some(format!("s:{}", s)),
-        Value::Boolean(b) => Some(format!("b:{}", b)),
-        Value::Timestamp(t) => Some(format!("t:{}", t)),
-        Value::Json(j) => Some(format!("j:{}", j)),
-    }
-}
+use ahash::AHashSet;
 
 /// Helper struct for tracking distinct values
+///
+/// Uses AHashSet<Value> directly instead of converting to strings,
+/// avoiding allocation overhead for each value.
+/// AHash provides better performance for complex keys like Value.
 #[derive(Default, Debug)]
 pub struct DistinctTracker {
-    seen: HashSet<String>,
+    seen: AHashSet<Value>,
 }
 
 impl DistinctTracker {
     /// Check if a value has been seen before (returns true if new)
+    /// Note: Caller must ensure value is not NULL before calling
+    #[inline]
     pub fn check_and_add(&mut self, value: &Value) -> bool {
-        if let Some(key) = value_to_distinct_key(value) {
-            self.seen.insert(key)
-        } else {
-            false // NULL is never considered for distinct
+        self.seen.insert(value.clone())
+    }
+
+    /// Check if a value has been seen before, with null handling (returns true if new)
+    #[inline]
+    pub fn check_and_add_with_null_check(&mut self, value: &Value) -> bool {
+        if value.is_null() {
+            return false;
         }
+        self.seen.insert(value.clone())
     }
 
     /// Get the count of distinct values
+    #[inline]
     pub fn count(&self) -> usize {
         self.seen.len()
     }
@@ -131,8 +126,9 @@ mod tests {
     fn test_null_handling() {
         let mut tracker = DistinctTracker::default();
 
-        assert!(!tracker.check_and_add(&Value::null_unknown())); // NULL returns false
-        assert!(!tracker.check_and_add(&Value::null_unknown())); // NULL again
+        // Using the with_null_check variant for null handling
+        assert!(!tracker.check_and_add_with_null_check(&Value::null_unknown())); // NULL returns false
+        assert!(!tracker.check_and_add_with_null_check(&Value::null_unknown())); // NULL again
         assert_eq!(tracker.count(), 0); // NULLs not counted
     }
 }
