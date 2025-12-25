@@ -39,6 +39,7 @@ use super::context::{
     get_cached_semi_join, BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
 };
 use super::expr_converter::convert_ast_to_storage_expr;
+use super::expression::compute_expression_hash;
 use super::operator::{ColumnInfo, MaterializedOperator, Operator};
 use super::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
 use super::utils::{dummy_token, value_to_expression};
@@ -398,27 +399,32 @@ impl Executor {
 
         // OPTIMIZATION: Cache correlation info to avoid per-row extraction
         // The subquery pointer is stable within a query execution, so we use it as cache key.
-        // This eliminates ~39ms of string cloning per 100 iterations.
-        let subquery_id = format!("{:p}", subquery as *const SelectStatement);
+        // Using pointer address directly as usize avoids format! allocation entirely.
+        let subquery_ptr = subquery as *const SelectStatement as usize;
 
-        let correlation = match get_cached_exists_correlation(&subquery_id) {
+        let correlation = match get_cached_exists_correlation(subquery_ptr) {
             Some(Some(info)) => info,
             Some(None) => return Ok(None), // Previously determined not extractable
             None => {
                 // First probe for this subquery - extract and cache
                 let info = Self::extract_index_nested_loop_info(subquery);
-                let cached_info = info.map(|i| ExistsCorrelationInfo {
-                    outer_column: i.outer_column.clone(),
-                    outer_table: i.outer_table.clone(),
-                    inner_column: i.inner_column.clone(),
-                    inner_table: i.inner_table.clone(),
-                    outer_column_lower: i.outer_column.to_lowercase(),
-                    outer_qualified_lower: i.outer_table.as_ref().map(|tbl| {
-                        format!("{}.{}", tbl.to_lowercase(), i.outer_column.to_lowercase())
-                    }),
-                    additional_predicate: i.additional_predicate.clone(),
+                let cached_info = info.map(|i| {
+                    // Pre-compute index cache key once to avoid per-probe format! allocation
+                    let index_cache_key = format!("{}:{}", i.inner_table, i.inner_column);
+                    ExistsCorrelationInfo {
+                        outer_column: i.outer_column.clone(),
+                        outer_table: i.outer_table.clone(),
+                        inner_column: i.inner_column.clone(),
+                        inner_table: i.inner_table.clone(),
+                        outer_column_lower: i.outer_column.to_lowercase(),
+                        outer_qualified_lower: i.outer_table.as_ref().map(|tbl| {
+                            format!("{}.{}", tbl.to_lowercase(), i.outer_column.to_lowercase())
+                        }),
+                        additional_predicate: i.additional_predicate.clone(),
+                        index_cache_key,
+                    }
                 });
-                cache_exists_correlation(subquery_id.clone(), cached_info.clone());
+                cache_exists_correlation(subquery_ptr, cached_info.clone());
                 match cached_info {
                     Some(c) => c,
                     None => return Ok(None),
@@ -444,9 +450,8 @@ impl Executor {
 
         // OPTIMIZATION: Cache index reference to avoid repeated lookups
         // This reduces the ~2-5μs overhead per EXISTS probe to nearly zero for subsequent probes
-        let index_cache_key = format!("{}:{}", correlation.inner_table, correlation.inner_column);
-
-        let index = match get_cached_exists_index(&index_cache_key) {
+        // Uses pre-computed index_cache_key from ExistsCorrelationInfo to avoid per-probe format!
+        let index = match get_cached_exists_index(&correlation.index_cache_key) {
             Some(idx) => idx,
             None => {
                 // First time: get index from engine and cache it
@@ -462,7 +467,7 @@ impl Executor {
 
                 match idx {
                     Some(idx) => {
-                        cache_exists_index(index_cache_key, idx.clone());
+                        cache_exists_index(correlation.index_cache_key.clone(), idx.clone());
                         idx
                     }
                     None => return Ok(None), // No index, fall back to full query
@@ -516,8 +521,8 @@ impl Executor {
         };
 
         // Try to get cached predicate filter using the cached predicate cache key
-        // (reuse subquery_id from correlation cache above)
-        let predicate_filter = match get_cached_exists_pred_key(&subquery_id) {
+        // (reuse subquery_ptr from correlation cache above)
+        let predicate_filter = match get_cached_exists_pred_key(subquery_ptr) {
             Some(cache_key) => {
                 // Fast path: we have a cached predicate cache key
                 match get_cached_exists_predicate(&cache_key) {
@@ -539,10 +544,12 @@ impl Executor {
             None => {
                 // First probe for this subquery - compute and cache the predicate cache key
                 let stripped_pred = Self::strip_table_alias_from_expr(additional_pred);
-                let cache_key = format!("{}:{:?}", correlation.inner_table, stripped_pred);
+                // Use expression hash instead of Debug formatting to avoid expensive string allocation
+                let pred_hash = compute_expression_hash(&stripped_pred);
+                let cache_key = format!("{}:{}", correlation.inner_table, pred_hash);
 
                 // Cache the predicate cache key for subsequent probes
-                cache_exists_pred_key(subquery_id, cache_key.clone());
+                cache_exists_pred_key(subquery_ptr, cache_key.clone());
 
                 match get_cached_exists_predicate(&cache_key) {
                     Some(filter) => filter,
@@ -707,20 +714,48 @@ impl Executor {
             return Ok(None);
         }
 
-        // Extract correlation info from subquery
-        let correlation = match Self::extract_index_nested_loop_info(subquery) {
-            Some(info) => info,
-            None => return Ok(None), // Can't use index optimization
+        // OPTIMIZATION: Use the same ExistsCorrelationInfo caching as EXISTS optimization
+        // This avoids per-probe format! allocations for qualified names and index cache keys
+        let subquery_ptr = subquery as *const SelectStatement as usize;
+
+        let correlation = match get_cached_exists_correlation(subquery_ptr) {
+            Some(Some(info)) => info,
+            Some(None) => return Ok(None), // Previously determined not extractable
+            None => {
+                // First probe for this subquery - extract and cache
+                let info = Self::extract_index_nested_loop_info(subquery);
+                let cached_info = info.map(|i| {
+                    // Pre-compute index cache key once to avoid per-probe format! allocation
+                    let index_cache_key = format!("{}:{}", i.inner_table, i.inner_column);
+                    ExistsCorrelationInfo {
+                        outer_column: i.outer_column.clone(),
+                        outer_table: i.outer_table.clone(),
+                        inner_column: i.inner_column.clone(),
+                        inner_table: i.inner_table.clone(),
+                        outer_column_lower: i.outer_column.to_lowercase(),
+                        outer_qualified_lower: i.outer_table.as_ref().map(|tbl| {
+                            format!("{}.{}", tbl.to_lowercase(), i.outer_column.to_lowercase())
+                        }),
+                        additional_predicate: i.additional_predicate.clone(),
+                        index_cache_key,
+                    }
+                });
+                cache_exists_correlation(subquery_ptr, cached_info.clone());
+                match cached_info {
+                    Some(c) => c,
+                    None => return Ok(None),
+                }
+            }
         };
 
-        // Get the outer value from the outer row hashmap
-        let outer_value = if let Some(tbl) = &correlation.outer_table {
-            let qualified = format!("{}.{}", tbl, &correlation.outer_column);
+        // Get the outer value from the outer row hashmap using pre-computed lowercase keys
+        // This avoids per-probe to_lowercase() calls
+        let outer_value = if let Some(ref qualified) = correlation.outer_qualified_lower {
             outer_row
-                .get(&qualified.to_lowercase())
-                .or_else(|| outer_row.get(&correlation.outer_column.to_lowercase()))
+                .get(qualified)
+                .or_else(|| outer_row.get(&correlation.outer_column_lower))
         } else {
-            outer_row.get(&correlation.outer_column.to_lowercase())
+            outer_row.get(&correlation.outer_column_lower)
         };
 
         let outer_value = match outer_value {
@@ -729,10 +764,8 @@ impl Executor {
             None => return Ok(None),       // Column not found, fall back
         };
 
-        // Use cached index lookup (same as EXISTS optimization)
-        let index_cache_key = format!("{}:{}", correlation.inner_table, correlation.inner_column);
-
-        let index = match get_cached_exists_index(&index_cache_key) {
+        // Use cached index lookup with pre-computed index_cache_key
+        let index = match get_cached_exists_index(&correlation.index_cache_key) {
             Some(idx) => idx,
             None => {
                 // First time: get index from engine and cache it
@@ -748,7 +781,7 @@ impl Executor {
 
                 match idx {
                     Some(idx) => {
-                        cache_exists_index(index_cache_key, idx.clone());
+                        cache_exists_index(correlation.index_cache_key.clone(), idx.clone());
                         idx
                     }
                     None => return Ok(None), // No index, fall back to full query
@@ -2519,17 +2552,30 @@ impl Executor {
     /// - Rows are fetched in batches and predicate is evaluated with early exit
     /// - This is O(LIMIT × avg_rows_per_key × predicate_selectivity) which is still efficient
     fn should_use_index_nested_loop(&self, info: &SemiJoinInfo, outer_limit: Option<i64>) -> bool {
-        // Use index-nested-loop for small LIMIT queries
-        // The LIMIT early termination in the sequential path makes this efficient
+        // Use index-nested-loop for small LIMIT queries WITHOUT additional predicates.
+        //
+        // IMPORTANT: If there's a non-correlated predicate (e.g., status = 'cancelled'),
+        // semi-join is FASTER because:
+        // 1. Semi-join executes the filtered inner query ONCE, builds a hash set
+        // 2. Index NL would probe the index for EACH outer row, then filter
+        //
+        // Benchmark shows semi-join is 3x faster when additional predicates exist:
+        // - Semi-join: ~290μs (execute filtered query once, O(1) hash lookups)
+        // - Index NL:  ~940μs (per-row index probe + filter)
+        //
+        // Only use Index NL when:
+        // 1. Small LIMIT (early termination benefit)
+        // 2. NO additional predicates (pure correlation only)
+        // 3. Index exists on correlation column
         const SMALL_LIMIT_THRESHOLD: i64 = 500;
 
-        // For small LIMIT, per-row EXISTS/NOT EXISTS with index probe is faster
-        // Complexity: O(LIMIT × log(inner)) vs O(inner) for semi-join hash build
-        //
-        // Note: Both EXISTS and NOT EXISTS benefit from early termination:
-        // - EXISTS: return true as soon as one match is found
-        // - NOT EXISTS: return false as soon as one match is found
-        // So Index NL works well for both cases with small LIMIT.
+        // If there's a non-correlated predicate, always use semi-join
+        // The semi-join can efficiently filter by predicate in bulk
+        if info.non_correlated_where.is_some() {
+            return false;
+        }
+
+        // For pure correlation (no additional predicate), check if index NL is worth it
         if let Some(limit) = outer_limit {
             if limit > 0 && limit <= SMALL_LIMIT_THRESHOLD {
                 // Check if inner table has an index on correlation column
@@ -2598,15 +2644,16 @@ impl Executor {
         info: &SemiJoinInfo,
         ctx: &ExecutionContext,
     ) -> Result<AHashSet<crate::core::Value>> {
-        // Build cache key from inner table, column, and WHERE predicate
+        // Build cache key from inner table, column, and WHERE predicate hash
+        // Use expression hash instead of to_string() to avoid expensive string allocation
+        let pred_hash = info
+            .non_correlated_where
+            .as_ref()
+            .map(compute_expression_hash)
+            .unwrap_or(0);
         let cache_key = format!(
             "SEMI:{}:{}:{}",
-            info.inner_table,
-            info.inner_column,
-            info.non_correlated_where
-                .as_ref()
-                .map(|e| e.to_string())
-                .unwrap_or_default()
+            info.inner_table, info.inner_column, pred_hash
         );
 
         // Check cache first

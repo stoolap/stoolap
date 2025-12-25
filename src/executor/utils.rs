@@ -1068,6 +1068,9 @@ pub fn extract_column_name_with_qualifier(expr: &Expression) -> Option<(Option<S
 pub fn find_column_index(col_info: &(Option<String>, String), columns: &[String]) -> Option<usize> {
     let (qualifier, col_name) = col_info;
 
+    // Pre-compute qualified name if qualifier exists (avoid format! in loop)
+    let qualified = qualifier.as_ref().map(|q| format!("{}.{}", q, col_name));
+
     // First pass: try exact or qualified match
     for (idx, column) in columns.iter().enumerate() {
         let col_lower = column.to_lowercase();
@@ -1078,9 +1081,8 @@ pub fn find_column_index(col_info: &(Option<String>, String), columns: &[String]
         }
 
         // Try qualified match (table.column)
-        if let Some(q) = qualifier {
-            let qualified = format!("{}.{}", q, col_name);
-            if col_lower == qualified {
+        if let Some(ref q) = qualified {
+            if col_lower == *q {
                 return Some(idx);
             }
         }
@@ -1089,9 +1091,11 @@ pub fn find_column_index(col_info: &(Option<String>, String), columns: &[String]
     // Second pass: ONLY if no qualifier was provided, try suffix match
     // This allows matching "id" against "t1.id" when the column ref is just "id"
     if qualifier.is_none() {
+        // Pre-compute suffix pattern once (avoid format! in loop)
+        let suffix_pattern = format!(".{}", col_name);
         for (idx, column) in columns.iter().enumerate() {
             let col_lower = column.to_lowercase();
-            if col_lower.ends_with(&format!(".{}", col_name)) {
+            if col_lower.ends_with(&suffix_pattern) {
                 return Some(idx);
             }
         }

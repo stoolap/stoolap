@@ -44,8 +44,8 @@ mod vm;
 
 pub use compiler::{CompileContext, CompileError, ExprCompiler};
 pub use evaluator_bridge::{
-    compile_expression, compile_expression_with_context, CompiledEvaluator, ExpressionEval,
-    JoinFilter, MultiExpressionEval, RowFilter, SharedProgram,
+    compile_expression, compile_expression_with_context, compute_expression_hash,
+    CompiledEvaluator, ExpressionEval, JoinFilter, MultiExpressionEval, RowFilter, SharedProgram,
 };
 pub use ops::Op;
 pub use program::{Constant, Program};

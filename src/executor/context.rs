@@ -84,18 +84,46 @@ pub fn cache_in_subquery(key: String, values: Vec<Value>) {
 
 // Cache for semi-join (EXISTS) hash sets to avoid re-execution.
 // Thread-local to avoid synchronization overhead.
-// Uses the inner query SQL + predicate as key.
+// Uses the inner query SQL + predicate as key (format: "SEMI:table:column:predicate").
 use ahash::{AHashMap, AHashSet};
 thread_local! {
     static SEMI_JOIN_CACHE: RefCell<FxHashMap<String, Arc<AHashSet<Value>>>> = RefCell::new(FxHashMap::default());
 }
 
-/// Clear the semi-join cache. Should be called at the start of each top-level query.
+/// Clear the semi-join cache completely.
+/// NOTE: This is now only used for explicit cache clearing (e.g., after DDL operations).
+/// For DML operations, use `invalidate_semi_join_cache_for_table` instead.
 pub fn clear_semi_join_cache() {
     SEMI_JOIN_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
         c.clear();
         c.shrink_to_fit();
+    });
+}
+
+/// Invalidate semi-join cache entries for a specific table.
+/// Should be called after INSERT, UPDATE, DELETE, or TRUNCATE on a table.
+/// The cache key format is "SEMI:table:column:predicate", so we match on "SEMI:table:".
+#[inline]
+pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
+    SEMI_JOIN_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        if c.is_empty() {
+            return;
+        }
+        c.retain(|key, _| {
+            // Key format: "SEMI:table:column:predicate"
+            // Use zero-allocation comparison with eq_ignore_ascii_case
+            if let Some(rest) = key.strip_prefix("SEMI:") {
+                if let Some(colon_pos) = rest.find(':') {
+                    let key_table = &rest[..colon_pos];
+                    // Keep entry if table names DON'T match (case-insensitive)
+                    return !key_table.eq_ignore_ascii_case(table_name);
+                }
+            }
+            // Keep entries that don't match expected format
+            true
+        });
     });
 }
 
@@ -254,9 +282,9 @@ pub fn cache_exists_schema(key: String, columns: Vec<String>) {
 }
 
 // Cache for pre-computed EXISTS predicate cache keys to avoid expensive format!("{:?}") on every probe.
-// The key is a stable identifier for the subquery (e.g., its Debug repr), the value is the predicate cache key.
+// The key is the subquery pointer address (usize), the value is the predicate cache key.
 thread_local! {
-    static EXISTS_PRED_KEY_CACHE: RefCell<FxHashMap<String, String>> = RefCell::new(FxHashMap::default());
+    static EXISTS_PRED_KEY_CACHE: RefCell<FxHashMap<usize, String>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the EXISTS predicate key cache.
@@ -266,15 +294,17 @@ pub fn clear_exists_pred_key_cache() {
     });
 }
 
-/// Get cached predicate cache key by subquery identifier.
-pub fn get_cached_exists_pred_key(subquery_key: &str) -> Option<String> {
-    EXISTS_PRED_KEY_CACHE.with(|cache| cache.borrow().get(subquery_key).cloned())
+/// Get cached predicate cache key by subquery pointer address.
+#[inline]
+pub fn get_cached_exists_pred_key(subquery_ptr: usize) -> Option<String> {
+    EXISTS_PRED_KEY_CACHE.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
 }
 
 /// Cache a predicate cache key.
-pub fn cache_exists_pred_key(subquery_key: String, pred_key: String) {
+#[inline]
+pub fn cache_exists_pred_key(subquery_ptr: usize, pred_key: String) {
     EXISTS_PRED_KEY_CACHE.with(|cache| {
-        cache.borrow_mut().insert(subquery_key, pred_key);
+        cache.borrow_mut().insert(subquery_ptr, pred_key);
     });
 }
 
@@ -368,12 +398,14 @@ pub struct ExistsCorrelationInfo {
     pub outer_qualified_lower: Option<String>,
     /// The additional predicate beyond the correlation (if any)
     pub additional_predicate: Option<Expression>,
+    /// Pre-computed index cache key ("table:column") to avoid per-probe format! allocation
+    pub index_cache_key: String,
 }
 
 // Cache for EXISTS correlation info to avoid per-row extraction.
-// The key is the subquery pointer (as string), the value is the pre-computed info.
+// The key is the subquery pointer address (usize), avoiding format! allocation.
 thread_local! {
-    static EXISTS_CORRELATION_CACHE: RefCell<FxHashMap<String, Option<ExistsCorrelationInfo>>> = RefCell::new(FxHashMap::default());
+    static EXISTS_CORRELATION_CACHE: RefCell<FxHashMap<usize, Option<ExistsCorrelationInfo>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the EXISTS correlation cache.
@@ -383,15 +415,17 @@ pub fn clear_exists_correlation_cache() {
     });
 }
 
-/// Get cached EXISTS correlation info by subquery pointer.
-pub fn get_cached_exists_correlation(subquery_key: &str) -> Option<Option<ExistsCorrelationInfo>> {
-    EXISTS_CORRELATION_CACHE.with(|cache| cache.borrow().get(subquery_key).cloned())
+/// Get cached EXISTS correlation info by subquery pointer address.
+#[inline]
+pub fn get_cached_exists_correlation(subquery_ptr: usize) -> Option<Option<ExistsCorrelationInfo>> {
+    EXISTS_CORRELATION_CACHE.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
 }
 
 /// Cache EXISTS correlation info (None means correlation not extractable).
-pub fn cache_exists_correlation(subquery_key: String, info: Option<ExistsCorrelationInfo>) {
+#[inline]
+pub fn cache_exists_correlation(subquery_ptr: usize, info: Option<ExistsCorrelationInfo>) {
     EXISTS_CORRELATION_CACHE.with(|cache| {
-        cache.borrow_mut().insert(subquery_key, info);
+        cache.borrow_mut().insert(subquery_ptr, info);
     });
 }
 

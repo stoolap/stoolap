@@ -67,6 +67,16 @@ fn compute_cache_key(expr: &Expression, columns: &[String]) -> u64 {
     hasher.finish()
 }
 
+/// Compute a u64 hash of an expression without string allocation.
+/// This is O(expression_size) and avoids Debug formatting overhead.
+/// Use this for cache keys instead of format!("{:?}", expr).
+#[inline]
+pub fn compute_expression_hash(expr: &Expression) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hash_expression(expr, &mut hasher);
+    hasher.finish()
+}
+
 /// Recursively hash an expression without string allocation.
 /// This is O(expression_size) and avoids Debug formatting overhead.
 fn hash_expression(expr: &Expression, hasher: &mut DefaultHasher) {
@@ -124,14 +134,16 @@ fn hash_expression(expr: &Expression, hasher: &mut DefaultHasher) {
             hash_expression(&dist.expr, hasher);
         }
         Expression::Exists(exists) => {
-            // Hash a stable identifier for the subquery
-            format!("{:?}", exists.subquery).hash(hasher);
+            // Use pointer identity for hashing - avoids expensive Debug format allocation
+            // The subquery AST is stable during query execution
+            (exists.subquery.as_ref() as *const _ as usize).hash(hasher);
         }
         Expression::AllAny(aa) => {
             aa.operator.hash(hasher);
             std::mem::discriminant(&aa.all_any_type).hash(hasher);
             hash_expression(&aa.left, hasher);
-            format!("{:?}", aa.subquery).hash(hasher);
+            // Use pointer identity for hashing - avoids expensive Debug format allocation
+            (aa.subquery.as_ref() as *const _ as usize).hash(hasher);
         }
         Expression::In(in_expr) => {
             in_expr.not.hash(hasher);
@@ -161,7 +173,8 @@ fn hash_expression(expr: &Expression, hasher: &mut DefaultHasher) {
             }
         }
         Expression::ScalarSubquery(sq) => {
-            format!("{:?}", sq.subquery).hash(hasher);
+            // Use pointer identity for hashing - avoids expensive Debug format allocation
+            (sq.subquery.as_ref() as *const _ as usize).hash(hasher);
         }
         Expression::ExpressionList(list) => {
             list.expressions.len().hash(hasher);
@@ -238,7 +251,8 @@ fn hash_expression(expr: &Expression, hasher: &mut DefaultHasher) {
             }
         }
         Expression::JoinSource(js) => {
-            format!("{:?}", js).hash(hasher);
+            // Use pointer identity for hashing - avoids expensive Debug format allocation
+            (js.as_ref() as *const _ as usize).hash(hasher);
         }
         Expression::SubquerySource(sq) => {
             if let Some(ref alias) = sq.alias {
@@ -247,7 +261,8 @@ fn hash_expression(expr: &Expression, hasher: &mut DefaultHasher) {
             } else {
                 false.hash(hasher);
             }
-            format!("{:?}", sq.subquery).hash(hasher);
+            // Use pointer identity for hashing - avoids expensive Debug format allocation
+            (sq.subquery.as_ref() as *const _ as usize).hash(hasher);
         }
         Expression::ValuesSource(vs) => {
             if let Some(ref alias) = vs.alias {
@@ -1476,15 +1491,15 @@ impl<'a> CompiledEvaluator<'a> {
                 Self::hash_expression(&dist.expr, hasher);
             }
             Expression::Exists(exists) => {
-                // Hash a stable identifier for the subquery
-                // We use the subquery's string representation hash as a unique ID
-                format!("{:?}", exists.subquery).hash(hasher);
+                // Use pointer identity for hashing - avoids expensive Debug format allocation
+                (exists.subquery.as_ref() as *const _ as usize).hash(hasher);
             }
             Expression::AllAny(aa) => {
                 aa.operator.hash(hasher);
                 std::mem::discriminant(&aa.all_any_type).hash(hasher);
                 Self::hash_expression(&aa.left, hasher);
-                format!("{:?}", aa.subquery).hash(hasher);
+                // Use pointer identity for hashing - avoids expensive Debug format allocation
+                (aa.subquery.as_ref() as *const _ as usize).hash(hasher);
             }
             Expression::In(in_expr) => {
                 in_expr.not.hash(hasher);
@@ -1514,7 +1529,8 @@ impl<'a> CompiledEvaluator<'a> {
                 }
             }
             Expression::ScalarSubquery(sq) => {
-                format!("{:?}", sq.subquery).hash(hasher);
+                // Use pointer identity for hashing - avoids expensive Debug format allocation
+                (sq.subquery.as_ref() as *const _ as usize).hash(hasher);
             }
             Expression::ExpressionList(list) => {
                 list.expressions.len().hash(hasher);
@@ -1592,7 +1608,8 @@ impl<'a> CompiledEvaluator<'a> {
                 }
             }
             Expression::JoinSource(js) => {
-                format!("{:?}", js).hash(hasher);
+                // Use pointer identity for hashing - avoids expensive Debug format allocation
+                (js.as_ref() as *const _ as usize).hash(hasher);
             }
             Expression::SubquerySource(sq) => {
                 if let Some(ref alias) = sq.alias {
@@ -1601,7 +1618,8 @@ impl<'a> CompiledEvaluator<'a> {
                 } else {
                     false.hash(hasher);
                 }
-                format!("{:?}", sq.subquery).hash(hasher);
+                // Use pointer identity for hashing - avoids expensive Debug format allocation
+                (sq.subquery.as_ref() as *const _ as usize).hash(hasher);
             }
             Expression::ValuesSource(vs) => {
                 if let Some(ref alias) = vs.alias {

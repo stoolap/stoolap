@@ -32,6 +32,41 @@ pub const INVALID_TRANSACTION_ID: i64 = -999999999;
 /// Special transaction ID for recovery transactions (always visible)
 pub const RECOVERY_TRANSACTION_ID: i64 = -1;
 
+/// Transaction status for unified state tracking
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum TxnStatus {
+    /// Transaction is in progress, changes not visible to others
+    Active = 0,
+    /// Two-phase commit in progress, changes being finalized
+    Committing = 1,
+    /// Transaction complete, changes visible per isolation rules
+    Committed = 2,
+}
+
+/// Unified transaction state - replaces 3 separate DashMaps with 1
+/// This reduces DashMap operations per commit from 5 to 2
+#[derive(Clone, Copy, Debug)]
+pub struct TxnState {
+    /// Current transaction status
+    pub status: TxnStatus,
+    /// Sequence number when transaction began
+    pub begin_seq: i64,
+    /// Sequence number when transaction committed (0 if not yet committing)
+    pub commit_seq: i64,
+}
+
+impl TxnState {
+    #[inline]
+    const fn new_active(begin_seq: i64) -> Self {
+        Self {
+            status: TxnStatus::Active,
+            begin_seq,
+            commit_seq: 0,
+        }
+    }
+}
+
 /// Cache size for thread-local committed transaction cache
 /// Small size (32 entries) is sufficient since most scans see rows from few transactions
 const COMMITTED_CACHE_SIZE: usize = 32;
@@ -105,14 +140,13 @@ pub struct TransactionRegistry {
     /// Next transaction ID to assign
     next_txn_id: AtomicI64,
 
-    /// Active transactions: txn_id -> begin_sequence
-    active_transactions: ConcurrentInt64Map<i64>,
-
-    /// Committed transactions: txn_id -> commit_sequence
-    committed_transactions: ConcurrentInt64Map<i64>,
-
-    /// Committing transactions (two-phase commit): txn_id -> commit_sequence
-    committing_transactions: ConcurrentInt64Map<i64>,
+    /// Unified transaction state map: txn_id -> TxnState
+    /// Replaces 3 separate maps (active, committing, committed) with 1
+    /// Benefits:
+    /// - State transitions are atomic updates, not remove+insert
+    /// - Single lookup for visibility checks
+    /// - 60% fewer DashMap operations per commit
+    transactions: ConcurrentInt64Map<TxnState>,
 
     /// Global isolation level for new transactions (stored as u8 for lock-free access)
     /// 0 = ReadCommitted, 1 = SnapshotIsolation
@@ -138,9 +172,7 @@ impl TransactionRegistry {
     pub fn new() -> Self {
         Self {
             next_txn_id: AtomicI64::new(0),
-            active_transactions: new_concurrent_int64_map(),
-            committed_transactions: new_concurrent_int64_map(),
-            committing_transactions: new_concurrent_int64_map(),
+            transactions: new_concurrent_int64_map(),
             global_isolation_level: AtomicU8::new(0), // 0 = ReadCommitted
             transaction_isolation_levels: new_concurrent_int64_map(),
             isolation_override_count: AtomicUsize::new(0),
@@ -238,8 +270,9 @@ impl TransactionRegistry {
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::AcqRel) + 1;
         let begin_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
-        // Record the transaction as active (DashMap is lock-free)
-        self.active_transactions.insert(txn_id, begin_seq);
+        // Record the transaction as active (single DashMap insert)
+        self.transactions
+            .insert(txn_id, TxnState::new_active(begin_seq));
 
         (txn_id, begin_seq)
     }
@@ -251,16 +284,18 @@ impl TransactionRegistry {
     ///
     /// # Concurrency
     ///
-    /// This is now lock-free using atomic operations on DashMap.
+    /// This is now lock-free using atomic update on single DashMap entry.
     /// Multiple transactions can start committing concurrently.
     #[inline]
     pub fn start_commit(&self, txn_id: i64) -> i64 {
         // Get commit sequence atomically
         let commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
-        // Move from active to committing state (DashMap operations are atomic)
-        self.active_transactions.remove(&txn_id);
-        self.committing_transactions.insert(txn_id, commit_seq);
+        // Atomic state transition: Active -> Committing (single update, no remove+insert)
+        if let Some(mut entry) = self.transactions.get_mut(&txn_id) {
+            entry.status = TxnStatus::Committing;
+            entry.commit_seq = commit_seq;
+        }
 
         commit_seq
     }
@@ -272,37 +307,42 @@ impl TransactionRegistry {
     ///
     /// # Concurrency
     ///
-    /// Lock-free completion using DashMap atomic operations.
+    /// Lock-free completion using atomic update on single DashMap entry.
     #[inline]
     pub fn complete_commit(&self, txn_id: i64) {
-        // Get commit sequence from committing state
-        let commit_seq = self
-            .committing_transactions
-            .get(&txn_id)
-            .map(|r| *r)
-            .unwrap_or_else(|| self.next_sequence.load(Ordering::Acquire));
-
-        // Move from committing to committed state (atomic visibility)
-        self.committing_transactions.remove(&txn_id);
-        self.committed_transactions.insert(txn_id, commit_seq);
+        // Atomic state transition: Committing -> Committed (single update)
+        if let Some(mut entry) = self.transactions.get_mut(&txn_id) {
+            entry.status = TxnStatus::Committed;
+        }
     }
 
     /// Commits a transaction (for read-only transactions)
     ///
     /// This is a simplified commit path for transactions that made no changes.
+    /// Uses atomic update instead of remove+insert.
     pub fn commit_transaction(&self, txn_id: i64) -> i64 {
         let commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
-        // Remove from active and add to committed
-        self.active_transactions.remove(&txn_id);
-        self.committed_transactions.insert(txn_id, commit_seq);
+        // Atomic state transition: Active -> Committed (single update)
+        if let Some(mut entry) = self.transactions.get_mut(&txn_id) {
+            entry.status = TxnStatus::Committed;
+            entry.commit_seq = commit_seq;
+        }
 
         commit_seq
     }
 
     /// Recovers a committed transaction during startup recovery
     pub fn recover_committed_transaction(&self, txn_id: i64, commit_seq: i64) {
-        self.committed_transactions.insert(txn_id, commit_seq);
+        // Insert directly as committed state
+        self.transactions.insert(
+            txn_id,
+            TxnState {
+                status: TxnStatus::Committed,
+                begin_seq: commit_seq, // Use commit_seq as begin_seq for recovered txns
+                commit_seq,
+            },
+        );
 
         // Update next_txn_id if necessary
         loop {
@@ -366,26 +406,29 @@ impl TransactionRegistry {
     ///
     /// # Concurrency
     ///
-    /// Lock-free abort using DashMap atomic operations.
+    /// Lock-free abort - just remove from unified map.
     #[inline]
     pub fn abort_transaction(&self, txn_id: i64) {
-        // Remove from active transactions (DashMap is lock-free)
-        self.active_transactions.remove(&txn_id);
-
-        // Also remove from committing state if present (atomic)
-        self.committing_transactions.remove(&txn_id);
+        // Remove from unified map (handles any state: active or committing)
+        self.transactions.remove(&txn_id);
     }
 
     /// Gets the commit sequence for a transaction
     pub fn get_commit_sequence(&self, txn_id: i64) -> Option<i64> {
-        self.committed_transactions.get(&txn_id).map(|r| *r)
+        self.transactions.get(&txn_id).and_then(|entry| {
+            if entry.status == TxnStatus::Committed {
+                Some(entry.commit_seq)
+            } else {
+                None
+            }
+        })
     }
 
     /// Gets the begin sequence for an active transaction
     pub fn get_transaction_begin_sequence(&self, txn_id: i64) -> i64 {
-        self.active_transactions
+        self.transactions
             .get(&txn_id)
-            .map(|r| *r)
+            .map(|entry| entry.begin_seq)
             .unwrap_or(0)
     }
 
@@ -415,14 +458,16 @@ impl TransactionRegistry {
             return true;
         }
 
-        // SLOW PATH: DashMap lookup (~15-20ns)
-        if self.committed_transactions.contains_key(&version_txn_id) {
-            // Cache for future lookups
-            COMMITTED_TXN_CACHE.with(|cache| cache.borrow_mut().insert(version_txn_id));
-            return true;
+        // SLOW PATH: Single DashMap lookup (~15-20ns)
+        if let Some(entry) = self.transactions.get(&version_txn_id) {
+            if entry.status == TxnStatus::Committed {
+                // Cache for future lookups
+                COMMITTED_TXN_CACHE.with(|cache| cache.borrow_mut().insert(version_txn_id));
+                return true;
+            }
         }
 
-        // Committing transactions are NOT visible
+        // Active or Committing transactions are NOT visible
         false
     }
 
@@ -489,24 +534,24 @@ impl TransactionRegistry {
             return self.is_directly_visible(version_txn_id);
         }
 
-        // Committing transactions are NOT visible
-        if self.committing_transactions.contains_key(&version_txn_id) {
+        // Single lookup for version transaction state
+        let version_state = match self.transactions.get(&version_txn_id) {
+            Some(entry) => *entry,
+            None => return false,
+        };
+
+        // Must be committed (not active or committing)
+        if version_state.status != TxnStatus::Committed {
             return false;
         }
 
-        // Must be committed
-        let commit_seq = match self.committed_transactions.get(&version_txn_id) {
-            Some(seq) => *seq,
-            None => return false,
-        };
-
         // For Snapshot Isolation, version must be committed before viewer began
-        let viewer_begin_seq = match self.active_transactions.get(&viewer_txn_id) {
-            Some(seq) => *seq,
+        let viewer_begin_seq = match self.transactions.get(&viewer_txn_id) {
+            Some(entry) => entry.begin_seq,
             None => return false,
         };
 
-        commit_seq <= viewer_begin_seq
+        version_state.commit_seq <= viewer_begin_seq
     }
 
     /// Cleans up old committed transactions
@@ -528,39 +573,26 @@ impl TransactionRegistry {
             .map(|_| self.next_sequence.load(Ordering::Acquire) - (max_age.as_nanos() as i64))
             .unwrap_or(0);
 
-        // Collect active transaction IDs for snapshot isolation
-        let active_set: std::collections::HashSet<i64> =
-            if isolation_level == IsolationLevel::SnapshotIsolation {
-                self.active_transactions
-                    .iter()
-                    .map(|entry| *entry.key())
-                    .collect()
-            } else {
-                std::collections::HashSet::new()
-            };
-
-        // Collect transactions to remove
+        // Collect transactions to remove (committed with old commit_seq)
         let txns_to_remove: Vec<i64> = self
-            .committed_transactions
+            .transactions
             .iter()
             .filter(|entry| {
                 let txn_id = *entry.key();
-                let commit_seq = *entry.value();
+                let state = entry.value();
 
                 // Never clean up negative transaction IDs
                 if txn_id < 0 {
                     return false;
                 }
 
-                // Skip active transactions in snapshot isolation
-                if isolation_level == IsolationLevel::SnapshotIsolation
-                    && active_set.contains(&txn_id)
-                {
+                // Only cleanup committed transactions
+                if state.status != TxnStatus::Committed {
                     return false;
                 }
 
                 // Only remove old transactions
-                commit_seq < cutoff_time
+                state.commit_seq < cutoff_time
             })
             .map(|entry| *entry.key())
             .collect();
@@ -568,7 +600,7 @@ impl TransactionRegistry {
         // Remove collected transactions
         let mut removed = 0;
         for txn_id in txns_to_remove {
-            self.committed_transactions.remove(&txn_id);
+            self.transactions.remove(&txn_id);
             removed += 1;
         }
 
@@ -586,7 +618,7 @@ impl TransactionRegistry {
                 break;
             }
 
-            let active_count = self.active_transactions.len();
+            let active_count = self.active_count();
             if active_count == 0 {
                 return 0;
             }
@@ -594,7 +626,7 @@ impl TransactionRegistry {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        self.active_transactions.len() as i32
+        self.active_count() as i32
     }
 
     /// Stops accepting new transactions
@@ -619,22 +651,43 @@ impl TransactionRegistry {
 
     /// Gets the count of active transactions
     pub fn active_count(&self) -> usize {
-        self.active_transactions.len()
+        self.transactions
+            .iter()
+            .filter(|entry| entry.value().status == TxnStatus::Active)
+            .count()
     }
 
     /// Gets the count of committed transactions
     pub fn committed_count(&self) -> usize {
-        self.committed_transactions.len()
+        self.transactions
+            .iter()
+            .filter(|entry| entry.value().status == TxnStatus::Committed)
+            .count()
     }
 
     /// Checks if a transaction is active
     pub fn is_active(&self, txn_id: i64) -> bool {
-        self.active_transactions.contains_key(&txn_id)
+        self.transactions
+            .get(&txn_id)
+            .map(|entry| entry.status == TxnStatus::Active)
+            .unwrap_or(false)
     }
 
     /// Checks if a transaction is committed
     pub fn is_committed(&self, txn_id: i64) -> bool {
-        self.committed_transactions.contains_key(&txn_id)
+        self.transactions
+            .get(&txn_id)
+            .map(|entry| entry.status == TxnStatus::Committed)
+            .unwrap_or(false)
+    }
+
+    /// Checks if a transaction is in committing state (for testing)
+    #[cfg(test)]
+    pub fn is_committing(&self, txn_id: i64) -> bool {
+        self.transactions
+            .get(&txn_id)
+            .map(|entry| entry.status == TxnStatus::Committing)
+            .unwrap_or(false)
     }
 
     /// Get the current commit sequence number
@@ -654,7 +707,7 @@ impl TransactionRegistry {
     ///
     /// IMPORTANT: This should only be called for transactions already confirmed
     /// as committed via `is_visible`. If a committed transaction is not in the
-    /// `committed_transactions` map, it means it's an old transaction that was
+    /// `transactions` map, it means it's an old transaction that was
     /// cleaned up, so it definitely committed before the cutoff.
     pub fn is_committed_before(&self, txn_id: i64, cutoff_commit_seq: i64) -> bool {
         // Special case: snapshot versions (txn_id = -1) are always "old" commits
@@ -662,17 +715,20 @@ impl TransactionRegistry {
             return true;
         }
 
-        if let Some(commit_seq) = self.committed_transactions.get(&txn_id) {
-            // Use <= because current_commit_sequence() returns next_sequence which equals
-            // the commit_seq of the most recently committed transaction. Without <=, the
-            // last committed transaction before the cutoff would be incorrectly excluded.
-            *commit_seq <= cutoff_commit_seq
-        } else {
-            // If a transaction is committed (caller verified via is_visible) but
-            // not in the map, it's an old transaction that was cleaned up.
-            // Old transactions definitely committed before our cutoff.
-            true
+        if let Some(entry) = self.transactions.get(&txn_id) {
+            if entry.status == TxnStatus::Committed {
+                // Use <= because current_commit_sequence() returns next_sequence which equals
+                // the commit_seq of the most recently committed transaction. Without <=, the
+                // last committed transaction before the cutoff would be incorrectly excluded.
+                return entry.commit_seq <= cutoff_commit_seq;
+            }
+            return false;
         }
+
+        // If a transaction is committed (caller verified via is_visible) but
+        // not in the map, it's an old transaction that was cleaned up.
+        // Old transactions definitely committed before our cutoff.
+        true
     }
 }
 
@@ -695,11 +751,11 @@ impl VisibilityChecker for TransactionRegistry {
     }
 
     fn get_active_transaction_ids(&self) -> Vec<i64> {
-        let mut ids = Vec::new();
-        self.active_transactions
+        self.transactions
             .iter()
-            .for_each(|entry| ids.push(*entry.key()));
-        ids
+            .filter(|entry| entry.value().status == TxnStatus::Active)
+            .map(|entry| *entry.key())
+            .collect()
     }
 
     fn is_committed_before(&self, txn_id: i64, cutoff_commit_seq: i64) -> bool {
@@ -747,11 +803,11 @@ mod tests {
         let commit_seq = registry.start_commit(txn_id);
         assert!(commit_seq > 0);
         assert!(!registry.is_active(txn_id));
-        assert!(registry.committing_transactions.contains_key(&txn_id));
+        assert!(registry.is_committing(txn_id));
 
         // Complete commit
         registry.complete_commit(txn_id);
-        assert!(!registry.committing_transactions.contains_key(&txn_id));
+        assert!(!registry.is_committing(txn_id));
         assert!(registry.is_committed(txn_id));
     }
 

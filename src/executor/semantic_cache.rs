@@ -877,7 +877,8 @@ fn hash_expr_structure(expr: &Expression, hasher: &mut DefaultHasher) {
         }
         Expression::Infix(infix) => {
             7u8.hash(hasher);
-            format!("{:?}", infix.op_type).hash(hasher);
+            // Use discriminant for hashing - avoids expensive Debug format allocation
+            std::mem::discriminant(&infix.op_type).hash(hasher);
             hash_expr_structure(&infix.left, hasher);
             hash_expr_structure(&infix.right, hasher);
         }

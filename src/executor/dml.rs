@@ -27,7 +27,7 @@ use ahash::AHashMap;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use super::context::ExecutionContext;
+use super::context::{invalidate_semi_join_cache_for_table, ExecutionContext};
 use super::expression::CompiledEvaluator;
 use super::pushdown;
 use super::result::ExecResult;
@@ -253,6 +253,7 @@ impl Executor {
             // where concurrent queries could see new data in storage but get old cached results
             if rows_affected > 0 {
                 self.semantic_cache.invalidate_table(table_name);
+                invalidate_semi_join_cache_for_table(table_name);
             }
 
             // Commit if this is a standalone (auto-commit) transaction
@@ -451,6 +452,7 @@ impl Executor {
         // CRITICAL: Must invalidate before commit to prevent stale data window
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
+            invalidate_semi_join_cache_for_table(table_name);
         }
 
         // Commit if this is a standalone (auto-commit) transaction
@@ -548,21 +550,12 @@ impl Executor {
                 None
             };
 
-        // Pre-compute column indices and types for updates (avoids string comparison per row)
-        // We store the index, type, expression, and whether it has correlated subqueries
+        // Pre-compute column indices for correlated updates path only
+        // For non-correlated path, we compile directly from source expressions
+        // This avoids cloning Expression objects when they're not needed
         let update_indices: Vec<(usize, crate::core::DataType, Expression, bool)> =
-            if let Some(ref processed) = processed_updates {
-                processed
-                    .iter()
-                    .filter_map(|(col_name, expr)| {
-                        schema
-                            .columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .map(|idx| (idx, schema.columns[idx].data_type, expr.clone(), false))
-                    })
-                    .collect()
-            } else {
+            if has_correlated_updates {
+                // Only clone expressions when we actually need them (correlated path)
                 stmt.updates
                     .iter()
                     .filter_map(|(col_name, expr)| {
@@ -582,6 +575,9 @@ impl Executor {
                             })
                     })
                     .collect()
+            } else {
+                // Non-correlated path: empty vec, we compile directly from source later
+                Vec::new()
             };
 
         // Build WHERE expression for storage layer
@@ -751,11 +747,55 @@ impl Executor {
             table.update(where_expr.as_deref(), &mut setter)?
         } else {
             // Optimized path for non-correlated subqueries
-            let mut setter = |mut row: Row| -> (Row, bool) {
-                evaluator.set_row_array(&row);
+            // CRITICAL: Pre-compile update expressions ONCE before the loop
+            // Compile directly from source expressions (no intermediate cloning!)
+            use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
 
+            let compiled_updates: Vec<(usize, crate::core::DataType, SharedProgram)> =
+                if let Some(ref processed) = processed_updates {
+                    // Use pre-processed expressions (subqueries already evaluated)
+                    processed
+                        .iter()
+                        .filter_map(|(col_name, expr)| {
+                            schema
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                                .and_then(|idx| {
+                                    compile_expression(expr, column_names).ok().map(|program| {
+                                        (idx, schema.columns[idx].data_type, program)
+                                    })
+                                })
+                        })
+                        .collect()
+                } else {
+                    // Compile directly from statement expressions
+                    stmt.updates
+                        .iter()
+                        .filter_map(|(col_name, expr)| {
+                            schema
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                                .and_then(|idx| {
+                                    compile_expression(expr, column_names).ok().map(|program| {
+                                        (idx, schema.columns[idx].data_type, program)
+                                    })
+                                })
+                        })
+                        .collect()
+                };
+
+            // Create VM once and reuse for all rows
+            let mut vm = ExprVM::new();
+            // Extract params before the closure so they can be captured
+            let params = ctx.params();
+            let named_params = ctx.named_params();
+
+            let mut setter = |mut row: Row| -> (Row, bool) {
                 // If we need in-memory WHERE filtering, check the condition first
                 if needs_memory_filter {
+                    evaluator.set_row_array(&row);
                     if let Some(ref where_expr) = memory_where_clause {
                         match evaluator.evaluate_bool(where_expr) {
                             Ok(true) => {}
@@ -764,20 +804,26 @@ impl Executor {
                     }
                 }
 
-                // Evaluate ALL expressions FIRST using original row values
-                let new_values: Vec<(usize, crate::core::Value)> = update_indices
-                    .iter()
-                    .filter_map(|(idx, col_type, expr, _)| {
-                        evaluator
-                            .evaluate(expr)
-                            .ok()
-                            .map(|new_value| (*idx, new_value.into_coerce_to_type(*col_type)))
-                    })
-                    .collect();
+                // Execute pre-compiled programs (no recompilation per row)
+                let updates_to_apply: Vec<(usize, Value)> = {
+                    let row_data = row.as_slice();
+                    let exec_ctx = ExecuteContext::new(row_data)
+                        .with_params(params)
+                        .with_named_params(named_params);
+
+                    compiled_updates
+                        .iter()
+                        .filter_map(|(idx, col_type, program)| {
+                            vm.execute(program, &exec_ctx)
+                                .ok()
+                                .map(|v| (*idx, v.into_coerce_to_type(*col_type)))
+                        })
+                        .collect()
+                };
 
                 // Now apply all the computed values to the row
-                let changed = !new_values.is_empty();
-                for (idx, new_value) in new_values {
+                let changed = !updates_to_apply.is_empty();
+                for (idx, new_value) in updates_to_apply {
                     let _ = row.set(idx, new_value);
                 }
 
@@ -796,6 +842,7 @@ impl Executor {
         // CRITICAL: Must invalidate before commit to prevent stale data window
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
+            invalidate_semi_join_cache_for_table(table_name);
         }
 
         // Commit if this is a standalone (auto-commit) transaction
@@ -1064,6 +1111,7 @@ impl Executor {
         // CRITICAL: Must invalidate before commit to prevent stale data window
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
+            invalidate_semi_join_cache_for_table(table_name);
         }
 
         // Commit if this is a standalone (auto-commit) transaction
@@ -1133,6 +1181,7 @@ impl Executor {
         // CRITICAL: Must invalidate before commit to prevent stale data window
         // (TRUNCATE always invalidates, regardless of rows_affected, for safety)
         self.semantic_cache.invalidate_table(table_name);
+        invalidate_semi_join_cache_for_table(table_name);
 
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
