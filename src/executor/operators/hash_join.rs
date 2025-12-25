@@ -32,6 +32,8 @@
 //! - RIGHT OUTER: All right rows, matched left or NULLs
 //! - FULL OUTER: All rows from both sides
 
+use std::sync::Arc;
+
 use crate::core::{Result, Row, Value};
 use crate::executor::hash_table::{hash_row_keys, verify_key_equality, JoinHashTable};
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
@@ -133,7 +135,9 @@ pub struct HashJoinOperator {
     right_key_indices: Vec<usize>,
 
     // Build phase state (populated in open())
-    build_rows: Vec<Row>,
+    // Uses Arc<Vec<Row>> to enable zero-copy sharing with CTE results.
+    // When dropped, only decrements refcount (O(1)) instead of deallocating rows.
+    build_rows: Arc<Vec<Row>>,
     hash_table: Option<JoinHashTable>,
 
     // Output schema
@@ -195,7 +199,7 @@ impl HashJoinOperator {
             build_side,
             left_key_indices,
             right_key_indices,
-            build_rows: Vec::new(),
+            build_rows: Arc::new(Vec::new()),
             hash_table: None,
             schema,
             left_col_count,
@@ -223,7 +227,7 @@ impl HashJoinOperator {
     ///
     /// # Arguments
     /// * `probe` - Probe side operator (will be iterated during join)
-    /// * `build_rows` - Pre-materialized build side rows
+    /// * `build_rows` - Pre-materialized build side rows (Arc for zero-copy sharing)
     /// * `hash_table` - Pre-built hash table for build side
     /// * `join_type` - Type of join
     /// * `probe_key_indices` - Key indices for probe side
@@ -231,7 +235,7 @@ impl HashJoinOperator {
     /// * `build_is_left` - Whether build side is left (for schema ordering)
     pub fn with_prebuilt(
         probe: Box<dyn Operator>,
-        build_rows: Vec<Row>,
+        build_rows: Arc<Vec<Row>>,
         hash_table: crate::executor::hash_table::JoinHashTable,
         join_type: JoinType,
         probe_key_indices: Vec<usize>,
@@ -346,7 +350,7 @@ impl HashJoinOperator {
             build_side: JoinSide::Left, // Build from the single input
             left_key_indices,
             right_key_indices,
-            build_rows: Vec::new(),
+            build_rows: Arc::new(Vec::new()),
             hash_table: None,
             schema,
             left_col_count: col_count,
@@ -498,7 +502,8 @@ impl Operator for HashJoinOperator {
             self.build_matched = vec![false; build_rows.len()];
         }
 
-        self.build_rows = build_rows;
+        // Wrap in Arc for zero-copy drop (only refcount decrement, not deallocation)
+        self.build_rows = Arc::new(build_rows);
         self.hash_table = Some(hash_table);
         self.opened = true;
 

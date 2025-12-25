@@ -98,6 +98,15 @@ pub trait QueryResult: Send {
         0
     }
 
+    /// Try to extract all rows as Arc<Vec<Row>> for zero-copy joins
+    ///
+    /// Returns None if the result cannot provide Arc-wrapped rows.
+    /// This consumes the result - after calling, iteration will yield no more rows.
+    /// Default implementation returns None.
+    fn try_into_arc_rows(&mut self) -> Option<Arc<Vec<Row>>> {
+        None
+    }
+
     /// Sets column aliases for this result
     ///
     /// The map keys are alias names, values are original column names.

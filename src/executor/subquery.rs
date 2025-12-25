@@ -29,11 +29,13 @@ use crate::parser::token::TokenType;
 use crate::storage::traits::Engine;
 
 use super::context::{
-    cache_exists_fetcher, cache_exists_index, cache_exists_pred_key, cache_exists_predicate,
-    cache_exists_schema, cache_in_subquery, cache_scalar_subquery, cache_semi_join,
-    get_cached_exists_fetcher, get_cached_exists_index, get_cached_exists_pred_key,
-    get_cached_exists_predicate, get_cached_exists_schema, get_cached_in_subquery,
-    get_cached_scalar_subquery, get_cached_semi_join, ExecutionContext,
+    cache_batch_aggregate, cache_batch_aggregate_info, cache_exists_fetcher, cache_exists_index,
+    cache_exists_pred_key, cache_exists_predicate, cache_exists_schema, cache_in_subquery,
+    cache_scalar_subquery, cache_semi_join, get_cached_batch_aggregate,
+    get_cached_batch_aggregate_info, get_cached_exists_fetcher, get_cached_exists_index,
+    get_cached_exists_pred_key, get_cached_exists_predicate, get_cached_exists_schema,
+    get_cached_in_subquery, get_cached_scalar_subquery, get_cached_semi_join,
+    BatchAggregateLookupInfo, ExecutionContext,
 };
 use super::utils::{dummy_token, value_to_expression};
 use super::Executor;
@@ -767,6 +769,237 @@ impl Executor {
         }
     }
 
+    /// Extract the aggregate function name from an expression.
+    /// Returns Some(func_name) for COUNT, SUM, AVG, MIN, MAX.
+    fn extract_aggregate_function(expr: &Expression) -> Option<String> {
+        match expr {
+            Expression::FunctionCall(func) => {
+                let name = func.function.to_uppercase();
+                if matches!(name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                    Some(name)
+                } else {
+                    None
+                }
+            }
+            Expression::Aliased(a) => Self::extract_aggregate_function(&a.expression),
+            _ => None,
+        }
+    }
+
+    /// Try to look up a batch aggregate result from cache.
+    /// Returns Some(value) if found in cache, None otherwise.
+    /// Uses cached lookup info to avoid per-row allocations.
+    fn try_lookup_batch_aggregate(
+        subquery: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Option<crate::core::Value> {
+        // Need outer row context for correlated subquery
+        let outer_row = ctx.outer_row()?;
+
+        // Get or compute lookup info (cached to avoid per-row allocations)
+        let subquery_key = subquery.to_string();
+        let lookup_info = match get_cached_batch_aggregate_info(&subquery_key) {
+            Some(cached) => cached?,
+            None => {
+                // First time: compute and cache the lookup info
+                let info = Self::compute_batch_aggregate_info(subquery);
+                cache_batch_aggregate_info(subquery_key, info.clone());
+                info?
+            }
+        };
+
+        // Get the outer value from the outer row hashmap (no allocation)
+        let outer_value = if let Some(ref qualified) = lookup_info.outer_qualified_lower {
+            outer_row
+                .get(qualified)
+                .or_else(|| outer_row.get(&lookup_info.outer_column_lower))
+        } else {
+            outer_row.get(&lookup_info.outer_column_lower)
+        };
+
+        let outer_value = match outer_value {
+            Some(v) if !v.is_null() => v.clone(),
+            // NULL never matches - for COUNT return 0, for other aggregates return NULL
+            Some(_) => {
+                return if lookup_info.is_count {
+                    Some(Value::Integer(0))
+                } else {
+                    Some(Value::null_unknown())
+                }
+            }
+            None => return None, // Column not found, can't optimize
+        };
+
+        // Look up in cache
+        let cache = get_cached_batch_aggregate(&lookup_info.cache_key)?;
+        let result = cache.get(&outer_value).cloned();
+
+        // Return 0 for COUNT if key not found (no matching rows)
+        if result.is_none() && lookup_info.is_count {
+            return Some(Value::Integer(0));
+        }
+
+        result
+    }
+
+    /// Compute batch aggregate lookup info for a subquery.
+    /// Returns None if the subquery is not batchable.
+    fn compute_batch_aggregate_info(
+        subquery: &SelectStatement,
+    ) -> Option<BatchAggregateLookupInfo> {
+        // Build cache key - returns None if not a batchable aggregate
+        let cache_key = Self::build_batch_aggregate_key(subquery)?;
+
+        // Extract correlation info
+        let correlation = Self::extract_index_nested_loop_info(subquery)?;
+
+        // Pre-compute lowercase column names
+        let outer_column_lower = correlation.outer_column.to_lowercase();
+        let outer_qualified_lower = correlation
+            .outer_table
+            .as_ref()
+            .map(|tbl| format!("{}.{}", tbl.to_lowercase(), outer_column_lower));
+
+        let is_count = Self::is_count_expression(&subquery.columns[0]);
+
+        Some(BatchAggregateLookupInfo {
+            cache_key,
+            outer_column_lower,
+            outer_qualified_lower,
+            is_count,
+        })
+    }
+
+    /// Build a cache key for batch aggregate based on subquery structure.
+    /// The key identifies the subquery pattern (table, correlation column, aggregate function).
+    fn build_batch_aggregate_key(subquery: &SelectStatement) -> Option<String> {
+        // Extract table name
+        let table_name = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
+            Some(Expression::TableSource(ts)) => ts.name.value.clone(),
+            _ => return None,
+        };
+
+        // Extract aggregate function
+        if subquery.columns.len() != 1 {
+            return None;
+        }
+        let agg_func = Self::extract_aggregate_function(&subquery.columns[0])?;
+
+        // Extract correlation column
+        let correlation = Self::extract_index_nested_loop_info(subquery)?;
+
+        Some(format!(
+            "batch_agg:{}:{}:{}",
+            table_name.to_lowercase(),
+            correlation.inner_column.to_lowercase(),
+            agg_func
+        ))
+    }
+
+    /// Try to execute and cache a batch aggregate query.
+    /// This executes `SELECT correlation_col, AGG() FROM table GROUP BY correlation_col`
+    /// and caches the results for O(1) lookup per outer row.
+    fn try_execute_and_cache_batch_aggregate(
+        &self,
+        subquery: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<Arc<rustc_hash::FxHashMap<Value, Value>>>> {
+        // Must have single aggregate column
+        if subquery.columns.len() != 1 {
+            return Ok(None);
+        }
+
+        // Verify this is an aggregate function (COUNT, SUM, AVG, MIN, MAX)
+        if Self::extract_aggregate_function(&subquery.columns[0]).is_none() {
+            return Ok(None);
+        }
+
+        // Must not have GROUP BY (we'll add our own)
+        if !subquery.group_by.columns.is_empty() {
+            return Ok(None);
+        }
+
+        // Must not have HAVING, LIMIT, OFFSET (these would change results)
+        if subquery.having.is_some() || subquery.limit.is_some() || subquery.offset.is_some() {
+            return Ok(None);
+        }
+
+        // Extract correlation info
+        let correlation = match Self::extract_index_nested_loop_info(subquery) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // Must not have additional predicates (only the correlation predicate)
+        if correlation.additional_predicate.is_some() {
+            return Ok(None);
+        }
+
+        // Build cache key
+        let cache_key = match Self::build_batch_aggregate_key(subquery) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        // Check if already cached
+        if let Some(cached) = get_cached_batch_aggregate(&cache_key) {
+            return Ok(Some(cached));
+        }
+
+        // Build the batch aggregate query:
+        // SELECT correlation_column, AGG(...) FROM table GROUP BY correlation_column
+        let inner_col_expr = Expression::Identifier(Identifier {
+            token: dummy_token(&correlation.inner_column, TokenType::Identifier),
+            value: correlation.inner_column.clone(),
+            value_lower: correlation.inner_column.to_lowercase(),
+        });
+
+        // Clone the aggregate expression from the original subquery
+        let agg_expr = subquery.columns[0].clone();
+
+        let batch_query = SelectStatement {
+            token: dummy_token("SELECT", TokenType::Keyword),
+            columns: vec![inner_col_expr.clone(), agg_expr],
+            table_expr: subquery.table_expr.clone(),
+            where_clause: None, // No WHERE - we want all rows
+            group_by: GroupByClause {
+                columns: vec![inner_col_expr],
+                modifier: GroupByModifier::None,
+            },
+            having: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            distinct: false,
+            with: None,
+            window_defs: vec![],
+            set_operations: vec![],
+        };
+
+        // Execute the batch query
+        let subquery_ctx = ctx.with_incremented_query_depth();
+        let mut result = self.execute_select(&batch_query, &subquery_ctx)?;
+
+        // Build the result map
+        let mut result_map: rustc_hash::FxHashMap<Value, Value> = rustc_hash::FxHashMap::default();
+        while result.next() {
+            let row = result.row();
+            if row.len() >= 2 {
+                let key = row.get(0).cloned().unwrap_or(Value::null_unknown());
+                let value = row.get(1).cloned().unwrap_or(Value::null_unknown());
+                if !key.is_null() {
+                    result_map.insert(key, value);
+                }
+            }
+        }
+
+        // Cache the results
+        cache_batch_aggregate(cache_key.clone(), result_map);
+
+        // Return the cached Arc
+        Ok(get_cached_batch_aggregate(&cache_key))
+    }
+
     /// Get or create a cached row fetcher for the given table.
     ///
     /// This helper reduces code duplication for the pattern of:
@@ -1082,6 +1315,28 @@ impl Executor {
         if !is_non_correlated {
             if let Some(count) = self.try_execute_scalar_count_with_index(subquery, ctx)? {
                 return Ok(crate::core::Value::Integer(count));
+            }
+
+            // OPTIMIZATION: Try batch aggregate lookup for correlated scalar subqueries
+            // First check if we have a cached batch result
+            if let Some(value) = Self::try_lookup_batch_aggregate(subquery, ctx) {
+                return Ok(value);
+            }
+
+            // If not cached, try to execute batch aggregate and cache results
+            // This is done on first call and subsequent calls will hit the cache
+            if let Some(batch_cache) = self.try_execute_and_cache_batch_aggregate(subquery, ctx)? {
+                // Now look up the value for this specific outer row
+                if let Some(value) = Self::try_lookup_batch_aggregate(subquery, ctx) {
+                    return Ok(value);
+                }
+                // If key not found and it's COUNT, return 0
+                if Self::is_count_expression(&subquery.columns[0]) {
+                    return Ok(Value::Integer(0));
+                }
+                // For other aggregates (SUM, AVG, etc.), return NULL for no matching rows
+                // We have the cache but the outer value isn't present
+                drop(batch_cache); // Just used to confirm we have the cache
             }
         }
 

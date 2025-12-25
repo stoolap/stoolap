@@ -49,10 +49,12 @@ use super::utils::{build_column_index_map, extract_join_keys_and_residual, is_so
 use super::Executor;
 
 /// Type alias for CTE data map
-pub type CteDataMap = FxHashMap<String, (Vec<String>, Vec<Row>)>;
+/// Uses Arc<Vec<Row>> to enable zero-copy sharing of CTE results with joins
+pub type CteDataMap = FxHashMap<String, (Vec<String>, Arc<Vec<Row>>)>;
 
 /// Type alias for join data result (left_columns, left_rows, right_columns, right_rows)
-type JoinDataResult = (Vec<String>, Vec<Row>, Vec<String>, Vec<Row>);
+/// Uses Arc<Vec<Row>> to enable zero-copy sharing of CTE results with join operators
+type JoinDataResult = (Vec<String>, Arc<Vec<Row>>, Vec<String>, Arc<Vec<Row>>);
 
 /// Convert an expression to a normalized lowercase string for ORDER BY matching.
 /// Handles nested function calls, multiple arguments, and various expression types.
@@ -141,13 +143,25 @@ impl CteRegistry {
     /// Uses Arc::make_mut for COW semantics:
     /// - If we're the only owner, mutates in place (no clone)
     /// - If shared, clones first then mutates (preserves other references)
+    ///
+    /// Rows are wrapped in Arc to enable zero-copy sharing with joins.
     pub fn store(&mut self, name: &str, columns: Vec<String>, rows: Vec<Row>) {
+        let name_lower = name.to_lowercase();
+        Arc::make_mut(&mut self.data).insert(name_lower, (columns, Arc::new(rows)));
+    }
+
+    /// Store a materialized CTE result with pre-wrapped Arc
+    ///
+    /// Use this when you already have an Arc<Vec<Row>> to avoid cloning.
+    /// This enables zero-copy sharing of CTE results between queries.
+    pub fn store_arc(&mut self, name: &str, columns: Vec<String>, rows: Arc<Vec<Row>>) {
         let name_lower = name.to_lowercase();
         Arc::make_mut(&mut self.data).insert(name_lower, (columns, rows));
     }
 
     /// Get a CTE result by name
-    pub fn get(&self, name: &str) -> Option<(&Vec<String>, &Vec<Row>)> {
+    /// Returns Arc reference to enable zero-copy sharing with joins
+    pub fn get(&self, name: &str) -> Option<(&Vec<String>, &Arc<Vec<Row>>)> {
         let name_lower = name.to_lowercase();
         self.data.get(&name_lower).map(|(cols, rows)| (cols, rows))
     }
@@ -167,7 +181,7 @@ impl CteRegistry {
     }
 
     /// Iterate over all stored CTEs (for copying to temp registries)
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &(Vec<String>, Vec<Row>))> {
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &(Vec<String>, Arc<Vec<Row>>))> {
         self.data.iter()
     }
 }
@@ -274,11 +288,12 @@ impl Executor {
                 if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
                     if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                         // Execute query against CTE result
+                        // Dereference Arc to get &Vec<Row>, then clone to Vec<Row>
                         return self.execute_query_on_cte_result(
                             stmt,
                             ctx,
                             columns.clone(),
-                            rows.clone(),
+                            (**rows).clone(),
                         );
                     }
                 }
@@ -408,9 +423,9 @@ impl Executor {
 
             // Create a temporary CTE registry with current working set
             let mut temp_registry = CteRegistry::new();
-            // Copy existing CTEs
+            // Copy existing CTEs - share Arc to avoid cloning row data
             for (name, (cols, rows)) in cte_registry.iter() {
-                temp_registry.store(name, cols.clone(), rows.clone());
+                temp_registry.store_arc(name, cols.clone(), Arc::clone(rows));
             }
             // Add current CTE with working rows
             temp_registry.store(cte_name, columns.clone(), working_rows.clone());
@@ -461,11 +476,12 @@ impl Executor {
                 if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
                     if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                         // Execute query against CTE result
+                        // Dereference Arc to get &Vec<Row>, then clone to Vec<Row>
                         let (result_cols, result_rows) = self.execute_query_on_cte_result(
                             stmt,
                             &ctx_with_ctes,
                             columns.clone(),
-                            rows.clone(),
+                            (**rows).clone(),
                         )?;
                         return Ok(Box::new(ExecutorMemoryResult::new(
                             result_cols,
@@ -624,7 +640,8 @@ impl Executor {
                 None => {
                     let (result, cols) = self.execute_table_expression(&join_source.left, ctx)?;
                     let rows = Self::materialize_result(result)?;
-                    (cols, rows)
+                    // Wrap in Arc for consistency with CTE data
+                    (cols, Arc::new(rows))
                 }
             };
 
@@ -633,7 +650,8 @@ impl Executor {
                 None => {
                     let (result, cols) = self.execute_table_expression(&join_source.right, ctx)?;
                     let rows = Self::materialize_result(result)?;
-                    (cols, rows)
+                    // Wrap in Arc for consistency with CTE data
+                    (cols, Arc::new(rows))
                 }
             };
             (left_columns, left_rows, right_columns, right_rows)
@@ -724,7 +742,9 @@ impl Executor {
             right_sorted,
         );
 
-        // Use JoinExecutor for consistent join execution (takes ownership of rows)
+        // Use JoinExecutor for consistent join execution
+        // Passes Arc<Vec<Row>> directly for zero-copy sharing with CTE results.
+        // JoinExecutor will only clone if necessary (e.g., parallel path).
         let join_executor = JoinExecutor::new();
         let join_result = join_executor.execute(JoinRequest {
             left_rows,
@@ -803,16 +823,19 @@ impl Executor {
     }
 
     /// Resolve a table expression - returns Some if it's a CTE, None if it's a regular table
+    /// Returns Arc-wrapped rows to enable zero-copy sharing with join operators
+    #[allow(clippy::type_complexity)]
     fn resolve_table_or_cte(
         &self,
         expr: &Expression,
         _ctx: &ExecutionContext,
         cte_registry: &CteRegistry,
-    ) -> Result<Option<(Vec<String>, Vec<Row>)>> {
+    ) -> Result<Option<(Vec<String>, Arc<Vec<Row>>)>> {
         // Use the base CTE name (not alias) for registry lookup
         if let Some(cte_name) = self.extract_cte_name_for_lookup(expr) {
             if let Some((columns, rows)) = cte_registry.get(&cte_name) {
-                return Ok(Some((columns.clone(), rows.clone())));
+                // Return Arc::clone for zero-copy sharing
+                return Ok(Some((columns.clone(), Arc::clone(rows))));
             }
         }
         Ok(None)
@@ -821,14 +844,15 @@ impl Executor {
     /// Execute CTE JOIN with semi-join reduction optimization.
     /// When one side is a CTE and the other is a regular table, extract join keys from the CTE
     /// and use them to filter the regular table scan via IN clause (which can use indexes).
+    /// Accepts Arc<Vec<Row>> to enable zero-copy sharing of CTE results.
     #[allow(clippy::too_many_arguments)]
     fn execute_cte_join_with_semijoin_reduction(
         &self,
         left_expr: &Expression,
         right_expr: &Expression,
         join_condition: Option<&Expression>,
-        left_data: Option<(Vec<String>, Vec<Row>)>,
-        right_data: Option<(Vec<String>, Vec<Row>)>,
+        left_data: Option<(Vec<String>, Arc<Vec<Row>>)>,
+        right_data: Option<(Vec<String>, Arc<Vec<Row>>)>,
         left_is_cte: bool,
         ctx: &ExecutionContext,
     ) -> Result<JoinDataResult> {
@@ -878,7 +902,8 @@ impl Executor {
                     // Extract distinct non-NULL values from CTE
                     let mut seen: AHashSet<Value> = AHashSet::with_capacity(cte_rows.len());
 
-                    for row in &cte_rows {
+                    // Iterate over Arc<Vec<Row>> by dereferencing
+                    for row in cte_rows.iter() {
                         if let Some(val) = row.get(idx) {
                             if !val.is_null() {
                                 seen.insert(val.clone());
@@ -910,7 +935,8 @@ impl Executor {
         } else {
             self.execute_table_expression(table_expr, ctx)?
         };
-        let table_rows = Self::materialize_result(table_result)?;
+        // Wrap materialized result in Arc for consistency with CTE data
+        let table_rows = Arc::new(Self::materialize_result(table_result)?);
 
         // Return in correct order (left, right)
         if cte_on_left {
@@ -1745,13 +1771,14 @@ impl Executor {
     /// because we can do direct lookups instead of building a hash table.
     ///
     /// Returns Some(result) if Index Nested Loop was used, None if not applicable.
+    /// Accepts Arc<Vec<Row>> to enable zero-copy sharing of CTE results.
     #[allow(clippy::too_many_arguments)]
     fn try_cte_index_nested_loop_join(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         join_source: &JoinTableSource,
-        cte_data: (Vec<String>, Vec<Row>),
+        cte_data: (Vec<String>, Arc<Vec<Row>>),
         table_expr: &Expression,
         cte_on_left: bool,
         cte_alias: Option<String>,
@@ -1893,10 +1920,10 @@ impl Executor {
         };
 
         // Execute Index Nested Loop Join using operator
-        // Wrap outer rows as a QueryResult/Operator
-        let outer_result: Box<dyn QueryResult> = Box::new(ExecutorMemoryResult::new(
+        // Wrap outer rows as a QueryResult/Operator using Arc for zero-copy sharing
+        let outer_result: Box<dyn QueryResult> = Box::new(ExecutorMemoryResult::with_shared_rows(
             outer_cols.clone(),
-            outer_rows.clone(),
+            Arc::clone(outer_rows),
         ));
         let outer_op: Box<dyn Operator> =
             Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));

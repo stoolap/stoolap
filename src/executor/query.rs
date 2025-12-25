@@ -40,11 +40,15 @@ use crate::storage::traits::{Engine, QueryResult};
 const MAX_VIEW_DEPTH: usize = 32;
 
 use super::context::{
-    clear_exists_fetcher_cache, clear_exists_index_cache, clear_exists_pred_key_cache,
-    clear_exists_predicate_cache, clear_exists_schema_cache, clear_in_subquery_cache,
-    clear_scalar_subquery_cache, clear_semi_join_cache, ExecutionContext, TimeoutGuard,
+    clear_batch_aggregate_cache, clear_batch_aggregate_info_cache, clear_exists_fetcher_cache,
+    clear_exists_index_cache, clear_exists_pred_key_cache, clear_exists_predicate_cache,
+    clear_exists_schema_cache, clear_in_subquery_cache, clear_scalar_subquery_cache,
+    clear_semi_join_cache, ExecutionContext, TimeoutGuard,
 };
-use super::expression::{CompiledEvaluator, ExpressionEval, JoinFilter, RowFilter};
+use super::expression::{
+    compile_expression, CompiledEvaluator, ExecuteContext, ExprVM, ExpressionEval, JoinFilter,
+    RowFilter, SharedProgram,
+};
 use super::hash_table::JoinHashTable;
 use super::join_executor::{JoinExecutor, StreamingJoinRequest};
 use super::operator::{ColumnInfo, Operator, QueryResultOperator};
@@ -178,6 +182,8 @@ impl Executor {
             clear_exists_fetcher_cache();
             clear_exists_schema_cache();
             clear_exists_pred_key_cache();
+            clear_batch_aggregate_cache();
+            clear_batch_aggregate_info_cache();
             TimeoutGuard::new(ctx)
         } else {
             None
@@ -795,11 +801,12 @@ impl Executor {
                 let table_name = &table_source.name.value_lower;
                 if let Some((columns, rows)) = ctx.get_cte(table_name) {
                     // Execute query against CTE data
+                    // Dereference Arc to get &Vec<Row>, then clone to Vec<Row>
                     return self.execute_query_on_memory_result(
                         stmt,
                         ctx,
                         columns.clone(),
-                        rows.clone(),
+                        (**rows).clone(),
                     );
                 }
 
@@ -2656,7 +2663,7 @@ impl Executor {
                 left_filter.as_ref(),
                 Some(limit_n),
             )?;
-            let left_rows = Self::materialize_result(left_result)?;
+            let left_rows = Self::materialize_result_arc(left_result)?;
 
             // Step 2: Extract join key values from limited left rows
             let left_key_idx = Self::find_column_index_by_name(&left_key_col, &left_cols);
@@ -2697,7 +2704,7 @@ impl Executor {
                 ctx,
                 right_filter_with_in.as_ref(),
             )?;
-            let right_rows = Self::materialize_result(right_result)?;
+            let right_rows = Self::materialize_result_arc(right_result)?;
 
             (left_rows, left_cols, right_rows, right_cols)
         } else {
@@ -3279,10 +3286,10 @@ impl Executor {
                     // Materialize the smaller side as build, stream the larger as probe
                     let (build_rows, build_cols, probe_result, probe_cols, build_is_left) =
                         if build_left {
-                            let build = Self::materialize_result(left_result)?;
+                            let build = Self::materialize_result_arc(left_result)?;
                             (build, left_cols, right_result, right_cols, true)
                         } else {
-                            let build = Self::materialize_result(right_result)?;
+                            let build = Self::materialize_result_arc(right_result)?;
                             (build, right_cols, left_result, left_cols, false)
                         };
 
@@ -3384,8 +3391,8 @@ impl Executor {
                 right_filter.as_ref(),
             )?;
 
-            let left_rows = Self::materialize_result(left_result)?;
-            let right_rows = Self::materialize_result(right_result)?;
+            let left_rows = Self::materialize_result_arc(left_result)?;
+            let right_rows = Self::materialize_result_arc(right_result)?;
 
             (left_rows, left_cols, right_rows, right_cols)
         };
@@ -4380,20 +4387,28 @@ impl Executor {
                         .map(|col| format!("{}.{}", table_alias, col))
                         .collect();
 
-                    // Apply filter to CTE data if present
-                    let filtered_rows = if let Some(filter_expr) = filter {
+                    // Apply filter to CTE data if present, or use shared Arc for zero-copy
+                    let result: Box<dyn QueryResult> = if let Some(filter_expr) = filter {
+                        // Need to clone matching rows
                         let row_filter = RowFilter::new(filter_expr, columns)?;
-                        rows.iter()
+                        let filtered_rows: Vec<Row> = rows
+                            .iter()
                             .filter(|row| row_filter.matches(row))
                             .cloned()
-                            .collect()
+                            .collect();
+                        Box::new(super::result::ExecutorMemoryResult::new(
+                            columns.clone(),
+                            filtered_rows,
+                        ))
                     } else {
-                        rows.clone()
+                        // Zero-copy: share the Arc<Vec<Row>> directly
+                        Box::new(super::result::ExecutorMemoryResult::with_shared_rows(
+                            columns.clone(),
+                            Arc::clone(rows),
+                        ))
                     };
 
-                    let result =
-                        super::result::ExecutorMemoryResult::new(columns.clone(), filtered_rows);
-                    return Ok((Box::new(result), qualified_columns));
+                    return Ok((result, qualified_columns));
                 }
 
                 // Check if this is actually a view (for JOINs that reference views)
@@ -4644,6 +4659,26 @@ impl Executor {
         Ok(rows)
     }
 
+    /// Materialize a result into an Arc<Vec<Row>> for zero-copy sharing with joins
+    ///
+    /// This method first tries to extract an Arc directly from the result (e.g., from CTE cache),
+    /// falling back to iterating and collecting rows if not possible.
+    pub(crate) fn materialize_result_arc(
+        mut result: Box<dyn QueryResult>,
+    ) -> Result<Arc<Vec<Row>>> {
+        // Try to extract Arc directly (zero-copy path for CTEs)
+        if let Some(arc_rows) = result.try_into_arc_rows() {
+            return Ok(arc_rows);
+        }
+
+        // Fallback: iterate and collect
+        let mut rows = Vec::new();
+        while result.next() {
+            rows.push(result.take_row());
+        }
+        Ok(Arc::new(rows))
+    }
+
     /// Project rows by evaluating SELECT expressions
     ///
     /// Optimized to:
@@ -4872,7 +4907,23 @@ impl Executor {
             // Fall through to slow path if there are duplicates
         }
 
-        // Slow path: Use Evaluator for complex expressions
+        // OPTIMIZATION: Pre-compute table alias lowercase (all_columns_lower computed earlier)
+        let table_alias_lower: Option<String> = table_alias.map(|a| a.to_lowercase());
+
+        // For non-correlated queries, use the optimized path with pre-compiled expressions
+        if !has_correlated_select {
+            return self.project_rows_optimized(
+                select_exprs,
+                rows,
+                all_columns,
+                &all_columns_lower,
+                &col_index_map_lower,
+                table_alias_lower.as_deref(),
+                ctx,
+            );
+        }
+
+        // Correlated subquery path: expressions change per-row, use CompiledEvaluator
         let mut projected = Vec::with_capacity(rows.len());
 
         // Create evaluator once and reuse for all rows
@@ -4881,85 +4932,61 @@ impl Executor {
         evaluator.init_columns(all_columns);
 
         // OPTIMIZATION: Pre-compute column name mappings outside the loop for correlated subqueries
-        let column_keys: Option<Vec<ColumnKeyMapping>> = if has_correlated_select {
-            Some(ColumnKeyMapping::build_mappings(all_columns, table_alias))
-        } else {
-            None
-        };
+        let column_keys = ColumnKeyMapping::build_mappings(all_columns, table_alias);
 
         // OPTIMIZATION: Pre-allocate outer_row_map with capacity and reuse
         let base_capacity = all_columns.len() * 2;
         let mut outer_row_map: FxHashMap<String, Value> = FxHashMap::default();
-        if has_correlated_select {
-            outer_row_map.reserve(base_capacity);
-        }
+        outer_row_map.reserve(base_capacity);
 
-        // OPTIMIZATION: Wrap all_columns in Arc once, reuse for all rows (only if needed)
-        let all_columns_arc: Option<Arc<Vec<String>>> = if has_correlated_select {
-            Some(Arc::new(all_columns.to_vec()))
-        } else {
-            None
-        };
+        // OPTIMIZATION: Wrap all_columns in Arc once, reuse for all rows
+        let all_columns_arc: Arc<Vec<String>> = Arc::new(all_columns.to_vec());
 
-        // OPTIMIZATION: Pre-compute table alias lowercase (all_columns_lower computed earlier)
-        let table_alias_lower: Option<String> = table_alias.map(|a| a.to_lowercase());
-
-        // OPTIMIZATION: Reuse col_index_map_lower (already built above) for O(1) lookup
-        // instead of O(N) linear search in evaluate_select_expr
         for row in rows {
             let mut values = Vec::with_capacity(select_exprs.len());
 
             evaluator.set_row_array(&row);
 
-            // For correlated subqueries in SELECT, we need to process them per-row
-            let exprs_to_eval: std::borrow::Cow<[Expression]> = if has_correlated_select {
-                // OPTIMIZATION: Clear and reuse outer_row_map instead of creating new
-                outer_row_map.clear();
+            // OPTIMIZATION: Clear and reuse outer_row_map instead of creating new
+            outer_row_map.clear();
 
-                // Use pre-computed column mappings
-                if let Some(ref keys) = column_keys {
-                    for mapping in keys {
-                        if let Some(value) = row.get(mapping.index) {
-                            // OPTIMIZATION: Clone value once and reuse for all key insertions
-                            // Previously we cloned 2-3 times per column
-                            let cloned_value = value.clone();
+            // Use pre-computed column mappings
+            for mapping in &column_keys {
+                if let Some(value) = row.get(mapping.index) {
+                    // OPTIMIZATION: Clone value once and reuse for all key insertions
+                    let cloned_value = value.clone();
 
-                            // Insert with unqualified part first (if column had a dot)
-                            if let Some(ref upart) = mapping.unqualified_part {
-                                outer_row_map.insert(upart.clone(), cloned_value.clone());
-                            }
-
-                            // Insert with qualified name if available
-                            if let Some(ref qname) = mapping.qualified_name {
-                                outer_row_map.insert(qname.clone(), cloned_value.clone());
-                            }
-
-                            // Insert with lowercase column name (move, no clone)
-                            outer_row_map.insert(mapping.col_lower.clone(), cloned_value);
-                        }
+                    // Insert with unqualified part first (if column had a dot)
+                    if let Some(ref upart) = mapping.unqualified_part {
+                        outer_row_map.insert(upart.clone(), cloned_value.clone());
                     }
+
+                    // Insert with qualified name if available
+                    if let Some(ref qname) = mapping.qualified_name {
+                        outer_row_map.insert(qname.clone(), cloned_value.clone());
+                    }
+
+                    // Insert with lowercase column name (move, no clone)
+                    outer_row_map.insert(mapping.col_lower.clone(), cloned_value);
                 }
+            }
 
-                // Create context with outer row (cheap due to Arc)
-                // SAFETY: all_columns_arc is always Some when has_correlated_select is true
-                let correlated_ctx = ctx.with_outer_row(
-                    std::mem::take(&mut outer_row_map),
-                    all_columns_arc.clone().unwrap(), // Arc clone = cheap
-                );
+            // Create context with outer row (cheap due to Arc)
+            let correlated_ctx = ctx.with_outer_row(
+                std::mem::take(&mut outer_row_map),
+                all_columns_arc.clone(), // Arc clone = cheap
+            );
 
-                // Process correlated SELECT expressions for this row
-                let processed_exprs: Result<Vec<Expression>> = select_exprs
-                    .iter()
-                    .map(|expr| self.process_correlated_expression(expr, &correlated_ctx))
-                    .collect();
+            // Process correlated SELECT expressions for this row
+            let processed_exprs: Result<Vec<Expression>> = select_exprs
+                .iter()
+                .map(|expr| self.process_correlated_expression(expr, &correlated_ctx))
+                .collect();
 
-                // Take back the map for reuse
-                outer_row_map = correlated_ctx.outer_row.unwrap_or_default();
+            // Take back the map for reuse
+            outer_row_map = correlated_ctx.outer_row.unwrap_or_default();
 
-                std::borrow::Cow::Owned(processed_exprs?)
-            } else {
-                std::borrow::Cow::Borrowed(select_exprs)
-            };
+            let exprs_to_eval = processed_exprs?;
 
             for expr in exprs_to_eval.iter() {
                 match expr {
@@ -4974,7 +5001,6 @@ impl Executor {
                         let prefix_lower = format!("{}.", qs.qualifier.to_lowercase());
                         let qualifier_lower = qs.qualifier.to_lowercase();
                         let mut found_any = false;
-                        // OPTIMIZATION: Use pre-computed all_columns_lower instead of to_lowercase() per row
                         for (idx, col_lower) in all_columns_lower.iter().enumerate() {
                             if col_lower.starts_with(&prefix_lower) {
                                 if let Some(val) = row.get(idx) {
@@ -4983,10 +5009,7 @@ impl Executor {
                                 }
                             }
                         }
-                        // If no columns matched the prefix (single-table query), check if
-                        // the qualifier matches the table alias - if so, include all columns
                         if !found_any {
-                            // OPTIMIZATION: Use pre-computed table_alias_lower
                             if let Some(ref alias_lower) = table_alias_lower {
                                 if *alias_lower == qualifier_lower {
                                     for val in row.iter() {
@@ -5003,6 +5026,178 @@ impl Executor {
                             &row,
                             &col_index_map_lower,
                         )?;
+                        values.push(value);
+                    }
+                }
+            }
+
+            projected.push(Row::from_values(values));
+        }
+
+        Ok(projected)
+    }
+
+    /// Optimized projection for non-correlated queries.
+    /// Pre-compiles all expressions once and uses direct VM execution.
+    #[allow(clippy::too_many_arguments)]
+    fn project_rows_optimized(
+        &self,
+        select_exprs: &[Expression],
+        rows: Vec<Row>,
+        all_columns: &[String],
+        all_columns_lower: &[String],
+        col_index_map_lower: &FxHashMap<String, usize>,
+        table_alias_lower: Option<&str>,
+        ctx: &ExecutionContext,
+    ) -> Result<Vec<Row>> {
+        // Analyze expressions and pre-compile complex ones
+        // Each element represents how to evaluate each SELECT expression:
+        // - SimpleColumn: direct column index lookup
+        // - StarExpand: expand all columns
+        // - QualifiedStarExpand: expand columns for specific qualifier
+        // - Compiled: pre-compiled program to execute via VM
+        enum ExprAction {
+            SimpleColumn(usize),
+            StarExpand,
+            QualifiedStarExpand {
+                prefix_lower: String,
+                qualifier_lower: String,
+            },
+            Compiled(SharedProgram),
+        }
+
+        // Analyze and pre-compile all expressions ONCE before the row loop
+        let mut actions: Vec<ExprAction> = Vec::with_capacity(select_exprs.len());
+
+        for expr in select_exprs.iter() {
+            let action = match expr {
+                Expression::Star(_) => ExprAction::StarExpand,
+                Expression::QualifiedStar(qs) => ExprAction::QualifiedStarExpand {
+                    prefix_lower: format!("{}.", qs.qualifier.to_lowercase()),
+                    qualifier_lower: qs.qualifier.to_lowercase(),
+                },
+                Expression::Identifier(id) => {
+                    if let Some(&idx) = col_index_map_lower.get(&id.value_lower) {
+                        ExprAction::SimpleColumn(idx)
+                    } else {
+                        // Unknown identifier - compile as expression (might be alias)
+                        let program = compile_expression(expr, all_columns)?;
+                        ExprAction::Compiled(program)
+                    }
+                }
+                Expression::QualifiedIdentifier(qid) => {
+                    let full_name =
+                        format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                    if let Some(&idx) = col_index_map_lower.get(&full_name) {
+                        ExprAction::SimpleColumn(idx)
+                    } else if let Some(&idx) = col_index_map_lower.get(&qid.name.value_lower) {
+                        ExprAction::SimpleColumn(idx)
+                    } else {
+                        let program = compile_expression(expr, all_columns)?;
+                        ExprAction::Compiled(program)
+                    }
+                }
+                Expression::Aliased(aliased) => {
+                    // Recurse into the inner expression
+                    match &*aliased.expression {
+                        Expression::Identifier(id) => {
+                            if let Some(&idx) = col_index_map_lower.get(&id.value_lower) {
+                                ExprAction::SimpleColumn(idx)
+                            } else {
+                                let program = compile_expression(&aliased.expression, all_columns)?;
+                                ExprAction::Compiled(program)
+                            }
+                        }
+                        Expression::QualifiedIdentifier(qid) => {
+                            let full_name =
+                                format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                            if let Some(&idx) = col_index_map_lower.get(&full_name) {
+                                ExprAction::SimpleColumn(idx)
+                            } else if let Some(&idx) =
+                                col_index_map_lower.get(&qid.name.value_lower)
+                            {
+                                ExprAction::SimpleColumn(idx)
+                            } else {
+                                let program = compile_expression(&aliased.expression, all_columns)?;
+                                ExprAction::Compiled(program)
+                            }
+                        }
+                        _ => {
+                            // Compile the inner expression (not the Aliased wrapper)
+                            let program = compile_expression(&aliased.expression, all_columns)?;
+                            ExprAction::Compiled(program)
+                        }
+                    }
+                }
+                _ => {
+                    // Complex expression - compile it
+                    let program = compile_expression(expr, all_columns)?;
+                    ExprAction::Compiled(program)
+                }
+            };
+            actions.push(action);
+        }
+
+        // Pre-fetch parameters for VM context
+        let params = ctx.params();
+        let named_params = ctx.named_params();
+        let transaction_id = ctx.transaction_id();
+
+        // Create reusable VM
+        let mut vm = ExprVM::new();
+
+        // Project rows using pre-analyzed actions
+        let mut projected = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let mut values = Vec::with_capacity(actions.len());
+            let row_slice = row.as_slice();
+
+            // Build VM context once per row (no cloning!)
+            let mut vm_ctx = ExecuteContext::new(row_slice);
+            if !params.is_empty() {
+                vm_ctx = vm_ctx.with_params(params);
+            }
+            if !named_params.is_empty() {
+                vm_ctx = vm_ctx.with_named_params(named_params);
+            }
+            vm_ctx = vm_ctx.with_transaction_id(transaction_id);
+
+            for action in &actions {
+                match action {
+                    ExprAction::SimpleColumn(idx) => {
+                        values.push(row.get(*idx).cloned().unwrap_or(Value::null_unknown()));
+                    }
+                    ExprAction::StarExpand => {
+                        for val in row.iter() {
+                            values.push(val.clone());
+                        }
+                    }
+                    ExprAction::QualifiedStarExpand {
+                        prefix_lower,
+                        qualifier_lower,
+                    } => {
+                        let mut found_any = false;
+                        for (idx, col_lower) in all_columns_lower.iter().enumerate() {
+                            if col_lower.starts_with(prefix_lower) {
+                                if let Some(val) = row.get(idx) {
+                                    values.push(val.clone());
+                                    found_any = true;
+                                }
+                            }
+                        }
+                        if !found_any {
+                            if let Some(alias_lower) = table_alias_lower {
+                                if alias_lower == qualifier_lower {
+                                    for val in row.iter() {
+                                        values.push(val.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ExprAction::Compiled(program) => {
+                        let value = vm.execute_cow(program, &vm_ctx)?;
                         values.push(value);
                     }
                 }

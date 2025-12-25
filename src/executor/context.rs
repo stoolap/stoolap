@@ -249,6 +249,76 @@ pub fn cache_exists_pred_key(subquery_key: String, pred_key: String) {
     });
 }
 
+// Cache for batch aggregate subquery results (e.g., COUNT(*) GROUP BY user_id).
+// Thread-local to avoid synchronization overhead.
+// The key is a stable identifier for the subquery, the value is a map from group key to aggregate value.
+thread_local! {
+    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, Arc<FxHashMap<Value, Value>>>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the batch aggregate cache. Should be called at the start of each top-level query.
+pub fn clear_batch_aggregate_cache() {
+    BATCH_AGGREGATE_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+}
+
+/// Get a cached batch aggregate result map by subquery identifier.
+pub fn get_cached_batch_aggregate(key: &str) -> Option<Arc<FxHashMap<Value, Value>>> {
+    BATCH_AGGREGATE_CACHE.with(|cache| cache.borrow().get(key).cloned())
+}
+
+/// Cache a batch aggregate result map.
+pub fn cache_batch_aggregate(key: String, values: FxHashMap<Value, Value>) {
+    BATCH_AGGREGATE_CACHE.with(|cache| {
+        cache.borrow_mut().insert(key, Arc::new(values));
+    });
+}
+
+/// Pre-computed info for batch aggregate lookups to avoid per-row allocations.
+#[derive(Clone)]
+pub struct BatchAggregateLookupInfo {
+    /// The cache key for the batch aggregate results
+    pub cache_key: String,
+    /// The outer column name (lowercase) to look up in outer_row
+    pub outer_column_lower: String,
+    /// Optional qualified outer column name (e.g., "u.id")
+    pub outer_qualified_lower: Option<String>,
+    /// Whether this is a COUNT expression (returns 0 for missing keys)
+    pub is_count: bool,
+}
+
+// Cache for batch aggregate lookup info to avoid recomputing per row.
+// The key is the subquery SQL string, the value is the pre-computed lookup info.
+thread_local! {
+    static BATCH_AGGREGATE_INFO_CACHE: RefCell<FxHashMap<String, Option<BatchAggregateLookupInfo>>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the batch aggregate info cache.
+pub fn clear_batch_aggregate_info_cache() {
+    BATCH_AGGREGATE_INFO_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+}
+
+/// Get cached batch aggregate lookup info by subquery string.
+pub fn get_cached_batch_aggregate_info(
+    subquery_key: &str,
+) -> Option<Option<BatchAggregateLookupInfo>> {
+    BATCH_AGGREGATE_INFO_CACHE.with(|cache| cache.borrow().get(subquery_key).cloned())
+}
+
+/// Cache batch aggregate lookup info (None means not batchable).
+pub fn cache_batch_aggregate_info(subquery_key: String, info: Option<BatchAggregateLookupInfo>) {
+    BATCH_AGGREGATE_INFO_CACHE.with(|cache| {
+        cache.borrow_mut().insert(subquery_key, info);
+    });
+}
+
 /// Execution context for SQL queries
 ///
 /// The execution context carries state and configuration for query execution,
@@ -292,7 +362,8 @@ pub struct ExecutionContext {
 }
 
 /// Type alias for CTE data map to reduce type complexity
-type CteDataMap = FxHashMap<String, (Vec<String>, Vec<Row>)>;
+/// Uses Arc<Vec<Row>> to enable zero-copy sharing of CTE results with joins
+type CteDataMap = FxHashMap<String, (Vec<String>, Arc<Vec<Row>>)>;
 
 impl Default for ExecutionContext {
     fn default() -> Self {
@@ -539,7 +610,8 @@ impl ExecutionContext {
     }
 
     /// Get CTE data by name (case-insensitive)
-    pub fn get_cte(&self, name: &str) -> Option<(&Vec<String>, &Vec<Row>)> {
+    /// Returns Arc reference to enable zero-copy sharing with joins
+    pub fn get_cte(&self, name: &str) -> Option<(&Vec<String>, &Arc<Vec<Row>>)> {
         self.cte_data.as_ref().and_then(|data| {
             data.get(&name.to_lowercase())
                 .map(|(cols, rows)| (cols, rows))

@@ -244,6 +244,15 @@ impl ExecutorMemoryResult {
         }
     }
 
+    /// Take rows as Arc for zero-copy sharing with joins
+    /// Returns Arc<Vec<Row>> - wraps owned rows or clones Arc for shared
+    pub fn into_arc_rows(self) -> Arc<Vec<Row>> {
+        match self.rows {
+            RowStorage::Owned(rows) => Arc::new(rows),
+            RowStorage::Shared(rows) => rows,
+        }
+    }
+
     /// Reset the cursor to the beginning
     pub fn reset(&mut self) {
         self.current_index = None;
@@ -333,6 +342,16 @@ impl QueryResult for ExecutorMemoryResult {
 
     fn last_insert_id(&self) -> i64 {
         self.insert_id
+    }
+
+    fn try_into_arc_rows(&mut self) -> Option<Arc<Vec<Row>>> {
+        // Take ownership of rows and return as Arc
+        let rows = std::mem::replace(&mut self.rows, RowStorage::Owned(Vec::new()));
+        self.closed = true; // Mark as consumed
+        match rows {
+            RowStorage::Owned(rows) => Some(Arc::new(rows)),
+            RowStorage::Shared(arc) => Some(arc),
+        }
     }
 
     fn with_aliases(

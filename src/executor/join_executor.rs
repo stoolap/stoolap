@@ -92,6 +92,8 @@
 //! The optimizer has bloom filter propagation logic, but runtime bloom filter
 //! checks are not yet integrated into the streaming operators.
 
+use std::sync::Arc;
+
 use crate::core::{Result, Row, Value};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::RowFilter;
@@ -159,13 +161,14 @@ struct JoinConfig {
 
 /// Request to execute a join operation.
 ///
-/// Takes ownership of row vectors to avoid cloning during materialization.
-/// The caller should pass owned data; if you only have references, use `to_vec()`.
+/// Uses Arc<Vec<Row>> to enable zero-copy sharing with CTE results.
+/// When dropping, only decrements refcount (O(1)) instead of deallocating rows.
+/// The caller should pass Arc-wrapped data for CTE sources.
 pub struct JoinRequest<'a> {
-    /// Left side rows (owned to avoid materialization clone).
-    pub left_rows: Vec<Row>,
-    /// Right side rows (owned to avoid materialization clone).
-    pub right_rows: Vec<Row>,
+    /// Left side rows (Arc for zero-copy sharing with CTE results).
+    pub left_rows: Arc<Vec<Row>>,
+    /// Right side rows (Arc for zero-copy sharing with CTE results).
+    pub right_rows: Arc<Vec<Row>>,
     /// Left side column names.
     pub left_columns: &'a [String],
     /// Right side column names.
@@ -201,8 +204,8 @@ pub struct JoinRequest<'a> {
 /// - Probe side is large (avoid full materialization)
 /// - Join algorithm is Hash Join
 pub struct StreamingJoinRequest<'a> {
-    /// Build side rows (must be materialized for hash table construction).
-    pub build_rows: Vec<Row>,
+    /// Build side rows (Arc for zero-copy sharing with CTE results).
+    pub build_rows: Arc<Vec<Row>>,
     /// Build side column names.
     pub build_columns: &'a [String],
     /// Probe side as streaming operator (NOT materialized).
@@ -370,7 +373,10 @@ impl JoinExecutor {
             // Standard path: build hash table during open()
             let build_schema: Vec<ColumnInfo> =
                 request.build_columns.iter().map(ColumnInfo::new).collect();
-            let build_op = Box::new(MaterializedOperator::new(request.build_rows, build_schema));
+            // Unwrap Arc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
+            let build_rows_vec =
+                Arc::try_unwrap(request.build_rows).unwrap_or_else(|arc| (*arc).clone());
+            let build_op = Box::new(MaterializedOperator::new(build_rows_vec, build_schema));
 
             let (left_op, right_op): (Box<dyn Operator>, Box<dyn Operator>) =
                 if request.build_is_left {
@@ -567,8 +573,8 @@ impl JoinExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join(
         &self,
-        left_rows: Vec<Row>,
-        right_rows: Vec<Row>,
+        left_rows: Arc<Vec<Row>>,
+        right_rows: Arc<Vec<Row>>,
         analysis: &JoinAnalysis,
         left_columns: &[String],
         right_columns: &[String],
@@ -634,8 +640,8 @@ impl JoinExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_parallel(
         &self,
-        left_rows: Vec<Row>,
-        right_rows: Vec<Row>,
+        left_rows: Arc<Vec<Row>>,
+        right_rows: Arc<Vec<Row>>,
         analysis: &JoinAnalysis,
         left_col_count: usize,
         right_col_count: usize,
@@ -646,27 +652,27 @@ impl JoinExecutor {
     ) -> Result<Vec<Row>> {
         let config = ParallelConfig::default();
 
-        // Determine probe and build sides
-        let (probe_rows, build_rows, probe_key_indices, build_key_indices, swapped) = if build_left
-        {
-            // Build on left: probe is right, build is left
-            (
-                right_rows,
-                left_rows,
-                &analysis.right_key_indices,
-                &analysis.left_key_indices,
-                true, // swapped: left is build, right is probe
-            )
-        } else {
-            // Build on right (default): probe is left, build is right
-            (
-                left_rows,
-                right_rows,
-                &analysis.left_key_indices,
-                &analysis.right_key_indices,
-                false, // not swapped: left is probe, right is build
-            )
-        };
+        // Determine probe and build sides - use Arc slices directly (zero-copy)
+        let (probe_slice, build_slice, probe_key_indices, build_key_indices, swapped) =
+            if build_left {
+                // Build on left: probe is right, build is left
+                (
+                    right_rows.as_slice(),
+                    left_rows.as_slice(),
+                    &analysis.right_key_indices,
+                    &analysis.left_key_indices,
+                    true, // swapped: left is build, right is probe
+                )
+            } else {
+                // Build on right (default): probe is left, build is right
+                (
+                    left_rows.as_slice(),
+                    right_rows.as_slice(),
+                    &analysis.left_key_indices,
+                    &analysis.right_key_indices,
+                    false, // not swapped: left is probe, right is build
+                )
+            };
 
         let (probe_col_count, build_col_count) = if swapped {
             (right_col_count, left_col_count)
@@ -676,8 +682,8 @@ impl JoinExecutor {
 
         // Execute parallel hash join
         let result = parallel_hash_join(
-            &probe_rows,
-            &build_rows,
+            probe_slice,
+            build_slice,
             probe_key_indices,
             build_key_indices,
             analysis.join_type,
@@ -731,8 +737,8 @@ impl JoinExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_streaming(
         &self,
-        left_rows: Vec<Row>,
-        right_rows: Vec<Row>,
+        left_rows: Arc<Vec<Row>>,
+        right_rows: Arc<Vec<Row>>,
         analysis: &JoinAnalysis,
         left_columns: &[String],
         right_columns: &[String],
@@ -747,9 +753,9 @@ impl JoinExecutor {
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
         let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
 
-        // Create input operators - takes ownership, no clone
-        let left_op = Box::new(MaterializedOperator::new(left_rows, left_schema));
-        let right_op = Box::new(MaterializedOperator::new(right_rows, right_schema));
+        // Create input operators from Arc (unwraps if sole owner, clones if shared)
+        let left_op = Box::new(MaterializedOperator::from_arc(left_rows, left_schema));
+        let right_op = Box::new(MaterializedOperator::from_arc(right_rows, right_schema));
 
         let build_side = if build_left {
             JoinSide::Left
@@ -806,8 +812,8 @@ impl JoinExecutor {
     /// Execute merge join for pre-sorted inputs using MergeJoinOperator.
     fn execute_merge_join(
         &self,
-        left_rows: Vec<Row>,
-        right_rows: Vec<Row>,
+        left_rows: Arc<Vec<Row>>,
+        right_rows: Arc<Vec<Row>>,
         left_columns: &[String],
         right_columns: &[String],
         analysis: &JoinAnalysis,
@@ -817,9 +823,13 @@ impl JoinExecutor {
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
         let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
 
+        // Unwrap Arc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
+        let left_vec = Arc::try_unwrap(left_rows).unwrap_or_else(|arc| (*arc).clone());
+        let right_vec = Arc::try_unwrap(right_rows).unwrap_or_else(|arc| (*arc).clone());
+
         // Create input operators - takes ownership, no clone
-        let left_op = Box::new(MaterializedOperator::new(left_rows, left_schema));
-        let right_op = Box::new(MaterializedOperator::new(right_rows, right_schema));
+        let left_op = Box::new(MaterializedOperator::new(left_vec, left_schema));
+        let right_op = Box::new(MaterializedOperator::new(right_vec, right_schema));
 
         // Create merge join operator
         let mut merge_op = MergeJoinOperator::new(
@@ -838,8 +848,8 @@ impl JoinExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_nested_loop(
         &self,
-        left_rows: Vec<Row>,
-        right_rows: Vec<Row>,
+        left_rows: Arc<Vec<Row>>,
+        right_rows: Arc<Vec<Row>>,
         condition: Option<&Expression>,
         left_columns: &[String],
         right_columns: &[String],
@@ -850,9 +860,13 @@ impl JoinExecutor {
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
         let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
 
+        // Unwrap Arc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
+        let left_vec = Arc::try_unwrap(left_rows).unwrap_or_else(|arc| (*arc).clone());
+        let right_vec = Arc::try_unwrap(right_rows).unwrap_or_else(|arc| (*arc).clone());
+
         // Create input operators - takes ownership, no clone
-        let left_op = Box::new(MaterializedOperator::new(left_rows, left_schema));
-        let right_op = Box::new(MaterializedOperator::new(right_rows, right_schema));
+        let left_op = Box::new(MaterializedOperator::new(left_vec, left_schema));
+        let right_op = Box::new(MaterializedOperator::new(right_vec, right_schema));
 
         // Convert join type string to enum
         let join_type = if join_type_str.contains("CROSS") {
@@ -1017,8 +1031,8 @@ mod tests {
         ));
 
         let request = JoinRequest {
-            left_rows: left,
-            right_rows: right,
+            left_rows: Arc::new(left),
+            right_rows: Arc::new(right),
             left_columns: &left_cols,
             right_columns: &right_cols,
             condition: Some(&cond),
@@ -1062,8 +1076,8 @@ mod tests {
         ));
 
         let request = JoinRequest {
-            left_rows: left,
-            right_rows: right,
+            left_rows: Arc::new(left),
+            right_rows: Arc::new(right),
             left_columns: &left_cols,
             right_columns: &right_cols,
             condition: Some(&cond),
@@ -1107,8 +1121,8 @@ mod tests {
         ));
 
         let request = JoinRequest {
-            left_rows: left,
-            right_rows: right,
+            left_rows: Arc::new(left),
+            right_rows: Arc::new(right),
             left_columns: &left_cols,
             right_columns: &right_cols,
             condition: Some(&cond),
@@ -1136,8 +1150,8 @@ mod tests {
         let right_cols = vec!["b.val".to_string()];
 
         let request = JoinRequest {
-            left_rows: left,
-            right_rows: right,
+            left_rows: Arc::new(left),
+            right_rows: Arc::new(right),
             left_columns: &left_cols,
             right_columns: &right_cols,
             condition: None,

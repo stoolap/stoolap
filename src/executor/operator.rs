@@ -44,6 +44,7 @@
 //! 4. **Zero-Copy**: RowRef allows referencing rows without cloning
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::core::{Result, Row, Value};
 
@@ -447,6 +448,13 @@ impl MaterializedOperator {
             current_idx: 0,
             opened: false,
         }
+    }
+
+    /// Create from an Arc<Vec<Row>>, unwrapping if sole owner or cloning if shared.
+    /// This is optimal for CTE results which may have multiple references.
+    pub fn from_arc(arc_rows: Arc<Vec<Row>>, schema: Vec<ColumnInfo>) -> Self {
+        let rows = Arc::try_unwrap(arc_rows).unwrap_or_else(|arc| (*arc).clone());
+        Self::new(rows, schema)
     }
 
     /// Create from rows with column names as strings.
