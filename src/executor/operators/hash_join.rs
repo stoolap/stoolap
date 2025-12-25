@@ -60,6 +60,10 @@ pub enum JoinType {
     Full,
     /// CROSS JOIN - cartesian product
     Cross,
+    /// SEMI JOIN - return left rows that have at least one match (for EXISTS)
+    Semi,
+    /// ANTI JOIN - return left rows that have NO matches (for NOT EXISTS)
+    Anti,
 }
 
 impl JoinType {
@@ -74,6 +78,10 @@ impl JoinType {
             JoinType::Full
         } else if s_lower.contains("cross") {
             JoinType::Cross
+        } else if s_lower.contains("semi") {
+            JoinType::Semi
+        } else if s_lower.contains("anti") {
+            JoinType::Anti
         } else {
             JoinType::Inner
         }
@@ -89,7 +97,8 @@ impl JoinType {
     /// Used by parallel hash join.
     pub fn needs_unmatched_probe(&self, swapped: bool) -> bool {
         match self {
-            JoinType::Inner | JoinType::Cross => false,
+            JoinType::Inner | JoinType::Cross | JoinType::Semi => false,
+            JoinType::Anti => !swapped, // ANTI: unmatched probe rows (when not swapped)
             JoinType::Left => !swapped, // LEFT JOIN: unmatched left (probe when not swapped)
             JoinType::Right => swapped, // RIGHT JOIN: unmatched right (probe when swapped)
             JoinType::Full => true,     // FULL JOIN: always needs unmatched rows
@@ -100,11 +109,21 @@ impl JoinType {
     /// Used by parallel hash join.
     pub fn needs_unmatched_build(&self, swapped: bool) -> bool {
         match self {
-            JoinType::Inner | JoinType::Cross => false,
+            JoinType::Inner | JoinType::Cross | JoinType::Semi | JoinType::Anti => false,
             JoinType::Left => swapped, // LEFT JOIN: unmatched left (build when swapped)
             JoinType::Right => !swapped, // RIGHT JOIN: unmatched right (build when not swapped)
             JoinType::Full => true,    // FULL JOIN: always needs unmatched rows
         }
+    }
+
+    /// Check if this is a semi-join (EXISTS semantics).
+    pub fn is_semi(&self) -> bool {
+        matches!(self, JoinType::Semi)
+    }
+
+    /// Check if this is an anti-join (NOT EXISTS semantics).
+    pub fn is_anti(&self) -> bool {
+        matches!(self, JoinType::Anti)
     }
 }
 
@@ -184,10 +203,15 @@ impl HashJoinOperator {
         right_key_indices: Vec<usize>,
         build_side: JoinSide,
     ) -> Self {
-        // Build combined schema
+        // Build schema
+        // For Semi/Anti joins, only return left (probe) columns
         let mut schema = Vec::new();
-        schema.extend(left.schema().iter().cloned());
-        schema.extend(right.schema().iter().cloned());
+        if join_type.is_semi() || join_type.is_anti() {
+            schema.extend(left.schema().iter().cloned());
+        } else {
+            schema.extend(left.schema().iter().cloned());
+            schema.extend(right.schema().iter().cloned());
+        }
 
         let left_col_count = left.schema().len();
         let right_col_count = right.schema().len();
@@ -550,6 +574,21 @@ impl Operator for HashJoinOperator {
                 ) {
                     self.probe_had_match = true;
 
+                    // SEMI JOIN: Return probe row only (no build columns), then skip remaining matches
+                    if self.join_type.is_semi() {
+                        let probe_row = self.current_probe_row.take().unwrap();
+                        // Skip remaining matches for this probe row
+                        self.current_match_idx = self.current_matches.len();
+                        return Ok(Some(RowRef::Owned(probe_row)));
+                    }
+
+                    // ANTI JOIN: Found a match, so this probe row should NOT be returned
+                    // Just skip remaining matches and move to next probe row
+                    if self.join_type.is_anti() {
+                        self.current_match_idx = self.current_matches.len();
+                        continue;
+                    }
+
                     // Mark build row as matched (for OUTER joins)
                     if !self.build_matched.is_empty() {
                         self.build_matched[build_idx] = true;
@@ -558,6 +597,15 @@ impl Operator for HashJoinOperator {
                     let probe_row = self.current_probe_row.as_ref().unwrap().clone();
                     let combined = self.combine_rows(probe_row, build_row.clone());
                     return Ok(Some(RowRef::Owned(combined)));
+                }
+            }
+
+            // Handle unmatched probe row
+            // - ANTI JOIN: Return probe row when NO match found
+            // - OUTER JOINs: Return probe row with NULL build columns
+            if self.join_type.is_anti() && !self.probe_had_match {
+                if let Some(probe_row) = self.current_probe_row.take() {
+                    return Ok(Some(RowRef::Owned(probe_row)));
                 }
             }
 
@@ -642,6 +690,8 @@ impl Operator for HashJoinOperator {
             JoinType::Right => right_est,
             JoinType::Full => left_est + right_est,
             JoinType::Cross => left_est * right_est,
+            JoinType::Semi => left_est.min(right_est), // At most all left rows
+            JoinType::Anti => left_est,                // At most all left rows
         })
     }
 
@@ -652,6 +702,8 @@ impl Operator for HashJoinOperator {
             JoinType::Right => "HashJoin (RIGHT)",
             JoinType::Full => "HashJoin (FULL)",
             JoinType::Cross => "HashJoin (CROSS)",
+            JoinType::Semi => "HashJoin (SEMI)",
+            JoinType::Anti => "HashJoin (ANTI)",
         }
     }
 }
@@ -811,5 +863,134 @@ mod tests {
 
         // Should match (1,10) and (1,20)
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_semi_join() {
+        // Left: users with id 1, 2, 3
+        let left = make_operator(
+            vec![vec![1, 100], vec![2, 200], vec![3, 300]],
+            vec!["id", "value"],
+        );
+        // Right: orders for users 1 and 3 (user 1 has 2 orders)
+        let right = make_operator(
+            vec![vec![1, 10], vec![1, 20], vec![3, 30]],
+            vec!["user_id", "order_id"],
+        );
+
+        let mut join = HashJoinOperator::new(
+            left,
+            right,
+            JoinType::Semi,
+            vec![0], // left key: id
+            vec![0], // right key: user_id
+            JoinSide::Right,
+        );
+
+        let results = collect_results(&mut join).unwrap();
+
+        // Semi join: return users who have at least one order
+        // User 1 has 2 orders but should only appear once
+        // User 2 has no orders - should NOT appear
+        // User 3 has 1 order - should appear
+        assert_eq!(results.len(), 2);
+
+        // Schema should only have left columns
+        assert_eq!(join.schema().len(), 2);
+
+        // Verify we got users 1 and 3
+        let ids: Vec<i64> = results
+            .iter()
+            .map(|r| r.get(0).unwrap().as_int64().unwrap())
+            .collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&3));
+        assert!(!ids.contains(&2));
+    }
+
+    #[test]
+    fn test_anti_join() {
+        // Left: users with id 1, 2, 3
+        let left = make_operator(
+            vec![vec![1, 100], vec![2, 200], vec![3, 300]],
+            vec!["id", "value"],
+        );
+        // Right: orders for users 1 and 3
+        let right = make_operator(vec![vec![1, 10], vec![3, 30]], vec!["user_id", "order_id"]);
+
+        let mut join = HashJoinOperator::new(
+            left,
+            right,
+            JoinType::Anti,
+            vec![0], // left key: id
+            vec![0], // right key: user_id
+            JoinSide::Right,
+        );
+
+        let results = collect_results(&mut join).unwrap();
+
+        // Anti join: return users who have NO orders
+        // User 1 has orders - should NOT appear
+        // User 2 has no orders - should appear
+        // User 3 has orders - should NOT appear
+        assert_eq!(results.len(), 1);
+
+        // Schema should only have left columns
+        assert_eq!(join.schema().len(), 2);
+
+        // Verify we only got user 2
+        let row = &results[0];
+        assert_eq!(row.get(0), Some(&Value::integer(2)));
+        assert_eq!(row.get(1), Some(&Value::integer(200)));
+    }
+
+    #[test]
+    fn test_anti_join_empty_right() {
+        // Left: users with id 1, 2, 3
+        let left = make_operator(
+            vec![vec![1, 100], vec![2, 200], vec![3, 300]],
+            vec!["id", "value"],
+        );
+        // Right: no orders
+        let right = make_operator(vec![], vec!["user_id", "order_id"]);
+
+        let mut join = HashJoinOperator::new(
+            left,
+            right,
+            JoinType::Anti,
+            vec![0],
+            vec![0],
+            JoinSide::Right,
+        );
+
+        let results = collect_results(&mut join).unwrap();
+
+        // Anti join with empty right: all left rows should be returned
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_semi_join_empty_right() {
+        // Left: users with id 1, 2, 3
+        let left = make_operator(
+            vec![vec![1, 100], vec![2, 200], vec![3, 300]],
+            vec!["id", "value"],
+        );
+        // Right: no orders
+        let right = make_operator(vec![], vec!["user_id", "order_id"]);
+
+        let mut join = HashJoinOperator::new(
+            left,
+            right,
+            JoinType::Semi,
+            vec![0],
+            vec![0],
+            JoinSide::Right,
+        );
+
+        let results = collect_results(&mut join).unwrap();
+
+        // Semi join with empty right: no left rows should be returned
+        assert_eq!(results.len(), 0);
     }
 }

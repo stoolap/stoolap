@@ -63,6 +63,7 @@ mod cte;
 mod ddl;
 mod dml;
 mod explain;
+pub(crate) mod expr_converter;
 mod index_optimizer;
 mod pk_fast_path;
 pub mod pushdown;

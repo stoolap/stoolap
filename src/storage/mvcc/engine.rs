@@ -2335,6 +2335,28 @@ impl Engine for MVCCEngine {
             store.get_visible_versions_batch(row_ids, read_txn_id)
         }))
     }
+
+    /// Get a count-only function for counting visible rows by their IDs.
+    /// This is optimized for COUNT(*) subqueries where we don't need the actual row data.
+    fn get_row_counter(
+        &self,
+        table_name: &str,
+    ) -> Result<Box<dyn Fn(&[i64]) -> usize + Send + Sync>> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+
+        // Get the version store reference once
+        let store = self.get_version_store(table_name)?;
+
+        // Use a high txn_id to see the latest committed version
+        let read_txn_id = INVALID_TRANSACTION_ID + 1;
+
+        // Return a closure that counts visible rows without cloning their data
+        Ok(Box::new(move |row_ids: &[i64]| {
+            store.count_visible_versions_batch(row_ids, read_txn_id)
+        }))
+    }
 }
 
 // =============================================================================

@@ -317,6 +317,8 @@ impl Operator for NestedLoopJoinOperator {
             JoinType::Right => right_est,
             JoinType::Full => left_est + right_est,
             JoinType::Cross => left_est * right_est,
+            JoinType::Semi => left_est.min(right_est),
+            JoinType::Anti => left_est,
         })
     }
 
@@ -327,6 +329,8 @@ impl Operator for NestedLoopJoinOperator {
             JoinType::Right => "NestedLoop (RIGHT)",
             JoinType::Full => "NestedLoop (FULL)",
             JoinType::Cross => "NestedLoop (CROSS)",
+            JoinType::Semi => "NestedLoop (SEMI)",
+            JoinType::Anti => "NestedLoop (ANTI)",
         }
     }
 }

@@ -40,8 +40,10 @@
 //! - Arithmetic expressions
 //! - Column-to-column comparisons
 
-use crate::core::{Operator, Value};
-use crate::executor::utils::{dummy_token, extract_column_name, extract_literal_value, flip_operator, infix_to_operator};
+use crate::core::Value;
+use crate::executor::utils::{
+    dummy_token, extract_column_name, extract_literal_value, flip_operator, infix_to_operator,
+};
 use crate::parser::ast::{self as ast, InfixOperator, PrefixOperator};
 use crate::parser::token::TokenType;
 use crate::storage::expression::{
@@ -109,7 +111,8 @@ pub fn convert_ast_to_storage_expr(expr: &ast::Expression) -> Option<Box<dyn Exp
         | ast::Expression::CteReference(_)
         | ast::Expression::Star(_)
         | ast::Expression::QualifiedStar(_)
-        | ast::Expression::Default(_) => None,
+        | ast::Expression::Default(_)
+        | ast::Expression::InHashSet(_) => None,
     }
 }
 
@@ -172,7 +175,6 @@ fn try_extract_column_value(
     let value = extract_literal_value(maybe_value)?;
     Some((column, value))
 }
-
 
 /// Convert IS NULL / IS NOT NULL expression
 fn convert_is_null(infix: &ast::InfixExpression) -> Option<Box<dyn Expression>> {
@@ -277,6 +279,7 @@ fn convert_like(like: &ast::LikeExpression) -> Option<Box<dyn Expression>> {
 ///
 /// For AND expressions, extracts the parts that can be pushed down.
 /// Returns (pushable, remaining) where remaining is None if everything was pushed.
+#[allow(dead_code)]
 pub fn split_pushable_predicates(
     expr: &ast::Expression,
 ) -> (Option<Box<dyn Expression>>, Option<ast::Expression>) {

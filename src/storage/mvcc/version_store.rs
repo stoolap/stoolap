@@ -43,6 +43,7 @@ use crate::storage::mvcc::get_fast_timestamp;
 use crate::storage::mvcc::streaming_result::{StreamingResult, VisibleRowInfo};
 use crate::storage::Index;
 // radsort removed - BTreeMap iteration is already ordered
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 /// Represents a specific version of a row with complete data
@@ -585,6 +586,9 @@ impl VersionStore {
     ///
     /// Optimized to use arena-based storage for zero-copy reading,
     /// with pre-acquired locks for minimal overhead.
+    ///
+    /// Uses parallel processing for large batches (>1000 row_ids) to leverage
+    /// multiple CPU cores for visibility checking and row materialization.
     pub fn get_visible_versions_batch(&self, row_ids: &[i64], txn_id: i64) -> Vec<(i64, Row)> {
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
@@ -604,48 +608,188 @@ impl VersionStore {
         // Pre-acquire versions lock ONCE for all lookups
         let versions = self.versions.read();
 
-        let mut results = Vec::with_capacity(row_ids.len());
+        // Parallel processing constants
+        /// Minimum batch size before enabling parallel processing (avoid overhead for small batches)
+        const PARALLEL_THRESHOLD: usize = 1000;
+        /// Chunk size for parallel processing (balances parallelism vs. overhead)
+        const PARALLEL_CHUNK_SIZE: usize = 512;
 
-        for &row_id in row_ids {
-            if let Some(entry) = versions.get(&row_id) {
-                let mut current: Option<&VersionChainEntry> = Some(entry);
+        if row_ids.len() >= PARALLEL_THRESHOLD {
+            // Parallel path: process chunks in parallel and flatten results
+            row_ids
+                .par_chunks(PARALLEL_CHUNK_SIZE)
+                .flat_map(|chunk| {
+                    let mut chunk_results = Vec::with_capacity(chunk.len());
+                    for &row_id in chunk {
+                        if let Some(entry) = versions.get(&row_id) {
+                            let mut current: Option<&VersionChainEntry> = Some(entry);
 
-                while let Some(e) = current {
-                    let version_txn_id = e.version.txn_id;
-                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
+                            while let Some(e) = current {
+                                let version_txn_id = e.version.txn_id;
+                                let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
-                    if checker.is_visible(version_txn_id, txn_id) {
-                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
-                        {
-                            // Read from arena if available (same as get_all_visible_rows_arena)
-                            let row_data = if let Some(idx) = e.arena_idx {
-                                if idx < arena_len {
-                                    let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                                    if meta.start <= meta.end && meta.end <= arena_data_slice.len()
+                                if checker.is_visible(version_txn_id, txn_id) {
+                                    if deleted_at_txn_id == 0
+                                        || !checker.is_visible(deleted_at_txn_id, txn_id)
                                     {
-                                        let slice = unsafe {
-                                            arena_data_slice.get_unchecked(meta.start..meta.end)
+                                        let row_data = if let Some(idx) = e.arena_idx {
+                                            if idx < arena_len {
+                                                let meta =
+                                                    unsafe { arena_rows_slice.get_unchecked(idx) };
+                                                if meta.start <= meta.end
+                                                    && meta.end <= arena_data_slice.len()
+                                                {
+                                                    let slice = unsafe {
+                                                        arena_data_slice
+                                                            .get_unchecked(meta.start..meta.end)
+                                                    };
+                                                    Row::from_values(slice.to_vec())
+                                                } else {
+                                                    e.version.data.clone()
+                                                }
+                                            } else {
+                                                e.version.data.clone()
+                                            }
+                                        } else {
+                                            e.version.data.clone()
                                         };
-                                        Row::from_values(slice.to_vec())
+                                        chunk_results.push((row_id, row_data));
+                                    }
+                                    break;
+                                }
+                                current = e.prev.as_ref().map(|b| b.as_ref());
+                            }
+                        }
+                    }
+                    chunk_results
+                })
+                .collect()
+        } else {
+            // Sequential path for small batches
+            let mut results = Vec::with_capacity(row_ids.len());
+            for &row_id in row_ids {
+                if let Some(entry) = versions.get(&row_id) {
+                    let mut current: Option<&VersionChainEntry> = Some(entry);
+
+                    while let Some(e) = current {
+                        let version_txn_id = e.version.txn_id;
+                        let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                        if checker.is_visible(version_txn_id, txn_id) {
+                            if deleted_at_txn_id == 0
+                                || !checker.is_visible(deleted_at_txn_id, txn_id)
+                            {
+                                let row_data = if let Some(idx) = e.arena_idx {
+                                    if idx < arena_len {
+                                        let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
+                                        if meta.start <= meta.end
+                                            && meta.end <= arena_data_slice.len()
+                                        {
+                                            let slice = unsafe {
+                                                arena_data_slice.get_unchecked(meta.start..meta.end)
+                                            };
+                                            Row::from_values(slice.to_vec())
+                                        } else {
+                                            e.version.data.clone()
+                                        }
                                     } else {
                                         e.version.data.clone()
                                     }
                                 } else {
                                     e.version.data.clone()
-                                }
-                            } else {
-                                e.version.data.clone()
-                            };
-                            results.push((row_id, row_data));
+                                };
+                                results.push((row_id, row_data));
+                            }
+                            break;
                         }
-                        break;
+                        current = e.prev.as_ref().map(|b| b.as_ref());
                     }
-                    current = e.prev.as_ref().map(|b| b.as_ref());
                 }
             }
+            results
+        }
+    }
+
+    /// Counts visible versions for batch operations (COUNT optimization)
+    ///
+    /// This is an optimized version of get_visible_versions_batch that only counts
+    /// visible rows without cloning their data. Used for COUNT(*) subqueries.
+    ///
+    /// Uses parallel processing for large batches (>1000 row_ids) to leverage
+    /// multiple CPU cores for visibility checking.
+    pub fn count_visible_versions_batch(&self, row_ids: &[i64], txn_id: i64) -> usize {
+        if self.closed.load(Ordering::Acquire) {
+            return 0;
         }
 
-        results
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return 0,
+        };
+
+        // Pre-acquire versions lock ONCE for all lookups
+        let versions = self.versions.read();
+
+        // Parallel processing constants
+        /// Minimum batch size before enabling parallel processing (avoid overhead for small batches)
+        const PARALLEL_THRESHOLD: usize = 1000;
+        /// Chunk size for parallel processing (balances parallelism vs. overhead)
+        const PARALLEL_CHUNK_SIZE: usize = 512;
+
+        if row_ids.len() >= PARALLEL_THRESHOLD {
+            // Parallel path: chunk and process in parallel
+            row_ids
+                .par_chunks(PARALLEL_CHUNK_SIZE)
+                .map(|chunk| {
+                    let mut chunk_count = 0;
+                    for &row_id in chunk {
+                        if let Some(entry) = versions.get(&row_id) {
+                            let mut current: Option<&VersionChainEntry> = Some(entry);
+
+                            while let Some(e) = current {
+                                let version_txn_id = e.version.txn_id;
+                                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                                if checker.is_visible(version_txn_id, txn_id) {
+                                    if deleted_at_txn_id == 0
+                                        || !checker.is_visible(deleted_at_txn_id, txn_id)
+                                    {
+                                        chunk_count += 1;
+                                    }
+                                    break;
+                                }
+                                current = e.prev.as_ref().map(|b| b.as_ref());
+                            }
+                        }
+                    }
+                    chunk_count
+                })
+                .sum()
+        } else {
+            // Sequential path for small batches
+            let mut count = 0;
+            for &row_id in row_ids {
+                if let Some(entry) = versions.get(&row_id) {
+                    let mut current: Option<&VersionChainEntry> = Some(entry);
+
+                    while let Some(e) = current {
+                        let version_txn_id = e.version.txn_id;
+                        let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                        if checker.is_visible(version_txn_id, txn_id) {
+                            if deleted_at_txn_id == 0
+                                || !checker.is_visible(deleted_at_txn_id, txn_id)
+                            {
+                                count += 1;
+                            }
+                            break;
+                        }
+                        current = e.prev.as_ref().map(|b| b.as_ref());
+                    }
+                }
+            }
+            count
+        }
     }
 
     /// Gets visible versions for batch update operations

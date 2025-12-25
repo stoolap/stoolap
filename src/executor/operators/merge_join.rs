@@ -408,6 +408,8 @@ impl Operator for MergeJoinOperator {
             JoinType::Right => right_est,
             JoinType::Full => left_est + right_est,
             JoinType::Cross => left_est * right_est,
+            JoinType::Semi => left_est.min(right_est),
+            JoinType::Anti => left_est,
         })
     }
 
@@ -418,6 +420,8 @@ impl Operator for MergeJoinOperator {
             JoinType::Right => "MergeJoin (RIGHT)",
             JoinType::Full => "MergeJoin (FULL)",
             JoinType::Cross => "MergeJoin (CROSS)",
+            JoinType::Semi => "MergeJoin (SEMI)",
+            JoinType::Anti => "MergeJoin (ANTI)",
         }
     }
 }

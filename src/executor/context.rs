@@ -19,7 +19,7 @@
 
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -85,7 +85,7 @@ pub fn cache_in_subquery(key: String, values: Vec<Value>) {
 // Cache for semi-join (EXISTS) hash sets to avoid re-execution.
 // Thread-local to avoid synchronization overhead.
 // Uses the inner query SQL + predicate as key.
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 thread_local! {
     static SEMI_JOIN_CACHE: RefCell<FxHashMap<String, Arc<AHashSet<Value>>>> = RefCell::new(FxHashMap::default());
 }
@@ -174,10 +174,20 @@ pub fn cache_exists_index(key: String, index: std::sync::Arc<dyn Index>) {
 /// Type alias for row fetcher function used in EXISTS/COUNT optimization.
 pub type RowFetcher = Box<dyn Fn(&[i64]) -> Vec<(i64, crate::core::Row)> + Send + Sync>;
 
+/// Type alias for row counter function used in COUNT(*) optimization.
+/// This only counts visible rows without cloning their data.
+pub type RowCounter = Box<dyn Fn(&[i64]) -> usize + Send + Sync>;
+
 // Cache for EXISTS row fetchers to avoid repeated version store lookups.
 // The key is the table name, the value is the row fetcher function.
 thread_local! {
     static EXISTS_FETCHER_CACHE: RefCell<FxHashMap<String, std::sync::Arc<RowFetcher>>> = RefCell::new(FxHashMap::default());
+}
+
+// Cache for COUNT row counters to avoid repeated version store lookups.
+// The key is the table name, the value is the row counter function.
+thread_local! {
+    static COUNT_COUNTER_CACHE: RefCell<FxHashMap<String, std::sync::Arc<RowCounter>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the EXISTS row fetcher cache. Should be called at the start of each top-level query.
@@ -187,15 +197,34 @@ pub fn clear_exists_fetcher_cache() {
     });
 }
 
+/// Clear the COUNT row counter cache. Should be called at the start of each top-level query.
+pub fn clear_count_counter_cache() {
+    COUNT_COUNTER_CACHE.with(|cache| {
+        cache.borrow_mut().clear();
+    });
+}
+
 /// Get a cached EXISTS row fetcher by table name.
 pub fn get_cached_exists_fetcher(key: &str) -> Option<std::sync::Arc<RowFetcher>> {
     EXISTS_FETCHER_CACHE.with(|cache| cache.borrow().get(key).cloned())
+}
+
+/// Get a cached COUNT row counter by table name.
+pub fn get_cached_count_counter(key: &str) -> Option<std::sync::Arc<RowCounter>> {
+    COUNT_COUNTER_CACHE.with(|cache| cache.borrow().get(key).cloned())
 }
 
 /// Cache an EXISTS row fetcher.
 pub fn cache_exists_fetcher(key: String, fetcher: RowFetcher) {
     EXISTS_FETCHER_CACHE.with(|cache| {
         cache.borrow_mut().insert(key, std::sync::Arc::new(fetcher));
+    });
+}
+
+/// Cache a COUNT row counter.
+pub fn cache_count_counter(key: String, counter: RowCounter) {
+    COUNT_COUNTER_CACHE.with(|cache| {
+        cache.borrow_mut().insert(key, std::sync::Arc::new(counter));
     });
 }
 
@@ -253,7 +282,7 @@ pub fn cache_exists_pred_key(subquery_key: String, pred_key: String) {
 // Thread-local to avoid synchronization overhead.
 // The key is a stable identifier for the subquery, the value is a map from group key to aggregate value.
 thread_local! {
-    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, Arc<FxHashMap<Value, Value>>>> = RefCell::new(FxHashMap::default());
+    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, Arc<AHashMap<Value, Value>>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the batch aggregate cache. Should be called at the start of each top-level query.
@@ -266,12 +295,12 @@ pub fn clear_batch_aggregate_cache() {
 }
 
 /// Get a cached batch aggregate result map by subquery identifier.
-pub fn get_cached_batch_aggregate(key: &str) -> Option<Arc<FxHashMap<Value, Value>>> {
+pub fn get_cached_batch_aggregate(key: &str) -> Option<Arc<AHashMap<Value, Value>>> {
     BATCH_AGGREGATE_CACHE.with(|cache| cache.borrow().get(key).cloned())
 }
 
 /// Cache a batch aggregate result map.
-pub fn cache_batch_aggregate(key: String, values: FxHashMap<Value, Value>) {
+pub fn cache_batch_aggregate(key: String, values: AHashMap<Value, Value>) {
     BATCH_AGGREGATE_CACHE.with(|cache| {
         cache.borrow_mut().insert(key, Arc::new(values));
     });
@@ -319,6 +348,53 @@ pub fn cache_batch_aggregate_info(subquery_key: String, info: Option<BatchAggreg
     });
 }
 
+use crate::parser::ast::Expression;
+
+/// Pre-computed info for index nested loop EXISTS lookups to avoid per-row string operations.
+/// This caches the pre-computed lowercase column names for O(1) outer row lookups.
+#[derive(Clone)]
+pub struct ExistsCorrelationInfo {
+    /// The outer column name in original case
+    pub outer_column: String,
+    /// The outer table name (optional)
+    pub outer_table: Option<String>,
+    /// The inner column name
+    pub inner_column: String,
+    /// The inner table name
+    pub inner_table: String,
+    /// Pre-computed lowercase outer column name for fast HashMap lookup
+    pub outer_column_lower: String,
+    /// Pre-computed qualified outer column name (e.g., "u.id") in lowercase
+    pub outer_qualified_lower: Option<String>,
+    /// The additional predicate beyond the correlation (if any)
+    pub additional_predicate: Option<Expression>,
+}
+
+// Cache for EXISTS correlation info to avoid per-row extraction.
+// The key is the subquery pointer (as string), the value is the pre-computed info.
+thread_local! {
+    static EXISTS_CORRELATION_CACHE: RefCell<FxHashMap<String, Option<ExistsCorrelationInfo>>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the EXISTS correlation cache.
+pub fn clear_exists_correlation_cache() {
+    EXISTS_CORRELATION_CACHE.with(|cache| {
+        cache.borrow_mut().clear();
+    });
+}
+
+/// Get cached EXISTS correlation info by subquery pointer.
+pub fn get_cached_exists_correlation(subquery_key: &str) -> Option<Option<ExistsCorrelationInfo>> {
+    EXISTS_CORRELATION_CACHE.with(|cache| cache.borrow().get(subquery_key).cloned())
+}
+
+/// Cache EXISTS correlation info (None means correlation not extractable).
+pub fn cache_exists_correlation(subquery_key: String, info: Option<ExistsCorrelationInfo>) {
+    EXISTS_CORRELATION_CACHE.with(|cache| {
+        cache.borrow_mut().insert(subquery_key, info);
+    });
+}
+
 /// Execution context for SQL queries
 ///
 /// The execution context carries state and configuration for query execution,
@@ -339,7 +415,7 @@ pub struct ExecutionContext {
     /// Current database/schema name - wrapped in Arc for cheap cloning
     current_database: Arc<Option<String>>,
     /// Session variables (SET key = value) - wrapped in Arc for cheap cloning
-    session_vars: Arc<HashMap<String, Value>>,
+    session_vars: Arc<AHashMap<String, Value>>,
     /// Query timeout in milliseconds (0 = no timeout)
     timeout_ms: u64,
     /// Current view nesting depth (for detecting infinite recursion)
@@ -380,7 +456,7 @@ impl ExecutionContext {
             auto_commit: true,
             cancelled: Arc::new(AtomicBool::new(false)),
             current_database: Arc::new(None),
-            session_vars: Arc::new(HashMap::new()),
+            session_vars: Arc::new(AHashMap::new()),
             timeout_ms: 0,
             view_depth: 0,
             query_depth: 0,
@@ -995,6 +1071,7 @@ impl Default for ExecutionContextBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_context_new() {

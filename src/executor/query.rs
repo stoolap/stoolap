@@ -39,11 +39,20 @@ use crate::storage::traits::{Engine, QueryResult};
 /// Maximum depth for nested views to prevent stack overflow
 const MAX_VIEW_DEPTH: usize = 32;
 
+/// Threshold below which streaming NOT EXISTS with early termination outperforms
+/// bulk anti-join materialization. Queries with LIMIT below this value use the
+/// streaming InHashSet path which can terminate early, while queries without LIMIT
+/// (or with larger LIMIT) use bulk anti-join which is faster for full scans.
+/// Based on benchmarking where streaming wins when result set is small enough
+/// to benefit from early termination.
+const ANTI_JOIN_LIMIT_THRESHOLD: i64 = 10000;
+
 use super::context::{
-    clear_batch_aggregate_cache, clear_batch_aggregate_info_cache, clear_exists_fetcher_cache,
-    clear_exists_index_cache, clear_exists_pred_key_cache, clear_exists_predicate_cache,
-    clear_exists_schema_cache, clear_in_subquery_cache, clear_scalar_subquery_cache,
-    clear_semi_join_cache, ExecutionContext, TimeoutGuard,
+    clear_batch_aggregate_cache, clear_batch_aggregate_info_cache, clear_count_counter_cache,
+    clear_exists_correlation_cache, clear_exists_fetcher_cache, clear_exists_index_cache,
+    clear_exists_pred_key_cache, clear_exists_predicate_cache, clear_exists_schema_cache,
+    clear_in_subquery_cache, clear_scalar_subquery_cache, clear_semi_join_cache, ExecutionContext,
+    TimeoutGuard,
 };
 use super::expression::{
     compile_expression, CompiledEvaluator, ExecuteContext, ExprVM, ExpressionEval, JoinFilter,
@@ -180,8 +189,10 @@ impl Executor {
             clear_exists_predicate_cache();
             clear_exists_index_cache();
             clear_exists_fetcher_cache();
+            clear_count_counter_cache();
             clear_exists_schema_cache();
             clear_exists_pred_key_cache();
+            clear_exists_correlation_cache();
             clear_batch_aggregate_cache();
             clear_batch_aggregate_info_cache();
             TimeoutGuard::new(ctx)
@@ -1746,6 +1757,89 @@ impl Executor {
                             None
                         }
                     });
+
+                    // ANTI-JOIN OPTIMIZATION: For pure NOT EXISTS without LIMIT, use HashJoinOperator::Anti
+                    // This is faster than InHashSet because:
+                    // 1. Bulk hash table build and probe (no per-row expression evaluation)
+                    // 2. Better cache efficiency
+                    // 3. Direct row iteration without VM overhead
+                    //
+                    // HOWEVER: For queries with LIMIT, we skip anti-join because it materializes
+                    // ALL outer rows before applying LIMIT. The streaming InHashSet path can stop
+                    // early once LIMIT is reached, making it faster for limited result sets.
+                    if let Some(not_exists_info) =
+                        Self::try_extract_not_exists_info(where_expr, &outer_tables)
+                    {
+                        // Check if NOT EXISTS is the ONLY predicate (pure anti-join case)
+                        let is_pure_not_exists = matches!(where_expr, Expression::Prefix(_));
+
+                        // Only use anti-join for queries without LIMIT (or very large LIMIT)
+                        // For LIMIT queries, the streaming InHashSet path is faster due to early termination
+                        let has_limit = outer_limit.is_some()
+                            && outer_limit.unwrap() < ANTI_JOIN_LIMIT_THRESHOLD;
+                        let use_anti_join = is_pure_not_exists && !has_limit;
+
+                        if use_anti_join {
+                            #[cfg(debug_assertions)]
+                            eprintln!("[ANTI_JOIN] Using anti-join optimization for NOT EXISTS");
+
+                            // Materialize outer table rows
+                            let outer_rows = table.collect_all_rows(storage_expr.as_deref())?;
+
+                            // Execute anti-join
+                            let anti_join_result = self.execute_anti_join(
+                                &not_exists_info,
+                                Arc::new(outer_rows),
+                                &all_columns,
+                                ctx,
+                            )?;
+
+                            // Project and return result
+                            let projected_rows = self.project_rows_with_alias(
+                                &stmt.columns,
+                                anti_join_result,
+                                &all_columns,
+                                ctx,
+                                table_alias.as_deref(),
+                            )?;
+                            let output_columns = self.get_output_column_names(
+                                &stmt.columns,
+                                &all_columns,
+                                table_alias.as_deref(),
+                            );
+
+                            // Apply LIMIT if present
+                            let final_rows = if let Some(limit_expr) = &stmt.limit {
+                                if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
+                                    let limit = lit.value as usize;
+                                    let offset = stmt
+                                        .offset
+                                        .as_ref()
+                                        .and_then(|o| {
+                                            if let Expression::IntegerLiteral(lit) = o.as_ref() {
+                                                Some(lit.value as usize)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .unwrap_or(0);
+                                    projected_rows
+                                        .into_iter()
+                                        .skip(offset)
+                                        .take(limit)
+                                        .collect()
+                                } else {
+                                    projected_rows
+                                }
+                            } else {
+                                projected_rows
+                            };
+
+                            let result =
+                                ExecutorMemoryResult::new(output_columns.clone(), final_rows);
+                            return Ok((Box::new(result), output_columns, true));
+                        }
+                    }
 
                     // Try semi-join optimizations for both EXISTS and IN subqueries
                     // These transform O(outer × inner) to O(inner + outer)

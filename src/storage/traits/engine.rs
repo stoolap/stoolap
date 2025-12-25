@@ -216,6 +216,19 @@ pub trait Engine: Send + Sync {
             "get_row_fetcher not supported by this engine",
         ))
     }
+
+    /// Get a count-only function for counting visible rows by their IDs.
+    /// This is optimized for COUNT(*) subqueries where we don't need the actual row data.
+    #[allow(clippy::type_complexity)]
+    fn get_row_counter(
+        &self,
+        table_name: &str,
+    ) -> Result<Box<dyn Fn(&[i64]) -> usize + Send + Sync>> {
+        let _ = table_name;
+        Err(crate::core::Error::internal(
+            "get_row_counter not supported by this engine",
+        ))
+    }
 }
 
 #[cfg(test)]
