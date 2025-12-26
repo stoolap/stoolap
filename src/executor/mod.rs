@@ -62,6 +62,7 @@ mod aggregation;
 mod cte;
 mod ddl;
 mod dml;
+mod dml_fast_path;
 mod explain;
 pub(crate) mod expr_converter;
 mod index_optimizer;
@@ -353,12 +354,30 @@ impl Executor {
                 }
             }
 
-            // For SELECT statements, try the compiled fast path first
-            if let Statement::Select(stmt) = cached.statement.as_ref() {
-                if let Some(result) = self.try_fast_pk_lookup_compiled(stmt, ctx, &cached.compiled)
-                {
-                    return result;
+            // Try compiled fast paths based on statement type
+            match cached.statement.as_ref() {
+                Statement::Select(stmt) => {
+                    if let Some(result) =
+                        self.try_fast_pk_lookup_compiled(stmt, ctx, &cached.compiled)
+                    {
+                        return result;
+                    }
                 }
+                Statement::Update(stmt) => {
+                    if let Some(result) =
+                        self.try_fast_pk_update_compiled(stmt, ctx, &cached.compiled)
+                    {
+                        return result;
+                    }
+                }
+                Statement::Delete(stmt) => {
+                    if let Some(result) =
+                        self.try_fast_pk_delete_compiled(stmt, ctx, &cached.compiled)
+                    {
+                        return result;
+                    }
+                }
+                _ => {}
             }
 
             // Execute the cached statement (standard path)
@@ -381,13 +400,30 @@ impl Executor {
                 .query_cache
                 .put(sql, stmt_arc.clone(), has_params, param_count);
 
-            // For SELECT statements, try the compiled fast path first
-            if let Statement::Select(select) = stmt_arc.as_ref() {
-                if let Some(result) =
-                    self.try_fast_pk_lookup_compiled(select, ctx, &cached_plan.compiled)
-                {
-                    return result;
+            // Try compiled fast paths based on statement type
+            match stmt_arc.as_ref() {
+                Statement::Select(select) => {
+                    if let Some(result) =
+                        self.try_fast_pk_lookup_compiled(select, ctx, &cached_plan.compiled)
+                    {
+                        return result;
+                    }
                 }
+                Statement::Update(update) => {
+                    if let Some(result) =
+                        self.try_fast_pk_update_compiled(update, ctx, &cached_plan.compiled)
+                    {
+                        return result;
+                    }
+                }
+                Statement::Delete(delete) => {
+                    if let Some(result) =
+                        self.try_fast_pk_delete_compiled(delete, ctx, &cached_plan.compiled)
+                    {
+                        return result;
+                    }
+                }
+                _ => {}
             }
 
             // Execute directly from the Arc (no clone needed)

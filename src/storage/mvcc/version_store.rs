@@ -3825,6 +3825,57 @@ impl TransactionVersionStore {
         Ok(())
     }
 
+    /// Optimized single-row put with pre-fetched original version
+    ///
+    /// This avoids redundant get_visible_version() calls by accepting the original
+    /// version that was already fetched during the read phase.
+    /// Used for PK-based UPDATE operations.
+    #[inline]
+    pub fn put_with_original(
+        &mut self,
+        row_id: i64,
+        data: Row,
+        original_version: RowVersion,
+        is_delete: bool,
+    ) -> Result<(), Error> {
+        // Create the new row version
+        let mut rv = RowVersion::new(self.txn_id, row_id, data);
+        if is_delete {
+            rv.deleted_at_txn_id = self.txn_id;
+        }
+
+        // Check if already in local versions (already processed in this transaction)
+        if let Some(versions) = self.local_versions.get_mut(&row_id) {
+            versions.push(rv);
+            return Ok(());
+        }
+
+        // Track in write-set using the pre-fetched original version
+        if !self.write_set.contains_key(&row_id) {
+            let read_version_seq = self
+                .parent_store
+                .visibility_checker
+                .as_ref()
+                .map(|c| c.get_current_sequence())
+                .unwrap_or(0);
+
+            self.write_set.insert(
+                row_id,
+                WriteSetEntry {
+                    read_version: Some(original_version),
+                    read_version_seq,
+                },
+            );
+
+            // Claim the row for update
+            self.parent_store.try_claim_row(row_id, self.txn_id)?;
+        }
+
+        // Insert new version history for this row
+        self.local_versions.insert(row_id, vec![rv]);
+        Ok(())
+    }
+
     /// Optimized batch put for UPDATE operations with pre-fetched original versions
     ///
     /// This avoids redundant get_visible_version() calls by accepting the original
@@ -3853,8 +3904,15 @@ impl TransactionVersionStore {
 
             // Track in write-set using the pre-fetched original version
             if let std::collections::hash_map::Entry::Vacant(e) = self.write_set.entry(row_id) {
-                // The read_version_seq was stored in create_time during get_visible_versions_for_update
-                let read_version_seq = original_version.create_time;
+                // Get current sequence for conflict detection
+                // Note: We get a fresh sequence instead of relying on create_time because
+                // callers may use get_visible_version() which doesn't set create_time to the sequence
+                let read_version_seq = self
+                    .parent_store
+                    .visibility_checker
+                    .as_ref()
+                    .map(|c| c.get_current_sequence())
+                    .unwrap_or(0);
                 e.insert(WriteSetEntry {
                     read_version: Some(original_version),
                     read_version_seq,
@@ -3918,6 +3976,53 @@ impl TransactionVersionStore {
             } else {
                 self.local_versions.insert(row_id, vec![rv]);
             }
+        }
+        Ok(())
+    }
+
+    /// Optimized batch delete with pre-fetched original versions
+    ///
+    /// This avoids redundant get_visible_version() calls by accepting the original
+    /// versions that were already fetched during the read phase.
+    /// Used for PK range DELETE operations.
+    pub fn put_batch_deleted_with_originals(
+        &mut self,
+        rows: Vec<(i64, Row, RowVersion)>,
+    ) -> Result<(), Error> {
+        for (row_id, data, original_version) in rows {
+            // Create deleted row version
+            let mut rv = RowVersion::new(self.txn_id, row_id, data);
+            rv.deleted_at_txn_id = self.txn_id;
+
+            // Check if already in local versions (already processed in this transaction)
+            if let Some(versions) = self.local_versions.get_mut(&row_id) {
+                versions.push(rv);
+                continue;
+            }
+
+            // Track in write-set using the pre-fetched original version
+            if !self.write_set.contains_key(&row_id) {
+                let read_version_seq = self
+                    .parent_store
+                    .visibility_checker
+                    .as_ref()
+                    .map(|c| c.get_current_sequence())
+                    .unwrap_or(0);
+
+                self.write_set.insert(
+                    row_id,
+                    WriteSetEntry {
+                        read_version: Some(original_version),
+                        read_version_seq,
+                    },
+                );
+
+                // Claim the row for delete
+                self.parent_store.try_claim_row(row_id, self.txn_id)?;
+            }
+
+            // Insert deleted version for this row
+            self.local_versions.insert(row_id, vec![rv]);
         }
         Ok(())
     }

@@ -382,6 +382,13 @@ impl MVCCTable {
                             && matches!(upper_op, Operator::Lt | Operator::Lte)
                         {
                             if let Some(index) = self.version_store.get_index_by_column(col1) {
+                                // Only B-tree indexes support range queries
+                                // Hash and Bitmap indexes return empty for range queries,
+                                // which would incorrectly indicate "no matches" instead of
+                                // "can't handle this query"
+                                if index.index_type() != IndexType::BTree {
+                                    return None; // Fall back to full scan
+                                }
                                 let min_inclusive = matches!(lower_op, Operator::Gte);
                                 let max_inclusive = matches!(upper_op, Operator::Lte);
                                 let row_ids = index.get_row_ids_in_range(
@@ -1558,15 +1565,18 @@ impl Table for MVCCTable {
         if let Some(expr) = where_expr {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
-                let row = {
+                // OPTIMIZATION: Track original version to avoid redundant lookup in put()
+                let row_with_original = {
                     let txn_versions = self.txn_versions.read().unwrap();
                     if let Some(row) = txn_versions.get(pk_id) {
-                        Some(row)
+                        // Local version - no need to track original (already in write-set)
+                        Some((row, None))
                     } else if let Some(version) =
                         self.version_store.get_visible_version(pk_id, self.txn_id)
                     {
                         if !version.is_deleted() {
-                            Some(version.data.clone())
+                            let data = version.data.clone();
+                            Some((data, Some(version)))
                         } else {
                             None
                         }
@@ -1575,14 +1585,25 @@ impl Table for MVCCTable {
                     }
                 };
 
-                if let Some(row) = row {
+                if let Some((row, original_version)) = row_with_original {
                     // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
                     let row = self.normalize_row_to_schema(row, schema);
                     let (updated_row, _) = setter(row);
-                    self.txn_versions
-                        .write()
-                        .unwrap()
-                        .put(pk_id, updated_row, false)?;
+                    if let Some(orig) = original_version {
+                        // Use optimized put that skips redundant get_visible_version
+                        self.txn_versions.write().unwrap().put_with_original(
+                            pk_id,
+                            updated_row,
+                            orig,
+                            false,
+                        )?;
+                    } else {
+                        // Local version - use regular put
+                        self.txn_versions
+                            .write()
+                            .unwrap()
+                            .put(pk_id, updated_row, false)?;
+                    }
                     return Ok(1);
                 }
                 return Ok(0);
@@ -1590,39 +1611,41 @@ impl Table for MVCCTable {
 
             // Fast path: PK range lookup (WHERE id >= X AND id < Y)
             if let Some(pk_range_ids) = self.try_pk_range_lookup(expr, schema) {
-                let mut rows_to_update: Vec<(i64, Row)> = Vec::with_capacity(pk_range_ids.len());
+                // OPTIMIZATION: Track original versions to avoid redundant lookups
+                let mut local_rows: Vec<(i64, Row)> = Vec::with_capacity(pk_range_ids.len() / 4);
+                let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
+                    Vec::with_capacity(pk_range_ids.len());
 
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
                     for row_id in pk_range_ids {
-                        let row = if let Some(row) = txn_versions.get(row_id) {
-                            Some(row)
+                        if let Some(row) = txn_versions.get(row_id) {
+                            // Local version
+                            let row = self.normalize_row_to_schema(row, schema);
+                            let (updated_row, _) = setter(row);
+                            local_rows.push((row_id, updated_row));
                         } else if let Some(version) =
                             self.version_store.get_visible_version(row_id, self.txn_id)
                         {
                             if !version.is_deleted() {
-                                Some(version.data.clone())
-                            } else {
-                                None
+                                let row =
+                                    self.normalize_row_to_schema(version.data.clone(), schema);
+                                let (updated_row, _) = setter(row);
+                                rows_with_originals.push((row_id, updated_row, version));
                             }
-                        } else {
-                            None
-                        };
-
-                        if let Some(row) = row {
-                            let row = self.normalize_row_to_schema(row, schema);
-                            let (updated_row, _) = setter(row);
-                            rows_to_update.push((row_id, updated_row));
                         }
                     }
                 }
 
-                let update_count = rows_to_update.len() as i32;
-                if !rows_to_update.is_empty() {
-                    self.txn_versions
-                        .write()
-                        .unwrap()
-                        .put_batch_for_update(rows_to_update)?;
+                let update_count = (local_rows.len() + rows_with_originals.len()) as i32;
+                if !local_rows.is_empty() || !rows_with_originals.is_empty() {
+                    let mut txn_versions = self.txn_versions.write().unwrap();
+                    if !local_rows.is_empty() {
+                        txn_versions.put_batch_for_update(local_rows)?;
+                    }
+                    if !rows_with_originals.is_empty() {
+                        txn_versions.put_batch_with_originals(rows_with_originals)?;
+                    }
                 }
                 return Ok(update_count);
             }
@@ -1786,15 +1809,18 @@ impl Table for MVCCTable {
         if let Some(expr) = where_expr {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
-                let row = {
+                // OPTIMIZATION: Track original version to avoid redundant lookup in put()
+                let row_with_original = {
                     let txn_versions = self.txn_versions.read().unwrap();
                     if let Some(row) = txn_versions.get(pk_id) {
-                        Some(row)
+                        // Local version - no need to track original (already in write-set)
+                        Some((row, None))
                     } else if let Some(version) =
                         self.version_store.get_visible_version(pk_id, self.txn_id)
                     {
                         if !version.is_deleted() {
-                            Some(version.data.clone())
+                            let data = version.data.clone();
+                            Some((data, Some(version)))
                         } else {
                             None
                         }
@@ -1803,9 +1829,17 @@ impl Table for MVCCTable {
                     }
                 };
 
-                if let Some(row) = row {
-                    // Row is already owned from the above block, no extra clone needed
-                    self.txn_versions.write().unwrap().put(pk_id, row, true)?;
+                if let Some((row, original_version)) = row_with_original {
+                    if let Some(orig) = original_version {
+                        // Use optimized put that skips redundant get_visible_version
+                        self.txn_versions
+                            .write()
+                            .unwrap()
+                            .put_with_original(pk_id, row, orig, true)?;
+                    } else {
+                        // Local version - use regular put
+                        self.txn_versions.write().unwrap().put(pk_id, row, true)?;
+                    }
                     return Ok(1);
                 }
                 return Ok(0);
@@ -1814,37 +1848,36 @@ impl Table for MVCCTable {
             // Fast path: PK range lookup (WHERE id >= X AND id < Y)
             // PK IS the row_id, so we can generate the range directly
             if let Some(pk_range_ids) = self.try_pk_range_lookup(expr, schema) {
-                let mut rows_to_delete: Vec<(i64, Row)> = Vec::with_capacity(pk_range_ids.len());
+                // OPTIMIZATION: Track original versions to avoid redundant lookups
+                let mut local_rows: Vec<(i64, Row)> = Vec::with_capacity(pk_range_ids.len() / 4);
+                let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
+                    Vec::with_capacity(pk_range_ids.len());
 
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
                     for row_id in pk_range_ids {
-                        let row = if let Some(row) = txn_versions.get(row_id) {
-                            Some(row)
+                        if let Some(row) = txn_versions.get(row_id) {
+                            // Local version
+                            local_rows.push((row_id, row));
                         } else if let Some(version) =
                             self.version_store.get_visible_version(row_id, self.txn_id)
                         {
                             if !version.is_deleted() {
-                                Some(version.data.clone())
-                            } else {
-                                None
+                                rows_with_originals.push((row_id, version.data.clone(), version));
                             }
-                        } else {
-                            None
-                        };
-
-                        if let Some(row) = row {
-                            rows_to_delete.push((row_id, row));
                         }
                     }
                 }
 
-                let delete_count = rows_to_delete.len() as i32;
-                if !rows_to_delete.is_empty() {
-                    self.txn_versions
-                        .write()
-                        .unwrap()
-                        .put_batch_deleted(rows_to_delete)?;
+                let delete_count = (local_rows.len() + rows_with_originals.len()) as i32;
+                if !local_rows.is_empty() || !rows_with_originals.is_empty() {
+                    let mut txn_versions = self.txn_versions.write().unwrap();
+                    if !local_rows.is_empty() {
+                        txn_versions.put_batch_deleted(local_rows)?;
+                    }
+                    if !rows_with_originals.is_empty() {
+                        txn_versions.put_batch_deleted_with_originals(rows_with_originals)?;
+                    }
                 }
                 return Ok(delete_count);
             }

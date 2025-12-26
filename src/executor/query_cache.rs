@@ -62,9 +62,61 @@ pub struct CompiledPkLookup {
     pub column_names: Vec<String>,
     /// How to extract the PK value
     pub pk_value_source: PkValueSource,
-    /// Schema version at compilation time (column count as simple version check)
+    /// Schema version at compilation time (updated_at timestamp in millis)
     /// Used to detect schema changes from ALTER TABLE
-    pub schema_version: usize,
+    pub schema_version: i64,
+}
+
+/// Pre-compiled update column assignment
+#[derive(Debug, Clone)]
+pub struct CompiledUpdateColumn {
+    /// Column index in the schema
+    pub column_idx: usize,
+    /// Column data type for coercion
+    pub column_type: crate::core::DataType,
+    /// How to get the new value (literal or parameter)
+    pub value_source: UpdateValueSource,
+}
+
+/// How to get the update value
+#[derive(Debug, Clone)]
+pub enum UpdateValueSource {
+    /// Value is a literal
+    Literal(crate::core::Value),
+    /// Value comes from a parameter (0-indexed)
+    Parameter(usize),
+}
+
+/// Pre-compiled state for PK-based UPDATE (UPDATE table SET col = val WHERE pk = value)
+#[derive(Debug, Clone)]
+pub struct CompiledPkUpdate {
+    /// Table name (already lowercased)
+    pub table_name: String,
+    /// Cached schema
+    pub schema: Arc<Schema>,
+    /// Cached PK column name
+    pub pk_column_name: String,
+    /// How to extract the PK value
+    pub pk_value_source: PkValueSource,
+    /// Pre-compiled column assignments
+    pub updates: Vec<CompiledUpdateColumn>,
+    /// Schema version at compilation time (updated_at timestamp in millis)
+    pub schema_version: i64,
+}
+
+/// Pre-compiled state for PK-based DELETE (DELETE FROM table WHERE pk = value)
+#[derive(Debug, Clone)]
+pub struct CompiledPkDelete {
+    /// Table name (already lowercased)
+    pub table_name: String,
+    /// Cached schema
+    pub schema: Arc<Schema>,
+    /// Cached PK column name
+    pub pk_column_name: String,
+    /// How to extract the PK value
+    pub pk_value_source: PkValueSource,
+    /// Schema version at compilation time (updated_at timestamp in millis)
+    pub schema_version: i64,
 }
 
 /// Pre-compiled execution state for fast paths
@@ -75,8 +127,12 @@ pub enum CompiledExecution {
     Unknown,
     /// Analyzed but doesn't qualify for any fast path
     NotOptimizable,
-    /// PK lookup fast path
+    /// PK lookup fast path (SELECT)
     PkLookup(CompiledPkLookup),
+    /// PK-based UPDATE fast path
+    PkUpdate(CompiledPkUpdate),
+    /// PK-based DELETE fast path
+    PkDelete(CompiledPkDelete),
 }
 
 /// Default cache size (number of cached plans)

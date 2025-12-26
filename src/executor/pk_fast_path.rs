@@ -64,8 +64,12 @@ impl Executor {
         // so it wouldn't see uncommitted changes from the current transaction.
         // This could return stale data if Transaction A updates a row and then
         // queries for it - the fast path would return the old committed value.
+        // Use try_lock for faster rejection under contention.
         {
-            let active_tx = self.active_transaction.lock().unwrap();
+            let active_tx = match self.active_transaction.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return None, // Lock contention - fall back to normal path
+            };
             if active_tx.is_some() {
                 return None; // Let normal execution path handle transaction context
             }
@@ -294,9 +298,12 @@ impl Executor {
         ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Quick reject: explicit transaction (same as non-compiled path)
+        // Quick reject: explicit transaction (use try_lock for fast rejection)
         {
-            let active_tx = self.active_transaction.lock().unwrap();
+            let active_tx = match self.active_transaction.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return None, // Lock contention - fall back to normal path
+            };
             if active_tx.is_some() {
                 return None;
             }
@@ -311,10 +318,10 @@ impl Executor {
             match &*compiled_guard {
                 CompiledExecution::NotOptimizable => return None,
                 CompiledExecution::PkLookup(lookup) => {
-                    // Validate schema version before using cached lookup
-                    // This detects ALTER TABLE ADD/DROP COLUMN
+                    // Validate schema version using updated_at timestamp
+                    // This detects any ALTER TABLE changes
                     if let Ok(current_schema) = self.engine.get_table_schema(&lookup.table_name) {
-                        if current_schema.columns.len() != lookup.schema_version {
+                        if current_schema.updated_at.timestamp_millis() != lookup.schema_version {
                             // Schema changed - need to recompile
                             // Fall through to recompile path
                         } else {
@@ -329,6 +336,8 @@ impl Executor {
                     }
                 }
                 CompiledExecution::Unknown => {} // Fall through to compile
+                // These variants are for UPDATE/DELETE fast paths
+                CompiledExecution::PkUpdate(_) | CompiledExecution::PkDelete(_) => return None,
             }
         }
 
@@ -396,6 +405,8 @@ impl Executor {
                 return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
             }
             CompiledExecution::Unknown => {} // Continue with compilation
+            // These variants are for UPDATE/DELETE fast paths
+            CompiledExecution::PkUpdate(_) | CompiledExecution::PkDelete(_) => return None,
         }
 
         // Do full pattern detection (same as try_fast_pk_lookup)
@@ -440,7 +451,7 @@ impl Executor {
                 // Build and cache compiled lookup
                 let column_names: Vec<String> =
                     info.schema.columns.iter().map(|c| c.name.clone()).collect();
-                let schema_version = info.schema.columns.len();
+                let schema_version = info.schema.updated_at.timestamp_millis();
                 let compiled_lookup = CompiledPkLookup {
                     table_name: info.table_name.clone(),
                     schema: info.schema.clone(),
