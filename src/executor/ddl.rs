@@ -359,6 +359,9 @@ impl Executor {
             self.engine.drop_table_internal(table_name)?;
         }
 
+        // Invalidate query cache for this table (schema no longer exists)
+        self.query_cache.invalidate_table(table_name);
+
         Ok(Box::new(ExecResult::empty()))
     }
 
@@ -557,6 +560,10 @@ impl Executor {
                         default_value,
                     )?;
 
+                    // Refresh engine's schema cache from version store
+                    // The table modified the version_store schema, but engine has a separate cache
+                    self.engine.refresh_schema_cache(table_name)?;
+
                     // Record ALTER TABLE ADD COLUMN to WAL for persistence
                     self.engine.record_alter_table_add_column(
                         table_name,
@@ -575,6 +582,9 @@ impl Executor {
                 if let Some(ref col_name) = stmt.column_name {
                     table.drop_column(&col_name.value)?;
 
+                    // Refresh engine's schema cache from version store
+                    self.engine.refresh_schema_cache(table_name)?;
+
                     // Record ALTER TABLE DROP COLUMN to WAL for persistence
                     self.engine
                         .record_alter_table_drop_column(table_name, &col_name.value);
@@ -587,6 +597,9 @@ impl Executor {
             AlterTableOperation::RenameColumn => match (&stmt.column_name, &stmt.new_column_name) {
                 (Some(old_name), Some(new_name)) => {
                     table.rename_column(&old_name.value, &new_name.value)?;
+
+                    // Refresh engine's schema cache from version store
+                    self.engine.refresh_schema_cache(table_name)?;
 
                     // Record ALTER TABLE RENAME COLUMN to WAL for persistence
                     self.engine.record_alter_table_rename_column(
@@ -610,6 +623,9 @@ impl Executor {
                         .any(|c| matches!(c, ColumnConstraint::NotNull));
 
                     table.modify_column(&col_def.name.value, data_type, nullable)?;
+
+                    // Refresh engine's schema cache from version store
+                    self.engine.refresh_schema_cache(table_name)?;
 
                     // Record ALTER TABLE MODIFY COLUMN to WAL for persistence
                     self.engine.record_alter_table_modify_column(
@@ -640,6 +656,10 @@ impl Executor {
         }
 
         tx.commit()?;
+
+        // Invalidate query cache for this table (schema may have changed)
+        self.query_cache.invalidate_table(table_name);
+
         Ok(Box::new(ExecResult::empty()))
     }
 

@@ -148,6 +148,10 @@ pub enum RowRef {
     /// Composite row - combines two rows without copying.
     /// Used by join operators to avoid materializing combined rows.
     Composite(CompositeRow),
+
+    /// Shared build composite - combines probe row with an Arc-referenced build row.
+    /// Avoids cloning build rows by keeping a reference to the shared storage.
+    SharedBuildComposite(SharedBuildCompositeRow),
 }
 
 impl RowRef {
@@ -169,6 +173,7 @@ impl RowRef {
         match self {
             RowRef::Owned(row) => row.len(),
             RowRef::Composite(comp) => comp.len(),
+            RowRef::SharedBuildComposite(shared) => shared.len(),
         }
     }
 
@@ -184,18 +189,20 @@ impl RowRef {
         match self {
             RowRef::Owned(row) => row.get(idx),
             RowRef::Composite(comp) => comp.get(idx),
+            RowRef::SharedBuildComposite(shared) => shared.get(idx),
         }
     }
 
     /// Convert to an owned Row.
     ///
     /// For `Owned`, this is a no-op move.
-    /// For `Composite`, this materializes the combined row.
+    /// For `Composite` and `SharedBuildComposite`, this materializes the combined row.
     #[inline]
     pub fn into_owned(self) -> Row {
         match self {
             RowRef::Owned(row) => row,
             RowRef::Composite(comp) => comp.materialize(),
+            RowRef::SharedBuildComposite(shared) => shared.materialize(),
         }
     }
 
@@ -206,6 +213,7 @@ impl RowRef {
         match self {
             RowRef::Owned(row) => row.clone(),
             RowRef::Composite(comp) => comp.materialize(),
+            RowRef::SharedBuildComposite(shared) => shared.materialize(),
         }
     }
 
@@ -215,7 +223,26 @@ impl RowRef {
         match self {
             RowRef::Owned(row) => Some(row),
             RowRef::Composite(_) => None,
+            RowRef::SharedBuildComposite(_) => None,
         }
+    }
+
+    /// Create a shared-build composite RowRef.
+    ///
+    /// This avoids cloning build rows by keeping an Arc reference.
+    #[inline]
+    pub fn shared_build_composite(
+        probe: Row,
+        build_rows: Arc<Vec<Row>>,
+        build_idx: usize,
+        probe_is_left: bool,
+    ) -> Self {
+        RowRef::SharedBuildComposite(SharedBuildCompositeRow::new(
+            probe,
+            build_rows,
+            build_idx,
+            probe_is_left,
+        ))
     }
 }
 
@@ -332,6 +359,119 @@ impl CompositeRow {
 }
 
 impl fmt::Display for CompositeRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "(")?;
+        for i in 0..self.len() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            if let Some(v) = self.get(i) {
+                write!(f, "{}", v)?;
+            } else {
+                write!(f, "NULL")?;
+            }
+        }
+        write!(f, ")")
+    }
+}
+
+/// A shared-build composite row that references build rows via Arc.
+///
+/// This optimization avoids cloning build rows by storing:
+/// - Owned probe row
+/// - Arc reference to shared build row storage
+/// - Index into the build rows
+///
+/// Only the Arc refcount is incremented (O(1)) instead of cloning
+/// the entire build row.
+#[derive(Debug, Clone)]
+pub struct SharedBuildCompositeRow {
+    /// Probe row (owned)
+    probe: Row,
+    /// Shared reference to build rows
+    build_rows: Arc<Vec<Row>>,
+    /// Index into build_rows
+    build_idx: usize,
+    /// Number of columns from the probe (left) side
+    probe_cols: usize,
+    /// Whether probe is left side (true) or right side (false)
+    probe_is_left: bool,
+}
+
+impl SharedBuildCompositeRow {
+    /// Create a new shared-build composite row.
+    #[inline]
+    pub fn new(
+        probe: Row,
+        build_rows: Arc<Vec<Row>>,
+        build_idx: usize,
+        probe_is_left: bool,
+    ) -> Self {
+        let probe_cols = probe.len();
+        Self {
+            probe,
+            build_rows,
+            build_idx,
+            probe_cols,
+            probe_is_left,
+        }
+    }
+
+    /// Get the total number of columns.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.probe_cols + self.build_rows[self.build_idx].len()
+    }
+
+    /// Check if this row is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.probe.is_empty() && self.build_rows[self.build_idx].is_empty()
+    }
+
+    /// Get a value by index without cloning.
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<&Value> {
+        let build_row = &self.build_rows[self.build_idx];
+        if self.probe_is_left {
+            // Output: [probe, build]
+            if idx < self.probe_cols {
+                self.probe.get(idx)
+            } else {
+                build_row.get(idx - self.probe_cols)
+            }
+        } else {
+            // Output: [build, probe]
+            let build_cols = build_row.len();
+            if idx < build_cols {
+                build_row.get(idx)
+            } else {
+                self.probe.get(idx - build_cols)
+            }
+        }
+    }
+
+    /// Materialize into an owned Row.
+    pub fn materialize(&self) -> Row {
+        let build_row = &self.build_rows[self.build_idx];
+        let total = self.probe_cols + build_row.len();
+        let mut values = Vec::with_capacity(total);
+
+        if self.probe_is_left {
+            // Output: [probe, build]
+            values.extend(self.probe.iter().cloned());
+            values.extend(build_row.iter().cloned());
+        } else {
+            // Output: [build, probe]
+            values.extend(build_row.iter().cloned());
+            values.extend(self.probe.iter().cloned());
+        }
+
+        Row::from_values(values)
+    }
+}
+
+impl fmt::Display for SharedBuildCompositeRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "(")?;
         for i in 0..self.len() {

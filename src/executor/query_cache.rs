@@ -39,7 +39,45 @@
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::core::Schema;
 use crate::parser::ast::Statement;
+
+/// How to extract the PK value for a compiled PK lookup
+#[derive(Debug, Clone)]
+pub enum PkValueSource {
+    /// Value comes from a parameter (0-indexed)
+    Parameter(usize),
+    /// Value is a literal integer
+    Literal(i64),
+}
+
+/// Pre-compiled state for PK lookup queries (SELECT * WHERE pk = value)
+#[derive(Debug, Clone)]
+pub struct CompiledPkLookup {
+    /// Table name (already lowercased)
+    pub table_name: String,
+    /// Cached schema
+    pub schema: Arc<Schema>,
+    /// Pre-computed column names for result
+    pub column_names: Vec<String>,
+    /// How to extract the PK value
+    pub pk_value_source: PkValueSource,
+    /// Schema version at compilation time (column count as simple version check)
+    /// Used to detect schema changes from ALTER TABLE
+    pub schema_version: usize,
+}
+
+/// Pre-compiled execution state for fast paths
+#[derive(Debug, Clone, Default)]
+pub enum CompiledExecution {
+    /// Not analyzed yet
+    #[default]
+    Unknown,
+    /// Analyzed but doesn't qualify for any fast path
+    NotOptimizable,
+    /// PK lookup fast path
+    PkLookup(CompiledPkLookup),
+}
 
 /// Default cache size (number of cached plans)
 pub const DEFAULT_CACHE_SIZE: usize = 1000;
@@ -54,6 +92,8 @@ pub struct CachedPlanRef {
     pub has_params: bool,
     /// Number of parameters required
     pub param_count: usize,
+    /// Shared reference to compiled execution state (lazily populated)
+    pub compiled: Arc<RwLock<CompiledExecution>>,
 }
 
 /// Represents a parsed and prepared statement stored in the cache
@@ -73,6 +113,8 @@ pub struct CachedQueryPlan {
     pub param_count: usize,
     /// Normalized query text (cache key)
     pub normalized_query: String,
+    /// Compiled execution state (lazily populated on first execution)
+    pub compiled: Arc<RwLock<CompiledExecution>>,
 }
 
 impl CachedQueryPlan {
@@ -92,6 +134,7 @@ impl CachedQueryPlan {
             has_params,
             param_count,
             normalized_query,
+            compiled: Arc::new(RwLock::new(CompiledExecution::Unknown)),
         }
     }
 }
@@ -143,6 +186,7 @@ impl QueryCache {
             statement: plan.statement.clone(),
             has_params: plan.has_params,
             param_count: plan.param_count,
+            compiled: plan.compiled.clone(), // Share compiled state
         })
     }
 
@@ -184,6 +228,35 @@ impl QueryCache {
     pub fn clear(&self) {
         if let Ok(mut plans) = self.plans.write() {
             plans.clear();
+        }
+    }
+
+    /// Invalidate all cached plans that reference a specific table
+    /// Called after DDL operations (ALTER TABLE, DROP TABLE, etc.)
+    pub fn invalidate_table(&self, table_name: &str) {
+        let table_lower = table_name.to_lowercase();
+        if let Ok(mut plans) = self.plans.write() {
+            // Remove plans that reference this table
+            // Check both the compiled PK lookup table name and query text
+            plans.retain(|_key, plan| {
+                // Check if compiled lookup references this table
+                if let Ok(compiled) = plan.compiled.read() {
+                    if let CompiledExecution::PkLookup(lookup) = &*compiled {
+                        if lookup.table_name == table_lower {
+                            return false; // Remove this plan
+                        }
+                    }
+                }
+                // Also check query text for table reference (simple heuristic)
+                let query_lower = plan.query_text.to_lowercase();
+                !query_lower.contains(&format!(" {} ", table_lower))
+                    && !query_lower.contains(&format!(" {}\n", table_lower))
+                    && !query_lower.contains(&format!(" {};", table_lower))
+                    && !query_lower.contains(&format!("from {}", table_lower))
+                    && !query_lower.contains(&format!("join {}", table_lower))
+                    && !query_lower.contains(&format!("into {}", table_lower))
+                    && !query_lower.contains(&format!("update {}", table_lower))
+            });
         }
     }
 

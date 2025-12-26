@@ -307,6 +307,14 @@ impl Iterator for ProbeIter<'_> {
 /// This is the same algorithm used in utils.rs but kept here to avoid circular deps.
 #[inline]
 pub fn hash_row_keys(row: &Row, key_indices: &[usize]) -> u64 {
+    // Fast path for single integer key (most common case: PK joins)
+    if key_indices.len() == 1 {
+        if let Some(Value::Integer(i)) = row.get(key_indices[0]) {
+            // FxHash for single integer - very fast
+            return (*i as u64).wrapping_mul(0x517cc1b727220a95);
+        }
+    }
+
     let mut hasher = FxHasher::default();
 
     for &idx in key_indices {
@@ -364,11 +372,27 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &Value) {
 pub fn verify_key_equality(row1: &Row, row2: &Row, indices1: &[usize], indices2: &[usize]) -> bool {
     debug_assert_eq!(indices1.len(), indices2.len());
 
+    // Fast path for single integer key (most common case: PK joins)
+    if indices1.len() == 1 {
+        let v1 = row1.get(indices1[0]);
+        let v2 = row2.get(indices2[0]);
+        return match (v1, v2) {
+            (Some(Value::Integer(a)), Some(Value::Integer(b))) => a == b,
+            (Some(a), Some(b)) => values_equal(a, b),
+            _ => false,
+        };
+    }
+
     for (&idx1, &idx2) in indices1.iter().zip(indices2.iter()) {
         let v1 = row1.get(idx1);
         let v2 = row2.get(idx2);
 
         match (v1, v2) {
+            (Some(Value::Integer(a)), Some(Value::Integer(b))) => {
+                if a != b {
+                    return false;
+                }
+            }
             (Some(a), Some(b)) => {
                 if !values_equal(a, b) {
                     return false;

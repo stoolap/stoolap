@@ -26,13 +26,14 @@
 //! For Index Nested Loop joins that perform thousands of PK lookups,
 //! this fast-path can provide significant speedups by amortizing less overhead.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use crate::core::{Result, Schema, Value};
+use crate::core::{Result, Row, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement, SimpleTableSource};
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
+use super::query_cache::{CompiledExecution, CompiledPkLookup, PkValueSource};
 use super::result::ExecutorMemoryResult;
 use super::Executor;
 
@@ -42,6 +43,8 @@ struct PkLookupInfo {
     table_name: String,
     /// PK value to look up
     pk_value: i64,
+    /// How to extract the PK value (for caching)
+    pk_value_source: PkValueSource,
     /// Cached schema to avoid second lookup
     schema: Arc<Schema>,
 }
@@ -125,7 +128,8 @@ impl Executor {
         let pk_column = &schema.columns[pk_idx].name;
 
         // Extract comparison info from WHERE clause
-        let (col_name, pk_value) = self.extract_pk_equality(where_clause, pk_column, ctx)?;
+        let (col_name, pk_value, pk_value_source) =
+            self.extract_pk_equality(where_clause, pk_column, ctx)?;
 
         // Column must match PK (case-insensitive)
         let col_lower = col_name.to_lowercase();
@@ -141,18 +145,19 @@ impl Executor {
         Some(PkLookupInfo {
             table_name: table_name.to_string(),
             pk_value,
+            pk_value_source,
             schema,
         })
     }
 
     /// Extract PK equality from WHERE clause
-    /// Returns (column_name, pk_value) if WHERE is `pk_col = literal` or `pk_col = $param`
+    /// Returns (column_name, pk_value, pk_value_source) if WHERE is `pk_col = literal` or `pk_col = $param`
     fn extract_pk_equality(
         &self,
         expr: &Expression,
         _pk_column: &str,
         ctx: &ExecutionContext,
-    ) -> Option<(String, i64)> {
+    ) -> Option<(String, i64, PkValueSource)> {
         match expr {
             Expression::Infix(infix) => {
                 // Must be equality operator
@@ -161,13 +166,17 @@ impl Executor {
                 }
 
                 // Try column = value pattern
-                if let Some((col, val)) = self.extract_col_eq_val(&infix.left, &infix.right, ctx) {
-                    return Some((col, val));
+                if let Some((col, val, source)) =
+                    self.extract_col_eq_val(&infix.left, &infix.right, ctx)
+                {
+                    return Some((col, val, source));
                 }
 
                 // Try value = column pattern
-                if let Some((col, val)) = self.extract_col_eq_val(&infix.right, &infix.left, ctx) {
-                    return Some((col, val));
+                if let Some((col, val, source)) =
+                    self.extract_col_eq_val(&infix.right, &infix.left, ctx)
+                {
+                    return Some((col, val, source));
                 }
 
                 None
@@ -176,13 +185,13 @@ impl Executor {
         }
     }
 
-    /// Extract column name and integer value from col = val pattern
+    /// Extract column name, integer value, and value source from col = val pattern
     fn extract_col_eq_val(
         &self,
         col_expr: &Expression,
         val_expr: &Expression,
         ctx: &ExecutionContext,
-    ) -> Option<(String, i64)> {
+    ) -> Option<(String, i64, PkValueSource)> {
         // Get column name
         let col_name = match col_expr {
             Expression::Identifier(id) => id.value.clone(),
@@ -190,10 +199,13 @@ impl Executor {
             _ => return None,
         };
 
-        // Get integer value
-        let pk_value = match val_expr {
-            Expression::IntegerLiteral(lit) => lit.value,
-            Expression::FloatLiteral(lit) => lit.value as i64,
+        // Get integer value and source
+        let (pk_value, pk_value_source) = match val_expr {
+            Expression::IntegerLiteral(lit) => (lit.value, PkValueSource::Literal(lit.value)),
+            Expression::FloatLiteral(lit) => {
+                let v = lit.value as i64;
+                (v, PkValueSource::Literal(v))
+            }
             Expression::Parameter(param) => {
                 // Resolve parameter from context
                 // Note: Parameters are 1-indexed in SQL ($1, $2, ...) but array is 0-indexed
@@ -206,16 +218,45 @@ impl Executor {
                 if param_idx >= params.len() {
                     return None;
                 }
-                match &params[param_idx] {
+                let pk_value = match &params[param_idx] {
                     Value::Integer(i) => *i,
                     Value::Float(f) => *f as i64,
                     _ => return None,
-                }
+                };
+                (pk_value, PkValueSource::Parameter(param_idx))
             }
             _ => return None,
         };
 
-        Some((col_name, pk_value))
+        Some((col_name, pk_value, pk_value_source))
+    }
+
+    /// Normalize a row to match the current schema
+    ///
+    /// This handles schema evolution (ALTER TABLE ADD/DROP COLUMN):
+    /// - If row has fewer columns than schema, append default values (or NULLs) for missing columns
+    /// - If row has more columns than schema, truncate the row
+    fn normalize_row_to_schema(mut row: Row, schema: &Schema) -> Row {
+        let schema_cols = schema.columns.len();
+        let row_cols = row.len();
+
+        if row_cols < schema_cols {
+            // Row has fewer columns - add default values (or NULLs) for new columns
+            for i in row_cols..schema_cols {
+                let col = &schema.columns[i];
+                // Use pre-computed default value if available, otherwise use NULL
+                if let Some(ref default_val) = col.default_value {
+                    row.push(default_val.clone());
+                } else {
+                    row.push(Value::null(col.data_type));
+                }
+            }
+        } else if row_cols > schema_cols {
+            // Row has more columns - truncate (columns were dropped)
+            row.truncate(schema_cols);
+        }
+
+        row
     }
 
     /// Execute the fast-path PK lookup using Engine::fetch_rows_by_ids
@@ -230,9 +271,193 @@ impl Executor {
             .engine
             .fetch_rows_by_ids(&info.table_name, &[info.pk_value])?;
 
-        // Extract just the Row values (discard row_ids)
-        let result_rows: Vec<_> = rows.into_iter().map(|(_, row)| row).collect();
+        // Extract Row values and normalize to current schema (handles ADD/DROP COLUMN)
+        let result_rows: Vec<_> = rows
+            .into_iter()
+            .map(|(_, row)| Self::normalize_row_to_schema(row, &info.schema))
+            .collect();
 
         Ok(Box::new(ExecutorMemoryResult::new(columns, result_rows)))
+    }
+
+    // ============================================================================
+    // COMPILED EXECUTION METHODS - Use pre-compiled state for fast repeated queries
+    // ============================================================================
+
+    /// Try fast PK lookup using pre-compiled state (if available)
+    ///
+    /// This is the preferred entry point for queries that may be executed multiple times.
+    /// First execution compiles and caches the state, subsequent executions use the cache.
+    pub(crate) fn try_fast_pk_lookup_compiled(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        compiled: &RwLock<CompiledExecution>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        // Quick reject: explicit transaction (same as non-compiled path)
+        {
+            let active_tx = self.active_transaction.lock().unwrap();
+            if active_tx.is_some() {
+                return None;
+            }
+        }
+
+        // Try read lock first - check if already compiled
+        {
+            let compiled_guard = match compiled.read() {
+                Ok(guard) => guard,
+                Err(_) => return None,
+            };
+            match &*compiled_guard {
+                CompiledExecution::NotOptimizable => return None,
+                CompiledExecution::PkLookup(lookup) => {
+                    // Validate schema version before using cached lookup
+                    // This detects ALTER TABLE ADD/DROP COLUMN
+                    if let Ok(current_schema) = self.engine.get_table_schema(&lookup.table_name) {
+                        if current_schema.columns.len() != lookup.schema_version {
+                            // Schema changed - need to recompile
+                            // Fall through to recompile path
+                        } else {
+                            // Fast path: extract value and execute
+                            let pk_value =
+                                self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
+                            return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
+                        }
+                    } else {
+                        // Table no longer exists - invalidate
+                        // Fall through to recompile path
+                    }
+                }
+                CompiledExecution::Unknown => {} // Fall through to compile
+            }
+        }
+
+        // First execution or schema changed - compile and cache (write lock)
+        self.compile_and_execute_pk_lookup(stmt, ctx, compiled)
+    }
+
+    /// Extract PK value using pre-compiled source (very fast - just array access)
+    fn extract_pk_value_fast(&self, source: &PkValueSource, ctx: &ExecutionContext) -> Option<i64> {
+        match source {
+            PkValueSource::Literal(v) => Some(*v),
+            PkValueSource::Parameter(idx) => {
+                let params = ctx.params();
+                if *idx >= params.len() {
+                    return None;
+                }
+                match &params[*idx] {
+                    Value::Integer(i) => Some(*i),
+                    Value::Float(f) => Some(*f as i64),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Execute using pre-compiled lookup (skip schema lookup, column name building)
+    fn execute_compiled_pk_lookup(
+        &self,
+        lookup: &CompiledPkLookup,
+        pk_value: i64,
+    ) -> Result<Box<dyn QueryResult>> {
+        let rows = self
+            .engine
+            .fetch_rows_by_ids(&lookup.table_name, &[pk_value])?;
+        // Normalize rows to current schema (handles ADD/DROP COLUMN)
+        let result_rows: Vec<_> = rows
+            .into_iter()
+            .map(|(_, row)| Self::normalize_row_to_schema(row, &lookup.schema))
+            .collect();
+        Ok(Box::new(ExecutorMemoryResult::new(
+            lookup.column_names.clone(),
+            result_rows,
+        )))
+    }
+
+    /// Compile and execute PK lookup, caching the compiled state
+    fn compile_and_execute_pk_lookup(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        compiled: &RwLock<CompiledExecution>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        // Acquire write lock
+        let mut compiled_guard = match compiled.write() {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        };
+
+        // Double-check (another thread may have compiled while we waited)
+        // But also re-validate schema version to handle schema changes
+        match &*compiled_guard {
+            CompiledExecution::NotOptimizable => return None,
+            CompiledExecution::PkLookup(lookup) => {
+                let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
+                return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
+            }
+            CompiledExecution::Unknown => {} // Continue with compilation
+        }
+
+        // Do full pattern detection (same as try_fast_pk_lookup)
+        let where_clause = stmt.where_clause.as_ref()?;
+        let table_expr = stmt.table_expr.as_ref()?;
+
+        // Quick reject: no GROUP BY, no HAVING, no CTEs, no set operations, no DISTINCT
+        if !stmt.group_by.columns.is_empty()
+            || stmt.having.is_some()
+            || !stmt.set_operations.is_empty()
+            || stmt.with.is_some()
+            || stmt.distinct
+        {
+            *compiled_guard = CompiledExecution::NotOptimizable;
+            return None;
+        }
+
+        // Quick reject: no ORDER BY
+        if !stmt.order_by.is_empty() {
+            *compiled_guard = CompiledExecution::NotOptimizable;
+            return None;
+        }
+
+        // Must be SELECT *
+        if stmt.columns.len() != 1 || !matches!(&stmt.columns[0], Expression::Star(_)) {
+            *compiled_guard = CompiledExecution::NotOptimizable;
+            return None;
+        }
+
+        // Extract table name
+        let table_name = match table_expr.as_ref() {
+            Expression::TableSource(SimpleTableSource { name, .. }) => name.value.to_lowercase(),
+            _ => {
+                *compiled_guard = CompiledExecution::NotOptimizable;
+                return None;
+            }
+        };
+
+        // Try to extract PK lookup info
+        match self.extract_pk_lookup_info(&table_name, where_clause, ctx) {
+            Some(info) => {
+                // Build and cache compiled lookup
+                let column_names: Vec<String> =
+                    info.schema.columns.iter().map(|c| c.name.clone()).collect();
+                let schema_version = info.schema.columns.len();
+                let compiled_lookup = CompiledPkLookup {
+                    table_name: info.table_name.clone(),
+                    schema: info.schema.clone(),
+                    column_names,
+                    pk_value_source: info.pk_value_source.clone(),
+                    schema_version,
+                };
+                *compiled_guard = CompiledExecution::PkLookup(compiled_lookup);
+                drop(compiled_guard);
+
+                // Execute
+                Some(self.execute_pk_lookup(info))
+            }
+            None => {
+                *compiled_guard = CompiledExecution::NotOptimizable;
+                None
+            }
+        }
     }
 }

@@ -1369,6 +1369,27 @@ impl MVCCEngine {
         Ok(())
     }
 
+    /// Refresh the engine's schema cache for a table from the version store
+    /// This is used after DDL operations that modify the table's schema directly
+    pub fn refresh_schema_cache(&self, table_name: &str) -> Result<()> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+
+        let table_name_lower = table_name.to_lowercase();
+
+        // Get the schema from the version store
+        let stores = self.version_stores.read().unwrap();
+        let store = stores.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+        let vs_schema = store.schema();
+
+        // Update the engine's schema cache
+        let mut schemas = self.schemas.write().unwrap();
+        schemas.insert(table_name_lower, vs_schema.clone());
+
+        Ok(())
+    }
+
     /// Drops a column from a table
     pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
         if !self.is_open() {

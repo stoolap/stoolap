@@ -353,7 +353,15 @@ impl Executor {
                 }
             }
 
-            // Execute the cached statement
+            // For SELECT statements, try the compiled fast path first
+            if let Statement::Select(stmt) = cached.statement.as_ref() {
+                if let Some(result) = self.try_fast_pk_lookup_compiled(stmt, ctx, &cached.compiled)
+                {
+                    return result;
+                }
+            }
+
+            // Execute the cached statement (standard path)
             return self.execute_statement(&cached.statement, ctx);
         }
 
@@ -369,8 +377,19 @@ impl Executor {
             let stmt = program.statements.pop().unwrap();
             let (has_params, param_count) = count_parameters(&stmt);
             let stmt_arc = std::sync::Arc::new(stmt);
-            self.query_cache
+            let cached_plan = self
+                .query_cache
                 .put(sql, stmt_arc.clone(), has_params, param_count);
+
+            // For SELECT statements, try the compiled fast path first
+            if let Statement::Select(select) = stmt_arc.as_ref() {
+                if let Some(result) =
+                    self.try_fast_pk_lookup_compiled(select, ctx, &cached_plan.compiled)
+                {
+                    return result;
+                }
+            }
+
             // Execute directly from the Arc (no clone needed)
             return self.execute_statement(&stmt_arc, ctx);
         }

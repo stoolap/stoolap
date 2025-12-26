@@ -429,25 +429,42 @@ impl HashJoinOperator {
         Row::from_values(vec![Value::null_unknown(); count])
     }
 
-    /// Combine probe and build rows in the correct order.
+    /// Combine probe row with a build row by index, avoiding clone.
+    /// Uses SharedBuildCompositeRow to reference the build row via Arc.
     #[inline]
-    fn combine_rows(&self, probe_row: Row, build_row: Row) -> Row {
+    fn combine_rows_shared(&self, probe_row: Row, build_idx: usize) -> RowRef {
+        // probe_is_left determines output column order:
+        // - true: output = [probe, build]
+        // - false: output = [build, probe]
+        let probe_is_left = self.build_side == JoinSide::Right;
+
+        RowRef::shared_build_composite(
+            probe_row,
+            Arc::clone(&self.build_rows),
+            build_idx,
+            probe_is_left,
+        )
+    }
+
+    /// Combine probe and build rows into a RowRef without allocation.
+    /// Uses CompositeRow to defer materialization until needed.
+    /// Used for OUTER join unmatched rows where we need an actual null row.
+    #[inline]
+    fn combine_rows_ref(&self, probe_row: Row, build_row: Row) -> RowRef {
         match self.build_side {
             JoinSide::Left => {
                 // Build is left, probe is right
                 // Output: [build_row, probe_row] = [left, right]
-                let mut values = Vec::with_capacity(self.left_col_count + self.right_col_count);
-                values.extend(build_row);
-                values.extend(probe_row);
-                Row::from_values(values)
+                RowRef::Composite(crate::executor::operator::CompositeRow::new(
+                    build_row, probe_row,
+                ))
             }
             JoinSide::Right => {
                 // Build is right, probe is left
                 // Output: [probe_row, build_row] = [left, right]
-                let mut values = Vec::with_capacity(self.left_col_count + self.right_col_count);
-                values.extend(probe_row);
-                values.extend(build_row);
-                Row::from_values(values)
+                RowRef::Composite(crate::executor::operator::CompositeRow::new(
+                    probe_row, build_row,
+                ))
             }
         }
     }
@@ -550,8 +567,7 @@ impl Operator for HashJoinOperator {
                 if !self.build_matched[idx] {
                     let build_row = self.build_rows[idx].clone();
                     let null_probe = self.null_probe_row();
-                    let combined = self.combine_rows(null_probe, build_row);
-                    return Ok(Some(RowRef::Owned(combined)));
+                    return Ok(Some(self.combine_rows_ref(null_probe, build_row)));
                 }
             }
             return Ok(None);
@@ -594,9 +610,19 @@ impl Operator for HashJoinOperator {
                         self.build_matched[build_idx] = true;
                     }
 
-                    let probe_row = self.current_probe_row.as_ref().unwrap().clone();
-                    let combined = self.combine_rows(probe_row, build_row.clone());
-                    return Ok(Some(RowRef::Owned(combined)));
+                    // Use SharedBuildComposite to avoid cloning build_row entirely.
+                    // The Arc<Vec<Row>> is shared, only refcount is incremented.
+                    //
+                    // For probe row: if this is the last match, take ownership instead of cloning.
+                    // This optimizes the common 1:1 join case where each probe has exactly one match.
+                    let probe_row = if self.current_match_idx >= self.current_matches.len() {
+                        // No more matches - take ownership
+                        self.current_probe_row.take().unwrap()
+                    } else {
+                        // More potential matches - clone
+                        self.current_probe_row.as_ref().unwrap().clone()
+                    };
+                    return Ok(Some(self.combine_rows_shared(probe_row, build_idx)));
                 }
             }
 
@@ -621,8 +647,7 @@ impl Operator for HashJoinOperator {
             if needs_unmatched_probe && !self.probe_had_match {
                 if let Some(probe_row) = self.current_probe_row.take() {
                     let null_build = self.null_build_row();
-                    let combined = self.combine_rows(probe_row, null_build);
-                    return Ok(Some(RowRef::Owned(combined)));
+                    return Ok(Some(self.combine_rows_ref(probe_row, null_build)));
                 }
             }
 
