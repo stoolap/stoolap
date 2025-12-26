@@ -27,14 +27,13 @@
 // - `RowFilter` pre-compiles the expression once and shares `Arc<Program>` across threads
 // - The VM is lightweight and can be created per-thread without performance penalty
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lru::LruCache;
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 
 use super::compiler::{CompileContext, ExprCompiler};
 use super::program::Program;
@@ -58,8 +57,9 @@ static PROGRAM_CACHE: Mutex<Option<LruCache<u64, SharedProgram>>> = Mutex::new(N
 
 /// Compute cache key from expression and columns using efficient recursive hashing.
 /// This avoids the overhead of Debug formatting by directly hashing expression structure.
+/// Uses FxHasher which is 2-5x faster than SipHash for small keys.
 fn compute_cache_key(expr: &Expression, columns: &[String]) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FxHasher::default();
     // Use efficient recursive hashing (same as CompiledEvaluator::hash_expression)
     hash_expression(expr, &mut hasher);
     // Hash column names
@@ -70,16 +70,17 @@ fn compute_cache_key(expr: &Expression, columns: &[String]) -> u64 {
 /// Compute a u64 hash of an expression without string allocation.
 /// This is O(expression_size) and avoids Debug formatting overhead.
 /// Use this for cache keys instead of format!("{:?}", expr).
+/// Uses FxHasher which is 2-5x faster than SipHash for small keys.
 #[inline]
 pub fn compute_expression_hash(expr: &Expression) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FxHasher::default();
     hash_expression(expr, &mut hasher);
     hasher.finish()
 }
 
 /// Recursively hash an expression without string allocation.
 /// This is O(expression_size) and avoids Debug formatting overhead.
-fn hash_expression(expr: &Expression, hasher: &mut DefaultHasher) {
+fn hash_expression(expr: &Expression, hasher: &mut FxHasher) {
     // First hash the discriminant to distinguish variants
     std::mem::discriminant(expr).hash(hasher);
 
@@ -1149,6 +1150,10 @@ pub struct CompiledEvaluator<'a> {
     /// Column names for compilation context
     columns: Vec<String>,
 
+    /// Cached source pointer for fast init_columns equality check
+    /// When init_columns is called with the same slice, we skip cloning
+    columns_source_id: usize,
+
     /// Second row columns (for joins)
     columns2: Option<Vec<String>>,
 
@@ -1196,6 +1201,7 @@ impl<'a> CompiledEvaluator<'a> {
         Self {
             function_registry,
             columns: Vec::new(),
+            columns_source_id: 0,
             columns2: None,
             outer_columns: None,
             params: Vec::new(),
@@ -1219,6 +1225,7 @@ impl<'a> CompiledEvaluator<'a> {
     /// Clear all state for reuse.
     pub fn clear(&mut self) {
         self.columns.clear();
+        self.columns_source_id = 0;
         self.columns2 = None;
         self.outer_columns = None;
         self.params.clear();
@@ -1294,8 +1301,21 @@ impl<'a> CompiledEvaluator<'a> {
     }
 
     /// Initialize the column index mapping (call once before set_row_array)
+    ///
+    /// Performance: This method caches the source slice pointer. When called
+    /// repeatedly with the same slice (e.g., same table schema), it skips
+    /// the expensive string cloning operation.
     pub fn init_columns(&mut self, columns: &[String]) {
+        // Fast path: if same slice by pointer and length, skip clone
+        // This handles the common case where init_columns is called repeatedly
+        // with the same table schema during UPDATE/SELECT operations
+        let new_source_id = columns.as_ptr() as usize;
+        if self.columns_source_id == new_source_id && self.columns.len() == columns.len() {
+            return;
+        }
+
         self.columns = columns.to_vec();
+        self.columns_source_id = new_source_id;
         // Clear local cache since compilation context changed
         self.local_cache.clear();
     }
@@ -1428,15 +1448,16 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Compute hash of expression content for local cache key.
     /// Fast recursive hash that avoids string allocation.
+    /// Uses FxHasher which is 2-5x faster than SipHash for small keys.
     #[inline]
     fn expr_hash(&self, expr: &Expression) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = FxHasher::default();
         Self::hash_expression(expr, &mut hasher);
         hasher.finish()
     }
 
     /// Recursively hash an expression without string allocation
-    fn hash_expression(expr: &Expression, hasher: &mut DefaultHasher) {
+    fn hash_expression(expr: &Expression, hasher: &mut FxHasher) {
         // First hash the discriminant to distinguish variants
         std::mem::discriminant(expr).hash(hasher);
 

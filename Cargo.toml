@@ -122,6 +122,14 @@ harness = false
 name = "select_complex"
 harness = false
 
+[[bench]]
+name = "update_complex"
+harness = false
+
+[[bench]]
+name = "delete_complex"
+harness = false
+
 [profile.bench]
 lto = true
 codegen-units = 1

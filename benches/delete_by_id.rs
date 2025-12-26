@@ -210,45 +210,81 @@ fn bench_delete_by_id(c: &mut Criterion) {
 }
 
 fn bench_delete_by_id_only(c: &mut Criterion) {
+    use criterion::BatchSize;
+
     let mut group = c.benchmark_group("DELETE by ID (delete only, no re-insert)");
 
-    // Use a smaller sample size since we're consuming rows
+    // Use a smaller sample size for this benchmark
     group.sample_size(50);
 
-    // Setup fresh databases for each run
-    let stoolap_db = setup_stoolap();
-    let sqlite_conn = setup_sqlite();
-
-    // Prepare statements
-    let stoolap_stmt = stoolap_db
-        .prepare("DELETE FROM users WHERE id = $1")
-        .unwrap();
-    let mut sqlite_stmt = sqlite_conn
-        .prepare("DELETE FROM users WHERE id = ?1")
-        .unwrap();
-
-    // Benchmark Stoolap - pure delete (rows get consumed)
+    // Benchmark Stoolap - fresh database per batch, delete 100 rows
     group.bench_function("stoolap", |b| {
-        let mut id = 1i64;
-        b.iter(|| {
-            if id <= ROW_COUNT as i64 {
-                stoolap_stmt.execute(black_box((id,))).unwrap();
-                id += 1;
-            }
-            black_box(())
-        });
+        b.iter_batched(
+            || {
+                // Setup: create fresh database with data
+                let db = Database::open_in_memory().unwrap();
+                db.execute(
+                    "CREATE TABLE users (
+                        id INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        age INTEGER NOT NULL
+                    )",
+                    (),
+                )
+                .unwrap();
+                for i in 1..=100 {
+                    db.execute(
+                        "INSERT INTO users VALUES ($1, $2, $3)",
+                        (i as i64, format!("User_{}", i), (i % 62 + 18) as i64),
+                    )
+                    .unwrap();
+                }
+                let stmt = db.prepare("DELETE FROM users WHERE id = $1").unwrap();
+                (db, stmt)
+            },
+            |(_db, stmt)| {
+                // Benchmark: delete all 100 rows
+                for id in 1..=100i64 {
+                    stmt.execute(black_box((id,))).unwrap();
+                }
+            },
+            BatchSize::SmallInput,
+        );
     });
 
-    // Benchmark SQLite - pure delete (rows get consumed)
+    // Benchmark SQLite - fresh database per batch, delete 100 rows
     group.bench_function("sqlite", |b| {
-        let mut id = 1i64;
-        b.iter(|| {
-            if id <= ROW_COUNT as i64 {
-                sqlite_stmt.execute([black_box(id)]).unwrap();
-                id += 1;
-            }
-            black_box(())
-        });
+        b.iter_batched(
+            || {
+                // Setup: create fresh database with data
+                let conn = Connection::open_in_memory().unwrap();
+                conn.execute(
+                    "CREATE TABLE users (
+                        id INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        age INTEGER NOT NULL
+                    )",
+                    [],
+                )
+                .unwrap();
+                for i in 1..=100 {
+                    conn.execute(
+                        "INSERT INTO users VALUES (?1, ?2, ?3)",
+                        rusqlite::params![i as i64, format!("User_{}", i), (i % 62 + 18) as i64],
+                    )
+                    .unwrap();
+                }
+                conn
+            },
+            |conn| {
+                // Benchmark: delete all 100 rows
+                let mut stmt = conn.prepare("DELETE FROM users WHERE id = ?1").unwrap();
+                for id in 1..=100i64 {
+                    stmt.execute([black_box(id)]).unwrap();
+                }
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();

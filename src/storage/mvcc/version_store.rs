@@ -1203,6 +1203,218 @@ impl VersionStore {
         result
     }
 
+    /// Returns all visible rows with their original RowVersions for UPDATE operations.
+    ///
+    /// This is optimized for UPDATE operations that need to track the original version
+    /// for conflict detection. By returning the RowVersion along with the row data,
+    /// callers can use `put_batch_with_originals()` to avoid redundant `get_visible_version()`
+    /// calls during the put phase.
+    ///
+    /// Returns: Vec of (row_id, row_data, original_version) tuples
+    /// The original_version.create_time contains the read_version_seq for conflict detection.
+    #[inline]
+    pub fn get_all_visible_rows_for_update(&self, txn_id: i64) -> Vec<(i64, Row, RowVersion)> {
+        if self.closed.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+
+        let current_seq = checker.get_current_sequence();
+
+        // Pre-acquire arena locks ONCE for the entire operation
+        let (arena_rows, arena_data) = self.arena.read_guards();
+        let arena_rows_slice = arena_rows.as_slice();
+        let arena_data_slice = arena_data.as_slice();
+        let arena_len = arena_rows_slice.len();
+
+        // Pre-acquire versions lock (BTreeMap iteration is already sorted by row_id)
+        let versions = self.versions.read();
+
+        // Helper closure to get row data from arena or version
+        let get_row_data = |e: &VersionChainEntry| -> Row {
+            if let Some(idx) = e.arena_idx {
+                if idx < arena_len {
+                    // SAFETY: idx bounds checked above
+                    let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
+                    // Validate data slice bounds to prevent UB from arena corruption
+                    if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                        // SAFETY: bounds validated above
+                        let slice = unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                        return Row::from_values(slice.to_vec());
+                    }
+                }
+            }
+            e.version.data.clone()
+        };
+
+        // Single-pass: read directly from arena during visibility check
+        let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len());
+
+        for (&row_id, chain) in versions.iter() {
+            // FAST PATH: Check HEAD version first - O(1) for common case
+            let head_txn_id = chain.version.txn_id;
+            let head_deleted_at = chain.version.deleted_at_txn_id;
+
+            if checker.is_visible(head_txn_id, txn_id) {
+                // HEAD is visible - check if deleted
+                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+                    let mut version_copy = chain.version.clone();
+                    version_copy.create_time = current_seq;
+                    result.push((row_id, get_row_data(chain), version_copy));
+                }
+                continue;
+            }
+
+            // SLOW PATH: HEAD not visible - traverse chain for older versions
+            let mut current = chain.prev.as_ref().map(|b| b.as_ref());
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                if checker.is_visible(version_txn_id, txn_id) {
+                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
+                        let mut version_copy = e.version.clone();
+                        version_copy.create_time = current_seq;
+                        result.push((row_id, get_row_data(e), version_copy));
+                    }
+                    break;
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
+            }
+        }
+
+        result
+    }
+
+    /// Get all visible rows for UPDATE with filter applied BEFORE cloning.
+    ///
+    /// This is a performance optimization for UPDATE operations with WHERE clauses.
+    /// Instead of fetching all rows and then filtering, we filter during the scan
+    /// to avoid allocating Row objects for non-matching rows.
+    ///
+    /// Returns (row_id, Row, RowVersion) tuples - the RowVersion is needed for
+    /// MVCC conflict detection during the update.
+    pub fn get_all_visible_rows_for_update_filtered(
+        &self,
+        txn_id: i64,
+        filter: &dyn crate::storage::expression::Expression,
+    ) -> Vec<(i64, Row, RowVersion)> {
+        if self.closed.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+
+        let current_seq = checker.get_current_sequence();
+
+        // Compile the filter once at the start for speedup in hot loop
+        let schema = self.schema.read();
+        let compiled_filter = CompiledFilter::compile(filter, &schema);
+        drop(schema); // Release lock early
+
+        // Pre-acquire arena locks ONCE for the entire operation
+        let (arena_rows, arena_data) = self.arena.read_guards();
+        let arena_rows_slice = arena_rows.as_slice();
+        let arena_data_slice = arena_data.as_slice();
+        let arena_len = arena_rows_slice.len();
+
+        // Pre-acquire versions lock (BTreeMap iteration is already sorted by row_id)
+        let versions = self.versions.read();
+
+        // Single-pass: read, filter, and collect in one loop
+        let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len() / 4);
+
+        for (&row_id, chain) in versions.iter() {
+            // FAST PATH: Check HEAD version first - O(1) for common case
+            let head_txn_id = chain.version.txn_id;
+            let head_deleted_at = chain.version.deleted_at_txn_id;
+
+            if checker.is_visible(head_txn_id, txn_id) {
+                // HEAD is visible - check if deleted
+                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+                    // Try arena path first (zero-copy filter check)
+                    if let Some(idx) = chain.arena_idx {
+                        if idx < arena_len {
+                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
+                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                let slice =
+                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
+                                // Filter on raw slice - no allocation!
+                                if compiled_filter.matches_slice(slice) {
+                                    let mut version_copy = chain.version.clone();
+                                    version_copy.create_time = current_seq;
+                                    result.push((
+                                        row_id,
+                                        Row::from_values(slice.to_vec()),
+                                        version_copy,
+                                    ));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    // Fallback: filter on version data
+                    if compiled_filter.matches(&chain.version.data) {
+                        let mut version_copy = chain.version.clone();
+                        version_copy.create_time = current_seq;
+                        result.push((row_id, chain.version.data.clone(), version_copy));
+                    }
+                }
+                continue;
+            }
+
+            // SLOW PATH: HEAD not visible - traverse chain for older versions
+            let mut current = chain.prev.as_ref().map(|b| b.as_ref());
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                if checker.is_visible(version_txn_id, txn_id) {
+                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
+                        // Try arena path first
+                        if let Some(idx) = e.arena_idx {
+                            if idx < arena_len {
+                                let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
+                                if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
+                                    let slice = unsafe {
+                                        arena_data_slice.get_unchecked(meta.start..meta.end)
+                                    };
+                                    if compiled_filter.matches_slice(slice) {
+                                        let mut version_copy = e.version.clone();
+                                        version_copy.create_time = current_seq;
+                                        result.push((
+                                            row_id,
+                                            Row::from_values(slice.to_vec()),
+                                            version_copy,
+                                        ));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        // Fallback: filter on version data
+                        if compiled_filter.matches(&e.version.data) {
+                            let mut version_copy = e.version.clone();
+                            version_copy.create_time = current_seq;
+                            result.push((row_id, e.version.data.clone(), version_copy));
+                        }
+                    }
+                    break;
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
+            }
+        }
+
+        result
+    }
+
     /// Returns all visible rows (BTreeMap iteration is already sorted by row_id).
     ///
     /// Note: With BTreeMap, this is functionally identical to get_all_visible_rows_arena
@@ -3658,6 +3870,58 @@ impl TransactionVersionStore {
         Ok(())
     }
 
+    /// Optimized batch delete for DELETE operations
+    ///
+    /// This marks multiple rows as deleted in a single operation, avoiding
+    /// the overhead of individual put() calls with lock acquisitions per row.
+    ///
+    /// Parameters:
+    /// - rows: Vec of (row_id, row_data) to mark as deleted
+    pub fn put_batch_deleted(&mut self, rows: Vec<(i64, Row)>) -> Result<(), Error> {
+        for (row_id, data) in rows {
+            // Check if we already have a local version
+            if !self.local_versions.contains_key(&row_id) {
+                // Check if this row exists in parent store and track in write-set
+                if !self.write_set.contains_key(&row_id) {
+                    let read_version = self.parent_store.get_visible_version(row_id, self.txn_id);
+                    let row_exists = read_version.is_some();
+
+                    let read_version_seq = self
+                        .parent_store
+                        .visibility_checker
+                        .as_ref()
+                        .map(|c| c.get_current_sequence())
+                        .unwrap_or(0);
+
+                    self.write_set.insert(
+                        row_id,
+                        WriteSetEntry {
+                            read_version,
+                            read_version_seq,
+                        },
+                    );
+
+                    // For existing rows, try to claim them
+                    if row_exists {
+                        self.parent_store.try_claim_row(row_id, self.txn_id)?;
+                    }
+                }
+            }
+
+            // Create deleted row version
+            let mut rv = RowVersion::new(self.txn_id, row_id, data);
+            rv.deleted_at_txn_id = self.txn_id;
+
+            // Append to version history for this row
+            if let Some(versions) = self.local_versions.get_mut(&row_id) {
+                versions.push(rv);
+            } else {
+                self.local_versions.insert(row_id, vec![rv]);
+            }
+        }
+        Ok(())
+    }
+
     /// Check if we have local changes for a row
     pub fn has_locally_seen(&self, row_id: i64) -> bool {
         self.local_versions.contains_key(&row_id)
@@ -3776,16 +4040,21 @@ impl TransactionVersionStore {
     }
 
     /// Commit local changes to parent store
-    pub fn commit(&self) -> Result<(), Error> {
+    ///
+    /// Performance: This method drains local_versions to take ownership of
+    /// RowVersion values, avoiding expensive clones. The transaction is
+    /// consumed after commit anyway, so this is safe.
+    pub fn commit(&mut self) -> Result<(), Error> {
         // Detect conflicts first
         self.detect_conflicts()?;
 
         // Batch apply all local versions to parent store (single lock acquisition)
         // Only commit the most recent version per row
+        // Use drain() to take ownership instead of cloning
         let batch: Vec<(i64, RowVersion)> = self
             .local_versions
-            .iter()
-            .filter_map(|(row_id, versions)| versions.last().map(|v| (*row_id, v.clone())))
+            .drain()
+            .filter_map(|(row_id, mut versions)| versions.pop().map(|v| (row_id, v)))
             .collect();
 
         self.parent_store.add_versions_batch(batch);

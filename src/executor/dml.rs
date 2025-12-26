@@ -582,12 +582,43 @@ impl Executor {
 
         // Build WHERE expression for storage layer
         // Try to convert to storage expression, fall back to in-memory filtering if not possible
+        //
+        // OPTIMIZATION: For correlated EXISTS/IN in WHERE, try semi-join optimization first.
+        // This transforms O(outer × inner) per-row subquery execution to O(inner + outer).
         let (where_expr, needs_memory_filter, memory_where_clause): (
             Option<Box<dyn StorageExpr>>,
             bool,
             Option<Expression>,
         ) = if let Some(ref where_clause) = stmt.where_clause {
-            let processed_where = if Self::has_subqueries(where_clause) {
+            let has_correlated_where =
+                Self::has_subqueries(where_clause) && Self::has_correlated_subqueries(where_clause);
+
+            let processed_where = if has_correlated_where {
+                // Try semi-join optimization for correlated EXISTS/IN
+                let outer_tables = vec![table_name.to_string()];
+                let mut current_expr = (**where_clause).clone();
+
+                // Try EXISTS semi-join optimization
+                if let Ok(Some(optimized)) =
+                    self.try_optimize_exists_to_semi_join(&current_expr, ctx, &outer_tables, None)
+                {
+                    current_expr = optimized;
+                }
+
+                // Try IN semi-join optimization
+                if let Ok(Some(optimized)) =
+                    self.try_optimize_in_to_semi_join(&current_expr, ctx, &outer_tables)
+                {
+                    current_expr = optimized;
+                }
+
+                // Process any remaining non-correlated subqueries
+                if Self::has_subqueries(&current_expr) {
+                    self.process_where_subqueries(&current_expr, ctx)?
+                } else {
+                    current_expr
+                }
+            } else if Self::has_subqueries(where_clause) {
                 self.process_where_subqueries(where_clause, ctx)?
             } else {
                 (**where_clause).clone()
@@ -916,20 +947,64 @@ impl Executor {
         let schema = table.schema();
 
         // Check if WHERE has correlated subqueries (needs per-row evaluation)
-        let has_correlated = if let Some(ref where_clause) = stmt.where_clause {
+        // This will be updated after semi-join optimization attempt
+        let mut has_correlated = if let Some(ref where_clause) = stmt.where_clause {
             Self::has_subqueries(where_clause) && Self::has_correlated_subqueries(where_clause)
         } else {
             false
         };
 
+        // OPTIMIZATION: For correlated EXISTS/IN in WHERE, try semi-join optimization first.
+        // This transforms O(outer × inner) per-row subquery execution to O(inner + outer).
         let (where_expr, needs_memory_filter, memory_where_clause): (
             Option<Box<dyn StorageExpr>>,
             bool,
             Option<Expression>,
         ) = if let Some(ref where_clause) = stmt.where_clause {
             if has_correlated {
-                // For correlated subqueries, keep original and process per-row
-                (None, true, Some((**where_clause).clone()))
+                // Try semi-join optimization for correlated EXISTS/IN
+                let outer_tables = vec![table_name.to_string()];
+                let mut current_expr = (**where_clause).clone();
+                let mut any_optimized = false;
+
+                // Try EXISTS semi-join optimization
+                if let Ok(Some(optimized)) =
+                    self.try_optimize_exists_to_semi_join(&current_expr, ctx, &outer_tables, None)
+                {
+                    current_expr = optimized;
+                    any_optimized = true;
+                }
+
+                // Try IN semi-join optimization
+                if let Ok(Some(optimized)) =
+                    self.try_optimize_in_to_semi_join(&current_expr, ctx, &outer_tables)
+                {
+                    current_expr = optimized;
+                    any_optimized = true;
+                }
+
+                // Check if there are still correlated subqueries after optimization
+                let still_correlated = Self::has_correlated_subqueries(&current_expr);
+
+                if any_optimized && !still_correlated {
+                    // All correlated subqueries were optimized away - update flag
+                    has_correlated = false;
+                    let processed = if Self::has_subqueries(&current_expr) {
+                        self.process_where_subqueries(&current_expr, ctx)?
+                    } else {
+                        current_expr
+                    };
+                    let (storage_expr, needs_mem) =
+                        pushdown::try_pushdown(&processed, schema, Some(ctx));
+                    if needs_mem {
+                        (storage_expr, true, Some(processed))
+                    } else {
+                        (storage_expr, false, None)
+                    }
+                } else {
+                    // Still have correlated subqueries - use per-row processing with optimized expr
+                    (None, true, Some(current_expr))
+                }
             } else {
                 let processed_where = if Self::has_subqueries(where_clause) {
                     self.process_where_subqueries(where_clause, ctx)?

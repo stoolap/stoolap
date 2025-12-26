@@ -23,13 +23,13 @@
 //! Before: has_aggregation() called 3-5 times per query, each traversing all columns
 //! After: Single traversal on first access, O(1) lookup thereafter
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lru::LruCache;
 use parking_lot::Mutex;
+use rustc_hash::FxHasher;
 
 use crate::parser::ast::{Expression, SelectStatement};
 
@@ -823,8 +823,9 @@ fn is_aggregate_function(name: &str) -> bool {
 
 /// Compute a cache key for a SELECT statement
 /// Only hashes structural elements that affect classification (not literal values)
+/// Uses FxHasher which is 2-5x faster than SipHash for small keys.
 fn compute_classification_key(stmt: &SelectStatement) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FxHasher::default();
 
     // Hash structural properties
     stmt.distinct.hash(&mut hasher);
@@ -870,7 +871,7 @@ fn compute_classification_key(stmt: &SelectStatement) -> u64 {
 }
 
 /// Hash the structural elements of an expression (discriminants, not values)
-fn hash_expression_structure(expr: &Expression, hasher: &mut DefaultHasher) {
+fn hash_expression_structure(expr: &Expression, hasher: &mut FxHasher) {
     std::mem::discriminant(expr).hash(hasher);
 
     match expr {

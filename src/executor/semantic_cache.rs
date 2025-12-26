@@ -74,8 +74,7 @@
 //!
 //! Future enhancement: Per-transaction cache scoping with timestamp-based invalidation
 
-use rustc_hash::FxHashMap;
-use std::collections::hash_map::DefaultHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -843,13 +842,15 @@ impl Default for SemanticCache {
 ///
 /// This allows matching predicates like:
 /// - `col > 100` and `col > 200` (same structure, different values)
+///
+/// Uses FxHasher which is 2-5x faster than SipHash for small keys.
 fn hash_predicate_structure(expr: &Expression) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FxHasher::default();
     hash_expr_structure(expr, &mut hasher);
     hasher.finish()
 }
 
-fn hash_expr_structure(expr: &Expression, hasher: &mut DefaultHasher) {
+fn hash_expr_structure(expr: &Expression, hasher: &mut FxHasher) {
     match expr {
         Expression::Identifier(ident) => {
             0u8.hash(hasher);

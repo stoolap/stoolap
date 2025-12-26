@@ -36,8 +36,7 @@
 //! SELECT * FROM users WHERE status = 'pending';
 //! ```
 
-use rustc_hash::FxHashMap;
-use std::collections::hash_map::DefaultHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -283,8 +282,10 @@ impl FeedbackCache {
 ///
 /// Different structures produce different fingerprints:
 /// - `status = 'active'` vs `status = 'active' AND age > 30`
+///
+/// Uses FxHasher which is 2-5x faster than SipHash for small keys.
 pub fn fingerprint_predicate(table_name: &str, expr: &Expression) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FxHasher::default();
 
     // Include table name
     table_name.hash(&mut hasher);
@@ -296,7 +297,7 @@ pub fn fingerprint_predicate(table_name: &str, expr: &Expression) -> u64 {
 }
 
 /// Hash the structure of an expression (not literal values)
-fn hash_expression_structure(expr: &Expression, hasher: &mut DefaultHasher) {
+fn hash_expression_structure(expr: &Expression, hasher: &mut FxHasher) {
     // Hash the expression type discriminant
     std::mem::discriminant(expr).hash(hasher);
 

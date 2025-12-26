@@ -193,6 +193,88 @@ impl MVCCTable {
         }
     }
 
+    /// Try to identify a PK range lookup (WHERE id >= X AND id < Y)
+    /// Returns Some(Vec<row_id>) if this is a PK range query
+    fn try_pk_range_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<Vec<i64>> {
+        use crate::core::Operator;
+
+        // Get PK column info
+        let pk_indices = schema.primary_key_indices();
+        if pk_indices.len() != 1 {
+            return None;
+        }
+        let pk_col_idx = pk_indices[0];
+        let pk_col_name = &schema.columns[pk_col_idx].name;
+
+        // Check for AND with two comparisons on PK
+        let and_operands = expr.get_and_operands()?;
+        if and_operands.len() != 2 {
+            return None;
+        }
+
+        let (info1, info2) = (
+            and_operands[0].get_comparison_info(),
+            and_operands[1].get_comparison_info(),
+        );
+
+        let ((col1, op1, val1), (col2, op2, val2)) = match (info1, info2) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return None,
+        };
+
+        // Both must be on PK column
+        if !col1.eq_ignore_ascii_case(pk_col_name) || !col2.eq_ignore_ascii_case(pk_col_name) {
+            return None;
+        }
+
+        // Extract integer values
+        let (v1, v2) = match (val1, val2) {
+            (Value::Integer(a), Value::Integer(b)) => (*a, *b),
+            _ => return None,
+        };
+
+        // Identify lower and upper bounds
+        let (min_id, min_inclusive, max_id, max_inclusive) = match (op1, op2) {
+            (Operator::Gte, Operator::Lt) => (v1, true, v2, false),
+            (Operator::Gte, Operator::Lte) => (v1, true, v2, true),
+            (Operator::Gt, Operator::Lt) => (v1, false, v2, false),
+            (Operator::Gt, Operator::Lte) => (v1, false, v2, true),
+            (Operator::Lt, Operator::Gte) => (v2, true, v1, false),
+            (Operator::Lt, Operator::Gt) => (v2, false, v1, false),
+            (Operator::Lte, Operator::Gte) => (v2, true, v1, true),
+            (Operator::Lte, Operator::Gt) => (v2, false, v1, true),
+            _ => return None,
+        };
+
+        // Adjust for inclusive/exclusive bounds using saturating arithmetic to prevent overflow
+        let start = if min_inclusive {
+            min_id
+        } else {
+            min_id.saturating_add(1)
+        };
+        let end = if max_inclusive {
+            max_id
+        } else {
+            max_id.saturating_sub(1)
+        };
+
+        // Check for invalid range (start > end means empty result)
+        if start > end {
+            return Some(Vec::new());
+        }
+
+        // SAFETY: Limit range size to prevent memory explosion
+        // For ranges larger than threshold, return None to fall back to index/full scan
+        const MAX_PK_RANGE_SIZE: i64 = 100_000;
+        let range_size = end.saturating_sub(start).saturating_add(1);
+        if range_size > MAX_PK_RANGE_SIZE {
+            return None; // Fall back to index scan or full scan
+        }
+
+        // Generate row_ids directly (no index needed - PK IS the row_id)
+        Some((start..=end).collect())
+    }
+
     /// Try to use an index to filter row IDs
     ///
     /// Returns Some(row_ids) if an index can be used, None otherwise
@@ -271,6 +353,51 @@ impl MVCCTable {
                 result = union_sorted_ids(&result, other);
             }
             return Some(result);
+        }
+
+        // OPTIMIZATION: Detect BETWEEN/range pattern (col >= X AND col <= Y) for single range scan
+        // This avoids two separate index scans + sort + intersection
+        if let Some(and_operands) = expr.get_and_operands() {
+            // Check for range pattern: exactly 2 comparisons on the same indexed column
+            if and_operands.len() == 2 {
+                if let (Some((col1, op1, val1)), Some((col2, op2, val2))) = (
+                    and_operands[0].get_comparison_info(),
+                    and_operands[1].get_comparison_info(),
+                ) {
+                    // Same column?
+                    if col1 == col2 {
+                        // Check for range pattern: one lower bound + one upper bound
+                        let (lower_op, lower_val, upper_op, upper_val) = match (op1, op2) {
+                            (Operator::Gt | Operator::Gte, Operator::Lt | Operator::Lte) => {
+                                (op1, val1, op2, val2)
+                            }
+                            (Operator::Lt | Operator::Lte, Operator::Gt | Operator::Gte) => {
+                                (op2, val2, op1, val1)
+                            }
+                            _ => (Operator::Eq, val1, Operator::Eq, val2), // Not a range
+                        };
+
+                        // If we have a valid range pattern, use single range scan
+                        if matches!(lower_op, Operator::Gt | Operator::Gte)
+                            && matches!(upper_op, Operator::Lt | Operator::Lte)
+                        {
+                            if let Some(index) = self.version_store.get_index_by_column(col1) {
+                                let min_inclusive = matches!(lower_op, Operator::Gte);
+                                let max_inclusive = matches!(upper_op, Operator::Lte);
+                                let row_ids = index.get_row_ids_in_range(
+                                    std::slice::from_ref(lower_val),
+                                    std::slice::from_ref(upper_val),
+                                    min_inclusive,
+                                    max_inclusive,
+                                );
+                                // Return result even if empty - we successfully used the index
+                                // Empty result is valid (no rows match the range)
+                                return Some(row_ids);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // OPTIMIZATION: Handle AND expressions with recursive index lookup
@@ -1461,6 +1588,45 @@ impl Table for MVCCTable {
                 return Ok(0);
             }
 
+            // Fast path: PK range lookup (WHERE id >= X AND id < Y)
+            if let Some(pk_range_ids) = self.try_pk_range_lookup(expr, schema) {
+                let mut rows_to_update: Vec<(i64, Row)> = Vec::with_capacity(pk_range_ids.len());
+
+                {
+                    let txn_versions = self.txn_versions.read().unwrap();
+                    for row_id in pk_range_ids {
+                        let row = if let Some(row) = txn_versions.get(row_id) {
+                            Some(row)
+                        } else if let Some(version) =
+                            self.version_store.get_visible_version(row_id, self.txn_id)
+                        {
+                            if !version.is_deleted() {
+                                Some(version.data.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(row) = row {
+                            let row = self.normalize_row_to_schema(row, schema);
+                            let (updated_row, _) = setter(row);
+                            rows_to_update.push((row_id, updated_row));
+                        }
+                    }
+                }
+
+                let update_count = rows_to_update.len() as i32;
+                if !rows_to_update.is_empty() {
+                    self.txn_versions
+                        .write()
+                        .unwrap()
+                        .put_batch_for_update(rows_to_update)?;
+                }
+                return Ok(update_count);
+            }
+
             // Try index lookup for non-PK columns
             if let Some(filtered_row_ids) = self.try_index_lookup(expr, schema) {
                 // Step 1: Check local versions first (these don't need write-set tracking)
@@ -1531,29 +1697,31 @@ impl Table for MVCCTable {
             }
         }
 
-        // Fall back to full scan - use batch fetch for better performance
-        // Step 1: Get all visible rows at once using batch operation
-        let all_rows = self.version_store.get_all_visible_rows_arena(self.txn_id);
-
-        // Step 2: Normalize and filter rows to update
-        let rows_to_update: Vec<(i64, Row)> = if let Some(expr) = where_expr {
-            all_rows
-                .into_iter()
-                .map(|(row_id, row)| {
-                    // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                    (row_id, self.normalize_row_to_schema(row, schema))
-                })
-                .filter(|(_, row)| expr.evaluate(row).unwrap_or(false))
-                .collect()
-        } else {
-            all_rows
-                .into_iter()
-                .map(|(row_id, row)| {
-                    // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                    (row_id, self.normalize_row_to_schema(row, schema))
-                })
-                .collect()
-        };
+        // Fall back to full scan - use batch fetch WITH original versions for O(1) lock
+        // OPTIMIZATION: When WHERE clause exists, push filter to storage layer
+        // This avoids allocating Row objects for non-matching rows
+        let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
+            if let Some(expr) = where_expr {
+                // Use filtered scan - filter is applied BEFORE cloning rows
+                self.version_store
+                    .get_all_visible_rows_for_update_filtered(self.txn_id, expr)
+                    .into_iter()
+                    .map(|(row_id, row, orig)| {
+                        // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
+                        (row_id, self.normalize_row_to_schema(row, schema), orig)
+                    })
+                    .collect()
+            } else {
+                // No filter - get all rows
+                self.version_store
+                    .get_all_visible_rows_for_update(self.txn_id)
+                    .into_iter()
+                    .map(|(row_id, row, orig)| {
+                        // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
+                        (row_id, self.normalize_row_to_schema(row, schema), orig)
+                    })
+                    .collect()
+            };
 
         // Also check local inserts that might not be in global store
         // OPTIMIZATION: Filter on reference BEFORE cloning to avoid wasted allocations
@@ -1582,24 +1750,30 @@ impl Table for MVCCTable {
                 .collect()
         };
 
-        // Apply setter to all rows
-        let mut all_updated: Vec<(i64, Row)> =
-            Vec::with_capacity(rows_to_update.len() + local_rows_to_update.len());
-        for (row_id, row) in rows_to_update {
-            let (updated_row, _) = setter(row);
-            all_updated.push((row_id, updated_row));
-        }
-        for (row_id, row) in local_rows_to_update {
-            let (updated_row, _) = setter(row);
-            all_updated.push((row_id, updated_row));
+        // Apply setter to rows with originals (from version store)
+        for (_, row, _) in &mut rows_with_originals {
+            let (updated_row, _) = setter(std::mem::take(row));
+            *row = updated_row;
         }
 
+        // Apply setter to local rows
+        let local_updated: Vec<(i64, Row)> = local_rows_to_update
+            .into_iter()
+            .map(|(row_id, row)| {
+                let (updated_row, _) = setter(row);
+                (row_id, updated_row)
+            })
+            .collect();
+
         // Batch update all rows at once
-        let update_count = all_updated.len();
-        self.txn_versions
-            .write()
-            .unwrap()
-            .put_batch_for_update(all_updated)?;
+        let update_count = rows_with_originals.len() + local_updated.len();
+        {
+            let mut txn_versions = self.txn_versions.write().unwrap();
+            // Use optimized put for rows from version store (avoids O(N) get_visible_version calls)
+            txn_versions.put_batch_with_originals(rows_with_originals)?;
+            // Use regular put for local rows (already tracked in local store)
+            txn_versions.put_batch_for_update(local_updated)?;
+        }
 
         Ok(update_count as i32)
     }
@@ -1637,13 +1811,15 @@ impl Table for MVCCTable {
                 return Ok(0);
             }
 
-            // Try index lookup for non-PK columns
-            if let Some(filtered_row_ids) = self.try_index_lookup(expr, schema) {
-                let mut delete_count = 0;
-                for row_id in filtered_row_ids {
-                    let row = {
-                        let txn_versions = self.txn_versions.read().unwrap();
-                        if let Some(row) = txn_versions.get(row_id) {
+            // Fast path: PK range lookup (WHERE id >= X AND id < Y)
+            // PK IS the row_id, so we can generate the range directly
+            if let Some(pk_range_ids) = self.try_pk_range_lookup(expr, schema) {
+                let mut rows_to_delete: Vec<(i64, Row)> = Vec::with_capacity(pk_range_ids.len());
+
+                {
+                    let txn_versions = self.txn_versions.read().unwrap();
+                    for row_id in pk_range_ids {
+                        let row = if let Some(row) = txn_versions.get(row_id) {
                             Some(row)
                         } else if let Some(version) =
                             self.version_store.get_visible_version(row_id, self.txn_id)
@@ -1655,17 +1831,65 @@ impl Table for MVCCTable {
                             }
                         } else {
                             None
-                        }
-                    };
+                        };
 
-                    if let Some(row) = row {
-                        // Re-apply filter (index may be partial match)
-                        if expr.evaluate(&row).unwrap_or(false) {
-                            // Row is already owned from the above block, no extra clone needed
-                            self.txn_versions.write().unwrap().put(row_id, row, true)?;
-                            delete_count += 1;
+                        if let Some(row) = row {
+                            rows_to_delete.push((row_id, row));
                         }
                     }
+                }
+
+                let delete_count = rows_to_delete.len() as i32;
+                if !rows_to_delete.is_empty() {
+                    self.txn_versions
+                        .write()
+                        .unwrap()
+                        .put_batch_deleted(rows_to_delete)?;
+                }
+                return Ok(delete_count);
+            }
+
+            // Try index lookup for non-PK columns
+            if let Some(filtered_row_ids) = self.try_index_lookup(expr, schema) {
+                // OPTIMIZATION: Batch collect rows to delete, then batch put
+                // This reduces lock contention from 2N locks to 2 locks for N rows
+                let mut rows_to_delete: Vec<(i64, Row)> =
+                    Vec::with_capacity(filtered_row_ids.len());
+
+                // Single read pass to collect all rows
+                {
+                    let txn_versions = self.txn_versions.read().unwrap();
+                    for row_id in filtered_row_ids {
+                        let row = if let Some(row) = txn_versions.get(row_id) {
+                            Some(row)
+                        } else if let Some(version) =
+                            self.version_store.get_visible_version(row_id, self.txn_id)
+                        {
+                            if !version.is_deleted() {
+                                Some(version.data.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(row) = row {
+                            // Re-apply filter (index may be partial match)
+                            if expr.evaluate(&row).unwrap_or(false) {
+                                rows_to_delete.push((row_id, row));
+                            }
+                        }
+                    }
+                }
+
+                // Single batch write for all deletes
+                let delete_count = rows_to_delete.len() as i32;
+                if !rows_to_delete.is_empty() {
+                    self.txn_versions
+                        .write()
+                        .unwrap()
+                        .put_batch_deleted(rows_to_delete)?;
                 }
                 return Ok(delete_count);
             }
