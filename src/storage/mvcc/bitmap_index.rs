@@ -464,9 +464,26 @@ impl Index for BitmapIndex {
     }
 
     fn get_row_ids_equal(&self, values: &[Value]) -> Vec<i64> {
-        match self.find(values) {
-            Ok(entries) => entries.into_iter().map(|e| e.row_id).collect(),
-            Err(_) => vec![],
+        let mut row_ids = Vec::new();
+        self.get_row_ids_equal_into(values, &mut row_ids);
+        row_ids
+    }
+
+    fn get_row_ids_equal_into(&self, values: &[Value], buffer: &mut Vec<i64>) {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return;
+        }
+
+        if values.len() != self.column_ids.len() {
+            return;
+        }
+
+        let key = self.value_to_key(values);
+        let bitmaps = self.bitmaps.read().unwrap();
+
+        if let Some(bitmap) = bitmaps.get(&key) {
+            // RoaringTreemap iteration is efficient
+            buffer.extend(bitmap.iter().map(|row_id| row_id as i64));
         }
     }
 

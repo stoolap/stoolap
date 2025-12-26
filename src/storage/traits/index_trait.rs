@@ -127,7 +127,25 @@ pub trait Index: Send + Sync {
     /// Returns row IDs with the given values (convenience method)
     ///
     /// This is a simplified version of `find` that returns only row IDs.
-    fn get_row_ids_equal(&self, values: &[Value]) -> Vec<i64>;
+    fn get_row_ids_equal(&self, values: &[Value]) -> Vec<i64> {
+        let mut row_ids = Vec::new();
+        self.get_row_ids_equal_into(values, &mut row_ids);
+        row_ids
+    }
+
+    /// Appends row IDs with the given values to the provided buffer
+    ///
+    /// This enables callers to reuse the vector allocation across multiple calls.
+    fn get_row_ids_equal_into(&self, values: &[Value], buffer: &mut Vec<i64>) {
+        // Default implementation: delegate to find (allocates)
+        // Override in concrete indexes for zero-allocation
+        if let Ok(entries) = self.find(values) {
+            buffer.reserve(entries.len());
+            for entry in entries {
+                buffer.push(entry.row_id);
+            }
+        }
+    }
 
     /// Returns row IDs with values in the given range (convenience method)
     ///

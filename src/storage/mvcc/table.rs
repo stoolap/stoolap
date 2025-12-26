@@ -1226,9 +1226,26 @@ impl Table for MVCCTable {
     /// Optimized to use batch fetch for global store rows,
     /// reducing lock contention from O(n) to O(1).
     fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Vec<(i64, Row)> {
+        let mut rows = Vec::with_capacity(row_ids.len());
+        self.fetch_rows_by_ids_into(row_ids, filter, &mut rows);
+        rows
+    }
+
+    /// Fetch rows into a reusable buffer
+    fn fetch_rows_by_ids_into(
+        &self,
+        row_ids: &[i64],
+        filter: &dyn Expression,
+        rows: &mut Vec<(i64, Row)>,
+    ) {
         let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
-        let mut rows = Vec::with_capacity(row_ids.len());
+
+        // Optimize: Reserve space in buffer if empty
+        if rows.is_empty() {
+            rows.reserve(row_ids.len());
+        }
+
         let mut global_row_ids = Vec::with_capacity(row_ids.len());
 
         // Step 1: Check local versions first (uncommitted changes in this transaction)
@@ -1263,8 +1280,6 @@ impl Table for MVCCTable {
                 }
             }
         }
-
-        rows
     }
 
     fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {

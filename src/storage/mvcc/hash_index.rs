@@ -425,9 +425,33 @@ impl Index for HashIndex {
     }
 
     fn get_row_ids_equal(&self, values: &[Value]) -> Vec<i64> {
-        match self.find(values) {
-            Ok(entries) => entries.into_iter().map(|e| e.row_id).collect(),
-            Err(_) => vec![],
+        let mut row_ids = Vec::new();
+        self.get_row_ids_equal_into(values, &mut row_ids);
+        row_ids
+    }
+
+    fn get_row_ids_equal_into(&self, values: &[Value], buffer: &mut Vec<i64>) {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return;
+        }
+
+        // Hash index only supports exact matches on all columns
+        if values.len() != self.column_ids.len() {
+            return;
+        }
+
+        let hash = hash_values(values);
+        let hash_to_values = self.hash_to_values.read().unwrap();
+
+        if let Some(entries) = hash_to_values.get(&hash) {
+            // Handle hash collisions by checking actual values
+            for (stored_values, row_ids) in entries {
+                if stored_values == values {
+                    // SmallVec can be iterated efficiently
+                    buffer.extend(row_ids.iter().copied());
+                    return;
+                }
+            }
         }
     }
 

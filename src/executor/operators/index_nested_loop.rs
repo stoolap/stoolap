@@ -68,9 +68,13 @@ pub struct IndexNestedLoopJoinOperator {
 
     // Current state
     current_outer_row: Option<Row>,
-    current_inner_rows: Vec<Row>,
+    // Optimization: Store (id, row) to verify specific inner rows if needed, and match fetch_rows_by_ids_into signature
+    current_inner_rows: Vec<(i64, Row)>,
     current_inner_idx: usize,
     outer_had_match: bool,
+
+    // Optimization: Reusable buffer for row IDs to avoid allocation per outer row
+    row_id_buffer: Vec<i64>,
 
     // Expression for fetching rows (always true - we apply residual separately)
     true_expr: ConstBoolExpr,
@@ -122,6 +126,8 @@ impl IndexNestedLoopJoinOperator {
             current_inner_rows: Vec::new(),
             current_inner_idx: 0,
             outer_had_match: false,
+            // Pre-allocate buffer for typical number of matches (small)
+            row_id_buffer: Vec::with_capacity(16),
             true_expr: ConstBoolExpr::true_expr(),
             opened: false,
             outer_exhausted: false,
@@ -144,30 +150,39 @@ impl IndexNestedLoopJoinOperator {
     }
 
     /// Look up matching inner rows for the current outer row.
-    fn lookup_inner_rows(&self, key_value: &Value) -> Vec<Row> {
-        // Get row IDs based on lookup strategy
-        let row_ids: Vec<i64> = match &self.lookup_strategy {
+    /// Uses internal buffers to avoid allocations.
+    fn lookup_inner_rows(&mut self, key_value: &Value) {
+        // Clear buffers for reuse
+        self.row_id_buffer.clear();
+        self.current_inner_rows.clear();
+
+        // Get row IDs based on lookup strategy into buffer
+        match &self.lookup_strategy {
             IndexLookupStrategy::SecondaryIndex(index) => {
-                index.get_row_ids_equal(std::slice::from_ref(key_value))
+                index.get_row_ids_equal_into(
+                    std::slice::from_ref(key_value),
+                    &mut self.row_id_buffer,
+                );
             }
             IndexLookupStrategy::PrimaryKey => {
                 match key_value {
-                    Value::Integer(id) => vec![*id],
-                    Value::Float(f) => vec![*f as i64],
-                    _ => vec![], // Non-numeric PK values can't match
+                    Value::Integer(id) => self.row_id_buffer.push(*id),
+                    Value::Float(f) => self.row_id_buffer.push(*f as i64),
+                    _ => {} // Non-numeric PK values can't match
                 }
             }
-        };
-
-        if row_ids.is_empty() {
-            return Vec::new();
         }
 
-        // Fetch matching rows from inner table
-        let inner_rows = self
-            .inner_table
-            .fetch_rows_by_ids(&row_ids, &self.true_expr);
-        inner_rows.into_iter().map(|(_, row)| row).collect()
+        if self.row_id_buffer.is_empty() {
+            return;
+        }
+
+        // Fetch matching rows directly into inner_rows buffer
+        self.inner_table.fetch_rows_by_ids_into(
+            &self.row_id_buffer,
+            &self.true_expr,
+            &mut self.current_inner_rows,
+        );
     }
 
     /// Advance to the next outer row and lookup matching inner rows.
@@ -182,7 +197,7 @@ impl IndexNestedLoopJoinOperator {
                     _ => {
                         // NULL key - no match possible (NULL != NULL in SQL)
                         self.current_outer_row = Some(outer_row);
-                        self.current_inner_rows = Vec::new();
+                        self.current_inner_rows.clear();
                         self.current_inner_idx = 0;
                         self.outer_had_match = false;
                         return Ok(true);
@@ -190,10 +205,10 @@ impl IndexNestedLoopJoinOperator {
                 };
 
                 // Lookup matching inner rows
-                let inner_rows = self.lookup_inner_rows(&key_value);
+                self.lookup_inner_rows(&key_value);
 
                 self.current_outer_row = Some(outer_row);
-                self.current_inner_rows = inner_rows;
+                // self.current_inner_rows is already populated by lookup_inner_rows
                 self.current_inner_idx = 0;
                 self.outer_had_match = false;
                 Ok(true)
@@ -247,7 +262,8 @@ impl Operator for IndexNestedLoopJoinOperator {
                 let inner_idx = self.current_inner_idx;
                 self.current_inner_idx += 1;
 
-                let inner_row = &self.current_inner_rows[inner_idx];
+                // Extract just the row from the (id, row) tuple
+                let inner_row = &self.current_inner_rows[inner_idx].1;
 
                 // Apply residual filter if present
                 let passes_filter = if let Some(ref filter) = self.residual_filter {
@@ -335,6 +351,9 @@ pub struct BatchIndexNestedLoopJoinOperator {
     results: Vec<Row>,
     result_idx: usize,
 
+    // Optimization: Reusable buffer for row IDs to avoid allocation per outer row
+    row_id_buffer: Vec<i64>,
+
     // State
     opened: bool,
 }
@@ -369,6 +388,8 @@ impl BatchIndexNestedLoopJoinOperator {
             inner_col_count,
             results: Vec::new(),
             result_idx: 0,
+            // Pre-allocate buffer for typical number of matches
+            row_id_buffer: Vec::with_capacity(16),
             opened: false,
         }
     }
@@ -402,20 +423,24 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
                 }
             };
 
-            // Get row IDs based on lookup strategy
-            let row_ids: Vec<i64> = match &self.lookup_strategy {
+            // Get row IDs based on lookup strategy into reusable buffer
+            self.row_id_buffer.clear();
+            match &self.lookup_strategy {
                 IndexLookupStrategy::SecondaryIndex(index) => {
-                    index.get_row_ids_equal(std::slice::from_ref(&key_value))
+                    index.get_row_ids_equal_into(
+                        std::slice::from_ref(&key_value),
+                        &mut self.row_id_buffer,
+                    );
                 }
                 IndexLookupStrategy::PrimaryKey => match &key_value {
-                    Value::Integer(id) => vec![*id],
-                    Value::Float(f) => vec![*f as i64],
-                    _ => vec![],
+                    Value::Integer(id) => self.row_id_buffer.push(*id),
+                    Value::Float(f) => self.row_id_buffer.push(*f as i64),
+                    _ => {}
                 },
-            };
+            }
 
             // Map row IDs to outer row indices
-            for row_id in row_ids {
+            for &row_id in &self.row_id_buffer {
                 key_to_outer_indices
                     .entry(row_id)
                     .or_default()

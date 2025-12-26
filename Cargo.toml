@@ -106,6 +106,22 @@ panic = "abort"
 opt-level = 3
 debug = true  # Enable debug symbols for profiling
 
+[[bench]]
+name = "select_by_id"
+harness = false
+
+[[bench]]
+name = "update_by_id"
+harness = false
+
+[[bench]]
+name = "delete_by_id"
+harness = false
+
+[[bench]]
+name = "select_complex"
+harness = false
+
 [profile.bench]
 lto = true
 codegen-units = 1

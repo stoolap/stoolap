@@ -683,17 +683,23 @@ impl Index for BTreeIndex {
     }
 
     fn get_row_ids_equal(&self, values: &[Value]) -> Vec<i64> {
+        let mut ids = Vec::new();
+        self.get_row_ids_equal_into(values, &mut ids);
+        ids
+    }
+
+    fn get_row_ids_equal_into(&self, values: &[Value], buffer: &mut Vec<i64>) {
         if values.is_empty() {
-            return Vec::new();
+            return;
         }
 
         let value = &values[0];
         let value_to_rows = self.value_to_rows.read().unwrap();
 
-        value_to_rows
-            .get(value)
-            .map(|rows| rows.iter().copied().collect())
-            .unwrap_or_default()
+        if let Some(rows) = value_to_rows.get(value) {
+            // Optimization: SmallVec can be iterated quickly
+            buffer.extend(rows.iter().copied());
+        }
     }
 
     fn get_row_ids_in_range(

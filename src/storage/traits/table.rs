@@ -737,9 +737,6 @@ pub trait Table: Send + Sync {
 
     /// Fetch rows by their row IDs with an optional filter.
     ///
-    /// This is used for index-based lookups where we have a list of row IDs
-    /// and need to fetch the actual rows efficiently.
-    ///
     /// # Arguments
     /// * `row_ids` - The row IDs to fetch
     /// * `filter` - Filter expression to apply to fetched rows
@@ -747,8 +744,20 @@ pub trait Table: Send + Sync {
     /// # Returns
     /// Vector of (row_id, Row) pairs for visible, non-deleted rows that pass the filter
     fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Vec<(i64, Row)> {
-        let _ = (row_ids, filter);
-        Vec::new() // Default implementation - override in concrete tables
+        let mut results = Vec::new();
+        self.fetch_rows_by_ids_into(row_ids, filter, &mut results);
+        results
+    }
+
+    /// Fetch rows into a reusable buffer
+    fn fetch_rows_by_ids_into(
+        &self,
+        row_ids: &[i64],
+        filter: &dyn Expression,
+        buffer: &mut Vec<(i64, Row)>,
+    ) {
+        let _ = (row_ids, filter, buffer);
+        // Default implementation does nothing
     }
 
     // ---- Additional Column Operations ----
