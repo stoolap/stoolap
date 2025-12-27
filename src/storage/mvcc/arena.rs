@@ -12,14 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Arena-based row storage for zero-copy scans
+//! Arena-based row storage for O(1) clone reads
 //!
-//! This module provides contiguous memory storage for row data,
-//! enabling 50x+ faster full table scans by eliminating cloning.
+//! This module provides Arc-based storage for row data,
+//! enabling O(1) row cloning on read (just Arc::clone).
 //!
-//! Key insight: Instead of storing each row as a separate Vec<Value>,
-//! store ALL values in a single contiguous Vec<Value> arena.
-//! Rows are just (start, end) indices into this arena.
+//! Key insight: Store row data as Arc<[Value]> for O(1) clone on read.
+//! Single clone on insert, zero clone on read.
+//!
+//! # Lock Design
+//!
+//! Uses a single RwLock for both data and metadata to:
+//! - Ensure consistent lock ordering (eliminates deadlock risk)
+//! - Reduce lock acquisition overhead (one lock vs two)
+//! - Guarantee atomic insert operations
+
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
@@ -30,10 +38,6 @@ use crate::core::{Row, Value};
 pub struct ArenaRowMeta {
     /// Row ID
     pub row_id: i64,
-    /// Start index in the arena (inclusive)
-    pub start: usize,
-    /// End index in the arena (exclusive)
-    pub end: usize,
     /// Transaction ID that created this row
     pub txn_id: i64,
     /// Transaction ID that deleted this row (0 if not deleted)
@@ -48,368 +52,192 @@ impl ArenaRowMeta {
     pub fn is_deleted(&self) -> bool {
         self.deleted_at_txn_id != 0
     }
+}
 
-    /// Get the number of columns in this row
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.end - self.start
-    }
-
-    /// Check if this row has no columns
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.start == self.end
-    }
+/// Inner arena data protected by single lock
+pub struct ArenaInner {
+    /// Arc storage per row (for O(1) clone on read)
+    pub data: Vec<Arc<[Value]>>,
+    /// Row metadata
+    pub meta: Vec<ArenaRowMeta>,
 }
 
 /// Arena-based storage for row data
 ///
-/// All row values are stored in a single contiguous Vec<Value>.
-/// This enables zero-copy scans by returning slices into the arena.
+/// Row data is stored as Arc<[Value]> for O(1) clone on read.
+/// Single clone on insert, zero clone on read.
+///
+/// Uses single RwLock for atomicity and deadlock prevention.
 pub struct RowArena {
-    /// Contiguous storage for all values
-    data: RwLock<Vec<Value>>,
-    /// Row metadata (row_id -> ArenaRowMeta)
-    rows: RwLock<Vec<ArenaRowMeta>>,
-    /// Number of columns per row (fixed for a table)
-    #[allow(dead_code)]
-    cols_per_row: usize,
+    /// Combined data and metadata under single lock
+    inner: RwLock<ArenaInner>,
 }
 
 impl RowArena {
-    /// Create a new arena with the given number of columns per row
-    pub fn new(cols_per_row: usize) -> Self {
+    /// Create a new arena
+    pub fn new() -> Self {
         Self {
-            data: RwLock::new(Vec::with_capacity(10_000 * cols_per_row)),
-            rows: RwLock::new(Vec::with_capacity(10_000)),
-            cols_per_row,
+            inner: RwLock::new(ArenaInner {
+                data: Vec::with_capacity(10_000),
+                meta: Vec::with_capacity(10_000),
+            }),
         }
     }
 
     /// Create a new arena with pre-allocated capacity
-    pub fn with_capacity(cols_per_row: usize, row_capacity: usize) -> Self {
+    pub fn with_capacity(row_capacity: usize) -> Self {
         Self {
-            data: RwLock::new(Vec::with_capacity(row_capacity * cols_per_row)),
-            rows: RwLock::new(Vec::with_capacity(row_capacity)),
-            cols_per_row,
+            inner: RwLock::new(ArenaInner {
+                data: Vec::with_capacity(row_capacity),
+                meta: Vec::with_capacity(row_capacity),
+            }),
         }
     }
 
     /// Insert a row into the arena
     ///
     /// Returns the index of the row metadata
+    #[inline]
     pub fn insert(&self, row_id: i64, txn_id: i64, create_time: i64, values: &[Value]) -> usize {
-        let mut data = self.data.write();
-        let mut rows = self.rows.write();
+        let mut inner = self.inner.write();
 
-        let start = data.len();
-        data.extend(values.iter().cloned());
-        let end = data.len();
+        // Store Arc for O(1) clone on read - single clone here
+        inner.data.push(Arc::from(values));
 
         let meta = ArenaRowMeta {
             row_id,
-            start,
-            end,
             txn_id,
             deleted_at_txn_id: 0,
             create_time,
         };
 
-        let idx = rows.len();
-        rows.push(meta);
+        let idx = inner.meta.len();
+        inner.meta.push(meta);
         idx
     }
 
     /// Insert a row from a Row struct
+    #[inline]
     pub fn insert_row(&self, row_id: i64, txn_id: i64, create_time: i64, row: &Row) -> usize {
-        let mut data = self.data.write();
-        let mut rows = self.rows.write();
+        let mut inner = self.inner.write();
 
-        let start = data.len();
-        for i in 0..row.len() {
-            if let Some(v) = row.get(i) {
-                data.push(v.clone());
-            }
-        }
-        let end = data.len();
+        // Store Arc for O(1) clone on read - single clone here
+        inner.data.push(Arc::from(row.as_slice()));
 
         let meta = ArenaRowMeta {
             row_id,
-            start,
-            end,
             txn_id,
             deleted_at_txn_id: 0,
             create_time,
         };
 
-        let idx = rows.len();
-        rows.push(meta);
+        let idx = inner.meta.len();
+        inner.meta.push(meta);
         idx
     }
 
+    /// Insert a row and return both the index AND the Arc
+    /// This allows the caller to reuse the Arc for O(1) clones
+    #[inline]
+    pub fn insert_row_get_arc(
+        &self,
+        row_id: i64,
+        txn_id: i64,
+        create_time: i64,
+        row: &Row,
+    ) -> (usize, Arc<[Value]>) {
+        let mut inner = self.inner.write();
+
+        // Create Arc once, clone for storage and return
+        let arc_data = Arc::from(row.as_slice());
+        inner.data.push(Arc::clone(&arc_data));
+
+        let meta = ArenaRowMeta {
+            row_id,
+            txn_id,
+            deleted_at_txn_id: 0,
+            create_time,
+        };
+
+        let idx = inner.meta.len();
+        inner.meta.push(meta);
+        (idx, arc_data)
+    }
+
     /// Mark a row as deleted
+    #[inline]
     pub fn mark_deleted(&self, row_idx: usize, deleted_at_txn_id: i64) {
-        let mut rows = self.rows.write();
-        if row_idx < rows.len() {
-            rows[row_idx].deleted_at_txn_id = deleted_at_txn_id;
+        let mut inner = self.inner.write();
+        if row_idx < inner.meta.len() {
+            inner.meta[row_idx].deleted_at_txn_id = deleted_at_txn_id;
         }
     }
 
     /// Get the number of rows (including deleted)
+    #[inline]
     pub fn len(&self) -> usize {
-        self.rows.read().len()
+        self.inner.read().meta.len()
     }
 
     /// Check if the arena is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.rows.read().is_empty()
+        self.inner.read().meta.is_empty()
     }
 
-    /// Get a row's values as a slice (zero-copy read)
+    /// Get read guard for arena data
     ///
-    /// Returns None if the row index is invalid
-    pub fn get_row_slice<'a>(
-        &'a self,
-        data_guard: &'a [Value],
-        meta: &ArenaRowMeta,
-    ) -> &'a [Value] {
-        &data_guard[meta.start..meta.end]
-    }
-
-    /// Create a scanner for zero-copy iteration
-    pub fn scan(&self) -> ArenaScanner<'_> {
-        ArenaScanner {
-            data: self.data.read(),
-            rows: self.rows.read(),
-            current_idx: 0,
-        }
-    }
-
-    /// Get all row metadata (for filtering before accessing data)
-    pub fn get_all_meta(&self) -> Vec<ArenaRowMeta> {
-        self.rows.read().clone()
-    }
-
-    /// Get row data by row_id (searches through metadata)
-    pub fn get_by_row_id(&self, row_id: i64) -> Option<(ArenaRowMeta, Vec<Value>)> {
-        let rows = self.rows.read();
-        let data = self.data.read();
-
-        for meta in rows.iter().rev() {
-            if meta.row_id == row_id {
-                let values = data[meta.start..meta.end].to_vec();
-                return Some((*meta, values));
-            }
-        }
-        None
-    }
-
-    /// Get row data by arena index (direct O(1) access)
-    pub fn get_by_index(&self, arena_idx: usize) -> Option<(ArenaRowMeta, Vec<Value>)> {
-        let rows = self.rows.read();
-        let data = self.data.read();
-
-        if arena_idx < rows.len() {
-            let meta = rows[arena_idx];
-            let values = data[meta.start..meta.end].to_vec();
-            Some((meta, values))
-        } else {
-            None
-        }
-    }
-
-    /// Get multiple rows by arena indices efficiently (single lock acquisition)
-    pub fn get_multiple_by_indices(&self, indices: &[usize]) -> Vec<(i64, Vec<Value>)> {
-        let rows = self.rows.read();
-        let data = self.data.read();
-
-        let mut results = Vec::with_capacity(indices.len());
-        for &idx in indices {
-            if idx < rows.len() {
-                let meta = &rows[idx];
-                let values = data[meta.start..meta.end].to_vec();
-                results.push((meta.row_id, values));
-            }
-        }
-        results
-    }
-
-    /// Get multiple rows as Row objects directly (avoids intermediate Vec<Value>)
+    /// Returns a guard that provides access to both metadata and data slices.
+    /// Single lock acquisition for both.
     #[inline]
-    pub fn get_multiple_as_rows(&self, indices: &[usize]) -> Vec<(i64, Row)> {
-        let rows = self.rows.read();
-        let data = self.data.read();
-        let rows_len = rows.len();
-        let data_slice = data.as_slice();
-
-        // Use iterator + collect for better compiler optimization
-        indices
-            .iter()
-            .filter_map(|&idx| {
-                if idx < rows_len {
-                    // SAFETY: idx bounds already checked
-                    let meta = unsafe { rows.get_unchecked(idx) };
-                    // SAFETY: arena maintains valid start..end ranges
-                    let slice = unsafe { data_slice.get_unchecked(meta.start..meta.end) };
-                    Some((meta.row_id, Row::from_values(slice.to_vec())))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    /// Get multiple rows with pre-known row_ids (faster - skips row_id lookup)
-    #[inline]
-    pub fn get_rows_with_ids(&self, pairs: &[(i64, usize)]) -> Vec<(i64, Row)> {
-        let rows = self.rows.read();
-        let data = self.data.read();
-        let rows_len = rows.len();
-        let data_slice = data.as_slice();
-
-        pairs
-            .iter()
-            .filter_map(|&(row_id, idx)| {
-                if idx < rows_len {
-                    // SAFETY: idx bounds already checked
-                    let meta = unsafe { rows.get_unchecked(idx) };
-                    // SAFETY: arena maintains valid start..end ranges
-                    let slice = unsafe { data_slice.get_unchecked(meta.start..meta.end) };
-                    Some((row_id, Row::from_values(slice.to_vec())))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    /// Get data read guard for external batch operations
-    #[inline]
-    pub fn read_guards(
-        &self,
-    ) -> (
-        parking_lot::RwLockReadGuard<'_, Vec<ArenaRowMeta>>,
-        parking_lot::RwLockReadGuard<'_, Vec<Value>>,
-    ) {
-        (self.rows.read(), self.data.read())
-    }
-
-    /// Clone row data directly given guards (zero lock overhead)
-    ///
-    /// # Safety
-    /// This method validates all bounds before accessing data:
-    /// 1. `idx` is within `rows_guard` bounds
-    /// 2. `meta.start..meta.end` is within `data_guard` bounds
-    ///
-    /// Returns `None` if any bounds check fails, preventing undefined behavior.
-    #[inline]
-    pub fn clone_row_data(
-        rows_guard: &[ArenaRowMeta],
-        data_guard: &[Value],
-        idx: usize,
-    ) -> Option<Row> {
-        if idx < rows_guard.len() {
-            // SAFETY: idx bounds checked above
-            let meta = unsafe { rows_guard.get_unchecked(idx) };
-            // Validate data slice bounds to prevent UB from arena corruption
-            if meta.start <= meta.end && meta.end <= data_guard.len() {
-                // SAFETY: start..end bounds validated above
-                let slice = unsafe { data_guard.get_unchecked(meta.start..meta.end) };
-                Some(Row::from_values(slice.to_vec()))
-            } else {
-                // Arena corruption detected - return None instead of UB
-                None
-            }
-        } else {
-            None
+    pub fn read_guard(&self) -> ArenaReadGuard<'_> {
+        ArenaReadGuard {
+            inner: self.inner.read(),
         }
+    }
+
+    /// Get Arc for a row by arena index - O(1) clone
+    #[inline]
+    pub fn get_arc(&self, arena_idx: usize) -> Option<Arc<[Value]>> {
+        let inner = self.inner.read();
+        inner.data.get(arena_idx).cloned()
     }
 }
 
-/// Zero-copy scanner over the arena
-pub struct ArenaScanner<'a> {
-    /// Read guard for the data array - public for direct access
-    pub(crate) data: parking_lot::RwLockReadGuard<'a, Vec<Value>>,
-    /// Read guard for the row metadata - public for direct access
-    pub(crate) rows: parking_lot::RwLockReadGuard<'a, Vec<ArenaRowMeta>>,
-    current_idx: usize,
+impl Default for RowArena {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-impl<'a> ArenaScanner<'a> {
-    /// Advance to the next row
+/// Read guard for arena providing access to both data and metadata
+pub struct ArenaReadGuard<'a> {
+    inner: parking_lot::RwLockReadGuard<'a, ArenaInner>,
+}
+
+impl<'a> ArenaReadGuard<'a> {
+    /// Get data slice
     #[inline]
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> bool {
-        if self.current_idx < self.rows.len() {
-            self.current_idx += 1;
-            true
-        } else {
-            false
-        }
+    pub fn data(&self) -> &[Arc<[Value]>] {
+        &self.inner.data
     }
 
-    /// Get current row metadata
+    /// Get metadata slice
     #[inline]
-    pub fn meta(&self) -> &ArenaRowMeta {
-        &self.rows[self.current_idx - 1]
+    pub fn meta(&self) -> &[ArenaRowMeta] {
+        &self.inner.meta
     }
 
-    /// Get current row ID
+    /// Get length
     #[inline]
-    pub fn row_id(&self) -> i64 {
-        self.rows[self.current_idx - 1].row_id
-    }
-
-    /// Get current row as a slice (ZERO COPY!)
-    #[inline]
-    pub fn row(&self) -> &[Value] {
-        let meta = &self.rows[self.current_idx - 1];
-        &self.data[meta.start..meta.end]
-    }
-
-    /// Get a specific column value from current row
-    #[inline]
-    pub fn get(&self, col: usize) -> Option<&Value> {
-        let meta = &self.rows[self.current_idx - 1];
-        let pos = meta.start + col;
-        if pos < meta.end {
-            Some(&self.data[pos])
-        } else {
-            None
-        }
-    }
-
-    /// Check if current row is deleted
-    #[inline]
-    pub fn is_deleted(&self) -> bool {
-        self.rows[self.current_idx - 1].is_deleted()
-    }
-
-    /// Get transaction ID of current row
-    #[inline]
-    pub fn txn_id(&self) -> i64 {
-        self.rows[self.current_idx - 1].txn_id
-    }
-
-    /// Get deleted_at transaction ID
-    #[inline]
-    pub fn deleted_at_txn_id(&self) -> i64 {
-        self.rows[self.current_idx - 1].deleted_at_txn_id
-    }
-
-    /// Reset scanner to beginning
-    pub fn reset(&mut self) {
-        self.current_idx = 0;
-    }
-
-    /// Get total row count
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.inner.meta.len()
     }
 
-    /// Check if scanner is empty
+    /// Check if empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.inner.meta.is_empty()
     }
 }
 
@@ -419,8 +247,8 @@ mod tests {
     use crate::core::Value;
 
     #[test]
-    fn test_arena_insert_and_scan() {
-        let arena = RowArena::new(3);
+    fn test_arena_insert_and_iterate() {
+        let arena = RowArena::new();
 
         // Insert some rows
         arena.insert(
@@ -444,14 +272,14 @@ mod tests {
 
         assert_eq!(arena.len(), 3);
 
-        // Scan and verify
-        let mut scanner = arena.scan();
+        // Iterate using read_guard
+        let guard = arena.read_guard();
         let mut count = 0;
         let mut sum = 0.0f64;
 
-        while scanner.next() {
+        for (idx, _meta) in guard.meta().iter().enumerate() {
             count += 1;
-            if let Some(Value::Float(v)) = scanner.get(2) {
+            if let Some(Value::Float(v)) = guard.data()[idx].get(2) {
                 sum += v;
             }
         }
@@ -461,19 +289,19 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_zero_copy() {
-        let arena = RowArena::new(2);
+    fn test_arena_arc_clone() {
+        let arena = RowArena::new();
 
         arena.insert(1, 100, 1000, &[Value::Integer(42), Value::text("test")]);
 
-        let mut scanner = arena.scan();
-        assert!(scanner.next());
+        let guard = arena.read_guard();
+        assert_eq!(guard.len(), 1);
 
-        // Get row as slice - this is a reference, not a copy!
-        let row = scanner.row();
-        assert_eq!(row.len(), 2);
+        // Get row as Arc - O(1) clone
+        let row_arc = Arc::clone(&guard.data()[0]);
+        assert_eq!(row_arc.len(), 2);
 
-        if let Value::Integer(v) = &row[0] {
+        if let Value::Integer(v) = &row_arc[0] {
             assert_eq!(*v, 42);
         } else {
             panic!("Expected Integer");
@@ -482,16 +310,58 @@ mod tests {
 
     #[test]
     fn test_arena_deletion() {
-        let arena = RowArena::new(2);
+        let arena = RowArena::new();
 
         let idx = arena.insert(1, 100, 1000, &[Value::Integer(1), Value::text("test")]);
 
         // Mark as deleted
         arena.mark_deleted(idx, 101);
 
-        let mut scanner = arena.scan();
-        assert!(scanner.next());
-        assert!(scanner.is_deleted());
-        assert_eq!(scanner.deleted_at_txn_id(), 101);
+        let guard = arena.read_guard();
+        assert!(guard.meta()[0].is_deleted());
+        assert_eq!(guard.meta()[0].deleted_at_txn_id, 101);
+    }
+
+    #[test]
+    fn test_arena_get_column_value() {
+        let arena = RowArena::new();
+
+        arena.insert(
+            1,
+            100,
+            1000,
+            &[Value::Integer(42), Value::text("hello"), Value::Float(3.15)],
+        );
+
+        let guard = arena.read_guard();
+
+        // Get column 0
+        let val = guard.data()[0].first().cloned();
+        assert_eq!(val, Some(Value::Integer(42)));
+
+        // Get column 1
+        let val = guard.data()[0].get(1).cloned();
+        assert_eq!(val, Some(Value::text("hello")));
+
+        // Get column 2
+        let val = guard.data()[0].get(2).cloned();
+        assert_eq!(val, Some(Value::Float(3.15)));
+
+        // Out of bounds column - returns None
+        let val = guard.data()[0].get(3).cloned();
+        assert_eq!(val, None);
+    }
+
+    #[test]
+    fn test_arena_read_guard() {
+        let arena = RowArena::new();
+
+        arena.insert(1, 100, 1000, &[Value::Integer(1), Value::text("a")]);
+        arena.insert(2, 100, 1001, &[Value::Integer(2), Value::text("b")]);
+
+        let guard = arena.read_guard();
+        assert_eq!(guard.len(), 2);
+        assert_eq!(guard.meta()[0].row_id, 1);
+        assert_eq!(guard.meta()[1].row_id, 2);
     }
 }

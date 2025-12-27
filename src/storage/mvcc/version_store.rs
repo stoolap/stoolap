@@ -33,8 +33,8 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::common::{
-    new_concurrent_int64_map, new_int64_map, new_int64_map_with_capacity, new_ordered_int64_map,
-    ConcurrentInt64Map, Int64Map, OrderedInt64Map,
+    new_btree_int64_map, new_concurrent_int64_map, new_int64_map, new_int64_map_with_capacity,
+    BTreeInt64Map, ConcurrentInt64Map, Int64Map,
 };
 use crate::core::{Error, Row, Schema, Value};
 use crate::storage::expression::CompiledFilter;
@@ -226,8 +226,8 @@ pub trait VisibilityChecker: Send + Sync {
 /// - Returning slices instead of clones during iteration
 /// - Eliminating per-row allocation overhead
 pub struct VersionStore {
-    /// Row versions indexed by row ID (ordered map for sorted iteration)
-    versions: OrderedInt64Map<VersionChainEntry>,
+    /// Row versions indexed by row ID (BTreeMap for ordered iteration)
+    versions: BTreeInt64Map<VersionChainEntry>,
     /// The name of the table this store belongs to
     table_name: String,
     /// Table schema (Arc for zero-cost cloning on read)
@@ -267,14 +267,13 @@ impl VersionStore {
         checker: Option<Arc<dyn VisibilityChecker>>,
         expected_rows: usize,
     ) -> Self {
-        let cols = schema.column_count();
         // BTreeMap doesn't support capacity hints, but row_arena_index (HashMap) does
         let row_arena_index = if expected_rows > 0 {
             RwLock::new(new_int64_map_with_capacity(expected_rows))
         } else {
             RwLock::new(new_int64_map())
         };
-        let versions = new_ordered_int64_map();
+        let versions = new_btree_int64_map();
 
         Self {
             versions,
@@ -285,7 +284,7 @@ impl VersionStore {
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: new_concurrent_int64_map(),
             visibility_checker: checker,
-            arena: RowArena::new(cols),
+            arena: RowArena::new(),
             row_arena_index,
             zone_maps: RwLock::new(None),
         }
@@ -385,13 +384,16 @@ impl VersionStore {
                 }
 
                 // Store in arena (only for non-deleted versions)
+                // Use insert_row_get_arc to get the Arc back and reuse it for O(1) clones
                 let arena_idx = if new_version.deleted_at_txn_id == 0 {
-                    let idx = self.arena.insert_row(
+                    let (idx, arc_data) = self.arena.insert_row_get_arc(
                         row_id,
                         new_version.txn_id,
                         new_version.create_time,
                         &new_version.data,
                     );
+                    // Reuse the Arc for the version's data - enables O(1) clone on read
+                    new_version.data = Row::from_arc(arc_data);
                     // Update row -> arena index mapping
                     self.row_arena_index.write().insert(row_id, idx);
                     Some(idx)
@@ -413,8 +415,9 @@ impl VersionStore {
                 }
             } else {
                 // First version for this row - store in arena
-                let arena_idx = if version.deleted_at_txn_id == 0 {
-                    let idx = self.arena.insert_row(
+                // Use insert_row_get_arc to get the Arc back and reuse it for O(1) clones
+                let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
+                    let (idx, arc_data) = self.arena.insert_row_get_arc(
                         row_id,
                         version.txn_id,
                         version.create_time,
@@ -422,13 +425,16 @@ impl VersionStore {
                     );
                     // Update row -> arena index mapping
                     self.row_arena_index.write().insert(row_id, idx);
-                    Some(idx)
+                    // Create version with Arc-backed data for O(1) clone
+                    let mut v = version;
+                    v.data = Row::from_arc(arc_data);
+                    (Some(idx), v)
                 } else {
-                    None
+                    (None, version)
                 };
 
                 VersionChainEntry {
-                    version,
+                    version: final_version,
                     prev: None,
                     arena_idx,
                 }
@@ -442,6 +448,7 @@ impl VersionStore {
     /// Updates both the version store and the arena atomically per row.
     /// Arena updates are O(1) per row (just an insert), so this is efficient.
     /// Row arena index updates are batched under a single lock acquisition.
+    /// Version data uses Arc-backed storage for O(1) clones on read.
     #[inline]
     pub fn add_versions_batch(&self, batch: Vec<(i64, RowVersion)>) {
         if self.closed.load(Ordering::Acquire) || batch.is_empty() {
@@ -475,14 +482,16 @@ impl VersionStore {
                     self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
                 }
 
-                // Update arena (O(1) per row - just an insert, not a scan)
+                // Update arena with Arc reuse for O(1) clones on read
                 let arena_idx = if new_version.deleted_at_txn_id == 0 {
-                    let idx = self.arena.insert_row(
+                    let (idx, arc_data) = self.arena.insert_row_get_arc(
                         row_id,
                         new_version.txn_id,
                         new_version.create_time,
                         &new_version.data,
                     );
+                    // Reuse the Arc for the version's data
+                    new_version.data = Row::from_arc(arc_data);
                     arena_index_updates.push((row_id, idx));
                     Some(idx)
                 } else {
@@ -502,22 +511,25 @@ impl VersionStore {
                     arena_idx,
                 }
             } else {
-                // First version for this row - store in arena
-                let arena_idx = if version.deleted_at_txn_id == 0 {
-                    let idx = self.arena.insert_row(
+                // First version for this row - store in arena with Arc reuse
+                let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
+                    let (idx, arc_data) = self.arena.insert_row_get_arc(
                         row_id,
                         version.txn_id,
                         version.create_time,
                         &version.data,
                     );
                     arena_index_updates.push((row_id, idx));
-                    Some(idx)
+                    // Create version with Arc-backed data for O(1) clone
+                    let mut v = version;
+                    v.data = Row::from_arc(arc_data);
+                    (Some(idx), v)
                 } else {
-                    None
+                    (None, version)
                 };
 
                 VersionChainEntry {
-                    version,
+                    version: final_version,
                     prev: None,
                     arena_idx,
                 }
@@ -552,31 +564,28 @@ impl VersionStore {
 
         let checker = self.visibility_checker.as_ref()?;
 
-        // Hold read lock for the duration of chain walk
+        // BTreeMap with read lock
         let versions = self.versions.read();
-
-        // First pass: find which version is visible (only need txn_ids, no cloning)
-        // Then clone only that one version
-        let entry = versions.get(&row_id)?;
+        let chain = versions.get(&row_id)?;
 
         // FAST PATH: Check HEAD version first - O(1) for common case
         // Most readers want latest committed data. If HEAD is visible, return immediately.
         // This avoids chain traversal even for multi-version rows.
-        let head_txn_id = entry.version.txn_id;
-        let head_deleted_at = entry.version.deleted_at_txn_id;
+        let head_txn_id = chain.version.txn_id;
+        let head_deleted_at = chain.version.deleted_at_txn_id;
 
         if checker.is_visible(head_txn_id, txn_id) {
             // HEAD is visible - check if deleted
             if head_deleted_at != 0 && checker.is_visible(head_deleted_at, txn_id) {
                 return None; // Row is deleted
             }
-            return Some(entry.version.clone());
+            return Some(chain.version.clone());
         }
 
         // SLOW PATH: HEAD not visible - need to traverse chain for older versions
         // This only happens for transactions that need to see historical data
         // (e.g., Snapshot Isolation reading versions from before they started)
-        let mut current = entry.prev.as_ref().map(|b| b.as_ref());
+        let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
 
         while let Some(e) = current {
             let version_txn_id = e.version.txn_id;
@@ -614,14 +623,9 @@ impl VersionStore {
             None => return Vec::new(),
         };
 
-        // Pre-acquire arena locks ONCE for all lookups (same optimization as full scan)
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
-
-        // Pre-acquire versions lock ONCE for all lookups
-        let versions = self.versions.read();
+        // Pre-acquire arena lock ONCE for all lookups (same optimization as full scan)
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
         // Parallel processing constants
         /// Minimum batch size before enabling parallel processing (avoid overhead for small batches)
@@ -632,41 +636,44 @@ impl VersionStore {
         // Helper closure to get row data from arena or version
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
-                if idx < arena_len {
-                    let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                    if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                        let slice = unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                        return Row::from_values(slice.to_vec());
-                    }
+                if let Some(arc_row) = arena_data.get(idx) {
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
         };
 
+        // BTreeMap with RwLock - hold read lock during parallel processing
+        // Read locks are shared, so concurrent readers can proceed
+        // This avoids expensive chain cloning while maintaining MVCC consistency
+        let versions = self.versions.read();
+
         if row_ids.len() >= PARALLEL_THRESHOLD {
-            // Parallel path: process chunks in parallel and flatten results
+            // Parallel path: process chunks while holding read lock (zero-copy)
+            // RwLock read locks allow concurrent readers, so this is safe and fast
             row_ids
                 .par_chunks(PARALLEL_CHUNK_SIZE)
                 .flat_map(|chunk| {
                     let mut chunk_results = Vec::with_capacity(chunk.len());
                     for &row_id in chunk {
-                        if let Some(entry) = versions.get(&row_id) {
+                        if let Some(chain) = versions.get(&row_id) {
                             // FAST PATH: Check HEAD version first - O(1) for common case
-                            let head_txn_id = entry.version.txn_id;
-                            let head_deleted_at = entry.version.deleted_at_txn_id;
+                            let head_txn_id = chain.version.txn_id;
+                            let head_deleted_at = chain.version.deleted_at_txn_id;
 
                             if checker.is_visible(head_txn_id, txn_id) {
                                 // HEAD is visible - check if deleted
                                 if head_deleted_at == 0
                                     || !checker.is_visible(head_deleted_at, txn_id)
                                 {
-                                    chunk_results.push((row_id, get_row_data(entry)));
+                                    chunk_results.push((row_id, get_row_data(chain)));
                                 }
                                 continue;
                             }
 
                             // SLOW PATH: HEAD not visible - traverse chain for older versions
-                            let mut current = entry.prev.as_ref().map(|b| b.as_ref());
+                            let mut current: Option<&VersionChainEntry> =
+                                chain.prev.as_ref().map(|b| b.as_ref());
 
                             while let Some(e) = current {
                                 let version_txn_id = e.version.txn_id;
@@ -691,21 +698,22 @@ impl VersionStore {
             // Sequential path for small batches
             let mut results = Vec::with_capacity(row_ids.len());
             for &row_id in row_ids {
-                if let Some(entry) = versions.get(&row_id) {
+                if let Some(chain) = versions.get(&row_id) {
                     // FAST PATH: Check HEAD version first - O(1) for common case
-                    let head_txn_id = entry.version.txn_id;
-                    let head_deleted_at = entry.version.deleted_at_txn_id;
+                    let head_txn_id = chain.version.txn_id;
+                    let head_deleted_at = chain.version.deleted_at_txn_id;
 
                     if checker.is_visible(head_txn_id, txn_id) {
                         // HEAD is visible - check if deleted
                         if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                            results.push((row_id, get_row_data(entry)));
+                            results.push((row_id, get_row_data(chain)));
                         }
                         continue;
                     }
 
                     // SLOW PATH: HEAD not visible - traverse chain for older versions
-                    let mut current = entry.prev.as_ref().map(|b| b.as_ref());
+                    let mut current: Option<&VersionChainEntry> =
+                        chain.prev.as_ref().map(|b| b.as_ref());
 
                     while let Some(e) = current {
                         let version_txn_id = e.version.txn_id;
@@ -744,26 +752,28 @@ impl VersionStore {
             None => return 0,
         };
 
-        // Pre-acquire versions lock ONCE for all lookups
-        let versions = self.versions.read();
-
         // Parallel processing constants
         /// Minimum batch size before enabling parallel processing (avoid overhead for small batches)
         const PARALLEL_THRESHOLD: usize = 1000;
         /// Chunk size for parallel processing (balances parallelism vs. overhead)
         const PARALLEL_CHUNK_SIZE: usize = 512;
 
+        // BTreeMap with RwLock - hold read lock during parallel processing
+        // Read locks are shared, so concurrent readers can proceed
+        let versions = self.versions.read();
+
         if row_ids.len() >= PARALLEL_THRESHOLD {
-            // Parallel path: chunk and process in parallel
+            // Parallel path: process chunks while holding read lock (zero-copy)
+            // RwLock read locks allow concurrent readers, so this is safe and fast
             row_ids
                 .par_chunks(PARALLEL_CHUNK_SIZE)
                 .map(|chunk| {
                     let mut chunk_count = 0;
                     for &row_id in chunk {
-                        if let Some(entry) = versions.get(&row_id) {
+                        if let Some(chain) = versions.get(&row_id) {
                             // FAST PATH: Check HEAD version first - O(1) for common case
-                            let head_txn_id = entry.version.txn_id;
-                            let head_deleted_at = entry.version.deleted_at_txn_id;
+                            let head_txn_id = chain.version.txn_id;
+                            let head_deleted_at = chain.version.deleted_at_txn_id;
 
                             if checker.is_visible(head_txn_id, txn_id) {
                                 // HEAD is visible - check if deleted
@@ -776,7 +786,8 @@ impl VersionStore {
                             }
 
                             // SLOW PATH: HEAD not visible - traverse chain for older versions
-                            let mut current = entry.prev.as_ref().map(|b| b.as_ref());
+                            let mut current: Option<&VersionChainEntry> =
+                                chain.prev.as_ref().map(|b| b.as_ref());
 
                             while let Some(e) = current {
                                 let version_txn_id = e.version.txn_id;
@@ -801,10 +812,10 @@ impl VersionStore {
             // Sequential path for small batches
             let mut count = 0;
             for &row_id in row_ids {
-                if let Some(entry) = versions.get(&row_id) {
+                if let Some(chain) = versions.get(&row_id) {
                     // FAST PATH: Check HEAD version first - O(1) for common case
-                    let head_txn_id = entry.version.txn_id;
-                    let head_deleted_at = entry.version.deleted_at_txn_id;
+                    let head_txn_id = chain.version.txn_id;
+                    let head_deleted_at = chain.version.deleted_at_txn_id;
 
                     if checker.is_visible(head_txn_id, txn_id) {
                         // HEAD is visible - check if deleted
@@ -815,7 +826,8 @@ impl VersionStore {
                     }
 
                     // SLOW PATH: HEAD not visible - traverse chain for older versions
-                    let mut current = entry.prev.as_ref().map(|b| b.as_ref());
+                    let mut current: Option<&VersionChainEntry> =
+                        chain.prev.as_ref().map(|b| b.as_ref());
 
                     while let Some(e) = current {
                         let version_txn_id = e.version.txn_id;
@@ -860,29 +872,43 @@ impl VersionStore {
             None => return Vec::new(),
         };
 
+        // Pre-acquire arena lock for O(1) Arc clones
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
+
+        // Helper: get row from arena (O(1)) or version (O(n) clone)
+        let get_row = |entry: &VersionChainEntry| -> Row {
+            if let Some(idx) = entry.arena_idx {
+                if let Some(arc_row) = arena_data.get(idx) {
+                    return Row::from_arc(Arc::clone(arc_row));
+                }
+            }
+            entry.version.data.clone()
+        };
+
         let current_seq = checker.get_current_sequence();
         let mut results = Vec::with_capacity(row_ids.len());
 
-        // Pre-acquire versions lock ONCE for all lookups
         let versions = self.versions.read();
         for &row_id in row_ids {
-            if let Some(entry) = versions.get(&row_id) {
+            if let Some(chain) = versions.get(&row_id) {
                 // FAST PATH: Check HEAD version first - O(1) for common case
-                let head_txn_id = entry.version.txn_id;
-                let head_deleted_at = entry.version.deleted_at_txn_id;
+                let head_txn_id = chain.version.txn_id;
+                let head_deleted_at = chain.version.deleted_at_txn_id;
 
                 if checker.is_visible(head_txn_id, txn_id) {
                     // HEAD is visible - check if deleted
                     if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                        let mut version_copy = entry.version.clone();
+                        let mut version_copy = chain.version.clone();
                         version_copy.create_time = current_seq;
-                        results.push((row_id, entry.version.data.clone(), version_copy));
+                        results.push((row_id, get_row(chain), version_copy));
                     }
                     continue;
                 }
 
                 // SLOW PATH: HEAD not visible - traverse chain for older versions
-                let mut current = entry.prev.as_ref().map(|b| b.as_ref());
+                let mut current: Option<&VersionChainEntry> =
+                    chain.prev.as_ref().map(|b| b.as_ref());
                 while let Some(e) = current {
                     let version_txn_id = e.version.txn_id;
                     let deleted_at_txn_id = e.version.deleted_at_txn_id;
@@ -895,7 +921,7 @@ impl VersionStore {
                             // Store the current sequence in create_time for later retrieval
                             // (This is a bit of a hack, but avoids changing the struct)
                             version_copy.create_time = current_seq;
-                            results.push((row_id, e.version.data.clone(), version_copy));
+                            results.push((row_id, get_row(e), version_copy));
                         }
                         break;
                     }
@@ -926,10 +952,10 @@ impl VersionStore {
         }
 
         let versions = self.versions.read();
-        let entry = versions.get(&row_id)?;
+        let chain = versions.get(&row_id)?;
 
         // Traverse version chain from newest to oldest
-        let mut current: Option<&VersionChainEntry> = Some(entry);
+        let mut current: Option<&VersionChainEntry> = Some(chain);
         while let Some(e) = current {
             // Check if this version was created before or at the asOf transaction
             if e.version.txn_id <= as_of_txn_id {
@@ -956,10 +982,10 @@ impl VersionStore {
         }
 
         let versions = self.versions.read();
-        let entry = versions.get(&row_id)?;
+        let chain = versions.get(&row_id)?;
 
         // Traverse version chain from newest to oldest
-        let mut current: Option<&VersionChainEntry> = Some(entry);
+        let mut current: Option<&VersionChainEntry> = Some(chain);
         while let Some(e) = current {
             // Check if this version was created before or at the asOf timestamp
             if e.version.create_time <= as_of_timestamp {
@@ -986,21 +1012,52 @@ impl VersionStore {
     }
 
     /// Returns all row IDs that are visible to the given transaction
+    ///
+    /// OPTIMIZATION: Single-pass iteration with O(1) lock acquisition instead of O(N).
+    /// Uses the same HEAD-first visibility pattern as count_visible_rows.
     pub fn get_all_visible_row_ids(&self, txn_id: i64) -> Vec<i64> {
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
         }
 
-        // First, collect all row IDs (already sorted by OrderedInt64Map)
-        let all_row_ids: Vec<i64> = self.versions.read().keys().copied().collect();
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
 
-        // Now check visibility for each row ID without holding any version store locks
-        let mut visible_row_ids = Vec::with_capacity(all_row_ids.len());
-        for row_id in all_row_ids {
-            if self.get_visible_version(row_id, txn_id).is_some() {
-                visible_row_ids.push(row_id);
+        // Single pass through all versions (holding read lock once)
+        let versions = self.versions.read();
+        let mut visible_row_ids = Vec::with_capacity(versions.len());
+
+        for (&row_id, chain) in versions.iter() {
+            // FAST PATH: Check HEAD version first - O(1) for common case
+            let head_txn_id = chain.version.txn_id;
+            let head_deleted_at = chain.version.deleted_at_txn_id;
+
+            if checker.is_visible(head_txn_id, txn_id) {
+                // HEAD is visible - check if deleted
+                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+                    visible_row_ids.push(row_id);
+                }
+                continue;
+            }
+
+            // SLOW PATH: HEAD not visible - traverse chain for older versions
+            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                if checker.is_visible(version_txn_id, txn_id) {
+                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
+                        visible_row_ids.push(row_id);
+                    }
+                    break;
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
             }
         }
+
         visible_row_ids
     }
 
@@ -1020,9 +1077,9 @@ impl VersionStore {
 
         let mut count = 0;
 
-        // Single pass through all versions (already sorted by BTreeMap)
+        // Single pass through all versions (holding read lock)
         let versions = self.versions.read();
-        for (_, chain) in versions.iter() {
+        for chain in versions.values() {
             // FAST PATH: Check HEAD version first - O(1) for common case
             let head_txn_id = chain.version.txn_id;
             let head_deleted_at = chain.version.deleted_at_txn_id;
@@ -1036,7 +1093,7 @@ impl VersionStore {
             }
 
             // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current = chain.prev.as_ref().map(|b| b.as_ref());
+            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
             while let Some(e) = current {
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
@@ -1077,7 +1134,21 @@ impl VersionStore {
             None => return Vec::new(),
         };
 
-        // Collect all versions in one pass (BTreeMap iteration is already sorted by row_id)
+        // Pre-acquire arena lock for O(1) Arc clones
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
+
+        // Helper: get row from arena (O(1)) or version (O(n) clone)
+        let get_row = |entry: &VersionChainEntry| -> Row {
+            if let Some(idx) = entry.arena_idx {
+                if let Some(arc_row) = arena_data.get(idx) {
+                    return Row::from_arc(Arc::clone(arc_row));
+                }
+            }
+            entry.version.data.clone()
+        };
+
+        // Collect all versions in one pass (BTreeMap is sorted)
         let versions = self.versions.read();
         let mut results = Vec::with_capacity(versions.len());
 
@@ -1089,20 +1160,20 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    results.push((row_id, chain.version.data.clone()));
+                    results.push((row_id, get_row(chain)));
                 }
                 continue;
             }
 
             // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current = chain.prev.as_ref().map(|b| b.as_ref());
+            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
             while let Some(e) = current {
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        results.push((row_id, e.version.data.clone()));
+                        results.push((row_id, get_row(e)));
                     }
                     break;
                 }
@@ -1110,7 +1181,7 @@ impl VersionStore {
             }
         }
 
-        // BTreeMap iteration is already sorted by row_id - no sort needed!
+        // BTreeMap already iterates in sorted order, no need to sort
         results
     }
 
@@ -1131,43 +1202,22 @@ impl VersionStore {
             None => return Vec::new(),
         };
 
-        // Pre-acquire arena locks ONCE for the entire operation
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
-
-        // Pre-acquire versions lock (BTreeMap iteration is already sorted by row_id)
-        let versions = self.versions.read();
+        // Pre-acquire arena lock ONCE for the entire operation
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
         // Helper closure to get row data from arena or version
-        let get_row_data = |e: &VersionChainEntry, row_id: i64| -> Row {
+        let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
-                if idx < arena_len {
-                    // SAFETY: idx bounds checked above
-                    let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                    // Validate data slice bounds to prevent UB from arena corruption
-                    if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                        // SAFETY: bounds validated above
-                        let slice = unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                        return Row::from_values(slice.to_vec());
-                    } else {
-                        // Arena corruption detected - fall back to version data
-                        debug_assert!(
-                            false,
-                            "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
-                            row_id,
-                            meta.start,
-                            meta.end,
-                            arena_data_slice.len()
-                        );
-                    }
+                if let Some(arc_row) = arena_data.get(idx) {
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
         };
 
-        // Single-pass: read directly from arena during visibility check
+        // Single-pass: read directly from arena during visibility check (BTreeMap is sorted)
+        let versions = self.versions.read();
         let mut result: Vec<(i64, Row)> = Vec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -1178,20 +1228,20 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, get_row_data(chain, row_id)));
+                    result.push((row_id, get_row_data(chain)));
                 }
                 continue;
             }
 
             // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current = chain.prev.as_ref().map(|b| b.as_ref());
+            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
             while let Some(e) = current {
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, get_row_data(e, row_id)));
+                        result.push((row_id, get_row_data(e)));
                     }
                     break;
                 }
@@ -1199,7 +1249,7 @@ impl VersionStore {
             }
         }
 
-        // BTreeMap iteration is already sorted by row_id - no sort needed!
+        // BTreeMap already iterates in sorted order, no need to sort
         result
     }
 
@@ -1225,33 +1275,22 @@ impl VersionStore {
 
         let current_seq = checker.get_current_sequence();
 
-        // Pre-acquire arena locks ONCE for the entire operation
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
-
-        // Pre-acquire versions lock (BTreeMap iteration is already sorted by row_id)
-        let versions = self.versions.read();
+        // Pre-acquire arena lock ONCE for the entire operation
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
         // Helper closure to get row data from arena or version
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
-                if idx < arena_len {
-                    // SAFETY: idx bounds checked above
-                    let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                    // Validate data slice bounds to prevent UB from arena corruption
-                    if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                        // SAFETY: bounds validated above
-                        let slice = unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                        return Row::from_values(slice.to_vec());
-                    }
+                if let Some(arc_row) = arena_data.get(idx) {
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
         };
 
-        // Single-pass: read directly from arena during visibility check
+        // Single-pass: read directly from arena during visibility check (BTreeMap)
+        let versions = self.versions.read();
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -1270,7 +1309,7 @@ impl VersionStore {
             }
 
             // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current = chain.prev.as_ref().map(|b| b.as_ref());
+            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
             while let Some(e) = current {
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
@@ -1319,16 +1358,12 @@ impl VersionStore {
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema); // Release lock early
 
-        // Pre-acquire arena locks ONCE for the entire operation
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
+        // Pre-acquire arena lock ONCE for the entire operation
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
-        // Pre-acquire versions lock (BTreeMap iteration is already sorted by row_id)
+        // Single-pass: read, filter, and collect in one loop (BTreeMap)
         let versions = self.versions.read();
-
-        // Single-pass: read, filter, and collect in one loop
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len() / 4);
 
         for (&row_id, chain) in versions.iter() {
@@ -1341,23 +1376,18 @@ impl VersionStore {
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
                     // Try arena path first (zero-copy filter check)
                     if let Some(idx) = chain.arena_idx {
-                        if idx < arena_len {
-                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                                let slice =
-                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                                // Filter on raw slice - no allocation!
-                                if compiled_filter.matches_slice(slice) {
-                                    let mut version_copy = chain.version.clone();
-                                    version_copy.create_time = current_seq;
-                                    result.push((
-                                        row_id,
-                                        Row::from_values(slice.to_vec()),
-                                        version_copy,
-                                    ));
-                                }
-                                continue;
+                        if let Some(arc_row) = arena_data.get(idx) {
+                            // Filter on slice - no allocation!
+                            if compiled_filter.matches_slice(arc_row) {
+                                let mut version_copy = chain.version.clone();
+                                version_copy.create_time = current_seq;
+                                result.push((
+                                    row_id,
+                                    Row::from_arc(Arc::clone(arc_row)),
+                                    version_copy,
+                                ));
                             }
+                            continue;
                         }
                     }
                     // Fallback: filter on version data
@@ -1371,7 +1401,7 @@ impl VersionStore {
             }
 
             // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current = chain.prev.as_ref().map(|b| b.as_ref());
+            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
             while let Some(e) = current {
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
@@ -1380,23 +1410,17 @@ impl VersionStore {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
                         // Try arena path first
                         if let Some(idx) = e.arena_idx {
-                            if idx < arena_len {
-                                let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                                if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                                    let slice = unsafe {
-                                        arena_data_slice.get_unchecked(meta.start..meta.end)
-                                    };
-                                    if compiled_filter.matches_slice(slice) {
-                                        let mut version_copy = e.version.clone();
-                                        version_copy.create_time = current_seq;
-                                        result.push((
-                                            row_id,
-                                            Row::from_values(slice.to_vec()),
-                                            version_copy,
-                                        ));
-                                    }
-                                    break;
+                            if let Some(arc_row) = arena_data.get(idx) {
+                                if compiled_filter.matches_slice(arc_row) {
+                                    let mut version_copy = e.version.clone();
+                                    version_copy.create_time = current_seq;
+                                    result.push((
+                                        row_id,
+                                        Row::from_arc(Arc::clone(arc_row)),
+                                        version_copy,
+                                    ));
                                 }
+                                break;
                             }
                         }
                         // Fallback: filter on version data
@@ -1415,7 +1439,7 @@ impl VersionStore {
         result
     }
 
-    /// Returns all visible rows (BTreeMap iteration is already sorted by row_id).
+    /// Returns all visible rows.
     ///
     /// Note: With BTreeMap, this is functionally identical to get_all_visible_rows_arena
     /// since BTreeMap iteration is inherently ordered.
@@ -1430,30 +1454,22 @@ impl VersionStore {
             None => return Vec::new(),
         };
 
-        // Pre-acquire arena locks ONCE for the entire operation
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
-
-        // Pre-acquire versions lock (BTreeMap iteration is sorted by row_id)
-        let versions = self.versions.read();
+        // Pre-acquire arena lock ONCE for the entire operation
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
         // Helper closure to get row data from arena or version
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
-                if idx < arena_len {
-                    let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                    if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                        let slice = unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                        return Row::from_values(slice.to_vec());
-                    }
+                if let Some(arc_row) = arena_data.get(idx) {
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
         };
 
-        // Single-pass: read directly from arena during visibility check
+        // Single-pass: read directly from arena during visibility check (BTreeMap is sorted)
+        let versions = self.versions.read();
         let mut result: Vec<(i64, Row)> = Vec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -1470,7 +1486,7 @@ impl VersionStore {
             }
 
             // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current = chain.prev.as_ref().map(|b| b.as_ref());
+            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
             while let Some(e) = current {
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
@@ -1485,7 +1501,6 @@ impl VersionStore {
             }
         }
 
-        // BTreeMap iteration is already sorted by row_id
         result
     }
 
@@ -1515,44 +1530,23 @@ impl VersionStore {
             None => return Vec::new(),
         };
 
-        // Pre-acquire arena locks ONCE for the entire operation
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
-
-        // Pre-acquire versions lock (BTreeMap iteration is sorted by row_id)
-        let versions = self.versions.read();
+        // Pre-acquire arena lock ONCE for the entire operation
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
         // Helper closure to get row data from arena or version
-        let get_row_data = |e: &VersionChainEntry, row_id: i64| -> Row {
+        let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
-                if idx < arena_len {
-                    // SAFETY: idx bounds checked above
-                    let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                    // Validate data slice bounds to prevent UB from arena corruption
-                    if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                        // SAFETY: bounds validated above
-                        let slice = unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                        return Row::from_values(slice.to_vec());
-                    } else {
-                        // Arena corruption detected - fall back to version data
-                        debug_assert!(
-                            false,
-                            "Arena corruption: row_id={}, bounds={}..{}, arena_len={}",
-                            row_id,
-                            meta.start,
-                            meta.end,
-                            arena_data_slice.len()
-                        );
-                    }
+                if let Some(arc_row) = arena_data.get(idx) {
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
         };
 
-        // True early termination with BTreeMap's ordered iteration
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit.min(1024));
+        // BTreeMap is sorted - collect with early termination
+        let versions = self.versions.read();
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit);
         let mut skipped = 0usize;
 
         for (&row_id, chain) in versions.iter() {
@@ -1560,49 +1554,49 @@ impl VersionStore {
             let head_txn_id = chain.version.txn_id;
             let head_deleted_at = chain.version.deleted_at_txn_id;
 
-            if checker.is_visible(head_txn_id, txn_id) {
+            // Track the actual visible entry, not just a boolean
+            let visible_entry: Option<&VersionChainEntry> = if checker
+                .is_visible(head_txn_id, txn_id)
+            {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    // Handle offset: skip first `offset` visible rows
-                    if skipped < offset {
-                        skipped += 1;
-                    } else {
-                        result.push((row_id, get_row_data(chain, row_id)));
-                        // Early termination: we have enough rows
-                        if result.len() >= limit {
-                            return result;
+                    Some(chain)
+                } else {
+                    None
+                }
+            } else {
+                // SLOW PATH: HEAD not visible - traverse chain for older versions
+                let mut found_entry: Option<&VersionChainEntry> = None;
+                let mut current: Option<&VersionChainEntry> =
+                    chain.prev.as_ref().map(|b| b.as_ref());
+                while let Some(e) = current {
+                    let version_txn_id = e.version.txn_id;
+                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                    if checker.is_visible(version_txn_id, txn_id) {
+                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
+                        {
+                            found_entry = Some(e);
                         }
+                        break;
+                    }
+                    current = e.prev.as_ref().map(|b| b.as_ref());
+                }
+                found_entry
+            };
+
+            if let Some(entry) = visible_entry {
+                if skipped < offset {
+                    skipped += 1;
+                } else {
+                    result.push((row_id, get_row_data(entry)));
+                    if result.len() >= limit {
+                        break; // Early termination!
                     }
                 }
-                continue;
-            }
-
-            // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current = chain.prev.as_ref().map(|b| b.as_ref());
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        // Handle offset: skip first `offset` visible rows
-                        if skipped < offset {
-                            skipped += 1;
-                        } else {
-                            result.push((row_id, get_row_data(e, row_id)));
-                            // Early termination: we have enough rows
-                            if result.len() >= limit {
-                                return result;
-                            }
-                        }
-                    }
-                    break;
-                }
-                current = e.prev.as_ref().map(|b| b.as_ref());
             }
         }
 
-        // BTreeMap iteration is already sorted - no sort needed!
         result
     }
 
@@ -1648,88 +1642,75 @@ impl VersionStore {
             None => return (Vec::new(), false),
         };
 
-        // Pre-acquire arena locks ONCE for this batch
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
-
-        // Pre-acquire versions lock
-        let versions = self.versions.read();
-
-        // Use range() to efficiently start from after_row_id
-        // Bound::Excluded means we start AFTER the given row_id
-        use std::ops::Bound;
-        let range_start = if after_row_id == i64::MIN {
-            Bound::Unbounded
-        } else {
-            Bound::Excluded(after_row_id)
-        };
+        // Pre-acquire arena lock ONCE for this batch
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
         // Helper closure to get row data from arena or version
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
-                if idx < arena_len {
-                    let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                    if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                        let slice = unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                        return Row::from_values(slice.to_vec());
-                    }
+                if let Some(arc_row) = arena_data.get(idx) {
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
         };
 
+        // BTreeMap is sorted - use range for efficient cursor-based iteration
+        let versions = self.versions.read();
         let mut result: Vec<(i64, Row)> = Vec::with_capacity(batch_size);
+        let mut has_more = false;
 
-        for (&row_id, chain) in versions.range((range_start, Bound::Unbounded)) {
+        // Use range to start after the cursor row_id
+        for (&row_id, chain) in versions.range((
+            std::ops::Bound::Excluded(after_row_id),
+            std::ops::Bound::Unbounded::<i64>,
+        )) {
             // FAST PATH: Check HEAD version first - O(1) for common case
             let head_txn_id = chain.version.txn_id;
             let head_deleted_at = chain.version.deleted_at_txn_id;
 
-            if checker.is_visible(head_txn_id, txn_id) {
+            // Track the actual visible entry, not just a boolean
+            let visible_entry: Option<&VersionChainEntry> = if checker
+                .is_visible(head_txn_id, txn_id)
+            {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, get_row_data(chain)));
-
-                    // Check if we've collected enough rows
-                    if result.len() >= batch_size {
-                        let has_more = versions
-                            .range((Bound::Excluded(row_id), Bound::Unbounded))
-                            .next()
-                            .is_some();
-                        return (result, has_more);
-                    }
+                    Some(chain)
+                } else {
+                    None
                 }
-                continue;
-            }
+            } else {
+                // SLOW PATH: HEAD not visible - traverse chain for older versions
+                let mut found_entry: Option<&VersionChainEntry> = None;
+                let mut current: Option<&VersionChainEntry> =
+                    chain.prev.as_ref().map(|b| b.as_ref());
+                while let Some(e) = current {
+                    let version_txn_id = e.version.txn_id;
+                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
-            // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current = chain.prev.as_ref().map(|b| b.as_ref());
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, get_row_data(e)));
-
-                        // Check if we've collected enough rows
-                        if result.len() >= batch_size {
-                            let has_more = versions
-                                .range((Bound::Excluded(row_id), Bound::Unbounded))
-                                .next()
-                                .is_some();
-                            return (result, has_more);
+                    if checker.is_visible(version_txn_id, txn_id) {
+                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
+                        {
+                            found_entry = Some(e);
                         }
+                        break;
                     }
-                    break;
+                    current = e.prev.as_ref().map(|b| b.as_ref());
                 }
-                current = e.prev.as_ref().map(|b| b.as_ref());
+                found_entry
+            };
+
+            if let Some(entry) = visible_entry {
+                if result.len() >= batch_size {
+                    has_more = true;
+                    break; // Early termination - found one more than needed
+                }
+                result.push((row_id, get_row_data(entry)));
             }
         }
 
-        (result, false)
+        (result, has_more)
     }
 
     /// Collect visible rows ordered by row_id (PRIMARY KEY) with efficient OFFSET/LIMIT
@@ -1762,79 +1743,77 @@ impl VersionStore {
             None => return Some(Vec::new()),
         };
 
-        // Pre-acquire arena locks ONCE for this entire operation
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
+        // Pre-acquire arena lock ONCE for this entire operation
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
-        // Pre-acquire versions lock
+        // Helper to get row data from an entry
+        let get_row_from_entry = |entry: &VersionChainEntry| -> Row {
+            if let Some(idx) = entry.arena_idx {
+                if let Some(arc_row) = arena_data.get(idx) {
+                    return Row::from_arc(Arc::clone(arc_row));
+                }
+            }
+            entry.version.data.clone()
+        };
+
+        // BTreeMap is already sorted ascending - collect with offset/limit
         let versions = self.versions.read();
-
-        let mut result: Vec<Row> = Vec::with_capacity(limit.min(1000));
+        // Cap capacity to avoid overflow when limit is usize::MAX
+        let capacity = limit.min(versions.len()).min(10_000);
+        let mut result: Vec<Row> = Vec::with_capacity(capacity);
         let mut skipped = 0usize;
 
-        // Macro to process a single chain entry - avoids code duplication for asc/desc
-        // Phase 1: Check visibility only (no cloning) - O(1) per row
-        // Phase 2: Clone only if we're past the offset - avoids wasted allocations
-        macro_rules! process_chain {
-            ($chain:expr) => {{
-                // Phase 1: Find visible entry without cloning
-                let mut current: Option<&VersionChainEntry> = Some($chain);
-                let mut visible_entry: Option<&VersionChainEntry> = None;
-
-                while let Some(e) = current {
-                    if checker.is_visible(e.version.txn_id, txn_id) {
-                        if e.version.deleted_at_txn_id == 0
-                            || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
+        if ascending {
+            // Forward iteration with early termination
+            for chain in versions.values() {
+                // Inline visibility check
+                let mut current: Option<&VersionChainEntry> = Some(chain);
+                while let Some(entry) = current {
+                    if checker.is_visible(entry.version.txn_id, txn_id) {
+                        if entry.version.deleted_at_txn_id == 0
+                            || !checker.is_visible(entry.version.deleted_at_txn_id, txn_id)
                         {
-                            visible_entry = Some(e);
+                            // Found visible entry
+                            if skipped < offset {
+                                skipped += 1;
+                            } else {
+                                result.push(get_row_from_entry(entry));
+                                if result.len() >= limit {
+                                    return Some(result);
+                                }
+                            }
                         }
                         break;
                     }
-                    current = e.prev.as_ref().map(|b| b.as_ref());
+                    current = entry.prev.as_ref().map(|b| b.as_ref());
                 }
-
-                if let Some(entry) = visible_entry {
-                    if skipped < offset {
-                        skipped += 1;
-                        // Skip without cloning - this is the key optimization
-                    } else {
-                        // Phase 2: Clone only rows we're keeping
-                        let row = if let Some(idx) = entry.arena_idx {
-                            if idx < arena_len {
-                                let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                                if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                                    let slice = unsafe {
-                                        arena_data_slice.get_unchecked(meta.start..meta.end)
-                                    };
-                                    Row::from_values(slice.to_vec())
-                                } else {
-                                    entry.version.data.clone()
-                                }
-                            } else {
-                                entry.version.data.clone()
-                            }
-                        } else {
-                            entry.version.data.clone()
-                        };
-                        result.push(row);
-                        if result.len() >= limit {
-                            break;
-                        }
-                    }
-                }
-            }};
-        }
-
-        if ascending {
-            for (_, chain) in versions.iter() {
-                process_chain!(chain);
             }
         } else {
-            for (_, chain) in versions.iter().rev() {
-                process_chain!(chain);
+            // For descending order, we need to collect all, then reverse
+            let mut all_visible: Vec<Row> = Vec::with_capacity(versions.len());
+            for chain in versions.values() {
+                // Inline visibility check
+                let mut current: Option<&VersionChainEntry> = Some(chain);
+                while let Some(entry) = current {
+                    if checker.is_visible(entry.version.txn_id, txn_id) {
+                        if entry.version.deleted_at_txn_id == 0
+                            || !checker.is_visible(entry.version.deleted_at_txn_id, txn_id)
+                        {
+                            all_visible.push(get_row_from_entry(entry));
+                        }
+                        break;
+                    }
+                    current = entry.prev.as_ref().map(|b| b.as_ref());
+                }
             }
+            // Reverse and apply offset/limit
+            result = all_visible
+                .into_iter()
+                .rev()
+                .skip(offset)
+                .take(limit)
+                .collect();
         }
 
         Some(result)
@@ -1862,8 +1841,6 @@ impl VersionStore {
         ascending: bool,
         limit: usize,
     ) -> Vec<(i64, Row)> {
-        use std::ops::Bound;
-
         if self.closed.load(Ordering::Acquire) || limit == 0 {
             return Vec::new();
         }
@@ -1873,85 +1850,72 @@ impl VersionStore {
             None => return Vec::new(),
         };
 
-        // Pre-acquire arena locks ONCE for this entire operation
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
+        // Pre-acquire arena lock ONCE for this entire operation
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
-        // Pre-acquire versions lock
-        let versions = self.versions.read();
-
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit.min(1000));
-
-        // Determine range start bound
-        let range_start = if let Some(after_id) = start_after_row_id {
-            Bound::Excluded(after_id)
-        } else if let Some(from_id) = start_from_row_id {
-            Bound::Included(from_id)
-        } else {
-            Bound::Unbounded
-        };
-
-        // Helper to process a version chain and get visible row
-        let process_entry = |row_id: i64, chain: &VersionChainEntry| -> Option<(i64, Row)> {
+        // Helper to find visible version and get row data
+        let find_visible_row = |chain: &VersionChainEntry| -> Option<Row> {
             let mut current: Option<&VersionChainEntry> = Some(chain);
-
             while let Some(e) = current {
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
-                        return None; // Row is deleted
+                        break; // Row is deleted
                     }
 
                     // Read row data from arena or version
                     let row_data = if let Some(idx) = e.arena_idx {
-                        if idx < arena_len {
-                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                                let slice =
-                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                                Row::from_values(slice.to_vec())
-                            } else {
-                                e.version.data.clone()
-                            }
+                        if let Some(arc_row) = arena_data.get(idx) {
+                            Row::from_arc(Arc::clone(arc_row))
                         } else {
                             e.version.data.clone()
                         }
                     } else {
                         e.version.data.clone()
                     };
-                    return Some((row_id, row_data));
+                    return Some(row_data);
                 }
                 current = e.prev.as_ref().map(|b| b.as_ref());
             }
             None
         };
 
+        // Determine range bounds
+        let start_bound = if let Some(after_id) = start_after_row_id {
+            std::ops::Bound::Excluded(after_id)
+        } else if let Some(from_id) = start_from_row_id {
+            std::ops::Bound::Included(from_id)
+        } else {
+            std::ops::Bound::Unbounded
+        };
+
+        // BTreeMap is already sorted - collect with early termination
+        let versions = self.versions.read();
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit);
+
         if ascending {
-            // Forward iteration starting from range_start
-            // For `WHERE id > X ORDER BY id ASC`, iterates from X+1 upward
-            for (&row_id, chain) in versions.range((range_start, Bound::Unbounded)) {
-                if let Some(row_pair) = process_entry(row_id, chain) {
-                    result.push(row_pair);
+            for (&row_id, chain) in versions.range((start_bound, std::ops::Bound::Unbounded::<i64>))
+            {
+                if let Some(row_data) = find_visible_row(chain) {
+                    result.push((row_id, row_data));
                     if result.len() >= limit {
                         break;
                     }
                 }
             }
         } else {
-            // Reverse iteration - same range but iterate backward
-            // For `WHERE id > X ORDER BY id DESC`, get rows > X from largest to smallest
-            for (&row_id, chain) in versions.range((range_start, Bound::Unbounded)).rev() {
-                if let Some(row_pair) = process_entry(row_id, chain) {
-                    result.push(row_pair);
-                    if result.len() >= limit {
-                        break;
-                    }
+            // For descending, we need to collect all in range then reverse
+            let mut all_visible: Vec<(i64, Row)> = Vec::new();
+            for (&row_id, chain) in versions.range((start_bound, std::ops::Bound::Unbounded::<i64>))
+            {
+                if let Some(row_data) = find_visible_row(chain) {
+                    all_visible.push((row_id, row_data));
                 }
             }
+            result = all_visible.into_iter().rev().take(limit).collect();
         }
 
         result
@@ -1985,16 +1949,12 @@ impl VersionStore {
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema); // Release lock early
 
-        // Pre-acquire arena locks ONCE
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
+        // Pre-acquire arena lock ONCE
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
-        // Pre-acquire versions lock (BTreeMap iteration is sorted by row_id)
+        // Single-pass: read, filter, and collect in one loop (BTreeMap is sorted)
         let versions = self.versions.read();
-
-        // Single-pass: read, filter, and collect in one loop
         let mut result: Vec<(i64, Row)> = Vec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -2012,18 +1972,13 @@ impl VersionStore {
                     // OPTIMIZATION: Filter BEFORE cloning to avoid allocation for non-matching rows
                     // Try arena path first (zero-copy filter check)
                     if let Some(idx) = e.arena_idx {
-                        if idx < arena_len {
-                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                                let slice =
-                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                                // Filter on raw slice - no allocation!
-                                if compiled_filter.matches_slice(slice) {
-                                    // Only clone if filter matched
-                                    result.push((row_id, Row::from_values(slice.to_vec())));
-                                }
-                                break;
+                        if let Some(arc_row) = arena_data.get(idx) {
+                            // Filter on slice - no allocation!
+                            if compiled_filter.matches_slice(arc_row) {
+                                // Only clone if filter matched
+                                result.push((row_id, Row::from_arc(Arc::clone(arc_row))));
                             }
+                            break;
                         }
                     }
                     // Fallback: filter on version data (already allocated)
@@ -2036,7 +1991,7 @@ impl VersionStore {
             }
         }
 
-        // BTreeMap iteration is already sorted by row_id - no sort needed!
+        // BTreeMap already iterates in sorted order
         result
     }
 
@@ -2072,17 +2027,13 @@ impl VersionStore {
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema);
 
-        // Pre-acquire arena locks ONCE
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_rows_slice = arena_rows.as_slice();
-        let arena_data_slice = arena_data.as_slice();
-        let arena_len = arena_rows_slice.len();
+        // Pre-acquire arena lock ONCE
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
-        // Pre-acquire versions lock (BTreeMap iteration is sorted by row_id)
+        // BTreeMap is already sorted - collect with offset/limit and early termination
         let versions = self.versions.read();
-
-        // True early termination with BTreeMap's ordered iteration
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit.min(1024));
+        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit);
         let mut skipped = 0usize;
 
         for (&row_id, chain) in versions.iter() {
@@ -2100,24 +2051,19 @@ impl VersionStore {
                     // OPTIMIZATION: Filter BEFORE cloning to avoid allocation for non-matching rows
                     // Try arena path first (zero-copy filter check)
                     if let Some(idx) = e.arena_idx {
-                        if idx < arena_len {
-                            let meta = unsafe { arena_rows_slice.get_unchecked(idx) };
-                            if meta.start <= meta.end && meta.end <= arena_data_slice.len() {
-                                let slice =
-                                    unsafe { arena_data_slice.get_unchecked(meta.start..meta.end) };
-                                // Filter on raw slice - no allocation!
-                                if compiled_filter.matches_slice(slice) {
-                                    if skipped < offset {
-                                        skipped += 1;
-                                    } else {
-                                        result.push((row_id, Row::from_values(slice.to_vec())));
-                                        if result.len() >= limit {
-                                            return result;
-                                        }
+                        if let Some(arc_row) = arena_data.get(idx) {
+                            // Filter on slice - no allocation!
+                            if compiled_filter.matches_slice(arc_row) {
+                                if skipped < offset {
+                                    skipped += 1;
+                                } else {
+                                    result.push((row_id, Row::from_arc(Arc::clone(arc_row))));
+                                    if result.len() >= limit {
+                                        return result; // Early termination!
                                     }
                                 }
-                                break;
                             }
+                            break;
                         }
                     }
                     // Fallback: filter on version data (already allocated)
@@ -2127,7 +2073,7 @@ impl VersionStore {
                         } else {
                             result.push((row_id, e.version.data.clone()));
                             if result.len() >= limit {
-                                return result;
+                                return result; // Early termination!
                             }
                         }
                     }
@@ -2137,7 +2083,6 @@ impl VersionStore {
             }
         }
 
-        // BTreeMap iteration is already sorted by row_id - no sort needed!
         result
     }
 
@@ -2174,8 +2119,9 @@ impl VersionStore {
         let checker = self.visibility_checker.as_ref();
 
         // Get arena metadata for fast path detection
-        let (arena_rows, _arena_data) = self.arena.read_guards();
-        let arena_len = arena_rows.len();
+        let arena_guard = self.arena.read_guard();
+        let arena_meta = arena_guard.meta();
+        let arena_len = arena_guard.len();
 
         // FAST PATH: If uncommitted_writes is empty, scan arena directly
         if let Some(checker) = checker {
@@ -2184,7 +2130,7 @@ impl VersionStore {
             if uncommitted_empty && arena_len > 0 {
                 let mut indices: Vec<RowIndex> = Vec::with_capacity(arena_len);
 
-                for (idx, meta) in arena_rows.iter().enumerate() {
+                for (idx, meta) in arena_meta.iter().enumerate() {
                     if meta.deleted_at_txn_id == 0 && checker.is_visible(meta.txn_id, txn_id) {
                         indices.push(RowIndex {
                             row_id: meta.row_id,
@@ -2199,10 +2145,10 @@ impl VersionStore {
             }
         }
 
-        // Drop arena guards before slow path to avoid holding locks
-        drop(arena_rows);
+        // Drop arena guard before slow path to avoid holding locks
+        drop(arena_guard);
 
-        // SLOW PATH: Full BTreeMap iteration (already sorted by row_id)
+        // SLOW PATH: Full iteration (BTreeMap is sorted)
         let versions = self.versions.read();
         let mut indices: Vec<RowIndex> = Vec::with_capacity(versions.len());
 
@@ -2230,7 +2176,7 @@ impl VersionStore {
             }
         }
 
-        // BTreeMap iteration is already sorted by row_id - no sort needed!
+        // BTreeMap already iterates in sorted order
         indices
     }
 
@@ -2250,7 +2196,6 @@ impl VersionStore {
     /// `RowIndex` values, call this to get the actual row data.
     ///
     /// # Performance
-    /// - Single lock acquisition for all rows
     /// - Only clones the rows you actually need
     /// - Falls back to version chain for non-arena rows
     pub fn materialize_rows(&self, indices: &[RowIndex]) -> Vec<(i64, Row)> {
@@ -2258,10 +2203,11 @@ impl VersionStore {
             return Vec::new();
         }
 
-        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
-        let arena_len = arena_rows_guard.len();
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
+        let arena_len = arena_guard.len();
 
-        // Pre-acquire versions lock for slow path lookups
+        // Pre-acquire versions lock ONCE for all slow path lookups
         let versions = self.versions.read();
 
         let mut result: Vec<(i64, Row)> = Vec::with_capacity(indices.len());
@@ -2270,16 +2216,16 @@ impl VersionStore {
             if let Some(arena_idx) = idx.arena_idx {
                 // Fast path: get from arena
                 if arena_idx < arena_len {
-                    let meta = &arena_rows_guard[arena_idx];
-                    let slice = &arena_data_guard[meta.start..meta.end];
-                    result.push((idx.row_id, Row::from_values(slice.to_vec())));
-                    continue;
+                    if let Some(arc_row) = arena_data.get(arena_idx) {
+                        result.push((idx.row_id, Row::from_arc(Arc::clone(arc_row))));
+                        continue;
+                    }
                 }
             }
 
-            // Slow path: look up in version chain
-            if let Some(chain) = versions.get(&idx.row_id) {
-                result.push((idx.row_id, chain.version.data.clone()));
+            // Slow path: look up in version chain (lock already held)
+            if let Some(entry) = versions.get(&idx.row_id) {
+                result.push((idx.row_id, entry.version.data.clone()));
             }
         }
 
@@ -2290,17 +2236,16 @@ impl VersionStore {
     #[inline]
     pub fn materialize_row(&self, idx: &RowIndex) -> Option<(i64, Row)> {
         if let Some(arena_idx) = idx.arena_idx {
-            let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
-            if arena_idx < arena_rows_guard.len() {
-                let meta = &arena_rows_guard[arena_idx];
-                let slice = &arena_data_guard[meta.start..meta.end];
-                return Some((idx.row_id, Row::from_values(slice.to_vec())));
+            let arena_guard = self.arena.read_guard();
+            let arena_data = arena_guard.data();
+            if let Some(arc_row) = arena_data.get(arena_idx) {
+                return Some((idx.row_id, Row::from_arc(Arc::clone(arc_row))));
             }
         }
 
         // Slow path: look up in version chain
-        self.versions
-            .read()
+        let versions = self.versions.read();
+        versions
             .get(&idx.row_id)
             .map(|chain| (idx.row_id, chain.version.data.clone()))
     }
@@ -2318,24 +2263,21 @@ impl VersionStore {
     #[inline]
     pub fn get_column_value(&self, idx: &RowIndex, col_idx: usize) -> Option<Value> {
         if let Some(arena_idx) = idx.arena_idx {
-            let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
-            if arena_idx < arena_rows_guard.len() {
-                let meta = &arena_rows_guard[arena_idx];
-                let pos = meta.start + col_idx;
-                if pos < meta.end {
-                    return Some(arena_data_guard[pos].clone());
-                }
+            let arena_guard = self.arena.read_guard();
+            let arena_data = arena_guard.data();
+            if let Some(arc_row) = arena_data.get(arena_idx) {
+                return arc_row.get(col_idx).cloned();
             }
         }
 
         // Slow path: look up in version chain
-        self.versions
-            .read()
+        let versions = self.versions.read();
+        versions
             .get(&idx.row_id)
-            .and_then(|chain| chain.version.data.get(col_idx).cloned())
+            .and_then(|entry| entry.version.data.get(col_idx).cloned())
     }
 
-    /// Batch get column values for multiple indices (single lock acquisition)
+    /// Batch get column values for multiple indices
     ///
     /// Optimized for ORDER BY: loads sort key values for all indices at once.
     #[inline]
@@ -2348,28 +2290,25 @@ impl VersionStore {
             return Vec::new();
         }
 
-        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
-        let arena_len = arena_rows_guard.len();
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
+        let arena_len = arena_guard.len();
 
-        // Pre-acquire versions lock for slow path lookups
         let versions = self.versions.read();
-
         indices
             .iter()
             .map(|idx| {
                 if let Some(arena_idx) = idx.arena_idx {
                     if arena_idx < arena_len {
-                        let meta = &arena_rows_guard[arena_idx];
-                        let pos = meta.start + col_idx;
-                        if pos < meta.end {
-                            return Some(arena_data_guard[pos].clone());
+                        if let Some(arc_row) = arena_data.get(arena_idx) {
+                            return arc_row.get(col_idx).cloned();
                         }
                     }
                 }
                 // Slow path: version chain lookup
                 versions
                     .get(&idx.row_id)
-                    .and_then(|chain| chain.version.data.get(col_idx).cloned())
+                    .and_then(|entry| entry.version.data.get(col_idx).cloned())
             })
             .collect()
     }
@@ -2469,10 +2408,10 @@ impl VersionStore {
             return (0.0, 0);
         }
 
-        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
-        let arena_len = arena_rows_guard.len();
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
-        // Pre-acquire versions lock for slow path lookups
+        // Pre-acquire versions lock ONCE for all slow path lookups
         let versions = self.versions.read();
 
         let mut sum = 0.0f64;
@@ -2481,11 +2420,9 @@ impl VersionStore {
         for idx in &indices {
             // Try arena path first (fast)
             if let Some(arena_idx) = idx.arena_idx {
-                if arena_idx < arena_len {
-                    let meta = &arena_rows_guard[arena_idx];
-                    let pos = meta.start + col_idx;
-                    if pos < meta.end {
-                        match &arena_data_guard[pos] {
+                if let Some(arc_row) = arena_data.get(arena_idx) {
+                    if let Some(val) = arc_row.get(col_idx) {
+                        match val {
                             Value::Integer(i) => {
                                 sum += *i as f64;
                                 count += 1;
@@ -2500,9 +2437,9 @@ impl VersionStore {
                     }
                 }
             }
-            // Slow path: version chain (must clone)
-            if let Some(chain) = versions.get(&idx.row_id) {
-                if let Some(val) = chain.version.data.get(col_idx) {
+            // Slow path: version chain lookup (lock already held)
+            if let Some(entry) = versions.get(&idx.row_id) {
+                if let Some(val) = entry.version.data.get(col_idx) {
                     match val {
                         Value::Integer(i) => {
                             sum += *i as f64;
@@ -2528,10 +2465,10 @@ impl VersionStore {
             return None;
         }
 
-        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
-        let arena_len = arena_rows_guard.len();
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
 
-        // Pre-acquire versions lock for slow path lookups
+        // Pre-acquire versions lock ONCE for all slow path lookups
         let versions = self.versions.read();
 
         let mut min_val: Option<Value> = None;
@@ -2553,18 +2490,16 @@ impl VersionStore {
         for idx in &indices {
             // Try arena path first (fast)
             if let Some(arena_idx) = idx.arena_idx {
-                if arena_idx < arena_len {
-                    let meta = &arena_rows_guard[arena_idx];
-                    let pos = meta.start + col_idx;
-                    if pos < meta.end {
-                        update_min(&mut min_val, &arena_data_guard[pos]);
+                if let Some(arc_row) = arena_data.get(arena_idx) {
+                    if let Some(val) = arc_row.get(col_idx) {
+                        update_min(&mut min_val, val);
                         continue;
                     }
                 }
             }
-            // Slow path: version chain
-            if let Some(chain) = versions.get(&idx.row_id) {
-                if let Some(val) = chain.version.data.get(col_idx) {
+            // Slow path: version chain lookup (lock already held)
+            if let Some(entry) = versions.get(&idx.row_id) {
+                if let Some(val) = entry.version.data.get(col_idx) {
                     update_min(&mut min_val, val);
                 }
             }
@@ -2580,8 +2515,11 @@ impl VersionStore {
             return None;
         }
 
-        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
-        let arena_len = arena_rows_guard.len();
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
+
+        // Pre-acquire versions lock ONCE for all slow path lookups
+        let versions = self.versions.read();
 
         let mut max_val: Option<Value> = None;
 
@@ -2599,24 +2537,19 @@ impl VersionStore {
             }
         };
 
-        // Pre-acquire versions lock for slow path
-        let versions = self.versions.read();
-
         for idx in &indices {
             // Try arena path first (fast)
             if let Some(arena_idx) = idx.arena_idx {
-                if arena_idx < arena_len {
-                    let meta = &arena_rows_guard[arena_idx];
-                    let pos = meta.start + col_idx;
-                    if pos < meta.end {
-                        update_max(&mut max_val, &arena_data_guard[pos]);
+                if let Some(arc_row) = arena_data.get(arena_idx) {
+                    if let Some(val) = arc_row.get(col_idx) {
+                        update_max(&mut max_val, val);
                         continue;
                     }
                 }
             }
-            // Slow path: version chain
-            if let Some(chain) = versions.get(&idx.row_id) {
-                if let Some(val) = chain.version.data.get(col_idx) {
+            // Slow path: version chain lookup (lock already held)
+            if let Some(entry) = versions.get(&idx.row_id) {
+                if let Some(val) = entry.version.data.get(col_idx) {
                     update_max(&mut max_val, val);
                 }
             }
@@ -2650,8 +2583,11 @@ impl VersionStore {
                 .collect();
         }
 
-        let (arena_rows_guard, arena_data_guard) = self.arena.read_guards();
-        let arena_len = arena_rows_guard.len();
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
+
+        // Pre-acquire versions lock ONCE for all slow path lookups
+        let versions = self.versions.read();
 
         // Initialize accumulators
         let mut results: Vec<AggregateAccumulator> = aggregates
@@ -2723,28 +2659,23 @@ impl VersionStore {
             }
         }
 
-        // Pre-acquire versions lock for slow path
-        let versions = self.versions.read();
-
         // Single pass through all rows
         for idx in &indices {
             // Try arena path first (fast)
             if let Some(arena_idx) = idx.arena_idx {
-                if arena_idx < arena_len {
-                    let meta = &arena_rows_guard[arena_idx];
+                if let Some(arc_row) = arena_data.get(arena_idx) {
                     for (i, (op, col_idx)) in aggregates.iter().enumerate() {
-                        let pos = meta.start + col_idx;
-                        if pos < meta.end {
-                            update_accumulator(&mut results[i], op, &arena_data_guard[pos]);
+                        if let Some(val) = arc_row.get(*col_idx) {
+                            update_accumulator(&mut results[i], op, val);
                         }
                     }
                     continue;
                 }
             }
-            // Slow path: version chain
-            if let Some(chain) = versions.get(&idx.row_id) {
+            // Slow path: version chain lookup (lock already held)
+            if let Some(entry) = versions.get(&idx.row_id) {
                 for (i, (op, col_idx)) in aggregates.iter().enumerate() {
-                    if let Some(val) = chain.version.data.get(*col_idx) {
+                    if let Some(val) = entry.version.data.get(*col_idx) {
                         update_accumulator(&mut results[i], op, val);
                     }
                 }
@@ -2790,9 +2721,9 @@ impl VersionStore {
     pub fn stream_visible_rows(&self, txn_id: i64) -> StreamingResult<'_> {
         let checker = self.visibility_checker.as_ref();
 
-        // Pre-acquire arena locks
-        let (arena_rows, arena_data) = self.arena.read_guards();
-        let arena_len = arena_rows.len();
+        // Pre-acquire arena lock
+        let arena_guard = self.arena.read_guard();
+        let arena_len = arena_guard.len();
 
         // Get column names from schema
         let columns: Vec<String> = self
@@ -2816,7 +2747,7 @@ impl VersionStore {
                 // Fast path: scan arena directly, skip DashMap iteration
                 let mut visible_indices: Vec<VisibleRowInfo> = Vec::with_capacity(arena_len);
 
-                for (idx, meta) in arena_rows.iter().enumerate() {
+                for (idx, meta) in arena_guard.meta().iter().enumerate() {
                     // Check visibility and deleted status
                     if meta.deleted_at_txn_id == 0 && checker.is_visible(meta.txn_id, txn_id) {
                         visible_indices.push(VisibleRowInfo {
@@ -2829,11 +2760,11 @@ impl VersionStore {
                 // Sort by row_id for consistent ordering
                 visible_indices.sort_unstable_by_key(|info| info.row_id);
 
-                return StreamingResult::new(arena_rows, arena_data, visible_indices, columns);
+                return StreamingResult::new(arena_guard, visible_indices, columns);
             }
         }
 
-        // SLOW PATH: Full BTreeMap iteration for complex visibility scenarios
+        // SLOW PATH: Full iteration (BTreeMap is sorted)
         let versions = self.versions.read();
         let mut visible_indices: Vec<VisibleRowInfo> = Vec::with_capacity(versions.len());
 
@@ -2864,11 +2795,10 @@ impl VersionStore {
                 }
             }
         }
+        drop(versions); // Release lock before returning
 
-        // BTreeMap iteration is already ordered by row_id - no sort needed
-        drop(versions);
-
-        StreamingResult::new(arena_rows, arena_data, visible_indices, columns)
+        // BTreeMap already iterates in sorted order
+        StreamingResult::new(arena_guard, visible_indices, columns)
     }
 
     /// Returns the count of rows
@@ -3372,7 +3302,7 @@ impl VersionStore {
             return;
         }
 
-        // Single pass over all rows
+        // Single pass over all rows (BTreeMap)
         let versions = self.versions.read();
         for (&row_id, version_chain) in versions.iter() {
             let version = &version_chain.version;
@@ -3531,9 +3461,12 @@ impl VersionStore {
 
         let mut cleaned = 0;
 
-        // Iterate through all rows
-        let mut versions = self.versions.write();
-        for (_, chain_entry) in versions.iter_mut() {
+        // Collect entries that need cleanup (BTreeMap doesn't support in-place mutation while iterating)
+        let mut updates: Vec<(i64, VersionChainEntry)> = Vec::new();
+
+        // First pass: identify entries that need pruning
+        let versions = self.versions.read();
+        for (&row_id, chain_entry) in versions.iter() {
             // Find the oldest version we need to keep
             let mut current = chain_entry.prev.as_ref();
             let mut versions_to_check = Vec::new();
@@ -3542,6 +3475,10 @@ impl VersionStore {
             while let Some(prev_entry) = current {
                 versions_to_check.push(prev_entry.clone());
                 current = prev_entry.prev.as_ref();
+            }
+
+            if versions_to_check.is_empty() {
+                continue;
             }
 
             // Find cutoff point - first version we can discard
@@ -3570,27 +3507,42 @@ impl VersionStore {
                 }
             }
 
-            // Prune versions beyond keep_count
+            // If we need to prune some versions, prepare an update
             if keep_count < versions_to_check.len() {
                 let to_remove = versions_to_check.len() - keep_count;
                 cleaned += to_remove as i32;
 
-                // Disconnect the chain at the cutoff point
+                // Clone and modify the chain entry
+                let mut modified_entry = chain_entry.clone();
+
                 if keep_count == 0 {
                     // Remove all previous versions
-                    chain_entry.prev = None;
+                    modified_entry.prev = None;
                 } else {
-                    // Navigate to the keep_count-th version and cut there
-                    let mut nav = &mut chain_entry.prev;
-                    for _ in 0..(keep_count - 1) {
-                        if let Some(ref mut entry) = nav {
-                            nav = &mut Arc::make_mut(entry).prev;
-                        }
+                    // Rebuild chain with only kept versions
+                    let kept_versions: Vec<_> =
+                        versions_to_check.into_iter().take(keep_count).collect();
+
+                    // Build chain from oldest to newest (reversed)
+                    let mut new_prev: Option<Arc<VersionChainEntry>> = None;
+                    for entry in kept_versions.into_iter().rev() {
+                        let mut cloned = (*entry).clone();
+                        cloned.prev = new_prev;
+                        new_prev = Some(Arc::new(cloned));
                     }
-                    if let Some(ref mut entry) = nav {
-                        Arc::make_mut(entry).prev = None;
-                    }
+                    modified_entry.prev = new_prev;
                 }
+
+                updates.push((row_id, modified_entry));
+            }
+        }
+        drop(versions); // Release read lock before writing
+
+        // Second pass: apply updates
+        if !updates.is_empty() {
+            let mut versions = self.versions.write();
+            for (row_id, modified_entry) in updates {
+                versions.insert(row_id, modified_entry);
             }
         }
 
@@ -3639,7 +3591,7 @@ impl VersionStore {
         let snapshot_txn_id = i64::MAX;
         let use_cutoff = commit_seq_cutoff > 0;
 
-        // Iterate all versions
+        // Iterate all versions (BTreeMap maintains sorted order)
         let versions = self.versions.read();
         for (&row_id, chain_entry) in versions.iter() {
             // Walk the version chain to find the visible version

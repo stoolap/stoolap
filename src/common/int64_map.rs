@@ -84,7 +84,7 @@ pub type ConcurrentUInt64Map<V> = DashMap<u64, V, FxBuildHasher>;
 /// Concurrent hash map for usize keys
 pub type ConcurrentUsizeMap<V> = DashMap<usize, V, FxBuildHasher>;
 
-/// Ordered concurrent map for i64 keys using parking_lot::RwLock<BTreeMap>
+/// BTreeMap-based concurrent map for i64 keys using parking_lot::RwLock
 ///
 /// Uses BTreeMap for ordered iteration and O(log n) lookups.
 /// Better for large datasets (1M+ rows) due to memory efficiency.
@@ -96,14 +96,14 @@ pub type ConcurrentUsizeMap<V> = DashMap<usize, V, FxBuildHasher>;
 ///
 /// # Example
 /// ```
-/// use stoolap::common::OrderedInt64Map;
-/// use stoolap::common::new_ordered_int64_map;
+/// use stoolap::common::BTreeInt64Map;
+/// use stoolap::common::new_btree_int64_map;
 ///
-/// let map: OrderedInt64Map<String> = new_ordered_int64_map();
+/// let map: BTreeInt64Map<String> = new_btree_int64_map();
 /// map.write().insert(42, "hello".to_string());
 /// assert_eq!(map.read().get(&42), Some(&"hello".to_string()));
 /// ```
-pub type OrderedInt64Map<V> = RwLock<BTreeMap<i64, V>>;
+pub type BTreeInt64Map<V> = RwLock<BTreeMap<i64, V>>;
 
 /// Create a new Int64Map with default capacity
 pub fn new_int64_map<V>() -> Int64Map<V> {
@@ -165,8 +165,8 @@ pub fn new_concurrent_usize_map_with_capacity<V>(capacity: usize) -> ConcurrentU
     DashMap::with_capacity_and_hasher(capacity, FxBuildHasher::default())
 }
 
-/// Create a new OrderedInt64Map
-pub fn new_ordered_int64_map<V>() -> OrderedInt64Map<V> {
+/// Create a new BTreeInt64Map
+pub fn new_btree_int64_map<V>() -> BTreeInt64Map<V> {
     RwLock::new(BTreeMap::new())
 }
 

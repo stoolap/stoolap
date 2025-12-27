@@ -23,10 +23,10 @@
 //! - Memory usage: O(1) instead of O(n)
 //! - Works with MVCC visibility by pre-computing visible row indices
 
-use parking_lot::RwLockReadGuard;
+use std::sync::Arc;
 
 use crate::core::{Row, Value};
-use crate::storage::mvcc::arena::ArenaRowMeta;
+use crate::storage::mvcc::arena::ArenaReadGuard;
 
 /// Pre-computed visible row information for zero-copy iteration
 #[derive(Clone, Copy)]
@@ -37,13 +37,11 @@ pub struct VisibleRowInfo {
 
 /// Zero-copy streaming result that yields references to arena data
 ///
-/// This struct holds the arena read locks for the duration of iteration,
+/// This struct holds the arena read guard for the duration of iteration,
 /// allowing it to yield `&[Value]` slices without any cloning.
 pub struct StreamingResult<'a> {
-    /// Arena row metadata (holds read lock)
-    arena_rows: RwLockReadGuard<'a, Vec<ArenaRowMeta>>,
-    /// Arena value data (holds read lock)
-    arena_data: RwLockReadGuard<'a, Vec<Value>>,
+    /// Unified arena guard (single lock for both data and metadata)
+    arena_guard: ArenaReadGuard<'a>,
     /// Pre-sorted list of visible row indices
     visible_indices: Vec<VisibleRowInfo>,
     /// Current position in visible_indices
@@ -52,23 +50,24 @@ pub struct StreamingResult<'a> {
     columns: Vec<String>,
     /// Temporary row buffer for the current row (to satisfy &Row interface)
     current_row: Row,
+    /// Cached Arc for current row (for zero-copy access)
+    current_arc: Option<Arc<[Value]>>,
 }
 
 impl<'a> StreamingResult<'a> {
-    /// Create a new streaming result from arena guards and visible indices
+    /// Create a new streaming result from arena guard and visible indices
     pub fn new(
-        arena_rows: RwLockReadGuard<'a, Vec<ArenaRowMeta>>,
-        arena_data: RwLockReadGuard<'a, Vec<Value>>,
+        arena_guard: ArenaReadGuard<'a>,
         visible_indices: Vec<VisibleRowInfo>,
         columns: Vec<String>,
     ) -> Self {
         Self {
-            arena_rows,
-            arena_data,
+            arena_guard,
             visible_indices,
             current_pos: 0,
             columns,
             current_row: Row::new(),
+            current_arc: None,
         }
     }
 
@@ -88,12 +87,14 @@ impl<'a> StreamingResult<'a> {
         if self.current_pos < self.visible_indices.len() {
             // Get the arena index for current visible row
             let info = &self.visible_indices[self.current_pos];
-            let meta = &self.arena_rows[info.arena_idx];
 
-            // OPTIMIZATION: Reuse the current_row buffer instead of allocating a new Vec
-            let slice = &self.arena_data[meta.start..meta.end];
-            self.current_row.clear();
-            self.current_row.extend_from_slice(slice);
+            // O(1) Arc clones from guard - no data copying
+            if let Some(arc) = self.arena_guard.data().get(info.arena_idx) {
+                self.current_row = Row::from_arc(Arc::clone(arc));
+                self.current_arc = Some(Arc::clone(arc));
+            } else {
+                self.current_arc = None;
+            }
 
             self.current_pos += 1;
             true
@@ -105,12 +106,10 @@ impl<'a> StreamingResult<'a> {
     /// Get current row as slice (TRUE ZERO-COPY!)
     #[inline]
     pub fn row_slice(&self) -> &[Value] {
-        if self.current_pos == 0 || self.current_pos > self.visible_indices.len() {
-            return &[];
-        }
-        let info = &self.visible_indices[self.current_pos - 1];
-        let meta = &self.arena_rows[info.arena_idx];
-        &self.arena_data[meta.start..meta.end]
+        self.current_arc
+            .as_ref()
+            .map(|arc| arc.as_ref())
+            .unwrap_or(&[])
     }
 
     /// Get current row ID
@@ -144,6 +143,17 @@ impl<'a> StreamingResult<'a> {
     /// Reset to beginning
     pub fn reset(&mut self) {
         self.current_pos = 0;
+        self.current_arc = None;
+    }
+
+    /// Create an AggregationScanner for fast direct aggregations
+    ///
+    /// This provides the fastest possible aggregation path:
+    /// - Zero allocations during computation
+    /// - Direct memory access to arena data
+    /// - Single pass through visible rows
+    pub fn as_aggregation_scanner(&self) -> AggregationScanner<'_> {
+        AggregationScanner::new(self.arena_guard.data(), &self.visible_indices)
     }
 }
 
@@ -153,32 +163,13 @@ impl<'a> StreamingResult<'a> {
 /// that can be computed in a single pass over contiguous memory with
 /// zero allocations during the scan.
 pub struct AggregationScanner<'a> {
-    arena_rows: &'a [ArenaRowMeta],
-    arena_data: &'a [Value],
+    arena_data: &'a [Arc<[Value]>],
     visible_indices: &'a [VisibleRowInfo],
 }
 
-/// Builder for creating AggregationScanner from StreamingResult
-impl<'a> StreamingResult<'a> {
-    /// Create an AggregationScanner for fast direct aggregations
-    ///
-    /// This provides the fastest possible aggregation path:
-    /// - Zero allocations during computation
-    /// - Direct memory access to arena data
-    /// - Single pass through visible rows
-    pub fn as_aggregation_scanner(&self) -> AggregationScanner<'_> {
-        AggregationScanner::new(&self.arena_rows, &self.arena_data, &self.visible_indices)
-    }
-}
-
 impl<'a> AggregationScanner<'a> {
-    pub fn new(
-        arena_rows: &'a [ArenaRowMeta],
-        arena_data: &'a [Value],
-        visible_indices: &'a [VisibleRowInfo],
-    ) -> Self {
+    pub fn new(arena_data: &'a [Arc<[Value]>], visible_indices: &'a [VisibleRowInfo]) -> Self {
         Self {
-            arena_rows,
             arena_data,
             visible_indices,
         }
@@ -189,13 +180,13 @@ impl<'a> AggregationScanner<'a> {
     pub fn sum_column(&self, col_idx: usize) -> f64 {
         let mut sum = 0.0f64;
         for info in self.visible_indices {
-            let meta = &self.arena_rows[info.arena_idx];
-            let pos = meta.start + col_idx;
-            if pos < meta.end {
-                match &self.arena_data[pos] {
-                    Value::Integer(i) => sum += *i as f64,
-                    Value::Float(f) => sum += *f,
-                    _ => {}
+            if let Some(row) = self.arena_data.get(info.arena_idx) {
+                if let Some(val) = row.get(col_idx) {
+                    match val {
+                        Value::Integer(i) => sum += *i as f64,
+                        Value::Float(f) => sum += *f,
+                        _ => {}
+                    }
                 }
             }
         }
@@ -213,10 +204,12 @@ impl<'a> AggregationScanner<'a> {
     pub fn count_column(&self, col_idx: usize) -> usize {
         let mut count = 0;
         for info in self.visible_indices {
-            let meta = &self.arena_rows[info.arena_idx];
-            let pos = meta.start + col_idx;
-            if pos < meta.end && !self.arena_data[pos].is_null() {
-                count += 1;
+            if let Some(row) = self.arena_data.get(info.arena_idx) {
+                if let Some(val) = row.get(col_idx) {
+                    if !val.is_null() {
+                        count += 1;
+                    }
+                }
             }
         }
         count
@@ -226,17 +219,16 @@ impl<'a> AggregationScanner<'a> {
     pub fn min_column(&self, col_idx: usize) -> Option<Value> {
         let mut min: Option<Value> = None;
         for info in self.visible_indices {
-            let meta = &self.arena_rows[info.arena_idx];
-            let pos = meta.start + col_idx;
-            if pos < meta.end {
-                let val = &self.arena_data[pos];
-                if !val.is_null() {
-                    match &min {
-                        None => min = Some(val.clone()),
-                        Some(current) => {
-                            if let Ok(ord) = val.compare(current) {
-                                if ord == std::cmp::Ordering::Less {
-                                    min = Some(val.clone());
+            if let Some(row) = self.arena_data.get(info.arena_idx) {
+                if let Some(val) = row.get(col_idx) {
+                    if !val.is_null() {
+                        match &min {
+                            None => min = Some(val.clone()),
+                            Some(current) => {
+                                if let Ok(ord) = val.compare(current) {
+                                    if ord == std::cmp::Ordering::Less {
+                                        min = Some(val.clone());
+                                    }
                                 }
                             }
                         }
@@ -251,17 +243,16 @@ impl<'a> AggregationScanner<'a> {
     pub fn max_column(&self, col_idx: usize) -> Option<Value> {
         let mut max: Option<Value> = None;
         for info in self.visible_indices {
-            let meta = &self.arena_rows[info.arena_idx];
-            let pos = meta.start + col_idx;
-            if pos < meta.end {
-                let val = &self.arena_data[pos];
-                if !val.is_null() {
-                    match &max {
-                        None => max = Some(val.clone()),
-                        Some(current) => {
-                            if let Ok(ord) = val.compare(current) {
-                                if ord == std::cmp::Ordering::Greater {
-                                    max = Some(val.clone());
+            if let Some(row) = self.arena_data.get(info.arena_idx) {
+                if let Some(val) = row.get(col_idx) {
+                    if !val.is_null() {
+                        match &max {
+                            None => max = Some(val.clone()),
+                            Some(current) => {
+                                if let Ok(ord) = val.compare(current) {
+                                    if ord == std::cmp::Ordering::Greater {
+                                        max = Some(val.clone());
+                                    }
                                 }
                             }
                         }
@@ -276,44 +267,17 @@ impl<'a> AggregationScanner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::mvcc::arena::RowArena;
 
     #[test]
     fn test_aggregation_scanner() {
-        // Create test data
-        let arena_data = vec![
-            Value::Integer(1),
-            Value::Float(10.0),
-            Value::Integer(2),
-            Value::Float(20.0),
-            Value::Integer(3),
-            Value::Float(30.0),
-        ];
-        let arena_rows = vec![
-            ArenaRowMeta {
-                row_id: 1,
-                start: 0,
-                end: 2,
-                txn_id: 1,
-                deleted_at_txn_id: 0,
-                create_time: 0,
-            },
-            ArenaRowMeta {
-                row_id: 2,
-                start: 2,
-                end: 4,
-                txn_id: 1,
-                deleted_at_txn_id: 0,
-                create_time: 0,
-            },
-            ArenaRowMeta {
-                row_id: 3,
-                start: 4,
-                end: 6,
-                txn_id: 1,
-                deleted_at_txn_id: 0,
-                create_time: 0,
-            },
-        ];
+        // Create test data using RowArena
+        let arena = RowArena::new();
+        arena.insert(1, 1, 0, &[Value::Integer(1), Value::Float(10.0)]);
+        arena.insert(2, 1, 0, &[Value::Integer(2), Value::Float(20.0)]);
+        arena.insert(3, 1, 0, &[Value::Integer(3), Value::Float(30.0)]);
+
+        let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
@@ -329,7 +293,7 @@ mod tests {
             },
         ];
 
-        let scanner = AggregationScanner::new(&arena_rows, &arena_data, &visible);
+        let scanner = AggregationScanner::new(guard.data(), &visible);
 
         assert_eq!(scanner.count(), 3);
         assert_eq!(scanner.sum_column(0), 6.0); // 1 + 2 + 3

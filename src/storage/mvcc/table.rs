@@ -1042,7 +1042,19 @@ impl MVCCTable {
             } else {
                 self.version_store.get_all_visible_rows_arena(self.txn_id)
             };
-            // Normalize rows to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
+
+            // OPTIMIZATION: Skip normalization if first row matches schema column count
+            // This is the common case when no ALTER TABLE ADD/DROP COLUMN has occurred
+            let schema_cols = schema.columns.len();
+            if raw_rows
+                .first()
+                .is_none_or(|(_, row)| row.len() == schema_cols)
+            {
+                // Fast path: all rows should have same column count, skip normalization
+                return raw_rows;
+            }
+
+            // Slow path: need to normalize rows for schema evolution
             return raw_rows
                 .into_iter()
                 .map(|(row_id, row)| (row_id, self.normalize_row_to_schema(row, schema)))
@@ -1616,6 +1628,8 @@ impl Table for MVCCTable {
                 let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
                     Vec::with_capacity(pk_range_ids.len());
 
+                // Step 1: Check local versions first (single lock acquisition)
+                let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
                     for row_id in pk_range_ids {
@@ -1624,16 +1638,21 @@ impl Table for MVCCTable {
                             let row = self.normalize_row_to_schema(row, schema);
                             let (updated_row, _) = setter(row);
                             local_rows.push((row_id, updated_row));
-                        } else if let Some(version) =
-                            self.version_store.get_visible_version(row_id, self.txn_id)
-                        {
-                            if !version.is_deleted() {
-                                let row =
-                                    self.normalize_row_to_schema(version.data.clone(), schema);
-                                let (updated_row, _) = setter(row);
-                                rows_with_originals.push((row_id, updated_row, version));
-                            }
+                        } else {
+                            remaining_row_ids.push(row_id);
                         }
+                    }
+                }
+
+                // Step 2: Batch fetch remaining from version store (1 lock for N rows)
+                if !remaining_row_ids.is_empty() {
+                    let batch_rows = self
+                        .version_store
+                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+                    for (row_id, row, version) in batch_rows {
+                        let row = self.normalize_row_to_schema(row, schema);
+                        let (updated_row, _) = setter(row);
+                        rows_with_originals.push((row_id, updated_row, version));
                     }
                 }
 
@@ -1853,19 +1872,27 @@ impl Table for MVCCTable {
                 let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
                     Vec::with_capacity(pk_range_ids.len());
 
+                // Step 1: Check local versions first (single lock acquisition)
+                let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
                     for row_id in pk_range_ids {
                         if let Some(row) = txn_versions.get(row_id) {
                             // Local version
                             local_rows.push((row_id, row));
-                        } else if let Some(version) =
-                            self.version_store.get_visible_version(row_id, self.txn_id)
-                        {
-                            if !version.is_deleted() {
-                                rows_with_originals.push((row_id, version.data.clone(), version));
-                            }
+                        } else {
+                            remaining_row_ids.push(row_id);
                         }
+                    }
+                }
+
+                // Step 2: Batch fetch remaining from version store (1 lock for N rows)
+                if !remaining_row_ids.is_empty() {
+                    let batch_rows = self
+                        .version_store
+                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+                    for (row_id, row, version) in batch_rows {
+                        rows_with_originals.push((row_id, row, version));
                     }
                 }
 
@@ -1889,29 +1916,31 @@ impl Table for MVCCTable {
                 let mut rows_to_delete: Vec<(i64, Row)> =
                     Vec::with_capacity(filtered_row_ids.len());
 
-                // Single read pass to collect all rows
+                // Step 1: Check local versions first (single lock acquisition)
+                let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
                     for row_id in filtered_row_ids {
-                        let row = if let Some(row) = txn_versions.get(row_id) {
-                            Some(row)
-                        } else if let Some(version) =
-                            self.version_store.get_visible_version(row_id, self.txn_id)
-                        {
-                            if !version.is_deleted() {
-                                Some(version.data.clone())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
-                        if let Some(row) = row {
+                        if let Some(row) = txn_versions.get(row_id) {
                             // Re-apply filter (index may be partial match)
                             if expr.evaluate(&row).unwrap_or(false) {
                                 rows_to_delete.push((row_id, row));
                             }
+                        } else {
+                            remaining_row_ids.push(row_id);
+                        }
+                    }
+                }
+
+                // Step 2: Batch fetch remaining from version store (1 lock for N rows)
+                if !remaining_row_ids.is_empty() {
+                    let batch_rows = self
+                        .version_store
+                        .get_visible_versions_batch(&remaining_row_ids, self.txn_id);
+                    for (row_id, row) in batch_rows {
+                        // Re-apply filter (index may be partial match)
+                        if expr.evaluate(&row).unwrap_or(false) {
+                            rows_to_delete.push((row_id, row));
                         }
                     }
                 }

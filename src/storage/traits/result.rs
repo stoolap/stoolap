@@ -225,6 +225,14 @@ impl QueryResult for MemoryResult {
         }
     }
 
+    /// Optimized take_row that swaps out the row instead of cloning
+    fn take_row(&mut self) -> Row {
+        match self.current_index {
+            Some(i) if i < self.rows.len() => std::mem::take(&mut self.rows[i]),
+            _ => panic!("take_row() called without successful next()"),
+        }
+    }
+
     fn close(&mut self) -> Result<()> {
         self.closed = true;
         Ok(())

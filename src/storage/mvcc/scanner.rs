@@ -23,7 +23,7 @@ use crate::core::{Result, Row, Schema};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Scanner;
 
-use super::version_store::VersionStore;
+use super::VersionStore;
 
 /// MVCC Scanner for iterating over versioned rows
 pub struct MVCCScanner {

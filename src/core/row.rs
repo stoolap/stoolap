@@ -15,41 +15,126 @@
 //! Row type for Stoolap - a collection of column values
 
 use std::fmt;
-use std::ops::{Deref, DerefMut, Index, IndexMut};
+use std::ops::{Deref, Index};
+use std::sync::Arc;
 
 use super::error::{Error, Result};
 use super::schema::Schema;
 use super::types::DataType;
 use super::value::Value;
 
+/// Internal storage for Row - either owned Vec or shared Arc
+#[derive(Debug, Clone)]
+enum RowStorage {
+    /// Owned storage - supports mutation
+    Owned(Vec<Value>),
+    /// Shared storage - O(1) clone, copy-on-write for mutation
+    Shared(Arc<[Value]>),
+}
+
+impl Default for RowStorage {
+    fn default() -> Self {
+        RowStorage::Owned(Vec::new())
+    }
+}
+
+impl PartialEq for RowStorage {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl RowStorage {
+    #[inline]
+    fn as_slice(&self) -> &[Value] {
+        match self {
+            RowStorage::Owned(v) => v,
+            RowStorage::Shared(a) => a,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            RowStorage::Owned(v) => v.len(),
+            RowStorage::Shared(a) => a.len(),
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Get mutable access, converting to owned if necessary (copy-on-write)
+    #[inline]
+    fn make_mut(&mut self) -> &mut Vec<Value> {
+        match self {
+            RowStorage::Owned(v) => v,
+            RowStorage::Shared(arc) => {
+                // Copy-on-write: convert shared to owned
+                *self = RowStorage::Owned(arc.to_vec());
+                match self {
+                    RowStorage::Owned(v) => v,
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    /// Convert to owned Vec, consuming self
+    #[inline]
+    fn into_vec(self) -> Vec<Value> {
+        match self {
+            RowStorage::Owned(v) => v,
+            RowStorage::Shared(arc) => arc.to_vec(),
+        }
+    }
+}
+
 /// A database row containing column values
 ///
 /// Row provides methods for accessing and manipulating column values
 /// while maintaining type safety and consistency with the schema.
 ///
-/// Performance: Row uses thread-local pooling to reuse Vec<Value> allocations.
-/// When a Row is dropped, its internal Vec is returned to the pool for reuse.
+/// Performance: Row uses Arc<[Value]> for O(1) cloning when created from
+/// arena storage. Mutations trigger copy-on-write conversion to owned Vec.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Row {
-    values: Vec<Value>,
+    storage: RowStorage,
 }
 
 impl Row {
     /// Create a new empty row
+    #[inline]
     pub fn new() -> Self {
-        Self { values: Vec::new() }
+        Self {
+            storage: RowStorage::Owned(Vec::new()),
+        }
     }
 
     /// Create a row with pre-allocated capacity
+    #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            values: Vec::with_capacity(capacity),
+            storage: RowStorage::Owned(Vec::with_capacity(capacity)),
         }
     }
 
     /// Create a row from a vector of values
+    #[inline]
     pub fn from_values(values: Vec<Value>) -> Self {
-        Self { values }
+        Self {
+            storage: RowStorage::Owned(values),
+        }
+    }
+
+    /// Create a row from an Arc slice - O(1) clone
+    #[inline]
+    pub fn from_arc(values: Arc<[Value]>) -> Self {
+        Self {
+            storage: RowStorage::Shared(values),
+        }
     }
 
     /// Create a row with null values for a given schema
@@ -59,111 +144,129 @@ impl Row {
             .iter()
             .map(|col| Value::null(col.data_type))
             .collect();
-        Self { values }
+        Self {
+            storage: RowStorage::Owned(values),
+        }
     }
 
     /// Get the number of values in the row
+    #[inline]
     pub fn len(&self) -> usize {
-        self.values.len()
+        self.storage.len()
     }
 
     /// Check if the row is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.storage.is_empty()
     }
 
     /// Get a value by index
+    #[inline]
     pub fn get(&self, index: usize) -> Option<&Value> {
-        self.values.get(index)
+        self.storage.as_slice().get(index)
     }
 
-    /// Get a mutable value by index
+    /// Get a mutable value by index (triggers copy-on-write if shared)
+    #[inline]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
-        self.values.get_mut(index)
+        self.storage.make_mut().get_mut(index)
     }
 
-    /// Set a value at the given index
+    /// Set a value at the given index (triggers copy-on-write if shared)
     pub fn set(&mut self, index: usize, value: Value) -> Result<()> {
-        if index >= self.values.len() {
+        let vec = self.storage.make_mut();
+        if index >= vec.len() {
             return Err(Error::Internal {
-                message: format!(
-                    "row index {} out of bounds (len={})",
-                    index,
-                    self.values.len()
-                ),
+                message: format!("row index {} out of bounds (len={})", index, vec.len()),
             });
         }
-        self.values[index] = value;
+        vec[index] = value;
         Ok(())
     }
 
-    /// Push a value to the end of the row
+    /// Push a value to the end of the row (triggers copy-on-write if shared)
+    #[inline]
     pub fn push(&mut self, value: Value) {
-        self.values.push(value);
+        self.storage.make_mut().push(value);
     }
 
-    /// Pop a value from the end of the row
+    /// Pop a value from the end of the row (triggers copy-on-write if shared)
+    #[inline]
     pub fn pop(&mut self) -> Option<Value> {
-        self.values.pop()
+        self.storage.make_mut().pop()
     }
 
-    /// Truncate the row to a specific length
+    /// Truncate the row to a specific length (triggers copy-on-write if shared)
     ///
     /// Used for schema evolution when columns are dropped
+    #[inline]
     pub fn truncate(&mut self, len: usize) {
-        self.values.truncate(len);
+        self.storage.make_mut().truncate(len);
     }
 
     /// Clear the row values while keeping the allocated capacity
     /// This allows reusing the Vec allocation for streaming operations
     #[inline]
     pub fn clear(&mut self) {
-        self.values.clear();
+        self.storage.make_mut().clear();
+    }
+
+    /// Extend the row with values from a slice (clones the values)
+    #[inline]
+    pub fn extend_from_slice(&mut self, other: &[Value]) {
+        self.storage.make_mut().extend_from_slice(other);
     }
 
     /// Reserve capacity for at least `additional` more values
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
-        self.values.reserve(additional);
+        self.storage.make_mut().reserve(additional);
     }
 
     /// Get an iterator over the values
-    pub fn iter(&self) -> impl Iterator<Item = &Value> {
-        self.values.iter()
+    #[inline]
+    pub fn iter(&self) -> std::slice::Iter<'_, Value> {
+        self.storage.as_slice().iter()
     }
 
-    /// Get a mutable iterator over the values
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Value> {
-        self.values.iter_mut()
+    /// Get a mutable iterator over the values (triggers copy-on-write if shared)
+    #[inline]
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Value> {
+        self.storage.make_mut().iter_mut()
     }
 
     /// Get the underlying vector of values
+    #[inline]
     pub fn into_values(self) -> Vec<Value> {
-        self.values
+        self.storage.into_vec()
     }
 
-    /// Get a reference to the underlying vector
+    /// Get a reference to the underlying slice
+    #[inline]
     pub fn as_slice(&self) -> &[Value] {
-        &self.values
+        self.storage.as_slice()
     }
 
-    /// Get a mutable reference to the underlying vector
+    /// Get a mutable reference to the underlying vector (triggers copy-on-write)
+    #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [Value] {
-        &mut self.values
+        self.storage.make_mut().as_mut_slice()
     }
 
     /// Extract specific columns by their indices
     pub fn select_columns(&self, indices: &[usize]) -> Result<Row> {
+        let slice = self.storage.as_slice();
         let mut values = Vec::with_capacity(indices.len());
         for &idx in indices {
-            match self.values.get(idx) {
+            match slice.get(idx) {
                 Some(v) => values.push(v.clone()),
                 None => {
                     return Err(Error::Internal {
                         message: format!(
                             "column index {} out of bounds (len={})",
                             idx,
-                            self.values.len()
+                            slice.len()
                         ),
                     })
                 }
@@ -175,12 +278,13 @@ impl Row {
     /// Take specific columns by their indices, consuming the row
     /// OPTIMIZATION: Avoids cloning by moving values out of the row
     #[inline]
-    pub fn take_columns(mut self, indices: &[usize]) -> Row {
+    pub fn take_columns(self, indices: &[usize]) -> Row {
+        let mut vec = self.storage.into_vec();
         let mut values = Vec::with_capacity(indices.len());
         for &idx in indices {
-            if idx < self.values.len() {
+            if idx < vec.len() {
                 // Take the value, replacing with null to avoid clone
-                values.push(std::mem::take(&mut self.values[idx]));
+                values.push(std::mem::take(&mut vec[idx]));
             } else {
                 values.push(Value::null_unknown());
             }
@@ -190,16 +294,18 @@ impl Row {
 
     /// Validate the row against a schema
     pub fn validate(&self, schema: &Schema) -> Result<()> {
+        let slice = self.storage.as_slice();
+
         // Check column count
-        if self.values.len() != schema.columns.len() {
+        if slice.len() != schema.columns.len() {
             return Err(Error::table_columns_not_match(
                 schema.columns.len(),
-                self.values.len(),
+                slice.len(),
             ));
         }
 
         // Check each value
-        for (i, (value, col)) in self.values.iter().zip(schema.columns.iter()).enumerate() {
+        for (i, (value, col)) in slice.iter().zip(schema.columns.iter()).enumerate() {
             // Check nullability
             if value.is_null() && !col.nullable && !col.primary_key {
                 return Err(Error::not_null_constraint(&col.name));
@@ -229,17 +335,18 @@ impl Row {
 
     /// Clone the row, selecting only the specified column indices
     pub fn clone_subset(&self, indices: &[usize]) -> Row {
+        let slice = self.storage.as_slice();
         let values = indices
             .iter()
-            .filter_map(|&i| self.values.get(i).cloned())
+            .filter_map(|&i| slice.get(i).cloned())
             .collect();
         Row::from_values(values)
     }
 
     /// Concatenate two rows
     pub fn concat(&self, other: &Row) -> Row {
-        let mut values = self.values.clone();
-        values.extend(other.values.iter().cloned());
+        let mut values = self.storage.as_slice().to_vec();
+        values.extend(other.storage.as_slice().iter().cloned());
         Row::from_values(values)
     }
 
@@ -249,35 +356,30 @@ impl Row {
     }
 }
 
-// Implement Deref to allow using Row like Vec<Value>
+// Implement Deref to allow using Row like a slice
 impl Deref for Row {
-    type Target = Vec<Value>;
+    type Target = [Value];
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.values
+        self.storage.as_slice()
     }
 }
 
-impl DerefMut for Row {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.values
-    }
-}
+// Note: DerefMut removed to avoid accidental copy-on-write triggers
+// Use as_mut_slice() or get_mut() explicitly when mutation is needed
 
 // Implement Index for convenient access
 impl Index<usize> for Row {
     type Output = Value;
 
+    #[inline]
     fn index(&self, index: usize) -> &Self::Output {
-        &self.values[index]
+        &self.storage.as_slice()[index]
     }
 }
 
-impl IndexMut<usize> for Row {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.values[index]
-    }
-}
+// Note: IndexMut removed - use get_mut() or set() for mutation
 
 // Implement FromIterator for collecting values into a row
 impl FromIterator<Value> for Row {
@@ -292,7 +394,7 @@ impl IntoIterator for Row {
     type IntoIter = std::vec::IntoIter<Value>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.values.into_iter()
+        self.storage.into_vec().into_iter()
     }
 }
 
@@ -301,16 +403,7 @@ impl<'a> IntoIterator for &'a Row {
     type IntoIter = std::slice::Iter<'a, Value>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.values.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a mut Row {
-    type Item = &'a mut Value;
-    type IntoIter = std::slice::IterMut<'a, Value>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.values.iter_mut()
+        self.storage.as_slice().iter()
     }
 }
 
@@ -320,10 +413,16 @@ impl From<Vec<Value>> for Row {
     }
 }
 
+impl From<Arc<[Value]>> for Row {
+    fn from(values: Arc<[Value]>) -> Self {
+        Row::from_arc(values)
+    }
+}
+
 impl fmt::Display for Row {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "(")?;
-        for (i, value) in self.values.iter().enumerate() {
+        for (i, value) in self.storage.as_slice().iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
@@ -379,6 +478,18 @@ mod tests {
     }
 
     #[test]
+    fn test_row_from_arc() {
+        let values: Arc<[Value]> = Arc::from(vec![Value::integer(1), Value::text("hello")]);
+        let row = Row::from_arc(values);
+        assert_eq!(row.len(), 2);
+
+        // Clone should be O(1)
+        let row2 = row.clone();
+        assert_eq!(row2.len(), 2);
+        assert_eq!(row, row2);
+    }
+
+    #[test]
     fn test_row_push_pop() {
         let mut row = Row::new();
         row.push(Value::integer(1));
@@ -389,6 +500,17 @@ mod tests {
         let popped = row.pop();
         assert_eq!(popped, Some(Value::text("hello")));
         assert_eq!(row.len(), 1);
+    }
+
+    #[test]
+    fn test_row_copy_on_write() {
+        // Create shared row
+        let values: Arc<[Value]> = Arc::from(vec![Value::integer(1), Value::text("hello")]);
+        let mut row = Row::from_arc(values);
+
+        // Mutation should trigger copy-on-write
+        row.push(Value::integer(2));
+        assert_eq!(row.len(), 3);
     }
 
     #[test]

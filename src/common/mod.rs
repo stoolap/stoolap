@@ -27,15 +27,15 @@ pub mod version;
 // Re-export main types for convenience
 pub use buffer_pool::{BufferPool, PoolStats};
 pub use int64_map::{
-    new_concurrent_int64_map, new_concurrent_int64_map_with_capacity, new_concurrent_uint64_map,
-    new_concurrent_uint64_map_with_capacity, new_concurrent_usize_map,
+    new_btree_int64_map, new_concurrent_int64_map, new_concurrent_int64_map_with_capacity,
+    new_concurrent_uint64_map, new_concurrent_uint64_map_with_capacity, new_concurrent_usize_map,
     new_concurrent_usize_map_with_capacity, new_int64_map, new_int64_map_with_capacity,
-    new_int64_set, new_int64_set_with_capacity, new_ordered_int64_map, new_segment_int64_map,
+    new_int64_set, new_int64_set_with_capacity, new_segment_int64_map,
     new_segment_int64_map_with_segments, new_uint64_map, new_uint64_map_with_capacity,
     new_uint64_set, new_uint64_set_with_capacity, new_usize_map, new_usize_map_with_capacity,
-    new_usize_set, new_usize_set_with_capacity, ConcurrentInt64Map, ConcurrentUInt64Map,
-    ConcurrentUsizeMap, Int64Map, Int64Set, OrderedInt64Map, SegmentInt64Map, UInt64Map, UInt64Set,
-    UsizeMap, UsizeSet,
+    new_usize_set, new_usize_set_with_capacity, BTreeInt64Map, ConcurrentInt64Map,
+    ConcurrentUInt64Map, ConcurrentUsizeMap, Int64Map, Int64Set, SegmentInt64Map, UInt64Map,
+    UInt64Set, UsizeMap, UsizeSet,
 };
 pub use version::{version, version_info, SemVer, BUILD_TIME, GIT_COMMIT, MAJOR, MINOR, PATCH};
 
