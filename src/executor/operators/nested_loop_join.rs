@@ -26,7 +26,7 @@ use crate::core::{Result, Row, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::executor::utils::combine_rows_with_nulls;
-use crate::functions::FunctionRegistry;
+use crate::functions::registry::global_registry;
 use crate::parser::ast::Expression;
 
 use super::hash_join::JoinType;
@@ -46,7 +46,6 @@ pub struct NestedLoopJoinOperator {
 
     // Compiled filter (created in open())
     filter: Option<JoinFilter>,
-    function_registry: FunctionRegistry,
 
     // Output schema
     schema: Vec<ColumnInfo>,
@@ -101,7 +100,6 @@ impl NestedLoopJoinOperator {
             join_type,
             condition,
             filter: None,
-            function_registry: FunctionRegistry::new(),
             schema,
             left_col_count,
             right_col_count,
@@ -161,7 +159,7 @@ impl Operator for NestedLoopJoinOperator {
                 cond,
                 &left_cols,
                 &right_cols,
-                &self.function_registry,
+                global_registry(),
             )?);
         }
 

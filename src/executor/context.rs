@@ -84,10 +84,25 @@ pub fn cache_in_subquery(key: String, values: Vec<Value>) {
 
 // Cache for semi-join (EXISTS) hash sets to avoid re-execution.
 // Thread-local to avoid synchronization overhead.
-// Uses the inner query SQL + predicate as key (format: "SEMI:table:column:predicate").
+// Uses u64 hash key to avoid string allocation entirely.
 use ahash::{AHashMap, AHashSet};
+use std::hash::{Hash, Hasher};
+
+/// Cached semi-join entry: (table_name for invalidation, hash_set values)
+type SemiJoinCacheEntry = (Arc<str>, Arc<AHashSet<Value>>);
+
+/// Compute a cache key hash from table, column, and predicate hash without allocation.
+#[inline]
+pub fn compute_semi_join_cache_key(table: &str, column: &str, pred_hash: u64) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    table.hash(&mut hasher);
+    column.hash(&mut hasher);
+    pred_hash.hash(&mut hasher);
+    hasher.finish()
+}
+
 thread_local! {
-    static SEMI_JOIN_CACHE: RefCell<FxHashMap<String, Arc<AHashSet<Value>>>> = RefCell::new(FxHashMap::default());
+    static SEMI_JOIN_CACHE: RefCell<FxHashMap<u64, SemiJoinCacheEntry>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the semi-join cache completely.
@@ -103,7 +118,6 @@ pub fn clear_semi_join_cache() {
 
 /// Invalidate semi-join cache entries for a specific table.
 /// Should be called after INSERT, UPDATE, DELETE, or TRUNCATE on a table.
-/// The cache key format is "SEMI:table:column:predicate", so we match on "SEMI:table:".
 #[inline]
 pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
     SEMI_JOIN_CACHE.with(|cache| {
@@ -111,38 +125,24 @@ pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
         if c.is_empty() {
             return;
         }
-        c.retain(|key, _| {
-            // Key format: "SEMI:table:column:predicate"
-            // Use zero-allocation comparison with eq_ignore_ascii_case
-            if let Some(rest) = key.strip_prefix("SEMI:") {
-                if let Some(colon_pos) = rest.find(':') {
-                    let key_table = &rest[..colon_pos];
-                    // Keep entry if table names DON'T match (case-insensitive)
-                    return !key_table.eq_ignore_ascii_case(table_name);
-                }
-            }
-            // Keep entries that don't match expected format
-            true
-        });
+        // Keep entries where table name doesn't match (case-insensitive)
+        c.retain(|_, (key_table, _)| !key_table.eq_ignore_ascii_case(table_name));
     });
 }
 
-/// Get a cached semi-join hash set by key.
-pub fn get_cached_semi_join(key: &str) -> Option<Arc<AHashSet<Value>>> {
-    SEMI_JOIN_CACHE.with(|cache| cache.borrow().get(key).cloned())
-}
-
-/// Cache a semi-join hash set result.
-pub fn cache_semi_join(key: String, values: AHashSet<Value>) {
-    SEMI_JOIN_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, Arc::new(values));
-    });
+/// Get a cached semi-join hash set by key hash.
+#[inline]
+pub fn get_cached_semi_join(key_hash: u64) -> Option<Arc<AHashSet<Value>>> {
+    SEMI_JOIN_CACHE.with(|cache| cache.borrow().get(&key_hash).map(|(_, v)| Arc::clone(v)))
 }
 
 /// Cache a semi-join hash set result (Arc version for zero-copy).
-pub fn cache_semi_join_arc(key: String, values: Arc<AHashSet<Value>>) {
+#[inline]
+pub fn cache_semi_join_arc(key_hash: u64, table: &str, values: Arc<AHashSet<Value>>) {
     SEMI_JOIN_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, values);
+        cache
+            .borrow_mut()
+            .insert(key_hash, (Arc::from(table), values));
     });
 }
 

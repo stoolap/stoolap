@@ -227,10 +227,14 @@ impl MultiColumnIndex {
         }
 
         // Build prefix index from row_to_key (read lock prevents concurrent inserts)
+        // Insert in sorted order for O(N+M) merge operations
         for (&row_id, key) in row_to_key.iter() {
             if key.0.len() >= prefix_len {
                 let prefix_key = CompositeKey(key.0[..prefix_len].to_vec());
-                prefix_index.entry(prefix_key).or_default().push(row_id);
+                let rows = prefix_index.entry(prefix_key).or_default();
+                if let Err(pos) = rows.binary_search(&row_id) {
+                    rows.insert(pos, row_id);
+                }
             }
         }
 
@@ -356,8 +360,12 @@ impl Index for MultiColumnIndex {
 
         // Add to hash index (for exact lookups) - ALWAYS maintained
         // Clone key once for hash index, keep original for row_to_key or BTree
+        // Insert in sorted order for O(N+M) merge operations
         let key_for_hash = key.clone();
-        value_to_rows.entry(key_for_hash).or_default().push(row_id);
+        let hash_rows = value_to_rows.entry(key_for_hash).or_default();
+        if let Err(pos) = hash_rows.binary_search(&row_id) {
+            hash_rows.insert(pos, row_id);
+        }
 
         // Update BTree only if it was already built (consumes key, avoiding extra clone)
         if btree_needs_update {
@@ -367,19 +375,26 @@ impl Index for MultiColumnIndex {
             drop(value_to_rows);
             drop(row_to_key);
             let mut sorted_values = self.sorted_values.write().unwrap();
-            sorted_values.entry(key).or_default().push(row_id);
+            let btree_rows = sorted_values.entry(key).or_default();
+            if let Err(pos) = btree_rows.binary_search(&row_id) {
+                btree_rows.insert(pos, row_id);
+            }
         } else {
             // No BTree update needed - move key directly to row_to_key (no clone needed)
             row_to_key.insert(row_id, key);
         }
 
         // Update prefix indexes only if they were already built
+        // Insert in sorted order for O(N+M) merge operations
         for prefix_len in 1..num_cols {
             let idx = prefix_len - 1;
             if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
                 let prefix_key = CompositeKey(values[..prefix_len].to_vec());
                 let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
-                prefix_index.entry(prefix_key).or_default().push(row_id);
+                let prefix_rows = prefix_index.entry(prefix_key).or_default();
+                if let Err(pos) = prefix_rows.binary_search(&row_id) {
+                    prefix_rows.insert(pos, row_id);
+                }
             }
         }
 
@@ -405,9 +420,11 @@ impl Index for MultiColumnIndex {
             let mut value_to_rows = self.value_to_rows.write().unwrap();
             let mut row_to_key = self.row_to_key.write().unwrap();
 
-            // Remove from hash index - ALWAYS maintained
+            // Remove from hash index (row_ids are sorted, use binary search)
             if let Some(rows) = value_to_rows.get_mut(&key) {
-                rows.retain(|id| *id != row_id);
+                if let Ok(pos) = rows.binary_search(&row_id) {
+                    rows.remove(pos);
+                }
                 if rows.is_empty() {
                     value_to_rows.remove(&key);
                 }
@@ -417,25 +434,29 @@ impl Index for MultiColumnIndex {
             row_to_key.remove(&row_id);
         }
 
-        // Only update BTree if it was built
+        // Only update BTree if it was built (row_ids are sorted, use binary search)
         if self.btree_built.load(AtomicOrdering::Acquire) {
             let mut sorted_values = self.sorted_values.write().unwrap();
             if let Some(rows) = sorted_values.get_mut(&key) {
-                rows.retain(|id| *id != row_id);
+                if let Ok(pos) = rows.binary_search(&row_id) {
+                    rows.remove(pos);
+                }
                 if rows.is_empty() {
                     sorted_values.remove(&key);
                 }
             }
         }
 
-        // Only update prefix indexes if they were built
+        // Only update prefix indexes if they were built (row_ids are sorted, use binary search)
         for prefix_len in 1..values.len() {
             let idx = prefix_len - 1;
             if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
                 let prefix_key = CompositeKey(values[..prefix_len].to_vec());
                 let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
                 if let Some(rows) = prefix_index.get_mut(&prefix_key) {
-                    rows.retain(|id| *id != row_id);
+                    if let Ok(pos) = rows.binary_search(&row_id) {
+                        rows.remove(pos);
+                    }
                     if rows.is_empty() {
                         prefix_index.remove(&prefix_key);
                     }

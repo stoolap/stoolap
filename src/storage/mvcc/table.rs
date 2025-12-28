@@ -310,8 +310,8 @@ impl MVCCTable {
 
             for operand in or_operands {
                 // Recursively try index lookup for each OR operand
-                if let Some(mut row_ids) = self.try_index_lookup(operand.as_ref(), schema) {
-                    row_ids.sort_unstable();
+                // Row IDs are already sorted by index (sorted insertion)
+                if let Some(row_ids) = self.try_index_lookup(operand.as_ref(), schema) {
                     indexed_row_ids.push(row_ids);
                 } else {
                     // This operand can't use an index
@@ -427,15 +427,12 @@ impl MVCCTable {
             // The executor will handle memory filtering for operands without index support
             if !indexed_row_ids.is_empty() {
                 if indexed_row_ids.len() == 1 {
-                    // OPTIMIZATION: Single operand - no intersection needed, no sorting needed
+                    // OPTIMIZATION: Single operand - no intersection needed
                     return Some(indexed_row_ids.into_iter().next().unwrap());
                 }
 
-                // OPTIMIZATION: Sort only when intersection is actually needed
-                // and use swap_remove(0) to take ownership instead of clone()
-                for row_ids in &mut indexed_row_ids {
-                    row_ids.sort_unstable();
-                }
+                // Row IDs are already sorted by index (sorted insertion)
+                // Just sort by length for optimal intersection order
                 indexed_row_ids.sort_by_key(|v| v.len());
                 let mut result = indexed_row_ids.swap_remove(0); // Take ownership, not clone
                 for other in &indexed_row_ids {
@@ -594,12 +591,12 @@ impl MVCCTable {
                                     if let Some((_, val)) =
                                         ops.iter().find(|(op, _)| matches!(op, Operator::Eq))
                                     {
-                                        let mut ids =
+                                        let ids =
                                             single_idx.get_row_ids_equal(std::slice::from_ref(val));
                                         if ids.is_empty() {
                                             return Some(Vec::new());
                                         }
-                                        ids.sort_unstable();
+                                        // Don't sort yet - only sort when intersection is needed
                                         all_row_ids.push(ids);
                                     }
                                 }
@@ -610,6 +607,7 @@ impl MVCCTable {
                         if all_row_ids.len() == 1 {
                             return Some(all_row_ids.into_iter().next().unwrap());
                         }
+                        // Row IDs are already sorted by index (sorted insertion)
                         let mut result = all_row_ids[0].clone();
                         for other in &all_row_ids[1..] {
                             result = intersect_sorted_ids(&result, other);
@@ -652,12 +650,12 @@ impl MVCCTable {
                         continue;
                     }
                     // OPTIMIZATION: Use from_ref to avoid clone
-                    let mut row_ids = index.get_row_ids_equal(std::slice::from_ref(val));
+                    let row_ids = index.get_row_ids_equal(std::slice::from_ref(val));
                     if row_ids.is_empty() {
                         // If any index returns empty, the AND result is empty
                         return Some(Vec::new());
                     }
-                    row_ids.sort_unstable();
+                    // Don't sort yet - only sort when intersection is needed
                     all_row_ids.push(row_ids);
                     continue;
                 }
@@ -670,7 +668,7 @@ impl MVCCTable {
                         continue;
                     }
 
-                    let mut row_ids =
+                    let row_ids =
                         if let (Some((min, min_inc)), Some((max, max_inc))) = (min_val, max_val) {
                             // OPTIMIZATION: Use from_ref to avoid clone
                             index.get_row_ids_in_range(
@@ -703,7 +701,7 @@ impl MVCCTable {
                         // If any index returns empty, the AND result is empty
                         return Some(Vec::new());
                     }
-                    row_ids.sort_unstable();
+                    // Don't sort yet - only sort when intersection is needed
                     all_row_ids.push(row_ids);
                 }
             }
@@ -719,6 +717,7 @@ impl MVCCTable {
             return Some(all_row_ids.into_iter().next().unwrap());
         }
 
+        // Row IDs are already sorted by index (sorted insertion)
         // Intersect all row ID sets for multi-column filtering
         // This is the key optimization - we filter rows using multiple indexes
         let mut result = all_row_ids[0].clone();

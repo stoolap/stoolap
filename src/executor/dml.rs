@@ -610,22 +610,26 @@ impl Executor {
 
             let processed_where = if has_correlated_where {
                 // Try semi-join optimization for correlated EXISTS/IN
+                // Avoid cloning upfront - only clone if no optimization succeeds
                 let outer_tables = vec![table_name.to_string()];
-                let mut current_expr = (**where_clause).clone();
 
                 // Try EXISTS semi-join optimization
-                if let Ok(Some(optimized)) =
-                    self.try_optimize_exists_to_semi_join(&current_expr, ctx, &outer_tables, None)
-                {
-                    current_expr = optimized;
-                }
+                let exists_optimized = self
+                    .try_optimize_exists_to_semi_join(where_clause, ctx, &outer_tables, None)
+                    .ok()
+                    .flatten();
 
-                // Try IN semi-join optimization
-                if let Ok(Some(optimized)) =
-                    self.try_optimize_in_to_semi_join(&current_expr, ctx, &outer_tables)
-                {
-                    current_expr = optimized;
-                }
+                // Try IN semi-join optimization (on EXISTS result or original)
+                let expr_for_in = exists_optimized.as_ref().unwrap_or(where_clause.as_ref());
+                let in_optimized = self
+                    .try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)
+                    .ok()
+                    .flatten();
+
+                // Determine final expression without unnecessary clones
+                let current_expr = in_optimized
+                    .or(exists_optimized)
+                    .unwrap_or_else(|| (**where_clause).clone());
 
                 // Process any remaining non-correlated subqueries
                 if Self::has_subqueries(&current_expr) {
@@ -970,25 +974,28 @@ impl Executor {
         ) = if let Some(ref where_clause) = stmt.where_clause {
             if has_correlated {
                 // Try semi-join optimization for correlated EXISTS/IN
+                // Avoid cloning upfront - only clone if no optimization succeeds
                 let outer_tables = vec![table_name.to_string()];
-                let mut current_expr = (**where_clause).clone();
-                let mut any_optimized = false;
 
                 // Try EXISTS semi-join optimization
-                if let Ok(Some(optimized)) =
-                    self.try_optimize_exists_to_semi_join(&current_expr, ctx, &outer_tables, None)
-                {
-                    current_expr = optimized;
-                    any_optimized = true;
-                }
+                let exists_optimized = self
+                    .try_optimize_exists_to_semi_join(where_clause, ctx, &outer_tables, None)
+                    .ok()
+                    .flatten();
 
-                // Try IN semi-join optimization
-                if let Ok(Some(optimized)) =
-                    self.try_optimize_in_to_semi_join(&current_expr, ctx, &outer_tables)
-                {
-                    current_expr = optimized;
-                    any_optimized = true;
-                }
+                // Try IN semi-join optimization (on EXISTS result or original)
+                let expr_for_in = exists_optimized.as_ref().unwrap_or(where_clause.as_ref());
+                let in_optimized = self
+                    .try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)
+                    .ok()
+                    .flatten();
+
+                // Determine final expression without unnecessary clones
+                let (current_expr, any_optimized) = match (&exists_optimized, &in_optimized) {
+                    (_, Some(_)) => (in_optimized.unwrap(), true),
+                    (Some(_), None) => (exists_optimized.unwrap(), true),
+                    (None, None) => ((**where_clause).clone(), false),
+                };
 
                 // Check if there are still correlated subqueries after optimization
                 let still_correlated = Self::has_correlated_subqueries(&current_expr);

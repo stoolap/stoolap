@@ -243,6 +243,31 @@ pub trait Index: Send + Sync {
         None // Default implementation - only B-tree indexes support this
     }
 
+    /// Iterates through groups in sorted order, calling the callback for each group.
+    ///
+    /// This is a zero-allocation alternative to `get_grouped_row_ids` that processes
+    /// groups one at a time without collecting all groups upfront. This is more
+    /// efficient when:
+    /// - Early termination is possible (LIMIT)
+    /// - Only a few groups pass filtering (HAVING)
+    ///
+    /// # Arguments
+    /// * `callback` - Called for each group with (value, row_ids). Return:
+    ///   - `Ok(true)` to continue to next group
+    ///   - `Ok(false)` to stop iteration early
+    ///   - `Err(e)` to stop and propagate the error
+    ///
+    /// # Returns
+    /// - `Some(Ok(()))` if iteration completed or stopped early with Ok(false)
+    /// - `Some(Err(e))` if callback returned an error
+    /// - `None` if the index doesn't support ordered group access
+    fn for_each_group(
+        &self,
+        _callback: &mut dyn FnMut(&Value, &[i64]) -> Result<bool>,
+    ) -> Option<Result<()>> {
+        None // Default implementation - only B-tree indexes support this
+    }
+
     /// Closes the index and releases any resources
     fn close(&mut self) -> Result<()>;
 }

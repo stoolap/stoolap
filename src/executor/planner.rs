@@ -126,6 +126,10 @@ impl QueryPlanner {
     ///
     /// If cached stats are stale (older than TTL), they will be refreshed
     /// from the system tables.
+    ///
+    /// Returns None if:
+    /// - No statistics have been collected (ANALYZE not run)
+    /// - Statistics have row_count == 0 (empty/invalid stats)
     pub fn get_table_stats(&self, table_name: &str) -> Option<TableStats> {
         let key = table_name.to_lowercase();
 
@@ -133,8 +137,8 @@ impl QueryPlanner {
         {
             let cache = self.stats_cache.read().unwrap();
             if let Some(cached) = cache.get(&key) {
-                // Return cached stats if still fresh
-                if !cached.is_stale() {
+                // Return cached stats if still fresh and valid (row_count > 0)
+                if !cached.is_stale() && cached.table_stats.row_count > 0 {
                     let result = cached.table_stats.clone();
                     // We need to touch the entry - drop read lock first
                     drop(cache);
@@ -146,12 +150,15 @@ impl QueryPlanner {
                     }
                     return Some(result);
                 }
-                // Stats are stale, will reload below
+                // Stats are stale or invalid, will reload below
             }
         }
 
         // Load from system tables (will update cache)
-        self.load_stats_from_system_tables(table_name).ok()
+        // Only return stats if they have valid row_count > 0
+        self.load_stats_from_system_tables(table_name)
+            .ok()
+            .filter(|stats| stats.row_count > 0)
     }
 
     /// Get table statistics with fallback to runtime estimation
@@ -1175,14 +1182,19 @@ impl QueryPlanner {
             }
         }
 
-        // Case 2: Both sides tiny - nested loop is faster
+        // Case 2: Both sides tiny - use hash join (still faster than nested loop)
+        // RATIONALE: Even for small datasets, hash join with equality keys is O(N+M)
+        // while nested loop is O(N*M) with JoinFilter VM evaluation per comparison.
+        // The hash table overhead is minimal for small tables, and we avoid expensive
+        // per-comparison expression evaluation.
         if left_rows <= NESTED_LOOP_MAX && right_rows <= NESTED_LOOP_MAX {
+            let swap = right_rows < left_rows;
             return RuntimeJoinDecision {
-                algorithm: RuntimeJoinAlgorithm::NestedLoop,
-                swap_sides: false,
+                algorithm: RuntimeJoinAlgorithm::HashJoin,
+                swap_sides: swap,
                 explanation: format!(
-                    "Nested loop: both sides small ({}x{} = {} comparisons)",
-                    left_rows, right_rows, product
+                    "Hash join: small tables ({} + {} = {} ops vs {} comparisons)",
+                    left_rows, right_rows, total_rows, product
                 ),
             };
         }

@@ -1864,27 +1864,32 @@ impl Executor {
 
                     // Try semi-join optimizations for both EXISTS and IN subqueries
                     // These transform O(outer × inner) to O(inner + outer)
-                    let mut current_expr = where_expr.clone();
-                    let mut any_optimized = false;
+                    // Avoid cloning upfront - only clone if no optimization succeeds
 
                     // 1. Try EXISTS semi-join optimization
-                    if let Ok(Some(optimized)) = self.try_optimize_exists_to_semi_join(
-                        &current_expr,
-                        ctx,
-                        &outer_tables,
-                        outer_limit,
-                    ) {
-                        current_expr = optimized;
-                        any_optimized = true;
-                    }
+                    let exists_optimized = self
+                        .try_optimize_exists_to_semi_join(
+                            where_expr,
+                            ctx,
+                            &outer_tables,
+                            outer_limit,
+                        )
+                        .ok()
+                        .flatten();
 
-                    // 2. Try IN semi-join optimization (for non-correlated IN subqueries)
-                    if let Ok(Some(optimized)) =
-                        self.try_optimize_in_to_semi_join(&current_expr, ctx, &outer_tables)
-                    {
-                        current_expr = optimized;
-                        any_optimized = true;
-                    }
+                    // 2. Try IN semi-join optimization (on EXISTS result or original)
+                    let expr_for_in = exists_optimized.as_ref().unwrap_or(where_expr);
+                    let in_optimized = self
+                        .try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)
+                        .ok()
+                        .flatten();
+
+                    // Determine final expression without unnecessary clones
+                    let (current_expr, any_optimized) = match (exists_optimized, in_optimized) {
+                        (_, Some(in_opt)) => (in_opt, true),
+                        (Some(exists_opt), None) => (exists_opt, true),
+                        (None, None) => (where_expr.clone(), false), // Clone only when needed
+                    };
 
                     // Check if there are still correlated subqueries after optimizations
                     let still_correlated = Self::has_correlated_subqueries(&current_expr);
@@ -1897,7 +1902,7 @@ impl Executor {
                         (Some(current_expr), true)
                     } else {
                         // No optimizations applied - keep original for per-row processing
-                        (Some(where_expr.clone()), true)
+                        (Some(current_expr), true)
                     }
                 } else {
                     (None, false)
@@ -3426,29 +3431,37 @@ impl Executor {
 
                     // Build hash table and bloom filter together in a single pass
                     // This avoids iterating build_rows twice (once for bloom, once for hash table)
-                    let (bloom_filter, pre_built_hash_table) =
-                        if build_rows.len() >= 100 && !build_key_indices.is_empty() {
-                            let mut builder = BloomFilterBuilder::new(
-                                "join_key".to_string(),
-                                "build".to_string(),
-                                build_rows.len(),
-                            );
-                            // Single-pass: build hash table and populate bloom filter
-                            let hash_table = JoinHashTable::build_with_bloom(
-                                &build_rows,
-                                &build_key_indices,
-                                &mut builder,
-                            );
-                            let bf = builder.build();
-                            let bloom = if bf.is_effective() { Some(bf) } else { None };
-                            (bloom, Some(hash_table))
-                        } else if !build_key_indices.is_empty() {
-                            // No bloom filter, but still pre-build hash table
-                            let hash_table = JoinHashTable::build(&build_rows, &build_key_indices);
-                            (None, Some(hash_table))
-                        } else {
-                            (None, None)
-                        };
+                    //
+                    // Skip bloom filter for small LIMIT queries - the overhead of building
+                    // a bloom filter for thousands of rows isn't worth it when we only
+                    // need a few results. With streaming + early termination, we don't
+                    // probe many rows anyway.
+                    let skip_bloom_for_small_limit = limit <= 500;
+                    let (bloom_filter, pre_built_hash_table) = if build_rows.len() >= 100
+                        && !build_key_indices.is_empty()
+                        && !skip_bloom_for_small_limit
+                    {
+                        let mut builder = BloomFilterBuilder::new(
+                            "join_key".to_string(),
+                            "build".to_string(),
+                            build_rows.len(),
+                        );
+                        // Single-pass: build hash table and populate bloom filter
+                        let hash_table = JoinHashTable::build_with_bloom(
+                            &build_rows,
+                            &build_key_indices,
+                            &mut builder,
+                        );
+                        let bf = builder.build();
+                        let bloom = if bf.is_effective() { Some(bf) } else { None };
+                        (bloom, Some(hash_table))
+                    } else if !build_key_indices.is_empty() {
+                        // No bloom filter, but still pre-build hash table
+                        let hash_table = JoinHashTable::build(&build_rows, &build_key_indices);
+                        (None, Some(hash_table))
+                    } else {
+                        (None, None)
+                    };
 
                     // Wrap probe with bloom filter if available
                     let probe_source: Box<dyn Operator> = if let Some(ref bf) = bloom_filter {
@@ -6920,15 +6933,6 @@ impl Executor {
             _ => return Ok(None),
         };
 
-        // Get grouped row IDs from the index (in sorted order)
-        // NOTE: get_grouped_row_ids() returns None if the index doesn't support
-        // ordered group access (e.g., index closed, or index type doesn't support it).
-        // This is intentional fallback - the caller will use the regular GROUP BY path.
-        let grouped_row_ids = match btree_index.get_grouped_row_ids() {
-            Some(groups) => groups,
-            None => return Ok(None), // Fall back to regular GROUP BY
-        };
-
         // Extract aggregations from SELECT columns
         let aggregations = self.extract_aggregations_simple(stmt);
         if aggregations.is_empty() {
@@ -6969,14 +6973,9 @@ impl Executor {
             }
         }
 
-        // OPTIMIZATION: Don't use streaming GROUP BY when row fetch is needed.
-        // Fetching rows group-by-group has high overhead (1 fetch per group).
-        // For SUM/AVG/MIN/MAX, the regular non-streaming path is faster because it
-        // fetches all rows in a single bulk operation.
-        //
-        // Streaming is only beneficial when:
-        // 1. All aggregates are COUNT (no row fetch needed)
-        // 2. We have LIMIT with sorted output (early termination)
+        // OPTIMIZATION: Don't use streaming GROUP BY when row fetch is needed without LIMIT.
+        // Streaming benefits from early termination (LIMIT), but without it, bulk fetch
+        // of all rows is more efficient than per-group fetching, even with buffer reuse.
         let needs_row_fetch = simple_aggs
             .iter()
             .any(|a| !matches!(a, StreamingAgg::Count));
@@ -7051,176 +7050,196 @@ impl Executor {
                 })
         });
 
-        for (group_value, row_ids) in grouped_row_ids {
-            // Aggregate state: sums for SUM/AVG, min/max values, counts
-            let mut agg_sums = vec![0.0f64; num_aggs];
-            let mut agg_mins = vec![f64::MAX; num_aggs];
-            let mut agg_maxs = vec![f64::MIN; num_aggs];
-            let mut agg_has_value = vec![false; num_aggs];
-            let mut counts = vec![0i64; num_aggs];
+        // Use streaming callback to avoid upfront allocation of all groups.
+        // This is more efficient because:
+        // 1. No Value cloning until we need to keep the result
+        // 2. No SmallVec->Vec conversion for row IDs
+        // 3. Early termination stops iteration immediately
+        // 4. Reusable row buffer avoids per-group allocations
 
-            // Optimization: For COUNT-only aggregates, use row_ids.len() directly
-            let row_count = row_ids.len() as i64;
+        // Pre-allocate reusable buffer for row fetching (avoids alloc/dealloc per group)
+        let mut row_buffer: Vec<(i64, crate::core::Row)> = Vec::with_capacity(256);
+        // Create true expression once outside loop
+        use crate::storage::expression::logical::ConstBoolExpr;
+        let true_expr = ConstBoolExpr::true_expr();
 
-            if needs_row_fetch {
-                // Create a true expression for fetching all rows (no filter)
-                use crate::storage::expression::logical::ConstBoolExpr;
-                let true_expr = ConstBoolExpr::true_expr();
+        let iteration_result =
+            btree_index.for_each_group(&mut |group_value: &Value, row_ids: &[i64]| {
+                // Aggregate state: sums for SUM/AVG, min/max values, counts
+                let mut agg_sums = vec![0.0f64; num_aggs];
+                let mut agg_mins = vec![f64::MAX; num_aggs];
+                let mut agg_maxs = vec![f64::MIN; num_aggs];
+                let mut agg_has_value = vec![false; num_aggs];
+                let mut counts = vec![0i64; num_aggs];
 
-                // Fetch rows for this group (returns Vec<(row_id, Row)>)
-                let fetched_rows = table.fetch_rows_by_ids(&row_ids, &true_expr);
+                // Optimization: For COUNT-only aggregates, use row_ids.len() directly
+                let row_count = row_ids.len() as i64;
 
-                for (_row_id, row) in &fetched_rows {
-                    for (i, agg) in simple_aggs.iter().enumerate() {
-                        match agg {
-                            StreamingAgg::Count => {
-                                counts[i] += 1;
-                            }
-                            StreamingAgg::Sum(col_idx) | StreamingAgg::Avg(col_idx) => {
-                                if let Some(value) = row.get(*col_idx) {
-                                    match value {
-                                        Value::Integer(v) => {
-                                            agg_sums[i] += *v as f64;
-                                            counts[i] += 1;
+                if needs_row_fetch {
+                    // Use the reusable buffer for row fetching
+                    row_buffer.clear();
+                    table.fetch_rows_by_ids_into(row_ids, &true_expr, &mut row_buffer);
+
+                    for (_row_id, row) in &row_buffer {
+                        for (i, agg) in simple_aggs.iter().enumerate() {
+                            match agg {
+                                StreamingAgg::Count => {
+                                    counts[i] += 1;
+                                }
+                                StreamingAgg::Sum(col_idx) | StreamingAgg::Avg(col_idx) => {
+                                    if let Some(value) = row.get(*col_idx) {
+                                        match value {
+                                            Value::Integer(v) => {
+                                                agg_sums[i] += *v as f64;
+                                                counts[i] += 1;
+                                                agg_has_value[i] = true;
+                                            }
+                                            Value::Float(v) => {
+                                                agg_sums[i] += v;
+                                                counts[i] += 1;
+                                                agg_has_value[i] = true;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                StreamingAgg::Min(col_idx) => {
+                                    if let Some(value) = row.get(*col_idx) {
+                                        let v = match value {
+                                            Value::Integer(v) => Some(*v as f64),
+                                            Value::Float(v) => Some(*v),
+                                            _ => None,
+                                        };
+                                        if let Some(v) = v {
+                                            if v < agg_mins[i] {
+                                                agg_mins[i] = v;
+                                            }
                                             agg_has_value[i] = true;
                                         }
-                                        Value::Float(v) => {
-                                            agg_sums[i] += v;
-                                            counts[i] += 1;
+                                    }
+                                }
+                                StreamingAgg::Max(col_idx) => {
+                                    if let Some(value) = row.get(*col_idx) {
+                                        let v = match value {
+                                            Value::Integer(v) => Some(*v as f64),
+                                            Value::Float(v) => Some(*v),
+                                            _ => None,
+                                        };
+                                        if let Some(v) = v {
+                                            if v > agg_maxs[i] {
+                                                agg_maxs[i] = v;
+                                            }
                                             agg_has_value[i] = true;
                                         }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            StreamingAgg::Min(col_idx) => {
-                                if let Some(value) = row.get(*col_idx) {
-                                    let v = match value {
-                                        Value::Integer(v) => Some(*v as f64),
-                                        Value::Float(v) => Some(*v),
-                                        _ => None,
-                                    };
-                                    if let Some(v) = v {
-                                        if v < agg_mins[i] {
-                                            agg_mins[i] = v;
-                                        }
-                                        agg_has_value[i] = true;
-                                    }
-                                }
-                            }
-                            StreamingAgg::Max(col_idx) => {
-                                if let Some(value) = row.get(*col_idx) {
-                                    let v = match value {
-                                        Value::Integer(v) => Some(*v as f64),
-                                        Value::Float(v) => Some(*v),
-                                        _ => None,
-                                    };
-                                    if let Some(v) = v {
-                                        if v > agg_maxs[i] {
-                                            agg_maxs[i] = v;
-                                        }
-                                        agg_has_value[i] = true;
                                     }
                                 }
                             }
                         }
                     }
-                }
-            } else {
-                // Fast path: All aggregates are COUNT, no row fetch needed
-                for (i, agg) in simple_aggs.iter().enumerate() {
-                    if matches!(agg, StreamingAgg::Count) {
-                        counts[i] = row_count;
-                    }
-                }
-            }
-
-            // Apply HAVING filter
-            if let Some((agg_idx, threshold, inclusive)) = having_filter {
-                let agg_val = match simple_aggs[agg_idx] {
-                    StreamingAgg::Count => counts[agg_idx] as f64,
-                    StreamingAgg::Sum(_) | StreamingAgg::Avg(_) => {
-                        if agg_has_value[agg_idx] {
-                            match simple_aggs[agg_idx] {
-                                StreamingAgg::Avg(_) if counts[agg_idx] > 0 => {
-                                    agg_sums[agg_idx] / counts[agg_idx] as f64
-                                }
-                                _ => agg_sums[agg_idx],
-                            }
-                        } else {
-                            continue; // NULL doesn't pass HAVING
-                        }
-                    }
-                    StreamingAgg::Min(_) => {
-                        if agg_has_value[agg_idx] {
-                            agg_mins[agg_idx]
-                        } else {
-                            continue;
-                        }
-                    }
-                    StreamingAgg::Max(_) => {
-                        if agg_has_value[agg_idx] {
-                            agg_maxs[agg_idx]
-                        } else {
-                            continue;
-                        }
-                    }
-                };
-                let passes = if inclusive {
-                    agg_val >= threshold
                 } else {
-                    agg_val > threshold
-                };
-                if !passes {
-                    continue;
+                    // Fast path: All aggregates are COUNT, no row fetch needed
+                    for (i, agg) in simple_aggs.iter().enumerate() {
+                        if matches!(agg, StreamingAgg::Count) {
+                            counts[i] = row_count;
+                        }
+                    }
                 }
-            }
 
-            // Build result row
-            let mut values = Vec::with_capacity(1 + num_aggs);
-            values.push(group_value.clone());
-            for (i, agg) in simple_aggs.iter().enumerate() {
-                let value = match agg {
-                    StreamingAgg::Count => Value::Integer(counts[i]),
-                    StreamingAgg::Sum(_) => {
-                        if agg_has_value[i] {
-                            Value::Float(agg_sums[i])
-                        } else {
-                            Value::null_unknown()
+                // Apply HAVING filter
+                if let Some((agg_idx, threshold, inclusive)) = having_filter {
+                    let agg_val = match simple_aggs[agg_idx] {
+                        StreamingAgg::Count => counts[agg_idx] as f64,
+                        StreamingAgg::Sum(_) | StreamingAgg::Avg(_) => {
+                            if agg_has_value[agg_idx] {
+                                match simple_aggs[agg_idx] {
+                                    StreamingAgg::Avg(_) if counts[agg_idx] > 0 => {
+                                        agg_sums[agg_idx] / counts[agg_idx] as f64
+                                    }
+                                    _ => agg_sums[agg_idx],
+                                }
+                            } else {
+                                return Ok(true); // NULL doesn't pass HAVING, continue to next group
+                            }
                         }
-                    }
-                    StreamingAgg::Avg(_) => {
-                        if agg_has_value[i] && counts[i] > 0 {
-                            Value::Float(agg_sums[i] / counts[i] as f64)
-                        } else {
-                            Value::null_unknown()
+                        StreamingAgg::Min(_) => {
+                            if agg_has_value[agg_idx] {
+                                agg_mins[agg_idx]
+                            } else {
+                                return Ok(true); // Continue to next group
+                            }
                         }
-                    }
-                    StreamingAgg::Min(_) => {
-                        if agg_has_value[i] {
-                            Value::Float(agg_mins[i])
-                        } else {
-                            Value::null_unknown()
+                        StreamingAgg::Max(_) => {
+                            if agg_has_value[agg_idx] {
+                                agg_maxs[agg_idx]
+                            } else {
+                                return Ok(true); // Continue to next group
+                            }
                         }
+                    };
+                    let passes = if inclusive {
+                        agg_val >= threshold
+                    } else {
+                        agg_val > threshold
+                    };
+                    if !passes {
+                        return Ok(true); // Continue to next group
                     }
-                    StreamingAgg::Max(_) => {
-                        if agg_has_value[i] {
-                            Value::Float(agg_maxs[i])
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
-                };
-                values.push(value);
-            }
-            result_rows.push(Row::from_values(values));
-
-            // Early termination: stop once we have LIMIT groups that passed HAVING
-            if let Some(limit) = limit_for_early_exit {
-                if result_rows.len() >= limit {
-                    break;
                 }
-            }
+
+                // Build result row - only clone group_value when we need to keep it
+                let mut values = Vec::with_capacity(1 + num_aggs);
+                values.push(group_value.clone());
+                for (i, agg) in simple_aggs.iter().enumerate() {
+                    let value = match agg {
+                        StreamingAgg::Count => Value::Integer(counts[i]),
+                        StreamingAgg::Sum(_) => {
+                            if agg_has_value[i] {
+                                Value::Float(agg_sums[i])
+                            } else {
+                                Value::null_unknown()
+                            }
+                        }
+                        StreamingAgg::Avg(_) => {
+                            if agg_has_value[i] && counts[i] > 0 {
+                                Value::Float(agg_sums[i] / counts[i] as f64)
+                            } else {
+                                Value::null_unknown()
+                            }
+                        }
+                        StreamingAgg::Min(_) => {
+                            if agg_has_value[i] {
+                                Value::Float(agg_mins[i])
+                            } else {
+                                Value::null_unknown()
+                            }
+                        }
+                        StreamingAgg::Max(_) => {
+                            if agg_has_value[i] {
+                                Value::Float(agg_maxs[i])
+                            } else {
+                                Value::null_unknown()
+                            }
+                        }
+                    };
+                    values.push(value);
+                }
+                result_rows.push(Row::from_values(values));
+
+                // Early termination: stop once we have LIMIT groups that passed HAVING
+                if let Some(limit) = limit_for_early_exit {
+                    if result_rows.len() >= limit {
+                        return Ok(false); // Stop iteration
+                    }
+                }
+
+                Ok(true) // Continue to next group
+            });
+
+        // Check if iteration was supported and succeeded
+        match iteration_result {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(e),
+            None => return Ok(None), // Fall back to regular GROUP BY
         }
 
         // Apply LIMIT if present

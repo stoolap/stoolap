@@ -32,11 +32,12 @@ use super::context::{
     cache_batch_aggregate, cache_batch_aggregate_info, cache_count_counter,
     cache_exists_correlation, cache_exists_fetcher, cache_exists_index, cache_exists_pred_key,
     cache_exists_predicate, cache_exists_schema, cache_in_subquery, cache_scalar_subquery,
-    cache_semi_join, get_cached_batch_aggregate, get_cached_batch_aggregate_info,
-    get_cached_count_counter, get_cached_exists_correlation, get_cached_exists_fetcher,
-    get_cached_exists_index, get_cached_exists_pred_key, get_cached_exists_predicate,
-    get_cached_exists_schema, get_cached_in_subquery, get_cached_scalar_subquery,
-    get_cached_semi_join, BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
+    cache_semi_join_arc, compute_semi_join_cache_key, get_cached_batch_aggregate,
+    get_cached_batch_aggregate_info, get_cached_count_counter, get_cached_exists_correlation,
+    get_cached_exists_fetcher, get_cached_exists_index, get_cached_exists_pred_key,
+    get_cached_exists_predicate, get_cached_exists_schema, get_cached_in_subquery,
+    get_cached_scalar_subquery, get_cached_semi_join, BatchAggregateLookupInfo, ExecutionContext,
+    ExistsCorrelationInfo,
 };
 use super::expr_converter::convert_ast_to_storage_expr;
 use super::expression::compute_expression_hash;
@@ -2644,23 +2645,20 @@ impl Executor {
         &self,
         info: &SemiJoinInfo,
         ctx: &ExecutionContext,
-    ) -> Result<AHashSet<crate::core::Value>> {
-        // Build cache key from inner table, column, and WHERE predicate hash
-        // Use expression hash instead of to_string() to avoid expensive string allocation
+    ) -> Result<Arc<AHashSet<crate::core::Value>>> {
+        // Build cache key hash from inner table, column, and WHERE predicate hash
+        // Uses u64 hash to avoid any string allocation
         let pred_hash = info
             .non_correlated_where
             .as_ref()
             .map(compute_expression_hash)
             .unwrap_or(0);
-        let cache_key = format!(
-            "SEMI:{}:{}:{}",
-            info.inner_table, info.inner_column, pred_hash
-        );
+        let cache_key =
+            compute_semi_join_cache_key(&info.inner_table, &info.inner_column, pred_hash);
 
-        // Check cache first
-        if let Some(cached) = get_cached_semi_join(&cache_key) {
-            // Return owned copy from Arc (Arc::unwrap_or_clone equivalent)
-            return Ok((*cached).clone());
+        // Check cache first - return Arc directly (no clone needed)
+        if let Some(cached) = get_cached_semi_join(cache_key) {
+            return Ok(cached);
         }
 
         // Build SELECT inner_column FROM inner_table WHERE non_correlated_predicates
@@ -2725,10 +2723,13 @@ impl Executor {
         // Build AHashSet from Vec - this deduplicates automatically
         let hash_set: AHashSet<crate::core::Value> = values_vec.into_iter().collect();
 
-        // Cache for subsequent calls within this query
-        cache_semi_join(cache_key, hash_set.clone());
+        // Wrap in Arc once - no cloning needed
+        let hash_set_arc = Arc::new(hash_set);
 
-        Ok(hash_set)
+        // Cache for subsequent calls within this query (Arc clone is cheap)
+        cache_semi_join_arc(cache_key, &info.inner_table, Arc::clone(&hash_set_arc));
+
+        Ok(hash_set_arc)
     }
 
     /// Execute NOT EXISTS as a true anti-join using HashJoinOperator.
@@ -2885,7 +2886,7 @@ impl Executor {
     /// Replaces: EXISTS (SELECT ...) with: outer_col IN (hash_set_values)
     pub fn transform_exists_to_in_list(
         info: &SemiJoinInfo,
-        hash_set: AHashSet<crate::core::Value>,
+        hash_set: Arc<AHashSet<crate::core::Value>>,
     ) -> Expression {
         // For empty hash set, return FALSE (no matches exist)
         // For NOT EXISTS with empty set, return TRUE (nothing exists to negate)
@@ -2926,7 +2927,7 @@ impl Executor {
         Expression::InHashSet(InHashSetExpression {
             token: dummy_token("IN", TokenType::Keyword),
             column: Box::new(outer_col_expr),
-            values: std::sync::Arc::new(hash_set),
+            values: hash_set, // Already Arc, no wrapping needed
             not: info.is_negated,
         })
     }

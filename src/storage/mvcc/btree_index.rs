@@ -232,11 +232,11 @@ impl BTreeIndex {
     /// Remove a row_id from both indexes for a given value
     /// Helper method used when updating a row's value
     fn remove_row_from_indexes(&self, row_id: i64, value: &Value) {
-        // Remove from hash index
+        // Remove from hash index (row_ids are sorted, use binary search)
         {
             let mut value_to_rows = self.value_to_rows.write().unwrap();
             if let Some(rows) = value_to_rows.get_mut(value) {
-                if let Some(pos) = rows.iter().position(|&id| id == row_id) {
+                if let Ok(pos) = rows.binary_search(&row_id) {
                     rows.remove(pos);
                 }
                 if rows.is_empty() {
@@ -245,11 +245,11 @@ impl BTreeIndex {
             }
         }
 
-        // Remove from sorted index
+        // Remove from sorted index (row_ids are sorted, use binary search)
         {
             let mut sorted_values = self.sorted_values.write().unwrap();
             if let Some(rows) = sorted_values.get_mut(value) {
-                if let Some(pos) = rows.iter().position(|&id| id == row_id) {
+                if let Ok(pos) = rows.binary_search(&row_id) {
                     rows.remove(pos);
                 }
                 if rows.is_empty() {
@@ -481,16 +481,18 @@ impl Index for BTreeIndex {
             let value_for_btree = value.clone();
 
             // Add to hash index (for O(1) equality lookups)
-            value_to_rows
-                .entry(value_for_hash)
-                .or_default()
-                .push(row_id);
+            // Insert in sorted order for O(N+M) intersection/union without re-sorting
+            let hash_rows = value_to_rows.entry(value_for_hash).or_default();
+            if let Err(pos) = hash_rows.binary_search(&row_id) {
+                hash_rows.insert(pos, row_id);
+            }
 
             // Add to sorted index (for O(log n) range queries)
-            sorted_values
-                .entry(value_for_btree)
-                .or_default()
-                .push(row_id);
+            // Insert in sorted order for O(N+M) intersection/union without re-sorting
+            let btree_rows = sorted_values.entry(value_for_btree).or_default();
+            if let Err(pos) = btree_rows.binary_search(&row_id) {
+                btree_rows.insert(pos, row_id);
+            }
 
             // Add to row -> value mapping (consumes the original value)
             row_to_value.insert(row_id, value);
@@ -521,12 +523,11 @@ impl Index for BTreeIndex {
         };
 
         if let Some(value) = stored_value {
-            // Remove from hash index
+            // Remove from hash index (row_ids are sorted, use binary search)
             {
                 let mut value_to_rows = self.value_to_rows.write().unwrap();
                 if let Some(rows) = value_to_rows.get_mut(&value) {
-                    // SmallVec: find and remove by value
-                    if let Some(pos) = rows.iter().position(|&id| id == row_id) {
+                    if let Ok(pos) = rows.binary_search(&row_id) {
                         rows.remove(pos);
                     }
                     if rows.is_empty() {
@@ -535,11 +536,11 @@ impl Index for BTreeIndex {
                 }
             }
 
-            // Remove from sorted index
+            // Remove from sorted index (row_ids are sorted, use binary search)
             {
                 let mut sorted_values = self.sorted_values.write().unwrap();
                 if let Some(rows) = sorted_values.get_mut(&value) {
-                    if let Some(pos) = rows.iter().position(|&id| id == row_id) {
+                    if let Ok(pos) = rows.binary_search(&row_id) {
                         rows.remove(pos);
                     }
                     if rows.is_empty() {
@@ -952,6 +953,29 @@ impl Index for BTreeIndex {
             .collect();
 
         Some(result)
+    }
+
+    fn for_each_group(
+        &self,
+        callback: &mut dyn FnMut(&Value, &[i64]) -> Result<bool>,
+    ) -> Option<Result<()>> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return None;
+        }
+
+        let sorted_values = self.sorted_values.read().unwrap();
+
+        // Iterate through groups in sorted order without collecting
+        for (value, row_ids) in sorted_values.iter() {
+            // Pass slice reference directly - no allocation
+            match callback(value, row_ids.as_slice()) {
+                Ok(true) => continue,          // Continue to next group
+                Ok(false) => break,            // Early termination requested
+                Err(e) => return Some(Err(e)), // Propagate error
+            }
+        }
+
+        Some(Ok(()))
     }
 
     fn close(&mut self) -> Result<()> {

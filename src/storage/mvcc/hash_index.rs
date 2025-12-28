@@ -267,8 +267,11 @@ impl Index for HashIndex {
         // Check uniqueness constraint
         self.check_unique_constraint(values, row_id, hash, &hash_to_values)?;
 
-        // Add to hash_to_rows
-        hash_to_rows.entry(hash).or_default().push(row_id);
+        // Add to hash_to_rows (insert sorted for O(N+M) merge operations)
+        let rows = hash_to_rows.entry(hash).or_default();
+        if let Err(pos) = rows.binary_search(&row_id) {
+            rows.insert(pos, row_id);
+        }
 
         // Add to row_to_hash
         row_to_hash.insert(row_id, hash);
@@ -278,8 +281,9 @@ impl Index for HashIndex {
         let mut found = false;
         for (stored_values, row_ids) in entries.iter_mut() {
             if stored_values == values {
-                if !row_ids.contains(&row_id) {
-                    row_ids.push(row_id);
+                // Insert sorted for O(N+M) merge operations
+                if let Err(pos) = row_ids.binary_search(&row_id) {
+                    row_ids.insert(pos, row_id);
                 }
                 found = true;
                 break;
@@ -287,7 +291,7 @@ impl Index for HashIndex {
         }
         if !found {
             let mut row_ids = SmallVec::new();
-            row_ids.push(row_id);
+            row_ids.push(row_id); // First element, already sorted
             entries.push((values.to_vec(), row_ids));
         }
 
@@ -312,9 +316,11 @@ impl Index for HashIndex {
         let mut row_to_hash = self.row_to_hash.write().unwrap();
         let mut hash_to_values = self.hash_to_values.write().unwrap();
 
-        // Remove from hash_to_rows
+        // Remove from hash_to_rows (row_ids are sorted, use binary search)
         if let Some(rows) = hash_to_rows.get_mut(&hash) {
-            rows.retain(|id| *id != row_id);
+            if let Ok(pos) = rows.binary_search(&row_id) {
+                rows.remove(pos);
+            }
             if rows.is_empty() {
                 hash_to_rows.remove(&hash);
             }
@@ -323,11 +329,13 @@ impl Index for HashIndex {
         // Remove from row_to_hash
         row_to_hash.remove(&row_id);
 
-        // Remove from hash_to_values
+        // Remove from hash_to_values (row_ids are sorted, use binary search)
         if let Some(entries) = hash_to_values.get_mut(&hash) {
             for (stored_values, row_ids) in entries.iter_mut() {
                 if stored_values == values {
-                    row_ids.retain(|id| *id != row_id);
+                    if let Ok(pos) = row_ids.binary_search(&row_id) {
+                        row_ids.remove(pos);
+                    }
                     break;
                 }
             }
