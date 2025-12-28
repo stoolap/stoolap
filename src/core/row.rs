@@ -315,6 +315,17 @@ impl Row {
         self.storage.as_slice()
     }
 
+    /// Convert Row to Arc, consuming self - efficient for arena storage
+    /// If already Shared, returns the Arc directly (O(1))
+    /// If Owned, converts to Arc (copies data once)
+    #[inline]
+    pub fn into_arc(self) -> Arc<[Value]> {
+        match self.storage {
+            RowStorage::Shared(arc) => arc,
+            RowStorage::Owned(vec) => Arc::from(vec.into_boxed_slice()),
+        }
+    }
+
     /// Get a mutable reference to the underlying vector (triggers copy-on-write)
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [Value] {

@@ -898,6 +898,69 @@ impl MVCCTable {
             })
     }
 
+    /// Prepares a row for insertion: handles auto-increment, validates, and checks constraints.
+    /// Returns the row_id on success. The row is modified in-place with auto-increment values.
+    #[inline]
+    fn prepare_insert(&mut self, row: &mut Row) -> Result<i64> {
+        // Handle auto-increment for primary key BEFORE validation
+        // This allows inserting without specifying the primary key (only if AUTO_INCREMENT)
+        if let Some(pk_idx) = self.find_pk_column_index() {
+            let pk_col = &self.cached_schema.columns[pk_idx];
+            let is_auto_increment = pk_col.auto_increment;
+
+            if let Some(value) = row.get(pk_idx) {
+                if value.is_null() {
+                    if is_auto_increment {
+                        // Generate new ID for NULL primary key (only with AUTO_INCREMENT)
+                        let next_id = self.version_store.get_next_auto_increment_id();
+                        let _ = row.set(pk_idx, Value::Integer(next_id));
+                    } else {
+                        // PRIMARY KEY without AUTO_INCREMENT cannot be NULL
+                        return Err(Error::internal(format!(
+                            "NULL value not allowed for PRIMARY KEY column '{}'. Use AUTO_INCREMENT for auto-generated IDs.",
+                            pk_col.name
+                        )));
+                    }
+                } else if let Some(pk_val) = value.as_int64() {
+                    // Track max row_id for ORDER BY contiguous iteration optimization.
+                    // Uses the auto-increment counter as a convenient max-row-id tracker.
+                    let current = self.version_store.get_auto_increment_counter();
+                    if pk_val > current {
+                        self.version_store.set_auto_increment_counter(pk_val);
+                    }
+                }
+            }
+        }
+
+        // Validate and coerce row AFTER auto-increment has filled in the primary key
+        self.validate_and_coerce_row(row)?;
+
+        // Extract row ID
+        let row_id = self.extract_row_pk(row);
+
+        // Check if row already exists in local versions
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            if txn_versions.has_locally_seen(row_id) && txn_versions.get(row_id).is_some() {
+                return Err(Error::primary_key_constraint(row_id));
+            }
+        }
+
+        // Check if row exists in global store
+        if self.version_store.quick_check_row_existence(row_id) {
+            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                if !version.is_deleted() {
+                    return Err(Error::primary_key_constraint(row_id));
+                }
+            }
+        }
+
+        // Check unique index constraints
+        self.check_unique_constraints(row, row_id)?;
+
+        Ok(row_id)
+    }
+
     /// Commits the transaction's local changes
     ///
     /// This method updates indexes before committing versions to the global store.
@@ -1483,61 +1546,7 @@ impl Table for MVCCTable {
     }
 
     fn insert(&mut self, mut row: Row) -> Result<Row> {
-        // Handle auto-increment for primary key BEFORE validation
-        // This allows inserting without specifying the primary key (only if AUTO_INCREMENT)
-        if let Some(pk_idx) = self.find_pk_column_index() {
-            let pk_col = &self.cached_schema.columns[pk_idx];
-            let is_auto_increment = pk_col.auto_increment;
-
-            if let Some(value) = row.get(pk_idx) {
-                if value.is_null() {
-                    if is_auto_increment {
-                        // Generate new ID for NULL primary key (only with AUTO_INCREMENT)
-                        let next_id = self.version_store.get_next_auto_increment_id();
-                        let _ = row.set(pk_idx, Value::Integer(next_id));
-                    } else {
-                        // PRIMARY KEY without AUTO_INCREMENT cannot be NULL
-                        return Err(Error::internal(format!(
-                            "NULL value not allowed for PRIMARY KEY column '{}'. Use AUTO_INCREMENT for auto-generated IDs.",
-                            pk_col.name
-                        )));
-                    }
-                } else if let Some(pk_val) = value.as_int64() {
-                    // Track max row_id for ORDER BY contiguous iteration optimization.
-                    // Uses the auto-increment counter as a convenient max-row-id tracker.
-                    let current = self.version_store.get_auto_increment_counter();
-                    if pk_val > current {
-                        self.version_store.set_auto_increment_counter(pk_val);
-                    }
-                }
-            }
-        }
-
-        // Validate and coerce row AFTER auto-increment has filled in the primary key
-        self.validate_and_coerce_row(&mut row)?;
-
-        // Extract row ID
-        let row_id = self.extract_row_pk(&row);
-
-        // Check if row already exists in local versions
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            if txn_versions.has_locally_seen(row_id) && txn_versions.get(row_id).is_some() {
-                return Err(Error::primary_key_constraint(row_id));
-            }
-        }
-
-        // Check if row exists in global store
-        if self.version_store.quick_check_row_existence(row_id) {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                if !version.is_deleted() {
-                    return Err(Error::primary_key_constraint(row_id));
-                }
-            }
-        }
-
-        // Check unique index constraints
-        self.check_unique_constraints(&row, row_id)?;
+        let row_id = self.prepare_insert(&mut row)?;
 
         // Clone the row for returning (with AUTO_INCREMENT value applied)
         let inserted_row = row.clone();
@@ -1548,20 +1557,20 @@ impl Table for MVCCTable {
         Ok(inserted_row)
     }
 
+    fn insert_discard(&mut self, mut row: Row) -> Result<()> {
+        let row_id = self.prepare_insert(&mut row)?;
+
+        // Add to transaction's local version store - NO CLONE!
+        self.txn_versions.write().unwrap().put(row_id, row, false)?;
+
+        Ok(())
+    }
+
     fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()> {
-        // For small batches, use single insert
-        if rows.len() <= 3 {
-            for row in rows {
-                let _ = self.insert(row)?;
-            }
-            return Ok(());
-        }
-
-        // Validate and insert all rows
+        // Use insert_discard since we don't need returned rows
         for row in rows {
-            let _ = self.insert(row)?;
+            self.insert_discard(row)?;
         }
-
         Ok(())
     }
 

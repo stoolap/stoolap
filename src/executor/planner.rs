@@ -1283,4 +1283,192 @@ mod tests {
         );
         assert!((sel_no_stats - 0.1).abs() < 0.001); // Default
     }
+
+    #[test]
+    fn test_estimate_value_position_integers() {
+        // Value in middle of range
+        let pos = QueryPlanner::estimate_value_position(
+            &Value::Integer(50),
+            &Value::Integer(0),
+            &Value::Integer(100),
+        );
+        assert!((pos - 0.5).abs() < 0.001);
+
+        // Value at start
+        let pos = QueryPlanner::estimate_value_position(
+            &Value::Integer(0),
+            &Value::Integer(0),
+            &Value::Integer(100),
+        );
+        assert!(pos.abs() < 0.001);
+
+        // Value at end
+        let pos = QueryPlanner::estimate_value_position(
+            &Value::Integer(100),
+            &Value::Integer(0),
+            &Value::Integer(100),
+        );
+        assert!((pos - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_estimate_value_position_floats() {
+        let pos = QueryPlanner::estimate_value_position(
+            &Value::Float(0.75),
+            &Value::Float(0.0),
+            &Value::Float(1.0),
+        );
+        assert!((pos - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_estimate_value_position_equal_bounds() {
+        // Equal bounds should return 0.5
+        let pos = QueryPlanner::estimate_value_position(
+            &Value::Integer(50),
+            &Value::Integer(50),
+            &Value::Integer(50),
+        );
+        assert!((pos - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_estimate_value_position_clamping() {
+        // Value below range should clamp to 0
+        let pos = QueryPlanner::estimate_value_position(
+            &Value::Integer(-10),
+            &Value::Integer(0),
+            &Value::Integer(100),
+        );
+        assert!(pos.abs() < 0.001);
+
+        // Value above range should clamp to 1
+        let pos = QueryPlanner::estimate_value_position(
+            &Value::Integer(200),
+            &Value::Integer(0),
+            &Value::Integer(100),
+        );
+        assert!((pos - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_runtime_join_decision_hash_join() {
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+
+        // For equality joins with reasonable sizes, hash join should be selected
+        let decision = planner.plan_runtime_join(1000, 1000, true);
+        assert!(decision.use_hash_join());
+        assert!(!decision.use_merge_join());
+        assert!(!decision.use_nested_loop());
+    }
+
+    #[test]
+    fn test_runtime_join_decision_nested_loop() {
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+
+        // Non-equality joins should use nested loop
+        let decision = planner.plan_runtime_join(100, 100, false);
+        assert!(decision.use_nested_loop());
+        assert!(!decision.use_hash_join());
+        assert!(!decision.use_merge_join());
+    }
+
+    #[test]
+    fn test_runtime_join_decision_small_tables() {
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+
+        // Very small tables might still use hash join for equality
+        let decision = planner.plan_runtime_join(10, 10, true);
+        // Small tables with equality should still use efficient algorithm
+        assert!(decision.use_hash_join() || decision.use_nested_loop());
+    }
+
+    #[test]
+    fn test_runtime_join_decision_merge_join() {
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+
+        // When both sides are sorted, merge join might be preferred
+        let decision = planner.plan_runtime_join_with_sort_info(10000, 10000, true, true, true);
+        assert!(decision.use_merge_join() || decision.use_hash_join());
+    }
+
+    #[test]
+    fn test_selectivity_range_operators() {
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+
+        let col_stats = ColumnStatsCache {
+            null_count: 0,
+            distinct_count: 100,
+            min_value: Some(Value::Integer(1)),
+            max_value: Some(Value::Integer(100)),
+            avg_width: 8,
+            histogram: None,
+        };
+        let table_stats = TableStats::default();
+
+        // Test Greater Than - should be about 50% for value in middle
+        let sel = planner.estimate_selectivity(
+            Some(Operator::Gt),
+            Some(&Value::Integer(50)),
+            Some(&col_stats),
+            &table_stats,
+        );
+        assert!(sel > 0.0 && sel < 1.0);
+
+        // Test Less Than
+        let sel = planner.estimate_selectivity(
+            Some(Operator::Lt),
+            Some(&Value::Integer(50)),
+            Some(&col_stats),
+            &table_stats,
+        );
+        assert!(sel > 0.0 && sel < 1.0);
+    }
+
+    #[test]
+    fn test_selectivity_no_operator() {
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+        let table_stats = TableStats::default();
+
+        // No operator should return default selectivity
+        let sel = planner.estimate_selectivity(None, Some(&Value::Integer(50)), None, &table_stats);
+        assert!((sel - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_stats_health_missing() {
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+
+        // Non-existent table should return Missing
+        let health = planner.stats_health("non_existent_table");
+        assert!(matches!(health, StatsHealth::Missing));
+    }
+
+    #[test]
+    fn test_estimate_value_position_mixed_types() {
+        // Integer min/max with float value
+        let pos = QueryPlanner::estimate_value_position(
+            &Value::Float(50.5),
+            &Value::Integer(0),
+            &Value::Integer(100),
+        );
+        assert!(pos > 0.49 && pos < 0.52);
+
+        // Float min/max with integer value
+        let pos = QueryPlanner::estimate_value_position(
+            &Value::Integer(75),
+            &Value::Float(0.0),
+            &Value::Float(100.0),
+        );
+        assert!((pos - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_runtime_join_decision_explanation() {
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+
+        let decision = planner.plan_runtime_join(1000, 1000, true);
+        // Explanation should not be empty
+        assert!(!decision.explanation.is_empty());
+    }
 }

@@ -164,6 +164,32 @@ impl RowArena {
         (idx, arc_data)
     }
 
+    /// Insert an already-created Arc directly - avoids copy when caller has Arc
+    /// Returns the index where it was stored
+    #[inline]
+    pub fn insert_arc(
+        &self,
+        row_id: i64,
+        txn_id: i64,
+        create_time: i64,
+        arc_data: Arc<[Value]>,
+    ) -> usize {
+        let mut inner = self.inner.write();
+
+        inner.data.push(arc_data);
+
+        let meta = ArenaRowMeta {
+            row_id,
+            txn_id,
+            deleted_at_txn_id: 0,
+            create_time,
+        };
+
+        let idx = inner.meta.len();
+        inner.meta.push(meta);
+        idx
+    }
+
     /// Mark a row as deleted
     #[inline]
     pub fn mark_deleted(&self, row_idx: usize, deleted_at_txn_id: i64) {

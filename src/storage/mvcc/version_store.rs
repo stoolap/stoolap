@@ -441,13 +441,16 @@ impl VersionStore {
                 }
 
                 // Store in arena (only for non-deleted versions)
-                // Use insert_row_get_arc to get the Arc back and reuse it for O(1) clones
+                // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
                 let arena_idx = if new_version.deleted_at_txn_id == 0 {
-                    let (idx, arc_data) = self.arena.insert_row_get_arc(
+                    // Convert Row to Arc once (takes ownership, no copy if already Arc)
+                    let arc_data = std::mem::take(&mut new_version.data).into_arc();
+                    // Insert Arc into arena (just Arc::clone, no data copy)
+                    let idx = self.arena.insert_arc(
                         row_id,
                         new_version.txn_id,
                         new_version.create_time,
-                        &new_version.data,
+                        Arc::clone(&arc_data),
                     );
                     // Reuse the Arc for the version's data - enables O(1) clone on read
                     new_version.data = Row::from_arc(arc_data);
@@ -490,18 +493,21 @@ impl VersionStore {
             }
             std::collections::btree_map::Entry::Vacant(vacant) => {
                 // First version for this row - store in arena
-                // Use insert_row_get_arc to get the Arc back and reuse it for O(1) clones
+                // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
                 let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
-                    let (idx, arc_data) = self.arena.insert_row_get_arc(
+                    let mut v = version;
+                    // Convert Row to Arc once (takes ownership, no copy if already Arc)
+                    let arc_data = std::mem::take(&mut v.data).into_arc();
+                    // Insert Arc into arena (just Arc::clone, no data copy)
+                    let idx = self.arena.insert_arc(
                         row_id,
-                        version.txn_id,
-                        version.create_time,
-                        &version.data,
+                        v.txn_id,
+                        v.create_time,
+                        Arc::clone(&arc_data),
                     );
                     // Update row -> arena index mapping
                     self.row_arena_index.write().insert(row_id, idx);
                     // Create version with Arc-backed data for O(1) clone
-                    let mut v = version;
                     v.data = Row::from_arc(arc_data);
                     (Some(idx), v)
                 } else {
@@ -563,12 +569,16 @@ impl VersionStore {
                     }
 
                     // Update arena with Arc reuse for O(1) clones on read
+                    // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
                     let arena_idx = if new_version.deleted_at_txn_id == 0 {
-                        let (idx, arc_data) = self.arena.insert_row_get_arc(
+                        // Convert Row to Arc once (takes ownership, no copy if already Arc)
+                        let arc_data = std::mem::take(&mut new_version.data).into_arc();
+                        // Insert Arc into arena (just Arc::clone, no data copy)
+                        let idx = self.arena.insert_arc(
                             row_id,
                             new_version.txn_id,
                             new_version.create_time,
-                            &new_version.data,
+                            Arc::clone(&arc_data),
                         );
                         // Reuse the Arc for the version's data
                         new_version.data = Row::from_arc(arc_data);
@@ -610,16 +620,20 @@ impl VersionStore {
                 }
                 std::collections::btree_map::Entry::Vacant(vacant) => {
                     // First version for this row - store in arena with Arc reuse
+                    // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
                     let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
-                        let (idx, arc_data) = self.arena.insert_row_get_arc(
+                        let mut v = version;
+                        // Convert Row to Arc once (takes ownership, no copy if already Arc)
+                        let arc_data = std::mem::take(&mut v.data).into_arc();
+                        // Insert Arc into arena (just Arc::clone, no data copy)
+                        let idx = self.arena.insert_arc(
                             row_id,
-                            version.txn_id,
-                            version.create_time,
-                            &version.data,
+                            v.txn_id,
+                            v.create_time,
+                            Arc::clone(&arc_data),
                         );
                         arena_index_updates.push((row_id, idx));
                         // Create version with Arc-backed data for O(1) clone
-                        let mut v = version;
                         v.data = Row::from_arc(arc_data);
                         (Some(idx), v)
                     } else {
@@ -704,6 +718,51 @@ impl VersionStore {
             current = e.prev.as_ref().map(|b| b.as_ref());
         }
 
+        None
+    }
+
+    /// Check if any of the given row_ids have a visible version
+    /// Returns the first row_id that has a visible version, or None if none exist
+    /// OPTIMIZATION: Used for conflict detection - stops at first hit, no data fetch
+    #[inline]
+    pub fn has_any_visible_version(&self, row_ids: &[i64], txn_id: i64) -> Option<i64> {
+        if self.closed.load(Ordering::Acquire) || row_ids.is_empty() {
+            return None;
+        }
+
+        let checker = self.visibility_checker.as_ref()?;
+        let versions = self.versions.read();
+
+        for &row_id in row_ids {
+            if let Some(chain) = versions.get(&row_id) {
+                // Check HEAD visibility (most common case)
+                let head_txn_id = chain.version.txn_id;
+                let head_deleted_at = chain.version.deleted_at_txn_id;
+
+                if checker.is_visible(head_txn_id, txn_id) {
+                    if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+                        return Some(row_id); // Found visible version - conflict!
+                    }
+                    continue; // Deleted, check next
+                }
+
+                // Check chain for older visible versions
+                let mut current: Option<&VersionChainEntry> =
+                    chain.prev.as_ref().map(|b| b.as_ref());
+
+                while let Some(e) = current {
+                    if checker.is_visible(e.version.txn_id, txn_id) {
+                        if e.version.deleted_at_txn_id == 0
+                            || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
+                        {
+                            return Some(row_id); // Found visible version - conflict!
+                        }
+                        break; // Deleted, move to next row
+                    }
+                    current = e.prev.as_ref().map(|b| b.as_ref());
+                }
+            }
+        }
         None
     }
 
@@ -2937,6 +2996,16 @@ impl VersionStore {
             .remove_if(&row_id, |_, &v| v == txn_id);
     }
 
+    /// Releases multiple row claims in batch
+    /// OPTIMIZATION: Avoids repeated function call overhead
+    #[inline]
+    pub fn release_row_claims_batch(&self, row_ids: &[i64], txn_id: i64) {
+        for &row_id in row_ids {
+            self.uncommitted_writes
+                .remove_if(&row_id, |_, &v| v == txn_id);
+        }
+    }
+
     /// Check if an index exists
     pub fn index_exists(&self, index_name: &str) -> bool {
         let indexes = self.indexes.read();
@@ -4153,39 +4222,36 @@ impl TransactionVersionStore {
     /// 1. New inserts (read_version is None) - check if row was inserted by another txn
     /// 2. Unclaimed rows (shouldn't happen with current code paths)
     pub fn detect_conflicts(&self) -> Result<(), Error> {
-        // Fast path: if we have no write set entries without read_version,
-        // and all rows were claimed, there can be no conflicts
-        let mut needs_insert_check = false;
-        for (_, write_entry) in self.write_set.iter() {
-            if write_entry.read_version.is_none() {
-                needs_insert_check = true;
-                break;
-            }
-        }
+        // Collect row_ids for inserts (read_version is None) that need conflict checking
+        let insert_row_ids: Vec<i64> = self
+            .write_set
+            .iter()
+            .filter_map(|(row_id, write_entry)| {
+                if write_entry.read_version.is_none() {
+                    Some(*row_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        // For UPDATE/DELETE operations where we claimed existing rows,
-        // the claim mechanism already prevents conflicts. Skip the expensive
-        // get_visible_version() calls for these rows.
-        if !needs_insert_check {
+        // Fast path: no inserts, no conflicts possible
+        if insert_row_ids.is_empty() {
             return Ok(());
         }
 
-        // Only check rows where we're inserting (read_version was None)
-        // These are the only rows where another transaction could have
-        // inserted a conflicting row
-        for (row_id, write_entry) in self.write_set.iter() {
-            if write_entry.read_version.is_none() {
-                // Check if row was inserted by another transaction
-                let current_version = self.parent_store.get_visible_version(*row_id, self.txn_id);
-                if current_version.is_some() {
-                    return Err(Error::internal(format!(
-                        "write conflict: row {} was inserted by another transaction",
-                        row_id
-                    )));
-                }
-            }
-            // Skip rows with read_version - they were claimed and can't conflict
+        // Batch check: see if any insert row_id has a visible version (conflict)
+        // OPTIMIZATION: Single lock acquisition, early exit on first conflict
+        if let Some(conflicting_row_id) = self
+            .parent_store
+            .has_any_visible_version(&insert_row_ids, self.txn_id)
+        {
+            return Err(Error::internal(format!(
+                "write conflict: row {} was inserted by another transaction",
+                conflicting_row_id
+            )));
         }
+
         Ok(())
     }
 
@@ -4221,8 +4287,10 @@ impl TransactionVersionStore {
 
         self.parent_store.add_versions_batch(batch);
 
-        // Release all claims
-        self.release_all_claims();
+        // Release all claims - drain write_set to get row_ids and avoid double iteration
+        let row_ids: Vec<i64> = self.write_set.drain().map(|(row_id, _)| row_id).collect();
+        self.parent_store
+            .release_row_claims_batch(&row_ids, self.txn_id);
 
         Ok(())
     }
@@ -4261,9 +4329,11 @@ impl TransactionVersionStore {
 
     /// Release all row claims held by this transaction
     fn release_all_claims(&self) {
-        for (row_id, _) in self.write_set.iter() {
-            self.parent_store.release_row_claim(*row_id, self.txn_id);
-        }
+        // OPTIMIZATION: Collect row_ids first, then batch release
+        // Avoids holding write_set iterator while accessing parent_store
+        let row_ids: Vec<i64> = self.write_set.keys().copied().collect();
+        self.parent_store
+            .release_row_claims_batch(&row_ids, self.txn_id);
     }
 }
 

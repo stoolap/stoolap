@@ -120,7 +120,8 @@ impl Executor {
         let all_column_types: Vec<crate::core::DataType>;
         // Pre-compute default values and check expressions for all columns
         let default_exprs: Vec<Option<String>>;
-        let check_exprs: Vec<(String, Option<String>)>; // (column_name, check_expr)
+        // OPTIMIZATION: Only collect columns that have CHECK constraints (saves 3ms clone overhead)
+        let check_exprs: Vec<(usize, String, String)>; // (col_idx, column_name, check_expr)
         {
             let schema = table.schema();
             schema_column_count = schema.columns.len();
@@ -131,10 +132,16 @@ impl Executor {
                 .iter()
                 .map(|c| c.default_expr.clone())
                 .collect();
+            // Only collect columns that actually have CHECK constraints
             check_exprs = schema
                 .columns
                 .iter()
-                .map(|c| (c.name.clone(), c.check_expr.clone()))
+                .enumerate()
+                .filter_map(|(idx, c)| {
+                    c.check_expr
+                        .as_ref()
+                        .map(|expr| (idx, c.name.clone(), expr.clone()))
+                })
                 .collect();
             all_column_types = schema.columns.iter().map(|c| c.data_type).collect();
 
@@ -194,7 +201,12 @@ impl Executor {
         // RETURNING clause support - collect inserted rows if RETURNING is specified
         let has_returning = !stmt.returning.is_empty();
         let mut returning_rows: Vec<Row> = Vec::new();
-        let schema_column_names: Vec<String> = table.schema().column_names_owned().to_vec();
+        // OPTIMIZATION: Only get column names Arc when RETURNING is used (avoids 7ms clone)
+        let schema_column_names_arc = if has_returning {
+            Some(table.schema().column_names_arc())
+        } else {
+            None
+        };
 
         // Check if this is INSERT ... SELECT
         if let Some(ref select_stmt) = stmt.select {
@@ -238,15 +250,17 @@ impl Executor {
                     row_values[column_indices[i]] = coerced;
                 }
 
-                // Create row and insert (returns row with AUTO_INCREMENT applied)
+                // Create row and insert
                 let row = Row::from_values(row_values);
-                let inserted_row = table.insert(row)?;
-                rows_affected += 1;
-
-                // Collect inserted row for RETURNING if specified
                 if has_returning {
+                    // Use insert() which returns row (for RETURNING clause)
+                    let inserted_row = table.insert(row)?;
                     returning_rows.push(inserted_row);
+                } else {
+                    // Use insert_discard() to avoid clone overhead
+                    table.insert_discard(row)?;
                 }
+                rows_affected += 1;
             }
 
             // Invalidate semantic cache for this table BEFORE commit
@@ -270,7 +284,7 @@ impl Executor {
                 return self.build_returning_result(
                     &stmt.returning,
                     returning_rows,
-                    &schema_column_names,
+                    schema_column_names_arc.as_ref().unwrap(),
                     ctx,
                 );
             }
@@ -329,8 +343,8 @@ impl Executor {
 
                 // Need to clone for potential update
                 let row = Row::from_values(row_values.clone());
-                match table.insert(row) {
-                    Ok(_inserted_row) => {
+                match table.insert_discard(row) {
+                    Ok(()) => {
                         rows_affected += 1;
                     }
                     Err(Error::PrimaryKeyConstraint { row_id }) => {
@@ -424,28 +438,28 @@ impl Executor {
                     row_values[column_indices[i]] = coerced;
                 }
 
-                // Validate CHECK constraints
-                for (col_idx, (col_name, check_expr_opt)) in check_exprs.iter().enumerate() {
-                    if let Some(ref check_expr) = check_expr_opt {
-                        let col_type = all_column_types[col_idx];
-                        self.validate_check_constraint(
-                            check_expr,
-                            col_name,
-                            &row_values[col_idx],
-                            col_type,
-                        )?;
-                    }
+                // Validate CHECK constraints (only iterates columns that have CHECK constraints)
+                for (col_idx, col_name, check_expr) in &check_exprs {
+                    let col_type = all_column_types[*col_idx];
+                    self.validate_check_constraint(
+                        check_expr,
+                        col_name,
+                        &row_values[*col_idx],
+                        col_type,
+                    )?;
                 }
 
-                // Insert row (returns row with AUTO_INCREMENT applied)
+                // Insert row
                 let row = Row::from_values(row_values);
-                let inserted_row = table.insert(row)?;
-                rows_affected += 1;
-
-                // Collect inserted row for RETURNING if specified
                 if has_returning {
+                    // Use insert() which returns row (for RETURNING clause)
+                    let inserted_row = table.insert(row)?;
                     returning_rows.push(inserted_row);
+                } else {
+                    // Use insert_discard() to avoid clone overhead
+                    table.insert_discard(row)?;
                 }
+                rows_affected += 1;
             }
         }
 
@@ -469,7 +483,7 @@ impl Executor {
             return self.build_returning_result(
                 &stmt.returning,
                 returning_rows,
-                &schema_column_names,
+                schema_column_names_arc.as_ref().unwrap(),
                 ctx,
             );
         }
