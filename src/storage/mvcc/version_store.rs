@@ -4696,4 +4696,840 @@ mod tests {
         );
         assert!(count >= 2, "Chain length {} should be at least 2", count);
     }
+
+    #[test]
+    fn test_row_version_with_timestamp() {
+        let row = Row::from(vec![Value::from(1)]);
+        let timestamp = 12345678;
+        let version = RowVersion::new_with_timestamp(1, 100, row, timestamp);
+
+        assert_eq!(version.txn_id, 1);
+        assert_eq!(version.row_id, 100);
+        assert_eq!(version.create_time, timestamp);
+        assert!(!version.is_deleted());
+    }
+
+    #[test]
+    fn test_row_version_deleted_with_timestamp() {
+        let row = Row::from(vec![Value::from(1)]);
+        let timestamp = 87654321;
+        let version = RowVersion::new_deleted_with_timestamp(1, 100, row, timestamp);
+
+        assert_eq!(version.txn_id, 1);
+        assert_eq!(version.deleted_at_txn_id, 1);
+        assert_eq!(version.create_time, timestamp);
+        assert!(version.is_deleted());
+    }
+
+    #[test]
+    fn test_row_version_debug_display() {
+        let row = Row::from(vec![Value::from(42)]);
+        let version = RowVersion::new(1, 100, row);
+
+        let debug = format!("{:?}", version);
+        assert!(debug.contains("RowVersion"));
+        assert!(debug.contains("txn_id: 1"));
+        assert!(debug.contains("row_id: 100"));
+
+        let display = format!("{}", version);
+        assert!(display.contains("TxnID: 1"));
+        assert!(display.contains("RowID: 100"));
+    }
+
+    #[test]
+    fn test_write_set_entry_clone() {
+        let row = Row::from(vec![Value::from(1)]);
+        let version = RowVersion::new(1, 100, row);
+
+        let entry = WriteSetEntry {
+            read_version: Some(version),
+            read_version_seq: 42,
+        };
+
+        let cloned = entry.clone();
+        assert!(cloned.read_version.is_some());
+        assert_eq!(cloned.read_version_seq, 42);
+
+        // Test with None
+        let empty_entry = WriteSetEntry {
+            read_version: None,
+            read_version_seq: 0,
+        };
+        let cloned_empty = empty_entry.clone();
+        assert!(cloned_empty.read_version.is_none());
+    }
+
+    #[test]
+    fn test_row_index() {
+        let idx = RowIndex {
+            row_id: 100,
+            arena_idx: Some(5),
+        };
+
+        // Test Copy trait
+        let copied = idx;
+        assert_eq!(copied.row_id, 100);
+        assert_eq!(copied.arena_idx, Some(5));
+
+        // Test Clone trait (use Clone::clone to avoid clone_on_copy warning)
+        let cloned = Clone::clone(&idx);
+        assert_eq!(cloned.row_id, 100);
+
+        // Test with None arena_idx
+        let idx_none = RowIndex {
+            row_id: 200,
+            arena_idx: None,
+        };
+        assert!(idx_none.arena_idx.is_none());
+
+        // Test Debug
+        let debug = format!("{:?}", idx);
+        assert!(debug.contains("RowIndex"));
+        assert!(debug.contains("100"));
+    }
+
+    #[test]
+    fn test_aggregate_op() {
+        // Test equality
+        assert_eq!(AggregateOp::Count, AggregateOp::Count);
+        assert_ne!(AggregateOp::Count, AggregateOp::Sum);
+
+        // Test all variants
+        let ops = [
+            AggregateOp::Count,
+            AggregateOp::Sum,
+            AggregateOp::Min,
+            AggregateOp::Max,
+            AggregateOp::Avg,
+        ];
+
+        for op in ops {
+            let debug = format!("{:?}", op);
+            assert!(!debug.is_empty());
+
+            // Test Clone and Copy (use Clone::clone to avoid clone_on_copy warning)
+            let copied = op;
+            let cloned = Clone::clone(&op);
+            assert_eq!(copied, cloned);
+        }
+    }
+
+    #[test]
+    fn test_version_store_with_capacity() {
+        let store = VersionStore::with_capacity("test_table".to_string(), test_schema(), None, 100);
+
+        assert_eq!(store.table_name(), "test_table");
+        assert_eq!(store.row_count(), 0);
+    }
+
+    #[test]
+    fn test_version_store_quick_check_row_existence() {
+        let store = VersionStore::new("test_table".to_string(), test_schema());
+
+        // Row doesn't exist
+        assert!(!store.quick_check_row_existence(100));
+
+        // Add a row
+        let row = Row::from(vec![Value::from(42)]);
+        let version = RowVersion::new(1, 100, row);
+        store.add_version(100, version);
+
+        // Row exists
+        assert!(store.quick_check_row_existence(100));
+        assert!(!store.quick_check_row_existence(200));
+    }
+
+    #[test]
+    fn test_version_store_get_visible_versions_batch() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows
+        for i in 1..=5 {
+            let row = Row::from(vec![Value::from(i * 10)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        // Batch query
+        let row_ids = vec![1, 3, 5, 99]; // 99 doesn't exist
+        let results = store.get_visible_versions_batch(&row_ids, 2);
+
+        assert_eq!(results.len(), 3); // Only 1, 3, 5 exist
+    }
+
+    #[test]
+    fn test_version_store_count_visible_versions_batch() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows
+        for i in 1..=5 {
+            let row = Row::from(vec![Value::from(i)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        let count = store.count_visible_versions_batch(&[1, 2, 3, 99, 100], 2);
+        assert_eq!(count, 3); // Only 1, 2, 3 exist
+    }
+
+    #[test]
+    fn test_version_store_count_visible_rows() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        assert_eq!(store.count_visible_rows(1), 0);
+
+        // Add rows
+        for i in 1..=10 {
+            let row = Row::from(vec![Value::from(i)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        assert_eq!(store.count_visible_rows(2), 10);
+    }
+
+    #[test]
+    fn test_version_store_mark_deleted() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add a row
+        let row = Row::from(vec![Value::from(42)]);
+        let version = RowVersion::new(1, 100, row);
+        store.add_version(100, version);
+
+        // Mark it deleted
+        store.mark_deleted(100, 2);
+
+        // Transaction 1 should still see it
+        assert!(store.get_visible_version(100, 1).is_some());
+
+        // Transaction 3 should not see deleted row
+        assert!(store.get_visible_version(100, 3).is_none());
+
+        // Mark non-existent row as deleted (no-op)
+        store.mark_deleted(999, 2);
+    }
+
+    #[test]
+    fn test_version_store_get_visible_rows_with_limit() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add 20 rows
+        for i in 1..=20 {
+            let row = Row::from(vec![Value::from(i)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        // Get with limit (txn_id, limit, offset)
+        let results = store.get_visible_rows_with_limit(2, 5, 0);
+        assert_eq!(results.len(), 5);
+
+        // Test with offset
+        let results_offset = store.get_visible_rows_with_limit(2, 5, 10);
+        assert_eq!(results_offset.len(), 5);
+    }
+
+    #[test]
+    fn test_version_store_as_of_transaction() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add version from transaction 5
+        let row = Row::from(vec![Value::from(100)]);
+        let version = RowVersion::new(5, 1, row);
+        store.add_version(1, version);
+
+        // Add updated version from transaction 10
+        let row2 = Row::from(vec![Value::from(200)]);
+        let version2 = RowVersion::new(10, 1, row2);
+        store.add_version(1, version2);
+
+        // AS OF transaction 7 should see the first version
+        let result = store.get_visible_version_as_of_transaction(1, 7);
+        assert!(result.is_some());
+        let rv = result.unwrap();
+        assert_eq!(rv.txn_id, 5);
+
+        // AS OF transaction 15 should see the second version
+        let result = store.get_visible_version_as_of_transaction(1, 15);
+        assert!(result.is_some());
+        let rv = result.unwrap();
+        assert_eq!(rv.txn_id, 10);
+
+        // AS OF transaction 3 should see nothing
+        let result = store.get_visible_version_as_of_transaction(1, 3);
+        assert!(result.is_none());
+
+        // Non-existent row
+        let result = store.get_visible_version_as_of_transaction(999, 10);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_version_store_as_of_timestamp() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add version with specific timestamp
+        let row = Row::from(vec![Value::from(100)]);
+        let version = RowVersion::new_with_timestamp(1, 1, row, 1000);
+        store.add_version(1, version);
+
+        // Add version with later timestamp
+        let row2 = Row::from(vec![Value::from(200)]);
+        let version2 = RowVersion::new_with_timestamp(2, 1, row2, 2000);
+        store.add_version(1, version2);
+
+        // AS OF timestamp 1500 should see first version
+        let result = store.get_visible_version_as_of_timestamp(1, 1500);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().create_time, 1000);
+
+        // AS OF timestamp 2500 should see second version
+        let result = store.get_visible_version_as_of_timestamp(1, 2500);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().create_time, 2000);
+
+        // AS OF timestamp 500 should see nothing
+        let result = store.get_visible_version_as_of_timestamp(1, 500);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_version_store_sum_column() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows with integer values
+        for i in 1..=5 {
+            let row = Row::from(vec![Value::from(i * 10)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        let (sum, count) = store.sum_column(2, 0);
+        assert_eq!(sum, 150.0); // 10 + 20 + 30 + 40 + 50
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_version_store_sum_column_with_floats() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows with float values
+        let values = [1.5, 2.5, 3.5];
+        for (i, v) in values.iter().enumerate() {
+            let row = Row::from(vec![Value::from(*v)]);
+            let version = RowVersion::new(1, (i + 1) as i64, row);
+            store.add_version((i + 1) as i64, version);
+        }
+
+        let (sum, count) = store.sum_column(2, 0);
+        assert!((sum - 7.5).abs() < 0.001);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_version_store_min_max_column() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows
+        for i in [30, 10, 50, 20, 40] {
+            let row = Row::from(vec![Value::from(i)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        let min = store.min_column(2, 0);
+        assert_eq!(min, Some(Value::from(10)));
+
+        let max = store.max_column(2, 0);
+        assert_eq!(max, Some(Value::from(50)));
+    }
+
+    #[test]
+    fn test_version_store_min_max_empty() {
+        let store = VersionStore::new("test_table".to_string(), test_schema());
+
+        let min = store.min_column(1, 0);
+        assert!(min.is_none());
+
+        let max = store.max_column(1, 0);
+        assert!(max.is_none());
+    }
+
+    #[test]
+    fn test_version_store_compute_aggregates() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows
+        for i in 1..=5 {
+            let row = Row::from(vec![Value::from(i * 10)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        // Compute multiple aggregates at once
+        let ops = vec![
+            (AggregateOp::Count, 0),
+            (AggregateOp::Sum, 0),
+            (AggregateOp::Min, 0),
+            (AggregateOp::Max, 0),
+            (AggregateOp::Avg, 0),
+        ];
+
+        let results = store.compute_aggregates(2, &ops);
+        assert_eq!(results.len(), 5);
+
+        // Check count
+        match &results[0] {
+            AggregateResult::Count(c) => assert_eq!(*c, 5),
+            _ => panic!("Expected Count"),
+        }
+
+        // Check sum
+        match &results[1] {
+            AggregateResult::Sum(s, _) => assert_eq!(*s, 150.0),
+            _ => panic!("Expected Sum"),
+        }
+
+        // Check min
+        match &results[2] {
+            AggregateResult::Min(Some(v)) => assert_eq!(*v, Value::from(10)),
+            _ => panic!("Expected Min"),
+        }
+
+        // Check max
+        match &results[3] {
+            AggregateResult::Max(Some(v)) => assert_eq!(*v, Value::from(50)),
+            _ => panic!("Expected Max"),
+        }
+
+        // Check avg (returns sum, count - caller computes sum/count)
+        match &results[4] {
+            AggregateResult::Avg(sum, count) => {
+                let avg = sum / *count as f64;
+                assert!((avg - 30.0).abs() < 0.001);
+            }
+            _ => panic!("Expected Avg"),
+        }
+    }
+
+    #[test]
+    fn test_version_store_stream_visible_rows() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows
+        for i in 1..=3 {
+            let row = Row::from(vec![Value::from(i * 10)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        let mut stream = store.stream_visible_rows(2);
+        let mut count = 0;
+
+        while stream.next() {
+            count += 1;
+            let slice = stream.row_slice();
+            assert!(!slice.is_empty());
+        }
+
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_version_store_row_claim() {
+        let store = VersionStore::new("test_table".to_string(), test_schema());
+
+        // Claim a row
+        assert!(store.try_claim_row(100, 1).is_ok());
+
+        // Same transaction can claim again
+        assert!(store.try_claim_row(100, 1).is_ok());
+
+        // Different transaction should fail
+        assert!(store.try_claim_row(100, 2).is_err());
+
+        // Release and another transaction can claim
+        store.release_row_claim(100, 1);
+        assert!(store.try_claim_row(100, 2).is_ok());
+    }
+
+    #[test]
+    fn test_version_store_index_operations() {
+        use crate::core::types::DataType;
+        use crate::storage::mvcc::hash_index::HashIndex;
+
+        let store = VersionStore::new("test_table".to_string(), test_schema());
+
+        // No indexes initially
+        assert!(!store.index_exists("idx_test"));
+        assert!(store.list_indexes().is_empty());
+
+        // Add an index with all required parameters
+        let index = Arc::new(HashIndex::new(
+            "idx_test".to_string(),
+            "test_table".to_string(),
+            vec!["test_col".to_string()],
+            vec![0],
+            vec![DataType::Integer],
+            false,
+        ));
+        store.add_index("idx_test".to_string(), index);
+
+        assert!(store.index_exists("idx_test"));
+        assert_eq!(store.list_indexes().len(), 1);
+
+        // Get index
+        assert!(store.get_index("idx_test").is_some());
+        assert!(store.get_index("nonexistent").is_none());
+
+        // Get by column
+        assert!(store.get_index_by_column("test_col").is_some());
+
+        // Remove index
+        let removed = store.remove_index("idx_test");
+        assert!(removed.is_some());
+        assert!(!store.index_exists("idx_test"));
+    }
+
+    #[test]
+    fn test_version_store_get_current_sequence() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Sequence should increment
+        let seq1 = store.get_current_sequence();
+        let seq2 = store.get_current_sequence();
+        assert!(seq2 > seq1);
+    }
+
+    #[test]
+    fn test_version_store_get_visible_row_indices() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows
+        for i in 1..=5 {
+            let row = Row::from(vec![Value::from(i)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        let indices = store.get_visible_row_indices(2);
+        assert_eq!(indices.len(), 5);
+
+        // Verify indices can be materialized
+        let materialized = store.materialize_rows(&indices);
+        assert_eq!(materialized.len(), 5);
+    }
+
+    #[test]
+    fn test_version_store_get_column_value() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add a row with multiple columns
+        let row = Row::from(vec![Value::from(42), Value::from("test")]);
+        let version = RowVersion::new(1, 1, row);
+        store.add_version(1, version);
+
+        let indices = store.get_visible_row_indices(2);
+        assert_eq!(indices.len(), 1);
+
+        // Get column values
+        let val = store.get_column_value(&indices[0], 0);
+        assert_eq!(val, Some(Value::from(42)));
+
+        let val = store.get_column_value(&indices[0], 1);
+        assert_eq!(val, Some(Value::from("test")));
+
+        // Out of bounds column
+        let val = store.get_column_value(&indices[0], 99);
+        assert!(val.is_none());
+    }
+
+    #[test]
+    fn test_version_store_apply_recovered_version() {
+        let store = VersionStore::new("test_table".to_string(), test_schema());
+
+        // Apply a recovered version
+        let row = Row::from(vec![Value::from(42)]);
+        let version = RowVersion::new(1, 100, row);
+        store.apply_recovered_version(version);
+
+        assert_eq!(store.row_count(), 1);
+        assert!(store.quick_check_row_existence(100));
+    }
+
+    #[test]
+    fn test_version_store_schema_operations() {
+        let store = VersionStore::new("test_table".to_string(), test_schema());
+
+        // Get schema
+        let schema = store.schema();
+        assert_eq!(schema.table_name, "test_table");
+
+        // Modify schema through mutable reference
+        {
+            let schema_guard = store.schema_mut();
+            // Just verify we can get mutable access
+            assert_eq!(schema_guard.table_name, "test_table");
+        }
+    }
+
+    #[test]
+    fn test_version_store_visibility_checker_setter() {
+        let mut store = VersionStore::new("test_table".to_string(), test_schema());
+
+        // Set a new visibility checker
+        let checker = Arc::new(TestVisibilityChecker::new());
+        store.set_visibility_checker(checker);
+
+        // Verify it works with the new checker
+        let row = Row::from(vec![Value::from(42)]);
+        let version = RowVersion::new(1, 100, row);
+        store.add_version(100, version);
+
+        let visible = store.get_visible_version(100, 2);
+        assert!(visible.is_some());
+    }
+
+    #[test]
+    fn test_transaction_version_store_update() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "test_table".to_string(),
+            test_schema(),
+            checker,
+        ));
+
+        // Add a row first
+        let row = Row::from(vec![Value::from(42)]);
+        let version = RowVersion::new(1, 100, row);
+        store.add_version(100, version);
+
+        // Start a new transaction and update
+        let mut tvs = TransactionVersionStore::new(Arc::clone(&store), 2);
+
+        // Update the row (is_delete = false for updates)
+        let new_row = Row::from(vec![Value::from(99)]);
+        tvs.put(100, new_row, false).unwrap();
+
+        // Should see updated value locally
+        let got = tvs.get(100);
+        assert!(got.is_some());
+        let data = got.unwrap();
+        assert_eq!(data.get(0), Some(&Value::from(99)));
+
+        // Commit
+        tvs.commit().unwrap();
+
+        // Updated value should be visible
+        let visible = store.get_visible_version(100, 3);
+        assert!(visible.is_some());
+        assert_eq!(visible.unwrap().data.get(0), Some(&Value::from(99)));
+    }
+
+    #[test]
+    fn test_transaction_version_store_delete() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "test_table".to_string(),
+            test_schema(),
+            checker,
+        ));
+
+        // Add a row first
+        let row = Row::from(vec![Value::from(42)]);
+        let version = RowVersion::new(1, 100, row);
+        store.add_version(100, version);
+
+        // Start a new transaction and delete
+        let mut tvs = TransactionVersionStore::new(Arc::clone(&store), 2);
+
+        // Delete the row by using put with is_delete=true
+        let delete_row = Row::from(vec![Value::from(42)]);
+        tvs.put(100, delete_row, true).unwrap(); // is_delete = true
+
+        // Should see it as deleted locally
+        let got = tvs.get(100);
+        assert!(got.is_none());
+
+        // Commit
+        tvs.commit().unwrap();
+
+        // Should not be visible after commit
+        let visible = store.get_visible_version(100, 3);
+        assert!(visible.is_none());
+    }
+
+    #[test]
+    fn test_get_all_visible_rows() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows
+        for i in 1..=5 {
+            let row = Row::from(vec![Value::from(i * 10)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        let rows = store.get_all_visible_rows(2);
+        assert_eq!(rows.len(), 5);
+
+        // Verify values
+        let values: Vec<i64> = rows
+            .iter()
+            .map(|(_, row)| match row.get(0) {
+                Some(Value::Integer(i)) => *i,
+                _ => panic!("Expected integer"),
+            })
+            .collect();
+
+        assert!(values.contains(&10));
+        assert!(values.contains(&50));
+    }
+
+    #[test]
+    fn test_get_all_visible_row_ids() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows
+        for i in 1..=5 {
+            let row = Row::from(vec![Value::from(i)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        let row_ids = store.get_all_visible_row_ids(2);
+        assert_eq!(row_ids.len(), 5);
+        assert!(row_ids.contains(&1));
+        assert!(row_ids.contains(&5));
+    }
+
+    #[test]
+    fn test_collect_rows_pk_ordered() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows in non-sequential order
+        for i in [5, 3, 1, 4, 2] {
+            let row = Row::from(vec![Value::from(i * 10)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        // Get rows in ascending PK order
+        let rows = store.collect_rows_pk_ordered(2, true, 3, 0);
+        assert!(rows.is_some());
+        let rows = rows.unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // First 3 rows in ascending PK order should be row_ids 1, 2, 3
+        // With values 10, 20, 30
+        assert_eq!(rows[0].get(0), Some(&Value::from(10)));
+        assert_eq!(rows[1].get(0), Some(&Value::from(20)));
+        assert_eq!(rows[2].get(0), Some(&Value::from(30)));
+
+        // Test descending order
+        let rows_desc = store.collect_rows_pk_ordered(2, false, 3, 0);
+        assert!(rows_desc.is_some());
+        let rows_desc = rows_desc.unwrap();
+        assert_eq!(rows_desc.len(), 3);
+
+        // First 3 rows in descending PK order should be row_ids 5, 4, 3
+        // With values 50, 40, 30
+        assert_eq!(rows_desc[0].get(0), Some(&Value::from(50)));
+        assert_eq!(rows_desc[1].get(0), Some(&Value::from(40)));
+        assert_eq!(rows_desc[2].get(0), Some(&Value::from(30)));
+
+        // Test with offset
+        let rows_offset = store.collect_rows_pk_ordered(2, true, 2, 2);
+        assert!(rows_offset.is_some());
+        let rows_offset = rows_offset.unwrap();
+        assert_eq!(rows_offset.len(), 2);
+        // Skip first 2 (values 10, 20), get next 2 (values 30, 40)
+        assert_eq!(rows_offset[0].get(0), Some(&Value::from(30)));
+        assert_eq!(rows_offset[1].get(0), Some(&Value::from(40)));
+    }
+
+    #[test]
+    fn test_count_visible() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        assert_eq!(store.count_visible(1), 0);
+
+        // Add rows
+        for i in 1..=10 {
+            let row = Row::from(vec![Value::from(i)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        assert_eq!(store.count_visible(2), 10);
+    }
+
+    #[test]
+    fn test_materialize_single_row() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add a row
+        let row = Row::from(vec![Value::from(42)]);
+        let version = RowVersion::new(1, 100, row);
+        store.add_version(100, version);
+
+        let indices = store.get_visible_row_indices(2);
+        assert_eq!(indices.len(), 1);
+
+        // Materialize single row
+        let result = store.materialize_row(&indices[0]);
+        assert!(result.is_some());
+        let (row_id, row) = result.unwrap();
+        assert_eq!(row_id, 100);
+        assert_eq!(row.get(0), Some(&Value::from(42)));
+
+        // Invalid index
+        let invalid_idx = RowIndex {
+            row_id: 999,
+            arena_idx: None,
+        };
+        let result = store.materialize_row(&invalid_idx);
+        assert!(result.is_none());
+    }
 }

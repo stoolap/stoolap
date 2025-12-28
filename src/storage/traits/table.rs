@@ -942,11 +942,201 @@ pub trait Table: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    // Table tests will be implemented when we have concrete implementations
-    // For now, just verify the trait compiles correctly
-
     use super::*;
 
     // Verify trait is object-safe
     fn _assert_object_safe(_: &dyn Table) {}
+
+    // ScanPlan Display tests
+
+    #[test]
+    fn test_seq_scan_display_without_filter() {
+        let plan = ScanPlan::SeqScan {
+            table: "users".to_string(),
+            filter: None,
+        };
+        let display = format!("{}", plan);
+        assert_eq!(display, "Seq Scan on users");
+    }
+
+    #[test]
+    fn test_seq_scan_display_with_filter() {
+        let plan = ScanPlan::SeqScan {
+            table: "orders".to_string(),
+            filter: Some("amount > 100".to_string()),
+        };
+        let display = format!("{}", plan);
+        assert!(display.contains("Seq Scan on orders"));
+        assert!(display.contains("Filter: amount > 100"));
+    }
+
+    #[test]
+    fn test_parallel_seq_scan_display_without_filter() {
+        let plan = ScanPlan::ParallelSeqScan {
+            table: "products".to_string(),
+            filter: None,
+            workers: 4,
+        };
+        let display = format!("{}", plan);
+        assert_eq!(display, "Parallel Seq Scan on products (workers=4)");
+    }
+
+    #[test]
+    fn test_parallel_seq_scan_display_with_filter() {
+        let plan = ScanPlan::ParallelSeqScan {
+            table: "items".to_string(),
+            filter: Some("price < 50".to_string()),
+            workers: 8,
+        };
+        let display = format!("{}", plan);
+        assert!(display.contains("Parallel Seq Scan on items (workers=8)"));
+        assert!(display.contains("Filter: price < 50"));
+    }
+
+    #[test]
+    fn test_pk_lookup_display() {
+        let plan = ScanPlan::PkLookup {
+            table: "users".to_string(),
+            pk_column: "id".to_string(),
+            pk_value: "42".to_string(),
+        };
+        let display = format!("{}", plan);
+        assert!(display.contains("PK Lookup on users"));
+        assert!(display.contains("id = 42"));
+    }
+
+    #[test]
+    fn test_index_scan_display() {
+        let plan = ScanPlan::IndexScan {
+            table: "orders".to_string(),
+            index_name: "idx_customer_id".to_string(),
+            column: "customer_id".to_string(),
+            condition: "= 123".to_string(),
+        };
+        let display = format!("{}", plan);
+        assert!(display.contains("Index Scan using idx_customer_id on orders"));
+        assert!(display.contains("Index Cond: customer_id = 123"));
+    }
+
+    #[test]
+    fn test_multi_index_scan_display_and() {
+        let plan = ScanPlan::MultiIndexScan {
+            table: "products".to_string(),
+            indexes: vec![
+                (
+                    "idx_category".to_string(),
+                    "category".to_string(),
+                    "= 'electronics'".to_string(),
+                ),
+                (
+                    "idx_price".to_string(),
+                    "price".to_string(),
+                    "> 100".to_string(),
+                ),
+            ],
+            operation: "AND".to_string(),
+        };
+        let display = format!("{}", plan);
+        assert!(display.contains("Multi-Index Scan on products (AND)"));
+        assert!(display.contains("idx_category on category: = 'electronics'"));
+        assert!(display.contains("idx_price on price: > 100"));
+    }
+
+    #[test]
+    fn test_multi_index_scan_display_or() {
+        let plan = ScanPlan::MultiIndexScan {
+            table: "items".to_string(),
+            indexes: vec![
+                ("idx_a".to_string(), "col_a".to_string(), "= 1".to_string()),
+                ("idx_b".to_string(), "col_b".to_string(), "= 2".to_string()),
+            ],
+            operation: "OR".to_string(),
+        };
+        let display = format!("{}", plan);
+        assert!(display.contains("Multi-Index Scan on items (OR)"));
+    }
+
+    #[test]
+    fn test_composite_index_scan_display() {
+        let plan = ScanPlan::CompositeIndexScan {
+            table: "orders".to_string(),
+            index_name: "idx_cust_date".to_string(),
+            columns: vec!["customer_id".to_string(), "order_date".to_string()],
+            conditions: vec!["= 100".to_string(), "> '2024-01-01'".to_string()],
+        };
+        let display = format!("{}", plan);
+        assert!(display.contains("Composite Index Scan using idx_cust_date on orders"));
+        assert!(display.contains("Columns: (customer_id, order_date)"));
+        assert!(display.contains("customer_id = 100"));
+        assert!(display.contains("order_date > '2024-01-01'"));
+    }
+
+    #[test]
+    fn test_scan_plan_debug() {
+        let plan = ScanPlan::SeqScan {
+            table: "test".to_string(),
+            filter: Some("x > 1".to_string()),
+        };
+        let debug = format!("{:?}", plan);
+        assert!(debug.contains("SeqScan"));
+        assert!(debug.contains("test"));
+    }
+
+    #[test]
+    fn test_scan_plan_clone() {
+        let plan = ScanPlan::PkLookup {
+            table: "users".to_string(),
+            pk_column: "id".to_string(),
+            pk_value: "1".to_string(),
+        };
+        let cloned = plan.clone();
+        match cloned {
+            ScanPlan::PkLookup {
+                table,
+                pk_column,
+                pk_value,
+            } => {
+                assert_eq!(table, "users");
+                assert_eq!(pk_column, "id");
+                assert_eq!(pk_value, "1");
+            }
+            _ => panic!("Expected PkLookup"),
+        }
+    }
+
+    #[test]
+    fn test_multi_index_scan_empty_indexes() {
+        let plan = ScanPlan::MultiIndexScan {
+            table: "empty".to_string(),
+            indexes: vec![],
+            operation: "AND".to_string(),
+        };
+        let display = format!("{}", plan);
+        assert!(display.contains("Multi-Index Scan on empty (AND)"));
+    }
+
+    #[test]
+    fn test_composite_index_scan_single_column() {
+        let plan = ScanPlan::CompositeIndexScan {
+            table: "single".to_string(),
+            index_name: "idx_single".to_string(),
+            columns: vec!["id".to_string()],
+            conditions: vec!["= 1".to_string()],
+        };
+        let display = format!("{}", plan);
+        assert!(display.contains("Composite Index Scan using idx_single on single"));
+        assert!(display.contains("Columns: (id)"));
+        assert!(display.contains("id = 1"));
+    }
+
+    #[test]
+    fn test_parallel_seq_scan_single_worker() {
+        let plan = ScanPlan::ParallelSeqScan {
+            table: "small".to_string(),
+            filter: None,
+            workers: 1,
+        };
+        let display = format!("{}", plan);
+        assert_eq!(display, "Parallel Seq Scan on small (workers=1)");
+    }
 }
