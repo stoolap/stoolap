@@ -146,6 +146,8 @@ pub struct ExecutorMemoryResult {
     columns: Arc<Vec<String>>,
     /// Result rows - either owned or shared
     rows: RowStorage,
+    /// Cached row count to avoid repeated match in next()
+    len: usize,
     /// Current row index (None before first next())
     current_index: Option<usize>,
     /// Whether the result is closed
@@ -159,9 +161,11 @@ pub struct ExecutorMemoryResult {
 impl ExecutorMemoryResult {
     /// Create a new memory result with columns and rows
     pub fn new(columns: Vec<String>, rows: Vec<Row>) -> Self {
+        let len = rows.len();
         Self {
             columns: Arc::new(columns),
             rows: RowStorage::Owned(rows),
+            len,
             current_index: None,
             closed: false,
             affected: 0,
@@ -171,9 +175,11 @@ impl ExecutorMemoryResult {
 
     /// Create a new memory result with Arc columns (zero-copy)
     pub fn with_arc_columns(columns: Arc<Vec<String>>, rows: Vec<Row>) -> Self {
+        let len = rows.len();
         Self {
             columns,
             rows: RowStorage::Owned(rows),
+            len,
             current_index: None,
             closed: false,
             affected: 0,
@@ -184,9 +190,11 @@ impl ExecutorMemoryResult {
     /// Create a new memory result with shared rows from cache (zero-copy for rows)
     /// This avoids cloning the entire Vec<Row> when reading from semantic cache
     pub fn with_shared_rows(columns: Vec<String>, rows: Arc<Vec<Row>>) -> Self {
+        let len = rows.len();
         Self {
             columns: Arc::new(columns),
             rows: RowStorage::Shared(rows),
+            len,
             current_index: None,
             closed: false,
             affected: 0,
@@ -196,9 +204,11 @@ impl ExecutorMemoryResult {
 
     /// Create a new memory result with Arc columns and shared rows (zero-copy for both)
     pub fn with_arc_columns_shared_rows(columns: Arc<Vec<String>>, rows: Arc<Vec<Row>>) -> Self {
+        let len = rows.len();
         Self {
             columns,
             rows: RowStorage::Shared(rows),
+            len,
             current_index: None,
             closed: false,
             affected: 0,
@@ -209,9 +219,11 @@ impl ExecutorMemoryResult {
     /// Create a new memory result with both Arc columns and Arc rows (fully zero-copy)
     /// This is the most efficient constructor for cached/shared results
     pub fn with_arc_all(columns: Arc<Vec<String>>, rows: Arc<Vec<Row>>) -> Self {
+        let len = rows.len();
         Self {
             columns,
             rows: RowStorage::Shared(rows),
+            len,
             current_index: None,
             closed: false,
             affected: 0,
@@ -242,12 +254,14 @@ impl ExecutorMemoryResult {
         }
         if let RowStorage::Owned(rows) = &mut self.rows {
             rows.push(row);
+            self.len += 1;
         }
     }
 
     /// Get the number of rows
+    #[inline]
     pub fn row_count(&self) -> usize {
-        self.rows.len()
+        self.len
     }
 
     /// Get all rows
@@ -303,6 +317,7 @@ impl QueryResult for ExecutorMemoryResult {
         Some(Arc::clone(&self.columns))
     }
 
+    #[inline]
     fn next(&mut self) -> bool {
         if self.closed {
             return false;
@@ -313,7 +328,7 @@ impl QueryResult for ExecutorMemoryResult {
             Some(i) => i + 1,
         };
 
-        if next_index < self.rows.len() {
+        if next_index < self.len {
             self.current_index = Some(next_index);
             true
         } else {

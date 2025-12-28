@@ -183,12 +183,9 @@ impl JoinHashTable {
             // Insert into hash table
             table.insert(hash, idx as u32);
 
-            // Insert into bloom filter using the same key values
-            for &key_idx in key_indices {
-                if let Some(value) = row.get(key_idx) {
-                    bloom_builder.insert(value);
-                }
-            }
+            // Insert into bloom filter using the same pre-computed hash
+            // This avoids re-hashing the same key values
+            bloom_builder.insert_raw_hash(hash);
         }
 
         table
@@ -300,6 +297,37 @@ impl Iterator for ProbeIter<'_> {
 // ============================================================================
 // Hashing Utilities
 // ============================================================================
+
+/// Hash values at given indices using a get function.
+///
+/// This is a generic version that works with any type that provides indexed access
+/// to values (Row, RowRef, etc.). Uses the same FxHash algorithm as hash_row_keys.
+#[inline]
+pub fn hash_keys_with<'a, F>(key_indices: &[usize], get_value: F) -> u64
+where
+    F: Fn(usize) -> Option<&'a Value>,
+{
+    // Fast path for single integer key (most common case: PK joins)
+    if key_indices.len() == 1 {
+        if let Some(Value::Integer(i)) = get_value(key_indices[0]) {
+            // FxHash for single integer - very fast
+            return (*i as u64).wrapping_mul(0x517cc1b727220a95);
+        }
+    }
+
+    let mut hasher = FxHasher::default();
+
+    for &idx in key_indices {
+        if let Some(value) = get_value(idx) {
+            hash_value(&mut hasher, value);
+        } else {
+            // NULL marker - use a sentinel that's unlikely to collide
+            0xDEADBEEF_u64.hash(&mut hasher);
+        }
+    }
+
+    hasher.finish()
+}
 
 /// Hash row key columns into a single u64.
 ///

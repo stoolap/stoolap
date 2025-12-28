@@ -23,9 +23,9 @@
 //!
 //! 1. The bloom filter is built from the build side of a hash join
 //! 2. This operator wraps the probe side input
-//! 3. For each probe row, we check if the join key MIGHT be in the filter
-//! 4. If `might_match` returns false, the row is definitely not in build side
-//! 5. If `might_match` returns true, the row MIGHT match (false positives possible)
+//! 3. For each probe row, we compute a combined hash of all join keys
+//! 4. If `might_match_raw_hash` returns false, the row is definitely not in build side
+//! 5. If it returns true, the row MIGHT match (false positives possible)
 //!
 //! # Performance
 //!
@@ -33,24 +33,15 @@
 //! - **Worst case**: Low selectivity (many matches) - small overhead per row
 //! - **Typical gain**: 10-40% fewer hash table probes
 //!
-//! # Limitations
+//! # Multi-Column Join Support
 //!
-//! **Single-key filtering only**: For multi-column joins (e.g., `ON a.x = b.x AND a.y = b.y`),
-//! the bloom filter only checks the first join key. This is a deliberate tradeoff:
-//!
-//! - **Why single key**: Combining multiple keys into a composite hash would require
-//!   allocating a tuple or computing a combined hash, adding overhead per row.
-//!   Single-key filtering is simpler and still effective for most joins.
-//!
-//! - **Impact**: For multi-column joins, the filter may have more false positives
-//!   since it only filters on one dimension. Rows that don't match on the first
-//!   key are filtered; rows that match the first key but not subsequent keys
-//!   will pass through to the hash join (which handles them correctly).
-//!
-//! - **Future improvement**: Could extend to use a composite bloom filter that
-//!   hashes all join keys together, reducing false positives for multi-key joins.
+//! This operator uses the same combined hash function as the join hash table,
+//! ensuring correct filtering for both single-key and multi-column joins.
+//! The hash is computed once and reused for both bloom filter check and
+//! hash table probe.
 
 use crate::core::Result;
+use crate::executor::hash_table::hash_keys_with;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::optimizer::bloom::RuntimeBloomFilter;
 
@@ -63,8 +54,8 @@ pub struct BloomFilterOperator {
     child: Box<dyn Operator>,
     /// Bloom filter built from join build side
     bloom_filter: RuntimeBloomFilter,
-    /// Column index of the join key in the probe schema
-    key_column_idx: usize,
+    /// Column indices of the join keys in the probe schema
+    key_indices: Vec<usize>,
     /// Whether the operator has been opened
     opened: bool,
     /// Statistics: total rows checked
@@ -80,16 +71,16 @@ impl BloomFilterOperator {
     ///
     /// * `child` - The probe side input operator
     /// * `bloom_filter` - Bloom filter built from join build side
-    /// * `key_column_idx` - Index of the join key column in probe schema
+    /// * `key_indices` - Indices of the join key columns in probe schema
     pub fn new(
         child: Box<dyn Operator>,
         bloom_filter: RuntimeBloomFilter,
-        key_column_idx: usize,
+        key_indices: Vec<usize>,
     ) -> Self {
         Self {
             child,
             bloom_filter,
-            key_column_idx,
+            key_indices,
             opened: false,
             rows_checked: 0,
             rows_passed: 0,
@@ -137,20 +128,27 @@ impl Operator for BloomFilterOperator {
         while let Some(row_ref) = self.child.next()? {
             self.rows_checked += 1;
 
-            // Get the key value from the row
-            if let Some(value) = row_ref.get(self.key_column_idx) {
-                // Check bloom filter - if definitely not in build side, skip
-                if self.bloom_filter.might_match(value) {
-                    // Might match - pass through to hash join
-                    self.rows_passed += 1;
-                    return Ok(Some(row_ref));
-                }
-                // Definitely no match - skip this row (bloom filter true negative)
-            } else {
-                // NULL key - pass through (let hash join handle NULL semantics)
+            // Check for NULL keys - pass through to let hash join handle NULL semantics
+            let has_null = self
+                .key_indices
+                .iter()
+                .any(|&idx| row_ref.get(idx).is_none());
+
+            if has_null {
                 self.rows_passed += 1;
                 return Ok(Some(row_ref));
             }
+
+            // Compute combined hash using same algorithm as hash table build
+            let hash = hash_keys_with(&self.key_indices, |idx| row_ref.get(idx));
+
+            // Check bloom filter - if definitely not in build side, skip
+            if self.bloom_filter.might_match_raw_hash(hash) {
+                // Might match - pass through to hash join
+                self.rows_passed += 1;
+                return Ok(Some(row_ref));
+            }
+            // Definitely no match - skip this row (bloom filter true negative)
         }
 
         // No more rows from child
@@ -184,16 +182,26 @@ impl Operator for BloomFilterOperator {
 mod tests {
     use super::*;
     use crate::core::{Row, Value};
+    use crate::executor::hash_table::hash_row_keys;
     use crate::executor::operator::MaterializedOperator;
     use crate::optimizer::bloom::BloomFilterBuilder;
 
     #[test]
     fn test_bloom_filter_operator_basic() {
-        // Build a bloom filter with values 1, 2, 3
+        // Build rows to insert into bloom filter
+        let build_rows = vec![
+            Row::from_values(vec![Value::Integer(1)]),
+            Row::from_values(vec![Value::Integer(2)]),
+            Row::from_values(vec![Value::Integer(3)]),
+        ];
+        let key_indices = vec![0usize];
+
+        // Build bloom filter using same FxHash as hash table
         let mut builder = BloomFilterBuilder::new("id".to_string(), "test".to_string(), 3);
-        builder.insert(&Value::Integer(1));
-        builder.insert(&Value::Integer(2));
-        builder.insert(&Value::Integer(3));
+        for row in &build_rows {
+            let hash = hash_row_keys(row, &key_indices);
+            builder.insert_raw_hash(hash);
+        }
         let bloom = builder.build();
 
         // Create probe rows: 1, 2, 3, 4, 5
@@ -208,7 +216,7 @@ mod tests {
         let schema = vec![ColumnInfo::new("id")];
         let child = Box::new(MaterializedOperator::new(probe_rows, schema));
 
-        let mut op = BloomFilterOperator::new(child, bloom, 0);
+        let mut op = BloomFilterOperator::new(child, bloom, vec![0]);
 
         // Open and collect results
         op.open().unwrap();
@@ -238,7 +246,7 @@ mod tests {
         let schema = vec![ColumnInfo::new("id")];
         let child = Box::new(MaterializedOperator::new(probe_rows, schema));
 
-        let mut op = BloomFilterOperator::new(child, bloom, 0);
+        let mut op = BloomFilterOperator::new(child, bloom, vec![0]);
 
         op.open().unwrap();
         let result = op.next().unwrap();

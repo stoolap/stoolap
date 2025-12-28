@@ -64,9 +64,6 @@ pub struct WindowFunctionInfo {
     pub frame: Option<WindowFrame>,
     /// Result column name (may include alias)
     pub column_name: String,
-    /// Index in the result columns
-    #[allow(dead_code)]
-    pub column_index: usize,
     /// Whether DISTINCT was specified (for COUNT(DISTINCT col) OVER())
     pub is_distinct: bool,
 }
@@ -99,13 +96,61 @@ pub struct WindowPreSortedState {
     pub ascending: bool,
 }
 
+/// Columnar layout for ORDER BY values - optimized for sorting performance
+///
+/// Instead of `Vec<Vec<(Value, bool)>>` (row-oriented, N allocations for N rows),
+/// this uses `Vec<Vec<Value>>` (column-oriented, K allocations for K ORDER BY columns).
+///
+/// Benefits:
+/// - Reduces allocations from O(N) to O(K) where K = number of ORDER BY columns
+/// - Stores ascending flags once per column instead of once per value
+/// - Better cache locality when accessing sort keys across rows
+#[derive(Clone, Debug)]
+pub struct ColumnarOrderByValues {
+    /// Column values: columns[col_idx][row_idx] = value
+    columns: Vec<Vec<Value>>,
+    /// Ascending flags: one per ORDER BY column
+    ascending: Vec<bool>,
+    /// Number of rows
+    num_rows: usize,
+}
+
+impl ColumnarOrderByValues {
+    /// Check if empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.num_rows == 0 || self.columns.is_empty()
+    }
+
+    /// Get number of columns
+    #[inline]
+    pub fn num_columns(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Get value at (row, column)
+    #[inline]
+    pub fn get(&self, row_idx: usize, col_idx: usize) -> Option<&Value> {
+        self.columns.get(col_idx).and_then(|col| col.get(row_idx))
+    }
+
+    /// Get first ORDER BY value for a row
+    #[inline]
+    pub fn get_first(&self, row_idx: usize) -> Option<&Value> {
+        self.get(row_idx, 0)
+    }
+
+    /// Get ascending flag for column
+    #[inline]
+    pub fn is_ascending(&self, col_idx: usize) -> bool {
+        self.ascending.get(col_idx).copied().unwrap_or(true)
+    }
+}
+
 /// Pre-grouped state for window function PARTITION BY optimization
 /// When rows are fetched grouped by an indexed partition column, we can skip hash-based grouping
 #[derive(Clone)]
 pub struct WindowPreGroupedState {
-    /// Column name that rows are partitioned by (lowercase)
-    #[allow(dead_code)]
-    pub column: String,
     /// Pre-built partition map: partition key -> row indices
     pub partition_map: FxHashMap<PartitionKey, Vec<usize>>,
 }
@@ -983,17 +1028,14 @@ impl Executor {
             match col_expr {
                 Expression::Window(window_expr) => {
                     let wf_info =
-                        self.extract_window_function_info(window_expr, col_idx, &stmt.window_defs)?;
+                        self.extract_window_function_info(window_expr, &stmt.window_defs)?;
                     window_functions.push(wf_info);
                     col_idx += 1;
                 }
                 Expression::Aliased(aliased) => {
                     if let Expression::Window(window_expr) = aliased.expression.as_ref() {
-                        let mut wf_info = self.extract_window_function_info(
-                            window_expr,
-                            col_idx,
-                            &stmt.window_defs,
-                        )?;
+                        let mut wf_info =
+                            self.extract_window_function_info(window_expr, &stmt.window_defs)?;
                         wf_info.column_name = aliased.alias.value.clone();
                         window_functions.push(wf_info);
                     } else if let Some(window_expr) =
@@ -1001,11 +1043,8 @@ impl Executor {
                     {
                         // Expression containing window function (e.g., val - LAG(...) AS diff)
                         // Generate synthetic name: __wf_<col_idx>
-                        let mut wf_info = self.extract_window_function_info(
-                            window_expr,
-                            col_idx,
-                            &stmt.window_defs,
-                        )?;
+                        let mut wf_info =
+                            self.extract_window_function_info(window_expr, &stmt.window_defs)?;
                         wf_info.column_name = format!("__wf_{}", col_idx);
                         window_functions.push(wf_info);
                     }
@@ -1014,11 +1053,8 @@ impl Executor {
                 _ => {
                     // Check for window function inside other expressions
                     if let Some(window_expr) = Self::find_window_in_expression(col_expr) {
-                        let mut wf_info = self.extract_window_function_info(
-                            window_expr,
-                            col_idx,
-                            &stmt.window_defs,
-                        )?;
+                        let mut wf_info =
+                            self.extract_window_function_info(window_expr, &stmt.window_defs)?;
                         wf_info.column_name = format!("__wf_{}", col_idx);
                         window_functions.push(wf_info);
                     }
@@ -1150,7 +1186,6 @@ impl Executor {
     fn extract_window_function_info(
         &self,
         window_expr: &WindowExpression,
-        col_idx: usize,
         window_defs: &[WindowDefinition],
     ) -> Result<WindowFunctionInfo> {
         let func = &window_expr.function;
@@ -1204,7 +1239,6 @@ impl Executor {
             order_by,
             frame,
             column_name,
-            column_index: col_idx,
             is_distinct: func.is_distinct,
         })
     }
@@ -1426,7 +1460,7 @@ impl Executor {
         wf_info: &WindowFunctionInfo,
         all_rows: &[Row],
         mut row_indices: Vec<usize>,
-        precomputed_order_by: Option<&Vec<Vec<(Value, bool)>>>,
+        precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
         ctx: &ExecutionContext,
@@ -1435,10 +1469,13 @@ impl Executor {
         // Suppress unused variable warnings - these are needed for compute_lead_lag, compute_ntile, etc.
         let _ = columns;
 
-        // Use precomputed ORDER BY values if available (avoids O(n × p) recomputation)
-        // The precomputed values are indexed by row index in the original rows array
-        let order_by_values: &[Vec<(Value, bool)>] =
-            precomputed_order_by.map(|v| v.as_slice()).unwrap_or(&[]);
+        // Empty fallback for when no precomputed values are provided
+        let empty_order_by = ColumnarOrderByValues {
+            columns: vec![],
+            ascending: vec![],
+            num_rows: 0,
+        };
+        let order_by_values = precomputed_order_by.unwrap_or(&empty_order_by);
 
         // Sort partition by ORDER BY if specified (skip if already pre-sorted by index)
         if !skip_sorting && !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
@@ -1477,9 +1514,8 @@ impl Executor {
                 .iter()
                 .map(|&idx| {
                     order_by_values
-                        .get(idx)
-                        .and_then(|vals| vals.first())
-                        .map(|(v, _)| v.clone())
+                        .get_first(idx)
+                        .cloned()
                         .unwrap_or_else(Value::null_unknown)
                 })
                 .collect()
@@ -1962,8 +1998,8 @@ impl Executor {
         }
     }
 
-    /// Precompute ORDER BY values for all rows
-    /// Returns a vec where each element is a vec of (value, ascending) pairs for one row
+    /// Precompute ORDER BY values for all rows using columnar layout
+    /// Returns a ColumnarOrderByValues structure for cache-efficient sorting
     fn precompute_order_by_values(
         &self,
         order_by: &[OrderByExpression],
@@ -1971,7 +2007,21 @@ impl Executor {
         columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
         ctx: &ExecutionContext,
-    ) -> Vec<Vec<(Value, bool)>> {
+    ) -> ColumnarOrderByValues {
+        let num_rows = rows.len();
+        let num_cols = order_by.len();
+
+        if num_cols == 0 || num_rows == 0 {
+            return ColumnarOrderByValues {
+                columns: vec![],
+                ascending: vec![],
+                num_rows: 0,
+            };
+        }
+
+        // Extract ascending flags once (not per row!)
+        let ascending_flags: Vec<bool> = order_by.iter().map(|ob| ob.ascending).collect();
+
         // Check if any ORDER BY expression is complex (not a simple column reference)
         let has_complex_expr = order_by.iter().any(|ob| {
             !matches!(
@@ -1980,81 +2030,95 @@ impl Executor {
             )
         });
 
+        // Pre-allocate columns with exact capacity
+        let mut result_columns: Vec<Vec<Value>> = (0..num_cols)
+            .map(|_| Vec::with_capacity(num_rows))
+            .collect();
+
         if has_complex_expr {
             // Build aliases from col_index_map (e.g., "sum(val)" -> column_index)
             // This allows ORDER BY SUM(val) to resolve to the correct column
             let agg_aliases: Vec<(String, usize)> =
                 col_index_map.iter().map(|(k, v)| (k.clone(), *v)).collect();
 
-            // Extract order_by expressions and ascending flags
+            // Extract order_by expressions
             let order_exprs: Vec<Expression> =
                 order_by.iter().map(|ob| ob.expression.clone()).collect();
-            let ascending_flags: Vec<bool> = order_by.iter().map(|ob| ob.ascending).collect();
 
             // Compile all expressions with aliases
             match MultiExpressionEval::compile_with_aliases(&order_exprs, columns, &agg_aliases) {
                 Ok(eval) => {
                     let mut eval = eval.with_context(ctx);
-                    rows.iter()
-                        .map(|row| match eval.eval_all(row) {
-                            Ok(values) => values
-                                .into_iter()
-                                .zip(ascending_flags.iter())
-                                .map(|(value, &asc)| (value, asc))
-                                .collect(),
-                            Err(_) => ascending_flags
-                                .iter()
-                                .map(|&asc| (Value::null_unknown(), asc))
-                                .collect(),
-                        })
-                        .collect()
+                    for row in rows {
+                        match eval.eval_all(row) {
+                            Ok(values) => {
+                                for (col_idx, value) in values.into_iter().enumerate() {
+                                    if col_idx < result_columns.len() {
+                                        result_columns[col_idx].push(value);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                for col in result_columns.iter_mut() {
+                                    col.push(Value::null_unknown());
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(_) => {
-                    // Compilation failed - return all nulls
-                    rows.iter()
-                        .map(|_| {
-                            ascending_flags
-                                .iter()
-                                .map(|&asc| (Value::null_unknown(), asc))
-                                .collect()
-                        })
-                        .collect()
+                    // Compilation failed - fill with nulls
+                    for _ in 0..num_rows {
+                        for col in result_columns.iter_mut() {
+                            col.push(Value::null_unknown());
+                        }
+                    }
                 }
             }
         } else {
             // Fast path: simple column references
-            let order_by_indices: Vec<(Option<usize>, bool)> = order_by
+            let order_by_indices: Vec<Option<usize>> = order_by
                 .iter()
-                .map(|ob| {
-                    let idx = match &ob.expression {
-                        Expression::Identifier(id) => col_index_map.get(&id.value_lower).copied(),
-                        Expression::QualifiedIdentifier(qid) => {
-                            let qualified = format!("{}.{}", qid.qualifier.value, qid.name.value)
-                                .to_lowercase();
-                            col_index_map
-                                .get(&qualified)
-                                .or_else(|| col_index_map.get(&qid.name.value_lower))
-                                .copied()
-                        }
-                        _ => None,
-                    };
-                    (idx, ob.ascending)
+                .map(|ob| match &ob.expression {
+                    Expression::Identifier(id) => col_index_map.get(&id.value_lower).copied(),
+                    Expression::QualifiedIdentifier(qid) => {
+                        let qualified =
+                            format!("{}.{}", qid.qualifier.value, qid.name.value).to_lowercase();
+                        col_index_map
+                            .get(&qualified)
+                            .or_else(|| col_index_map.get(&qid.name.value_lower))
+                            .copied()
+                    }
+                    _ => None,
                 })
                 .collect();
 
-            rows.iter()
-                .map(|row| {
-                    order_by_indices
-                        .iter()
-                        .map(|(idx_opt, ascending)| {
-                            let value = idx_opt
-                                .and_then(|idx| row.get(idx).cloned())
-                                .unwrap_or_else(Value::null_unknown);
-                            (value, *ascending)
-                        })
-                        .collect()
-                })
-                .collect()
+            // Extract values column by column for better cache locality
+            for (col_idx, idx_opt) in order_by_indices.iter().enumerate() {
+                let col = &mut result_columns[col_idx];
+                match idx_opt {
+                    Some(src_idx) => {
+                        for row in rows {
+                            col.push(
+                                row.get(*src_idx)
+                                    .cloned()
+                                    .unwrap_or_else(Value::null_unknown),
+                            );
+                        }
+                    }
+                    None => {
+                        for _ in 0..num_rows {
+                            col.push(Value::null_unknown());
+                        }
+                    }
+                }
+            }
+        }
+
+        ColumnarOrderByValues {
+            columns: result_columns,
+            ascending: ascending_flags,
+            num_rows,
         }
     }
 
@@ -2088,27 +2152,23 @@ impl Executor {
         order_col == pre_sorted.column && order_by.ascending == pre_sorted.ascending
     }
 
-    /// Sort row indices using precomputed ORDER BY values
-    fn sort_by_order_values(row_indices: &mut [usize], order_by_values: &[Vec<(Value, bool)>]) {
-        if row_indices.len() < 2 {
+    /// Sort row indices using precomputed ORDER BY values (columnar layout)
+    fn sort_by_order_values(row_indices: &mut [usize], order_by_values: &ColumnarOrderByValues) {
+        if row_indices.len() < 2 || order_by_values.is_empty() {
             return;
         }
 
         // Check if single ORDER BY column (most common case) - use fast path
-        let is_single_order_by = order_by_values
-            .first()
-            .map(|v| v.len() == 1)
-            .unwrap_or(false);
+        let is_single_order_by = order_by_values.num_columns() == 1;
 
         if is_single_order_by {
             // Fast path: single ORDER BY column with type-specific comparison
-            let ascending = order_by_values
-                .first()
-                .and_then(|v| v.first())
-                .map(|(_, asc)| *asc)
-                .unwrap_or(true);
+            let ascending = order_by_values.is_ascending(0);
 
-            // Detect column type from first non-null value (single pass instead of double sampling)
+            // Get direct reference to the column for cache-efficient access
+            let col = &order_by_values.columns[0];
+
+            // Detect column type from first non-null value (single pass)
             #[derive(Clone, Copy, PartialEq)]
             enum DetectedType {
                 Unknown,
@@ -2119,11 +2179,7 @@ impl Executor {
 
             let mut detected = DetectedType::Unknown;
             for &idx in row_indices.iter().take(100) {
-                if let Some(val) = order_by_values
-                    .get(idx)
-                    .and_then(|v| v.first())
-                    .map(|(val, _)| val)
-                {
+                if let Some(val) = col.get(idx) {
                     match val {
                         Value::Integer(_) => {
                             if detected == DetectedType::Unknown {
@@ -2154,16 +2210,16 @@ impl Executor {
 
             match detected {
                 DetectedType::Integer => {
-                    Self::sort_by_integer_key(row_indices, order_by_values, ascending);
+                    Self::sort_by_integer_key_columnar(row_indices, col, ascending);
                     return;
                 }
                 DetectedType::Float => {
-                    Self::sort_by_float_key(row_indices, order_by_values, ascending);
+                    Self::sort_by_float_key_columnar(row_indices, col, ascending);
                     return;
                 }
                 _ => {
                     // Mixed types or unknown - use generic single column sort
-                    Self::sort_single_column(row_indices, order_by_values, ascending);
+                    Self::sort_single_column_columnar(row_indices, col, ascending);
                     return;
                 }
             }
@@ -2173,30 +2229,40 @@ impl Executor {
         const PARALLEL_THRESHOLD: usize = 10_000;
 
         if row_indices.len() >= PARALLEL_THRESHOLD {
-            row_indices
-                .par_sort_unstable_by(|&a, &b| Self::compare_order_values(order_by_values, a, b));
+            row_indices.par_sort_unstable_by(|&a, &b| {
+                Self::compare_order_values_columnar(order_by_values, a, b)
+            });
         } else {
-            row_indices
-                .sort_unstable_by(|&a, &b| Self::compare_order_values(order_by_values, a, b));
+            row_indices.sort_unstable_by(|&a, &b| {
+                Self::compare_order_values_columnar(order_by_values, a, b)
+            });
         }
     }
 
-    /// Compare two rows by their ORDER BY values
+    /// Compare two rows by their ORDER BY values (columnar layout)
     #[inline]
-    fn compare_order_values(
-        order_by_values: &[Vec<(Value, bool)>],
+    fn compare_order_values_columnar(
+        order_by_values: &ColumnarOrderByValues,
         a: usize,
         b: usize,
     ) -> Ordering {
-        let a_vals = &order_by_values[a];
-        let b_vals = &order_by_values[b];
+        for col_idx in 0..order_by_values.num_columns() {
+            let a_val = order_by_values.get(a, col_idx);
+            let b_val = order_by_values.get(b, col_idx);
 
-        for i in 0..a_vals.len() {
-            let (a_val, ascending) = &a_vals[i];
-            let (b_val, _) = &b_vals[i];
+            let cmp = match (a_val, b_val) {
+                (Some(av), Some(bv)) => Self::compare_values_fast(av, bv),
+                (None, None) => Ordering::Equal,
+                (None, _) => Ordering::Greater,
+                (_, None) => Ordering::Less,
+            };
 
-            let cmp = Self::compare_values_fast(a_val, b_val);
-            let cmp = if !ascending { cmp.reverse() } else { cmp };
+            let cmp = if !order_by_values.is_ascending(col_idx) {
+                cmp.reverse()
+            } else {
+                cmp
+            };
+
             if cmp != Ordering::Equal {
                 return cmp;
             }
@@ -2223,19 +2289,13 @@ impl Executor {
         }
     }
 
-    /// Ultra-fast sort for integer ORDER BY column
-    fn sort_by_integer_key(
-        row_indices: &mut [usize],
-        order_by_values: &[Vec<(Value, bool)>],
-        ascending: bool,
-    ) {
+    /// Ultra-fast sort for integer ORDER BY column (columnar layout)
+    fn sort_by_integer_key_columnar(row_indices: &mut [usize], col: &[Value], ascending: bool) {
         const PARALLEL_THRESHOLD: usize = 50_000;
 
         let get_key = |idx: usize| -> i64 {
-            order_by_values
-                .get(idx)
-                .and_then(|v| v.first())
-                .and_then(|(val, _)| {
+            col.get(idx)
+                .and_then(|val| {
                     if let Value::Integer(i) = val {
                         Some(*i)
                     } else {
@@ -2258,19 +2318,13 @@ impl Executor {
         }
     }
 
-    /// Fast sort for float ORDER BY column
-    fn sort_by_float_key(
-        row_indices: &mut [usize],
-        order_by_values: &[Vec<(Value, bool)>],
-        ascending: bool,
-    ) {
+    /// Fast sort for float ORDER BY column (columnar layout)
+    fn sort_by_float_key_columnar(row_indices: &mut [usize], col: &[Value], ascending: bool) {
         const PARALLEL_THRESHOLD: usize = 50_000;
 
         let get_float = |idx: usize| -> f64 {
-            order_by_values
-                .get(idx)
-                .and_then(|v| v.first())
-                .and_then(|(val, _)| {
+            col.get(idx)
+                .and_then(|val| {
                     if let Value::Float(f) = val {
                         Some(*f)
                     } else {
@@ -2297,23 +2351,13 @@ impl Executor {
         }
     }
 
-    /// Single column generic sort (faster than multi-column loop)
-    fn sort_single_column(
-        row_indices: &mut [usize],
-        order_by_values: &[Vec<(Value, bool)>],
-        ascending: bool,
-    ) {
+    /// Single column generic sort (columnar layout)
+    fn sort_single_column_columnar(row_indices: &mut [usize], col: &[Value], ascending: bool) {
         const PARALLEL_THRESHOLD: usize = 10_000;
 
         let compare = |&a: &usize, &b: &usize| -> Ordering {
-            let a_val = order_by_values
-                .get(a)
-                .and_then(|v| v.first())
-                .map(|(v, _)| v);
-            let b_val = order_by_values
-                .get(b)
-                .and_then(|v| v.first())
-                .map(|(v, _)| v);
+            let a_val = col.get(a);
+            let b_val = col.get(b);
 
             let cmp = match (a_val, b_val) {
                 (Some(a), Some(b)) => Self::compare_values_fast(a, b),
@@ -2394,11 +2438,8 @@ impl Executor {
             .collect();
 
         // Precompute ORDER BY values (supports complex expressions like -score)
-        let order_by_values = if !wf_info.order_by.is_empty() {
-            self.precompute_order_by_values(&wf_info.order_by, rows, columns, col_index_map, ctx)
-        } else {
-            vec![]
-        };
+        let order_by_values =
+            self.precompute_order_by_values(&wf_info.order_by, rows, columns, col_index_map, ctx);
 
         // Group rows by partition key
         // OPTIMIZATION: Use SmallVec for partition keys to avoid heap allocation
@@ -2449,15 +2490,24 @@ impl Executor {
                     } else {
                         let mut group_start = 0;
                         // Use precomputed ORDER BY values (supports complex expressions)
-                        let mut prev_values: Vec<Value> = order_by_values[row_indices[0]]
-                            .iter()
-                            .map(|(v, _)| v.clone())
+                        // Collect all column values for first row
+                        let mut prev_values: Vec<Value> = (0..order_by_values.num_columns())
+                            .map(|col_idx| {
+                                order_by_values
+                                    .get(row_indices[0], col_idx)
+                                    .cloned()
+                                    .unwrap_or_else(Value::null_unknown)
+                            })
                             .collect();
 
-                        for i in 1..partition_len {
-                            let current_values: Vec<Value> = order_by_values[row_indices[i]]
-                                .iter()
-                                .map(|(v, _)| v.clone())
+                        for (i, &row_idx) in row_indices.iter().enumerate().skip(1) {
+                            let current_values: Vec<Value> = (0..order_by_values.num_columns())
+                                .map(|col_idx| {
+                                    order_by_values
+                                        .get(row_idx, col_idx)
+                                        .cloned()
+                                        .unwrap_or_else(Value::null_unknown)
+                                })
                                 .collect();
 
                             if current_values != prev_values {
@@ -2495,7 +2545,7 @@ impl Executor {
                         // For RANGE frames with numeric offsets, we need value-based comparison
                         // Get the current row's ORDER BY value for RANGE calculations
                         let current_order_value = if is_range && !order_by_values.is_empty() {
-                            order_by_values[row_idx].first().map(|(v, _)| v.clone())
+                            order_by_values.get_first(row_idx).cloned()
                         } else {
                             None
                         };
@@ -2531,9 +2581,9 @@ impl Executor {
                                             // Linear scan from start to find first row in range
                                             let mut start_idx = 0;
                                             for (j, &idx) in row_indices.iter().enumerate() {
-                                                if let Some(row_val) = order_by_values[idx]
-                                                    .first()
-                                                    .and_then(|(v, _)| value_to_f64(v))
+                                                if let Some(row_val) = order_by_values
+                                                    .get_first(idx)
+                                                    .and_then(value_to_f64)
                                                 {
                                                     if row_val >= lower_bound {
                                                         start_idx = j;
@@ -2567,9 +2617,9 @@ impl Executor {
                                             let lower_bound = curr_f64 + lit.value as f64;
                                             let mut start_idx = partition_len;
                                             for (j, &idx) in row_indices.iter().enumerate() {
-                                                if let Some(row_val) = order_by_values[idx]
-                                                    .first()
-                                                    .and_then(|(v, _)| value_to_f64(v))
+                                                if let Some(row_val) = order_by_values
+                                                    .get_first(idx)
+                                                    .and_then(value_to_f64)
                                                 {
                                                     if row_val >= lower_bound {
                                                         start_idx = j;
@@ -2616,9 +2666,9 @@ impl Executor {
                                                 // Scan from end backwards to find last row in range
                                                 let mut end_idx = 0;
                                                 for (j, &idx) in row_indices.iter().enumerate() {
-                                                    if let Some(row_val) = order_by_values[idx]
-                                                        .first()
-                                                        .and_then(|(v, _)| value_to_f64(v))
+                                                    if let Some(row_val) = order_by_values
+                                                        .get_first(idx)
+                                                        .and_then(value_to_f64)
                                                     {
                                                         if row_val <= upper_bound {
                                                             end_idx = j + 1; // exclusive end
@@ -2648,9 +2698,9 @@ impl Executor {
                                                 let upper_bound = curr_f64 - lit.value as f64;
                                                 let mut end_idx = 0;
                                                 for (j, &idx) in row_indices.iter().enumerate() {
-                                                    if let Some(row_val) = order_by_values[idx]
-                                                        .first()
-                                                        .and_then(|(v, _)| value_to_f64(v))
+                                                    if let Some(row_val) = order_by_values
+                                                        .get_first(idx)
+                                                        .and_then(value_to_f64)
                                                     {
                                                         if row_val <= upper_bound {
                                                             end_idx = j + 1;
@@ -2972,7 +3022,6 @@ mod tests {
             order_by: vec![],
             frame: None,
             column_name: "rn".to_string(),
-            column_index: 0,
             is_distinct: false,
         };
 

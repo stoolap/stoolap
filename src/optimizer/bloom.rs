@@ -141,12 +141,26 @@ impl BloomFilter {
     }
 
     /// Insert a raw hash value
+    #[inline]
     fn insert_hash(&mut self, hash: u64) {
-        for i in 0..self.num_hashes {
-            let bit_idx = self.get_bit_index(hash, i);
+        let h1 = hash as usize;
+        let h2 = (hash >> 32) as usize;
+        let num_bits = self.num_bits;
+        let num_hashes = self.num_hashes;
+        let bits = self.bits.as_mut_ptr();
+
+        let mut i = 0usize;
+        while i < num_hashes {
+            let bit_idx = h1.wrapping_add(i.wrapping_mul(h2)).wrapping_add(i * i) % num_bits;
             let word_idx = bit_idx / 64;
             let bit_offset = bit_idx % 64;
-            self.bits[word_idx] |= 1u64 << bit_offset;
+            // SAFETY: word_idx < bits.len() because:
+            // - bit_idx < num_bits (due to modulo)
+            // - word_idx = bit_idx / 64 < num_bits / 64 <= (num_bits + 63) / 64 = bits.len()
+            unsafe {
+                *bits.add(word_idx) |= 1u64 << bit_offset;
+            }
+            i += 1;
         }
     }
 
@@ -161,14 +175,27 @@ impl BloomFilter {
     }
 
     /// Check using raw hash (internal)
+    #[inline]
     fn might_contain_hash(&self, hash: u64) -> bool {
-        for i in 0..self.num_hashes {
-            let bit_idx = self.get_bit_index(hash, i);
+        let h1 = hash as usize;
+        let h2 = (hash >> 32) as usize;
+        let num_bits = self.num_bits;
+        let num_hashes = self.num_hashes;
+        let bits = self.bits.as_ptr();
+
+        let mut i = 0usize;
+        while i < num_hashes {
+            let bit_idx = h1.wrapping_add(i.wrapping_mul(h2)).wrapping_add(i * i) % num_bits;
             let word_idx = bit_idx / 64;
             let bit_offset = bit_idx % 64;
-            if (self.bits[word_idx] & (1u64 << bit_offset)) == 0 {
+            // SAFETY: word_idx < bits.len() because:
+            // - bit_idx < num_bits (due to modulo)
+            // - word_idx = bit_idx / 64 < num_bits / 64 <= (num_bits + 63) / 64 = bits.len()
+            let word = unsafe { *bits.add(word_idx) };
+            if (word & (1u64 << bit_offset)) == 0 {
                 return false;
             }
+            i += 1;
         }
         true
     }
@@ -189,18 +216,6 @@ impl BloomFilter {
     /// - `false`: Value with this hash is DEFINITELY NOT in the set
     pub fn might_contain_raw_hash(&self, hash: u64) -> bool {
         self.might_contain_hash(hash)
-    }
-
-    /// Get bit index for the i-th hash function
-    ///
-    /// Uses double hashing: h(i) = h1 + i*h2 + i^2
-    /// This provides independent hash functions from a single base hash.
-    fn get_bit_index(&self, hash: u64, i: usize) -> usize {
-        let h1 = hash as usize;
-        let h2 = (hash >> 32) as usize;
-        // Double hashing with quadratic probing for better distribution
-        let combined = h1.wrapping_add(i.wrapping_mul(h2)).wrapping_add(i * i);
-        combined % self.num_bits
     }
 
     /// Hash a Value using AHash (fast and good distribution)
@@ -318,6 +333,13 @@ impl BloomFilterBuilder {
         self.filter.insert(value);
     }
 
+    /// Add a pre-computed hash to the filter
+    /// This is more efficient when the hash is already computed (e.g., during hash table build)
+    #[inline]
+    pub fn insert_raw_hash(&mut self, hash: u64) {
+        self.filter.insert_raw_hash(hash);
+    }
+
     /// Finish building and return the filter
     pub fn build(self) -> RuntimeBloomFilter {
         RuntimeBloomFilter {
@@ -343,6 +365,15 @@ impl RuntimeBloomFilter {
     /// Check if a value might be in the join keys
     pub fn might_match(&self, value: &Value) -> bool {
         self.filter.might_contain(value)
+    }
+
+    /// Check if a pre-computed hash might be in the join keys
+    ///
+    /// This is more efficient when the hash is already computed (e.g., using
+    /// the same hash function as the join hash table).
+    #[inline]
+    pub fn might_match_raw_hash(&self, hash: u64) -> bool {
+        self.filter.might_contain_raw_hash(hash)
     }
 
     /// Get estimated selectivity (fraction of rows that pass)

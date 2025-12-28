@@ -2429,10 +2429,7 @@ impl Executor {
                             (
                                 all_rows,
                                 None,
-                                Some(WindowPreGroupedState {
-                                    column: col_lower,
-                                    partition_map,
-                                }),
+                                Some(WindowPreGroupedState { partition_map }),
                             )
                         } else {
                             (table.collect_all_rows(None)?, None, None)
@@ -3459,7 +3456,7 @@ impl Executor {
                             Box::new(BloomFilterOperator::new(
                                 probe_source,
                                 bf.clone(),
-                                probe_key_indices[0],
+                                probe_key_indices.clone(),
                             ))
                         } else {
                             probe_source
