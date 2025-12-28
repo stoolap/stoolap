@@ -2832,4 +2832,1494 @@ mod tests {
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
+
+    // =========================================================================
+    // ExecuteContext tests
+    // =========================================================================
+
+    #[test]
+    fn test_context_new() {
+        let row = vec![Value::Integer(1), Value::Text("test".into())];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(ctx.row.len(), 2);
+        assert!(ctx.row2.is_none());
+        assert!(ctx.outer_row.is_none());
+        assert!(ctx.params.is_empty());
+    }
+
+    #[test]
+    fn test_context_for_join() {
+        let row1 = vec![Value::Integer(1)];
+        let row2 = vec![Value::Integer(2)];
+        let ctx = ExecuteContext::for_join(&row1, &row2);
+        assert_eq!(ctx.row.len(), 1);
+        assert!(ctx.row2.is_some());
+        assert_eq!(ctx.row2.unwrap()[0], Value::Integer(2));
+    }
+
+    #[test]
+    fn test_context_with_params() {
+        let row = vec![Value::Integer(1)];
+        let params = vec![Value::Text("param1".into())];
+        let ctx = ExecuteContext::new(&row).with_params(&params);
+        assert_eq!(ctx.params.len(), 1);
+    }
+
+    #[test]
+    fn test_context_with_named_params() {
+        let row = vec![Value::Integer(1)];
+        let mut named = FxHashMap::default();
+        named.insert("name".to_string(), Value::Text("value".into()));
+        let ctx = ExecuteContext::new(&row).with_named_params(&named);
+        assert!(ctx.named_params.is_some());
+    }
+
+    #[test]
+    fn test_context_with_transaction_id() {
+        let row = vec![Value::Integer(1)];
+        let ctx = ExecuteContext::new(&row).with_transaction_id(Some(12345));
+        assert_eq!(ctx.transaction_id, Some(12345));
+    }
+
+    #[test]
+    fn test_context_with_outer_row() {
+        let row = vec![Value::Integer(1)];
+        let mut outer: FxHashMap<Arc<str>, Value> = FxHashMap::default();
+        outer.insert(Arc::from("outer_col"), Value::Integer(42));
+        let ctx = ExecuteContext::new(&row).with_outer_row(&outer);
+        assert!(ctx.outer_row.is_some());
+    }
+
+    // =========================================================================
+    // ExprVM creation tests
+    // =========================================================================
+
+    #[test]
+    fn test_vm_new() {
+        let vm = ExprVM::new();
+        assert_eq!(vm.stack.len(), 0);
+    }
+
+    #[test]
+    fn test_vm_with_capacity() {
+        let vm = ExprVM::with_capacity(16);
+        assert!(vm.stack.capacity() >= 16);
+    }
+
+    #[test]
+    fn test_vm_default() {
+        let vm = ExprVM::default();
+        assert_eq!(vm.stack.len(), 0);
+    }
+
+    // =========================================================================
+    // Load operations tests
+    // =========================================================================
+
+    #[test]
+    fn test_load_column() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadColumn(1), Op::Return]);
+        let row = vec![Value::Integer(10), Value::Integer(20), Value::Integer(30)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(20));
+    }
+
+    #[test]
+    fn test_load_column_out_of_bounds() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadColumn(10), Op::Return]);
+        let row = vec![Value::Integer(1)];
+        let ctx = ExecuteContext::new(&row);
+        // Out of bounds returns null
+        assert!(vm.execute(&program, &ctx).unwrap().is_null());
+    }
+
+    #[test]
+    fn test_load_column2() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadColumn2(0), Op::Return]);
+        let row1 = vec![Value::Integer(1)];
+        let row2 = vec![Value::Integer(2)];
+        let ctx = ExecuteContext::for_join(&row1, &row2);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(2));
+    }
+
+    #[test]
+    fn test_load_const() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadConst(Value::Float(1.23)), Op::Return]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Float(1.23));
+    }
+
+    #[test]
+    fn test_load_param() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadParam(0), Op::Return]);
+        let row: Vec<Value> = vec![];
+        let params = vec![Value::Text("hello".into())];
+        let ctx = ExecuteContext::new(&row).with_params(&params);
+        assert_eq!(
+            vm.execute(&program, &ctx).unwrap(),
+            Value::Text("hello".into())
+        );
+    }
+
+    #[test]
+    fn test_load_named_param() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadNamedParam(Arc::from("myvar")), Op::Return]);
+        let row: Vec<Value> = vec![];
+        let mut named = FxHashMap::default();
+        named.insert("myvar".to_string(), Value::Integer(999));
+        let ctx = ExecuteContext::new(&row).with_named_params(&named);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(999));
+    }
+
+    #[test]
+    fn test_load_null() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadNull(DataType::Integer), Op::Return]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert!(vm.execute(&program, &ctx).unwrap().is_null());
+    }
+
+    #[test]
+    fn test_load_outer_column() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadOuterColumn(Arc::from("outer_val")),
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let mut outer: FxHashMap<Arc<str>, Value> = FxHashMap::default();
+        outer.insert(Arc::from("outer_val"), Value::Integer(100));
+        let ctx = ExecuteContext::new(&row).with_outer_row(&outer);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(100));
+    }
+
+    // =========================================================================
+    // Comparison operations tests
+    // =========================================================================
+
+    #[test]
+    fn test_eq() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(5)),
+            Op::LoadConst(Value::Integer(5)),
+            Op::Eq,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_ne() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(5)),
+            Op::LoadConst(Value::Integer(10)),
+            Op::Ne,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_lt() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(3)),
+            Op::LoadConst(Value::Integer(5)),
+            Op::Lt,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_le() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(5)),
+            Op::LoadConst(Value::Integer(5)),
+            Op::Le,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_ge() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(5)),
+            Op::LoadConst(Value::Integer(5)),
+            Op::Ge,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    // =========================================================================
+    // Null checks tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_null() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadColumn(0), Op::IsNull, Op::Return]);
+
+        // Test with null
+        let row = vec![Value::Null(DataType::Integer)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        // Test with non-null
+        let row = vec![Value::Integer(5)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_is_not_null() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadColumn(0), Op::IsNotNull, Op::Return]);
+
+        let row = vec![Value::Integer(5)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Null(DataType::Integer)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_is_distinct_from() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::LoadColumn(1),
+            Op::IsDistinctFrom,
+            Op::Return,
+        ]);
+
+        // Two nulls are NOT distinct
+        let row = vec![
+            Value::Null(DataType::Integer),
+            Value::Null(DataType::Integer),
+        ];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+
+        // Null and non-null ARE distinct
+        let row = vec![Value::Null(DataType::Integer), Value::Integer(5)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        // Same values are NOT distinct
+        let row = vec![Value::Integer(5), Value::Integer(5)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+
+        // Different values ARE distinct
+        let row = vec![Value::Integer(5), Value::Integer(10)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_is_not_distinct_from() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::LoadColumn(1),
+            Op::IsNotDistinctFrom,
+            Op::Return,
+        ]);
+
+        // Two nulls ARE "not distinct"
+        let row = vec![
+            Value::Null(DataType::Integer),
+            Value::Null(DataType::Integer),
+        ];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        // Same values ARE "not distinct"
+        let row = vec![Value::Integer(5), Value::Integer(5)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    // =========================================================================
+    // Fused comparison operations tests
+    // =========================================================================
+
+    #[test]
+    fn test_eq_column_const() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::EqColumnConst(0, Value::Integer(42)), Op::Return]);
+
+        let row = vec![Value::Integer(42)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Integer(100)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_ne_column_const() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::NeColumnConst(0, Value::Integer(42)), Op::Return]);
+
+        let row = vec![Value::Integer(100)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_lt_column_const() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LtColumnConst(0, Value::Integer(10)), Op::Return]);
+
+        let row = vec![Value::Integer(5)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Integer(15)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_le_column_const() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LeColumnConst(0, Value::Integer(10)), Op::Return]);
+
+        let row = vec![Value::Integer(10)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_gt_column_const() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::GtColumnConst(0, Value::Integer(10)), Op::Return]);
+
+        let row = vec![Value::Integer(15)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_ge_column_const() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::GeColumnConst(0, Value::Integer(10)), Op::Return]);
+
+        let row = vec![Value::Integer(10)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_is_null_column() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::IsNullColumn(0), Op::Return]);
+
+        let row = vec![Value::Null(DataType::Integer)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Integer(1)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_is_not_null_column() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::IsNotNullColumn(0), Op::Return]);
+
+        let row = vec![Value::Integer(1)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_between_column_const() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::BetweenColumnConst(0, Value::Integer(5), Value::Integer(15)),
+            Op::Return,
+        ]);
+
+        let row = vec![Value::Integer(10)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Integer(20)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+
+        // Edge case: value equals lower bound
+        let row = vec![Value::Integer(5)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        // Edge case: value equals upper bound
+        let row = vec![Value::Integer(15)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    // =========================================================================
+    // Logical operations tests
+    // =========================================================================
+
+    #[test]
+    fn test_or_short_circuit() {
+        let mut vm = ExprVM::new();
+        // WHERE col0 = 1 OR col1 = 2
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::LoadConst(Value::Integer(1)),
+            Op::Eq,
+            Op::Or(8), // Jump if first condition is true
+            Op::LoadColumn(1),
+            Op::LoadConst(Value::Integer(2)),
+            Op::Eq,
+            Op::OrFinalize,
+            Op::Return,
+        ]);
+
+        // First condition true
+        let row = vec![Value::Integer(1), Value::Integer(0)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        // Second condition true
+        let row = vec![Value::Integer(0), Value::Integer(2)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        // Both conditions false
+        let row = vec![Value::Integer(0), Value::Integer(0)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_not() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Boolean(true)),
+            Op::Not,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_xor() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Boolean(true)),
+            Op::LoadConst(Value::Boolean(false)),
+            Op::Xor,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        // Both true = false
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Boolean(true)),
+            Op::LoadConst(Value::Boolean(true)),
+            Op::Xor,
+            Op::Return,
+        ]);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    // =========================================================================
+    // Arithmetic operations tests
+    // =========================================================================
+
+    #[test]
+    fn test_add() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(10)),
+            Op::LoadConst(Value::Integer(5)),
+            Op::Add,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(15));
+    }
+
+    #[test]
+    fn test_add_floats() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Float(2.5)),
+            Op::LoadConst(Value::Float(3.5)),
+            Op::Add,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Float(6.0));
+    }
+
+    #[test]
+    fn test_sub() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(10)),
+            Op::LoadConst(Value::Integer(3)),
+            Op::Sub,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(7));
+    }
+
+    #[test]
+    fn test_mul() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(6)),
+            Op::LoadConst(Value::Integer(7)),
+            Op::Mul,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(42));
+    }
+
+    #[test]
+    fn test_div() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(20)),
+            Op::LoadConst(Value::Integer(4)),
+            Op::Div,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(5));
+    }
+
+    #[test]
+    fn test_mod() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(17)),
+            Op::LoadConst(Value::Integer(5)),
+            Op::Mod,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(2));
+    }
+
+    #[test]
+    fn test_neg() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadConst(Value::Integer(5)), Op::Neg, Op::Return]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(-5));
+    }
+
+    // =========================================================================
+    // Bitwise operations tests
+    // =========================================================================
+
+    #[test]
+    fn test_bit_and() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(0b1100)),
+            Op::LoadConst(Value::Integer(0b1010)),
+            Op::BitAnd,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(0b1000));
+    }
+
+    #[test]
+    fn test_bit_or() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(0b1100)),
+            Op::LoadConst(Value::Integer(0b1010)),
+            Op::BitOr,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(0b1110));
+    }
+
+    #[test]
+    fn test_bit_xor() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(0b1100)),
+            Op::LoadConst(Value::Integer(0b1010)),
+            Op::BitXor,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(0b0110));
+    }
+
+    #[test]
+    fn test_bit_not() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(0b0000_0000_0000_0101)),
+            Op::BitNot,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        let result = vm.execute(&program, &ctx).unwrap();
+        // Bitwise NOT of 5 is -6 in two's complement
+        assert_eq!(result, Value::Integer(!5));
+    }
+
+    #[test]
+    fn test_shl() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(1)),
+            Op::LoadConst(Value::Integer(4)),
+            Op::Shl,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(16));
+    }
+
+    #[test]
+    fn test_shr() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(16)),
+            Op::LoadConst(Value::Integer(2)),
+            Op::Shr,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(4));
+    }
+
+    // =========================================================================
+    // String operations tests
+    // =========================================================================
+
+    #[test]
+    fn test_concat() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Text("Hello".into())),
+            Op::LoadConst(Value::Text(" World".into())),
+            Op::Concat,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(
+            vm.execute(&program, &ctx).unwrap(),
+            Value::Text("Hello World".into())
+        );
+    }
+
+    #[test]
+    fn test_like_pattern() {
+        use super::super::ops::CompiledPattern;
+
+        let mut vm = ExprVM::new();
+        let pattern = CompiledPattern::compile("%world%", false);
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::Like(Arc::new(pattern), false),
+            Op::Return,
+        ]);
+
+        let row = vec![Value::Text("hello world!".into())];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Text("hello there!".into())];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_glob_pattern() {
+        use super::super::ops::CompiledPattern;
+
+        let mut vm = ExprVM::new();
+        let pattern = CompiledPattern::compile_glob("*.txt");
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::Glob(Arc::new(pattern)),
+            Op::Return,
+        ]);
+
+        let row = vec![Value::Text("document.txt".into())];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Text("document.pdf".into())];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    // =========================================================================
+    // Between tests
+    // =========================================================================
+
+    #[test]
+    fn test_between() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::LoadConst(Value::Integer(5)),
+            Op::LoadConst(Value::Integer(15)),
+            Op::Between,
+            Op::Return,
+        ]);
+
+        let row = vec![Value::Integer(10)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Integer(3)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_not_between() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::LoadConst(Value::Integer(5)),
+            Op::LoadConst(Value::Integer(15)),
+            Op::NotBetween,
+            Op::Return,
+        ]);
+
+        let row = vec![Value::Integer(3)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Integer(10)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    // =========================================================================
+    // Not In Set tests
+    // =========================================================================
+
+    #[test]
+    fn test_not_in_set() {
+        let mut vm = ExprVM::new();
+        let set: AHashSet<Value> = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+            .into_iter()
+            .collect();
+
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::NotInSet(Arc::new(set), false),
+            Op::Return,
+        ]);
+
+        let row = vec![Value::Integer(5)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Integer(2)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_in_set_with_null() {
+        let mut vm = ExprVM::new();
+        let set: AHashSet<Value> = [Value::Integer(1), Value::Integer(2)].into_iter().collect();
+
+        // has_null = true means the set conceptually contains NULL
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::InSet(Arc::new(set), true),
+            Op::Return,
+        ]);
+
+        // Value not in set, but set has null -> returns NULL
+        let row = vec![Value::Integer(5)];
+        let ctx = ExecuteContext::new(&row);
+        let result = vm.execute(&program, &ctx).unwrap();
+        assert!(result.is_null());
+    }
+
+    // =========================================================================
+    // In Set Column (fused) tests
+    // =========================================================================
+
+    #[test]
+    fn test_in_set_column() {
+        let mut vm = ExprVM::new();
+        let set: AHashSet<Value> = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+            .into_iter()
+            .collect();
+
+        let program = Program::new(vec![Op::InSetColumn(0, Arc::new(set), false), Op::Return]);
+
+        let row = vec![Value::Integer(2)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Integer(5)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    // =========================================================================
+    // Boolean checks (IS TRUE, IS FALSE, etc.)
+    // =========================================================================
+
+    #[test]
+    fn test_is_true() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadColumn(0), Op::IsTrue, Op::Return]);
+
+        let row = vec![Value::Boolean(true)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Boolean(false)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+
+        let row = vec![Value::Null(DataType::Boolean)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_is_not_true() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadColumn(0), Op::IsNotTrue, Op::Return]);
+
+        let row = vec![Value::Boolean(true)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+
+        let row = vec![Value::Boolean(false)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Null(DataType::Boolean)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_is_false() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadColumn(0), Op::IsFalse, Op::Return]);
+
+        let row = vec![Value::Boolean(false)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Boolean(true)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_is_not_false() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadColumn(0), Op::IsNotFalse, Op::Return]);
+
+        let row = vec![Value::Boolean(false)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+
+        let row = vec![Value::Boolean(true)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Null(DataType::Boolean)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    // =========================================================================
+    // Coalesce, NullIf, Greatest, Least tests
+    // =========================================================================
+
+    #[test]
+    fn test_coalesce() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadNull(DataType::Integer),
+            Op::LoadNull(DataType::Integer),
+            Op::LoadConst(Value::Integer(42)),
+            Op::Coalesce(3),
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(42));
+    }
+
+    #[test]
+    fn test_nullif() {
+        let mut vm = ExprVM::new();
+        // NULLIF(5, 5) -> NULL
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(5)),
+            Op::LoadConst(Value::Integer(5)),
+            Op::NullIf,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert!(vm.execute(&program, &ctx).unwrap().is_null());
+
+        // NULLIF(5, 10) -> 5
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(5)),
+            Op::LoadConst(Value::Integer(10)),
+            Op::NullIf,
+            Op::Return,
+        ]);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(5));
+    }
+
+    #[test]
+    fn test_greatest() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(3)),
+            Op::LoadConst(Value::Integer(7)),
+            Op::LoadConst(Value::Integer(2)),
+            Op::Greatest(3),
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(7));
+    }
+
+    #[test]
+    fn test_least() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(3)),
+            Op::LoadConst(Value::Integer(7)),
+            Op::LoadConst(Value::Integer(2)),
+            Op::Least(3),
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(2));
+    }
+
+    // =========================================================================
+    // Stack operations tests
+    // =========================================================================
+
+    #[test]
+    fn test_dup() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(42)),
+            Op::Dup,
+            Op::Add, // 42 + 42
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(84));
+    }
+
+    #[test]
+    fn test_swap() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(10)),
+            Op::LoadConst(Value::Integer(3)),
+            Op::Swap,
+            Op::Sub, // 3 - 10
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(-7));
+    }
+
+    #[test]
+    fn test_pop() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(100)),
+            Op::LoadConst(Value::Integer(42)),
+            Op::Pop, // Discard 42
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(100));
+    }
+
+    // =========================================================================
+    // Jump operations tests
+    // =========================================================================
+
+    #[test]
+    fn test_jump() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(1)),
+            Op::Jump(3),
+            Op::LoadConst(Value::Integer(2)), // Skipped
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
+    }
+
+    #[test]
+    fn test_jump_if_true() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Boolean(true)),
+            Op::JumpIfTrue(4),
+            Op::LoadConst(Value::Integer(0)), // Skipped
+            Op::Return,
+            Op::LoadConst(Value::Integer(1)), // Executed
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
+    }
+
+    #[test]
+    fn test_jump_if_false() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Boolean(false)),
+            Op::JumpIfFalse(4),
+            Op::LoadConst(Value::Integer(0)), // Skipped
+            Op::Return,
+            Op::LoadConst(Value::Integer(1)), // Executed
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
+    }
+
+    #[test]
+    fn test_jump_if_null() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadNull(DataType::Integer),
+            Op::JumpIfNull(4),
+            Op::LoadConst(Value::Integer(0)), // Skipped
+            Op::Return,
+            Op::LoadConst(Value::Integer(1)), // Executed
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
+    }
+
+    // =========================================================================
+    // Return variants tests
+    // =========================================================================
+
+    #[test]
+    fn test_return_true() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::ReturnTrue]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_return_false() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::ReturnFalse]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_return_null() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::ReturnNull(DataType::Text)]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        let result = vm.execute(&program, &ctx).unwrap();
+        assert!(result.is_null());
+    }
+
+    // =========================================================================
+    // Nop tests
+    // =========================================================================
+
+    #[test]
+    fn test_nop() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(42)),
+            Op::Nop,
+            Op::Nop,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(42));
+    }
+
+    // =========================================================================
+    // Empty program tests
+    // =========================================================================
+
+    #[test]
+    fn test_empty_program() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        let result = vm.execute(&program, &ctx).unwrap();
+        assert!(result.is_null());
+    }
+
+    // =========================================================================
+    // execute_bool tests
+    // =========================================================================
+
+    #[test]
+    fn test_execute_bool_simple() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::GtColumnConst(0, Value::Integer(5)), Op::Return]);
+
+        let row = vec![Value::Integer(10)];
+        let ctx = ExecuteContext::new(&row);
+        assert!(vm.execute_bool(&program, &ctx));
+
+        let row = vec![Value::Integer(3)];
+        let ctx = ExecuteContext::new(&row);
+        assert!(!vm.execute_bool(&program, &ctx));
+    }
+
+    #[test]
+    fn test_execute_bool_with_null() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::GtColumnConst(0, Value::Integer(5)), Op::Return]);
+
+        // Null comparison returns false (not true)
+        let row = vec![Value::Null(DataType::Integer)];
+        let ctx = ExecuteContext::new(&row);
+        assert!(!vm.execute_bool(&program, &ctx));
+    }
+
+    #[test]
+    fn test_execute_bool_between() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::BetweenColumnConst(0, Value::Integer(5), Value::Integer(15)),
+            Op::Return,
+        ]);
+
+        let row = vec![Value::Integer(10)];
+        let ctx = ExecuteContext::new(&row);
+        assert!(vm.execute_bool(&program, &ctx));
+
+        let row = vec![Value::Integer(20)];
+        let ctx = ExecuteContext::new(&row);
+        assert!(!vm.execute_bool(&program, &ctx));
+    }
+
+    #[test]
+    fn test_execute_bool_is_null_column() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::IsNullColumn(0), Op::Return]);
+
+        let row = vec![Value::Null(DataType::Integer)];
+        let ctx = ExecuteContext::new(&row);
+        assert!(vm.execute_bool(&program, &ctx));
+
+        let row = vec![Value::Integer(1)];
+        let ctx = ExecuteContext::new(&row);
+        assert!(!vm.execute_bool(&program, &ctx));
+    }
+
+    #[test]
+    fn test_execute_bool_load_const_true() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadConst(Value::Boolean(true)), Op::Return]);
+
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert!(vm.execute_bool(&program, &ctx));
+    }
+
+    // =========================================================================
+    // Cast tests
+    // =========================================================================
+
+    #[test]
+    fn test_cast_int_to_float() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(42)),
+            Op::Cast(DataType::Float),
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Float(42.0));
+    }
+
+    #[test]
+    fn test_cast_float_to_int() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Float(42.7)),
+            Op::Cast(DataType::Integer),
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(42));
+    }
+
+    #[test]
+    fn test_cast_text_to_int() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Text("123".into())),
+            Op::Cast(DataType::Integer),
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(123));
+    }
+
+    // =========================================================================
+    // LikeColumn (fused) tests
+    // =========================================================================
+
+    #[test]
+    fn test_like_column() {
+        use super::super::ops::CompiledPattern;
+
+        let mut vm = ExprVM::new();
+        let pattern = CompiledPattern::compile("test%", false);
+        let program = Program::new(vec![
+            Op::LikeColumn(0, Arc::new(pattern), false),
+            Op::Return,
+        ]);
+
+        let row = vec![Value::Text("testing".into())];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Text("other".into())];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    // =========================================================================
+    // TruncateToDate tests
+    // =========================================================================
+
+    #[test]
+    fn test_truncate_to_date() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Text("2024-01-15 14:30:00".into())),
+            Op::TruncateToDate,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        let result = vm.execute(&program, &ctx).unwrap();
+        // TruncateToDate returns a Timestamp with time set to 00:00:00
+        if let Value::Timestamp(t) = result {
+            use chrono::Datelike;
+            assert_eq!(t.year(), 2024);
+            assert_eq!(t.month(), 1);
+            assert_eq!(t.day(), 15);
+        } else {
+            panic!("Expected Timestamp result, got {:?}", result);
+        }
+    }
+
+    // =========================================================================
+    // Pop/Jump combinations
+    // =========================================================================
+
+    #[test]
+    fn test_pop_jump_if_true() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Boolean(true)),
+            Op::PopJumpIfTrue(4),
+            Op::LoadConst(Value::Integer(0)), // Skipped
+            Op::Return,
+            Op::LoadConst(Value::Integer(1)), // Executed
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
+    }
+
+    #[test]
+    fn test_pop_jump_if_false() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Boolean(false)),
+            Op::PopJumpIfFalse(4),
+            Op::LoadConst(Value::Integer(0)), // Skipped
+            Op::Return,
+            Op::LoadConst(Value::Integer(1)), // Executed
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
+    }
+
+    // =========================================================================
+    // Mixed type arithmetic
+    // =========================================================================
+
+    #[test]
+    fn test_add_int_and_float() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(10)),
+            Op::LoadConst(Value::Float(2.5)),
+            Op::Add,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Float(12.5));
+    }
+
+    // =========================================================================
+    // String concatenation with non-strings
+    // =========================================================================
+
+    #[test]
+    fn test_concat_int_to_string() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Text("Value: ".into())),
+            Op::LoadConst(Value::Integer(42)),
+            Op::Concat,
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(
+            vm.execute(&program, &ctx).unwrap(),
+            Value::Text("Value: 42".into())
+        );
+    }
+
+    // =========================================================================
+    // Float comparisons
+    // =========================================================================
+
+    #[test]
+    fn test_gt_column_const_float() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::GtColumnConst(0, Value::Float(2.5)), Op::Return]);
+
+        let row = vec![Value::Float(3.5)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+
+        let row = vec![Value::Float(1.5)];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
+    }
+
+    // =========================================================================
+    // Test LoadTransactionId
+    // =========================================================================
+
+    #[test]
+    fn test_load_transaction_id() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadTransactionId, Op::Return]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row).with_transaction_id(Some(12345));
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(12345));
+    }
+
+    #[test]
+    fn test_load_transaction_id_none() {
+        let mut vm = ExprVM::new();
+        let program = Program::new(vec![Op::LoadTransactionId, Op::Return]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        let result = vm.execute(&program, &ctx).unwrap();
+        assert!(result.is_null());
+    }
 }

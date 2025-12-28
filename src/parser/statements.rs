@@ -14,7 +14,7 @@
 
 //! Statement parsing methods for the SQL Parser
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use super::ast::*;
 use super::parser::Parser;
@@ -1128,7 +1128,7 @@ impl Parser {
         }
 
         // Parse column-value pairs
-        let mut updates = HashMap::new();
+        let mut updates = FxHashMap::default();
         loop {
             if !self.expect_peek(TokenType::Identifier) {
                 return None;

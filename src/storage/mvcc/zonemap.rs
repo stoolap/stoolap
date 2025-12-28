@@ -41,8 +41,9 @@
 //! └──────────┴─────────────┴─────────────┘
 //! ```
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use rustc_hash::FxHashMap;
 
 use crate::core::{Operator, Value};
 
@@ -231,7 +232,7 @@ impl ColumnZoneMap {
 #[derive(Debug)]
 pub struct TableZoneMap {
     /// Zone maps per column
-    pub columns: HashMap<String, ColumnZoneMap>,
+    pub columns: FxHashMap<String, ColumnZoneMap>,
     /// Number of rows per segment
     pub segment_size: usize,
     /// Total number of segments
@@ -255,7 +256,7 @@ impl TableZoneMap {
     /// Create a new table zone map
     pub fn new(segment_size: usize) -> Self {
         Self {
-            columns: HashMap::new(),
+            columns: FxHashMap::default(),
             segment_size,
             segment_count: 0,
             stale: AtomicBool::new(false),

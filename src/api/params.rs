@@ -37,13 +37,19 @@
 //! )?;
 //! ```
 
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use compact_str::CompactString;
+use smallvec::SmallVec;
 
 use crate::core::Value;
+
+/// Type alias for parameter vectors.
+/// Uses SmallVec to avoid heap allocation for queries with ≤4 parameters (the common case).
+pub type ParamVec = SmallVec<[Value; 4]>;
 
 /// Trait for types that can be converted to SQL parameters
 ///
@@ -171,34 +177,35 @@ impl<T: ToParam> ToParam for &T {
 ///
 /// This enables passing tuples, arrays, and slices as parameters.
 pub trait Params {
-    /// Convert into a Vec of Values
-    fn into_params(self) -> Vec<Value>;
+    /// Convert into a ParamVec of Values.
+    /// Uses SmallVec to avoid heap allocation for ≤4 parameters.
+    fn into_params(self) -> ParamVec;
 }
 
 // Empty params
 impl Params for () {
-    fn into_params(self) -> Vec<Value> {
-        Vec::new()
+    fn into_params(self) -> ParamVec {
+        ParamVec::new()
     }
 }
 
 // Slice of Value
 impl Params for &[Value] {
-    fn into_params(self) -> Vec<Value> {
-        self.to_vec()
+    fn into_params(self) -> ParamVec {
+        self.iter().cloned().collect()
     }
 }
 
 // Vec of Value
 impl Params for Vec<Value> {
-    fn into_params(self) -> Vec<Value> {
-        self
+    fn into_params(self) -> ParamVec {
+        self.into_iter().collect()
     }
 }
 
 // Array of Value
 impl<const N: usize> Params for [Value; N] {
-    fn into_params(self) -> Vec<Value> {
+    fn into_params(self) -> ParamVec {
         self.into_iter().collect()
     }
 }
@@ -207,8 +214,8 @@ impl<const N: usize> Params for [Value; N] {
 macro_rules! impl_params_for_tuple {
     ($($idx:tt: $T:ident),+) => {
         impl<$($T: ToParam),+> Params for ($($T,)+) {
-            fn into_params(self) -> Vec<Value> {
-                vec![$(self.$idx.to_param()),+]
+            fn into_params(self) -> ParamVec {
+                smallvec::smallvec![$(self.$idx.to_param()),+]
             }
         }
     };
@@ -295,14 +302,14 @@ macro_rules! params {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct NamedParams {
-    params: HashMap<String, Value>,
+    params: FxHashMap<String, Value>,
 }
 
 impl NamedParams {
     /// Create empty named params
     pub fn new() -> Self {
         Self {
-            params: HashMap::new(),
+            params: FxHashMap::default(),
         }
     }
 
@@ -317,20 +324,22 @@ impl NamedParams {
         self.params.insert(name.into(), value.to_param());
     }
 
-    /// Get the underlying HashMap
-    pub fn into_inner(self) -> HashMap<String, Value> {
+    /// Get the underlying FxHashMap
+    pub fn into_inner(self) -> FxHashMap<String, Value> {
         self.params
     }
 
-    /// Get a reference to the underlying HashMap
-    pub fn as_map(&self) -> &HashMap<String, Value> {
+    /// Get a reference to the underlying FxHashMap
+    pub fn as_map(&self) -> &FxHashMap<String, Value> {
         &self.params
     }
 }
 
 impl From<HashMap<String, Value>> for NamedParams {
     fn from(params: HashMap<String, Value>) -> Self {
-        Self { params }
+        Self {
+            params: params.into_iter().collect(),
+        }
     }
 }
 
@@ -416,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_params_empty() {
-        let params: Vec<Value> = ().into_params();
+        let params: ParamVec = ().into_params();
         assert!(params.is_empty());
     }
 
@@ -442,7 +451,7 @@ mod tests {
     #[test]
     fn test_params_macro_empty() {
         let p = params![];
-        let params: Vec<Value> = p.into_params();
+        let params: ParamVec = p.into_params();
         assert!(params.is_empty());
     }
 

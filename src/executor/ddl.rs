@@ -401,11 +401,7 @@ impl Executor {
         // Validate columns
         for col_id in &stmt.columns {
             let col_name = &col_id.value;
-            if !schema
-                .columns
-                .iter()
-                .any(|c| c.name.eq_ignore_ascii_case(col_name))
-            {
+            if !schema.column_index_map().contains_key(&col_id.value_lower) {
                 return Err(Error::ColumnNotFoundNamed(col_name.clone()));
             }
         }

@@ -34,6 +34,9 @@ pub struct SchemaColumn {
     /// Column name
     pub name: String,
 
+    /// Pre-computed lowercase column name for case-insensitive lookups
+    pub name_lower: String,
+
     /// Data type of the column
     pub data_type: DataType,
 
@@ -65,9 +68,12 @@ impl SchemaColumn {
         nullable: bool,
         primary_key: bool,
     ) -> Self {
+        let name_str = name.into();
+        let name_lower = name_str.to_lowercase();
         Self {
             id,
-            name: name.into(),
+            name: name_str,
+            name_lower,
             data_type,
             nullable,
             primary_key,
@@ -90,9 +96,12 @@ impl SchemaColumn {
         default_expr: Option<String>,
         check_expr: Option<String>,
     ) -> Self {
+        let name_str = name.into();
+        let name_lower = name_str.to_lowercase();
         Self {
             id,
-            name: name.into(),
+            name: name_str,
+            name_lower,
             data_type,
             nullable,
             primary_key,
@@ -116,9 +125,12 @@ impl SchemaColumn {
         default_value: Option<super::Value>,
         check_expr: Option<String>,
     ) -> Self {
+        let name_str = name.into();
+        let name_lower = name_str.to_lowercase();
         Self {
             id,
-            name: name.into(),
+            name: name_str,
+            name_lower,
             data_type,
             nullable,
             primary_key,
@@ -187,6 +199,9 @@ pub struct Schema {
 
     /// Cached column index map (lowercase name -> index) for O(1) column lookup
     column_index_map_cache: OnceLock<FxHashMap<String, usize>>,
+
+    /// Cached primary key indices (computed lazily on first access)
+    pk_indices_cache: OnceLock<Arc<Vec<usize>>>,
 }
 
 impl Clone for Schema {
@@ -208,6 +223,11 @@ impl Clone for Schema {
             let _ = column_index_map_cache.set(map.clone());
         }
 
+        let pk_indices_cache = OnceLock::new();
+        if let Some(indices) = self.pk_indices_cache.get() {
+            let _ = pk_indices_cache.set(Arc::clone(indices));
+        }
+
         Self {
             table_name: self.table_name.clone(),
             table_name_lower: self.table_name_lower.clone(),
@@ -217,6 +237,7 @@ impl Clone for Schema {
             column_names_cache,
             pk_column_index_cache,
             column_index_map_cache,
+            pk_indices_cache,
         }
     }
 }
@@ -256,9 +277,19 @@ impl Schema {
             columns
                 .iter()
                 .enumerate()
-                .map(|(i, c)| (c.name.to_lowercase(), i))
+                .map(|(i, c)| (c.name_lower.clone(), i))
                 .collect(),
         );
+
+        let pk_indices_cache = OnceLock::new();
+        let _ = pk_indices_cache.set(Arc::new(
+            columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.primary_key)
+                .map(|(i, _)| i)
+                .collect(),
+        ));
 
         Self {
             table_name: name,
@@ -269,6 +300,7 @@ impl Schema {
             column_names_cache,
             pk_column_index_cache,
             column_index_map_cache,
+            pk_indices_cache,
         }
     }
 
@@ -299,9 +331,19 @@ impl Schema {
             columns
                 .iter()
                 .enumerate()
-                .map(|(i, c)| (c.name.to_lowercase(), i))
+                .map(|(i, c)| (c.name_lower.clone(), i))
                 .collect(),
         );
+
+        let pk_indices_cache = OnceLock::new();
+        let _ = pk_indices_cache.set(Arc::new(
+            columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.primary_key)
+                .map(|(i, _)| i)
+                .collect(),
+        ));
 
         Self {
             table_name: name,
@@ -312,6 +354,7 @@ impl Schema {
             column_names_cache,
             pk_column_index_cache,
             column_index_map_cache,
+            pk_indices_cache,
         }
     }
 
@@ -327,12 +370,12 @@ impl Schema {
 
     /// Find a column by name (case-insensitive)
     /// Returns the column index and reference
+    /// OPTIMIZATION: Uses cached column_index_map for O(1) lookup
     pub fn find_column(&self, name: &str) -> Option<(usize, &SchemaColumn)> {
         let name_lower = name.to_lowercase();
-        self.columns
-            .iter()
-            .enumerate()
-            .find(|(_, col)| col.name.to_lowercase() == name_lower)
+        self.column_index_map()
+            .get(&name_lower)
+            .map(|&idx| (idx, &self.columns[idx]))
     }
 
     /// Get a column by index
@@ -395,7 +438,7 @@ impl Schema {
             self.columns
                 .iter()
                 .enumerate()
-                .map(|(i, c)| (c.name.to_lowercase(), i))
+                .map(|(i, c)| (c.name_lower.clone(), i))
                 .collect()
         })
     }
@@ -410,14 +453,20 @@ impl Schema {
         self.columns.iter().any(|c| c.primary_key)
     }
 
-    /// Get the primary key column indices
-    pub fn primary_key_indices(&self) -> Vec<usize> {
-        self.columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.primary_key)
-            .map(|(i, _)| i)
-            .collect()
+    /// Get the primary key column indices (cached for performance)
+    /// OPTIMIZATION: Cached to avoid allocating Vec on every call
+    #[inline]
+    pub fn primary_key_indices(&self) -> &[usize] {
+        self.pk_indices_cache.get_or_init(|| {
+            Arc::new(
+                self.columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.primary_key)
+                    .map(|(i, _)| i)
+                    .collect(),
+            )
+        })
     }
 
     /// Get the single primary key column index (cached for performance)
@@ -473,9 +522,20 @@ impl Schema {
             self.columns
                 .iter()
                 .enumerate()
-                .map(|(i, c)| (c.name.to_lowercase(), i))
+                .map(|(i, c)| (c.name_lower.clone(), i))
                 .collect(),
         );
+
+        // Rebuild primary key indices cache
+        self.pk_indices_cache = OnceLock::new();
+        let _ = self.pk_indices_cache.set(Arc::new(
+            self.columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.primary_key)
+                .map(|(i, _)| i)
+                .collect(),
+        ));
     }
 
     /// Add a column to the schema
@@ -518,6 +578,7 @@ impl Schema {
             .get_column_index(old_name)
             .ok_or(Error::ColumnNotFound)?;
 
+        self.columns[idx].name_lower = new_name.to_lowercase();
         self.columns[idx].name = new_name;
         self.mark_updated();
         self.rebuild_caches();

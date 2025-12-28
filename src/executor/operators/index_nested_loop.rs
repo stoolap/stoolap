@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::core::{Result, Row, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
-use crate::executor::utils::{combine_rows, combine_rows_with_nulls};
+use crate::executor::utils::combine_rows_with_nulls;
 use crate::storage::expression::ConstBoolExpr;
 use crate::storage::traits::{Index, Table};
 
@@ -63,7 +63,6 @@ pub struct IndexNestedLoopJoinOperator {
 
     // Output schema
     schema: Vec<ColumnInfo>,
-    outer_col_count: usize,
     inner_col_count: usize,
 
     // Current state
@@ -109,7 +108,6 @@ impl IndexNestedLoopJoinOperator {
         schema.extend(outer.schema().iter().cloned());
         schema.extend(inner_schema.iter().cloned());
 
-        let outer_col_count = outer.schema().len();
         let inner_col_count = inner_schema.len();
 
         Self {
@@ -120,7 +118,6 @@ impl IndexNestedLoopJoinOperator {
             lookup_strategy,
             residual_filter,
             schema,
-            outer_col_count,
             inner_col_count,
             current_outer_row: None,
             current_inner_rows: Vec::new(),
@@ -140,13 +137,9 @@ impl IndexNestedLoopJoinOperator {
     }
 
     /// Combine outer and inner rows into output row.
+    #[inline]
     fn combine(&self, outer: &Row, inner: &Row) -> Row {
-        Row::from_values(combine_rows(
-            outer,
-            inner,
-            self.outer_col_count,
-            self.inner_col_count,
-        ))
+        Row::from_combined(outer, inner)
     }
 
     /// Look up matching inner rows for the current outer row.
@@ -285,7 +278,8 @@ impl Operator for IndexNestedLoopJoinOperator {
                 let outer_row = self.current_outer_row.take().unwrap();
                 self.advance_outer()?;
                 let null_inner = self.null_inner_row();
-                let combined = self.combine(&outer_row, &null_inner);
+                // Use owned variant - both rows are owned and won't be used again
+                let combined = Row::from_combined_owned(outer_row, null_inner);
                 return Ok(Some(RowRef::Owned(combined)));
             }
 
@@ -483,13 +477,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
 
                     if passes_filter {
                         matched_outers[outer_idx] = true;
-                        let values = combine_rows(
-                            outer_row,
-                            inner_row,
-                            self.outer_col_count,
-                            self.inner_col_count,
-                        );
-                        self.results.push(Row::from_values(values));
+                        self.results.push(Row::from_combined(outer_row, inner_row));
                     }
                 }
             }
@@ -522,7 +510,8 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
         }
 
         if self.result_idx < self.results.len() {
-            let row = self.results[self.result_idx].clone();
+            // Use mem::take to avoid cloning - each result is only returned once
+            let row = std::mem::take(&mut self.results[self.result_idx]);
             self.result_idx += 1;
             Ok(Some(RowRef::Owned(row)))
         } else {

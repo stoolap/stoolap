@@ -43,7 +43,7 @@
 //! let count: i64 = db.query_one("SELECT COUNT(*) FROM users", ())?;
 //! ```
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::core::{Error, IsolationLevel, Result, Value};
@@ -64,8 +64,8 @@ pub const MEMORY_SCHEME: &str = "memory";
 pub const FILE_SCHEME: &str = "file";
 
 /// Global database registry to ensure single instance per DSN
-static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<HashMap<String, Arc<DatabaseInner>>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<FxHashMap<String, Arc<DatabaseInner>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(FxHashMap::default()));
 
 /// Inner database state (shared between Database instances with same DSN)
 struct DatabaseInner {
@@ -518,7 +518,7 @@ impl Database {
 
         let param_values = params.into_params();
         let ctx = ExecutionContextBuilder::new()
-            .params(param_values)
+            .params(param_values.into_vec())
             .timeout_ms(timeout_ms)
             .build();
 
@@ -553,7 +553,7 @@ impl Database {
 
         let param_values = params.into_params();
         let ctx = ExecutionContextBuilder::new()
-            .params(param_values)
+            .params(param_values.into_vec())
             .timeout_ms(timeout_ms)
             .build();
 

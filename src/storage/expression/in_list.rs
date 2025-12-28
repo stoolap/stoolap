@@ -22,9 +22,8 @@
 //! This is the same optimization PostgreSQL uses for "hashed IN lists".
 
 use std::any::Any;
-use std::collections::HashMap;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::core::{Result, Row, Schema, Value};
@@ -70,7 +69,7 @@ pub struct InListExpr {
     has_null: bool,
 
     /// Column aliases
-    aliases: HashMap<String, String>,
+    aliases: FxHashMap<String, String>,
     /// Original column name if using alias
     original_column: Option<String>,
 }
@@ -86,7 +85,7 @@ impl InListExpr {
             col_index: None,
             hashed: HashedValues::None,
             has_null,
-            aliases: HashMap::new(),
+            aliases: FxHashMap::default(),
             original_column: None,
         }
     }
@@ -101,7 +100,7 @@ impl InListExpr {
             col_index: None,
             hashed: HashedValues::None,
             has_null,
-            aliases: HashMap::new(),
+            aliases: FxHashMap::default(),
             original_column: None,
         }
     }
@@ -371,7 +370,7 @@ impl Expression for InListExpr {
         }
     }
 
-    fn with_aliases(&self, aliases: &HashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
         let resolved = resolve_alias(&self.column, aliases);
         let mut expr = self.clone();
 
@@ -587,7 +586,7 @@ mod tests {
             Value::text("active"),
         ]);
 
-        let mut aliases = HashMap::new();
+        let mut aliases = FxHashMap::default();
         aliases.insert("i".to_string(), "id".to_string());
 
         let expr = InListExpr::new("i", vec![Value::integer(1), Value::integer(2)]);

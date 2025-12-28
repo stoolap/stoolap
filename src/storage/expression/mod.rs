@@ -40,8 +40,9 @@ pub mod null_check;
 pub mod range;
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt::Debug;
+
+use rustc_hash::FxHashMap;
 
 use crate::core::{Operator, Result, Row, Schema, Value};
 
@@ -79,7 +80,7 @@ pub trait Expression: Send + Sync + Debug {
     /// The aliases map maps alias names to original column names.
     /// If a column in the expression matches an alias, it will be
     /// replaced with the original name in the returned expression.
-    fn with_aliases(&self, aliases: &HashMap<String, String>) -> Box<dyn Expression>;
+    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression>;
 
     /// Prepare the expression for a specific schema
     ///
@@ -198,7 +199,10 @@ pub(crate) fn find_column_index(schema: &Schema, column: &str) -> Option<usize> 
 }
 
 /// Helper to resolve column name through aliases
-pub(crate) fn resolve_alias<'a>(column: &'a str, aliases: &'a HashMap<String, String>) -> &'a str {
+pub(crate) fn resolve_alias<'a>(
+    column: &'a str,
+    aliases: &'a FxHashMap<String, String>,
+) -> &'a str {
     aliases.get(column).map(|s| s.as_str()).unwrap_or(column)
 }
 
@@ -233,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_resolve_alias() {
-        let mut aliases = HashMap::new();
+        let mut aliases = FxHashMap::default();
         aliases.insert("n".to_string(), "name".to_string());
         aliases.insert("a".to_string(), "age".to_string());
 

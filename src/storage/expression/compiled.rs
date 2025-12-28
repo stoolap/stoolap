@@ -42,8 +42,9 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use chrono::{DateTime, Utc};
 
@@ -60,7 +61,7 @@ use super::Expression;
 
 // Thread-local cache for compiled regex patterns to avoid recompilation
 thread_local! {
-    static REGEX_CACHE: RefCell<HashMap<String, regex::Regex>> = RefCell::new(HashMap::new());
+    static REGEX_CACHE: RefCell<FxHashMap<String, regex::Regex>> = RefCell::new(FxHashMap::default());
 }
 
 /// Get or compile a regex pattern, using thread-local cache

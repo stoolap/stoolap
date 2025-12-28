@@ -108,7 +108,7 @@ impl Executor {
                     }
                 } else {
                     // Check if this column has a UNIQUE constraint
-                    if unique_columns.contains(&col.name.to_lowercase()) {
+                    if unique_columns.contains(&col.name_lower) {
                         def.push_str(" UNIQUE");
                     }
                     if !col.nullable {

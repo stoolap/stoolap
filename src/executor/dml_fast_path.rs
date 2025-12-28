@@ -525,14 +525,12 @@ impl Executor {
             };
 
         // Extract update value sources
+        let col_map = schema.column_index_map();
         let mut compiled_updates = Vec::with_capacity(stmt.updates.len());
         for (col_name, expr) in &stmt.updates {
-            let col_idx = match schema
-                .columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(col_name))
-            {
-                Some(idx) => idx,
+            let col_lower = col_name.to_lowercase();
+            let col_idx = match col_map.get(&col_lower) {
+                Some(&idx) => idx,
                 None => {
                     *compiled_guard = CompiledExecution::NotOptimizable;
                     return None;

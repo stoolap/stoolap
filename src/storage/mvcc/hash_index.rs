@@ -56,7 +56,6 @@
 //! contention characteristics. DashMap could help for truly concurrent writes but
 //! would complicate atomicity across the three maps.
 
-use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
@@ -295,7 +294,7 @@ impl Index for HashIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &HashMap<i64, Vec<Value>>) -> Result<()> {
+    fn add_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
         for (&row_id, values) in entries {
             self.add(values, row_id, 0)?;
         }
@@ -341,7 +340,7 @@ impl Index for HashIndex {
         Ok(())
     }
 
-    fn remove_batch(&self, entries: &HashMap<i64, Vec<Value>>) -> Result<()> {
+    fn remove_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
         for (&row_id, values) in entries {
             self.remove(values, row_id, 0)?;
         }

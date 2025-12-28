@@ -30,7 +30,7 @@
 //!
 //! B-tree index implementation for single-column indexing
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
@@ -502,7 +502,7 @@ impl Index for BTreeIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &HashMap<i64, Vec<Value>>) -> Result<()> {
+    fn add_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
         self.check_closed()?;
 
         for (row_id, values) in entries {
@@ -561,7 +561,7 @@ impl Index for BTreeIndex {
         Ok(())
     }
 
-    fn remove_batch(&self, entries: &HashMap<i64, Vec<Value>>) -> Result<()> {
+    fn remove_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
         self.check_closed()?;
 
         for (row_id, values) in entries {
@@ -1248,7 +1248,7 @@ mod tests {
     fn test_btree_index_batch_operations() {
         let index = create_test_index();
 
-        let mut entries = HashMap::new();
+        let mut entries = FxHashMap::default();
         entries.insert(1, vec![Value::Integer(100)]);
         entries.insert(2, vec![Value::Integer(200)]);
         entries.insert(3, vec![Value::Integer(100)]);
@@ -1257,7 +1257,7 @@ mod tests {
         assert_eq!(index.entry_count(), 3);
 
         // Remove batch
-        let mut to_remove = HashMap::new();
+        let mut to_remove = FxHashMap::default();
         to_remove.insert(1, vec![Value::Integer(100)]);
         to_remove.insert(2, vec![Value::Integer(200)]);
 

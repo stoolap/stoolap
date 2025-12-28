@@ -548,9 +548,11 @@ fn deserialize_snapshot_schema(data: &[u8]) -> Result<Schema> {
             None
         };
 
+        let name_lower = col_name.to_lowercase();
         columns.push(SchemaColumn {
             id: i,
             name: col_name,
+            name_lower,
             data_type,
             nullable,
             primary_key,

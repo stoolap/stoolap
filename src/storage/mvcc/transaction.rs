@@ -19,7 +19,6 @@
 
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::core::{Error, IsolationLevel, Result, Schema, SchemaColumn};
 use crate::storage::mvcc::{get_fast_timestamp, MvccError, TransactionRegistry};
@@ -43,8 +42,6 @@ pub enum TransactionState {
 pub struct MvccTransaction {
     /// Transaction ID
     id: i64,
-    /// Transaction start time
-    start_time: Instant,
     /// Transaction state
     state: TransactionState,
     /// Tables accessed in this transaction
@@ -104,6 +101,12 @@ pub trait TransactionEngineOperations: Send + Sync {
 
     /// Commit all tables for a transaction at once
     fn commit_all_tables(&self, txn_id: i64) -> Result<()>;
+
+    /// Defer table cleanup to background thread (avoids synchronous deallocation)
+    /// Default implementation drops synchronously
+    fn defer_table_cleanup(&self, _tables: Vec<Box<dyn Table>>) {
+        // Default: just drop synchronously (tables dropped when _tables goes out of scope)
+    }
 }
 
 impl MvccTransaction {
@@ -111,7 +114,6 @@ impl MvccTransaction {
     pub fn new(id: i64, begin_seq: i64, registry: Arc<TransactionRegistry>) -> Self {
         Self {
             id,
-            start_time: Instant::now(),
             state: TransactionState::Active,
             tables: FxHashMap::default(),
             isolation_level: None,
@@ -128,11 +130,6 @@ impl MvccTransaction {
     /// Sets the engine operations callback
     pub fn set_engine_operations(&mut self, ops: Arc<dyn TransactionEngineOperations>) {
         self.engine_operations = Some(ops);
-    }
-
-    /// Returns the transaction start time
-    pub fn start_time(&self) -> Instant {
-        self.start_time
     }
 
     /// Returns the begin sequence number
@@ -332,6 +329,11 @@ impl Transaction for MvccTransaction {
         // Mark as committed
         self.state = TransactionState::Committed;
         self.cleanup();
+
+        // tables_with_changes dropped here synchronously
+        // (async channel cleanup was tested but macOS semaphore_signal is 10x slower)
+        drop(tables_with_changes);
+
         Ok(())
     }
 

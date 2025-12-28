@@ -20,9 +20,10 @@
 //! - Recovery from disk
 //!
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -266,7 +267,7 @@ pub struct PersistenceManager {
     /// Running flag for background tasks
     running: AtomicBool,
     /// Table schemas cache
-    schemas: RwLock<HashMap<String, Arc<Schema>>>,
+    schemas: RwLock<FxHashMap<String, Arc<Schema>>>,
 }
 
 impl PersistenceManager {
@@ -282,7 +283,7 @@ impl PersistenceManager {
                 snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
                 keep_count: DEFAULT_KEEP_SNAPSHOTS,
                 running: AtomicBool::new(false),
-                schemas: RwLock::new(HashMap::new()),
+                schemas: RwLock::new(FxHashMap::default()),
             });
         }
 
@@ -321,7 +322,7 @@ impl PersistenceManager {
             snapshot_interval,
             keep_count,
             running: AtomicBool::new(false),
-            schemas: RwLock::new(HashMap::new()),
+            schemas: RwLock::new(FxHashMap::default()),
         };
 
         pm.meta.last_wal_lsn.store(initial_lsn, Ordering::Release);

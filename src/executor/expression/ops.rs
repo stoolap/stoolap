@@ -917,4 +917,567 @@ mod tests {
         // Ideally under 32 bytes, definitely under 64 bytes
         assert!(size <= 64, "Op enum is too large: {} bytes", size);
     }
+
+    // =========================================================================
+    // CompiledPattern::compile() tests - LIKE patterns
+    // =========================================================================
+
+    #[test]
+    fn test_pattern_exact() {
+        let pattern = CompiledPattern::compile("hello", false);
+        assert!(matches!(pattern, CompiledPattern::Exact(ref s) if s == "hello"));
+        assert!(pattern.matches("hello", false));
+        assert!(!pattern.matches("Hello", false));
+        assert!(!pattern.matches("hello world", false));
+    }
+
+    #[test]
+    fn test_pattern_exact_case_insensitive() {
+        let pattern = CompiledPattern::compile("Hello", true);
+        assert!(matches!(pattern, CompiledPattern::Exact(ref s) if s == "hello"));
+        assert!(pattern.matches("hello", true));
+        assert!(pattern.matches("HELLO", true));
+        assert!(pattern.matches("HeLLo", true));
+    }
+
+    #[test]
+    fn test_pattern_match_all() {
+        let pattern = CompiledPattern::compile("%", false);
+        assert!(matches!(pattern, CompiledPattern::MatchAll));
+        assert!(pattern.matches("", false));
+        assert!(pattern.matches("anything", false));
+        assert!(pattern.matches("with spaces and 123", false));
+    }
+
+    #[test]
+    fn test_pattern_single_char() {
+        let pattern = CompiledPattern::compile("_", false);
+        assert!(matches!(pattern, CompiledPattern::SingleChar));
+        assert!(pattern.matches("a", false));
+        assert!(pattern.matches("Z", false));
+        assert!(!pattern.matches("", false));
+        assert!(!pattern.matches("ab", false));
+    }
+
+    #[test]
+    fn test_pattern_prefix() {
+        let pattern = CompiledPattern::compile("hello%", false);
+        assert!(matches!(pattern, CompiledPattern::Prefix(ref s) if s == "hello"));
+        assert!(pattern.matches("hello", false));
+        assert!(pattern.matches("hello world", false));
+        assert!(pattern.matches("hellooooo", false));
+        assert!(!pattern.matches("Hello", false));
+        assert!(!pattern.matches("say hello", false));
+    }
+
+    #[test]
+    fn test_pattern_prefix_case_insensitive() {
+        let pattern = CompiledPattern::compile("Hello%", true);
+        assert!(pattern.matches("hello world", true));
+        assert!(pattern.matches("HELLO WORLD", true));
+        assert!(!pattern.matches("say hello", true));
+    }
+
+    #[test]
+    fn test_pattern_suffix() {
+        let pattern = CompiledPattern::compile("%world", false);
+        assert!(matches!(pattern, CompiledPattern::Suffix(ref s) if s == "world"));
+        assert!(pattern.matches("world", false));
+        assert!(pattern.matches("hello world", false));
+        assert!(!pattern.matches("World", false));
+        assert!(!pattern.matches("world!", false));
+    }
+
+    #[test]
+    fn test_pattern_suffix_case_insensitive() {
+        let pattern = CompiledPattern::compile("%World", true);
+        assert!(pattern.matches("hello world", true));
+        assert!(pattern.matches("HELLO WORLD", true));
+        assert!(!pattern.matches("world!", true));
+    }
+
+    #[test]
+    fn test_pattern_contains() {
+        let pattern = CompiledPattern::compile("%ello%", false);
+        assert!(matches!(pattern, CompiledPattern::Contains(ref s) if s == "ello"));
+        assert!(pattern.matches("hello", false));
+        assert!(pattern.matches("yellow", false));
+        assert!(pattern.matches("hello world", false));
+        assert!(!pattern.matches("HELLO", false));
+    }
+
+    #[test]
+    fn test_pattern_contains_case_insensitive() {
+        let pattern = CompiledPattern::compile("%ELLO%", true);
+        assert!(pattern.matches("hello", true));
+        assert!(pattern.matches("YELLOW", true));
+        assert!(!pattern.matches("hi", true));
+    }
+
+    #[test]
+    fn test_pattern_prefix_suffix() {
+        let pattern = CompiledPattern::compile("hello%world", false);
+        assert!(
+            matches!(pattern, CompiledPattern::PrefixSuffix(ref p, ref s) if p == "hello" && s == "world")
+        );
+        assert!(pattern.matches("helloworld", false));
+        assert!(pattern.matches("hello world", false));
+        assert!(pattern.matches("hello beautiful world", false));
+        assert!(!pattern.matches("hello", false));
+        assert!(!pattern.matches("world", false));
+    }
+
+    #[test]
+    fn test_pattern_prefix_suffix_case_insensitive() {
+        let pattern = CompiledPattern::compile("Hello%World", true);
+        assert!(pattern.matches("helloworld", true));
+        assert!(pattern.matches("HELLO WORLD", true));
+        assert!(!pattern.matches("hello", true));
+    }
+
+    #[test]
+    fn test_pattern_prefix_suffix_too_short() {
+        let pattern = CompiledPattern::compile("abc%xyz", false);
+        // Text must be at least prefix.len() + suffix.len()
+        assert!(!pattern.matches("abcxy", false)); // too short
+        assert!(pattern.matches("abcxyz", false)); // exact length
+        assert!(pattern.matches("abc123xyz", false));
+    }
+
+    #[test]
+    fn test_pattern_complex_regex() {
+        // Pattern with multiple % or _ that requires regex
+        let pattern = CompiledPattern::compile("a%b%c", false);
+        assert!(matches!(pattern, CompiledPattern::Regex(_)));
+        assert!(pattern.matches("abc", false));
+        assert!(pattern.matches("aXbYc", false));
+        assert!(pattern.matches("aXXXbYYYc", false));
+        assert!(!pattern.matches("ac", false));
+    }
+
+    #[test]
+    fn test_pattern_underscore_regex() {
+        let pattern = CompiledPattern::compile("a_c", false);
+        assert!(matches!(pattern, CompiledPattern::Regex(_)));
+        assert!(pattern.matches("abc", false));
+        assert!(pattern.matches("aXc", false));
+        assert!(!pattern.matches("ac", false));
+        assert!(!pattern.matches("abbc", false));
+    }
+
+    #[test]
+    fn test_pattern_mixed_wildcards() {
+        let pattern = CompiledPattern::compile("a_%b", false);
+        assert!(matches!(pattern, CompiledPattern::Regex(_)));
+        assert!(pattern.matches("aXb", false));
+        assert!(pattern.matches("aXYZb", false));
+        assert!(!pattern.matches("ab", false));
+    }
+
+    // =========================================================================
+    // CompiledPattern::compile_glob() tests - GLOB patterns
+    // =========================================================================
+
+    #[test]
+    fn test_glob_exact() {
+        let pattern = CompiledPattern::compile_glob("hello");
+        assert!(matches!(pattern, CompiledPattern::Exact(ref s) if s == "hello"));
+        assert!(pattern.matches("hello", false));
+        assert!(!pattern.matches("Hello", false));
+    }
+
+    #[test]
+    fn test_glob_match_all() {
+        let pattern = CompiledPattern::compile_glob("*");
+        assert!(matches!(pattern, CompiledPattern::MatchAll));
+        assert!(pattern.matches("anything", false));
+    }
+
+    #[test]
+    fn test_glob_single_char() {
+        let pattern = CompiledPattern::compile_glob("?");
+        assert!(matches!(pattern, CompiledPattern::SingleChar));
+        assert!(pattern.matches("a", false));
+        assert!(!pattern.matches("ab", false));
+    }
+
+    #[test]
+    fn test_glob_prefix() {
+        let pattern = CompiledPattern::compile_glob("hello*");
+        assert!(matches!(pattern, CompiledPattern::Prefix(ref s) if s == "hello"));
+        assert!(pattern.matches("hello", false));
+        assert!(pattern.matches("hello world", false));
+    }
+
+    #[test]
+    fn test_glob_suffix() {
+        let pattern = CompiledPattern::compile_glob("*world");
+        assert!(matches!(pattern, CompiledPattern::Suffix(ref s) if s == "world"));
+        assert!(pattern.matches("world", false));
+        assert!(pattern.matches("hello world", false));
+    }
+
+    #[test]
+    fn test_glob_contains() {
+        let pattern = CompiledPattern::compile_glob("*ello*");
+        assert!(matches!(pattern, CompiledPattern::Contains(ref s) if s == "ello"));
+        assert!(pattern.matches("hello", false));
+        assert!(pattern.matches("yellow", false));
+    }
+
+    #[test]
+    fn test_glob_prefix_suffix() {
+        let pattern = CompiledPattern::compile_glob("hello*world");
+        assert!(
+            matches!(pattern, CompiledPattern::PrefixSuffix(ref p, ref s) if p == "hello" && s == "world")
+        );
+        assert!(pattern.matches("helloworld", false));
+        assert!(pattern.matches("hello beautiful world", false));
+    }
+
+    #[test]
+    fn test_glob_complex_regex() {
+        let pattern = CompiledPattern::compile_glob("a*b*c");
+        assert!(matches!(pattern, CompiledPattern::Regex(_)));
+        assert!(pattern.matches("abc", false));
+        assert!(pattern.matches("aXbYc", false));
+    }
+
+    #[test]
+    fn test_glob_question_mark() {
+        let pattern = CompiledPattern::compile_glob("a?c");
+        assert!(matches!(pattern, CompiledPattern::Regex(_)));
+        assert!(pattern.matches("abc", false));
+        assert!(!pattern.matches("ac", false));
+    }
+
+    #[test]
+    fn test_glob_character_class() {
+        // Character class alone without * or ? is treated as exact match
+        let pattern = CompiledPattern::compile_glob("a[bc]d");
+        assert!(matches!(pattern, CompiledPattern::Exact(_)));
+
+        // Pattern with * at end is treated as Prefix
+        let pattern2 = CompiledPattern::compile_glob("a[bc]*");
+        assert!(matches!(pattern2, CompiledPattern::Prefix(ref s) if s == "a[bc]"));
+
+        // *[bc]* is Contains since middle has no wildcards
+        let pattern3 = CompiledPattern::compile_glob("*[bc]*");
+        assert!(matches!(pattern3, CompiledPattern::Contains(ref s) if s == "[bc]"));
+    }
+
+    #[test]
+    fn test_glob_escape_edge_cases() {
+        // `a\\*b` splits on * giving ["a\\", "b"] - treated as PrefixSuffix
+        let pattern1 = CompiledPattern::compile_glob("a\\*b");
+        assert!(matches!(pattern1, CompiledPattern::PrefixSuffix(_, _)));
+
+        // Complex escapes with multiple wildcards go to regex
+        let pattern2 = CompiledPattern::compile_glob("*a*b*");
+        assert!(matches!(pattern2, CompiledPattern::Regex(_)));
+        assert!(pattern2.matches("XaYbZ", false));
+        assert!(pattern2.matches("ab", false));
+    }
+
+    // =========================================================================
+    // CompareOp tests
+    // =========================================================================
+
+    #[test]
+    fn test_compare_op_eq() {
+        let op = CompareOp::Eq;
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(5)),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(6)),
+            Some(false)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(6), &Value::Integer(5)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_compare_op_ne() {
+        let op = CompareOp::Ne;
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(5)),
+            Some(false)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(6)),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(6), &Value::Integer(5)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_compare_op_lt() {
+        let op = CompareOp::Lt;
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(6)),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(5)),
+            Some(false)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(6), &Value::Integer(5)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_compare_op_le() {
+        let op = CompareOp::Le;
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(6)),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(5)),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(6), &Value::Integer(5)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_compare_op_gt() {
+        let op = CompareOp::Gt;
+        assert_eq!(
+            op.compare(&Value::Integer(6), &Value::Integer(5)),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(5)),
+            Some(false)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(6)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_compare_op_ge() {
+        let op = CompareOp::Ge;
+        assert_eq!(
+            op.compare(&Value::Integer(6), &Value::Integer(5)),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(5)),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Integer(5), &Value::Integer(6)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_compare_op_with_booleans() {
+        // Test boolean comparisons
+        let op = CompareOp::Eq;
+        assert_eq!(
+            op.compare(&Value::Boolean(true), &Value::Boolean(true)),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Boolean(true), &Value::Boolean(false)),
+            Some(false)
+        );
+        assert_eq!(
+            op.compare(&Value::Boolean(false), &Value::Boolean(false)),
+            Some(true)
+        );
+
+        let op_ne = CompareOp::Ne;
+        assert_eq!(
+            op_ne.compare(&Value::Boolean(true), &Value::Boolean(false)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_compare_op_strings() {
+        let op = CompareOp::Lt;
+        assert_eq!(
+            op.compare(&Value::Text("apple".into()), &Value::Text("banana".into())),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Text("banana".into()), &Value::Text("apple".into())),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_compare_op_floats() {
+        let op = CompareOp::Ge;
+        assert_eq!(
+            op.compare(&Value::Float(2.5), &Value::Float(2.5)),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Float(2.6), &Value::Float(2.5)),
+            Some(true)
+        );
+        assert_eq!(
+            op.compare(&Value::Float(2.4), &Value::Float(2.5)),
+            Some(false)
+        );
+    }
+
+    // =========================================================================
+    // Op Debug format tests
+    // =========================================================================
+
+    #[test]
+    fn test_op_debug_format() {
+        // Test that Debug formatting works for various Op variants
+        assert_eq!(format!("{:?}", Op::LoadColumn(5)), "LoadColumn(5)");
+        assert_eq!(format!("{:?}", Op::LoadColumn2(3)), "LoadColumn2(3)");
+        assert_eq!(format!("{:?}", Op::Eq), "Eq");
+        assert_eq!(format!("{:?}", Op::Ne), "Ne");
+        assert_eq!(format!("{:?}", Op::Lt), "Lt");
+        assert_eq!(format!("{:?}", Op::Le), "Le");
+        assert_eq!(format!("{:?}", Op::Gt), "Gt");
+        assert_eq!(format!("{:?}", Op::Ge), "Ge");
+        assert_eq!(format!("{:?}", Op::Add), "Add");
+        assert_eq!(format!("{:?}", Op::Sub), "Sub");
+        assert_eq!(format!("{:?}", Op::Mul), "Mul");
+        assert_eq!(format!("{:?}", Op::Div), "Div");
+        assert_eq!(format!("{:?}", Op::Mod), "Mod");
+        assert_eq!(format!("{:?}", Op::Not), "Not");
+        assert_eq!(format!("{:?}", Op::Neg), "Neg");
+        assert_eq!(format!("{:?}", Op::IsNull), "IsNull");
+        assert_eq!(format!("{:?}", Op::IsNotNull), "IsNotNull");
+        assert_eq!(format!("{:?}", Op::Return), "Return");
+        assert_eq!(format!("{:?}", Op::ReturnTrue), "ReturnTrue");
+        assert_eq!(format!("{:?}", Op::ReturnFalse), "ReturnFalse");
+        assert_eq!(format!("{:?}", Op::Nop), "Nop");
+        assert_eq!(format!("{:?}", Op::Dup), "Dup");
+        assert_eq!(format!("{:?}", Op::Pop), "Pop");
+        assert_eq!(format!("{:?}", Op::Swap), "Swap");
+    }
+
+    #[test]
+    fn test_op_debug_format_with_values() {
+        assert_eq!(
+            format!("{:?}", Op::LoadConst(Value::Integer(42))),
+            "LoadConst(Integer(42))"
+        );
+        assert_eq!(
+            format!("{:?}", Op::EqColumnConst(0, Value::Integer(10))),
+            "EqColumnConst(0, Integer(10))"
+        );
+        assert_eq!(format!("{:?}", Op::And(5)), "And(jump=5)");
+        assert_eq!(format!("{:?}", Op::Or(10)), "Or(jump=10)");
+        assert_eq!(format!("{:?}", Op::Jump(15)), "Jump(15)");
+        assert_eq!(format!("{:?}", Op::JumpIfTrue(20)), "JumpIfTrue(20)");
+        assert_eq!(format!("{:?}", Op::JumpIfFalse(25)), "JumpIfFalse(25)");
+    }
+
+    #[test]
+    fn test_op_debug_format_special() {
+        assert_eq!(format!("{:?}", Op::Coalesce(3)), "Coalesce(3)");
+        assert_eq!(format!("{:?}", Op::NullIf), "NullIf");
+        assert_eq!(format!("{:?}", Op::Greatest(2)), "Greatest(2)");
+        assert_eq!(format!("{:?}", Op::Least(4)), "Least(4)");
+        assert_eq!(format!("{:?}", Op::Between), "Between");
+        assert_eq!(format!("{:?}", Op::NotBetween), "NotBetween");
+        assert_eq!(format!("{:?}", Op::Concat), "Concat");
+        assert_eq!(format!("{:?}", Op::JsonAccess), "JsonAccess");
+        assert_eq!(format!("{:?}", Op::JsonAccessText), "JsonAccessText");
+    }
+
+    #[test]
+    fn test_op_debug_bitwise() {
+        assert_eq!(format!("{:?}", Op::BitAnd), "BitAnd");
+        assert_eq!(format!("{:?}", Op::BitOr), "BitOr");
+        assert_eq!(format!("{:?}", Op::BitXor), "BitXor");
+        assert_eq!(format!("{:?}", Op::BitNot), "BitNot");
+        assert_eq!(format!("{:?}", Op::Shl), "Shl");
+        assert_eq!(format!("{:?}", Op::Shr), "Shr");
+    }
+
+    #[test]
+    fn test_op_debug_case() {
+        assert_eq!(format!("{:?}", Op::CaseStart), "CaseStart");
+        assert_eq!(format!("{:?}", Op::CaseWhen(5)), "CaseWhen(jump=5)");
+        assert_eq!(format!("{:?}", Op::CaseThen(10)), "CaseThen(jump=10)");
+        assert_eq!(format!("{:?}", Op::CaseElse), "CaseElse");
+        assert_eq!(format!("{:?}", Op::CaseEnd), "CaseEnd");
+        assert_eq!(format!("{:?}", Op::CaseCompare), "CaseCompare");
+    }
+
+    #[test]
+    fn test_op_debug_timestamp() {
+        assert_eq!(
+            format!("{:?}", Op::TimestampAddInterval),
+            "TimestampAddInterval"
+        );
+        assert_eq!(
+            format!("{:?}", Op::TimestampSubInterval),
+            "TimestampSubInterval"
+        );
+        assert_eq!(format!("{:?}", Op::TimestampDiff), "TimestampDiff");
+        assert_eq!(format!("{:?}", Op::TimestampAddDays), "TimestampAddDays");
+        assert_eq!(format!("{:?}", Op::TimestampSubDays), "TimestampSubDays");
+    }
+
+    #[test]
+    fn test_op_debug_boolean_checks() {
+        assert_eq!(format!("{:?}", Op::IsTrue), "IsTrue");
+        assert_eq!(format!("{:?}", Op::IsNotTrue), "IsNotTrue");
+        assert_eq!(format!("{:?}", Op::IsFalse), "IsFalse");
+        assert_eq!(format!("{:?}", Op::IsNotFalse), "IsNotFalse");
+        assert_eq!(format!("{:?}", Op::IsDistinctFrom), "IsDistinctFrom");
+        assert_eq!(format!("{:?}", Op::IsNotDistinctFrom), "IsNotDistinctFrom");
+    }
+
+    #[test]
+    fn test_op_debug_subquery() {
+        assert_eq!(
+            format!("{:?}", Op::ExecScalarSubquery(0)),
+            "ExecScalarSubquery(0)"
+        );
+        assert_eq!(format!("{:?}", Op::ExecExists(1)), "ExecExists(1)");
+        assert_eq!(format!("{:?}", Op::ExecInSubquery(2)), "ExecInSubquery(2)");
+        assert_eq!(
+            format!("{:?}", Op::ExecAll(3, CompareOp::Gt)),
+            "ExecAll(3, Gt)"
+        );
+        assert_eq!(
+            format!("{:?}", Op::ExecAny(4, CompareOp::Lt)),
+            "ExecAny(4, Lt)"
+        );
+    }
+
+    #[test]
+    fn test_op_debug_sets() {
+        let set = Arc::new(AHashSet::new());
+        assert!(format!("{:?}", Op::InSet(set.clone(), false)).contains("InSet"));
+        assert!(format!("{:?}", Op::NotInSet(set.clone(), true)).contains("NotInSet"));
+        assert!(format!("{:?}", Op::InSetColumn(0, set, false)).contains("InSetColumn"));
+    }
+
+    #[test]
+    fn test_op_debug_like_glob() {
+        let pattern = Arc::new(CompiledPattern::compile("test%", false));
+        assert!(format!("{:?}", Op::Like(pattern.clone(), false)).contains("Like"));
+        assert!(format!("{:?}", Op::Glob(pattern.clone())).contains("Glob"));
+        assert!(format!("{:?}", Op::LikeColumn(0, pattern, false)).contains("LikeColumn"));
+    }
 }

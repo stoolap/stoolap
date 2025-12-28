@@ -42,12 +42,12 @@
 //! Uses `roaring` crate (RoaringBitmap) - same as Lucene, Druid, Spark.
 //! Automatic compression: array for sparse, bitmap for dense, RLE for runs.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
 use ahash::AHashMap;
 use roaring::RoaringTreemap;
+use rustc_hash::FxHashMap;
 
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
 use crate::storage::expression::Expression;
@@ -327,7 +327,7 @@ impl Index for BitmapIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &HashMap<i64, Vec<Value>>) -> Result<()> {
+    fn add_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
         for (&row_id, values) in entries {
             self.add(values, row_id, 0)?;
         }
@@ -368,7 +368,7 @@ impl Index for BitmapIndex {
         Ok(())
     }
 
-    fn remove_batch(&self, entries: &HashMap<i64, Vec<Value>>) -> Result<()> {
+    fn remove_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
         for (&row_id, values) in entries {
             self.remove(values, row_id, 0)?;
         }

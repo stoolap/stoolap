@@ -2738,7 +2738,7 @@ impl Table for MVCCTable {
         // This uses efficient BTreeMap iteration with skip/take semantics.
         if let Some(pk_idx) = self.cached_schema.pk_column_index() {
             let pk_col = &self.cached_schema.columns[pk_idx];
-            if pk_col.name.eq_ignore_ascii_case(column_name) {
+            if pk_col.name_lower == column_name.to_lowercase() {
                 // Use efficient BTreeMap iteration with OFFSET/LIMIT
                 // This iterates the BTreeMap directly (already sorted by row_id)
                 // and only clones rows that are actually returned (not skipped)

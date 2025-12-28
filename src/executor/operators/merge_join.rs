@@ -24,7 +24,7 @@ use std::cmp::Ordering;
 
 use crate::core::{Result, Row, Value};
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
-use crate::executor::utils::{combine_rows, compare_values};
+use crate::executor::utils::compare_values;
 
 use super::hash_join::JoinType;
 
@@ -199,13 +199,9 @@ impl MergeJoinOperator {
     }
 
     /// Combine left and right rows into output row.
+    #[inline]
     fn combine(&self, left: &Row, right: &Row) -> Row {
-        Row::from_values(combine_rows(
-            left,
-            right,
-            self.left_col_count,
-            self.right_col_count,
-        ))
+        Row::from_combined(left, right)
     }
 }
 

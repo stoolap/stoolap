@@ -75,6 +75,19 @@ impl RowVersion {
         }
     }
 
+    /// Creates a new row version with a pre-computed timestamp
+    /// This avoids calling SystemTime::now() for each row in bulk operations
+    #[inline]
+    pub fn new_with_timestamp(txn_id: i64, row_id: i64, data: Row, create_time: i64) -> Self {
+        Self {
+            txn_id,
+            deleted_at_txn_id: 0,
+            data,
+            row_id,
+            create_time,
+        }
+    }
+
     /// Creates a new deleted version
     pub fn new_deleted(txn_id: i64, row_id: i64, data: Row) -> Self {
         Self {
@@ -83,6 +96,23 @@ impl RowVersion {
             data,
             row_id,
             create_time: get_fast_timestamp(),
+        }
+    }
+
+    /// Creates a new deleted version with a pre-computed timestamp
+    #[inline]
+    pub fn new_deleted_with_timestamp(
+        txn_id: i64,
+        row_id: i64,
+        data: Row,
+        create_time: i64,
+    ) -> Self {
+        Self {
+            txn_id,
+            deleted_at_txn_id: txn_id,
+            data,
+            row_id,
+            create_time,
         }
     }
 
@@ -388,20 +418,16 @@ impl VersionStore {
         // Use write lock for the entire operation (MVCC single-writer semantics)
         let mut versions = self.versions.write();
 
-        // Check if existing version exists first
-        let existing_data = versions.get(&row_id).map(|e| {
-            (
-                e.version.clone(),
-                e.prev.clone(),
-                e.arena_idx,
-                e.chain_depth,
-            )
-        });
+        // Use entry API to avoid double BTreeMap traversal (get + insert -> single entry)
+        match versions.entry(row_id) {
+            std::collections::btree_map::Entry::Occupied(mut occupied) => {
+                // Extract existing data from the entry
+                let existing = occupied.get();
+                let existing_version = existing.version.clone();
+                let existing_prev = existing.prev.clone();
+                let existing_arena_idx = existing.arena_idx;
+                let existing_depth = existing.chain_depth;
 
-        let entry =
-            if let Some((existing_version, existing_prev, existing_arena_idx, existing_depth)) =
-                existing_data
-            {
                 // Create new entry with previous version
                 let mut new_version = version;
                 // For deletes, if no data provided, preserve data from current version
@@ -452,13 +478,17 @@ impl VersionStore {
                 });
                 let final_depth = prev_depth + 2;
 
-                VersionChainEntry {
+                let new_entry = VersionChainEntry {
                     version: new_version,
                     prev: Some(prev_chain),
                     arena_idx,
                     chain_depth: final_depth,
-                }
-            } else {
+                };
+
+                // Replace entry in-place (no additional tree traversal)
+                occupied.insert(new_entry);
+            }
+            std::collections::btree_map::Entry::Vacant(vacant) => {
                 // First version for this row - store in arena
                 // Use insert_row_get_arc to get the Arc back and reuse it for O(1) clones
                 let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
@@ -478,15 +508,17 @@ impl VersionStore {
                     (None, version)
                 };
 
-                VersionChainEntry {
+                let new_entry = VersionChainEntry {
                     version: final_version,
                     prev: None,
                     arena_idx,
                     chain_depth: 1, // First version
-                }
-            };
+                };
 
-        versions.insert(row_id, entry);
+                // Insert into vacant slot (no additional traversal)
+                vacant.insert(new_entry);
+            }
+        }
     }
 
     /// Adds multiple versions in batch - used by commit
@@ -508,104 +540,103 @@ impl VersionStore {
         let mut arena_index_updates: Vec<(i64, usize)> = Vec::with_capacity(batch.len());
 
         for (row_id, version) in batch {
-            // Get existing data first (if any)
-            let existing_data = versions.get(&row_id).map(|e| {
-                (
-                    e.version.clone(),
-                    e.prev.clone(),
-                    e.arena_idx,
-                    e.chain_depth,
-                )
-            });
+            // Use entry API to avoid double BTreeMap traversal (get + insert -> single entry)
+            match versions.entry(row_id) {
+                std::collections::btree_map::Entry::Occupied(mut occupied) => {
+                    // Extract existing data from the entry
+                    let existing = occupied.get();
+                    let existing_version = existing.version.clone();
+                    let existing_prev = existing.prev.clone();
+                    let existing_arena_idx = existing.arena_idx;
+                    let existing_depth = existing.chain_depth;
 
-            let entry = if let Some((
-                existing_version,
-                existing_prev,
-                existing_arena_idx,
-                existing_depth,
-            )) = existing_data
-            {
-                // Create new entry with previous version
-                let mut new_version = version;
-                // For deletes, if no data provided, preserve data from current version
-                if new_version.deleted_at_txn_id != 0 && new_version.data.is_empty() {
-                    new_version.data = existing_version.data.clone();
-                }
+                    // Create new entry with previous version
+                    let mut new_version = version;
+                    // For deletes, if no data provided, preserve data from current version
+                    if new_version.deleted_at_txn_id != 0 && new_version.data.is_empty() {
+                        new_version.data = existing_version.data.clone();
+                    }
 
-                // Mark old arena entry as deleted to avoid double-counting
-                if let Some(old_arena_idx) = existing_arena_idx {
-                    self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
-                }
+                    // Mark old arena entry as deleted to avoid double-counting
+                    if let Some(old_arena_idx) = existing_arena_idx {
+                        self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
+                    }
 
-                // Update arena with Arc reuse for O(1) clones on read
-                let arena_idx = if new_version.deleted_at_txn_id == 0 {
-                    let (idx, arc_data) = self.arena.insert_row_get_arc(
-                        row_id,
-                        new_version.txn_id,
-                        new_version.create_time,
-                        &new_version.data,
-                    );
-                    // Reuse the Arc for the version's data
-                    new_version.data = Row::from_arc(arc_data);
-                    arena_index_updates.push((row_id, idx));
-                    Some(idx)
-                } else {
-                    None
-                };
-
-                // O(1) chain management with depth tracking
-                // When limit exceeded: drop old chain (no cloning, truly O(1))
-                let new_depth = existing_depth + 1;
-                let (keep_prev, prev_depth) =
-                    if self.max_version_history > 0 && new_depth > self.max_version_history {
-                        // Exceeded limit - drop old chain (O(1), no cloning)
-                        (None, 0)
+                    // Update arena with Arc reuse for O(1) clones on read
+                    let arena_idx = if new_version.deleted_at_txn_id == 0 {
+                        let (idx, arc_data) = self.arena.insert_row_get_arc(
+                            row_id,
+                            new_version.txn_id,
+                            new_version.create_time,
+                            &new_version.data,
+                        );
+                        // Reuse the Arc for the version's data
+                        new_version.data = Row::from_arc(arc_data);
+                        arena_index_updates.push((row_id, idx));
+                        Some(idx)
                     } else {
-                        // Under limit - keep chain as-is
-                        (existing_prev, existing_depth)
+                        None
                     };
 
-                let prev_chain = Arc::new(VersionChainEntry {
-                    version: existing_version,
-                    prev: keep_prev,
-                    arena_idx: existing_arena_idx,
-                    chain_depth: prev_depth + 1,
-                });
-                let final_depth = prev_depth + 2;
+                    // O(1) chain management with depth tracking
+                    // When limit exceeded: drop old chain (no cloning, truly O(1))
+                    let new_depth = existing_depth + 1;
+                    let (keep_prev, prev_depth) =
+                        if self.max_version_history > 0 && new_depth > self.max_version_history {
+                            // Exceeded limit - drop old chain (O(1), no cloning)
+                            (None, 0)
+                        } else {
+                            // Under limit - keep chain as-is
+                            (existing_prev, existing_depth)
+                        };
 
-                VersionChainEntry {
-                    version: new_version,
-                    prev: Some(prev_chain),
-                    arena_idx,
-                    chain_depth: final_depth,
+                    let prev_chain = Arc::new(VersionChainEntry {
+                        version: existing_version,
+                        prev: keep_prev,
+                        arena_idx: existing_arena_idx,
+                        chain_depth: prev_depth + 1,
+                    });
+                    let final_depth = prev_depth + 2;
+
+                    let new_entry = VersionChainEntry {
+                        version: new_version,
+                        prev: Some(prev_chain),
+                        arena_idx,
+                        chain_depth: final_depth,
+                    };
+
+                    // Replace entry in-place (no additional tree traversal)
+                    occupied.insert(new_entry);
                 }
-            } else {
-                // First version for this row - store in arena with Arc reuse
-                let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
-                    let (idx, arc_data) = self.arena.insert_row_get_arc(
-                        row_id,
-                        version.txn_id,
-                        version.create_time,
-                        &version.data,
-                    );
-                    arena_index_updates.push((row_id, idx));
-                    // Create version with Arc-backed data for O(1) clone
-                    let mut v = version;
-                    v.data = Row::from_arc(arc_data);
-                    (Some(idx), v)
-                } else {
-                    (None, version)
-                };
+                std::collections::btree_map::Entry::Vacant(vacant) => {
+                    // First version for this row - store in arena with Arc reuse
+                    let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
+                        let (idx, arc_data) = self.arena.insert_row_get_arc(
+                            row_id,
+                            version.txn_id,
+                            version.create_time,
+                            &version.data,
+                        );
+                        arena_index_updates.push((row_id, idx));
+                        // Create version with Arc-backed data for O(1) clone
+                        let mut v = version;
+                        v.data = Row::from_arc(arc_data);
+                        (Some(idx), v)
+                    } else {
+                        (None, version)
+                    };
 
-                VersionChainEntry {
-                    version: final_version,
-                    prev: None,
-                    arena_idx,
-                    chain_depth: 1,
+                    let new_entry = VersionChainEntry {
+                        version: final_version,
+                        prev: None,
+                        arena_idx,
+                        chain_depth: 1,
+                    };
+
+                    // Insert into vacant slot (no additional traversal)
+                    vacant.insert(new_entry);
                 }
-            };
-
-            versions.insert(row_id, entry);
+            }
         }
 
         // Batch update row_arena_index under a single lock acquisition
@@ -3773,14 +3804,20 @@ pub struct TransactionVersionStore {
     write_set: Int64Map<WriteSetEntry>,
 }
 
+/// Default capacity for transaction-local maps.
+/// Pre-sizing to 16 entries balances memory efficiency for small transactions
+/// while avoiding rehashing for operations affecting up to ~11 rows.
+const TX_VERSION_MAP_INITIAL_CAPACITY: usize = 16;
+
 impl TransactionVersionStore {
     /// Creates a new transaction-local version store
     pub fn new(parent_store: Arc<VersionStore>, txn_id: i64) -> Self {
         Self {
-            local_versions: new_int64_map(),
+            // Pre-size maps to avoid rehashing for typical DML operations
+            local_versions: new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY),
             parent_store,
             txn_id,
-            write_set: new_int64_map(),
+            write_set: new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY),
         }
     }
 
@@ -3791,48 +3828,45 @@ impl TransactionVersionStore {
 
     /// Put adds or updates a row in the transaction's local store
     pub fn put(&mut self, row_id: i64, data: Row, is_delete: bool) -> Result<(), Error> {
-        // Check if we already have a local version
-        if !self.local_versions.contains_key(&row_id) {
-            // Check if this row exists in parent store and track in write-set
-            // Single lookup instead of two separate calls
-            if !self.write_set.contains_key(&row_id) {
-                let read_version = self.parent_store.get_visible_version(row_id, self.txn_id);
-                let row_exists = read_version.is_some();
-
-                let read_version_seq = self
-                    .parent_store
-                    .visibility_checker
-                    .as_ref()
-                    .map(|c| c.get_current_sequence())
-                    .unwrap_or(0);
-
-                self.write_set.insert(
-                    row_id,
-                    WriteSetEntry {
-                        read_version,
-                        read_version_seq,
-                    },
-                );
-
-                // For existing rows, try to claim them
-                if row_exists {
-                    self.parent_store.try_claim_row(row_id, self.txn_id)?;
-                }
-            }
-        }
-
         // Create the row version
         let mut rv = RowVersion::new(self.txn_id, row_id, data);
-
         if is_delete {
             rv.deleted_at_txn_id = self.txn_id;
         }
 
-        // Append to version history for this row (for savepoint support)
-        if let Some(versions) = self.local_versions.get_mut(&row_id) {
-            versions.push(rv);
-        } else {
-            self.local_versions.insert(row_id, vec![rv]);
+        // Use entry API to avoid double lookup on local_versions
+        match self.local_versions.entry(row_id) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                // Already have local version - just append
+                e.get_mut().push(rv);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // New row - need to check write-set and parent store
+                if let std::collections::hash_map::Entry::Vacant(ws_entry) =
+                    self.write_set.entry(row_id)
+                {
+                    let read_version = self.parent_store.get_visible_version(row_id, self.txn_id);
+                    let row_exists = read_version.is_some();
+
+                    let read_version_seq = self
+                        .parent_store
+                        .visibility_checker
+                        .as_ref()
+                        .map(|c| c.get_current_sequence())
+                        .unwrap_or(0);
+
+                    ws_entry.insert(WriteSetEntry {
+                        read_version,
+                        read_version_seq,
+                    });
+
+                    // For existing rows, try to claim them
+                    if row_exists {
+                        self.parent_store.try_claim_row(row_id, self.txn_id)?;
+                    }
+                }
+                e.insert(vec![rv]);
+            }
         }
         Ok(())
     }
@@ -3867,35 +3901,35 @@ impl TransactionVersionStore {
             rv.deleted_at_txn_id = self.txn_id;
         }
 
-        // Check if already in local versions (already processed in this transaction)
-        if let Some(versions) = self.local_versions.get_mut(&row_id) {
-            versions.push(rv);
-            return Ok(());
+        // Use entry API to avoid double lookup on local_versions
+        match self.local_versions.entry(row_id) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                // Already have local version - just append
+                e.get_mut().push(rv);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // Track in write-set using the pre-fetched original version
+                if let std::collections::hash_map::Entry::Vacant(ws_entry) =
+                    self.write_set.entry(row_id)
+                {
+                    let read_version_seq = self
+                        .parent_store
+                        .visibility_checker
+                        .as_ref()
+                        .map(|c| c.get_current_sequence())
+                        .unwrap_or(0);
+
+                    ws_entry.insert(WriteSetEntry {
+                        read_version: Some(original_version),
+                        read_version_seq,
+                    });
+
+                    // Claim the row for update
+                    self.parent_store.try_claim_row(row_id, self.txn_id)?;
+                }
+                e.insert(vec![rv]);
+            }
         }
-
-        // Track in write-set using the pre-fetched original version
-        if !self.write_set.contains_key(&row_id) {
-            let read_version_seq = self
-                .parent_store
-                .visibility_checker
-                .as_ref()
-                .map(|c| c.get_current_sequence())
-                .unwrap_or(0);
-
-            self.write_set.insert(
-                row_id,
-                WriteSetEntry {
-                    read_version: Some(original_version),
-                    read_version_seq,
-                },
-            );
-
-            // Claim the row for update
-            self.parent_store.try_claim_row(row_id, self.txn_id)?;
-        }
-
-        // Insert new version history for this row
-        self.local_versions.insert(row_id, vec![rv]);
         Ok(())
     }
 

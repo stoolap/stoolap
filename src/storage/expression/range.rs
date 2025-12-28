@@ -15,9 +15,8 @@
 //! Range expression for Stoolap
 //!
 
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
+use rustc_hash::FxHashMap;
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::core::{DataType, Result, Row, Schema, Value};
@@ -85,7 +84,7 @@ pub struct RangeExpr {
     col_index: Option<usize>,
 
     /// Column aliases
-    aliases: HashMap<String, String>,
+    aliases: FxHashMap<String, String>,
     /// Original column name if using alias
     original_column: Option<String>,
 }
@@ -107,7 +106,7 @@ impl RangeExpr {
             include_max,
             bounds: RangeBounds::default(),
             col_index: None,
-            aliases: HashMap::new(),
+            aliases: FxHashMap::default(),
             original_column: None,
         };
         expr.compute_typed_bounds();
@@ -377,7 +376,7 @@ impl Expression for RangeExpr {
         }
     }
 
-    fn with_aliases(&self, aliases: &HashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
         let resolved = resolve_alias(&self.column, aliases);
         let mut expr = self.clone();
 
@@ -613,7 +612,7 @@ mod tests {
             Value::text("Alice"),
         ]);
 
-        let mut aliases = HashMap::new();
+        let mut aliases = FxHashMap::default();
         aliases.insert("i".to_string(), "id".to_string());
 
         let expr = RangeExpr::inclusive("i", Value::integer(1), Value::integer(10));

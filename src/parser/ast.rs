@@ -19,7 +19,7 @@
 
 use super::token::{Position, Token};
 use ahash::AHashSet;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -1549,7 +1549,7 @@ impl fmt::Display for InsertStatement {
 pub struct UpdateStatement {
     pub token: Token,
     pub table_name: Identifier,
-    pub updates: HashMap<String, Expression>,
+    pub updates: FxHashMap<String, Expression>,
     pub where_clause: Option<Box<Expression>>,
     /// RETURNING clause expressions
     pub returning: Vec<Expression>,

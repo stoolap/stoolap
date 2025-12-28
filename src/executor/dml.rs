@@ -147,16 +147,16 @@ impl Executor {
                 column_names = schema.column_names_owned().to_vec();
             } else {
                 // Validate columns exist and pre-compute their indices
+                // OPTIMIZATION: Use cached column_index_map for O(1) lookups instead of O(n) linear scan
+                let col_map = schema.column_index_map();
                 column_indices = stmt
                     .columns
                     .iter()
                     .map(|id| {
                         // Use pre-computed lowercase value from AST
-                        let col_lower = &id.value_lower;
-                        schema
-                            .columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(col_lower))
+                        col_map
+                            .get(&id.value_lower)
+                            .copied()
                             .ok_or_else(|| Error::ColumnNotFoundNamed(id.value.clone()))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -318,7 +318,7 @@ impl Executor {
                     } else {
                         // Fall back to VM for complex expressions (Parameters, functions, etc.)
                         let program = compile_expression(expr, &[])?;
-                        vm.execute(&program, &base_exec_ctx)?
+                        vm.execute_cow(&program, &base_exec_ctx)?
                     };
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
@@ -415,7 +415,7 @@ impl Executor {
                     } else {
                         // Fall back to VM for complex expressions (Parameters, functions, etc.)
                         let program = compile_expression(expr, &[])?;
-                        vm.execute(&program, &base_exec_ctx)?
+                        vm.execute_cow(&program, &base_exec_ctx)?
                     };
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
@@ -519,8 +519,8 @@ impl Executor {
 
         // Pre-compute column names and indices to avoid schema borrow conflicts
         let schema = table.schema();
-        // OPTIMIZATION: Use reference directly, avoid cloning all column names
-        let column_names = schema.column_names_owned();
+        // OPTIMIZATION: Use Arc<Vec<String>> to share column names without cloning
+        let column_names = schema.column_names_arc();
 
         // Check if any update expressions contain subqueries
         let has_update_subqueries = stmt
@@ -557,16 +557,15 @@ impl Executor {
         let update_indices: Vec<(usize, crate::core::DataType, Expression, bool)> =
             if has_correlated_updates {
                 // Only clone expressions when we actually need them (correlated path)
-                stmt.updates
-                    .iter()
-                    .filter_map(|(col_name, expr)| {
-                        let is_correlated =
-                            Self::has_subqueries(expr) && Self::has_correlated_subqueries(expr);
-                        schema
-                            .columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .map(|idx| {
+                {
+                    let col_map = schema.column_index_map();
+                    stmt.updates
+                        .iter()
+                        .filter_map(|(col_name, expr)| {
+                            let is_correlated =
+                                Self::has_subqueries(expr) && Self::has_correlated_subqueries(expr);
+                            let col_lower = col_name.to_lowercase();
+                            col_map.get(&col_lower).map(|&idx| {
                                 (
                                     idx,
                                     schema.columns[idx].data_type,
@@ -574,8 +573,9 @@ impl Executor {
                                     is_correlated,
                                 )
                             })
-                    })
-                    .collect()
+                        })
+                        .collect()
+                }
             } else {
                 // Non-correlated path: empty vec, we compile directly from source later
                 Vec::new()
@@ -642,11 +642,7 @@ impl Executor {
 
         // Create evaluator once and reuse for all rows (optimization)
         let mut evaluator = CompiledEvaluator::new(function_registry).with_context(ctx);
-        evaluator.init_columns(column_names);
-
-        // For correlated subqueries, we need to process per-row with outer row context
-        // Build column name mappings for outer row context
-        let column_names_vec: Vec<String> = column_names.to_vec();
+        evaluator.init_columns_arc(Arc::clone(&column_names));
 
         // Use RefCell to collect updated rows for RETURNING clause
         use std::cell::RefCell;
@@ -674,11 +670,10 @@ impl Executor {
             let mut precomputed: AHashMap<Value, Vec<(usize, Value)>> = AHashMap::with_capacity(64);
 
             // Build column indices for scanning (all columns)
-            let all_col_indices: Vec<usize> = (0..column_names_vec.len()).collect();
-            let column_names_arc = Arc::new(column_names_vec.clone());
+            let all_col_indices: Vec<usize> = (0..column_names.len()).collect();
 
             // OPTIMIZATION: Pre-compute lowercase and qualified column names once
-            let col_name_pairs: Vec<(String, String)> = column_names_vec
+            let col_name_pairs: Vec<(String, String)> = column_names
                 .iter()
                 .map(|col_name| {
                     let col_lower = col_name.to_lowercase();
@@ -721,8 +716,10 @@ impl Executor {
 
                 // Create context with outer row for correlated subquery evaluation
                 // Move map into context, we'll take it back after
-                let mut correlated_ctx = ctx
-                    .with_outer_row(std::mem::take(&mut outer_row_map), column_names_arc.clone());
+                let mut correlated_ctx = ctx.with_outer_row(
+                    std::mem::take(&mut outer_row_map),
+                    Arc::clone(&column_names),
+                );
 
                 // Evaluate all update expressions
                 let mut new_values: Vec<(usize, Value)> = Vec::with_capacity(update_indices.len());
@@ -734,7 +731,7 @@ impl Executor {
                                 // Now evaluate the processed expression (subquery replaced with value)
                                 let mut eval = CompiledEvaluator::new(function_registry)
                                     .with_context(&correlated_ctx);
-                                eval.init_columns(column_names);
+                                eval.init_columns_arc(Arc::clone(&column_names));
                                 eval.set_row_array(row);
                                 eval.evaluate(&processed_expr).ok()
                             }
@@ -783,21 +780,19 @@ impl Executor {
             // Compile directly from source expressions (no intermediate cloning!)
             use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
 
+            let col_map = schema.column_index_map();
             let compiled_updates: Vec<(usize, crate::core::DataType, SharedProgram)> =
                 if let Some(ref processed) = processed_updates {
                     // Use pre-processed expressions (subqueries already evaluated)
                     processed
                         .iter()
                         .filter_map(|(col_name, expr)| {
-                            schema
-                                .columns
-                                .iter()
-                                .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                                .and_then(|idx| {
-                                    compile_expression(expr, column_names).ok().map(|program| {
-                                        (idx, schema.columns[idx].data_type, program)
-                                    })
-                                })
+                            let col_lower = col_name.to_lowercase();
+                            col_map.get(&col_lower).and_then(|&idx| {
+                                compile_expression(expr, &column_names)
+                                    .ok()
+                                    .map(|program| (idx, schema.columns[idx].data_type, program))
+                            })
                         })
                         .collect()
                 } else {
@@ -805,15 +800,12 @@ impl Executor {
                     stmt.updates
                         .iter()
                         .filter_map(|(col_name, expr)| {
-                            schema
-                                .columns
-                                .iter()
-                                .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                                .and_then(|idx| {
-                                    compile_expression(expr, column_names).ok().map(|program| {
-                                        (idx, schema.columns[idx].data_type, program)
-                                    })
-                                })
+                            let col_lower = col_name.to_lowercase();
+                            col_map.get(&col_lower).and_then(|&idx| {
+                                compile_expression(expr, &column_names)
+                                    .ok()
+                                    .map(|program| (idx, schema.columns[idx].data_type, program))
+                            })
                         })
                         .collect()
                 };
@@ -846,7 +838,7 @@ impl Executor {
                     compiled_updates
                         .iter()
                         .filter_map(|(idx, col_type, program)| {
-                            vm.execute(program, &exec_ctx)
+                            vm.execute_cow(program, &exec_ctx)
                                 .ok()
                                 .map(|v| (*idx, v.into_coerce_to_type(*col_type)))
                         })
@@ -888,7 +880,7 @@ impl Executor {
         // Handle RETURNING clause
         if has_returning {
             let rows = returning_rows.into_inner();
-            return self.build_returning_result(&stmt.returning, rows, &column_names_vec, ctx);
+            return self.build_returning_result(&stmt.returning, rows, &column_names, ctx);
         }
 
         Ok(Box::new(ExecResult::with_rows_affected(
@@ -1299,16 +1291,16 @@ impl Executor {
         };
 
         // OPTIMIZATION: Pre-compute column indices and types to avoid per-row linear search
+        // Use cached column_index_map for O(1) lookups
+        let col_map = schema.column_index_map();
         let update_specs: Vec<(usize, crate::core::DataType, &Expression)> = stmt
             .update_columns
             .iter()
             .zip(stmt.update_expressions.iter())
             .filter_map(|(col, expr)| {
-                schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&col.value))
-                    .map(|idx| (idx, schema.columns[idx].data_type, expr))
+                col_map
+                    .get(&col.value_lower)
+                    .map(|&idx| (idx, schema.columns[idx].data_type, expr))
             })
             .collect();
 
@@ -1338,7 +1330,7 @@ impl Executor {
                 compiled_updates
                     .iter()
                     .filter_map(|(idx, col_type, program)| {
-                        vm.execute(program, &exec_ctx)
+                        vm.execute_cow(program, &exec_ctx)
                             .ok()
                             .map(|v| (*idx, v.into_coerce_to_type(*col_type)))
                     })
@@ -1369,17 +1361,12 @@ impl Executor {
         column_name: &str,
         row_values: &[Value],
     ) -> Result<Option<i64>> {
-        // Find the column index
-        let col_idx = schema
-            .columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(column_name));
-
-        if col_idx.is_none() {
-            return Ok(None);
-        }
-
-        let col_idx = col_idx.unwrap();
+        // Find the column index using cached map for O(1) lookup
+        let col_lower = column_name.to_lowercase();
+        let col_idx = match schema.column_index_map().get(&col_lower) {
+            Some(&idx) => idx,
+            None => return Ok(None),
+        };
         let value = row_values
             .get(col_idx)
             .cloned()
@@ -1595,7 +1582,7 @@ impl Executor {
             let mut row_values = Vec::with_capacity(compiled_exprs.len());
             for program in &compiled_exprs {
                 // CRITICAL: Propagate errors instead of silently returning NULL
-                let value = vm.execute(program, &exec_ctx)?;
+                let value = vm.execute_cow(program, &exec_ctx)?;
                 row_values.push(value);
             }
             result_rows.push(Row::from_values(row_values));

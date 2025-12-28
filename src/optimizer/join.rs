@@ -46,7 +46,7 @@
 //! - **Interesting orderings**: Tracks sort orders for potential merge joins
 //! - **Cross-product avoidance**: Strongly penalizes Cartesian products
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::optimizer::cost::{CostEstimator, JoinAlgorithm, JoinStats, PlanCost};
 use crate::storage::statistics::TableStats;
@@ -84,7 +84,7 @@ impl JoinCondition {
     }
 
     /// Check if this condition connects the given tables
-    pub fn connects(&self, tables1: &HashSet<String>, tables2: &HashSet<String>) -> bool {
+    pub fn connects(&self, tables1: &FxHashSet<String>, tables2: &FxHashSet<String>) -> bool {
         (tables1.contains(&self.left_table) && tables2.contains(&self.right_table))
             || (tables1.contains(&self.right_table) && tables2.contains(&self.left_table))
     }
@@ -127,7 +127,7 @@ impl SortOrder {
 #[derive(Debug, Clone)]
 pub struct JoinNode {
     /// Tables included in this node
-    pub tables: HashSet<String>,
+    pub tables: FxHashSet<String>,
     /// Estimated row count after joining
     pub row_estimate: u64,
     /// Distinct count on the join columns (for further joins)
@@ -145,7 +145,7 @@ pub struct JoinNode {
 impl JoinNode {
     /// Create a new leaf node for a single table
     pub fn leaf(table_name: String, row_count: u64, distinct_count: u64) -> Self {
-        let mut tables = HashSet::new();
+        let mut tables = FxHashSet::default();
         tables.insert(table_name);
         Self {
             tables,
@@ -164,7 +164,7 @@ impl JoinNode {
         distinct_count: u64,
         sorted_by: Vec<SortOrder>,
     ) -> Self {
-        let mut tables = HashSet::new();
+        let mut tables = FxHashSet::default();
         tables.insert(table_name);
         Self {
             tables,
@@ -245,8 +245,8 @@ impl JoinNode {
 #[derive(Debug, Clone)]
 pub struct JoinStep {
     /// Tables being joined in this step
-    pub left_tables: HashSet<String>,
-    pub right_tables: HashSet<String>,
+    pub left_tables: FxHashSet<String>,
+    pub right_tables: FxHashSet<String>,
     /// The join algorithm to use
     pub algorithm: JoinAlgorithm,
     /// The join condition for this step
@@ -334,14 +334,14 @@ pub struct JoinOptimizer {
     /// Cost estimator for join cost calculations
     cost_estimator: CostEstimator,
     /// Table statistics (table_name -> TableStats)
-    table_stats: HashMap<String, TableStats>,
+    table_stats: FxHashMap<String, TableStats>,
     /// Column distinct counts (table_name.column_name -> distinct_count)
-    column_distinct: HashMap<String, u64>,
+    column_distinct: FxHashMap<String, u64>,
     /// Available memory for hash tables (rows, for edge-aware planning)
     memory_budget: u64,
     /// Sorted tables: table_name -> columns the input is sorted by
     /// This is set when the input comes from an index scan or pre-sorted source
-    sorted_inputs: HashMap<String, Vec<SortOrder>>,
+    sorted_inputs: FxHashMap<String, Vec<SortOrder>>,
 }
 
 impl JoinOptimizer {
@@ -349,10 +349,10 @@ impl JoinOptimizer {
     pub fn new(cost_estimator: CostEstimator) -> Self {
         Self {
             cost_estimator,
-            table_stats: HashMap::new(),
-            column_distinct: HashMap::new(),
+            table_stats: FxHashMap::default(),
+            column_distinct: FxHashMap::default(),
             memory_budget: HASH_JOIN_MEMORY_LIMIT,
-            sorted_inputs: HashMap::new(),
+            sorted_inputs: FxHashMap::default(),
         }
     }
 
@@ -360,10 +360,10 @@ impl JoinOptimizer {
     pub fn with_memory_budget(cost_estimator: CostEstimator, memory_budget: u64) -> Self {
         Self {
             cost_estimator,
-            table_stats: HashMap::new(),
-            column_distinct: HashMap::new(),
+            table_stats: FxHashMap::default(),
+            column_distinct: FxHashMap::default(),
             memory_budget,
-            sorted_inputs: HashMap::new(),
+            sorted_inputs: FxHashMap::default(),
         }
     }
 
@@ -396,7 +396,7 @@ impl JoinOptimizer {
 
     /// Check if input is sorted by a specific column
     #[allow(dead_code)]
-    fn is_sorted_by_column(&self, tables: &HashSet<String>, column: &str) -> bool {
+    fn is_sorted_by_column(&self, tables: &FxHashSet<String>, column: &str) -> bool {
         for table in tables {
             if let Some(sorted_cols) = self.sorted_inputs.get(table) {
                 if sorted_cols
@@ -474,7 +474,7 @@ impl JoinOptimizer {
         let n = tables.len();
 
         // Map table names to indices for bitmask operations
-        let _table_to_idx: HashMap<&str, usize> =
+        let _table_to_idx: FxHashMap<&str, usize> =
             tables.iter().enumerate().map(|(i, &t)| (t, i)).collect();
         let idx_to_table: Vec<&str> = tables.to_vec();
 
@@ -539,11 +539,11 @@ impl JoinOptimizer {
                     };
 
                     // Check if there's a valid join condition connecting left and right
-                    let left_tables: HashSet<String> = (0..n)
+                    let left_tables: FxHashSet<String> = (0..n)
                         .filter(|i| left & (1 << i) != 0)
                         .map(|i| idx_to_table[i].to_string())
                         .collect();
-                    let right_tables: HashSet<String> = (0..n)
+                    let right_tables: FxHashSet<String> = (0..n)
                         .filter(|i| right & (1 << i) != 0)
                         .map(|i| idx_to_table[i].to_string())
                         .collect();
@@ -750,11 +750,11 @@ impl JoinOptimizer {
 
         // Build table sets
         let n = idx_to_table.len();
-        let left_tables: HashSet<String> = (0..n)
+        let left_tables: FxHashSet<String> = (0..n)
             .filter(|i| entry.left_mask & (1 << i) != 0)
             .map(|i| idx_to_table[i].to_string())
             .collect();
-        let right_tables: HashSet<String> = (0..n)
+        let right_tables: FxHashSet<String> = (0..n)
             .filter(|i| entry.right_mask & (1 << i) != 0)
             .map(|i| idx_to_table[i].to_string())
             .collect();
@@ -1053,16 +1053,16 @@ mod tests {
             "user_id".to_string(),
         );
 
-        let mut tables1 = HashSet::new();
+        let mut tables1 = FxHashSet::default();
         tables1.insert("users".to_string());
 
-        let mut tables2 = HashSet::new();
+        let mut tables2 = FxHashSet::default();
         tables2.insert("orders".to_string());
 
         assert!(condition.connects(&tables1, &tables2));
         assert!(condition.connects(&tables2, &tables1));
 
-        let mut tables3 = HashSet::new();
+        let mut tables3 = FxHashSet::default();
         tables3.insert("products".to_string());
         assert!(!condition.connects(&tables1, &tables3));
     }

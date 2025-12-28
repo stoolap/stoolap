@@ -17,7 +17,7 @@
 //! This module provides the function registry for looking up and managing
 //! SQL functions (aggregate, scalar, and window functions).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 /// Global function registry instance
@@ -69,13 +69,13 @@ type WindowFnFactory = Arc<dyn Fn() -> Box<dyn WindowFunction> + Send + Sync>;
 /// Function registry for SQL functions
 pub struct FunctionRegistry {
     /// Aggregate functions
-    aggregate_functions: RwLock<HashMap<String, AggregateFnFactory>>,
+    aggregate_functions: RwLock<FxHashMap<String, AggregateFnFactory>>,
     /// Scalar functions
-    scalar_functions: RwLock<HashMap<String, ScalarFnFactory>>,
+    scalar_functions: RwLock<FxHashMap<String, ScalarFnFactory>>,
     /// Window functions
-    window_functions: RwLock<HashMap<String, WindowFnFactory>>,
+    window_functions: RwLock<FxHashMap<String, WindowFnFactory>>,
     /// Function info cache
-    function_info: RwLock<HashMap<String, FunctionInfo>>,
+    function_info: RwLock<FxHashMap<String, FunctionInfo>>,
 }
 
 impl Default for FunctionRegistry {
@@ -88,10 +88,10 @@ impl FunctionRegistry {
     /// Create a new function registry with all built-in functions registered
     pub fn new() -> Self {
         let registry = Self {
-            aggregate_functions: RwLock::new(HashMap::new()),
-            scalar_functions: RwLock::new(HashMap::new()),
-            window_functions: RwLock::new(HashMap::new()),
-            function_info: RwLock::new(HashMap::new()),
+            aggregate_functions: RwLock::new(FxHashMap::default()),
+            scalar_functions: RwLock::new(FxHashMap::default()),
+            window_functions: RwLock::new(FxHashMap::default()),
+            function_info: RwLock::new(FxHashMap::default()),
         };
 
         // Register built-in aggregate functions

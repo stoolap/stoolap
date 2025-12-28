@@ -1145,12 +1145,11 @@ pub struct CompiledEvaluator<'a> {
     /// Function registry for compilation
     function_registry: &'a FunctionRegistry,
 
-    /// Column names for compilation context
-    columns: Vec<String>,
+    /// Column names for compilation context (Arc for zero-copy sharing)
+    columns: Arc<Vec<String>>,
 
-    /// Cached source pointer for fast init_columns equality check
-    /// When init_columns is called with the same slice, we skip cloning
-    columns_source_id: usize,
+    /// Cached Arc pointer for fast equality check (avoids Arc comparison)
+    columns_arc_id: usize,
 
     /// Second row columns (for joins)
     columns2: Option<Vec<String>>,
@@ -1198,8 +1197,8 @@ impl<'a> CompiledEvaluator<'a> {
     pub fn new(function_registry: &'a FunctionRegistry) -> Self {
         Self {
             function_registry,
-            columns: Vec::new(),
-            columns_source_id: 0,
+            columns: Arc::new(Vec::new()),
+            columns_arc_id: 0,
             columns2: None,
             outer_columns: None,
             params: Arc::new(Vec::new()),
@@ -1222,8 +1221,8 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Clear all state for reuse.
     pub fn clear(&mut self) {
-        self.columns.clear();
-        self.columns_source_id = 0;
+        self.columns = Arc::new(Vec::new());
+        self.columns_arc_id = 0;
         self.columns2 = None;
         self.outer_columns = None;
         self.params = Arc::new(Vec::new());
@@ -1308,12 +1307,30 @@ impl<'a> CompiledEvaluator<'a> {
         // This handles the common case where init_columns is called repeatedly
         // with the same table schema during UPDATE/SELECT operations
         let new_source_id = columns.as_ptr() as usize;
-        if self.columns_source_id == new_source_id && self.columns.len() == columns.len() {
+        if self.columns_arc_id == new_source_id && self.columns.len() == columns.len() {
             return;
         }
 
-        self.columns = columns.to_vec();
-        self.columns_source_id = new_source_id;
+        self.columns = Arc::new(columns.to_vec());
+        self.columns_arc_id = new_source_id;
+        // Clear local cache since compilation context changed
+        self.local_cache.clear();
+    }
+
+    /// Initialize columns from an Arc (zero-copy when schema already has Arc)
+    ///
+    /// This is the preferred method when the caller already has an Arc<Vec<String>>,
+    /// such as from `Schema::column_names_arc()`. It avoids all string cloning.
+    #[inline]
+    pub fn init_columns_arc(&mut self, columns: Arc<Vec<String>>) {
+        // Use Arc pointer for identity check
+        let new_arc_id = Arc::as_ptr(&columns) as usize;
+        if self.columns_arc_id == new_arc_id {
+            return;
+        }
+
+        self.columns = columns;
+        self.columns_arc_id = new_arc_id;
         // Clear local cache since compilation context changed
         self.local_cache.clear();
     }
@@ -1356,7 +1373,8 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Initialize join columns
     pub fn init_join_columns(&mut self, left_columns: &[String], right_columns: &[String]) {
-        self.columns = left_columns.to_vec();
+        self.columns = Arc::new(left_columns.to_vec());
+        self.columns_arc_id = 0; // Reset since we're creating a new Arc
         self.columns2 = Some(right_columns.to_vec());
         // Invalidate local cache since compilation context changed
         self.local_cache.clear();
@@ -1797,5 +1815,363 @@ impl<'a> CompiledEvaluator<'a> {
 impl Default for CompiledEvaluator<'static> {
     fn default() -> Self {
         Self::with_defaults()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::ast::{
+        Expression, Identifier, InfixExpression, InfixOperator, IntegerLiteral,
+    };
+    use crate::parser::token::{Position, Token, TokenType};
+
+    fn dummy_token() -> Token {
+        Token::new(TokenType::Eof, "", Position::default())
+    }
+
+    fn make_identifier(name: &str) -> Expression {
+        Expression::Identifier(Identifier {
+            token: dummy_token(),
+            value: name.to_string(),
+            value_lower: name.to_lowercase(),
+        })
+    }
+
+    fn make_int_literal(value: i64) -> Expression {
+        Expression::IntegerLiteral(IntegerLiteral {
+            token: dummy_token(),
+            value,
+        })
+    }
+
+    fn make_infix(left: Expression, op: InfixOperator, right: Expression) -> Expression {
+        let op_str = match op {
+            InfixOperator::GreaterThan => ">",
+            InfixOperator::LessThan => "<",
+            InfixOperator::Equal => "=",
+            InfixOperator::Add => "+",
+            InfixOperator::Multiply => "*",
+            _ => "?",
+        };
+        Expression::Infix(InfixExpression {
+            token: dummy_token(),
+            left: Box::new(left),
+            operator: op_str.to_string(),
+            op_type: op,
+            right: Box::new(right),
+        })
+    }
+
+    // =========================================================================
+    // compute_expression_hash tests
+    // =========================================================================
+
+    #[test]
+    fn test_compute_expression_hash_same_expr() {
+        let expr1 = make_int_literal(42);
+        let expr2 = make_int_literal(42);
+        assert_eq!(
+            compute_expression_hash(&expr1),
+            compute_expression_hash(&expr2)
+        );
+    }
+
+    #[test]
+    fn test_compute_expression_hash_different_expr() {
+        let expr1 = make_int_literal(42);
+        let expr2 = make_int_literal(43);
+        assert_ne!(
+            compute_expression_hash(&expr1),
+            compute_expression_hash(&expr2)
+        );
+    }
+
+    #[test]
+    fn test_compute_expression_hash_complex() {
+        // col > 5
+        let expr1 = make_infix(
+            make_identifier("col"),
+            InfixOperator::GreaterThan,
+            make_int_literal(5),
+        );
+        // col > 5 (same)
+        let expr2 = make_infix(
+            make_identifier("col"),
+            InfixOperator::GreaterThan,
+            make_int_literal(5),
+        );
+        assert_eq!(
+            compute_expression_hash(&expr1),
+            compute_expression_hash(&expr2)
+        );
+    }
+
+    // =========================================================================
+    // compile_expression tests
+    // =========================================================================
+
+    #[test]
+    fn test_compile_expression_basic() {
+        // col > 5
+        let expr = make_infix(
+            make_identifier("col"),
+            InfixOperator::GreaterThan,
+            make_int_literal(5),
+        );
+        let columns = vec!["col".to_string()];
+        let program = compile_expression(&expr, &columns);
+        assert!(program.is_ok());
+    }
+
+    #[test]
+    fn test_compile_expression_unknown_column() {
+        // unknown_col > 5
+        let expr = make_infix(
+            make_identifier("unknown_col"),
+            InfixOperator::GreaterThan,
+            make_int_literal(5),
+        );
+        let columns = vec!["col".to_string()];
+        // Unknown columns cause compilation errors
+        let program = compile_expression(&expr, &columns);
+        assert!(program.is_err());
+    }
+
+    // =========================================================================
+    // RowFilter tests
+    // =========================================================================
+
+    #[test]
+    fn test_row_filter_new() {
+        // col > 5
+        let expr = make_infix(
+            make_identifier("col"),
+            InfixOperator::GreaterThan,
+            make_int_literal(5),
+        );
+        let columns = vec!["col".to_string()];
+        let filter = RowFilter::new(&expr, &columns);
+        assert!(filter.is_ok());
+    }
+
+    #[test]
+    fn test_row_filter_matches_true() {
+        // col > 5
+        let expr = make_infix(
+            make_identifier("col"),
+            InfixOperator::GreaterThan,
+            make_int_literal(5),
+        );
+        let columns = vec!["col".to_string()];
+        let filter = RowFilter::new(&expr, &columns).unwrap();
+
+        // Row with col = 10 (> 5)
+        let row = Row::from(vec![Value::Integer(10)]);
+        assert!(filter.matches(&row));
+    }
+
+    #[test]
+    fn test_row_filter_matches_false() {
+        // col > 5
+        let expr = make_infix(
+            make_identifier("col"),
+            InfixOperator::GreaterThan,
+            make_int_literal(5),
+        );
+        let columns = vec!["col".to_string()];
+        let filter = RowFilter::new(&expr, &columns).unwrap();
+
+        // Row with col = 3 (not > 5)
+        let row = Row::from(vec![Value::Integer(3)]);
+        assert!(!filter.matches(&row));
+    }
+
+    #[test]
+    fn test_row_filter_evaluate() {
+        // col + 10
+        let expr = make_infix(
+            make_identifier("col"),
+            InfixOperator::Add,
+            make_int_literal(10),
+        );
+        let columns = vec!["col".to_string()];
+        let filter = RowFilter::new(&expr, &columns).unwrap();
+
+        let row = Row::from(vec![Value::Integer(5)]);
+        let result = filter.evaluate(&row).unwrap();
+        assert_eq!(result, Value::Integer(15));
+    }
+
+    #[test]
+    fn test_row_filter_clone() {
+        let expr = make_infix(
+            make_identifier("col"),
+            InfixOperator::GreaterThan,
+            make_int_literal(5),
+        );
+        let columns = vec!["col".to_string()];
+        let filter = RowFilter::new(&expr, &columns).unwrap();
+        let cloned = filter.clone();
+
+        let row = Row::from(vec![Value::Integer(10)]);
+        assert!(filter.matches(&row));
+        assert!(cloned.matches(&row));
+    }
+
+    // =========================================================================
+    // ExpressionEval tests
+    // =========================================================================
+
+    #[test]
+    fn test_expression_eval_compile() {
+        let expr = make_infix(
+            make_identifier("col"),
+            InfixOperator::GreaterThan,
+            make_int_literal(5),
+        );
+        let columns = vec!["col".to_string()];
+        let eval = ExpressionEval::compile(&expr, &columns);
+        assert!(eval.is_ok());
+    }
+
+    #[test]
+    fn test_expression_eval_eval() {
+        // col + 10
+        let expr = make_infix(
+            make_identifier("col"),
+            InfixOperator::Add,
+            make_int_literal(10),
+        );
+        let columns = vec!["col".to_string()];
+        let mut eval = ExpressionEval::compile(&expr, &columns).unwrap();
+
+        let row = Row::from(vec![Value::Integer(5)]);
+        let result = eval.eval(&row).unwrap();
+        assert_eq!(result, Value::Integer(15));
+    }
+
+    #[test]
+    fn test_expression_eval_eval_bool() {
+        // col > 5
+        let expr = make_infix(
+            make_identifier("col"),
+            InfixOperator::GreaterThan,
+            make_int_literal(5),
+        );
+        let columns = vec!["col".to_string()];
+        let mut eval = ExpressionEval::compile(&expr, &columns).unwrap();
+
+        let row = Row::from(vec![Value::Integer(10)]);
+        assert!(eval.eval_bool(&row));
+
+        let row = Row::from(vec![Value::Integer(3)]);
+        assert!(!eval.eval_bool(&row));
+    }
+
+    // =========================================================================
+    // MultiExpressionEval tests
+    // =========================================================================
+
+    #[test]
+    fn test_multi_expression_eval_compile() {
+        let expr1 = make_infix(
+            make_identifier("col"),
+            InfixOperator::Add,
+            make_int_literal(10),
+        );
+        let expr2 = make_infix(
+            make_identifier("col"),
+            InfixOperator::Multiply,
+            make_int_literal(2),
+        );
+        let columns = vec!["col".to_string()];
+
+        let eval = MultiExpressionEval::compile(&[expr1, expr2], &columns);
+        assert!(eval.is_ok());
+        assert_eq!(eval.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_multi_expression_eval_all() {
+        let expr1 = make_infix(
+            make_identifier("col"),
+            InfixOperator::Add,
+            make_int_literal(10),
+        );
+        let expr2 = make_infix(
+            make_identifier("col"),
+            InfixOperator::Multiply,
+            make_int_literal(2),
+        );
+        let columns = vec!["col".to_string()];
+        let mut eval = MultiExpressionEval::compile(&[expr1, expr2], &columns).unwrap();
+
+        let row = Row::from(vec![Value::Integer(5)]);
+        let results = eval.eval_all(&row).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], Value::Integer(15)); // 5 + 10
+        assert_eq!(results[1], Value::Integer(10)); // 5 * 2
+    }
+
+    // =========================================================================
+    // CompiledEvaluator tests
+    // =========================================================================
+
+    #[test]
+    fn test_compiled_evaluator_with_defaults() {
+        let eval = CompiledEvaluator::with_defaults();
+        assert!(eval.columns.is_empty());
+    }
+
+    #[test]
+    fn test_compiled_evaluator_init_columns() {
+        let mut eval = CompiledEvaluator::with_defaults();
+        eval.init_columns(&["col1".to_string(), "col2".to_string()]);
+        assert_eq!(eval.columns.len(), 2);
+    }
+
+    #[test]
+    fn test_compiled_evaluator_evaluate_bool() {
+        let mut eval = CompiledEvaluator::with_defaults();
+        eval.init_columns(&["col".to_string()]);
+        let row = Row::from(vec![Value::Integer(10)]);
+        eval.set_row_array(&row);
+
+        // col > 5
+        let expr = make_infix(
+            make_identifier("col"),
+            InfixOperator::GreaterThan,
+            make_int_literal(5),
+        );
+
+        let result = eval.evaluate_bool(&expr);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_compiled_evaluator_evaluate() {
+        let mut eval = CompiledEvaluator::with_defaults();
+        eval.init_columns(&["col".to_string()]);
+        let row = Row::from(vec![Value::Integer(5)]);
+        eval.set_row_array(&row);
+
+        // col + 10
+        let expr = make_infix(
+            make_identifier("col"),
+            InfixOperator::Add,
+            make_int_literal(10),
+        );
+
+        let result = eval.evaluate(&expr);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Value::Integer(15));
+    }
+
+    #[test]
+    fn test_compiled_evaluator_default() {
+        let eval = CompiledEvaluator::default();
+        assert!(eval.columns.is_empty());
     }
 }

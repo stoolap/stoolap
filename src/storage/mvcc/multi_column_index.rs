@@ -34,7 +34,7 @@
 //! - `sorted_values` BTree is built on first range query
 //! - `prefix_indexes` are built on first partial query per prefix length
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
@@ -386,7 +386,7 @@ impl Index for MultiColumnIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &HashMap<i64, Vec<Value>>) -> Result<()> {
+    fn add_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
         for (&row_id, values) in entries {
             self.add(values, row_id, 0)?;
         }
@@ -446,7 +446,7 @@ impl Index for MultiColumnIndex {
         Ok(())
     }
 
-    fn remove_batch(&self, entries: &HashMap<i64, Vec<Value>>) -> Result<()> {
+    fn remove_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
         for (&row_id, values) in entries {
             self.remove(values, row_id, 0)?;
         }

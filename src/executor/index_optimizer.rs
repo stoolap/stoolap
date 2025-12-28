@@ -773,7 +773,7 @@ impl Executor {
         let pk_indices = schema.primary_key_indices();
         let is_pk_column = pk_indices.len() == 1 && {
             let pk_col_idx = pk_indices[0];
-            schema.columns[pk_col_idx].name.to_lowercase() == column_name
+            schema.columns[pk_col_idx].name_lower == column_name
         };
 
         // If not PK, check for index
@@ -1089,7 +1089,7 @@ impl Executor {
         let pk_indices = schema.primary_key_indices();
         let is_pk_column = pk_indices.len() == 1 && {
             let pk_col_idx = pk_indices[0];
-            schema.columns[pk_col_idx].name.to_lowercase() == column_name
+            schema.columns[pk_col_idx].name_lower == column_name
         };
 
         // If not PK, check for index
@@ -1401,8 +1401,7 @@ impl Executor {
         let pk_indices = schema.primary_key_indices();
         let is_pk_column = pk_indices.len() == 1 && {
             let pk_col_idx = pk_indices[0];
-            let pk_col_name = schema.columns[pk_col_idx].name.to_lowercase();
-            pk_col_name == column_name
+            schema.columns[pk_col_idx].name_lower == column_name
         };
 
         // For NOT IN (negated), only optimize if it's a PK column

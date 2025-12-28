@@ -1305,7 +1305,7 @@ impl Executor {
                         values.push(Value::null_unknown());
                     }
                     CompiledColumn::Compiled(program) => {
-                        values.push(vm.execute(program, &exec_ctx)?);
+                        values.push(vm.execute_cow(program, &exec_ctx)?);
                     }
                 }
             }
@@ -1856,7 +1856,7 @@ impl Executor {
         // Check if table column is the PRIMARY KEY (direct row_id lookup)
         let table_col_lower = table_col_unqualified.to_lowercase();
         let lookup_strategy = if let Some(pk_idx) = schema.pk_column_index() {
-            if schema.columns[pk_idx].name.to_lowercase() == table_col_lower {
+            if schema.columns[pk_idx].name_lower == table_col_lower {
                 // It's a primary key lookup - most efficient!
                 IndexLookupStrategy::PrimaryKey
             } else if let Some(index) = table.get_index_on_column(&table_col_unqualified) {

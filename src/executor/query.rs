@@ -2368,8 +2368,7 @@ impl Executor {
                     let col_lower = partition_col.to_lowercase();
                     let schema = table.schema();
                     let pk_columns = schema.primary_key_columns();
-                    let is_pk =
-                        pk_columns.len() == 1 && pk_columns[0].name.to_lowercase() == col_lower;
+                    let is_pk = pk_columns.len() == 1 && pk_columns[0].name_lower == col_lower;
                     let has_index = is_pk || table.get_index_on_column(&partition_col).is_some();
 
                     if has_index {
@@ -2447,8 +2446,7 @@ impl Executor {
                     let col_lower = col_name.to_lowercase();
                     let schema = table.schema();
                     let pk_columns = schema.primary_key_columns();
-                    let is_pk =
-                        pk_columns.len() == 1 && pk_columns[0].name.to_lowercase() == col_lower;
+                    let is_pk = pk_columns.len() == 1 && pk_columns[0].name_lower == col_lower;
                     let has_index = is_pk || table.get_index_on_column(&col_name).is_some();
 
                     if has_index {
@@ -6637,7 +6635,7 @@ impl Executor {
         // First check if inner column is the PRIMARY KEY (direct row_id lookup)
         let inner_col_lower = inner_col_unqualified.to_lowercase();
         if let Some(pk_idx) = schema.pk_column_index() {
-            if schema.columns[pk_idx].name.to_lowercase() == inner_col_lower {
+            if schema.columns[pk_idx].name_lower == inner_col_lower {
                 // It's a primary key lookup - most efficient!
                 return Some((
                     table_name,

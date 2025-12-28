@@ -1598,7 +1598,7 @@ impl MVCCEngine {
                 )));
             }
 
-            if !seen_names.insert(col.name.to_lowercase()) {
+            if !seen_names.insert(col.name_lower.clone()) {
                 return Err(Error::DuplicateColumn);
             }
         }
@@ -2167,7 +2167,7 @@ impl Engine for MVCCEngine {
                 .columns
                 .iter()
                 .enumerate()
-                .find(|(_, c)| c.name.to_lowercase() == col_name_lower)
+                .find(|(_, c)| c.name_lower == col_name_lower)
             {
                 column_ids.push(idx as i32);
                 data_types.push(col.data_type);

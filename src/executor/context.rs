@@ -514,12 +514,9 @@ impl ExecutionContext {
     }
 
     /// Create an execution context with named parameters
-    /// Accepts std::collections::HashMap for API compatibility
-    pub fn with_named_params(named_params: std::collections::HashMap<String, Value>) -> Self {
-        // Convert HashMap to FxHashMap (more efficient for lookups)
-        let fx_params: FxHashMap<String, Value> = named_params.into_iter().collect();
+    pub fn with_named_params(named_params: FxHashMap<String, Value>) -> Self {
         Self {
-            named_params: Arc::new(fx_params),
+            named_params: Arc::new(named_params),
             ..Self::new()
         }
     }
@@ -1108,7 +1105,7 @@ impl Default for ExecutionContextBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
     #[test]
     fn test_context_new() {
@@ -1130,7 +1127,7 @@ mod tests {
 
     #[test]
     fn test_context_named_params() {
-        let mut params = HashMap::new();
+        let mut params = FxHashMap::default();
         params.insert("name".to_string(), Value::text("Alice"));
         params.insert("age".to_string(), Value::Integer(30));
 

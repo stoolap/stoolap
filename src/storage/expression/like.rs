@@ -20,17 +20,17 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 
 use regex::Regex;
+use rustc_hash::FxHashMap;
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::core::{Result, Row, Schema};
 
 // Thread-local cache for compiled regex patterns
 thread_local! {
-    static LIKE_REGEX_CACHE: RefCell<HashMap<String, Regex>> = RefCell::new(HashMap::new());
+    static LIKE_REGEX_CACHE: RefCell<FxHashMap<String, Regex>> = RefCell::new(FxHashMap::default());
 }
 
 /// Get or compile a regex pattern, using thread-local cache
@@ -261,7 +261,7 @@ impl Expression for LikeExpr {
         }
     }
 
-    fn with_aliases(&self, aliases: &HashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
         let resolved = resolve_alias(&self.column, aliases);
         let mut expr = LikeExpr {
             column: resolved.to_string(),

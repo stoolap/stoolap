@@ -25,7 +25,7 @@
 use crate::core::{Result, Row, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
-use crate::executor::utils::{combine_rows, combine_rows_with_nulls};
+use crate::executor::utils::combine_rows_with_nulls;
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::Expression;
 
@@ -123,13 +123,9 @@ impl NestedLoopJoinOperator {
     }
 
     /// Combine left and right rows into output row.
+    #[inline]
     fn combine(&self, left: &Row, right: &Row) -> Row {
-        Row::from_values(combine_rows(
-            left,
-            right,
-            self.left_col_count,
-            self.right_col_count,
-        ))
+        Row::from_combined(left, right)
     }
 
     /// Get the next left row from the outer input.
@@ -280,7 +276,8 @@ impl Operator for NestedLoopJoinOperator {
                 let left_row = self.current_left_row.take().unwrap();
                 self.advance_left()?;
                 let null_right = self.null_right_row();
-                let combined = self.combine(&left_row, &null_right);
+                // Use owned variant - both rows are owned and won't be used again
+                let combined = Row::from_combined_owned(left_row, null_right);
                 return Ok(Some(RowRef::Owned(combined)));
             }
 

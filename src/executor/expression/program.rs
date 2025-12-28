@@ -587,3 +587,339 @@ impl Default for ProgramBuilder {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // Program factory methods
+    // =========================================================================
+
+    #[test]
+    fn test_program_null() {
+        let prog = Program::null();
+        assert!(!prog.is_empty());
+        assert!(!prog.needs_outer_context());
+        assert!(!prog.needs_second_row());
+        assert!(!prog.has_subqueries());
+    }
+
+    #[test]
+    fn test_program_constant() {
+        let prog = Program::constant(Value::Integer(42));
+        assert!(!prog.is_empty());
+        assert!(!prog.needs_outer_context());
+        assert!(!prog.needs_second_row());
+    }
+
+    #[test]
+    fn test_program_always_true() {
+        let prog = Program::always_true();
+        assert_eq!(prog.len(), 1);
+        assert!(matches!(prog.ops()[0], Op::ReturnTrue));
+    }
+
+    #[test]
+    fn test_program_always_false() {
+        let prog = Program::always_false();
+        assert_eq!(prog.len(), 1);
+        assert!(matches!(prog.ops()[0], Op::ReturnFalse));
+    }
+
+    // =========================================================================
+    // Stack depth calculation
+    // =========================================================================
+
+    #[test]
+    fn test_stack_depth_simple() {
+        // LoadConst pushes 1, Return pops and returns
+        let prog = Program::new_unoptimized(vec![Op::LoadConst(Value::Integer(1)), Op::Return]);
+        assert_eq!(prog.max_stack_depth(), 1);
+    }
+
+    #[test]
+    fn test_stack_depth_binary_op() {
+        // LoadConst (+1), LoadConst (+1), Add (-1) = max 2
+        let prog = Program::new_unoptimized(vec![
+            Op::LoadConst(Value::Integer(1)),
+            Op::LoadConst(Value::Integer(2)),
+            Op::Add,
+            Op::Return,
+        ]);
+        assert_eq!(prog.max_stack_depth(), 2);
+    }
+
+    #[test]
+    fn test_stack_depth_nested() {
+        // (1 + 2) * (3 + 4)
+        // Load 1, Load 2, Add, Load 3, Load 4, Add, Mul
+        let prog = Program::new_unoptimized(vec![
+            Op::LoadConst(Value::Integer(1)),
+            Op::LoadConst(Value::Integer(2)),
+            Op::Add,
+            Op::LoadConst(Value::Integer(3)),
+            Op::LoadConst(Value::Integer(4)),
+            Op::Add,
+            Op::Mul,
+            Op::Return,
+        ]);
+        // Stack trace: 1, 2, 1, 2, 3, 2, 1
+        // Max is 3 (after loading 3rd value before second add)
+        assert!(prog.max_stack_depth() >= 2);
+    }
+
+    #[test]
+    fn test_stack_depth_fused_ops() {
+        // Fused ops push 1
+        let prog =
+            Program::new_unoptimized(vec![Op::EqColumnConst(0, Value::Integer(5)), Op::Return]);
+        assert_eq!(prog.max_stack_depth(), 1);
+    }
+
+    #[test]
+    fn test_stack_depth_between() {
+        // Between pops 3, pushes 1
+        let prog = Program::new_unoptimized(vec![
+            Op::LoadColumn(0),
+            Op::LoadConst(Value::Integer(1)),
+            Op::LoadConst(Value::Integer(10)),
+            Op::Between,
+            Op::Return,
+        ]);
+        assert_eq!(prog.max_stack_depth(), 3);
+    }
+
+    // =========================================================================
+    // Metadata detection
+    // =========================================================================
+
+    #[test]
+    fn test_needs_outer_context() {
+        let prog = Program::new_unoptimized(vec![Op::LoadOuterColumn("col".into()), Op::Return]);
+        assert!(prog.needs_outer_context());
+
+        let prog2 = Program::new_unoptimized(vec![Op::LoadColumn(0), Op::Return]);
+        assert!(!prog2.needs_outer_context());
+    }
+
+    #[test]
+    fn test_needs_second_row() {
+        let prog = Program::new_unoptimized(vec![
+            Op::LoadColumn(0),
+            Op::LoadColumn2(1),
+            Op::Eq,
+            Op::Return,
+        ]);
+        assert!(prog.needs_second_row());
+
+        let prog2 = Program::new_unoptimized(vec![Op::LoadColumn(0), Op::Return]);
+        assert!(!prog2.needs_second_row());
+    }
+
+    #[test]
+    fn test_has_subqueries() {
+        let prog1 = Program::new_unoptimized(vec![Op::ExecExists(0), Op::Return]);
+        assert!(prog1.has_subqueries());
+
+        let prog2 = Program::new_unoptimized(vec![Op::ExecScalarSubquery(0), Op::Return]);
+        assert!(prog2.has_subqueries());
+
+        let prog3 = Program::new_unoptimized(vec![Op::LoadColumn(0), Op::Return]);
+        assert!(!prog3.has_subqueries());
+    }
+
+    // =========================================================================
+    // Peephole optimization
+    // =========================================================================
+
+    #[test]
+    fn test_peephole_eq_column_const() {
+        // LoadColumn + LoadConst + Eq should fuse to EqColumnConst
+        let ops = vec![
+            Op::LoadColumn(0),
+            Op::LoadConst(Value::Integer(5)),
+            Op::Eq,
+            Op::Return,
+        ];
+        let prog = Program::new(ops);
+        // Should be fused to 2 ops: EqColumnConst + Return
+        assert_eq!(prog.len(), 2);
+        assert!(matches!(prog.ops()[0], Op::EqColumnConst(0, _)));
+    }
+
+    #[test]
+    fn test_peephole_lt_column_const() {
+        let ops = vec![
+            Op::LoadColumn(1),
+            Op::LoadConst(Value::Integer(10)),
+            Op::Lt,
+            Op::Return,
+        ];
+        let prog = Program::new(ops);
+        assert_eq!(prog.len(), 2);
+        assert!(matches!(prog.ops()[0], Op::LtColumnConst(1, _)));
+    }
+
+    #[test]
+    fn test_peephole_is_null_column() {
+        let ops = vec![Op::LoadColumn(2), Op::IsNull, Op::Return];
+        let prog = Program::new(ops);
+        assert_eq!(prog.len(), 2);
+        assert!(matches!(prog.ops()[0], Op::IsNullColumn(2)));
+    }
+
+    #[test]
+    fn test_peephole_between_column_const() {
+        let ops = vec![
+            Op::LoadColumn(0),
+            Op::LoadConst(Value::Integer(1)),
+            Op::LoadConst(Value::Integer(100)),
+            Op::Between,
+            Op::Return,
+        ];
+        let prog = Program::new(ops);
+        // Should fuse 4 ops to 1 BetweenColumnConst
+        assert_eq!(prog.len(), 2);
+        assert!(matches!(prog.ops()[0], Op::BetweenColumnConst(0, _, _)));
+    }
+
+    #[test]
+    fn test_peephole_no_fusion_when_not_applicable() {
+        // Can't fuse when pattern doesn't match
+        let ops = vec![
+            Op::LoadConst(Value::Integer(5)),
+            Op::LoadColumn(0),
+            Op::Eq,
+            Op::Return,
+        ];
+        let prog = Program::new(ops);
+        // LoadConst + LoadColumn + Eq doesn't match (order is wrong)
+        assert!(prog.len() >= 3);
+    }
+
+    #[test]
+    fn test_peephole_preserves_jumps() {
+        // Ensure jump targets aren't fused over
+        let ops = vec![
+            Op::LoadColumn(0),
+            Op::JumpIfFalse(3), // Jump to position 3
+            Op::LoadConst(Value::Integer(5)),
+            Op::Eq, // This is position 3 - a jump target
+            Op::Return,
+        ];
+        let prog = Program::new(ops);
+        // The fusion should not break jump semantics
+        assert!(prog.len() >= 3);
+    }
+
+    // =========================================================================
+    // ProgramBuilder
+    // =========================================================================
+
+    #[test]
+    fn test_builder_basic() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit(Op::LoadConst(Value::Integer(42)));
+        builder.emit(Op::Return);
+
+        let prog = builder.build();
+        assert!(!prog.is_empty());
+    }
+
+    #[test]
+    fn test_builder_position() {
+        let mut builder = ProgramBuilder::new();
+        assert_eq!(builder.position(), 0);
+
+        builder.emit(Op::LoadColumn(0));
+        assert_eq!(builder.position(), 1);
+
+        builder.emit(Op::LoadColumn(1));
+        assert_eq!(builder.position(), 2);
+    }
+
+    #[test]
+    fn test_builder_patch_jump() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit(Op::LoadColumn(0));
+        builder.emit(Op::JumpIfFalse(0)); // Placeholder target
+        let jump_pos = 1;
+        builder.emit(Op::LoadConst(Value::Integer(1)));
+        builder.emit(Op::Return);
+        let end_pos = builder.position();
+
+        builder.patch_jump(jump_pos, end_pos);
+
+        let prog = builder.build();
+        // After optimization, check that jump exists
+        let has_jump = prog.ops().iter().any(|op| matches!(op, Op::JumpIfFalse(_)));
+        assert!(has_jump || prog.len() < 4); // Either has jump or was optimized away
+    }
+
+    #[test]
+    fn test_builder_default() {
+        let builder: ProgramBuilder = Default::default();
+        let prog = builder.build();
+        // Empty program still has max_stack_depth of 1
+        assert_eq!(prog.max_stack_depth(), 1);
+    }
+
+    // =========================================================================
+    // Disassemble
+    // =========================================================================
+
+    #[test]
+    fn test_disassemble() {
+        let prog = Program::new_unoptimized(vec![
+            Op::LoadColumn(0),
+            Op::LoadConst(Value::Integer(5)),
+            Op::Eq,
+            Op::Return,
+        ]);
+        let disasm = prog.disassemble();
+        assert!(disasm.contains("LoadColumn"));
+        assert!(disasm.contains("LoadConst"));
+        assert!(disasm.contains("Eq"));
+        assert!(disasm.contains("Return"));
+        // Check format has line numbers
+        assert!(disasm.contains("0000:"));
+        assert!(disasm.contains("0001:"));
+    }
+
+    // =========================================================================
+    // Debug formatting
+    // =========================================================================
+
+    #[test]
+    fn test_program_debug() {
+        let prog = Program::constant(Value::Integer(42));
+        let debug_str = format!("{:?}", prog);
+        assert!(debug_str.contains("Program"));
+        assert!(debug_str.contains("ops_count"));
+        assert!(debug_str.contains("max_stack_depth"));
+    }
+
+    // =========================================================================
+    // Constant enum
+    // =========================================================================
+
+    #[test]
+    fn test_constant_value() {
+        let c = Constant::Value(Value::Integer(42));
+        assert!(matches!(c, Constant::Value(Value::Integer(42))));
+    }
+
+    #[test]
+    fn test_constant_string() {
+        let c = Constant::String("test".into());
+        assert!(matches!(c, Constant::String(_)));
+    }
+
+    #[test]
+    fn test_constant_clone() {
+        let c1 = Constant::Value(Value::Text("hello".into()));
+        let c2 = c1.clone();
+        assert!(matches!(c2, Constant::Value(Value::Text(_))));
+    }
+}

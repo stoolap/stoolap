@@ -23,8 +23,9 @@
 //! ```
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt::{self, Debug};
+
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use crate::core::{Operator, Result, Row, Schema, Value};
@@ -254,7 +255,7 @@ impl Expression for FunctionExpr {
         self.evaluate(row).unwrap_or(false)
     }
 
-    fn with_aliases(&self, aliases: &HashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
         let new_arguments: Vec<FunctionArg> = self
             .arguments
             .iter()
@@ -368,7 +369,7 @@ impl Expression for EvalExpr {
         (self.eval_fn)(row)
     }
 
-    fn with_aliases(&self, _aliases: &HashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, _aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
         // Can't modify the closure, return a clone
         panic!("EvalExpr does not support alias resolution")
     }

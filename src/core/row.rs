@@ -129,6 +129,73 @@ impl Row {
         }
     }
 
+    /// Create a row by combining two rows (for JOINs) - clones values
+    /// Use `from_combined_owned` when you can consume the input rows
+    #[inline]
+    pub fn from_combined(left: &Row, right: &Row) -> Self {
+        let total_len = left.len() + right.len();
+        let mut values = Vec::with_capacity(total_len);
+        // Clone values directly into the pre-allocated vec
+        for v in left.iter() {
+            values.push(v.clone());
+        }
+        for v in right.iter() {
+            values.push(v.clone());
+        }
+        Self {
+            storage: RowStorage::Owned(values),
+        }
+    }
+
+    /// Create a row by combining two owned rows (for JOINs) - moves values without cloning
+    /// OPTIMIZATION: Takes ownership and moves values instead of cloning
+    #[inline]
+    pub fn from_combined_owned(left: Row, right: Row) -> Self {
+        let total_len = left.len() + right.len();
+        // For owned storage, we can move values directly
+        // For shared storage, we need to clone
+        match (left.storage, right.storage) {
+            (RowStorage::Owned(mut left_vec), RowStorage::Owned(right_vec)) => {
+                left_vec.reserve(right_vec.len());
+                left_vec.extend(right_vec);
+                Self {
+                    storage: RowStorage::Owned(left_vec),
+                }
+            }
+            (RowStorage::Owned(mut left_vec), RowStorage::Shared(right_arc)) => {
+                left_vec.reserve(right_arc.len());
+                for v in right_arc.iter() {
+                    left_vec.push(v.clone());
+                }
+                Self {
+                    storage: RowStorage::Owned(left_vec),
+                }
+            }
+            (RowStorage::Shared(left_arc), RowStorage::Owned(right_vec)) => {
+                let mut values = Vec::with_capacity(total_len);
+                for v in left_arc.iter() {
+                    values.push(v.clone());
+                }
+                values.extend(right_vec);
+                Self {
+                    storage: RowStorage::Owned(values),
+                }
+            }
+            (RowStorage::Shared(left_arc), RowStorage::Shared(right_arc)) => {
+                let mut values = Vec::with_capacity(total_len);
+                for v in left_arc.iter() {
+                    values.push(v.clone());
+                }
+                for v in right_arc.iter() {
+                    values.push(v.clone());
+                }
+                Self {
+                    storage: RowStorage::Owned(values),
+                }
+            }
+        }
+    }
+
     /// Create a row from an Arc slice - O(1) clone
     #[inline]
     pub fn from_arc(values: Arc<[Value]>) -> Self {
@@ -276,20 +343,36 @@ impl Row {
     }
 
     /// Take specific columns by their indices, consuming the row
-    /// OPTIMIZATION: Avoids cloning by moving values out of the row
+    /// OPTIMIZATION: For Owned storage, moves values without cloning.
+    /// For Shared (Arc) storage, only clones the requested columns (not entire row).
     #[inline]
     pub fn take_columns(self, indices: &[usize]) -> Row {
-        let mut vec = self.storage.into_vec();
-        let mut values = Vec::with_capacity(indices.len());
-        for &idx in indices {
-            if idx < vec.len() {
-                // Take the value, replacing with null to avoid clone
-                values.push(std::mem::take(&mut vec[idx]));
-            } else {
-                values.push(Value::null_unknown());
+        match self.storage {
+            RowStorage::Owned(mut vec) => {
+                // Owned: move values out without cloning
+                let mut values = Vec::with_capacity(indices.len());
+                for &idx in indices {
+                    if idx < vec.len() {
+                        values.push(std::mem::take(&mut vec[idx]));
+                    } else {
+                        values.push(Value::null_unknown());
+                    }
+                }
+                Row::from_values(values)
+            }
+            RowStorage::Shared(arc) => {
+                // Shared: only clone the specific columns we need
+                let mut values = Vec::with_capacity(indices.len());
+                for &idx in indices {
+                    if idx < arc.len() {
+                        values.push(arc[idx].clone());
+                    } else {
+                        values.push(Value::null_unknown());
+                    }
+                }
+                Row::from_values(values)
             }
         }
-        Row::from_values(values)
     }
 
     /// Validate the row against a schema

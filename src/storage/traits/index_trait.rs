@@ -15,7 +15,7 @@
 //! Index trait for database indexes
 //!
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, Value};
 use crate::storage::expression::Expression;
@@ -54,7 +54,7 @@ pub trait Index: Send + Sync {
     ///
     /// # Arguments
     /// * `entries` - Map from row_id to column values
-    fn add_batch(&self, entries: &HashMap<i64, Vec<Value>>) -> Result<()>;
+    fn add_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()>;
 
     /// Removes values from the index
     ///
@@ -70,7 +70,7 @@ pub trait Index: Send + Sync {
     ///
     /// # Arguments
     /// * `entries` - Map from row_id to column values
-    fn remove_batch(&self, entries: &HashMap<i64, Vec<Value>>) -> Result<()>;
+    fn remove_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()>;
 
     /// Returns the column IDs for this index
     fn column_ids(&self) -> &[i32];

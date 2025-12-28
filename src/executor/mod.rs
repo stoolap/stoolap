@@ -365,7 +365,7 @@ impl Executor {
     pub fn execute_with_named_params(
         &self,
         sql: &str,
-        params: std::collections::HashMap<String, Value>,
+        params: FxHashMap<String, Value>,
     ) -> Result<Box<dyn QueryResult>> {
         let ctx = ExecutionContext::with_named_params(params);
         self.execute_cached(sql, &ctx)
