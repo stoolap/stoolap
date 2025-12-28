@@ -19,7 +19,7 @@
 
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use std::path::Path;
@@ -291,6 +291,9 @@ pub struct MVCCEngine {
     loading_from_disk: Arc<AtomicBool>,
     /// File lock to prevent multiple processes from accessing the same database
     file_lock: Mutex<Option<FileLock>>,
+    /// Schema epoch counter - increments on any CREATE/ALTER/DROP TABLE
+    /// Used for fast cache invalidation without HashMap lookup
+    schema_epoch: AtomicU64,
 }
 
 impl MVCCEngine {
@@ -327,6 +330,7 @@ impl MVCCEngine {
             persistence: Arc::new(persistence),
             loading_from_disk: Arc::new(AtomicBool::new(false)),
             file_lock: Mutex::new(None),
+            schema_epoch: AtomicU64::new(0),
         }
     }
 
@@ -1204,6 +1208,9 @@ impl MVCCEngine {
             stores.insert(table_name, version_store);
         }
 
+        // Increment schema epoch for cache invalidation
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+
         Ok(return_schema)
     }
 
@@ -1239,6 +1246,9 @@ impl MVCCEngine {
             let mut schemas = self.schemas.write().unwrap();
             schemas.remove(&table_name);
         }
+
+        // Increment schema epoch for cache invalidation
+        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -1309,6 +1319,9 @@ impl MVCCEngine {
             vs_schema.add_column(col)?;
         }
 
+        // Increment schema epoch for cache invalidation
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+
         Ok(())
     }
 
@@ -1365,6 +1378,9 @@ impl MVCCEngine {
             col.default_expr = default_expr;
             vs_schema.add_column(col)?;
         }
+
+        // Increment schema epoch for cache invalidation
+        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -1423,6 +1439,9 @@ impl MVCCEngine {
             Arc::make_mut(&mut *vs_schema_guard).remove_column(column_name)?;
         }
 
+        // Increment schema epoch for cache invalidation
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+
         Ok(())
     }
 
@@ -1459,6 +1478,9 @@ impl MVCCEngine {
             let mut vs_schema_guard = store.schema_mut();
             Arc::make_mut(&mut *vs_schema_guard).rename_column(old_name, new_name)?;
         }
+
+        // Increment schema epoch for cache invalidation
+        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -1501,6 +1523,9 @@ impl MVCCEngine {
                 Some(nullable),
             )?;
         }
+
+        // Increment schema epoch for cache invalidation
+        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -1546,6 +1571,9 @@ impl MVCCEngine {
                 stores.insert(new_name_lower, store);
             }
         }
+
+        // Increment schema epoch for cache invalidation
+        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -1801,6 +1829,11 @@ impl Engine for MVCCEngine {
             .get(name.as_ref())
             .cloned()
             .ok_or(Error::TableNotFound)
+    }
+
+    #[inline]
+    fn schema_epoch(&self) -> u64 {
+        self.schema_epoch.load(Ordering::Acquire)
     }
 
     fn list_table_indexes(&self, table_name: &str) -> Result<FxHashMap<String, String>> {

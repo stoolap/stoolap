@@ -265,8 +265,8 @@ impl Executor {
 
     /// Execute the fast-path PK lookup using Engine::fetch_rows_by_ids
     fn execute_pk_lookup(&self, info: PkLookupInfo) -> Result<Box<dyn QueryResult>> {
-        // Use cached schema for column names (already fetched in extract_pk_lookup_info)
-        let columns: Vec<String> = info.schema.columns.iter().map(|c| c.name.clone()).collect();
+        // Use cached schema for column names - Arc clone is O(1)
+        let columns = info.schema.column_names_arc();
 
         // Use engine's fetch_rows_by_ids for direct MVCC lookup
         // This bypasses the full query planner and goes straight to version store
@@ -281,7 +281,10 @@ impl Executor {
             .map(|(_, row)| Self::normalize_row_to_schema(row, &info.schema))
             .collect();
 
-        Ok(Box::new(ExecutorMemoryResult::new(columns, result_rows)))
+        Ok(Box::new(ExecutorMemoryResult::with_arc_columns(
+            columns,
+            result_rows,
+        )))
     }
 
     // ============================================================================
@@ -318,22 +321,15 @@ impl Executor {
             match &*compiled_guard {
                 CompiledExecution::NotOptimizable => return None,
                 CompiledExecution::PkLookup(lookup) => {
-                    // Validate schema version using updated_at timestamp
-                    // This detects any ALTER TABLE changes
-                    if let Ok(current_schema) = self.engine.get_table_schema(&lookup.table_name) {
-                        if current_schema.updated_at.timestamp_millis() != lookup.schema_version {
-                            // Schema changed - need to recompile
-                            // Fall through to recompile path
-                        } else {
-                            // Fast path: extract value and execute
-                            let pk_value =
-                                self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
-                            return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
-                        }
-                    } else {
-                        // Table no longer exists - invalidate
-                        // Fall through to recompile path
+                    // Fast validation using schema epoch (~1ns vs ~7ns for HashMap lookup)
+                    // If epoch matches, no DDL has occurred since compilation
+                    if self.engine.schema_epoch() == lookup.cached_epoch {
+                        // Fast path: extract value and execute
+                        let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
+                        return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
                     }
+                    // Epoch changed - some DDL occurred, need to recompile
+                    // Fall through to recompile path
                 }
                 CompiledExecution::Unknown => {} // Fall through to compile
                 // These variants are for UPDATE/DELETE fast paths
@@ -347,10 +343,15 @@ impl Executor {
 
     /// Extract PK value using pre-compiled source (very fast - just array access)
     fn extract_pk_value_fast(&self, source: &PkValueSource, ctx: &ExecutionContext) -> Option<i64> {
+        Self::extract_pk_value_from_slice(source, ctx.params())
+    }
+
+    /// Extract PK value from params slice directly (avoids ExecutionContext overhead)
+    #[inline]
+    fn extract_pk_value_from_slice(source: &PkValueSource, params: &[Value]) -> Option<i64> {
         match source {
             PkValueSource::Literal(v) => Some(*v),
             PkValueSource::Parameter(idx) => {
-                let params = ctx.params();
                 if *idx >= params.len() {
                     return None;
                 }
@@ -360,6 +361,34 @@ impl Executor {
                     _ => None,
                 }
             }
+        }
+    }
+
+    /// Try fast PK lookup with borrowed params slice (avoids Arc allocation)
+    pub(crate) fn try_fast_pk_lookup_with_params(
+        &self,
+        _stmt: &SelectStatement,
+        params: &[Value],
+        compiled: &RwLock<CompiledExecution>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        // Try read lock first - check if already compiled
+        let compiled_guard = compiled.read().ok()?;
+        match &*compiled_guard {
+            CompiledExecution::NotOptimizable => None,
+            CompiledExecution::PkLookup(lookup) => {
+                // Fast validation using schema epoch
+                if self.engine.schema_epoch() == lookup.cached_epoch {
+                    // Fast path: extract value from slice directly
+                    let pk_value =
+                        Self::extract_pk_value_from_slice(&lookup.pk_value_source, params)?;
+                    Some(self.execute_compiled_pk_lookup(lookup, pk_value))
+                } else {
+                    // Epoch changed - need recompile, use normal path
+                    None
+                }
+            }
+            CompiledExecution::Unknown => None, // Not compiled yet, use normal path
+            _ => None,
         }
     }
 
@@ -373,11 +402,13 @@ impl Executor {
             .engine
             .fetch_rows_by_ids(&lookup.table_name, &[pk_value])?;
         // Normalize rows to current schema (handles ADD/DROP COLUMN)
-        let result_rows: Vec<_> = rows
-            .into_iter()
-            .map(|(_, row)| Self::normalize_row_to_schema(row, &lookup.schema))
-            .collect();
-        Ok(Box::new(ExecutorMemoryResult::new(
+        // Pre-allocate with capacity 1 for single PK lookup (avoids realloc)
+        let mut result_rows = Vec::with_capacity(1);
+        for (_, row) in rows {
+            result_rows.push(Self::normalize_row_to_schema(row, &lookup.schema));
+        }
+        // Use Arc columns to avoid clone (O(1) Arc clone vs O(n) Vec clone)
+        Ok(Box::new(ExecutorMemoryResult::with_arc_columns(
             lookup.column_names.clone(),
             result_rows,
         )))
@@ -449,15 +480,15 @@ impl Executor {
         match self.extract_pk_lookup_info(&table_name, where_clause, ctx) {
             Some(info) => {
                 // Build and cache compiled lookup
-                let column_names: Vec<String> =
-                    info.schema.columns.iter().map(|c| c.name.clone()).collect();
-                let schema_version = info.schema.updated_at.timestamp_millis();
+                // Use schema's cached column names - O(1) Arc clone
+                let column_names = info.schema.column_names_arc();
+                let cached_epoch = self.engine.schema_epoch();
                 let compiled_lookup = CompiledPkLookup {
                     table_name: info.table_name.clone(),
                     schema: info.schema.clone(),
                     column_names,
                     pk_value_source: info.pk_value_source.clone(),
-                    schema_version,
+                    cached_epoch,
                 };
                 *compiled_guard = CompiledExecution::PkLookup(compiled_lookup);
                 drop(compiled_guard);

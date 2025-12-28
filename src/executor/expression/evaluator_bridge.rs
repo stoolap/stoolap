@@ -393,8 +393,8 @@ pub fn compile_expression_with_context(
 pub struct RowFilter {
     /// Pre-compiled program (shared across clones)
     program: SharedProgram,
-    /// Query parameters (shared)
-    params: Arc<[Value]>,
+    /// Query parameters (shared) - uses Arc<Vec<Value>> to match ExecutionContext
+    params: Arc<Vec<Value>>,
     /// Named parameters (shared)
     named_params: Arc<FxHashMap<String, Value>>,
 }
@@ -409,7 +409,7 @@ impl RowFilter {
         let program = compile_expression(expr, columns)?;
         Ok(Self {
             program,
-            params: Arc::from([]),
+            params: Arc::new(Vec::new()),
             named_params: Arc::new(FxHashMap::default()),
         })
     }
@@ -457,14 +457,14 @@ impl RowFilter {
 
         Ok(Self {
             program,
-            params: Arc::from([]),
+            params: Arc::new(Vec::new()),
             named_params: Arc::new(FxHashMap::default()),
         })
     }
 
     /// Create a filter with query parameters.
     pub fn with_params(mut self, params: Vec<Value>) -> Self {
-        self.params = Arc::from(params);
+        self.params = Arc::new(params);
         self
     }
 
@@ -476,12 +476,10 @@ impl RowFilter {
 
     /// Create a filter from execution context.
     ///
-    /// PERF: For `named_params`, we share the Arc to avoid cloning.
-    /// For `params`, we must clone because RowFilter uses Arc<[Value]> while
-    /// ExecutionContext uses Arc<Vec<Value>>. These are incompatible types.
+    /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
-        // Clone params (type mismatch: Arc<[Value]> vs Arc<Vec<Value>>)
-        self.params = Arc::from(ctx.params().to_vec());
+        // Share params Arc - no cloning needed (both use Arc<Vec<Value>>)
+        self.params = Arc::clone(ctx.params_arc());
         // Share named_params Arc - no cloning needed
         self.named_params = Arc::clone(ctx.named_params_arc());
         self
@@ -491,7 +489,7 @@ impl RowFilter {
     pub fn from_program(program: SharedProgram) -> Self {
         Self {
             program,
-            params: Arc::from([]),
+            params: Arc::new(Vec::new()),
             named_params: Arc::new(FxHashMap::default()),
         }
     }
@@ -678,10 +676,10 @@ pub struct ExpressionEval {
     program: SharedProgram,
     /// VM instance (reusable, maintains stack)
     vm: ExprVM,
-    /// Query parameters
-    params: Vec<Value>,
-    /// Named parameters
-    named_params: FxHashMap<String, Value>,
+    /// Query parameters (shared) - uses Arc<Vec<Value>> to match ExecutionContext
+    params: Arc<Vec<Value>>,
+    /// Named parameters (shared) - uses Arc to match ExecutionContext
+    named_params: Arc<FxHashMap<String, Value>>,
     /// Outer row context for correlated subqueries
     outer_row: Option<FxHashMap<Arc<str>, Value>>,
     /// Transaction ID
@@ -695,8 +693,8 @@ impl ExpressionEval {
         Ok(Self {
             program,
             vm: ExprVM::new(),
-            params: Vec::new(),
-            named_params: FxHashMap::default(),
+            params: Arc::new(Vec::new()),
+            named_params: Arc::new(FxHashMap::default()),
             outer_row: None,
             transaction_id: None,
         })
@@ -766,8 +764,8 @@ impl ExpressionEval {
         Ok(Self {
             program,
             vm: ExprVM::new(),
-            params: Vec::new(),
-            named_params: FxHashMap::default(),
+            params: Arc::new(Vec::new()),
+            named_params: Arc::new(FxHashMap::default()),
             outer_row: None,
             transaction_id: None,
         })
@@ -778,8 +776,8 @@ impl ExpressionEval {
         Self {
             program,
             vm: ExprVM::new(),
-            params: Vec::new(),
-            named_params: FxHashMap::default(),
+            params: Arc::new(Vec::new()),
+            named_params: Arc::new(FxHashMap::default()),
             outer_row: None,
             transaction_id: None,
         }
@@ -787,24 +785,24 @@ impl ExpressionEval {
 
     /// Set query parameters.
     pub fn with_params(mut self, params: Vec<Value>) -> Self {
-        self.params = params;
+        self.params = Arc::new(params);
         self
     }
 
     /// Set named parameters.
     pub fn with_named_params(mut self, named_params: FxHashMap<String, Value>) -> Self {
-        self.named_params = named_params;
+        self.named_params = Arc::new(named_params);
         self
     }
 
     /// Set context from ExecutionContext.
+    ///
+    /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
-        self.params = ctx.params().to_vec();
-        self.named_params = ctx
-            .named_params()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // Share params Arc - no cloning needed
+        self.params = Arc::clone(ctx.params_arc());
+        // Share named_params Arc - no cloning needed
+        self.named_params = Arc::clone(ctx.named_params_arc());
         if let Some(outer) = ctx.outer_row() {
             let mut arc_map = FxHashMap::default();
             for (k, v) in outer.iter() {
@@ -946,10 +944,10 @@ pub struct MultiExpressionEval {
     programs: Vec<SharedProgram>,
     /// Single VM instance (reused for all expressions)
     vm: ExprVM,
-    /// Query parameters
-    params: Vec<Value>,
-    /// Named parameters
-    named_params: FxHashMap<String, Value>,
+    /// Query parameters (shared) - uses Arc<Vec<Value>> to match ExecutionContext
+    params: Arc<Vec<Value>>,
+    /// Named parameters (shared) - uses Arc to match ExecutionContext
+    named_params: Arc<FxHashMap<String, Value>>,
     /// Transaction ID
     transaction_id: Option<u64>,
 }
@@ -973,8 +971,8 @@ impl MultiExpressionEval {
         Ok(Self {
             programs,
             vm: ExprVM::new(),
-            params: Vec::new(),
-            named_params: FxHashMap::default(),
+            params: Arc::new(Vec::new()),
+            named_params: Arc::new(FxHashMap::default()),
             transaction_id: None,
         })
     }
@@ -1015,26 +1013,26 @@ impl MultiExpressionEval {
         Ok(Self {
             programs,
             vm: ExprVM::new(),
-            params: Vec::new(),
-            named_params: FxHashMap::default(),
+            params: Arc::new(Vec::new()),
+            named_params: Arc::new(FxHashMap::default()),
             transaction_id: None,
         })
     }
 
     /// Set query parameters.
     pub fn with_params(mut self, params: Vec<Value>) -> Self {
-        self.params = params;
+        self.params = Arc::new(params);
         self
     }
 
     /// Set from execution context.
+    ///
+    /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
-        self.params = ctx.params().to_vec();
-        self.named_params = ctx
-            .named_params()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // Share params Arc - no cloning needed
+        self.params = Arc::clone(ctx.params_arc());
+        // Share named_params Arc - no cloning needed
+        self.named_params = Arc::clone(ctx.named_params_arc());
         self.transaction_id = ctx.transaction_id();
         self
     }
@@ -1160,11 +1158,11 @@ pub struct CompiledEvaluator<'a> {
     /// Outer query columns (for correlated subqueries)
     outer_columns: Option<Vec<String>>,
 
-    /// Query parameters (positional)
-    params: Vec<Value>,
+    /// Query parameters (positional) - uses Arc<Vec<Value>> to match ExecutionContext
+    params: Arc<Vec<Value>>,
 
-    /// Query parameters (named)
-    named_params: FxHashMap<String, Value>,
+    /// Query parameters (named) - uses Arc to match ExecutionContext
+    named_params: Arc<FxHashMap<String, Value>>,
 
     /// Outer row context for correlated subqueries
     outer_row: Option<FxHashMap<Arc<str>, Value>>,
@@ -1204,8 +1202,8 @@ impl<'a> CompiledEvaluator<'a> {
             columns_source_id: 0,
             columns2: None,
             outer_columns: None,
-            params: Vec::new(),
-            named_params: FxHashMap::default(),
+            params: Arc::new(Vec::new()),
+            named_params: Arc::new(FxHashMap::default()),
             outer_row: None,
             transaction_id: None,
             expression_aliases: FxHashMap::default(),
@@ -1228,8 +1226,8 @@ impl<'a> CompiledEvaluator<'a> {
         self.columns_source_id = 0;
         self.columns2 = None;
         self.outer_columns = None;
-        self.params.clear();
-        self.named_params.clear();
+        self.params = Arc::new(Vec::new());
+        self.named_params = Arc::new(FxHashMap::default());
         self.outer_row = None;
         self.transaction_id = None;
         self.expression_aliases.clear();
@@ -1246,24 +1244,24 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Set query parameters (positional) - fluent API
     pub fn with_params(mut self, params: Vec<Value>) -> Self {
-        self.params = params;
+        self.params = Arc::new(params);
         self
     }
 
     /// Set named query parameters - fluent API
     pub fn with_named_params(mut self, named_params: FxHashMap<String, Value>) -> Self {
-        self.named_params = named_params;
+        self.named_params = Arc::new(named_params);
         self
     }
 
     /// Set parameters from execution context - fluent API
+    ///
+    /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
-        self.params = ctx.params().to_vec();
-        self.named_params = ctx
-            .named_params()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // Share params Arc - no cloning needed
+        self.params = Arc::clone(ctx.params_arc());
+        // Share named_params Arc - no cloning needed
+        self.named_params = Arc::clone(ctx.named_params_arc());
 
         // Set outer row context for correlated subqueries
         if let Some(outer) = ctx.outer_row() {

@@ -47,6 +47,10 @@ const MAX_VIEW_DEPTH: usize = 32;
 /// to benefit from early termination.
 const ANTI_JOIN_LIMIT_THRESHOLD: i64 = 10000;
 
+/// Type alias for select execution results: (result, column_names, is_empty)
+/// Using Arc<Vec<String>> for column names enables zero-copy sharing across query execution.
+type SelectResult = Result<(Box<dyn QueryResult>, Arc<Vec<String>>, bool)>;
+
 use super::context::{
     clear_batch_aggregate_cache, clear_batch_aggregate_info_cache, clear_count_counter_cache,
     clear_exists_correlation_cache, clear_exists_fetcher_cache, clear_exists_index_cache,
@@ -509,7 +513,7 @@ impl Executor {
                 // Each inner Vec contains the evaluated ORDER BY expressions for that row
                 let sort_keys: Vec<Vec<Value>> = if has_correlated_order_by {
                     // For correlated subqueries, we need to process per-row with outer context
-                    let columns_arc = std::sync::Arc::new(columns.clone());
+                    let columns_arc = Arc::clone(&columns);
                     // Extract table alias for qualified column names
                     let order_table_alias: Option<String> =
                         stmt.table_expr.as_ref().and_then(|te| match te.as_ref() {
@@ -693,11 +697,11 @@ impl Executor {
 
                 // Use original column names if expected_columns matches
                 let output_columns = if expected_columns > 0 && expected_columns <= columns.len() {
-                    columns[..expected_columns].to_vec()
+                    Arc::new(columns[..expected_columns].to_vec())
                 } else {
-                    columns.clone()
+                    Arc::clone(&columns)
                 };
-                return Ok(Box::new(ExecutorMemoryResult::new(
+                return Ok(Box::new(ExecutorMemoryResult::with_arc_columns(
                     output_columns,
                     result_rows,
                 )));
@@ -797,7 +801,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+    ) -> SelectResult {
         // Get table source
         let table_expr = match &stmt.table_expr {
             Some(expr) => expr.as_ref(),
@@ -818,7 +822,7 @@ impl Executor {
                     return self.execute_query_on_memory_result(
                         stmt,
                         ctx,
-                        columns.clone(),
+                        columns.to_vec(),
                         (**rows).clone(),
                     );
                 }
@@ -850,7 +854,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+    ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
 
         // Check WHERE clause first - if it evaluates to false, return empty result
@@ -877,7 +881,8 @@ impl Executor {
                     };
                     columns.push(col_name);
                 }
-                let result = ExecutorMemoryResult::new(columns.clone(), vec![]);
+                let columns = Arc::new(columns);
+                let result = ExecutorMemoryResult::with_arc_columns(Arc::clone(&columns), vec![]);
                 return Ok((Box::new(result), columns, false));
             }
         }
@@ -890,7 +895,7 @@ impl Executor {
             let empty_columns: Vec<String> = vec![];
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, dummy_rows, &empty_columns)?;
-            let columns = result.columns().to_vec();
+            let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
 
@@ -918,7 +923,8 @@ impl Executor {
         }
 
         let row = Row::from_values(values);
-        let result = ExecutorMemoryResult::new(columns.clone(), vec![row]);
+        let columns = Arc::new(columns);
+        let result = ExecutorMemoryResult::with_arc_columns(Arc::clone(&columns), vec![row]);
 
         Ok((Box::new(result), columns, false))
     }
@@ -930,12 +936,16 @@ impl Executor {
         ctx: &ExecutionContext,
         columns: Vec<String>,
         rows: Vec<Row>,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+    ) -> SelectResult {
         // Use the CTE execution logic from cte.rs
         let (result_cols, result_rows) =
             self.execute_query_on_cte_result(stmt, ctx, columns, rows)?;
+        let result_cols = Arc::new(result_cols);
         Ok((
-            Box::new(ExecutorMemoryResult::new(result_cols.clone(), result_rows)),
+            Box::new(ExecutorMemoryResult::with_arc_columns(
+                Arc::clone(&result_cols),
+                result_rows,
+            )),
             result_cols,
             false,
         ))
@@ -1115,7 +1125,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+    ) -> SelectResult {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &table_source.name.value_lower;
 
@@ -1188,7 +1198,7 @@ impl Executor {
                 ctx,
                 classification,
             )? {
-                let columns = result.columns().to_vec();
+                let columns = Arc::new(result.columns().to_vec());
                 return Ok((result, columns, false));
             }
         }
@@ -1201,7 +1211,7 @@ impl Executor {
             if let Some(result) =
                 self.try_distinct_pushdown(table.as_ref(), stmt, &all_columns, classification)?
             {
-                let columns = result.columns().to_vec();
+                let columns = Arc::new(result.columns().to_vec());
                 return Ok((result, columns, false));
             }
         }
@@ -1311,13 +1321,13 @@ impl Executor {
                 {
                     CacheLookupResult::ExactHit(rows_arc) => {
                         // Exact cache hit - return cached rows with zero-copy sharing
-                        let output_columns = self.get_output_column_names(
+                        let output_columns = Arc::new(self.get_output_column_names(
                             &stmt.columns,
                             &all_columns,
                             table_alias.as_deref(),
-                        );
-                        let result = ExecutorMemoryResult::with_shared_rows(
-                            output_columns.clone(),
+                        ));
+                        let result = ExecutorMemoryResult::with_arc_columns_shared_rows(
+                            Arc::clone(&output_columns),
                             rows_arc,
                         );
                         return Ok((Box::new(result), output_columns, false));
@@ -1336,13 +1346,15 @@ impl Executor {
                             &columns,
                             &self.function_registry,
                         )?;
-                        let output_columns = self.get_output_column_names(
+                        let output_columns = Arc::new(self.get_output_column_names(
                             &stmt.columns,
                             &all_columns,
                             table_alias.as_deref(),
+                        ));
+                        let result = ExecutorMemoryResult::with_arc_columns(
+                            Arc::clone(&output_columns),
+                            filtered_rows,
                         );
-                        let result =
-                            ExecutorMemoryResult::new(output_columns.clone(), filtered_rows);
                         return Ok((Box::new(result), output_columns, false));
                     }
                     CacheLookupResult::Miss => {
@@ -1409,12 +1421,13 @@ impl Executor {
                     .can_prune_entire_scan(&*table, expr.as_ref())
                 {
                     // Zone maps indicate no segments can match - return empty result
-                    let output_columns = self.get_output_column_names(
+                    let output_columns = Arc::new(self.get_output_column_names(
                         &stmt.columns,
                         &all_columns,
                         table_alias.as_deref(),
-                    );
-                    let result = ExecutorMemoryResult::new(output_columns.clone(), vec![]);
+                    ));
+                    let result =
+                        ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), vec![]);
                     return Ok((Box::new(result), output_columns, true));
                 }
             }
@@ -1622,11 +1635,14 @@ impl Executor {
                 ctx,
                 table_alias.as_deref(),
             )?;
-            let output_columns =
-                self.get_output_column_names(&stmt.columns, &all_columns, table_alias.as_deref());
-            let (projected_rows, output_columns) = (projected_rows, output_columns);
+            let output_columns = Arc::new(self.get_output_column_names(
+                &stmt.columns,
+                &all_columns,
+                table_alias.as_deref(),
+            ));
 
-            let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+            let result =
+                ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
             // LIMIT/OFFSET already applied at storage level
             return Ok((Box::new(result), output_columns, true));
         }
@@ -1704,17 +1720,18 @@ impl Executor {
                 // 1. Non-identity projection (different columns or reordered)
                 // 2. Column names differ (aliases like "SELECT id AS a")
                 if !column_indices.is_empty() && (!is_identity_projection || names_differ) {
+                    let output_columns = Arc::new(output_columns);
                     result = Box::new(StreamingProjectionResult::new(
                         result,
                         column_indices,
-                        output_columns.clone(),
+                        (*output_columns).clone(),
                     ));
                     // LIMIT/OFFSET NOT applied yet - streaming path
                     return Ok((result, output_columns, false));
                 } else {
                     // SELECT * - no projection needed
                     // LIMIT/OFFSET NOT applied yet - streaming path
-                    return Ok((result, output_columns, false));
+                    return Ok((result, Arc::new(output_columns), false));
                 }
             }
         }
@@ -1804,11 +1821,11 @@ impl Executor {
                                 ctx,
                                 table_alias.as_deref(),
                             )?;
-                            let output_columns = self.get_output_column_names(
+                            let output_columns = Arc::new(self.get_output_column_names(
                                 &stmt.columns,
                                 &all_columns,
                                 table_alias.as_deref(),
-                            );
+                            ));
 
                             // Apply LIMIT if present
                             let final_rows = if let Some(limit_expr) = &stmt.limit {
@@ -1837,8 +1854,10 @@ impl Executor {
                                 projected_rows
                             };
 
-                            let result =
-                                ExecutorMemoryResult::new(output_columns.clone(), final_rows);
+                            let result = ExecutorMemoryResult::with_arc_columns(
+                                Arc::clone(&output_columns),
+                                final_rows,
+                            );
                             return Ok((Box::new(result), output_columns, true));
                         }
                     }
@@ -2033,12 +2052,15 @@ impl Executor {
                         ctx,
                         table_alias.as_deref(),
                     )?;
-                    let output_columns = self.get_output_column_names(
+                    let output_columns = Arc::new(self.get_output_column_names(
                         &stmt.columns,
                         &all_columns,
                         table_alias.as_deref(),
+                    ));
+                    let result = ExecutorMemoryResult::with_arc_columns(
+                        Arc::clone(&output_columns),
+                        projected_rows,
                     );
-                    let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
                     return Ok((Box::new(result), output_columns, true)); // true = LIMIT applied
                 }
 
@@ -2372,7 +2394,7 @@ impl Executor {
                                                 limit_val,
                                             );
                                         if let Ok(query_result) = result {
-                                            let columns = query_result.columns().to_vec();
+                                            let columns = Arc::new(query_result.columns().to_vec());
                                             return Ok((query_result, columns, false));
                                         }
                                         // Fall through to regular path if optimization fails
@@ -2528,7 +2550,7 @@ impl Executor {
             // Apply window functions on aggregated rows
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, agg_rows, &agg_columns)?;
-            let columns = result.columns().to_vec();
+            let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
 
@@ -2557,14 +2579,14 @@ impl Executor {
                 // Default path: no optimization
                 self.execute_select_with_window_functions(stmt, ctx, rows, &all_columns)?
             };
-            let columns = result.columns().to_vec();
+            let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
 
         // Check if we need aggregation only (no window functions)
         if has_agg {
             let result = self.execute_select_with_aggregation(stmt, ctx, rows, &all_columns)?;
-            let columns = result.columns().to_vec();
+            let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
 
@@ -2635,7 +2657,9 @@ impl Executor {
             projected_rows
         };
 
-        let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+        let output_columns = Arc::new(output_columns);
+        let result =
+            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok((Box::new(result), output_columns, false))
     }
 
@@ -2646,7 +2670,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+    ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
 
         // Get table aliases for filter pushdown
@@ -3291,12 +3315,17 @@ impl Executor {
                         // Project rows according to SELECT expressions
                         let projected_rows =
                             self.project_rows(&stmt.columns, final_rows, &all_columns, ctx)?;
-                        let output_columns =
-                            self.get_output_column_names(&stmt.columns, &all_columns, None);
+                        let output_columns = Arc::new(self.get_output_column_names(
+                            &stmt.columns,
+                            &all_columns,
+                            None,
+                        ));
 
                         // Return with projected results
-                        let result =
-                            ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+                        let result = ExecutorMemoryResult::with_arc_columns(
+                            Arc::clone(&output_columns),
+                            projected_rows,
+                        );
                         return Ok((Box::new(result), output_columns, false));
                     }
                 }
@@ -3463,9 +3492,12 @@ impl Executor {
                     let projected_rows =
                         self.project_rows(&stmt.columns, join_result.rows, &all_cols, ctx)?;
                     let output_columns =
-                        self.get_output_column_names(&stmt.columns, &all_cols, None);
+                        Arc::new(self.get_output_column_names(&stmt.columns, &all_cols, None));
 
-                    let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+                    let result = ExecutorMemoryResult::with_arc_columns(
+                        Arc::clone(&output_columns),
+                        projected_rows,
+                    );
                     return Ok((Box::new(result), output_columns, false));
                 }
             }
@@ -3789,7 +3821,7 @@ impl Executor {
             // Apply window functions on aggregated rows
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, agg_rows, &agg_columns)?;
-            let columns = result.columns().to_vec();
+            let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
 
@@ -3797,7 +3829,7 @@ impl Executor {
         if has_window {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, final_rows, &final_columns)?;
-            let columns = result.columns().to_vec();
+            let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
 
@@ -3805,7 +3837,7 @@ impl Executor {
         if has_agg {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, final_rows, &final_columns)?;
-            let columns = result.columns().to_vec();
+            let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
 
@@ -3815,9 +3847,11 @@ impl Executor {
         // Determine output column names
         // Note: For JOIN results, columns are already qualified (e.g., "a.id", "b.id"),
         // so we pass None for table_alias - the prefix matching will work
-        let output_columns = self.get_output_column_names(&stmt.columns, &final_columns, None);
+        let output_columns =
+            Arc::new(self.get_output_column_names(&stmt.columns, &final_columns, None));
 
-        let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+        let result =
+            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok((Box::new(result), output_columns, false))
     }
 
@@ -3828,7 +3862,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+    ) -> SelectResult {
         // classification is passed from caller for the outer stmt
         // Note: The inner subquery will get its own classification via execute_select
 
@@ -3855,7 +3889,7 @@ impl Executor {
         if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, filtered_rows, &columns)?;
-            let out_columns = result.columns().to_vec();
+            let out_columns = Arc::new(result.columns().to_vec());
             return Ok((result, out_columns, false));
         }
 
@@ -3863,7 +3897,7 @@ impl Executor {
         if classification.has_aggregation {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &columns)?;
-            let out_columns = result.columns().to_vec();
+            let out_columns = Arc::new(result.columns().to_vec());
             return Ok((result, out_columns, false));
         }
 
@@ -3875,9 +3909,11 @@ impl Executor {
             .alias
             .as_ref()
             .map(|a| a.value_lower.as_str());
-        let output_columns = self.get_output_column_names(&stmt.columns, &columns, subquery_alias);
+        let output_columns =
+            Arc::new(self.get_output_column_names(&stmt.columns, &columns, subquery_alias));
 
-        let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+        let result =
+            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok((Box::new(result), output_columns, false))
     }
 
@@ -3931,7 +3967,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+    ) -> SelectResult {
         // classification is passed from caller for the outer stmt
         // Note: The view's inner query will get its own classification via execute_select
 
@@ -3976,7 +4012,7 @@ impl Executor {
             // Execute aggregation on the view's rows
             let agg_result =
                 self.execute_select_with_aggregation(stmt, ctx, rows, &view_columns)?;
-            let columns = agg_result.columns().to_vec();
+            let columns = Arc::new(agg_result.columns().to_vec());
             return Ok((agg_result, columns, false));
         }
 
@@ -3991,7 +4027,7 @@ impl Executor {
         if is_select_star {
             // For SELECT *, just return the view result with WHERE applied
             // DISTINCT, ORDER BY, LIMIT/OFFSET are handled by execute_select
-            return Ok((result, view_columns, false));
+            return Ok((result, Arc::new(view_columns), false));
         }
 
         // Determine if we have any complex expressions (not just column references)
@@ -4133,7 +4169,7 @@ impl Executor {
             output_columns
         };
 
-        Ok((result, final_columns, false))
+        Ok((result, Arc::new(final_columns), false))
     }
 
     /// Execute a VALUES source (e.g., (VALUES (1, 'a'), (2, 'b')) AS t(col1, col2))
@@ -4143,7 +4179,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+    ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
 
         // Determine column names
@@ -4233,7 +4269,7 @@ impl Executor {
         if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, result_rows, &column_names)?;
-            let columns = result.columns().to_vec();
+            let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
 
@@ -4241,12 +4277,14 @@ impl Executor {
         if classification.has_aggregation {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, result_rows, &column_names)?;
-            let columns = result.columns().to_vec();
+            let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
 
-        // Create the result
-        let values_result = ExecutorMemoryResult::new(column_names.clone(), result_rows);
+        // Create the result - use Arc for column names
+        let column_names_arc = Arc::new(column_names);
+        let values_result =
+            ExecutorMemoryResult::with_arc_columns(Arc::clone(&column_names_arc), result_rows);
 
         // If the SELECT has projections, apply them
         if stmt.columns.len() == 1
@@ -4256,7 +4294,7 @@ impl Executor {
             )
         {
             // SELECT * or t.* - return all columns
-            return Ok((Box::new(values_result), column_names, false));
+            return Ok((Box::new(values_result), column_names_arc, false));
         }
 
         // Apply column projection
@@ -4267,11 +4305,11 @@ impl Executor {
         for (i, col_expr) in stmt.columns.iter().enumerate() {
             match col_expr {
                 Expression::Star(_) => {
-                    projected_columns.extend(column_names.clone());
+                    projected_columns.extend(column_names_arc.iter().cloned());
                 }
                 Expression::QualifiedStar(_) => {
                     // For single table, t.* is equivalent to *
-                    projected_columns.extend(column_names.clone());
+                    projected_columns.extend(column_names_arc.iter().cloned());
                 }
                 Expression::Aliased(a) => {
                     projected_columns.push(a.alias.value.clone());
@@ -4290,7 +4328,7 @@ impl Executor {
 
         // Build extended columns for evaluator - just use simple column names
         // The evaluator handles qualified references by stripping the qualifier
-        let extended_columns = column_names.clone();
+        let extended_columns = column_names_arc.to_vec();
 
         // OPTIMIZATION: Check if we need an evaluator for complex expressions
         let needs_evaluator = stmt.columns.iter().any(|c| {
@@ -4445,8 +4483,12 @@ impl Executor {
             projected_rows.push(Row::from_values(new_values));
         }
 
-        let final_result = ExecutorMemoryResult::new(projected_columns.clone(), projected_rows);
-        Ok((Box::new(final_result), projected_columns, false))
+        let projected_columns_arc = Arc::new(projected_columns);
+        let final_result = ExecutorMemoryResult::with_arc_columns(
+            Arc::clone(&projected_columns_arc),
+            projected_rows,
+        );
+        Ok((Box::new(final_result), projected_columns_arc, false))
     }
 
     /// Execute a table expression (for JOIN left/right sides)
@@ -4493,13 +4535,13 @@ impl Executor {
                             .cloned()
                             .collect();
                         Box::new(super::result::ExecutorMemoryResult::new(
-                            columns.clone(),
+                            columns.to_vec(),
                             filtered_rows,
                         ))
                     } else {
                         // Zero-copy: share the Arc<Vec<Row>> directly
                         Box::new(super::result::ExecutorMemoryResult::with_shared_rows(
-                            columns.clone(),
+                            columns.to_vec(),
                             Arc::clone(rows),
                         ))
                     };
@@ -4603,7 +4645,7 @@ impl Executor {
                 let classification = get_classification(&select_all);
                 let (result, columns, _) =
                     self.execute_join_source(js, &select_all, ctx, &classification)?;
-                Ok((result, columns))
+                Ok((result, columns.to_vec()))
             }
             Expression::SubquerySource(ss) => {
                 // Execute subquery with incremented depth to avoid creating new TimeoutGuard
@@ -4646,7 +4688,7 @@ impl Executor {
                 let classification = get_classification(&select_all);
                 let (result, columns, _) =
                     self.execute_values_source(vs, &select_all, ctx, &classification)?;
-                Ok((result, columns))
+                Ok((result, columns.to_vec()))
             }
             _ => Err(Error::NotSupportedMessage(
                 "Unsupported table expression type".to_string(),
@@ -5981,7 +6023,7 @@ impl Executor {
         ctx: &ExecutionContext,
         tx: &dyn crate::storage::traits::Transaction,
         classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+    ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
 
         // Get table schema
@@ -6036,14 +6078,14 @@ impl Executor {
         if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, rows, &all_columns)?;
-            let columns = result.columns().to_vec();
+            let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
 
         // Check for aggregation
         if classification.has_aggregation {
             let result = self.execute_select_with_aggregation(stmt, ctx, rows, &all_columns)?;
-            let columns = result.columns().to_vec();
+            let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
 
@@ -6051,12 +6093,13 @@ impl Executor {
         let (projected_rows, final_columns) =
             self.project_rows_for_select(stmt, rows, &all_columns, ctx)?;
 
+        let final_columns_arc = Arc::new(final_columns);
         Ok((
-            Box::new(ExecutorMemoryResult::new(
-                final_columns.clone(),
+            Box::new(ExecutorMemoryResult::with_arc_columns(
+                Arc::clone(&final_columns_arc),
                 projected_rows,
             )),
-            final_columns,
+            final_columns_arc,
             false,
         ))
     }
@@ -6862,7 +6905,7 @@ impl Executor {
         table: &dyn crate::storage::traits::Table,
         all_columns: &[String],
         ctx: &ExecutionContext,
-    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, Arc<Vec<String>>)>> {
         use crate::core::IndexType;
 
         // Only single-column GROUP BY is supported for now
@@ -7196,7 +7239,9 @@ impl Executor {
             }
         }
 
-        let result = ExecutorMemoryResult::new(result_columns.clone(), result_rows);
+        let result_columns = Arc::new(result_columns);
+        let result =
+            ExecutorMemoryResult::with_arc_columns(Arc::clone(&result_columns), result_rows);
         Ok(Some((Box::new(result), result_columns)))
     }
 }

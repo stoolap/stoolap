@@ -181,11 +181,36 @@ impl ExecutorMemoryResult {
         }
     }
 
-    /// Create a new memory result with shared rows from cache (zero-copy)
+    /// Create a new memory result with shared rows from cache (zero-copy for rows)
     /// This avoids cloning the entire Vec<Row> when reading from semantic cache
     pub fn with_shared_rows(columns: Vec<String>, rows: Arc<Vec<Row>>) -> Self {
         Self {
             columns: Arc::new(columns),
+            rows: RowStorage::Shared(rows),
+            current_index: None,
+            closed: false,
+            affected: 0,
+            insert_id: 0,
+        }
+    }
+
+    /// Create a new memory result with Arc columns and shared rows (zero-copy for both)
+    pub fn with_arc_columns_shared_rows(columns: Arc<Vec<String>>, rows: Arc<Vec<Row>>) -> Self {
+        Self {
+            columns,
+            rows: RowStorage::Shared(rows),
+            current_index: None,
+            closed: false,
+            affected: 0,
+            insert_id: 0,
+        }
+    }
+
+    /// Create a new memory result with both Arc columns and Arc rows (fully zero-copy)
+    /// This is the most efficient constructor for cached/shared results
+    pub fn with_arc_all(columns: Arc<Vec<String>>, rows: Arc<Vec<Row>>) -> Self {
+        Self {
+            columns,
             rows: RowStorage::Shared(rows),
             current_index: None,
             closed: false,

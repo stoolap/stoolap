@@ -39,6 +39,8 @@
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use rustc_hash::FxHashMap;
+
 use crate::core::Schema;
 use crate::parser::ast::Statement;
 
@@ -58,13 +60,12 @@ pub struct CompiledPkLookup {
     pub table_name: String,
     /// Cached schema
     pub schema: Arc<Schema>,
-    /// Pre-computed column names for result
-    pub column_names: Vec<String>,
+    /// Pre-computed column names for result (Arc for zero-copy on execution)
+    pub column_names: Arc<Vec<String>>,
     /// How to extract the PK value
     pub pk_value_source: PkValueSource,
-    /// Schema version at compilation time (updated_at timestamp in millis)
-    /// Used to detect schema changes from ALTER TABLE
-    pub schema_version: i64,
+    /// Schema epoch at compilation time (for fast cache invalidation)
+    pub cached_epoch: u64,
 }
 
 /// Pre-compiled update column assignment
@@ -100,8 +101,8 @@ pub struct CompiledPkUpdate {
     pub pk_value_source: PkValueSource,
     /// Pre-compiled column assignments
     pub updates: Vec<CompiledUpdateColumn>,
-    /// Schema version at compilation time (updated_at timestamp in millis)
-    pub schema_version: i64,
+    /// Schema epoch at compilation time (for fast cache invalidation)
+    pub cached_epoch: u64,
 }
 
 /// Pre-compiled state for PK-based DELETE (DELETE FROM table WHERE pk = value)
@@ -115,8 +116,8 @@ pub struct CompiledPkDelete {
     pub pk_column_name: String,
     /// How to extract the PK value
     pub pk_value_source: PkValueSource,
-    /// Schema version at compilation time (updated_at timestamp in millis)
-    pub schema_version: i64,
+    /// Schema epoch at compilation time (for fast cache invalidation)
+    pub cached_epoch: u64,
 }
 
 /// Pre-compiled execution state for fast paths
@@ -200,8 +201,8 @@ impl CachedQueryPlan {
 /// Provides thread-safe caching of parsed SQL queries to avoid
 /// the overhead of parsing the same query multiple times.
 pub struct QueryCache {
-    /// Cached plans indexed by normalized query text
-    plans: RwLock<std::collections::HashMap<String, CachedQueryPlan>>,
+    /// Cached plans indexed by normalized query text (FxHash for fast string hashing)
+    plans: RwLock<FxHashMap<String, CachedQueryPlan>>,
     /// Maximum number of cached plans
     max_size: usize,
     /// Factor to determine how many plans to prune when cache is full (0.0-1.0)
@@ -212,7 +213,7 @@ impl QueryCache {
     /// Create a new query cache with the given maximum size
     pub fn new(max_size: usize) -> Self {
         Self {
-            plans: RwLock::new(std::collections::HashMap::new()),
+            plans: RwLock::new(FxHashMap::default()),
             max_size,
             prune_factor: 0.2, // Prune 20% of entries when cache is full
         }
@@ -352,7 +353,7 @@ impl QueryCache {
     }
 
     /// Prune the least recently used entries when the cache is full
-    fn prune_cache(&self, plans: &mut std::collections::HashMap<String, CachedQueryPlan>) {
+    fn prune_cache(&self, plans: &mut FxHashMap<String, CachedQueryPlan>) {
         // Calculate how many entries to remove
         let num_to_remove = ((self.max_size as f64) * self.prune_factor).ceil() as usize;
         let num_to_remove = num_to_remove.max(1);
@@ -399,31 +400,61 @@ pub struct CacheStats {
 /// Normalize a query for caching
 ///
 /// This handles irrelevant whitespace differences to improve cache hits.
-/// OPTIMIZATION: Returns Cow to avoid allocation when query is already normalized.
+/// OPTIMIZATION: Single-pass check + Cow to avoid allocation when already normalized.
+#[inline]
 fn normalize_query(query: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
 
-    let trimmed = query.trim();
+    let bytes = query.as_bytes();
+    let len = bytes.len();
 
-    // Fast path: check if already normalized (no consecutive whitespace)
-    let needs_normalization = trimmed
-        .as_bytes()
-        .windows(2)
-        .any(|w| w[0].is_ascii_whitespace() && w[1].is_ascii_whitespace())
-        || trimmed
-            .bytes()
-            .any(|b| b == b'\n' || b == b'\t' || b == b'\r');
-
-    if !needs_normalization {
-        return Cow::Borrowed(trimmed);
+    // Find start (skip leading whitespace)
+    let start = bytes
+        .iter()
+        .position(|&b| !b.is_ascii_whitespace())
+        .unwrap_or(len);
+    if start == len {
+        return Cow::Borrowed("");
     }
 
-    // Slow path: normalize whitespace
+    // Find end (skip trailing whitespace)
+    let end = bytes
+        .iter()
+        .rposition(|&b| !b.is_ascii_whitespace())
+        .map(|p| p + 1)
+        .unwrap_or(start);
+
+    // Single pass: check if normalization needed (consecutive whitespace or non-space whitespace)
+    let trimmed = &bytes[start..end];
+    let mut prev_ws = false;
+    let mut needs_normalization = false;
+
+    for &b in trimmed {
+        let is_ws = b.is_ascii_whitespace();
+        if is_ws {
+            // Check for consecutive whitespace or non-space whitespace chars
+            if prev_ws || b != b' ' {
+                needs_normalization = true;
+                break;
+            }
+        }
+        prev_ws = is_ws;
+    }
+
+    if !needs_normalization {
+        // SAFETY: trimmed is valid UTF-8 since it's a slice of a UTF-8 string
+        return Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(trimmed) });
+    }
+
+    // Slow path: normalize whitespace (rarely hit for well-formed queries)
+    // SAFETY: trimmed is valid UTF-8 since it's a slice of a UTF-8 string
+    // at ASCII whitespace boundaries (ASCII chars are single-byte in UTF-8)
+    let trimmed_str = unsafe { std::str::from_utf8_unchecked(trimmed) };
     let mut result = String::with_capacity(trimmed.len());
     let mut last_was_space = false;
 
-    for c in trimmed.chars() {
-        if c.is_whitespace() {
+    for c in trimmed_str.chars() {
+        if c.is_ascii_whitespace() {
             if !last_was_space {
                 result.push(' ');
                 last_was_space = true;
@@ -555,6 +586,33 @@ mod tests {
         assert_eq!(
             normalize_query("SELECT\t*\t\tFROM users"),
             "SELECT * FROM users"
+        );
+    }
+
+    #[test]
+    fn test_normalize_query_utf8() {
+        // UTF-8 characters should be preserved in fast path (no normalization needed)
+        assert_eq!(
+            normalize_query("SELECT * FROM t WHERE name = '日本語'"),
+            "SELECT * FROM t WHERE name = '日本語'"
+        );
+
+        // UTF-8 characters should be preserved in slow path (normalization needed)
+        assert_eq!(
+            normalize_query("SELECT  *  FROM t WHERE name = '日本語'"),
+            "SELECT * FROM t WHERE name = '日本語'"
+        );
+
+        // Mixed ASCII and UTF-8 with tabs/newlines
+        assert_eq!(
+            normalize_query("SELECT\t*\tFROM t WHERE city = '東京' AND country = '中国'"),
+            "SELECT * FROM t WHERE city = '東京' AND country = '中国'"
+        );
+
+        // Emoji should also be preserved
+        assert_eq!(
+            normalize_query("SELECT  *  FROM t WHERE emoji = '🎉'"),
+            "SELECT * FROM t WHERE emoji = '🎉'"
         );
     }
 

@@ -514,9 +514,10 @@ impl Executor {
                     Ok(s) => s,
                     Err(_) => return Ok(None), // Fall back if schema not found
                 };
-                let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                cache_exists_schema(correlation.inner_table.clone(), cols.clone());
-                Arc::new(cols)
+                // Use schema's cached column names - O(1) Arc clone
+                let cols = schema.column_names_arc();
+                cache_exists_schema(correlation.inner_table.clone(), Arc::clone(&cols));
+                cols
             }
         };
 

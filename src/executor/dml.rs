@@ -143,7 +143,8 @@ impl Executor {
             if stmt.columns.is_empty() {
                 column_indices = (0..schema_column_count).collect();
                 column_types = all_column_types.clone();
-                column_names = schema.columns.iter().map(|c| c.name.clone()).collect();
+                // Use schema's cached column names - avoids re-collecting on every INSERT
+                column_names = schema.column_names_owned().to_vec();
             } else {
                 // Validate columns exist and pre-compute their indices
                 column_indices = stmt

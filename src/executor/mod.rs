@@ -308,8 +308,54 @@ impl Executor {
     /// Parameters are substituted for $1, $2, etc. placeholders in the query.
     /// Uses the query cache for efficient re-execution of parameterized queries.
     pub fn execute_with_params(&self, sql: &str, params: &[Value]) -> Result<Box<dyn QueryResult>> {
+        // Try fast path first with borrowed params (avoids Arc allocation)
+        if let Some(result) = self.try_fast_path_with_params(sql, params) {
+            return result;
+        }
+        // Fall back to full execution with owned context
         let ctx = ExecutionContext::with_params(params.to_vec());
         self.execute_cached(sql, &ctx)
+    }
+
+    /// Try fast path execution with borrowed params slice
+    /// Returns None if fast path doesn't apply, Some(result) otherwise
+    fn try_fast_path_with_params(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        // Quick reject: if in explicit transaction, skip fast path
+        {
+            let active_tx = match self.active_transaction.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return None,
+            };
+            if active_tx.is_some() {
+                return None;
+            }
+        }
+
+        // Try to get from cache
+        let cached = self.query_cache.get(sql)?;
+
+        // Validate parameter count
+        if cached.has_params && params.len() < cached.param_count {
+            return None; // Let normal path handle error
+        }
+
+        // Try compiled fast paths based on statement type
+        match cached.statement.as_ref() {
+            Statement::Select(stmt) => {
+                self.try_fast_pk_lookup_with_params(stmt, params, &cached.compiled)
+            }
+            Statement::Update(stmt) => {
+                self.try_fast_pk_update_with_params(stmt, params, &cached.compiled)
+            }
+            Statement::Delete(stmt) => {
+                self.try_fast_pk_delete_with_params(stmt, params, &cached.compiled)
+            }
+            _ => None,
+        }
     }
 
     /// Execute a SQL query with named parameters

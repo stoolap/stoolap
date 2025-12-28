@@ -85,6 +85,13 @@ pub trait Engine: Send + Sync {
     /// This is a critical optimization for hot paths like PK lookups.
     fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>>;
 
+    /// Gets the current schema epoch
+    ///
+    /// This is a monotonically increasing counter that increments on any
+    /// CREATE TABLE, ALTER TABLE, or DROP TABLE operation. Used for fast
+    /// cache invalidation without HashMap lookup (~1ns vs ~7ns).
+    fn schema_epoch(&self) -> u64;
+
     /// Lists all indexes for a table
     ///
     /// Returns a map from index name to index type string.

@@ -47,7 +47,7 @@ impl Executor {
         stmt: &SelectStatement,
         table: &dyn Table,
         _all_columns: &[String],
-    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, Arc<Vec<String>>)>> {
         // Only optimize single MIN or MAX without DISTINCT
         if stmt.columns.len() != 1 {
             return Ok(None);
@@ -98,12 +98,14 @@ impl Executor {
         };
 
         if let Some(val) = value {
-            // Build result
+            // Build result - wrap columns in Arc once for zero-copy sharing
             let col_name = alias.unwrap_or_else(|| format!("{}({})", func.function, column_name));
-            let columns = vec![col_name.clone()];
+            let columns = Arc::new(vec![col_name]);
             let rows = vec![Row::from_values(vec![val])];
-            let result: Box<dyn QueryResult> =
-                Box::new(ExecutorMemoryResult::new(columns.clone(), rows));
+            let result: Box<dyn QueryResult> = Box::new(ExecutorMemoryResult::with_arc_columns(
+                Arc::clone(&columns),
+                rows,
+            ));
             return Ok(Some((result, columns)));
         }
 
@@ -119,7 +121,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         table: &dyn Table,
-    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, Arc<Vec<String>>)>> {
         // Only optimize single COUNT(*) without DISTINCT
         if stmt.columns.len() != 1 {
             return Ok(None);
@@ -167,12 +169,14 @@ impl Executor {
         // Use table's row_count method (O(1) instead of O(n))
         let count = table.row_count();
 
-        // Build result
+        // Build result - wrap columns in Arc once for zero-copy sharing
         let col_name = alias.unwrap_or_else(|| "COUNT(*)".to_string());
-        let columns = vec![col_name.clone()];
+        let columns = Arc::new(vec![col_name]);
         let rows = vec![Row::from_values(vec![Value::Integer(count as i64)])];
-        let result: Box<dyn QueryResult> =
-            Box::new(ExecutorMemoryResult::new(columns.clone(), rows));
+        let result: Box<dyn QueryResult> = Box::new(ExecutorMemoryResult::with_arc_columns(
+            Arc::clone(&columns),
+            rows,
+        ));
         Ok(Some((result, columns)))
     }
 
@@ -187,7 +191,7 @@ impl Executor {
         table: &dyn Table,
         all_columns: &[String],
         ctx: &ExecutionContext,
-    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, Arc<Vec<String>>)>> {
         // Get the ORDER BY column name
         let order_by = &stmt.order_by[0];
         let column_name = match &order_by.expression {
@@ -235,9 +239,11 @@ impl Executor {
 
             // Note: This optimization path doesn't have table_alias available,
             // so we pass None. The prefix-based matching will still work for JOINs.
-            let output_columns = self.get_output_column_names(&stmt.columns, all_columns, None);
+            let output_columns =
+                Arc::new(self.get_output_column_names(&stmt.columns, all_columns, None));
 
-            let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+            let result =
+                ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
             return Ok(Some((Box::new(result), output_columns)));
         }
 
@@ -258,7 +264,7 @@ impl Executor {
         all_columns: &[String],
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
-    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, Arc<Vec<String>>)>> {
         // Must have WHERE clause
         let where_clause = match where_expr {
             Some(expr) => expr,
@@ -326,9 +332,10 @@ impl Executor {
             let projected_rows =
                 self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
             let output_columns =
-                self.get_output_column_names(&stmt.columns, all_columns, table_alias);
+                Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
 
-            let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+            let result =
+                ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
             return Ok(Some((Box::new(result), output_columns)));
         }
 
@@ -742,7 +749,7 @@ impl Executor {
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
         classification: &Arc<QueryClassification>,
-    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, Arc<Vec<String>>)>> {
         // Extract IN subquery info: (column_name, subquery, is_negated, remaining_predicate)
         let (column_name, subquery, is_negated, remaining_predicate) =
             match Self::extract_in_subquery_info(where_expr) {
@@ -812,8 +819,9 @@ impl Executor {
             } else {
                 // IN empty set = no rows match
                 let output_columns =
-                    self.get_output_column_names(&stmt.columns, all_columns, table_alias);
-                let result = ExecutorMemoryResult::new(output_columns.clone(), vec![]);
+                    Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
+                let result =
+                    ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), vec![]);
                 return Ok(Some((Box::new(result), output_columns)));
             }
         }
@@ -1039,8 +1047,10 @@ impl Executor {
         // Project rows according to SELECT expressions
         let projected_rows =
             self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
-        let output_columns = self.get_output_column_names(&stmt.columns, all_columns, table_alias);
-        let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+        let output_columns =
+            Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
+        let result =
+            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok(Some((Box::new(result), output_columns)))
     }
 
@@ -1060,7 +1070,7 @@ impl Executor {
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
         classification: &Arc<QueryClassification>,
-    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, Arc<Vec<String>>)>> {
         // Extract IN list info: (column_name, values, is_negated, remaining_predicate)
         let (column_name, values, is_negated, remaining_predicate) =
             match Self::extract_in_list_info(where_expr, ctx) {
@@ -1100,8 +1110,9 @@ impl Executor {
             } else {
                 // IN empty set = no rows match
                 let output_columns =
-                    self.get_output_column_names(&stmt.columns, all_columns, table_alias);
-                let result = ExecutorMemoryResult::new(output_columns.clone(), vec![]);
+                    Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
+                let result =
+                    ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), vec![]);
                 return Ok(Some((Box::new(result), output_columns)));
             }
         }
@@ -1246,8 +1257,10 @@ impl Executor {
         // Project rows according to SELECT expressions
         let projected_rows =
             self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
-        let output_columns = self.get_output_column_names(&stmt.columns, all_columns, table_alias);
-        let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+        let output_columns =
+            Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
+        let result =
+            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok(Some((Box::new(result), output_columns)))
     }
 
@@ -1375,7 +1388,7 @@ impl Executor {
         all_columns: &[String],
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
-    ) -> Result<Option<(Box<dyn QueryResult>, Vec<String>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, Arc<Vec<String>>)>> {
         // Extract InHashSet info: (column_name, values, is_negated, remaining_predicate)
         let (column_name, values, is_negated, remaining_predicate) =
             match Self::extract_in_hashset_info(where_expr) {
@@ -1512,8 +1525,9 @@ impl Executor {
         // If no row_ids found, return empty result
         if all_row_ids.is_empty() {
             let output_columns =
-                self.get_output_column_names(&stmt.columns, all_columns, table_alias);
-            let result = ExecutorMemoryResult::new(output_columns.clone(), vec![]);
+                Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
+            let result =
+                ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), vec![]);
             return Ok(Some((Box::new(result), output_columns)));
         }
 
@@ -1627,8 +1641,10 @@ impl Executor {
         // Project rows according to SELECT expressions
         let projected_rows =
             self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
-        let output_columns = self.get_output_column_names(&stmt.columns, all_columns, table_alias);
-        let result = ExecutorMemoryResult::new(output_columns.clone(), projected_rows);
+        let output_columns =
+            Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
+        let result =
+            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok(Some((Box::new(result), output_columns)))
     }
 

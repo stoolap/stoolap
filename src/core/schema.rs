@@ -17,7 +17,7 @@
 //! This module defines SchemaColumn and Schema types for table structure.
 
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 use rustc_hash::FxHashMap;
@@ -178,8 +178,8 @@ pub struct Schema {
     /// Last update timestamp
     pub updated_at: DateTime<Utc>,
 
-    /// Cached column names (computed lazily on first access)
-    column_names_cache: OnceLock<Vec<String>>,
+    /// Cached column names (computed lazily on first access, Arc for zero-copy sharing)
+    column_names_cache: OnceLock<Arc<Vec<String>>>,
 
     /// Cached primary key column index (computed lazily on first access)
     /// None means not computed yet, Some(None) means no PK, Some(Some(idx)) means PK at idx
@@ -194,7 +194,8 @@ impl Clone for Schema {
         // Clone caches if already computed to avoid recomputation
         let column_names_cache = OnceLock::new();
         if let Some(names) = self.column_names_cache.get() {
-            let _ = column_names_cache.set(names.clone());
+            // Arc clone is O(1) - just increments ref count
+            let _ = column_names_cache.set(Arc::clone(names));
         }
 
         let pk_column_index_cache = OnceLock::new();
@@ -240,7 +241,7 @@ impl Schema {
 
         // Eagerly compute caches to avoid recomputation on clone
         let column_names_cache = OnceLock::new();
-        let _ = column_names_cache.set(columns.iter().map(|c| c.name.clone()).collect());
+        let _ = column_names_cache.set(Arc::new(columns.iter().map(|c| c.name.clone()).collect()));
 
         let pk_column_index_cache = OnceLock::new();
         let pk_idx = columns
@@ -283,7 +284,7 @@ impl Schema {
 
         // Eagerly compute caches to avoid recomputation on clone
         let column_names_cache = OnceLock::new();
-        let _ = column_names_cache.set(columns.iter().map(|c| c.name.clone()).collect());
+        let _ = column_names_cache.set(Arc::new(columns.iter().map(|c| c.name.clone()).collect()));
 
         let pk_column_index_cache = OnceLock::new();
         let pk_idx = columns
@@ -371,7 +372,19 @@ impl Schema {
     #[inline]
     pub fn column_names_owned(&self) -> &[String] {
         self.column_names_cache
-            .get_or_init(|| self.columns.iter().map(|c| c.name.clone()).collect())
+            .get_or_init(|| Arc::new(self.columns.iter().map(|c| c.name.clone()).collect()))
+    }
+
+    /// Get column names as Arc for zero-copy sharing with results
+    ///
+    /// This is the most efficient way to pass column names to `ExecutorMemoryResult::with_arc_columns`
+    /// as it avoids any string cloning after the first call.
+    #[inline]
+    pub fn column_names_arc(&self) -> Arc<Vec<String>> {
+        Arc::clone(
+            self.column_names_cache
+                .get_or_init(|| Arc::new(self.columns.iter().map(|c| c.name.clone()).collect())),
+        )
     }
 
     /// Get a cached map of lowercase column names to their indices
@@ -440,9 +453,9 @@ impl Schema {
     fn rebuild_caches(&mut self) {
         // Rebuild column names cache
         self.column_names_cache = OnceLock::new();
-        let _ = self
-            .column_names_cache
-            .set(self.columns.iter().map(|c| c.name.clone()).collect());
+        let _ = self.column_names_cache.set(Arc::new(
+            self.columns.iter().map(|c| c.name.clone()).collect(),
+        ));
 
         // Rebuild PK cache
         self.pk_column_index_cache = OnceLock::new();

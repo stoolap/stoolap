@@ -122,6 +122,9 @@ struct VersionChainEntry {
     prev: Option<Arc<VersionChainEntry>>,
     /// Index into the arena for zero-copy access (None if data not in arena)
     arena_idx: Option<usize>,
+    /// Depth of this chain (number of previous versions including this one)
+    /// Used for amortized O(1) truncation - only truncate when depth exceeds limit
+    chain_depth: usize,
 }
 
 /// Tracks write operations with the version read for conflict detection
@@ -249,6 +252,10 @@ pub struct VersionStore {
     /// Zone maps for segment pruning (set by ANALYZE)
     /// Uses Arc to avoid cloning on every read - critical for high QPS workloads
     zone_maps: RwLock<Option<Arc<crate::storage::mvcc::zonemap::TableZoneMap>>>,
+    /// Maximum number of previous versions to keep per row (0 = unlimited)
+    /// This limits memory growth during write-heavy operations.
+    /// Default is 10 - enough for most concurrent transaction scenarios.
+    max_version_history: usize,
 }
 
 impl VersionStore {
@@ -287,7 +294,24 @@ impl VersionStore {
             arena: RowArena::new(),
             row_arena_index,
             zone_maps: RwLock::new(None),
+            max_version_history: 10, // Default: keep up to 10 previous versions
         }
+    }
+
+    /// Sets the maximum version history limit per row
+    ///
+    /// This controls how many previous versions are kept for each row.
+    /// Lower values reduce memory usage but limit time-travel query range.
+    /// - 0 = unlimited (not recommended for write-heavy workloads)
+    /// - 1 = only keep immediate previous (minimal memory, limited AS OF range)
+    /// - 10 = default, good balance for most workloads
+    pub fn set_max_version_history(&mut self, limit: usize) {
+        self.max_version_history = limit;
+    }
+
+    /// Gets the current max version history limit
+    pub fn max_version_history(&self) -> usize {
+        self.max_version_history
     }
 
     /// Creates a new version store with a visibility checker
@@ -365,12 +389,19 @@ impl VersionStore {
         let mut versions = self.versions.write();
 
         // Check if existing version exists first
-        let existing_data = versions
-            .get(&row_id)
-            .map(|e| (e.version.clone(), e.prev.clone(), e.arena_idx));
+        let existing_data = versions.get(&row_id).map(|e| {
+            (
+                e.version.clone(),
+                e.prev.clone(),
+                e.arena_idx,
+                e.chain_depth,
+            )
+        });
 
         let entry =
-            if let Some((existing_version, existing_prev, existing_arena_idx)) = existing_data {
+            if let Some((existing_version, existing_prev, existing_arena_idx, existing_depth)) =
+                existing_data
+            {
                 // Create new entry with previous version
                 let mut new_version = version;
                 // For deletes, if no data provided, preserve data from current version
@@ -401,17 +432,31 @@ impl VersionStore {
                     None
                 };
 
-                // Use Arc to share the previous chain - O(1) instead of deep clone
+                // O(1) chain management with depth tracking
+                // When limit exceeded: drop old chain (no cloning, truly O(1))
+                let new_depth = existing_depth + 1;
+                let (keep_prev, prev_depth) =
+                    if self.max_version_history > 0 && new_depth > self.max_version_history {
+                        // Exceeded limit - drop old chain (O(1), no cloning)
+                        (None, 0)
+                    } else {
+                        // Under limit - keep chain as-is
+                        (existing_prev, existing_depth)
+                    };
+
                 let prev_chain = Arc::new(VersionChainEntry {
                     version: existing_version,
-                    prev: existing_prev,
+                    prev: keep_prev,
                     arena_idx: existing_arena_idx,
+                    chain_depth: prev_depth + 1,
                 });
+                let final_depth = prev_depth + 2;
 
                 VersionChainEntry {
                     version: new_version,
                     prev: Some(prev_chain),
                     arena_idx,
+                    chain_depth: final_depth,
                 }
             } else {
                 // First version for this row - store in arena
@@ -437,6 +482,7 @@ impl VersionStore {
                     version: final_version,
                     prev: None,
                     arena_idx,
+                    chain_depth: 1, // First version
                 }
             };
 
@@ -463,12 +509,21 @@ impl VersionStore {
 
         for (row_id, version) in batch {
             // Get existing data first (if any)
-            let existing_data = versions
-                .get(&row_id)
-                .map(|e| (e.version.clone(), e.prev.clone(), e.arena_idx));
+            let existing_data = versions.get(&row_id).map(|e| {
+                (
+                    e.version.clone(),
+                    e.prev.clone(),
+                    e.arena_idx,
+                    e.chain_depth,
+                )
+            });
 
-            let entry = if let Some((existing_version, existing_prev, existing_arena_idx)) =
-                existing_data
+            let entry = if let Some((
+                existing_version,
+                existing_prev,
+                existing_arena_idx,
+                existing_depth,
+            )) = existing_data
             {
                 // Create new entry with previous version
                 let mut new_version = version;
@@ -498,17 +553,31 @@ impl VersionStore {
                     None
                 };
 
-                // Use Arc to share the previous chain - O(1) instead of deep clone
+                // O(1) chain management with depth tracking
+                // When limit exceeded: drop old chain (no cloning, truly O(1))
+                let new_depth = existing_depth + 1;
+                let (keep_prev, prev_depth) =
+                    if self.max_version_history > 0 && new_depth > self.max_version_history {
+                        // Exceeded limit - drop old chain (O(1), no cloning)
+                        (None, 0)
+                    } else {
+                        // Under limit - keep chain as-is
+                        (existing_prev, existing_depth)
+                    };
+
                 let prev_chain = Arc::new(VersionChainEntry {
                     version: existing_version,
-                    prev: existing_prev,
+                    prev: keep_prev,
                     arena_idx: existing_arena_idx,
+                    chain_depth: prev_depth + 1,
                 });
+                let final_depth = prev_depth + 2;
 
                 VersionChainEntry {
                     version: new_version,
                     prev: Some(prev_chain),
                     arena_idx,
+                    chain_depth: final_depth,
                 }
             } else {
                 // First version for this row - store in arena with Arc reuse
@@ -532,6 +601,7 @@ impl VersionStore {
                     version: final_version,
                     prev: None,
                     arena_idx,
+                    chain_depth: 1,
                 }
             };
 
@@ -3675,6 +3745,7 @@ impl Clone for VersionChainEntry {
             version: self.version.clone(),
             prev: self.prev.clone(), // Arc clone is O(1)
             arena_idx: self.arena_idx,
+            chain_depth: self.chain_depth,
         }
     }
 }
@@ -4420,5 +4491,175 @@ mod tests {
         // Should NOT be visible in parent store
         let visible = store.get_visible_version(100, 2);
         assert!(visible.is_none());
+    }
+
+    #[test]
+    fn test_version_history_limit_default() {
+        let store = VersionStore::new("test_table".to_string(), test_schema());
+        // Default limit is 10
+        assert_eq!(store.max_version_history(), 10);
+    }
+
+    #[test]
+    fn test_version_history_limit_drop() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let mut store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Set a small limit for testing
+        store.set_max_version_history(3);
+
+        let row_id = 100;
+
+        // Add 5 versions to the same row
+        // v1: depth=1, v2: depth=2, v3: depth=3
+        // v4: depth=4 > 3, triggers drop -> depth=2
+        // v5: depth=3
+        for txn_id in 1..=5 {
+            let row = Row::from(vec![Value::from(txn_id)]);
+            let version = RowVersion::new(txn_id, row_id, row);
+            store.add_version(row_id, version);
+        }
+
+        // After 5 versions with limit 3:
+        // v4 triggered drop (4 > 3), so chain was: v4 -> v3 -> None (depth=2)
+        // v5 added: v5 -> v4 -> v3 -> None (depth=3)
+        let versions = store.versions.read();
+        let entry = versions.get(&row_id).expect("Row should exist");
+
+        // Chain depth should be at most limit + 1 (oscillates between 2 and limit+1)
+        assert!(
+            entry.chain_depth <= 4,
+            "Chain depth {} exceeds limit+1",
+            entry.chain_depth
+        );
+
+        // Count actual chain length
+        let mut count = 1;
+        let mut current = entry.prev.as_ref();
+        while let Some(prev) = current {
+            count += 1;
+            current = prev.prev.as_ref();
+        }
+
+        // Should be <= limit + 1
+        assert!(count <= 4, "Actual chain length {} exceeds limit+1", count);
+    }
+
+    #[test]
+    fn test_version_history_drop_cycles() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let mut store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Set limit to 5
+        store.set_max_version_history(5);
+
+        let row_id = 100;
+
+        // Add 20 versions - drop should happen multiple times
+        // Pattern: 1,2,3,4,5,6(drop->2),3,4,5,6(drop->2),...
+        for txn_id in 1..=20 {
+            let row = Row::from(vec![Value::from(txn_id)]);
+            let version = RowVersion::new(txn_id, row_id, row);
+            store.add_version(row_id, version);
+        }
+
+        // Verify chain is bounded (between 2 and limit+1)
+        let versions = store.versions.read();
+        let entry = versions.get(&row_id).expect("Row should exist");
+
+        let mut count = 1;
+        let mut current = entry.prev.as_ref();
+        while let Some(prev) = current {
+            count += 1;
+            current = prev.prev.as_ref();
+        }
+
+        assert!(
+            count <= 6,
+            "Chain length {} exceeds limit+1 (6) after 20 updates",
+            count
+        );
+        assert!(count >= 2, "Chain length {} should be at least 2", count);
+    }
+
+    #[test]
+    fn test_version_history_unlimited() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let mut store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Set to unlimited (0)
+        store.set_max_version_history(0);
+
+        let row_id = 100;
+
+        // Add 15 versions
+        for txn_id in 1..=15 {
+            let row = Row::from(vec![Value::from(txn_id)]);
+            let version = RowVersion::new(txn_id, row_id, row);
+            store.add_version(row_id, version);
+        }
+
+        // Count chain length - should be 15 (unlimited)
+        let versions = store.versions.read();
+        let entry = versions.get(&row_id).expect("Row should exist");
+
+        let mut count = 1;
+        let mut current = entry.prev.as_ref();
+        while let Some(prev) = current {
+            count += 1;
+            current = prev.prev.as_ref();
+        }
+
+        assert_eq!(count, 15, "Unlimited mode should keep all 15 versions");
+    }
+
+    #[test]
+    fn test_version_history_batch_drop() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let mut store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Set limit to 3
+        store.set_max_version_history(3);
+
+        let row_id = 100;
+
+        // First add some versions individually (depth reaches 3)
+        for txn_id in 1..=3 {
+            let row = Row::from(vec![Value::from(txn_id)]);
+            let version = RowVersion::new(txn_id, row_id, row);
+            store.add_version(row_id, version);
+        }
+
+        // Now add more via batch - each will trigger drop when exceeding limit
+        let batch: Vec<(i64, RowVersion)> = (4..=7)
+            .map(|txn_id| {
+                let row = Row::from(vec![Value::from(txn_id)]);
+                (row_id, RowVersion::new(txn_id, row_id, row))
+            })
+            .collect();
+
+        store.add_versions_batch(batch);
+
+        // Verify chain is bounded (between 2 and limit+1)
+        let versions = store.versions.read();
+        let entry = versions.get(&row_id).expect("Row should exist");
+
+        let mut count = 1;
+        let mut current = entry.prev.as_ref();
+        while let Some(prev) = current {
+            count += 1;
+            current = prev.prev.as_ref();
+        }
+
+        assert!(
+            count <= 4,
+            "Chain length {} exceeds limit+1 (4) after batch",
+            count
+        );
+        assert!(count >= 2, "Chain length {} should be at least 2", count);
     }
 }

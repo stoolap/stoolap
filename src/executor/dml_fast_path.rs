@@ -65,17 +65,14 @@ impl Executor {
             match &*compiled_guard {
                 CompiledExecution::NotOptimizable => return None,
                 CompiledExecution::PkUpdate(update) => {
-                    // Validate schema version using updated_at timestamp
-                    if let Ok(current_schema) = self.engine.get_table_schema(&update.table_name) {
-                        if current_schema.updated_at.timestamp_millis() != update.schema_version {
-                            // Schema changed - fall through to recompile
-                        } else {
-                            // Fast path: extract PK value and execute
-                            let pk_value =
-                                self.extract_pk_value_from_source(&update.pk_value_source, ctx)?;
-                            return Some(self.execute_compiled_pk_update(update, pk_value, ctx));
-                        }
+                    // Fast validation using schema epoch (~1ns vs ~7ns for HashMap lookup)
+                    if self.engine.schema_epoch() == update.cached_epoch {
+                        // Fast path: extract PK value and execute
+                        let pk_value =
+                            self.extract_pk_value_from_source(&update.pk_value_source, ctx)?;
+                        return Some(self.execute_compiled_pk_update(update, pk_value, ctx));
                     }
+                    // Epoch changed - fall through to recompile
                 }
                 CompiledExecution::Unknown => {} // Fall through to compile
                 _ => return None,                // Different type of compiled execution
@@ -113,17 +110,14 @@ impl Executor {
             match &*compiled_guard {
                 CompiledExecution::NotOptimizable => return None,
                 CompiledExecution::PkDelete(delete) => {
-                    // Validate schema version using updated_at timestamp
-                    if let Ok(current_schema) = self.engine.get_table_schema(&delete.table_name) {
-                        if current_schema.updated_at.timestamp_millis() != delete.schema_version {
-                            // Schema changed - fall through to recompile
-                        } else {
-                            // Fast path: extract PK value and execute
-                            let pk_value =
-                                self.extract_pk_value_from_source(&delete.pk_value_source, ctx)?;
-                            return Some(self.execute_compiled_pk_delete(delete, pk_value));
-                        }
+                    // Fast validation using schema epoch (~1ns vs ~7ns for HashMap lookup)
+                    if self.engine.schema_epoch() == delete.cached_epoch {
+                        // Fast path: extract PK value and execute
+                        let pk_value =
+                            self.extract_pk_value_from_source(&delete.pk_value_source, ctx)?;
+                        return Some(self.execute_compiled_pk_delete(delete, pk_value));
                     }
+                    // Epoch changed - fall through to recompile
                 }
                 CompiledExecution::Unknown => {} // Fall through to compile
                 _ => return None,                // Different type of compiled execution
@@ -226,10 +220,15 @@ impl Executor {
         source: &PkValueSource,
         ctx: &ExecutionContext,
     ) -> Option<i64> {
+        Self::extract_pk_value_from_params(source, ctx.params())
+    }
+
+    /// Extract PK value from params slice directly (avoids ExecutionContext overhead)
+    #[inline]
+    fn extract_pk_value_from_params(source: &PkValueSource, params: &[Value]) -> Option<i64> {
         match source {
             PkValueSource::Literal(v) => Some(*v),
             PkValueSource::Parameter(idx) => {
-                let params = ctx.params();
                 if *idx >= params.len() {
                     return None;
                 }
@@ -240,6 +239,125 @@ impl Executor {
                 }
             }
         }
+    }
+
+    /// Extract update value from params slice directly
+    #[inline]
+    fn extract_update_value_from_slice(
+        source: &UpdateValueSource,
+        params: &[Value],
+    ) -> Option<Value> {
+        match source {
+            UpdateValueSource::Literal(v) => Some(v.clone()),
+            UpdateValueSource::Parameter(idx) => params.get(*idx).cloned(),
+        }
+    }
+
+    /// Try fast PK update with borrowed params slice (avoids Arc allocation)
+    pub(crate) fn try_fast_pk_update_with_params(
+        &self,
+        _stmt: &UpdateStatement,
+        params: &[Value],
+        compiled: &RwLock<CompiledExecution>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        // Try read lock first - check if already compiled
+        let compiled_guard = compiled.read().ok()?;
+        match &*compiled_guard {
+            CompiledExecution::NotOptimizable => None,
+            CompiledExecution::PkUpdate(update) => {
+                // Fast validation using schema epoch
+                if self.engine.schema_epoch() == update.cached_epoch {
+                    let pk_value =
+                        Self::extract_pk_value_from_params(&update.pk_value_source, params)?;
+                    // Extract update values
+                    let mut updates = Vec::with_capacity(update.updates.len());
+                    for u in &update.updates {
+                        let value = Self::extract_update_value_from_slice(&u.value_source, params)?;
+                        updates.push((u.column_idx, value.coerce_to_type(u.column_type)));
+                    }
+                    // Clone what we need before dropping guard
+                    let update_clone = update.clone();
+                    drop(compiled_guard);
+                    return Some(self.execute_pk_update_direct(&update_clone, pk_value, updates));
+                }
+                None // Epoch changed, use normal path
+            }
+            CompiledExecution::Unknown => None,
+            _ => None,
+        }
+    }
+
+    /// Try fast PK delete with borrowed params slice (avoids Arc allocation)
+    pub(crate) fn try_fast_pk_delete_with_params(
+        &self,
+        _stmt: &DeleteStatement,
+        params: &[Value],
+        compiled: &RwLock<CompiledExecution>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        // Try read lock first - check if already compiled
+        let compiled_guard = compiled.read().ok()?;
+        match &*compiled_guard {
+            CompiledExecution::NotOptimizable => None,
+            CompiledExecution::PkDelete(delete) => {
+                // Fast validation using schema epoch
+                if self.engine.schema_epoch() == delete.cached_epoch {
+                    let pk_value =
+                        Self::extract_pk_value_from_params(&delete.pk_value_source, params)?;
+                    // Clone what we need before dropping guard
+                    let delete_clone = delete.clone();
+                    drop(compiled_guard);
+                    return Some(self.execute_compiled_pk_delete(&delete_clone, pk_value));
+                }
+                None // Epoch changed, use normal path
+            }
+            CompiledExecution::Unknown => None,
+            _ => None,
+        }
+    }
+
+    /// Execute PK update directly with pre-extracted values (no ExecutionContext needed)
+    fn execute_pk_update_direct(
+        &self,
+        compiled: &CompiledPkUpdate,
+        pk_value: i64,
+        updates: Vec<(usize, Value)>,
+    ) -> Result<Box<dyn QueryResult>> {
+        // Create auto-commit transaction
+        let tx = self.engine.begin_transaction()?;
+        let mut table = tx.get_table(&compiled.table_name)?;
+
+        // Build WHERE expression for PK lookup
+        let mut pk_expr = ComparisonExpr::new(
+            &compiled.pk_column_name,
+            crate::core::Operator::Eq,
+            Value::Integer(pk_value),
+        );
+        pk_expr.prepare_for_schema(&compiled.schema);
+
+        // Execute update with simple setter
+        let mut setter = |mut row: Row| -> (Row, bool) {
+            for (idx, new_value) in &updates {
+                let _ = row.set(*idx, new_value.clone());
+            }
+            (row, true)
+        };
+
+        let rows_affected = table.update(Some(&pk_expr), &mut setter)?;
+
+        // Invalidate caches
+        if rows_affected > 0 {
+            self.semantic_cache.invalidate_table(&compiled.table_name);
+            invalidate_semi_join_cache_for_table(&compiled.table_name);
+        }
+
+        // Commit
+        drop(table);
+        let mut tx = tx;
+        tx.commit()?;
+
+        Ok(Box::new(ExecResult::with_rows_affected(
+            rows_affected as i64,
+        )))
     }
 
     // ============================================================================
@@ -265,21 +383,21 @@ impl Executor {
         );
         pk_expr.prepare_for_schema(&compiled.schema);
 
-        // Extract values from compiled sources
-        let updates: Vec<(usize, Value)> = compiled
-            .updates
-            .iter()
-            .filter_map(|u| {
-                let value = match &u.value_source {
-                    UpdateValueSource::Literal(v) => v.clone(),
-                    UpdateValueSource::Parameter(idx) => {
-                        let params = ctx.params();
-                        params.get(*idx)?.clone()
+        // Extract values from compiled sources (pre-allocate for typical 1-3 column updates)
+        let mut updates = Vec::with_capacity(compiled.updates.len());
+        for u in &compiled.updates {
+            let value = match &u.value_source {
+                UpdateValueSource::Literal(v) => v.clone(),
+                UpdateValueSource::Parameter(idx) => {
+                    let params = ctx.params();
+                    match params.get(*idx) {
+                        Some(v) => v.clone(),
+                        None => continue,
                     }
-                };
-                Some((u.column_idx, value.coerce_to_type(u.column_type)))
-            })
-            .collect();
+                }
+            };
+            updates.push((u.column_idx, value.coerce_to_type(u.column_type)));
+        }
 
         // Execute update with simple setter
         let mut setter = |mut row: Row| -> (Row, bool) {
@@ -444,7 +562,7 @@ impl Executor {
             pk_column_name: pk_column.clone(),
             pk_value_source: pk_source,
             updates: compiled_updates,
-            schema_version: schema.updated_at.timestamp_millis(),
+            cached_epoch: self.engine.schema_epoch(),
         };
 
         *compiled_guard = CompiledExecution::PkUpdate(compiled_update.clone());
@@ -518,7 +636,7 @@ impl Executor {
             schema: Arc::new((*schema).clone()),
             pk_column_name: pk_column.clone(),
             pk_value_source: pk_source,
-            schema_version: schema.updated_at.timestamp_millis(),
+            cached_epoch: self.engine.schema_epoch(),
         };
 
         *compiled_guard = CompiledExecution::PkDelete(compiled_delete.clone());

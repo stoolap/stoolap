@@ -274,10 +274,10 @@ pub fn get_cached_exists_schema(key: &str) -> Option<std::sync::Arc<Vec<String>>
     EXISTS_SCHEMA_CACHE.with(|cache| cache.borrow().get(key).cloned())
 }
 
-/// Cache table column names.
-pub fn cache_exists_schema(key: String, columns: Vec<String>) {
+/// Cache table column names (takes Arc for zero-copy sharing).
+pub fn cache_exists_schema(key: String, columns: std::sync::Arc<Vec<String>>) {
     EXISTS_SCHEMA_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, std::sync::Arc::new(columns));
+        cache.borrow_mut().insert(key, columns);
     });
 }
 
@@ -471,9 +471,13 @@ pub struct ExecutionContext {
     transaction_id: Option<u64>,
 }
 
+/// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
+type CteData = (Arc<Vec<String>>, Arc<Vec<Row>>);
+
 /// Type alias for CTE data map to reduce type complexity
-/// Uses Arc<Vec<Row>> to enable zero-copy sharing of CTE results with joins
-type CteDataMap = FxHashMap<String, (Vec<String>, Arc<Vec<Row>>)>;
+/// Uses Arc<Vec<String>> for columns and Arc<Vec<Row>> for rows
+/// to enable zero-copy sharing of CTE results with joins
+type CteDataMap = FxHashMap<String, CteData>;
 
 impl Default for ExecutionContext {
     fn default() -> Self {
@@ -720,12 +724,11 @@ impl ExecutionContext {
     }
 
     /// Get CTE data by name (case-insensitive)
-    /// Returns Arc reference to enable zero-copy sharing with joins
-    pub fn get_cte(&self, name: &str) -> Option<(&Vec<String>, &Arc<Vec<Row>>)> {
-        self.cte_data.as_ref().and_then(|data| {
-            data.get(&name.to_lowercase())
-                .map(|(cols, rows)| (cols, rows))
-        })
+    /// Returns Arc references to enable zero-copy sharing with joins
+    pub fn get_cte(&self, name: &str) -> Option<&CteData> {
+        self.cte_data
+            .as_ref()
+            .and_then(|data| data.get(&name.to_lowercase()))
     }
 
     /// Check if context has CTE data

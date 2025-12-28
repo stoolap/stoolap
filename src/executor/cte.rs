@@ -48,13 +48,22 @@ use super::result::ExecutorMemoryResult;
 use super::utils::{build_column_index_map, extract_join_keys_and_residual, is_sorted_on_keys};
 use super::Executor;
 
+/// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
+pub type CteData = (Arc<Vec<String>>, Arc<Vec<Row>>);
+
 /// Type alias for CTE data map
-/// Uses Arc<Vec<Row>> to enable zero-copy sharing of CTE results with joins
-pub type CteDataMap = FxHashMap<String, (Vec<String>, Arc<Vec<Row>>)>;
+/// Uses Arc<Vec<String>> for columns and Arc<Vec<Row>> for rows
+/// to enable zero-copy sharing of CTE results with joins
+pub type CteDataMap = FxHashMap<String, CteData>;
 
 /// Type alias for join data result (left_columns, left_rows, right_columns, right_rows)
-/// Uses Arc<Vec<Row>> to enable zero-copy sharing of CTE results with join operators
-type JoinDataResult = (Vec<String>, Arc<Vec<Row>>, Vec<String>, Arc<Vec<Row>>);
+/// Uses Arc for zero-copy sharing of CTE results with join operators
+type JoinDataResult = (
+    Arc<Vec<String>>,
+    Arc<Vec<Row>>,
+    Arc<Vec<String>>,
+    Arc<Vec<Row>>,
+);
 
 /// Convert an expression to a normalized lowercase string for ORDER BY matching.
 /// Handles nested function calls, multiple arguments, and various expression types.
@@ -144,26 +153,26 @@ impl CteRegistry {
     /// - If we're the only owner, mutates in place (no clone)
     /// - If shared, clones first then mutates (preserves other references)
     ///
-    /// Rows are wrapped in Arc to enable zero-copy sharing with joins.
+    /// Both columns and rows are wrapped in Arc to enable zero-copy sharing.
     pub fn store(&mut self, name: &str, columns: Vec<String>, rows: Vec<Row>) {
         let name_lower = name.to_lowercase();
-        Arc::make_mut(&mut self.data).insert(name_lower, (columns, Arc::new(rows)));
+        Arc::make_mut(&mut self.data).insert(name_lower, (Arc::new(columns), Arc::new(rows)));
     }
 
-    /// Store a materialized CTE result with pre-wrapped Arc
+    /// Store a materialized CTE result with pre-wrapped Arcs
     ///
-    /// Use this when you already have an Arc<Vec<Row>> to avoid cloning.
+    /// Use this when you already have Arc-wrapped data to avoid cloning.
     /// This enables zero-copy sharing of CTE results between queries.
-    pub fn store_arc(&mut self, name: &str, columns: Vec<String>, rows: Arc<Vec<Row>>) {
+    pub fn store_arc(&mut self, name: &str, columns: Arc<Vec<String>>, rows: Arc<Vec<Row>>) {
         let name_lower = name.to_lowercase();
         Arc::make_mut(&mut self.data).insert(name_lower, (columns, rows));
     }
 
     /// Get a CTE result by name
-    /// Returns Arc reference to enable zero-copy sharing with joins
-    pub fn get(&self, name: &str) -> Option<(&Vec<String>, &Arc<Vec<Row>>)> {
+    /// Returns Arc references to enable zero-copy sharing with joins
+    pub fn get(&self, name: &str) -> Option<&CteData> {
         let name_lower = name.to_lowercase();
-        self.data.get(&name_lower).map(|(cols, rows)| (cols, rows))
+        self.data.get(&name_lower)
     }
 
     /// Check if a CTE exists
@@ -181,7 +190,7 @@ impl CteRegistry {
     }
 
     /// Iterate over all stored CTEs (for copying to temp registries)
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &(Vec<String>, Arc<Vec<Row>>))> {
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &CteData)> {
         self.data.iter()
     }
 }
@@ -288,11 +297,11 @@ impl Executor {
                 if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
                     if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                         // Execute query against CTE result
-                        // Dereference Arc to get &Vec<Row>, then clone to Vec<Row>
+                        // Dereference Arc to get underlying data
                         return self.execute_query_on_cte_result(
                             stmt,
                             ctx,
-                            columns.clone(),
+                            columns.to_vec(),
                             (**rows).clone(),
                         );
                     }
@@ -476,11 +485,11 @@ impl Executor {
                 if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
                     if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                         // Execute query against CTE result
-                        // Dereference Arc to get &Vec<Row>, then clone to Vec<Row>
+                        // Dereference Arc to get underlying data
                         let (result_cols, result_rows) = self.execute_query_on_cte_result(
                             stmt,
                             &ctx_with_ctes,
-                            columns.clone(),
+                            columns.to_vec(),
                             (**rows).clone(),
                         )?;
                         return Ok(Box::new(ExecutorMemoryResult::new(
@@ -635,23 +644,23 @@ impl Executor {
             )?
         } else {
             // Both CTEs or both regular tables - use standard path
-            let (left_columns, left_rows) = match left_data {
+            let (left_columns, left_rows): (Arc<Vec<String>>, Arc<Vec<Row>>) = match left_data {
                 Some(data) => data,
                 None => {
                     let (result, cols) = self.execute_table_expression(&join_source.left, ctx)?;
                     let rows = Self::materialize_result(result)?;
                     // Wrap in Arc for consistency with CTE data
-                    (cols, Arc::new(rows))
+                    (Arc::new(cols), Arc::new(rows))
                 }
             };
 
-            let (right_columns, right_rows) = match right_data {
+            let (right_columns, right_rows): (Arc<Vec<String>>, Arc<Vec<Row>>) = match right_data {
                 Some(data) => data,
                 None => {
                     let (result, cols) = self.execute_table_expression(&join_source.right, ctx)?;
                     let rows = Self::materialize_result(result)?;
                     // Wrap in Arc for consistency with CTE data
-                    (cols, Arc::new(rows))
+                    (Arc::new(cols), Arc::new(rows))
                 }
             };
             (left_columns, left_rows, right_columns, right_rows)
@@ -670,11 +679,11 @@ impl Executor {
                     .map(|col| format!("{}.{}", name, col))
                     .collect()
             } else {
-                left_columns.clone()
+                left_columns.to_vec()
             }
         } else {
             // Already prefixed by execute_table_expression
-            left_columns.clone()
+            left_columns.to_vec()
         };
         all_columns.extend(left_qualified.clone());
 
@@ -686,11 +695,11 @@ impl Executor {
                     .map(|col| format!("{}.{}", name, col))
                     .collect()
             } else {
-                right_columns.clone()
+                right_columns.to_vec()
             }
         } else {
             // Already prefixed by execute_table_expression
-            right_columns.clone()
+            right_columns.to_vec()
         };
         all_columns.extend(right_qualified.clone());
 
@@ -823,19 +832,19 @@ impl Executor {
     }
 
     /// Resolve a table expression - returns Some if it's a CTE, None if it's a regular table
-    /// Returns Arc-wrapped rows to enable zero-copy sharing with join operators
+    /// Returns Arc-wrapped columns and rows to enable zero-copy sharing with join operators
     #[allow(clippy::type_complexity)]
     fn resolve_table_or_cte(
         &self,
         expr: &Expression,
         _ctx: &ExecutionContext,
         cte_registry: &CteRegistry,
-    ) -> Result<Option<(Vec<String>, Arc<Vec<Row>>)>> {
+    ) -> Result<Option<(Arc<Vec<String>>, Arc<Vec<Row>>)>> {
         // Use the base CTE name (not alias) for registry lookup
         if let Some(cte_name) = self.extract_cte_name_for_lookup(expr) {
             if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                 // Return Arc::clone for zero-copy sharing
-                return Ok(Some((columns.clone(), Arc::clone(rows))));
+                return Ok(Some((Arc::clone(columns), Arc::clone(rows))));
             }
         }
         Ok(None)
@@ -851,8 +860,8 @@ impl Executor {
         left_expr: &Expression,
         right_expr: &Expression,
         join_condition: Option<&Expression>,
-        left_data: Option<(Vec<String>, Arc<Vec<Row>>)>,
-        right_data: Option<(Vec<String>, Arc<Vec<Row>>)>,
+        left_data: Option<CteData>,
+        right_data: Option<CteData>,
         left_is_cte: bool,
         ctx: &ExecutionContext,
     ) -> Result<JoinDataResult> {
@@ -939,6 +948,7 @@ impl Executor {
         let table_rows = Arc::new(Self::materialize_result(table_result)?);
 
         // Return in correct order (left, right)
+        let table_cols = Arc::new(table_cols);
         if cte_on_left {
             Ok((cte_columns, cte_rows, table_cols, table_rows))
         } else {
@@ -1778,7 +1788,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         join_source: &JoinTableSource,
-        cte_data: (Vec<String>, Arc<Vec<Row>>),
+        cte_data: CteData,
         table_expr: &Expression,
         cte_on_left: bool,
         cte_alias: Option<String>,
@@ -1885,7 +1895,7 @@ impl Executor {
                 .map(|col| format!("{}.{}", alias, col))
                 .collect()
         } else {
-            cte_columns.clone()
+            cte_columns.to_vec()
         };
 
         // Get table columns with qualified names
