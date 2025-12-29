@@ -35,7 +35,7 @@ pub use error::{Error, Result};
 pub use row::Row;
 pub use schema::{Schema, SchemaBuilder, SchemaColumn};
 pub use types::{DataType, IndexEntry, IndexType, IsolationLevel, Operator};
-pub use value::{parse_timestamp, Value};
+pub use value::{parse_timestamp, Value, NULL_VALUE};
 
 #[cfg(test)]
 mod integration_tests {

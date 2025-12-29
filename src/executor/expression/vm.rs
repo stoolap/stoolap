@@ -30,14 +30,14 @@ use smallvec::SmallVec;
 
 use super::ops::{CompareOp, Op};
 use super::program::Program;
-use crate::core::{DataType, Result, Value};
+use crate::core::{DataType, Result, Value, NULL_VALUE};
 
 /// Stack value that can be borrowed (from row/constants) or owned (from operations)
 type StackValue<'a> = Cow<'a, Value>;
 
 /// Stack capacity for inline storage (avoids heap allocation for simple expressions)
 /// Most expressions need 4-8 stack slots, so 8 covers the common case.
-const STACK_INLINE_CAPACITY: usize = 8;
+const STACK_INLINE_CAPACITY: usize = 16;
 
 /// Arithmetic operation type (used for safe wrapping operations)
 #[derive(Clone, Copy)]
@@ -83,6 +83,7 @@ pub struct ExecuteContext<'a> {
 
 impl<'a> ExecuteContext<'a> {
     /// Create a simple context with just a row
+    #[inline]
     pub fn new(row: &'a [Value]) -> Self {
         Self {
             row,
@@ -92,6 +93,26 @@ impl<'a> ExecuteContext<'a> {
             named_params: None,
             subquery_executor: None,
             transaction_id: None,
+        }
+    }
+
+    /// Create a context with common parameters that can be reused across rows
+    /// Only the row field needs to be updated for each iteration
+    #[inline]
+    pub fn with_common_params(
+        row: &'a [Value],
+        params: &'a [Value],
+        named_params: Option<&'a FxHashMap<String, Value>>,
+        transaction_id: Option<u64>,
+    ) -> Self {
+        Self {
+            row,
+            row2: None,
+            outer_row: None,
+            params,
+            named_params,
+            subquery_executor: None,
+            transaction_id,
         }
     }
 
@@ -927,41 +948,80 @@ impl ExprVM {
                     let result = if a.is_null() || b.is_null() {
                         Value::Null(DataType::Text)
                     } else {
-                        // Fast path: both are Text - avoid intermediate allocations
+                        // Fast path: both are Text - use CompactString directly (no intermediate String)
                         match (&a, &b) {
                             (Value::Text(a_str), Value::Text(b_str)) => {
-                                // Pre-allocate with exact capacity
-                                let mut s = String::with_capacity(a_str.len() + b_str.len());
+                                // Build CompactString directly - single allocation
+                                let mut s = CompactString::with_capacity(a_str.len() + b_str.len());
                                 s.push_str(a_str);
                                 s.push_str(b_str);
-                                Value::Text(CompactString::from(s.as_str()))
+                                Value::Text(s)
                             }
                             (Value::Text(a_str), _) => {
                                 // a is Text, b needs conversion
                                 use std::fmt::Write;
-                                let mut s = String::with_capacity(a_str.len() + 32);
+                                let mut s = CompactString::with_capacity(a_str.len() + 32);
                                 s.push_str(a_str);
                                 let _ = write!(s, "{}", b);
-                                Value::Text(CompactString::from(s.as_str()))
+                                Value::Text(s)
                             }
                             (_, Value::Text(b_str)) => {
                                 // a needs conversion, b is Text
                                 use std::fmt::Write;
-                                let mut s = String::with_capacity(32 + b_str.len());
+                                let mut s = CompactString::with_capacity(32 + b_str.len());
                                 let _ = write!(s, "{}", a);
                                 s.push_str(b_str);
-                                Value::Text(CompactString::from(s.as_str()))
+                                Value::Text(s)
                             }
                             _ => {
                                 // Both need conversion - rare case
                                 use std::fmt::Write;
-                                let mut s = String::with_capacity(64);
+                                let mut s = CompactString::with_capacity(64);
                                 let _ = write!(s, "{}{}", a, b);
-                                Value::Text(CompactString::from(s.as_str()))
+                                Value::Text(s)
                             }
                         }
                     };
                     self.stack.push(result);
+                    pc += 1;
+                }
+
+                Op::ConcatN(n) => {
+                    let n = *n as usize;
+                    let start = self.stack.len().saturating_sub(n);
+
+                    // Check for any NULL - if so, result is NULL
+                    let has_null = self.stack[start..].iter().any(|v| v.is_null());
+                    if has_null {
+                        self.stack.truncate(start);
+                        self.stack.push(Value::Null(DataType::Text));
+                        pc += 1;
+                        continue;
+                    }
+
+                    // Calculate total length for single allocation
+                    let mut total_len = 0usize;
+                    for v in &self.stack[start..] {
+                        if let Value::Text(s) = v {
+                            total_len += s.len();
+                        } else {
+                            // Non-text needs conversion - estimate 32 chars
+                            total_len += 32;
+                        }
+                    }
+
+                    // Build result with single allocation
+                    let mut result = CompactString::with_capacity(total_len);
+                    for v in self.stack.drain(start..) {
+                        match v {
+                            Value::Text(s) => result.push_str(&s),
+                            _ => {
+                                use std::fmt::Write;
+                                let _ = write!(result, "{}", v);
+                            }
+                        }
+                    }
+                    self.stack.push(Value::Text(result));
                     pc += 1;
                 }
 
@@ -1548,6 +1608,15 @@ impl ExprVM {
                     }
                 }
 
+                Op::JumpIfNotNull(target) => {
+                    let top = self.stack.last().unwrap_or(&Value::Null(DataType::Boolean));
+                    if !top.is_null() {
+                        pc = *target as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+
                 Op::PopJumpIfTrue(target) => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     if Self::to_bool(&v) {
@@ -1711,10 +1780,9 @@ impl ExprVM {
 
         let ops = program.ops();
         if ops.is_empty() {
-            return Ok(Value::null_unknown());
+            return Ok(NULL_VALUE.clone());
         }
 
-        let null_value = Value::null_unknown();
         let mut pc: usize = 0;
 
         loop {
@@ -1730,7 +1798,7 @@ impl ExprVM {
                         .row
                         .get(idx)
                         .map(Cow::Borrowed)
-                        .unwrap_or(Cow::Owned(Value::null_unknown()));
+                        .unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
                     stack.push(value);
                     pc += 1;
                 }
@@ -1741,7 +1809,7 @@ impl ExprVM {
                         .row2
                         .and_then(|r| r.get(idx))
                         .map(Cow::Borrowed)
-                        .unwrap_or(Cow::Owned(Value::null_unknown()));
+                        .unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
                     stack.push(value);
                     pc += 1;
                 }
@@ -1757,7 +1825,7 @@ impl ExprVM {
                         .params
                         .get(idx)
                         .map(Cow::Borrowed)
-                        .unwrap_or(Cow::Owned(Value::null_unknown()));
+                        .unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
                     stack.push(value);
                     pc += 1;
                 }
@@ -1773,15 +1841,15 @@ impl ExprVM {
                         .row
                         .get(idx)
                         .map(Cow::Borrowed)
-                        .unwrap_or(Cow::Owned(Value::null_unknown()));
+                        .unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
                     stack.push(value);
                     pc += 1;
                 }
 
                 // COMPARISON OPERATIONS - work with references
                 Op::Eq => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let b = stack.pop().unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
                     let result = if a.is_null() || b.is_null() {
                         Value::Null(DataType::Boolean)
                     } else {
@@ -1792,8 +1860,8 @@ impl ExprVM {
                 }
 
                 Op::Ne => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let b = stack.pop().unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
                     let result = if a.is_null() || b.is_null() {
                         Value::Null(DataType::Boolean)
                     } else {
@@ -1804,8 +1872,8 @@ impl ExprVM {
                 }
 
                 Op::Lt => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x < *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x < *y),
@@ -1818,8 +1886,8 @@ impl ExprVM {
                 }
 
                 Op::Le => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x <= *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x <= *y),
@@ -1838,8 +1906,8 @@ impl ExprVM {
                 }
 
                 Op::Gt => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x > *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x > *y),
@@ -1852,8 +1920,8 @@ impl ExprVM {
                 }
 
                 Op::Ge => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x >= *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x >= *y),
@@ -1872,20 +1940,20 @@ impl ExprVM {
                 }
 
                 Op::IsNull => {
-                    let v = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     stack.push(Cow::Owned(Value::Boolean(v.is_null())));
                     pc += 1;
                 }
 
                 Op::IsNotNull => {
-                    let v = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     stack.push(Cow::Owned(Value::Boolean(!v.is_null())));
                     pc += 1;
                 }
 
                 // LOGICAL OPERATIONS
                 Op::And(jump_target) => {
-                    let top = stack.last().map(|v| &**v).unwrap_or(&null_value);
+                    let top = stack.last().map(|v| &**v).unwrap_or(&NULL_VALUE);
                     match top {
                         Value::Boolean(false) => pc = *jump_target as usize,
                         Value::Null(_) => pc += 1,
@@ -1894,7 +1962,7 @@ impl ExprVM {
                 }
 
                 Op::Or(jump_target) => {
-                    let top = stack.last().map(|v| &**v).unwrap_or(&null_value);
+                    let top = stack.last().map(|v| &**v).unwrap_or(&NULL_VALUE);
                     match top {
                         Value::Boolean(true) => pc = *jump_target as usize,
                         Value::Null(_) => pc += 1,
@@ -1903,8 +1971,8 @@ impl ExprVM {
                 }
 
                 Op::AndFinalize => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
                         (Some(false), _) | (_, Some(false)) => Value::Boolean(false),
                         (Some(true), Some(true)) => Value::Boolean(true),
@@ -1915,8 +1983,8 @@ impl ExprVM {
                 }
 
                 Op::OrFinalize => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
                         (Some(true), _) | (_, Some(true)) => Value::Boolean(true),
                         (Some(false), Some(false)) => Value::Boolean(false),
@@ -1927,7 +1995,7 @@ impl ExprVM {
                 }
 
                 Op::Not => {
-                    let v = stack.pop().unwrap_or(Cow::Borrowed(&null_value));
+                    let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let result = match Self::to_tribool(&v) {
                         Some(b) => Value::Boolean(!b),
                         None => Value::Null(DataType::Boolean),
@@ -1956,7 +2024,7 @@ impl ExprVM {
 
                 // FUSED OPERATIONS (already optimized, no stack involvement)
                 Op::GtColumnConst(idx, val) => {
-                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&null_value);
+                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
                     let result = match val {
                         Value::Integer(threshold) => Self::gt_int(col_val, *threshold),
                         Value::Float(threshold) => Self::gt_float(col_val, *threshold),
@@ -1967,7 +2035,7 @@ impl ExprVM {
                 }
 
                 Op::LtColumnConst(idx, val) => {
-                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&null_value);
+                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
                     let result = match val {
                         Value::Integer(threshold) => Self::lt_int(col_val, *threshold),
                         Value::Float(threshold) => Self::lt_float(col_val, *threshold),
@@ -1978,7 +2046,7 @@ impl ExprVM {
                 }
 
                 Op::EqColumnConst(idx, val) => {
-                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&null_value);
+                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
                     let result = match val {
                         Value::Integer(v) => Self::eq_int(col_val, *v),
                         Value::Float(v) => Self::eq_float(col_val, *v),
@@ -1991,6 +2059,236 @@ impl ExprVM {
                         }
                     };
                     stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                // COALESCE - return first non-null value
+                Op::Coalesce(n) => {
+                    let n = *n as usize;
+                    let start = stack.len().saturating_sub(n);
+
+                    // Find first non-null value index
+                    let result_idx = stack[start..]
+                        .iter()
+                        .position(|v| !v.is_null())
+                        .map(|i| start + i);
+
+                    let result = if let Some(idx) = result_idx {
+                        // Move the result out, swap to end, pop, then truncate
+                        let last = stack.len() - 1;
+                        stack.swap(idx, last);
+                        // pop() should always succeed since we found an index
+                        stack.pop().expect("stack underflow in COALESCE")
+                    } else {
+                        Cow::Borrowed(&NULL_VALUE)
+                    };
+                    stack.truncate(start);
+                    stack.push(result);
+                    pc += 1;
+                }
+
+                // NULLIF - return NULL if both args are equal
+                Op::NullIf => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let result = if &*a == &*b {
+                        Cow::Borrowed(&NULL_VALUE)
+                    } else {
+                        a
+                    };
+                    stack.push(result);
+                    pc += 1;
+                }
+
+                // GREATEST - return maximum non-null value
+                Op::Greatest(n) => {
+                    let n = *n as usize;
+                    let start = stack.len().saturating_sub(n);
+
+                    // Find max value index
+                    let mut max_idx: Option<usize> = None;
+                    for (i, v) in stack[start..].iter().enumerate() {
+                        if !v.is_null() {
+                            match max_idx {
+                                None => max_idx = Some(start + i),
+                                Some(mi) => {
+                                    if let Some(std::cmp::Ordering::Greater) =
+                                        v.partial_cmp(&stack[mi])
+                                    {
+                                        max_idx = Some(start + i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let result = if let Some(idx) = max_idx {
+                        let last = stack.len() - 1;
+                        stack.swap(idx, last);
+                        stack.pop().expect("stack underflow in GREATEST")
+                    } else {
+                        Cow::Borrowed(&NULL_VALUE)
+                    };
+                    stack.truncate(start);
+                    stack.push(result);
+                    pc += 1;
+                }
+
+                // LEAST - return minimum non-null value
+                Op::Least(n) => {
+                    let n = *n as usize;
+                    let start = stack.len().saturating_sub(n);
+
+                    // Find min value index
+                    let mut min_idx: Option<usize> = None;
+                    for (i, v) in stack[start..].iter().enumerate() {
+                        if !v.is_null() {
+                            match min_idx {
+                                None => min_idx = Some(start + i),
+                                Some(mi) => {
+                                    if let Some(std::cmp::Ordering::Less) =
+                                        v.partial_cmp(&stack[mi])
+                                    {
+                                        min_idx = Some(start + i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let result = if let Some(idx) = min_idx {
+                        let last = stack.len() - 1;
+                        stack.swap(idx, last);
+                        stack.pop().expect("stack underflow in LEAST")
+                    } else {
+                        Cow::Borrowed(&NULL_VALUE)
+                    };
+                    stack.truncate(start);
+                    stack.push(result);
+                    pc += 1;
+                }
+
+                // JUMP/CONTROL FLOW for short-circuit evaluation (used by COALESCE)
+                Op::JumpIfNotNull(target) => {
+                    if let Some(top) = stack.last() {
+                        if !top.is_null() {
+                            pc = *target as usize;
+                            continue;
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Op::Pop => {
+                    stack.pop();
+                    pc += 1;
+                }
+
+                Op::Jump(target) => {
+                    pc = *target as usize;
+                }
+
+                Op::PopJumpIfFalse(target) => {
+                    let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    match &*v {
+                        Value::Boolean(false) | Value::Null(_) => {
+                            pc = *target as usize;
+                        }
+                        _ => pc += 1,
+                    }
+                }
+
+                Op::PopJumpIfTrue(target) => {
+                    let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    match &*v {
+                        Value::Boolean(true) => {
+                            pc = *target as usize;
+                        }
+                        _ => pc += 1,
+                    }
+                }
+
+                Op::Nop => {
+                    pc += 1;
+                }
+
+                // STRING CONCATENATION
+                Op::Concat => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let result = if a.is_null() || b.is_null() {
+                        Value::Null(DataType::Text)
+                    } else {
+                        // Fast path: both are Text - use CompactString directly
+                        match (&*a, &*b) {
+                            (Value::Text(a_str), Value::Text(b_str)) => {
+                                let mut s = CompactString::with_capacity(a_str.len() + b_str.len());
+                                s.push_str(a_str);
+                                s.push_str(b_str);
+                                Value::Text(s)
+                            }
+                            (Value::Text(a_str), _) => {
+                                use std::fmt::Write;
+                                let mut s = CompactString::with_capacity(a_str.len() + 32);
+                                s.push_str(a_str);
+                                let _ = write!(s, "{}", *b);
+                                Value::Text(s)
+                            }
+                            (_, Value::Text(b_str)) => {
+                                use std::fmt::Write;
+                                let mut s = CompactString::with_capacity(32 + b_str.len());
+                                let _ = write!(s, "{}", *a);
+                                s.push_str(b_str);
+                                Value::Text(s)
+                            }
+                            _ => {
+                                use std::fmt::Write;
+                                let mut s = CompactString::with_capacity(64);
+                                let _ = write!(s, "{}{}", *a, *b);
+                                Value::Text(s)
+                            }
+                        }
+                    };
+                    stack.push(Cow::Owned(result));
+                    pc += 1;
+                }
+
+                // Multi-value string concatenation (optimized for chained ||)
+                Op::ConcatN(n) => {
+                    let n = *n as usize;
+                    let start = stack.len().saturating_sub(n);
+
+                    // Check for any NULL - if so, result is NULL
+                    let has_null = stack[start..].iter().any(|v| v.is_null());
+                    if has_null {
+                        stack.truncate(start);
+                        stack.push(Cow::Owned(Value::Null(DataType::Text)));
+                        pc += 1;
+                        continue;
+                    }
+
+                    // Calculate total length for single allocation
+                    let mut total_len = 0usize;
+                    for v in &stack[start..] {
+                        if let Value::Text(s) = &**v {
+                            total_len += s.len();
+                        } else {
+                            total_len += 32; // estimate for non-text
+                        }
+                    }
+
+                    // Build result with single allocation
+                    let mut result = CompactString::with_capacity(total_len);
+                    for v in stack.drain(start..) {
+                        match &*v {
+                            Value::Text(s) => result.push_str(s),
+                            other => {
+                                use std::fmt::Write;
+                                let _ = write!(result, "{}", other);
+                            }
+                        }
+                    }
+                    stack.push(Cow::Owned(Value::Text(result)));
                     pc += 1;
                 }
 
@@ -3978,6 +4276,83 @@ mod tests {
         let row: Vec<Value> = vec![];
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
+    }
+
+    #[test]
+    fn test_jump_if_not_null() {
+        let mut vm = ExprVM::new();
+        // Test 1: Non-null value should jump
+        let program = Program::new(vec![
+            Op::LoadConst(Value::Integer(42)),
+            Op::JumpIfNotNull(4),
+            Op::LoadConst(Value::Integer(0)), // Skipped
+            Op::Return,
+            Op::LoadConst(Value::Integer(1)), // Executed
+            Op::Return,
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
+
+        // Test 2: Null value should NOT jump
+        let program2 = Program::new(vec![
+            Op::LoadNull(DataType::Integer),
+            Op::JumpIfNotNull(4),
+            Op::LoadConst(Value::Integer(99)), // Executed (no jump)
+            Op::Return,
+            Op::LoadConst(Value::Integer(0)), // Not reached
+            Op::Return,
+        ]);
+        assert_eq!(vm.execute(&program2, &ctx).unwrap(), Value::Integer(99));
+    }
+
+    #[test]
+    fn test_coalesce_short_circuit() {
+        // Test short-circuit COALESCE compilation pattern:
+        // COALESCE(NULL, NULL, 42) should return 42 without evaluating further
+        let mut vm = ExprVM::new();
+
+        // Simulates: COALESCE(NULL, NULL, 42)
+        // Bytecode: LoadNull, JumpIfNotNull(end), Pop, LoadNull, JumpIfNotNull(end), Pop, LoadConst(42)
+        let program = Program::new(vec![
+            Op::LoadNull(DataType::Integer),   // arg1: NULL
+            Op::JumpIfNotNull(8),              // if not null, jump to end (position 8)
+            Op::Pop,                           // pop the null
+            Op::LoadNull(DataType::Integer),   // arg2: NULL
+            Op::JumpIfNotNull(8),              // if not null, jump to end
+            Op::Pop,                           // pop the null
+            Op::LoadConst(Value::Integer(42)), // arg3: 42
+            Op::Return,                        // end
+        ]);
+        let row: Vec<Value> = vec![];
+        let ctx = ExecuteContext::new(&row);
+        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(42));
+
+        // Test COALESCE(100, NULL, 42) - first non-null wins
+        let program2 = Program::new(vec![
+            Op::LoadConst(Value::Integer(100)), // arg1: 100 (not null)
+            Op::JumpIfNotNull(8),               // jump to end
+            Op::Pop,
+            Op::LoadNull(DataType::Integer), // arg2: NULL (skipped)
+            Op::JumpIfNotNull(8),
+            Op::Pop,
+            Op::LoadConst(Value::Integer(42)), // arg3: 42 (skipped)
+            Op::Return,
+        ]);
+        assert_eq!(vm.execute(&program2, &ctx).unwrap(), Value::Integer(100));
+
+        // Test COALESCE(NULL, 50, 42) - second wins
+        let program3 = Program::new(vec![
+            Op::LoadNull(DataType::Integer),   // arg1: NULL
+            Op::JumpIfNotNull(8),              // no jump (is null)
+            Op::Pop,                           // pop the null
+            Op::LoadConst(Value::Integer(50)), // arg2: 50 (not null)
+            Op::JumpIfNotNull(8),              // jump to end
+            Op::Pop,
+            Op::LoadConst(Value::Integer(42)), // arg3: 42 (skipped)
+            Op::Return,
+        ]);
+        assert_eq!(vm.execute(&program3, &ctx).unwrap(), Value::Integer(50));
     }
 
     // =========================================================================

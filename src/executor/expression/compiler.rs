@@ -306,6 +306,34 @@ impl<'a> ExprCompiler<'a> {
         Ok(builder.build())
     }
 
+    /// Flatten chained concatenation operators into a list of operands.
+    /// For `a || b || c || d`, returns [a, b, c, d] in order.
+    fn flatten_concat_chain_infix<'b>(
+        infix: &'b InfixExpression,
+        operands: &mut Vec<&'b Expression>,
+    ) {
+        // Flatten left side
+        if let Expression::Infix(left_infix) = &*infix.left {
+            if left_infix.op_type == InfixOperator::Concat {
+                Self::flatten_concat_chain_infix(left_infix, operands);
+            } else {
+                operands.push(&infix.left);
+            }
+        } else {
+            operands.push(&infix.left);
+        }
+        // Flatten right side
+        if let Expression::Infix(right_infix) = &*infix.right {
+            if right_infix.op_type == InfixOperator::Concat {
+                Self::flatten_concat_chain_infix(right_infix, operands);
+            } else {
+                operands.push(&infix.right);
+            }
+        } else {
+            operands.push(&infix.right);
+        }
+    }
+
     /// Compile an expression, emitting ops to the builder
     fn compile_expr(
         &self,
@@ -731,11 +759,24 @@ impl<'a> ExprCompiler<'a> {
                 builder.emit(Op::Mod);
             }
 
-            // String concatenation
+            // String concatenation - optimize chained || into single ConcatN
             InfixOperator::Concat => {
-                self.compile_expr(&infix.left, builder)?;
-                self.compile_expr(&infix.right, builder)?;
-                builder.emit(Op::Concat);
+                // Flatten chained concatenations: a || b || c -> ConcatN(3)
+                let mut operands = Vec::new();
+                Self::flatten_concat_chain_infix(infix, &mut operands);
+
+                if operands.len() > 2 && operands.len() <= 255 {
+                    // Compile all operands in order
+                    for operand in &operands {
+                        self.compile_expr(operand, builder)?;
+                    }
+                    builder.emit(Op::ConcatN(operands.len() as u8));
+                } else {
+                    // Fallback to binary concat
+                    self.compile_expr(&infix.left, builder)?;
+                    self.compile_expr(&infix.right, builder)?;
+                    builder.emit(Op::Concat);
+                }
             }
 
             // Bitwise operators
@@ -1335,10 +1376,44 @@ impl<'a> ExprCompiler<'a> {
             }
 
             "COALESCE" => {
-                for arg in &func.arguments {
-                    self.compile_expr(arg, builder)?;
+                // Short-circuit COALESCE: stop evaluation as soon as we find non-null
+                // Bytecode pattern:
+                //   Eval(Arg1)
+                //   JumpIfNotNull(End)  // If not null, jump to end (keep value)
+                //   Pop                  // Pop the null value
+                //   Eval(Arg2)
+                //   JumpIfNotNull(End)
+                //   Pop
+                //   ...
+                //   Eval(ArgN)          // Last arg: keep on stack (null or not)
+                //   Label(End)
+                if func.arguments.is_empty() {
+                    builder.emit(Op::LoadNull(DataType::Null));
+                    return Ok(());
                 }
-                builder.emit(Op::Coalesce(func.arguments.len() as u8));
+
+                let mut jump_positions = Vec::new();
+                let last_idx = func.arguments.len() - 1;
+
+                for (i, arg) in func.arguments.iter().enumerate() {
+                    self.compile_expr(arg, builder)?;
+
+                    if i < last_idx {
+                        // For all but last: jump to end if not null, else pop and continue
+                        let jump_pos = builder.position();
+                        builder.emit(Op::JumpIfNotNull(0)); // Placeholder, will patch
+                        jump_positions.push(jump_pos);
+                        builder.emit(Op::Pop); // Pop the null value
+                    }
+                    // Last argument: just leave on stack
+                }
+
+                // Patch all jumps to point to end
+                let end_pos = builder.position();
+                for pos in jump_positions {
+                    builder.patch_jump(pos as usize, end_pos);
+                }
+
                 return Ok(());
             }
 

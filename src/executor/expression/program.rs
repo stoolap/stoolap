@@ -303,13 +303,16 @@ impl Program {
 
                 // Function calls: pop N, push 1
                 Op::CallScalar { arg_count, .. } => 1 - (*arg_count as i32),
-                Op::Coalesce(n) | Op::Greatest(n) | Op::Least(n) => 1 - (*n as i32),
+                Op::Coalesce(n) | Op::Greatest(n) | Op::Least(n) | Op::ConcatN(n) => {
+                    1 - (*n as i32)
+                }
 
                 // Control flow (no stack effect for depth calculation)
                 Op::Jump(_)
                 | Op::JumpIfTrue(_)
                 | Op::JumpIfFalse(_)
                 | Op::JumpIfNull(_)
+                | Op::JumpIfNotNull(_)
                 | Op::PopJumpIfTrue(_)
                 | Op::PopJumpIfFalse(_)
                 | Op::Swap
@@ -567,6 +570,7 @@ impl ProgramBuilder {
                 | Op::JumpIfTrue(t)
                 | Op::JumpIfFalse(t)
                 | Op::JumpIfNull(t)
+                | Op::JumpIfNotNull(t)
                 | Op::PopJumpIfTrue(t)
                 | Op::PopJumpIfFalse(t)
                 | Op::CaseWhen(t)

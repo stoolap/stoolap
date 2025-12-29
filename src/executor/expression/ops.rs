@@ -463,9 +463,14 @@ pub enum Op {
     // =========================================================================
     // STRING OPERATIONS
     // =========================================================================
-    /// String concatenation
+    /// String concatenation (binary)
     /// Stack: [a, b] -> [a || b]
     Concat,
+
+    /// Multi-value string concatenation (optimized for chained ||)
+    /// Stack: [v1, v2, ..., vN] -> [v1 || v2 || ... || vN]
+    /// Pre-calculates total length and allocates once
+    ConcatN(u8),
 
     /// LIKE pattern match (pre-compiled pattern)
     /// Stack: [text] -> [bool]
@@ -647,6 +652,10 @@ pub enum Op {
 
     /// Jump if top of stack is NULL (doesn't pop)
     JumpIfNull(u16),
+
+    /// Jump if top of stack is NOT NULL (doesn't pop)
+    /// Used for COALESCE short-circuit evaluation
+    JumpIfNotNull(u16),
 
     /// Pop and jump if true
     PopJumpIfTrue(u16),
@@ -875,6 +884,7 @@ impl std::fmt::Debug for Op {
             Op::JumpIfTrue(target) => write!(f, "JumpIfTrue({})", target),
             Op::JumpIfFalse(target) => write!(f, "JumpIfFalse({})", target),
             Op::JumpIfNull(target) => write!(f, "JumpIfNull({})", target),
+            Op::JumpIfNotNull(target) => write!(f, "JumpIfNotNull({})", target),
             Op::PopJumpIfTrue(target) => write!(f, "PopJumpIfTrue({})", target),
             Op::PopJumpIfFalse(target) => write!(f, "PopJumpIfFalse({})", target),
             Op::Dup => write!(f, "Dup"),
@@ -893,6 +903,7 @@ impl std::fmt::Debug for Op {
             Op::ReturnFalse => write!(f, "ReturnFalse"),
             Op::ReturnNull(dt) => write!(f, "ReturnNull({:?})", dt),
             Op::NativeFn1(_) => write!(f, "NativeFn1(...)"),
+            Op::ConcatN(n) => write!(f, "ConcatN({})", n),
         }
     }
 }

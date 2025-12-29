@@ -5292,64 +5292,98 @@ impl Executor {
         // Create reusable VM
         let mut vm = ExprVM::new();
 
+        // Check if all actions are SimpleColumn (common fast path)
+        let all_simple_columns = actions
+            .iter()
+            .all(|a| matches!(a, ExprAction::SimpleColumn(_)));
+
         // Project rows using pre-analyzed actions
         let mut projected = Vec::with_capacity(rows.len());
 
-        for row in rows {
-            let mut values = Vec::with_capacity(actions.len());
-            let row_slice = row.as_slice();
-
-            // Build VM context once per row (no cloning!)
-            let mut vm_ctx = ExecuteContext::new(row_slice);
-            if !params.is_empty() {
-                vm_ctx = vm_ctx.with_params(params);
-            }
-            if !named_params.is_empty() {
-                vm_ctx = vm_ctx.with_named_params(named_params);
-            }
-            vm_ctx = vm_ctx.with_transaction_id(transaction_id);
-
-            for action in &actions {
-                match action {
-                    ExprAction::SimpleColumn(idx) => {
-                        values.push(row.get(*idx).cloned().unwrap_or(Value::null_unknown()));
+        if all_simple_columns {
+            // Super fast path: just extract column indices and use take_columns
+            let indices: Vec<usize> = actions
+                .iter()
+                .filter_map(|a| {
+                    if let ExprAction::SimpleColumn(idx) = a {
+                        Some(*idx)
+                    } else {
+                        None
                     }
-                    ExprAction::StarExpand => {
-                        for val in row.iter() {
-                            values.push(val.clone());
+                })
+                .collect();
+
+            for row in rows {
+                projected.push(row.take_columns(&indices));
+            }
+        } else {
+            // General path: mixed actions
+            // Pre-compute named_params Option to avoid repeated checks
+            let named_params_opt = if named_params.is_empty() {
+                None
+            } else {
+                Some(named_params)
+            };
+
+            for row in rows {
+                let mut values = Vec::with_capacity(actions.len());
+                let row_slice = row.as_slice();
+
+                // Build VM context with all params in one call (faster than builder chain)
+                let vm_ctx = ExecuteContext::with_common_params(
+                    row_slice,
+                    params,
+                    named_params_opt,
+                    transaction_id,
+                );
+
+                for action in &actions {
+                    match action {
+                        ExprAction::SimpleColumn(idx) => {
+                            values.push(
+                                row_slice
+                                    .get(*idx)
+                                    .cloned()
+                                    .unwrap_or_else(Value::null_unknown),
+                            );
                         }
-                    }
-                    ExprAction::QualifiedStarExpand {
-                        prefix_lower,
-                        qualifier_lower,
-                    } => {
-                        let mut found_any = false;
-                        for (idx, col_lower) in all_columns_lower.iter().enumerate() {
-                            if col_lower.starts_with(prefix_lower) {
-                                if let Some(val) = row.get(idx) {
-                                    values.push(val.clone());
-                                    found_any = true;
-                                }
+                        ExprAction::StarExpand => {
+                            for val in row_slice.iter() {
+                                values.push(val.clone());
                             }
                         }
-                        if !found_any {
-                            if let Some(alias_lower) = table_alias_lower {
-                                if alias_lower == qualifier_lower {
-                                    for val in row.iter() {
+                        ExprAction::QualifiedStarExpand {
+                            prefix_lower,
+                            qualifier_lower,
+                        } => {
+                            let mut found_any = false;
+                            for (idx, col_lower) in all_columns_lower.iter().enumerate() {
+                                if col_lower.starts_with(prefix_lower) {
+                                    if let Some(val) = row_slice.get(idx) {
                                         values.push(val.clone());
+                                        found_any = true;
+                                    }
+                                }
+                            }
+                            if !found_any {
+                                if let Some(alias_lower) = table_alias_lower {
+                                    if alias_lower == qualifier_lower {
+                                        for val in row_slice.iter() {
+                                            values.push(val.clone());
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    ExprAction::Compiled(program) => {
-                        let value = vm.execute_cow(program, &vm_ctx)?;
-                        values.push(value);
+                        ExprAction::Compiled(program) => {
+                            let value = vm.execute_cow(program, &vm_ctx)?;
+                            values.push(value);
+                        }
                     }
                 }
-            }
 
-            projected.push(Row::from_values(values));
+                projected.push(Row::from_values(values));
+            }
         }
 
         Ok(projected)

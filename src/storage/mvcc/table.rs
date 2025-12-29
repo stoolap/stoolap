@@ -980,7 +980,52 @@ impl MVCCTable {
                             continue;
                         }
 
-                        // Collect values for ALL columns in the index
+                        // OPTIMIZATION: For UPDATEs, check if any indexed column changed
+                        // BEFORE allocating Vecs. This avoids allocation overhead when
+                        // updating columns that aren't indexed.
+                        if let Some(old_r) = old_row {
+                            if !is_deleted {
+                                // UPDATE case: check if indexed columns differ (no allocation)
+                                let any_changed = column_ids.iter().any(|&col_id| {
+                                    let idx = col_id as usize;
+                                    let old_val = old_r.get(idx);
+                                    let new_val = new_row.get(idx);
+                                    old_val != new_val
+                                });
+
+                                if !any_changed {
+                                    // Indexed columns unchanged - skip this index entirely
+                                    continue;
+                                }
+
+                                // Values differ - now collect and update
+                                let old_values: Vec<Value> = column_ids
+                                    .iter()
+                                    .map(|&col_id| {
+                                        old_r
+                                            .get(col_id as usize)
+                                            .cloned()
+                                            .unwrap_or(Value::Null(DataType::Null))
+                                    })
+                                    .collect();
+
+                                let new_values: Vec<Value> = column_ids
+                                    .iter()
+                                    .map(|&col_id| {
+                                        new_row
+                                            .get(col_id as usize)
+                                            .cloned()
+                                            .unwrap_or(Value::Null(DataType::Null))
+                                    })
+                                    .collect();
+
+                                let _ = index.remove(&old_values, row_id, row_id);
+                                index.add(&new_values, row_id, row_id)?;
+                                continue;
+                            }
+                        }
+
+                        // INSERT or DELETE case: collect values (allocation needed)
                         let new_values: Vec<Value> = column_ids
                             .iter()
                             .map(|&col_id| {
@@ -991,38 +1036,25 @@ impl MVCCTable {
                             })
                             .collect();
 
-                        let old_values: Option<Vec<Value>> = old_row.map(|r| {
-                            column_ids
-                                .iter()
-                                .map(|&col_id| {
-                                    r.get(col_id as usize)
-                                        .cloned()
-                                        .unwrap_or(Value::Null(DataType::Null))
-                                })
-                                .collect()
-                        });
-
                         if is_deleted {
-                            // Remove from index for deleted rows (use old values if available)
-                            let vals_to_remove = old_values.as_ref().unwrap_or(&new_values);
-                            let _ = index.remove(vals_to_remove, row_id, row_id);
-                        } else {
-                            // Always add rows to index, including all-NULL rows
-                            // (for lookups and unique constraint enforcement)
-                            match &old_values {
-                                None => {
-                                    // INSERT: just add new values
-                                    index.add(&new_values, row_id, row_id)?;
-                                }
-                                Some(old_vals) if old_vals != &new_values => {
-                                    // UPDATE with changed value: remove old, add new
-                                    let _ = index.remove(old_vals, row_id, row_id);
-                                    index.add(&new_values, row_id, row_id)?;
-                                }
-                                Some(_) => {
-                                    // UPDATE with same values: no index change needed
-                                }
+                            // DELETE: remove from index using old values if available
+                            if let Some(old_r) = old_row {
+                                let old_values: Vec<Value> = column_ids
+                                    .iter()
+                                    .map(|&col_id| {
+                                        old_r
+                                            .get(col_id as usize)
+                                            .cloned()
+                                            .unwrap_or(Value::Null(DataType::Null))
+                                    })
+                                    .collect();
+                                let _ = index.remove(&old_values, row_id, row_id);
+                            } else {
+                                let _ = index.remove(&new_values, row_id, row_id);
                             }
+                        } else {
+                            // INSERT: just add new values
+                            index.add(&new_values, row_id, row_id)?;
                         }
                     }
                 }

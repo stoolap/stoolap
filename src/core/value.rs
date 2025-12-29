@@ -82,17 +82,22 @@ pub enum Value {
     Json(Arc<str>),
 }
 
+/// Static NULL value for zero-cost reuse
+pub const NULL_VALUE: Value = Value::Null(DataType::Null);
+
 impl Value {
     // =========================================================================
     // Constructors
     // =========================================================================
 
     /// Create a NULL value with a type hint
+    #[inline]
     pub fn null(data_type: DataType) -> Self {
         Value::Null(data_type)
     }
 
     /// Create a NULL value with unknown type
+    #[inline(always)]
     pub fn null_unknown() -> Self {
         Value::Null(DataType::Null)
     }
