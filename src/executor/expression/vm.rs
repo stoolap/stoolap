@@ -2091,7 +2091,7 @@ impl ExprVM {
                 Op::NullIf => {
                     let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = if &*a == &*b {
+                    let result = if *a == *b {
                         Cow::Borrowed(&NULL_VALUE)
                     } else {
                         a

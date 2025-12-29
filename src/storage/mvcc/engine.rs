@@ -50,7 +50,8 @@ use crate::storage::mvcc::{
 use crate::storage::traits::{Engine, Index, Table, Transaction};
 
 /// Type alias for the transaction version store map
-type TxnVersionStoreMap = FxHashMap<(i64, String), Arc<RwLock<TransactionVersionStore>>>;
+/// Structured as txn_id -> (table_name -> store) for O(1) lookup per transaction
+type TxnVersionStoreMap = FxHashMap<i64, FxHashMap<String, Arc<RwLock<TransactionVersionStore>>>>;
 
 // ============================================================================
 // Binary Snapshot Metadata Functions
@@ -2598,11 +2599,25 @@ impl TransactionEngineOperations for EngineOperations {
         drop(stores);
 
         // Check if we have a cached transaction version store for this (txn_id, table_name)
-        let cache_key = (txn_id, table_name_lower.clone());
         let txn_versions = {
             let cache = self.txn_version_stores().read().unwrap();
-            if let Some(cached) = cache.get(&cache_key) {
-                Arc::clone(cached)
+            if let Some(txn_tables) = cache.get(&txn_id) {
+                if let Some(cached) = txn_tables.get(&table_name_lower) {
+                    Arc::clone(cached)
+                } else {
+                    drop(cache);
+                    // Create new transaction version store and cache it
+                    let new_store = Arc::new(RwLock::new(TransactionVersionStore::new(
+                        Arc::clone(&version_store),
+                        txn_id,
+                    )));
+                    let mut cache = self.txn_version_stores().write().unwrap();
+                    cache
+                        .entry(txn_id)
+                        .or_default()
+                        .insert(table_name_lower, Arc::clone(&new_store));
+                    new_store
+                }
             } else {
                 drop(cache);
                 // Create new transaction version store and cache it
@@ -2611,7 +2626,10 @@ impl TransactionEngineOperations for EngineOperations {
                     txn_id,
                 )));
                 let mut cache = self.txn_version_stores().write().unwrap();
-                cache.insert(cache_key, Arc::clone(&new_store));
+                cache
+                    .entry(txn_id)
+                    .or_default()
+                    .insert(table_name_lower, Arc::clone(&new_store));
                 new_store
             }
         };
@@ -2807,11 +2825,11 @@ impl TransactionEngineOperations for EngineOperations {
     fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn Table>>> {
         let mut tables = Vec::new();
 
-        // Iterate over all cached transaction version stores for this txn_id
+        // O(1) lookup for this transaction's tables
         let cache = self.txn_version_stores().read().unwrap();
 
-        for ((cached_txn_id, table_name), txn_store) in cache.iter() {
-            if *cached_txn_id == txn_id {
+        if let Some(txn_tables) = cache.get(&txn_id) {
+            for (table_name, txn_store) in txn_tables.iter() {
                 // Check if this store has pending changes
                 let store = txn_store.read().unwrap();
                 if store.has_local_changes() {
@@ -2839,12 +2857,11 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn commit_all_tables(&self, txn_id: i64) -> Result<()> {
-        // Iterate over all cached transaction version stores for this txn_id
-        // and use MvccTable::commit() which properly updates indexes
+        // O(1) lookup for this transaction's tables
         let cache = self.txn_version_stores().read().unwrap();
 
-        for ((cached_txn_id, table_name), txn_store) in cache.iter() {
-            if *cached_txn_id == txn_id {
+        if let Some(txn_tables) = cache.get(&txn_id) {
+            for (table_name, txn_store) in txn_tables.iter() {
                 // Check if there are local changes before committing
                 let has_changes = {
                     let store = txn_store.read().unwrap();
@@ -2869,10 +2886,10 @@ impl TransactionEngineOperations for EngineOperations {
             }
         }
 
-        // Clean up the transaction version store cache for this transaction
+        // O(1) cleanup - remove entire transaction entry
         drop(cache);
         let mut cache = self.txn_version_stores().write().unwrap();
-        cache.retain(|(cached_txn_id, _), _| *cached_txn_id != txn_id);
+        cache.remove(&txn_id);
 
         Ok(())
     }

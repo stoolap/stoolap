@@ -21,7 +21,10 @@ use std::time::Instant;
 use stoolap::Database;
 
 const ROW_COUNT: usize = 10_000;
-const ITERATIONS: usize = 100;
+const ITERATIONS: usize = 500; // Point queries
+const ITERATIONS_MEDIUM: usize = 250; // Index scans, aggregations
+const ITERATIONS_HEAVY: usize = 50; // Full scans, JOINs
+const WARMUP: usize = 10;
 
 fn main() {
     println!("Starting Stoolap-Rust benchmark...");
@@ -79,28 +82,36 @@ fn main() {
 
     println!("Benchmarking Stoolap-Rust...\n");
     println!("============================================================");
-    println!("STOOLAP-RUST BENCHMARK (10,000 rows, 100 iterations, in-memory)");
+    println!(
+        "STOOLAP-RUST BENCHMARK ({} rows, {} iterations, in-memory)",
+        ROW_COUNT, ITERATIONS
+    );
     println!("============================================================\n");
     println!(
-        "{:<25} | {:>12} | {:>12}",
+        "{:<25} | {:>15} | {:>12}",
         "Operation", "Avg (μs)", "ops/sec"
     );
-    println!("------------------------------------------------------------");
+    println!("---------------------------------------------------------------");
 
     // SELECT by ID (prepared statement)
     let select_by_id = db.prepare("SELECT * FROM users WHERE id = $1").unwrap();
     let ids: Vec<i64> = (0..ITERATIONS)
         .map(|i| ((i % ROW_COUNT) + 1) as i64)
         .collect();
+    // Warmup
+    for &id in ids.iter().take(WARMUP) {
+        let rows = select_by_id.query((id,)).unwrap();
+        let _ = rows.into_iter().next();
+    }
     let start = Instant::now();
     for &id in &ids {
         let rows = select_by_id.query((id,)).unwrap();
         let _ = rows.into_iter().next();
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "SELECT by ID",
         avg_us,
         1_000_000.0 / avg_us
@@ -109,15 +120,20 @@ fn main() {
     // SELECT by index (exact match on age)
     let select_by_index = db.prepare("SELECT * FROM users WHERE age = $1").unwrap();
     let ages: Vec<i64> = (0..ITERATIONS).map(|i| ((i % 62) + 18) as i64).collect();
+    // Warmup
+    for &age in ages.iter().take(WARMUP) {
+        let rows = select_by_index.query((age,)).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
     for &age in &ages {
         let rows = select_by_index.query((age,)).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "SELECT by index (exact)",
         avg_us,
         1_000_000.0 / avg_us
@@ -127,15 +143,20 @@ fn main() {
     let select_by_index_range = db
         .prepare("SELECT * FROM users WHERE age >= $1 AND age <= $2")
         .unwrap();
+    // Warmup
+    for _ in 0..WARMUP {
+        let rows = select_by_index_range.query((30_i64, 40_i64)).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         let rows = select_by_index_range.query((30_i64, 40_i64)).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "SELECT by index (range)",
         avg_us,
         1_000_000.0 / avg_us
@@ -145,15 +166,20 @@ fn main() {
     let select_complex = db
         .prepare("SELECT id, name, balance FROM users WHERE age >= 25 AND age <= 45 AND active = true ORDER BY balance DESC LIMIT 100")
         .unwrap();
+    // Warmup
+    for _ in 0..WARMUP {
+        let rows = select_complex.query(()).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         let rows = select_complex.query(()).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "SELECT complex",
         avg_us,
         1_000_000.0 / avg_us
@@ -161,15 +187,20 @@ fn main() {
 
     // SELECT * (full scan) (prepared statement)
     let select_all = db.prepare("SELECT * FROM users").unwrap();
+    // Warmup
+    for _ in 0..10 {
+        let rows = select_all.query(()).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
-    for _ in 0..ITERATIONS {
+    for _ in 0..ITERATIONS_HEAVY {
         let rows = select_all.query(()).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS_HEAVY as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "SELECT * (full scan)",
         avg_us,
         1_000_000.0 / avg_us
@@ -187,14 +218,18 @@ fn main() {
             )
         })
         .collect();
+    // Warmup
+    for &(balance, id) in update_params.iter().take(WARMUP) {
+        update_by_id.execute((balance, id)).unwrap();
+    }
     let start = Instant::now();
     for &(balance, id) in &update_params {
         update_by_id.execute((balance, id)).unwrap();
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "UPDATE by ID",
         avg_us,
         1_000_000.0 / avg_us
@@ -207,14 +242,18 @@ fn main() {
     let update_complex_balances: Vec<f64> = (0..ITERATIONS)
         .map(|_| rng.random_range(0.0..100000.0))
         .collect();
+    // Warmup
+    for &balance in update_complex_balances.iter().take(WARMUP) {
+        update_complex.execute((balance, 27_i64, 28_i64)).unwrap();
+    }
     let start = Instant::now();
     for &balance in &update_complex_balances {
         update_complex.execute((balance, 27_i64, 28_i64)).unwrap(); // Small range like DELETE
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "UPDATE complex",
         avg_us,
         1_000_000.0 / avg_us
@@ -250,9 +289,9 @@ fn main() {
             .unwrap();
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "INSERT single",
         avg_us,
         1_000_000.0 / avg_us
@@ -268,9 +307,9 @@ fn main() {
         delete_by_id.execute((id,)).unwrap();
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "DELETE by ID",
         avg_us,
         1_000_000.0 / avg_us
@@ -285,9 +324,9 @@ fn main() {
         delete_complex.execute((25_i64, 26_i64)).unwrap(); // Small range to not delete too many
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "DELETE complex",
         avg_us,
         1_000_000.0 / avg_us
@@ -297,15 +336,20 @@ fn main() {
     let agg_stmt = db
         .prepare("SELECT age, COUNT(*), AVG(balance) FROM users GROUP BY age")
         .unwrap();
+    // Warmup
+    for _ in 0..10 {
+        let rows = agg_stmt.query(()).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
-    for _ in 0..ITERATIONS {
+    for _ in 0..ITERATIONS_MEDIUM {
         let rows = agg_stmt.query(()).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS_MEDIUM as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Aggregation (GROUP BY)",
         avg_us,
         1_000_000.0 / avg_us
@@ -313,10 +357,10 @@ fn main() {
 
     println!("============================================================");
     println!(
-        "\n{:<25} | {:>12} | {:>12}",
+        "\n{:<25} | {:>15} | {:>12}",
         "Advanced Operations", "Avg (μs)", "ops/sec"
     );
-    println!("------------------------------------------------------------");
+    println!("---------------------------------------------------------------");
 
     // Create orders table for JOIN benchmarks
     db.execute(
@@ -361,9 +405,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "INNER JOIN",
         avg_us,
         1_000_000.0 / avg_us
@@ -379,9 +423,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "LEFT JOIN + GROUP BY",
         avg_us,
         1_000_000.0 / avg_us
@@ -397,9 +441,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Scalar subquery",
         avg_us,
         1_000_000.0 / avg_us
@@ -415,9 +459,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 10.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 10.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "IN subquery",
         avg_us,
         1_000_000.0 / avg_us
@@ -433,9 +477,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 10.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 10.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "EXISTS subquery",
         avg_us,
         1_000_000.0 / avg_us
@@ -451,9 +495,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "CTE + JOIN",
         avg_us,
         1_000_000.0 / avg_us
@@ -469,9 +513,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Window ROW_NUMBER",
         avg_us,
         1_000_000.0 / avg_us
@@ -487,9 +531,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Window ROW_NUMBER (PK)",
         avg_us,
         1_000_000.0 / avg_us
@@ -505,9 +549,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Window PARTITION BY",
         avg_us,
         1_000_000.0 / avg_us
@@ -523,9 +567,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "UNION ALL",
         avg_us,
         1_000_000.0 / avg_us
@@ -541,9 +585,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "CASE expression",
         avg_us,
         1_000_000.0 / avg_us
@@ -559,9 +603,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Complex JOIN+GROUP+HAVING",
         avg_us,
         1_000_000.0 / avg_us
@@ -582,9 +626,9 @@ fn main() {
         db.execute("COMMIT", ()).unwrap();
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Batch INSERT (100 rows)",
         avg_us,
         1_000_000.0 / avg_us
@@ -592,10 +636,10 @@ fn main() {
 
     println!("============================================================");
     println!(
-        "\n{:<25} | {:>12} | {:>12}",
+        "\n{:<25} | {:>15} | {:>12}",
         "Bottleneck Hunters", "Avg (μs)", "ops/sec"
     );
-    println!("------------------------------------------------------------");
+    println!("---------------------------------------------------------------");
 
     // DISTINCT without ORDER BY
     let distinct_stmt = db.prepare("SELECT DISTINCT age FROM users").unwrap();
@@ -605,9 +649,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "DISTINCT (no ORDER)",
         avg_us,
         1_000_000.0 / avg_us
@@ -623,9 +667,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "DISTINCT + ORDER BY",
         avg_us,
         1_000_000.0 / avg_us
@@ -639,9 +683,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "COUNT DISTINCT",
         avg_us,
         1_000_000.0 / avg_us
@@ -657,9 +701,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "LIKE prefix (User_1%)",
         avg_us,
         1_000_000.0 / avg_us
@@ -675,9 +719,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "LIKE contains (%50%)",
         avg_us,
         1_000_000.0 / avg_us
@@ -693,9 +737,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "OR conditions (3 vals)",
         avg_us,
         1_000_000.0 / avg_us
@@ -711,9 +755,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "IN list (7 values)",
         avg_us,
         1_000_000.0 / avg_us
@@ -729,9 +773,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 10.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 10.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "NOT IN subquery",
         avg_us,
         1_000_000.0 / avg_us
@@ -747,9 +791,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 10.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 10.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "NOT EXISTS subquery",
         avg_us,
         1_000_000.0 / avg_us
@@ -765,9 +809,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "OFFSET pagination (5000)",
         avg_us,
         1_000_000.0 / avg_us
@@ -783,9 +827,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Multi-col ORDER BY (3)",
         avg_us,
         1_000_000.0 / avg_us
@@ -801,9 +845,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Self JOIN (same age)",
         avg_us,
         1_000_000.0 / avg_us
@@ -819,9 +863,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Multi window funcs (3)",
         avg_us,
         1_000_000.0 / avg_us
@@ -837,9 +881,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Nested subquery (3 lvl)",
         avg_us,
         1_000_000.0 / avg_us
@@ -855,9 +899,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Multi aggregates (6)",
         avg_us,
         1_000_000.0 / avg_us
@@ -873,9 +917,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "COALESCE + IS NOT NULL",
         avg_us,
         1_000_000.0 / avg_us
@@ -893,9 +937,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Expr in WHERE (funcs)",
         avg_us,
         1_000_000.0 / avg_us
@@ -911,9 +955,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Math expressions",
         avg_us,
         1_000_000.0 / avg_us
@@ -929,9 +973,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "String concat (||)",
         avg_us,
         1_000_000.0 / avg_us
@@ -947,9 +991,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Large result (no LIMIT)",
         avg_us,
         1_000_000.0 / avg_us
@@ -965,9 +1009,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Multiple CTEs (2)",
         avg_us,
         1_000_000.0 / avg_us
@@ -977,15 +1021,20 @@ fn main() {
     let corr_select_stmt = db
         .prepare("SELECT u.name, (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) as order_count FROM users u LIMIT 100")
         .unwrap();
+    // Warm up
+    for _ in 0..5 {
+        let rows = corr_select_stmt.query(()).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
-    for _ in 0..10 {
+    for _ in 0..100 {
         let rows = corr_select_stmt.query(()).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / 10.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 100.0;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Correlated in SELECT",
         avg_us,
         1_000_000.0 / avg_us
@@ -1001,9 +1050,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "BETWEEN (non-indexed)",
         avg_us,
         1_000_000.0 / avg_us
@@ -1019,9 +1068,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "GROUP BY (2 columns)",
         avg_us,
         1_000_000.0 / avg_us
@@ -1037,9 +1086,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "CROSS JOIN (limited)",
         avg_us,
         1_000_000.0 / avg_us
@@ -1055,9 +1104,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Derived table (FROM sub)",
         avg_us,
         1_000_000.0 / avg_us
@@ -1073,9 +1122,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Window ROWS frame",
         avg_us,
         1_000_000.0 / avg_us
@@ -1093,9 +1142,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "HAVING complex",
         avg_us,
         1_000_000.0 / avg_us
@@ -1113,9 +1162,9 @@ fn main() {
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_micros() as f64 / ITERATIONS as f64;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / ITERATIONS as f64;
     println!(
-        "{:<25} | {:>12.1} | {:>12.0}",
+        "{:<25} | {:>15.3} | {:>12.0}",
         "Compare with subquery",
         avg_us,
         1_000_000.0 / avg_us

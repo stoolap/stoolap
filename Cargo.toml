@@ -38,9 +38,6 @@ dashmap = "6"
 crossbeam = "0.8"
 rayon = "1.8"
 
-# Async (for pg-server)
-tokio = { version = "1.35", features = ["full"], optional = true }
-
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -96,8 +93,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 [features]
 default = ["cli"]
 cli = ["clap", "rustyline", "comfy-table", "dirs"]
-pg-server = ["tokio"]
-simd = []  # Enable SIMD optimizations
 
 [profile.release]
 lto = true

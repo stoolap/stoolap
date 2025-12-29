@@ -765,6 +765,47 @@ impl MVCCTable {
         }
     }
 
+    /// Fast path for index-based row fetching when there are no local transaction changes.
+    /// Returns Some(rows) if we can serve from index, None if we should fall through to full path.
+    #[inline]
+    fn try_fetch_from_index(
+        &self,
+        row_ids: Vec<i64>,
+        expr: &dyn Expression,
+        schema: &Schema,
+        limit: usize,
+        offset: usize,
+    ) -> Option<Vec<Row>> {
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None; // Fall through to full path
+        }
+
+        // No local changes - fetch directly from version store by row IDs
+        let mut result = Vec::with_capacity(limit.min(row_ids.len()));
+        let mut skipped = 0usize;
+
+        for row_id in row_ids {
+            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                if !version.is_deleted() {
+                    // Re-apply filter (index may return superset for complex expressions)
+                    let row = self.normalize_row_to_schema(version.data.clone(), schema);
+                    if expr.evaluate_fast(&row) {
+                        if skipped < offset {
+                            skipped += 1;
+                        } else {
+                            result.push(row);
+                            if result.len() >= limit {
+                                return Some(result);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(result)
+    }
+
     /// Validates and coerces a row against the schema
     /// Returns the coerced row if successful
     fn validate_and_coerce_row(&self, row: &mut Row) -> Result<()> {
@@ -1291,6 +1332,17 @@ impl MVCCTable {
                     _ => Vec::new(),
                 };
             }
+
+            // OPTIMIZATION: Try secondary index lookup for OR/AND expressions on indexed columns
+            // This handles queries like: WHERE age = 25 OR age = 50 OR age = 75
+            if let Some(row_ids) = self.try_index_lookup(expr, schema) {
+                if let Some(result) =
+                    self.try_fetch_from_index(row_ids, expr, schema, limit, offset)
+                {
+                    return result;
+                }
+                // Has local changes - fall through to full path
+            }
         }
 
         let txn_versions = self.txn_versions.read().unwrap();
@@ -1415,6 +1467,17 @@ impl MVCCTable {
                     }
                     _ => Vec::new(),
                 };
+            }
+
+            // OPTIMIZATION: Try secondary index lookup for OR/AND expressions on indexed columns
+            // This handles queries like: WHERE age = 25 OR age = 50 OR age = 75
+            if let Some(row_ids) = self.try_index_lookup(expr, schema) {
+                if let Some(result) =
+                    self.try_fetch_from_index(row_ids, expr, schema, limit, offset)
+                {
+                    return result;
+                }
+                // Has local changes - fall through to full path
             }
         }
 

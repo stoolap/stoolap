@@ -6,7 +6,8 @@
   <p>
     <a href="https://stoolap.io">Website</a> •
     <a href="https://stoolap.io/docs">Docs</a> •
-    <a href="https://github.com/stoolap/stoolap/releases">Releases</a>
+    <a href="https://github.com/stoolap/stoolap/releases">Releases</a> •
+    <a href="BENCHMARKS.md">Benchmarks</a>
   </p>
 
   <p>
@@ -304,6 +305,10 @@ cargo test               # Run tests
 cargo clippy             # Lint
 cargo doc --open         # Generate documentation
 ```
+
+## Performance
+
+See [BENCHMARKS.md](BENCHMARKS.md) for detailed performance comparisons with SQLite.
 
 ## Contributing
 
