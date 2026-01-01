@@ -42,16 +42,34 @@ use super::file_lock::FileLock;
 use crate::core::{DataType, Error, IsolationLevel, Result, Schema};
 use crate::storage::config::Config;
 use crate::storage::mvcc::wal_manager::WALOperationType;
+#[cfg(test)]
+use crate::storage::mvcc::VisibilityChecker;
 use crate::storage::mvcc::{
     MVCCTable, MvccTransaction, PersistenceManager, RowVersion, TransactionEngineOperations,
-    TransactionRegistry, TransactionVersionStore, VersionStore, VisibilityChecker,
-    INVALID_TRANSACTION_ID,
+    TransactionRegistry, TransactionVersionStore, VersionStore, INVALID_TRANSACTION_ID,
 };
 use crate::storage::traits::{Engine, Index, Table, Transaction};
 
 /// Type alias for the transaction version store map
 /// Structured as txn_id -> (table_name -> store) for O(1) lookup per transaction
 type TxnVersionStoreMap = FxHashMap<i64, FxHashMap<String, Arc<RwLock<TransactionVersionStore>>>>;
+
+/// Helper to get registry as the visibility checker type expected by VersionStore.
+/// In production: returns concrete Arc<TransactionRegistry> (zero-cost, inlined).
+/// In tests: returns Arc<dyn VisibilityChecker> for TestVisibilityChecker flexibility.
+#[cfg(not(test))]
+#[inline]
+fn registry_as_visibility_checker(registry: &Arc<TransactionRegistry>) -> Arc<TransactionRegistry> {
+    Arc::clone(registry)
+}
+
+#[cfg(test)]
+#[inline]
+fn registry_as_visibility_checker(
+    registry: &Arc<TransactionRegistry>,
+) -> Arc<dyn VisibilityChecker> {
+    Arc::clone(registry) as Arc<dyn VisibilityChecker>
+}
 
 // ============================================================================
 // Binary Snapshot Metadata Functions
@@ -478,7 +496,7 @@ impl MVCCEngine {
         let version_store = Arc::new(VersionStore::with_visibility_checker(
             schema.table_name.clone(),
             schema.clone(),
-            Arc::clone(&self.registry) as Arc<dyn VisibilityChecker>,
+            registry_as_visibility_checker(&self.registry),
         ));
 
         // Load all rows from the snapshot
@@ -561,7 +579,7 @@ impl MVCCEngine {
                     let version_store = Arc::new(VersionStore::with_visibility_checker(
                         schema.table_name.clone(),
                         schema.clone(),
-                        Arc::clone(&self.registry) as Arc<dyn VisibilityChecker>,
+                        registry_as_visibility_checker(&self.registry),
                     ));
 
                     let table_name = schema.table_name_lower.clone();
@@ -1186,7 +1204,7 @@ impl MVCCEngine {
         let version_store = Arc::new(VersionStore::with_visibility_checker(
             schema.table_name.clone(),
             schema.clone(),
-            Arc::clone(&self.registry) as Arc<dyn VisibilityChecker>,
+            registry_as_visibility_checker(&self.registry),
         ));
 
         // Record DDL operation in WAL (before inserting into map)
@@ -2588,12 +2606,13 @@ impl EngineOperations {
 
 impl TransactionEngineOperations for EngineOperations {
     fn get_table_for_transaction(&self, txn_id: i64, table_name: &str) -> Result<Box<dyn Table>> {
-        let table_name_lower = table_name.to_lowercase();
+        // Use Cow to avoid allocation when table_name is already lowercase (common case)
+        let table_name_lower = to_lowercase_cow(table_name);
 
         // Get version store
         let stores = self.version_stores().read().unwrap();
         let version_store = stores
-            .get(&table_name_lower)
+            .get(&*table_name_lower)
             .cloned()
             .ok_or(Error::TableNotFound)?;
         drop(stores);
@@ -2602,7 +2621,7 @@ impl TransactionEngineOperations for EngineOperations {
         let txn_versions = {
             let cache = self.txn_version_stores().read().unwrap();
             if let Some(txn_tables) = cache.get(&txn_id) {
-                if let Some(cached) = txn_tables.get(&table_name_lower) {
+                if let Some(cached) = txn_tables.get(&*table_name_lower) {
                     Arc::clone(cached)
                 } else {
                     drop(cache);
@@ -2615,7 +2634,7 @@ impl TransactionEngineOperations for EngineOperations {
                     cache
                         .entry(txn_id)
                         .or_default()
-                        .insert(table_name_lower, Arc::clone(&new_store));
+                        .insert(table_name_lower.into_owned(), Arc::clone(&new_store));
                     new_store
                 }
             } else {
@@ -2629,7 +2648,7 @@ impl TransactionEngineOperations for EngineOperations {
                 cache
                     .entry(txn_id)
                     .or_default()
-                    .insert(table_name_lower, Arc::clone(&new_store));
+                    .insert(table_name_lower.into_owned(), Arc::clone(&new_store));
                 new_store
             }
         };
@@ -2655,7 +2674,7 @@ impl TransactionEngineOperations for EngineOperations {
         let version_store = Arc::new(VersionStore::with_visibility_checker(
             schema.table_name.clone(),
             schema.clone(),
-            Arc::clone(&self.registry) as Arc<dyn VisibilityChecker>,
+            registry_as_visibility_checker(&self.registry),
         ));
 
         // Store schema and version store

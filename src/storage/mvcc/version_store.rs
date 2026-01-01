@@ -33,13 +33,14 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::common::{
-    new_btree_int64_map, new_concurrent_int64_map, new_int64_map, new_int64_map_with_capacity,
-    BTreeInt64Map, ConcurrentInt64Map, Int64Map,
+    new_btree_int64_map, new_int64_map, new_int64_map_with_capacity, BTreeInt64Map, Int64Map,
 };
 use crate::core::{Error, Row, Schema, Value};
 use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::RowArena;
 use crate::storage::mvcc::get_fast_timestamp;
+#[cfg(not(test))]
+use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::mvcc::streaming_result::{StreamingResult, VisibleRowInfo};
 use crate::storage::Index;
 // radsort removed - BTreeMap iteration is already ordered
@@ -272,8 +273,13 @@ pub struct VersionStore {
     /// Auto-increment counter for tables without explicit PK
     auto_increment_counter: AtomicI64,
     /// Track which transaction has uncommitted changes to each row
-    uncommitted_writes: ConcurrentInt64Map<i64>,
+    uncommitted_writes: RwLock<Int64Map<i64>>,
     /// Visibility checker (registry reference)
+    /// Production: concrete type for zero-cost inlining in hot paths
+    /// Test: dyn trait for TestVisibilityChecker flexibility
+    #[cfg(not(test))]
+    visibility_checker: Option<Arc<TransactionRegistry>>,
+    #[cfg(test)]
     visibility_checker: Option<Arc<dyn VisibilityChecker>>,
     /// Arena-based storage for zero-copy full table scans
     arena: RowArena,
@@ -298,10 +304,11 @@ impl VersionStore {
     ///
     /// Pre-allocating capacity avoids hash map resizing during bulk inserts.
     /// Use this when the expected row count is known (e.g., during recovery).
+    #[cfg(not(test))]
     pub fn with_capacity(
         table_name: String,
         schema: Schema,
-        checker: Option<Arc<dyn VisibilityChecker>>,
+        checker: Option<Arc<TransactionRegistry>>,
         expected_rows: usize,
     ) -> Self {
         // BTreeMap doesn't support capacity hints, but row_arena_index (HashMap) does
@@ -319,12 +326,43 @@ impl VersionStore {
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
-            uncommitted_writes: new_concurrent_int64_map(),
+            uncommitted_writes: RwLock::new(new_int64_map()),
             visibility_checker: checker,
             arena: RowArena::new(),
             row_arena_index,
             zone_maps: RwLock::new(None),
             max_version_history: 10, // Default: keep up to 10 previous versions
+        }
+    }
+
+    /// Creates a new version store with pre-allocated capacity (test version)
+    #[cfg(test)]
+    pub fn with_capacity(
+        table_name: String,
+        schema: Schema,
+        checker: Option<Arc<dyn VisibilityChecker>>,
+        expected_rows: usize,
+    ) -> Self {
+        let row_arena_index = if expected_rows > 0 {
+            RwLock::new(new_int64_map_with_capacity(expected_rows))
+        } else {
+            RwLock::new(new_int64_map())
+        };
+        let versions = new_btree_int64_map();
+
+        Self {
+            versions,
+            table_name,
+            schema: RwLock::new(Arc::new(schema)),
+            indexes: RwLock::new(FxHashMap::default()),
+            closed: AtomicBool::new(false),
+            auto_increment_counter: AtomicI64::new(0),
+            uncommitted_writes: RwLock::new(new_int64_map()),
+            visibility_checker: checker,
+            arena: RowArena::new(),
+            row_arena_index,
+            zone_maps: RwLock::new(None),
+            max_version_history: 10,
         }
     }
 
@@ -344,7 +382,18 @@ impl VersionStore {
         self.max_version_history
     }
 
-    /// Creates a new version store with a visibility checker
+    /// Creates a new version store with a visibility checker (production)
+    #[cfg(not(test))]
+    pub fn with_visibility_checker(
+        table_name: String,
+        schema: Schema,
+        checker: Arc<TransactionRegistry>,
+    ) -> Self {
+        Self::with_capacity(table_name, schema, Some(checker), 0)
+    }
+
+    /// Creates a new version store with a visibility checker (test)
+    #[cfg(test)]
     pub fn with_visibility_checker(
         table_name: String,
         schema: Schema,
@@ -353,7 +402,14 @@ impl VersionStore {
         Self::with_capacity(table_name, schema, Some(checker), 0)
     }
 
-    /// Sets the visibility checker
+    /// Sets the visibility checker (production)
+    #[cfg(not(test))]
+    pub fn set_visibility_checker(&mut self, checker: Arc<TransactionRegistry>) {
+        self.visibility_checker = Some(checker);
+    }
+
+    /// Sets the visibility checker (test)
+    #[cfg(test)]
     pub fn set_visibility_checker(&mut self, checker: Arc<dyn VisibilityChecker>) {
         self.visibility_checker = Some(checker);
     }
@@ -2285,7 +2341,7 @@ impl VersionStore {
 
         // FAST PATH: If uncommitted_writes is empty, scan arena directly
         if let Some(checker) = checker {
-            let uncommitted_empty = self.uncommitted_writes.is_empty();
+            let uncommitted_empty = self.uncommitted_writes.read().is_empty();
 
             if uncommitted_empty && arena_len > 0 {
                 let mut indices: Vec<RowIndex> = Vec::with_capacity(arena_len);
@@ -2901,7 +2957,7 @@ impl VersionStore {
         // Check if we can use the fast path by scanning arena directly
         if let Some(checker) = checker {
             // Check if uncommitted_writes is empty (no dirty reads to worry about)
-            let uncommitted_empty = self.uncommitted_writes.is_empty();
+            let uncommitted_empty = self.uncommitted_writes.read().is_empty();
 
             if uncommitted_empty && arena_len > 0 {
                 // Fast path: scan arena directly, skip DashMap iteration
@@ -2967,10 +3023,10 @@ impl VersionStore {
     }
     /// Tries to claim a row for update (dirty write prevention)
     pub fn try_claim_row(&self, row_id: i64, txn_id: i64) -> Result<(), Error> {
-        // Use DashMap's entry API for atomic check-and-insert
-        use dashmap::mapref::entry::Entry;
+        use std::collections::hash_map::Entry;
 
-        match self.uncommitted_writes.entry(row_id) {
+        let mut map = self.uncommitted_writes.write();
+        match map.entry(row_id) {
             Entry::Occupied(e) => {
                 let existing_txn = *e.get();
                 if existing_txn != txn_id {
@@ -2991,18 +3047,25 @@ impl VersionStore {
 
     /// Releases a row claim
     pub fn release_row_claim(&self, row_id: i64, txn_id: i64) {
-        // Use remove_if for atomic check-and-remove
-        self.uncommitted_writes
-            .remove_if(&row_id, |_, &v| v == txn_id);
+        let mut map = self.uncommitted_writes.write();
+        if let Some(&v) = map.get(&row_id) {
+            if v == txn_id {
+                map.remove(&row_id);
+            }
+        }
     }
 
     /// Releases multiple row claims in batch
-    /// OPTIMIZATION: Avoids repeated function call overhead
+    /// OPTIMIZATION: Single lock acquisition for all removals
     #[inline]
     pub fn release_row_claims_batch(&self, row_ids: &[i64], txn_id: i64) {
+        let mut map = self.uncommitted_writes.write();
         for &row_id in row_ids {
-            self.uncommitted_writes
-                .remove_if(&row_id, |_, &v| v == txn_id);
+            if let Some(&v) = map.get(&row_id) {
+                if v == txn_id {
+                    map.remove(&row_id);
+                }
+            }
         }
     }
 
@@ -3864,13 +3927,15 @@ impl fmt::Debug for VersionStore {
 pub struct TransactionVersionStore {
     /// Local versions for this transaction - stores version history per row for savepoint support
     /// The Vec is ordered by create_time (oldest first, newest last)
-    local_versions: Int64Map<Vec<RowVersion>>,
+    /// Lazily allocated on first write to avoid allocation overhead for read-only queries
+    local_versions: Option<Int64Map<Vec<RowVersion>>>,
     /// Parent (shared) version store
     parent_store: Arc<VersionStore>,
     /// This transaction's ID
     txn_id: i64,
     /// Write set for conflict detection
-    write_set: Int64Map<WriteSetEntry>,
+    /// Lazily allocated on first write to avoid allocation overhead for read-only queries
+    write_set: Option<Int64Map<WriteSetEntry>>,
 }
 
 /// Default capacity for transaction-local maps.
@@ -3880,19 +3945,37 @@ const TX_VERSION_MAP_INITIAL_CAPACITY: usize = 16;
 
 impl TransactionVersionStore {
     /// Creates a new transaction-local version store
+    ///
+    /// Uses lazy allocation for local_versions and write_set maps to avoid
+    /// allocation overhead for read-only queries. These are only allocated
+    /// when the first write operation occurs.
     pub fn new(parent_store: Arc<VersionStore>, txn_id: i64) -> Self {
         Self {
-            // Pre-size maps to avoid rehashing for typical DML operations
-            local_versions: new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY),
+            // Lazy allocation - maps are created on first write
+            local_versions: None,
             parent_store,
             txn_id,
-            write_set: new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY),
+            write_set: None,
         }
     }
 
     /// Returns the transaction ID
     pub fn txn_id(&self) -> i64 {
         self.txn_id
+    }
+
+    /// Ensures local_versions map is allocated, returning a mutable reference
+    #[inline]
+    fn ensure_local_versions(&mut self) -> &mut Int64Map<Vec<RowVersion>> {
+        self.local_versions
+            .get_or_insert_with(|| new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY))
+    }
+
+    /// Ensures write_set map is allocated, returning a mutable reference
+    #[inline]
+    fn ensure_write_set(&mut self) -> &mut Int64Map<WriteSetEntry> {
+        self.write_set
+            .get_or_insert_with(|| new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY))
     }
 
     /// Put adds or updates a row in the transaction's local store
@@ -3903,39 +3986,50 @@ impl TransactionVersionStore {
             rv.deleted_at_txn_id = self.txn_id;
         }
 
-        // Use entry API to avoid double lookup on local_versions
-        match self.local_versions.entry(row_id) {
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                // Already have local version - just append
-                e.get_mut().push(rv);
-            }
-            std::collections::hash_map::Entry::Vacant(e) => {
-                // New row - need to check write-set and parent store
-                if let std::collections::hash_map::Entry::Vacant(ws_entry) =
-                    self.write_set.entry(row_id)
-                {
-                    let read_version = self.parent_store.get_visible_version(row_id, self.txn_id);
-                    let row_exists = read_version.is_some();
+        // Check if we already have a local version for this row
+        let has_local = self
+            .local_versions
+            .as_ref()
+            .is_some_and(|lv| lv.contains_key(&row_id));
 
-                    let read_version_seq = self
-                        .parent_store
-                        .visibility_checker
-                        .as_ref()
-                        .map(|c| c.get_current_sequence())
-                        .unwrap_or(0);
+        if has_local {
+            // Already have local version - just append
+            self.ensure_local_versions()
+                .get_mut(&row_id)
+                .unwrap()
+                .push(rv);
+        } else {
+            // New row - need to check write-set and parent store
+            let needs_write_set_entry = self
+                .write_set
+                .as_ref()
+                .is_none_or(|ws| !ws.contains_key(&row_id));
 
-                    ws_entry.insert(WriteSetEntry {
+            if needs_write_set_entry {
+                let read_version = self.parent_store.get_visible_version(row_id, self.txn_id);
+                let row_exists = read_version.is_some();
+
+                let read_version_seq = self
+                    .parent_store
+                    .visibility_checker
+                    .as_ref()
+                    .map(|c| c.get_current_sequence())
+                    .unwrap_or(0);
+
+                self.ensure_write_set().insert(
+                    row_id,
+                    WriteSetEntry {
                         read_version,
                         read_version_seq,
-                    });
+                    },
+                );
 
-                    // For existing rows, try to claim them
-                    if row_exists {
-                        self.parent_store.try_claim_row(row_id, self.txn_id)?;
-                    }
+                // For existing rows, try to claim them
+                if row_exists {
+                    self.parent_store.try_claim_row(row_id, self.txn_id)?;
                 }
-                e.insert(vec![rv]);
             }
+            self.ensure_local_versions().insert(row_id, vec![rv]);
         }
         Ok(())
     }
@@ -3970,34 +4064,45 @@ impl TransactionVersionStore {
             rv.deleted_at_txn_id = self.txn_id;
         }
 
-        // Use entry API to avoid double lookup on local_versions
-        match self.local_versions.entry(row_id) {
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                // Already have local version - just append
-                e.get_mut().push(rv);
-            }
-            std::collections::hash_map::Entry::Vacant(e) => {
-                // Track in write-set using the pre-fetched original version
-                if let std::collections::hash_map::Entry::Vacant(ws_entry) =
-                    self.write_set.entry(row_id)
-                {
-                    let read_version_seq = self
-                        .parent_store
-                        .visibility_checker
-                        .as_ref()
-                        .map(|c| c.get_current_sequence())
-                        .unwrap_or(0);
+        // Check if we already have a local version for this row
+        let has_local = self
+            .local_versions
+            .as_ref()
+            .is_some_and(|lv| lv.contains_key(&row_id));
 
-                    ws_entry.insert(WriteSetEntry {
+        if has_local {
+            // Already have local version - just append
+            self.ensure_local_versions()
+                .get_mut(&row_id)
+                .unwrap()
+                .push(rv);
+        } else {
+            // Track in write-set using the pre-fetched original version
+            let needs_write_set_entry = self
+                .write_set
+                .as_ref()
+                .is_none_or(|ws| !ws.contains_key(&row_id));
+
+            if needs_write_set_entry {
+                let read_version_seq = self
+                    .parent_store
+                    .visibility_checker
+                    .as_ref()
+                    .map(|c| c.get_current_sequence())
+                    .unwrap_or(0);
+
+                self.ensure_write_set().insert(
+                    row_id,
+                    WriteSetEntry {
                         read_version: Some(original_version),
                         read_version_seq,
-                    });
+                    },
+                );
 
-                    // Claim the row for update
-                    self.parent_store.try_claim_row(row_id, self.txn_id)?;
-                }
-                e.insert(vec![rv]);
+                // Claim the row for update
+                self.parent_store.try_claim_row(row_id, self.txn_id)?;
             }
+            self.ensure_local_versions().insert(row_id, vec![rv]);
         }
         Ok(())
     }
@@ -4022,14 +4127,19 @@ impl TransactionVersionStore {
             rv.create_time = now;
 
             // Check if already in local versions (already processed in this transaction)
-            if let Some(versions) = self.local_versions.get_mut(&row_id) {
+            if let Some(versions) = self.ensure_local_versions().get_mut(&row_id) {
                 // Append new version to history
                 versions.push(rv);
                 continue;
             }
 
             // Track in write-set using the pre-fetched original version
-            if let std::collections::hash_map::Entry::Vacant(e) = self.write_set.entry(row_id) {
+            let needs_write_set_entry = self
+                .write_set
+                .as_ref()
+                .is_none_or(|ws| !ws.contains_key(&row_id));
+
+            if needs_write_set_entry {
                 // Get current sequence for conflict detection
                 // Note: We get a fresh sequence instead of relying on create_time because
                 // callers may use get_visible_version() which doesn't set create_time to the sequence
@@ -4039,17 +4149,20 @@ impl TransactionVersionStore {
                     .as_ref()
                     .map(|c| c.get_current_sequence())
                     .unwrap_or(0);
-                e.insert(WriteSetEntry {
-                    read_version: Some(original_version),
-                    read_version_seq,
-                });
+                self.ensure_write_set().insert(
+                    row_id,
+                    WriteSetEntry {
+                        read_version: Some(original_version),
+                        read_version_seq,
+                    },
+                );
 
                 // Claim the row for update
                 self.parent_store.try_claim_row(row_id, self.txn_id)?;
             }
 
             // Insert new version history for this row
-            self.local_versions.insert(row_id, vec![rv]);
+            self.ensure_local_versions().insert(row_id, vec![rv]);
         }
         Ok(())
     }
@@ -4064,9 +4177,19 @@ impl TransactionVersionStore {
     pub fn put_batch_deleted(&mut self, rows: Vec<(i64, Row)>) -> Result<(), Error> {
         for (row_id, data) in rows {
             // Check if we already have a local version
-            if !self.local_versions.contains_key(&row_id) {
+            let has_local = self
+                .local_versions
+                .as_ref()
+                .is_some_and(|lv| lv.contains_key(&row_id));
+
+            if !has_local {
                 // Check if this row exists in parent store and track in write-set
-                if !self.write_set.contains_key(&row_id) {
+                let needs_write_set_entry = self
+                    .write_set
+                    .as_ref()
+                    .is_none_or(|ws| !ws.contains_key(&row_id));
+
+                if needs_write_set_entry {
                     let read_version = self.parent_store.get_visible_version(row_id, self.txn_id);
                     let row_exists = read_version.is_some();
 
@@ -4077,7 +4200,7 @@ impl TransactionVersionStore {
                         .map(|c| c.get_current_sequence())
                         .unwrap_or(0);
 
-                    self.write_set.insert(
+                    self.ensure_write_set().insert(
                         row_id,
                         WriteSetEntry {
                             read_version,
@@ -4097,10 +4220,11 @@ impl TransactionVersionStore {
             rv.deleted_at_txn_id = self.txn_id;
 
             // Append to version history for this row
-            if let Some(versions) = self.local_versions.get_mut(&row_id) {
+            let local_versions = self.ensure_local_versions();
+            if let Some(versions) = local_versions.get_mut(&row_id) {
                 versions.push(rv);
             } else {
-                self.local_versions.insert(row_id, vec![rv]);
+                local_versions.insert(row_id, vec![rv]);
             }
         }
         Ok(())
@@ -4121,13 +4245,18 @@ impl TransactionVersionStore {
             rv.deleted_at_txn_id = self.txn_id;
 
             // Check if already in local versions (already processed in this transaction)
-            if let Some(versions) = self.local_versions.get_mut(&row_id) {
+            if let Some(versions) = self.ensure_local_versions().get_mut(&row_id) {
                 versions.push(rv);
                 continue;
             }
 
             // Track in write-set using the pre-fetched original version
-            if !self.write_set.contains_key(&row_id) {
+            let needs_write_set_entry = self
+                .write_set
+                .as_ref()
+                .is_none_or(|ws| !ws.contains_key(&row_id));
+
+            if needs_write_set_entry {
                 let read_version_seq = self
                     .parent_store
                     .visibility_checker
@@ -4135,7 +4264,7 @@ impl TransactionVersionStore {
                     .map(|c| c.get_current_sequence())
                     .unwrap_or(0);
 
-                self.write_set.insert(
+                self.ensure_write_set().insert(
                     row_id,
                     WriteSetEntry {
                         read_version: Some(original_version),
@@ -4148,38 +4277,44 @@ impl TransactionVersionStore {
             }
 
             // Insert deleted version for this row
-            self.local_versions.insert(row_id, vec![rv]);
+            self.ensure_local_versions().insert(row_id, vec![rv]);
         }
         Ok(())
     }
 
     /// Check if we have local changes for a row
     pub fn has_locally_seen(&self, row_id: i64) -> bool {
-        self.local_versions.contains_key(&row_id)
+        self.local_versions
+            .as_ref()
+            .is_some_and(|lv| lv.contains_key(&row_id))
     }
 
     /// Returns true if this transaction has any uncommitted local changes
     pub fn has_local_changes(&self) -> bool {
-        !self.local_versions.is_empty()
+        self.local_versions
+            .as_ref()
+            .is_some_and(|lv| !lv.is_empty())
     }
 
     /// Iterate over local versions (returns most recent version per row)
     pub fn iter_local(&self) -> impl Iterator<Item = (i64, &RowVersion)> {
         self.local_versions
             .iter()
+            .flat_map(|lv| lv.iter())
             .filter_map(|(k, versions)| versions.last().map(|v| (*k, v)))
     }
 
     /// Iterate over local versions with their original (old) versions for index updates
     /// Returns (row_id, new_version, old_row_option)
     pub fn iter_local_with_old(&self) -> impl Iterator<Item = (i64, &RowVersion, Option<&Row>)> {
+        let write_set_ref = self.write_set.as_ref();
         self.local_versions
             .iter()
+            .flat_map(|lv| lv.iter())
             .filter_map(move |(row_id, versions)| {
                 versions.last().map(|version| {
-                    let old_row = self
-                        .write_set
-                        .get(row_id)
+                    let old_row = write_set_ref
+                        .and_then(|ws| ws.get(row_id))
                         .and_then(|entry| entry.read_version.as_ref())
                         .filter(|v| !v.is_deleted())
                         .map(|v| &v.data);
@@ -4192,19 +4327,22 @@ impl TransactionVersionStore {
     /// Returns the most recent version in the transaction's history
     pub fn get_local_version(&self, row_id: i64) -> Option<&RowVersion> {
         self.local_versions
-            .get(&row_id)
+            .as_ref()
+            .and_then(|lv| lv.get(&row_id))
             .and_then(|versions| versions.last())
     }
 
     /// Get a row, checking local versions first then parent store
     pub fn get(&self, row_id: i64) -> Option<Row> {
         // Check local versions first (get most recent)
-        if let Some(versions) = self.local_versions.get(&row_id) {
-            if let Some(local_version) = versions.last() {
-                if local_version.is_deleted() {
-                    return None;
+        if let Some(lv) = self.local_versions.as_ref() {
+            if let Some(versions) = lv.get(&row_id) {
+                if let Some(local_version) = versions.last() {
+                    if local_version.is_deleted() {
+                        return None;
+                    }
+                    return Some(local_version.data.clone());
                 }
-                return Some(local_version.data.clone());
             }
         }
 
@@ -4222,9 +4360,13 @@ impl TransactionVersionStore {
     /// 1. New inserts (read_version is None) - check if row was inserted by another txn
     /// 2. Unclaimed rows (shouldn't happen with current code paths)
     pub fn detect_conflicts(&self) -> Result<(), Error> {
+        // Fast path: no write set means no writes, no conflicts possible
+        let Some(write_set) = self.write_set.as_ref() else {
+            return Ok(());
+        };
+
         // Collect row_ids for inserts (read_version is None) that need conflict checking
-        let insert_row_ids: Vec<i64> = self
-            .write_set
+        let insert_row_ids: Vec<i64> = write_set
             .iter()
             .filter_map(|(row_id, write_entry)| {
                 if write_entry.read_version.is_none() {
@@ -4257,8 +4399,12 @@ impl TransactionVersionStore {
 
     /// Prepare commit - returns list of versions to commit (most recent per row)
     pub fn prepare_commit(&self) -> Vec<(i64, RowVersion)> {
+        let Some(local_versions) = self.local_versions.as_ref() else {
+            return Vec::new();
+        };
+
         let mut versions = Vec::new();
-        for (row_id, version_history) in self.local_versions.iter() {
+        for (row_id, version_history) in local_versions.iter() {
             // Only commit the most recent version per row
             if let Some(version) = version_history.last() {
                 versions.push((*row_id, version.clone()));
@@ -4279,18 +4425,21 @@ impl TransactionVersionStore {
         // Batch apply all local versions to parent store (single lock acquisition)
         // Only commit the most recent version per row
         // Use drain() to take ownership instead of cloning
-        let batch: Vec<(i64, RowVersion)> = self
-            .local_versions
-            .drain()
-            .filter_map(|(row_id, mut versions)| versions.pop().map(|v| (row_id, v)))
-            .collect();
+        if let Some(local_versions) = self.local_versions.as_mut() {
+            let batch: Vec<(i64, RowVersion)> = local_versions
+                .drain()
+                .filter_map(|(row_id, mut versions)| versions.pop().map(|v| (row_id, v)))
+                .collect();
 
-        self.parent_store.add_versions_batch(batch);
+            self.parent_store.add_versions_batch(batch);
+        }
 
         // Release all claims - drain write_set to get row_ids and avoid double iteration
-        let row_ids: Vec<i64> = self.write_set.drain().map(|(row_id, _)| row_id).collect();
-        self.parent_store
-            .release_row_claims_batch(&row_ids, self.txn_id);
+        if let Some(write_set) = self.write_set.as_mut() {
+            let row_ids: Vec<i64> = write_set.drain().map(|(row_id, _)| row_id).collect();
+            self.parent_store
+                .release_row_claims_batch(&row_ids, self.txn_id);
+        }
 
         Ok(())
     }
@@ -4306,10 +4455,14 @@ impl TransactionVersionStore {
     /// For rows with version history, keeps versions at or before the timestamp.
     /// Row claims are released only if all versions for that row are discarded.
     pub fn rollback_to_timestamp(&mut self, timestamp: i64) {
+        let Some(local_versions) = self.local_versions.as_mut() else {
+            return;
+        };
+
         let mut rows_to_remove_completely: Vec<i64> = Vec::new();
 
         // For each row, remove versions with create_time > timestamp
-        for (row_id, versions) in self.local_versions.iter_mut() {
+        for (row_id, versions) in local_versions.iter_mut() {
             // Keep only versions at or before the timestamp
             versions.retain(|v| v.create_time <= timestamp);
 
@@ -4321,17 +4474,22 @@ impl TransactionVersionStore {
 
         // Remove rows with no remaining versions and release their claims
         for row_id in &rows_to_remove_completely {
-            self.local_versions.remove(row_id);
+            local_versions.remove(row_id);
             self.parent_store.release_row_claim(*row_id, self.txn_id);
-            self.write_set.remove(row_id);
+            if let Some(write_set) = self.write_set.as_mut() {
+                write_set.remove(row_id);
+            }
         }
     }
 
     /// Release all row claims held by this transaction
     fn release_all_claims(&self) {
+        let Some(write_set) = self.write_set.as_ref() else {
+            return;
+        };
         // OPTIMIZATION: Collect row_ids first, then batch release
         // Avoids holding write_set iterator while accessing parent_store
-        let row_ids: Vec<i64> = self.write_set.keys().copied().collect();
+        let row_ids: Vec<i64> = write_set.keys().copied().collect();
         self.parent_store
             .release_row_claims_batch(&row_ids, self.txn_id);
     }
@@ -4341,8 +4499,14 @@ impl fmt::Debug for TransactionVersionStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TransactionVersionStore")
             .field("txn_id", &self.txn_id)
-            .field("local_version_count", &self.local_versions.len())
-            .field("write_set_count", &self.write_set.len())
+            .field(
+                "local_version_count",
+                &self.local_versions.as_ref().map_or(0, |lv| lv.len()),
+            )
+            .field(
+                "write_set_count",
+                &self.write_set.as_ref().map_or(0, |ws| ws.len()),
+            )
             .finish()
     }
 }

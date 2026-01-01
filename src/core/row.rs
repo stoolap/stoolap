@@ -147,6 +147,40 @@ impl Row {
         }
     }
 
+    /// Combine two rows into this row buffer (for JOINs) - reuses allocation
+    /// OPTIMIZATION: Clears and refills existing buffer, avoiding allocation per join result
+    #[inline]
+    pub fn combine_into(&mut self, left: &Row, right: &Row) {
+        let vec = self.storage.make_mut();
+        vec.clear();
+        let total_len = left.len() + right.len();
+        vec.reserve(total_len.saturating_sub(vec.capacity()));
+        vec.extend(left.iter().cloned());
+        vec.extend(right.iter().cloned());
+    }
+
+    /// Combine rows: clone left values, move right values (for JOINs)
+    /// OPTIMIZATION: Moves right values instead of cloning them - saves ~50% of cloning cost
+    #[inline]
+    pub fn from_combined_clone_move(left: &Row, right: Row) -> Self {
+        let total_len = left.len() + right.len();
+        let mut values = Vec::with_capacity(total_len);
+        // Clone left values (borrowed)
+        values.extend(left.iter().cloned());
+        // Move right values (owned) - no cloning needed for Owned storage
+        match right.storage {
+            RowStorage::Owned(right_vec) => {
+                values.extend(right_vec);
+            }
+            RowStorage::Shared(arc) => {
+                values.extend(arc.iter().cloned());
+            }
+        }
+        Self {
+            storage: RowStorage::Owned(values),
+        }
+    }
+
     /// Create a row by combining two owned rows (for JOINs) - moves values without cloning
     /// OPTIMIZATION: Takes ownership and moves values instead of cloning
     #[inline]

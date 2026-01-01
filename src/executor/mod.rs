@@ -131,9 +131,10 @@ pub use operator::{
 };
 pub use operators::{
     BatchIndexNestedLoopJoinOperator, HashJoinOperator, IndexLookupStrategy,
-    IndexNestedLoopJoinOperator, JoinSide, JoinType, MergeJoinOperator, NestedLoopJoinOperator,
+    IndexNestedLoopJoinOperator, JoinProjection, JoinSide, JoinType, MergeJoinOperator,
+    NestedLoopJoinOperator,
 };
-pub use utils::extract_join_keys_and_residual;
+pub use utils::{compute_join_projection, extract_join_keys_and_residual, JoinProjectionIndices};
 
 /// Active transaction state for explicit transaction control (BEGIN/COMMIT/ROLLBACK)
 struct ActiveTransaction {

@@ -1208,36 +1208,55 @@ impl CompiledFilter {
     ///
     /// This is the zero-copy hot path for storage layer filtering.
     /// By operating directly on &[Value], we avoid cloning rows that don't match.
+    ///
+    /// # Schema Evolution Safety
+    ///
+    /// This function safely handles schema evolution (ALTER TABLE ADD COLUMN).
+    /// When a column index is out of bounds (column added after row was inserted),
+    /// the missing column is treated as NULL:
+    /// - IsNull → true (missing columns are null)
+    /// - IsNotNull → false
+    /// - All other comparisons → false (can't match a missing value)
     #[inline]
     pub fn matches_slice(&self, values: &[Value]) -> bool {
+        // Helper macro: get value or return false for missing columns
+        macro_rules! get_val {
+            ($col_idx:expr) => {
+                match values.get(*$col_idx) {
+                    Some(v) => v,
+                    None => return false, // Column added after row was inserted
+                }
+            };
+        }
+
         match self {
             // Integer comparisons
             CompiledFilter::IntegerEq { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i == *value)
+                matches!(get_val!(col_idx), Value::Integer(i) if *i == *value)
             }
             CompiledFilter::IntegerNe { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i != *value)
+                matches!(get_val!(col_idx), Value::Integer(i) if *i != *value)
             }
             CompiledFilter::IntegerGt { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i > *value)
+                matches!(get_val!(col_idx), Value::Integer(i) if *i > *value)
             }
             CompiledFilter::IntegerGte { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i >= *value)
+                matches!(get_val!(col_idx), Value::Integer(i) if *i >= *value)
             }
             CompiledFilter::IntegerLt { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i < *value)
+                matches!(get_val!(col_idx), Value::Integer(i) if *i < *value)
             }
             CompiledFilter::IntegerLte { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i <= *value)
+                matches!(get_val!(col_idx), Value::Integer(i) if *i <= *value)
             }
             CompiledFilter::IntegerBetween { col_idx, min, max } => {
-                matches!(values.get(*col_idx), Some(Value::Integer(i)) if *i >= *min && *i <= *max)
+                matches!(get_val!(col_idx), Value::Integer(i) if *i >= *min && *i <= *max)
             }
             CompiledFilter::IntegerIn {
                 col_idx,
                 values: set,
             } => {
-                if let Some(Value::Integer(i)) = values.get(*col_idx) {
+                if let Value::Integer(i) = get_val!(col_idx) {
                     set.contains(i)
                 } else {
                     false
@@ -1246,65 +1265,65 @@ impl CompiledFilter {
 
             // Float comparisons
             CompiledFilter::FloatEq { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f == *value)
+                matches!(get_val!(col_idx), Value::Float(f) if *f == *value)
             }
             CompiledFilter::FloatNe { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f != *value)
+                matches!(get_val!(col_idx), Value::Float(f) if *f != *value)
             }
             CompiledFilter::FloatGt { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f > *value)
+                matches!(get_val!(col_idx), Value::Float(f) if *f > *value)
             }
             CompiledFilter::FloatGte { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f >= *value)
+                matches!(get_val!(col_idx), Value::Float(f) if *f >= *value)
             }
             CompiledFilter::FloatLt { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f < *value)
+                matches!(get_val!(col_idx), Value::Float(f) if *f < *value)
             }
             CompiledFilter::FloatLte { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f <= *value)
+                matches!(get_val!(col_idx), Value::Float(f) if *f <= *value)
             }
             CompiledFilter::FloatBetween { col_idx, min, max } => {
-                matches!(values.get(*col_idx), Some(Value::Float(f)) if *f >= *min && *f <= *max)
+                matches!(get_val!(col_idx), Value::Float(f) if *f >= *min && *f <= *max)
             }
 
             // String comparisons
             CompiledFilter::StringEq { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     s.as_str() == value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::StringNe { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     s.as_str() != value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::StringGt { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     s.as_str() > value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::StringGte { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     s.as_str() >= value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::StringLt { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     s.as_str() < value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::StringLte { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     s.as_str() <= value.as_ref()
                 } else {
                     false
@@ -1314,7 +1333,7 @@ impl CompiledFilter {
                 col_idx,
                 values: set,
             } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     set.iter().any(|v| s.as_str() == v.as_ref())
                 } else {
                     false
@@ -1326,7 +1345,7 @@ impl CompiledFilter {
                 case_insensitive,
                 negated,
             } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     let matches = pattern.matches(s.as_str(), *case_insensitive);
                     if *negated {
                         !matches
@@ -1340,41 +1359,39 @@ impl CompiledFilter {
 
             // Boolean comparisons
             CompiledFilter::BooleanEq { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Boolean(b)) if *b == *value)
+                matches!(get_val!(col_idx), Value::Boolean(b) if *b == *value)
             }
             CompiledFilter::BooleanNe { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Boolean(b)) if *b != *value)
+                matches!(get_val!(col_idx), Value::Boolean(b) if *b != *value)
             }
 
             // Timestamp comparisons
             CompiledFilter::TimestampEq { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t == *value)
+                matches!(get_val!(col_idx), Value::Timestamp(t) if *t == *value)
             }
             CompiledFilter::TimestampNe { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t != *value)
+                matches!(get_val!(col_idx), Value::Timestamp(t) if *t != *value)
             }
             CompiledFilter::TimestampGt { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t > *value)
+                matches!(get_val!(col_idx), Value::Timestamp(t) if *t > *value)
             }
             CompiledFilter::TimestampGte { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t >= *value)
+                matches!(get_val!(col_idx), Value::Timestamp(t) if *t >= *value)
             }
             CompiledFilter::TimestampLt { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t < *value)
+                matches!(get_val!(col_idx), Value::Timestamp(t) if *t < *value)
             }
             CompiledFilter::TimestampLte { col_idx, value } => {
-                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t <= *value)
+                matches!(get_val!(col_idx), Value::Timestamp(t) if *t <= *value)
             }
             CompiledFilter::TimestampBetween { col_idx, min, max } => {
-                matches!(values.get(*col_idx), Some(Value::Timestamp(t)) if *t >= *min && *t <= *max)
+                matches!(get_val!(col_idx), Value::Timestamp(t) if *t >= *min && *t <= *max)
             }
 
-            // NULL checks
-            CompiledFilter::IsNull { col_idx } => {
-                values.get(*col_idx).map(|v| v.is_null()).unwrap_or(true)
-            }
+            // NULL checks - missing columns (schema evolution) are treated as NULL
+            CompiledFilter::IsNull { col_idx } => values.get(*col_idx).is_none_or(|v| v.is_null()),
             CompiledFilter::IsNotNull { col_idx } => {
-                values.get(*col_idx).map(|v| !v.is_null()).unwrap_or(false)
+                values.get(*col_idx).is_some_and(|v| !v.is_null())
             }
 
             // Logical operators (recursive)
@@ -1401,7 +1418,7 @@ impl CompiledFilter {
 
             // Scalar function expressions
             CompiledFilter::UpperEq { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     // Unicode-aware uppercase comparison
                     s.to_uppercase() == value.as_ref()
                 } else {
@@ -1409,7 +1426,7 @@ impl CompiledFilter {
                 }
             }
             CompiledFilter::LowerEq { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     // Unicode-aware lowercase comparison
                     s.to_lowercase() == value.as_ref()
                 } else {
@@ -1417,14 +1434,14 @@ impl CompiledFilter {
                 }
             }
             CompiledFilter::TrimEq { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     s.trim() == value.as_ref()
                 } else {
                     false
                 }
             }
             CompiledFilter::LengthEq { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     let len = if s.is_ascii() {
                         s.len()
                     } else {
@@ -1436,7 +1453,7 @@ impl CompiledFilter {
                 }
             }
             CompiledFilter::LengthNe { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     let len = if s.is_ascii() {
                         s.len()
                     } else {
@@ -1448,7 +1465,7 @@ impl CompiledFilter {
                 }
             }
             CompiledFilter::LengthGt { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     let len = if s.is_ascii() {
                         s.len()
                     } else {
@@ -1460,7 +1477,7 @@ impl CompiledFilter {
                 }
             }
             CompiledFilter::LengthGte { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     let len = if s.is_ascii() {
                         s.len()
                     } else {
@@ -1472,7 +1489,7 @@ impl CompiledFilter {
                 }
             }
             CompiledFilter::LengthLt { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     let len = if s.is_ascii() {
                         s.len()
                     } else {
@@ -1484,7 +1501,7 @@ impl CompiledFilter {
                 }
             }
             CompiledFilter::LengthLte { col_idx, value } => {
-                if let Some(Value::Text(s)) = values.get(*col_idx) {
+                if let Value::Text(s) = get_val!(col_idx) {
                     let len = if s.is_ascii() {
                         s.len()
                     } else {

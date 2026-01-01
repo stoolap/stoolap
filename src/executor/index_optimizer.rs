@@ -827,7 +827,8 @@ impl Executor {
         }
 
         // Collect row_ids: either from PK (direct) or from index probe
-        let mut all_row_ids = Vec::new();
+        // Pre-allocate based on expected size to avoid reallocations
+        let mut all_row_ids = Vec::with_capacity(values.len());
         if is_pk_column {
             if is_negated {
                 // NOT IN optimization for INTEGER PRIMARY KEY:
@@ -928,7 +929,9 @@ impl Executor {
             }
         }
 
-        // Remove duplicates and sort for efficient batch fetch (only for IN, NOT IN is already ordered)
+        // Sort row_ids for better BTreeMap cache locality during version lookup
+        // and deduplicate. More efficient than HashSet when sorted output is needed anyway.
+        // (only for IN, NOT IN is already ordered)
         if !is_negated {
             all_row_ids.sort_unstable();
             all_row_ids.dedup();
@@ -1124,7 +1127,8 @@ impl Executor {
         }
 
         // Collect row_ids: either from PK (direct) or from index probe
-        let mut all_row_ids = Vec::new();
+        // Pre-allocate based on expected size to avoid reallocations
+        let mut all_row_ids = Vec::with_capacity(values.len());
         if is_pk_column {
             // PRIMARY KEY: the value IS the row_id (for INTEGER PK)
             for value in &values {
@@ -1140,7 +1144,8 @@ impl Executor {
             }
         }
 
-        // Remove duplicates and sort for efficient batch fetch
+        // Sort row_ids for better BTreeMap cache locality during version lookup
+        // and deduplicate. More efficient than HashSet when sorted output is needed anyway.
         all_row_ids.sort_unstable();
         all_row_ids.dedup();
 
@@ -1461,7 +1466,13 @@ impl Executor {
 
         // Collect row_ids: either from PK (direct) or from index probe
         // With early termination target, stop once we have enough
-        let mut all_row_ids = Vec::new();
+        // Pre-allocate based on expected size to avoid reallocations
+        let estimated_capacity = if let Some(target) = early_termination_target {
+            target.min(values.len())
+        } else {
+            values.len()
+        };
+        let mut all_row_ids = Vec::with_capacity(estimated_capacity);
         if is_pk_column {
             if is_negated {
                 // NOT IN optimization for INTEGER PRIMARY KEY (from NOT EXISTS semi-join):
@@ -1530,7 +1541,8 @@ impl Executor {
             return Ok(Some((Box::new(result), output_columns)));
         }
 
-        // Remove duplicates and sort for efficient batch fetch
+        // Sort row_ids for better BTreeMap cache locality during version lookup
+        // and deduplicate. More efficient than HashSet when sorted output is needed anyway.
         all_row_ids.sort_unstable();
         all_row_ids.dedup();
 

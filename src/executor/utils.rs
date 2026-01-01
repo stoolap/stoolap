@@ -23,6 +23,7 @@
 
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
+use std::sync::LazyLock;
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
@@ -38,12 +39,28 @@ use crate::parser::token::{Position, Token, TokenType};
 // Token Creation Utilities
 // ============================================================================
 
+/// Static dummy token for internal AST construction - avoids allocation.
+/// Token literal is not used during execution, only for display/errors.
+static DUMMY_TOKEN: LazyLock<Token> =
+    LazyLock::new(|| Token::new(TokenType::Identifier, String::new(), Position::default()));
+
+/// Get a reference to a pre-allocated dummy token (zero allocation).
+#[inline]
+pub fn dummy_token_ref() -> &'static Token {
+    &DUMMY_TOKEN
+}
+
+/// Clone the static dummy token (single String allocation for empty string).
+#[inline]
+pub fn dummy_token_clone() -> Token {
+    DUMMY_TOKEN.clone()
+}
+
 /// Helper to create a dummy token for internal AST construction.
-///
-/// This is useful when programmatically building AST nodes that require tokens.
+/// Use `dummy_token_clone()` when literal doesn't matter to avoid allocation.
 #[inline]
 pub fn dummy_token(literal: &str, token_type: TokenType) -> Token {
-    Token::new(token_type, literal, Position::new(0, 1, 1))
+    Token::new(token_type, literal, Position::default())
 }
 
 // ============================================================================
@@ -1606,6 +1623,154 @@ fn create_column_identifier(col_name: &str) -> Expression {
             col_name.to_string(),
         ))
     }
+}
+
+// ============================================================================
+// Join Projection Utilities
+// ============================================================================
+
+/// Result of computing join projection indices.
+/// Contains the column indices needed from outer and inner sides
+/// to satisfy the SELECT expressions.
+pub struct JoinProjectionIndices {
+    /// Column indices from outer row to include in output
+    pub outer_indices: Vec<usize>,
+    /// Column indices from inner row to include in output
+    pub inner_indices: Vec<usize>,
+    /// Output column names for the projected result
+    pub output_columns: Vec<String>,
+}
+
+/// Compute projection indices for a join operator.
+///
+/// Analyzes SELECT expressions and determines which columns from the outer and inner
+/// sides are needed. Returns None if projection cannot be pushed down (e.g., when
+/// expressions are not simple column references).
+///
+/// # Arguments
+/// * `select_exprs` - The SELECT expressions to analyze
+/// * `outer_columns` - Column names from the outer (left) side of the join
+/// * `inner_columns` - Column names from the inner (right) side of the join
+///
+/// # Returns
+/// Some(JoinProjectionIndices) if all expressions are simple column references,
+/// None otherwise.
+pub fn compute_join_projection(
+    select_exprs: &[Expression],
+    outer_columns: &[String],
+    inner_columns: &[String],
+) -> Option<JoinProjectionIndices> {
+    // Build column index maps for fast lookup
+    let outer_col_count = outer_columns.len();
+    let combined: Vec<String> = outer_columns
+        .iter()
+        .chain(inner_columns.iter())
+        .cloned()
+        .collect();
+    let col_index_map = build_column_index_map(&combined);
+
+    let mut outer_indices = Vec::new();
+    let mut inner_indices = Vec::new();
+    let mut output_columns = Vec::new();
+
+    for expr in select_exprs {
+        match expr {
+            // SELECT * - cannot push down projection
+            Expression::Star(_) | Expression::QualifiedStar(_) => return None,
+
+            Expression::Identifier(id) => {
+                let col_lower = id.value_lower.as_str();
+                if let Some(&idx) = col_index_map.get(col_lower) {
+                    if idx < outer_col_count {
+                        outer_indices.push(idx);
+                    } else {
+                        inner_indices.push(idx - outer_col_count);
+                    }
+                    output_columns.push(id.value.clone());
+                } else {
+                    // Column not found - cannot push down
+                    return None;
+                }
+            }
+
+            Expression::QualifiedIdentifier(qid) => {
+                // Try qualified name first
+                let full_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                if let Some(&idx) = col_index_map.get(&full_name) {
+                    if idx < outer_col_count {
+                        outer_indices.push(idx);
+                    } else {
+                        inner_indices.push(idx - outer_col_count);
+                    }
+                    // Output column name is just the column name, not qualified
+                    // (SQL standard: SELECT e.name produces column "name", not "e.name")
+                    output_columns.push(qid.name.value.clone());
+                } else if let Some(&idx) = col_index_map.get(&qid.name.value_lower) {
+                    // Fall back to unqualified name
+                    if idx < outer_col_count {
+                        outer_indices.push(idx);
+                    } else {
+                        inner_indices.push(idx - outer_col_count);
+                    }
+                    output_columns.push(qid.name.value.clone());
+                } else {
+                    // Column not found - cannot push down
+                    return None;
+                }
+            }
+
+            Expression::Aliased(aliased) => {
+                // Handle aliased expressions - check if inner is a simple column
+                let alias_name = aliased.alias.value.clone();
+                match &*aliased.expression {
+                    Expression::Identifier(id) => {
+                        let col_lower = id.value_lower.as_str();
+                        if let Some(&idx) = col_index_map.get(col_lower) {
+                            if idx < outer_col_count {
+                                outer_indices.push(idx);
+                            } else {
+                                inner_indices.push(idx - outer_col_count);
+                            }
+                            output_columns.push(alias_name);
+                        } else {
+                            return None;
+                        }
+                    }
+                    Expression::QualifiedIdentifier(qid) => {
+                        let full_name =
+                            format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                        if let Some(&idx) = col_index_map.get(&full_name) {
+                            if idx < outer_col_count {
+                                outer_indices.push(idx);
+                            } else {
+                                inner_indices.push(idx - outer_col_count);
+                            }
+                            output_columns.push(alias_name);
+                        } else if let Some(&idx) = col_index_map.get(&qid.name.value_lower) {
+                            if idx < outer_col_count {
+                                outer_indices.push(idx);
+                            } else {
+                                inner_indices.push(idx - outer_col_count);
+                            }
+                            output_columns.push(alias_name);
+                        } else {
+                            return None;
+                        }
+                    }
+                    _ => return None, // Complex expression - cannot push down
+                }
+            }
+
+            // Any other expression type cannot be pushed down
+            _ => return None,
+        }
+    }
+
+    Some(JoinProjectionIndices {
+        outer_indices,
+        inner_indices,
+        output_columns,
+    })
 }
 
 #[cfg(test)]

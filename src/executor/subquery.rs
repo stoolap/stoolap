@@ -43,7 +43,7 @@ use super::expr_converter::convert_ast_to_storage_expr;
 use super::expression::compute_expression_hash;
 use super::operator::{ColumnInfo, MaterializedOperator, Operator};
 use super::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
-use super::utils::{dummy_token, value_to_expression};
+use super::utils::{dummy_token, dummy_token_clone, value_to_expression};
 use super::Executor;
 
 // ============================================================================
@@ -573,7 +573,7 @@ impl Executor {
         };
 
         // Fetch rows by their IDs using the cached row fetcher
-        const BATCH_SIZE: usize = 10;
+        const BATCH_SIZE: usize = 100;
         for batch in row_ids.chunks(BATCH_SIZE) {
             let fetched = row_fetcher(batch);
 
@@ -2405,10 +2405,11 @@ impl Executor {
     ) -> Option<(String, Option<String>)> {
         match expr {
             Expression::QualifiedIdentifier(qid) => {
-                let table = qid.qualifier.value.to_lowercase();
+                // Use pre-computed value_lower to avoid allocation
+                let table = &qid.qualifier.value_lower;
                 // Must be in outer tables and NOT in inner tables
-                if outer_tables.iter().any(|t| t.eq_ignore_ascii_case(&table))
-                    && !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table))
+                if outer_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
+                    && !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
                 {
                     Some((qid.name.value.clone(), Some(qid.qualifier.value.clone())))
                 } else {
@@ -2425,8 +2426,9 @@ impl Executor {
     fn extract_inner_column(expr: &Expression, inner_tables: &[String]) -> Option<String> {
         match expr {
             Expression::QualifiedIdentifier(qid) => {
-                let table = qid.qualifier.value.to_lowercase();
-                if inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table)) {
+                // Use pre-computed value_lower to avoid allocation
+                let table = &qid.qualifier.value_lower;
+                if inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table)) {
                     Some(qid.name.value.clone())
                 } else {
                     None
@@ -2450,10 +2452,11 @@ impl Executor {
     ) -> bool {
         match expr {
             Expression::QualifiedIdentifier(qid) => {
-                let table = qid.qualifier.value.to_lowercase();
+                // Use pre-computed value_lower to avoid allocation
+                let table = &qid.qualifier.value_lower;
                 // References outer if it's in outer_tables and NOT in inner_tables
-                outer_tables.iter().any(|t| t.eq_ignore_ascii_case(&table))
-                    && !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table))
+                outer_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
+                    && !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
             }
             Expression::Infix(infix) => {
                 Self::expression_references_outer_tables(&infix.left, outer_tables, inner_tables)
@@ -2529,12 +2532,13 @@ impl Executor {
             (None, None) => None,
             (Some(l), None) => Some(l),
             (None, Some(r)) => Some(r),
-            (Some(l), Some(r)) => Some(Expression::Infix(InfixExpression::new(
-                dummy_token("AND", TokenType::Keyword),
-                Box::new(l),
-                "AND".to_string(),
-                Box::new(r),
-            ))),
+            (Some(l), Some(r)) => Some(Expression::Infix(InfixExpression {
+                token: dummy_token_clone(),
+                left: Box::new(l),
+                operator: "AND".to_string(),
+                op_type: InfixOperator::And,
+                right: Box::new(r),
+            })),
         }
     }
 
@@ -2662,29 +2666,24 @@ impl Executor {
         }
 
         // Build SELECT inner_column FROM inner_table WHERE non_correlated_predicates
-        let inner_col_expr = Expression::Identifier(Identifier {
-            token: dummy_token(&info.inner_column, TokenType::Identifier),
-            value: info.inner_column.clone(),
-            value_lower: info.inner_column.to_lowercase(),
-        });
+        // Use dummy_token_clone() to avoid allocations - token literal is not used during execution
+        let inner_col_expr = Expression::Identifier(Identifier::new(
+            dummy_token_clone(),
+            info.inner_column.clone(),
+        ));
 
         let table_source = Expression::TableSource(SimpleTableSource {
-            token: dummy_token(&info.inner_table, TokenType::Identifier),
-            name: Identifier {
-                token: dummy_token(&info.inner_table, TokenType::Identifier),
-                value: info.inner_table.clone(),
-                value_lower: info.inner_table.to_lowercase(),
-            },
-            alias: info.inner_alias.as_ref().map(|a| Identifier {
-                token: dummy_token(a, TokenType::Identifier),
-                value: a.clone(),
-                value_lower: a.to_lowercase(),
-            }),
+            token: dummy_token_clone(),
+            name: Identifier::new(dummy_token_clone(), info.inner_table.clone()),
+            alias: info
+                .inner_alias
+                .as_ref()
+                .map(|a| Identifier::new(dummy_token_clone(), a.clone())),
             as_of: None,
         });
 
         let select_stmt = SelectStatement {
-            token: dummy_token("SELECT", TokenType::Keyword),
+            token: dummy_token_clone(),
             // Don't use DISTINCT here - it's slower in Stoolap because it requires
             // additional hashing/sorting overhead. Instead, we collect into HashSet
             // which deduplicates more efficiently for this use case.
@@ -2892,40 +2891,31 @@ impl Executor {
         // For NOT EXISTS with empty set, return TRUE (nothing exists to negate)
         if hash_set.is_empty() {
             return Expression::BooleanLiteral(BooleanLiteral {
-                token: dummy_token(
-                    if info.is_negated { "TRUE" } else { "FALSE" },
-                    TokenType::Keyword,
-                ),
+                token: dummy_token_clone(),
                 value: info.is_negated,
             });
         }
 
-        // Build the outer column expression
+        // Build the outer column expression using dummy_token_clone() to avoid allocations
         let outer_col_expr = if let Some(ref tbl) = info.outer_table {
             Expression::QualifiedIdentifier(QualifiedIdentifier {
-                token: dummy_token(&info.outer_column, TokenType::Identifier),
-                qualifier: Box::new(Identifier {
-                    token: dummy_token(tbl, TokenType::Identifier),
-                    value: tbl.clone(),
-                    value_lower: tbl.to_lowercase(),
-                }),
-                name: Box::new(Identifier {
-                    token: dummy_token(&info.outer_column, TokenType::Identifier),
-                    value: info.outer_column.clone(),
-                    value_lower: info.outer_column.to_lowercase(),
-                }),
+                token: dummy_token_clone(),
+                qualifier: Box::new(Identifier::new(dummy_token_clone(), tbl.clone())),
+                name: Box::new(Identifier::new(
+                    dummy_token_clone(),
+                    info.outer_column.clone(),
+                )),
             })
         } else {
-            Expression::Identifier(Identifier {
-                token: dummy_token(&info.outer_column, TokenType::Identifier),
-                value: info.outer_column.clone(),
-                value_lower: info.outer_column.to_lowercase(),
-            })
+            Expression::Identifier(Identifier::new(
+                dummy_token_clone(),
+                info.outer_column.clone(),
+            ))
         };
 
         // Use InHashSet with Arc for O(1) lookup and cheap cloning in parallel execution
         Expression::InHashSet(InHashSetExpression {
-            token: dummy_token("IN", TokenType::Keyword),
+            token: dummy_token_clone(),
             column: Box::new(outer_col_expr),
             values: hash_set, // Already Arc, no wrapping needed
             not: info.is_negated,
@@ -2997,25 +2987,25 @@ impl Executor {
                 match (left_opt, right_opt) {
                     (Some(new_left), Some(new_right)) => {
                         Ok(Some(Expression::Infix(InfixExpression {
-                            token: infix.token.clone(),
+                            token: dummy_token_clone(),
                             left: Box::new(new_left),
-                            operator: infix.operator.clone(),
-                            op_type: infix.op_type,
+                            operator: "AND".to_string(),
+                            op_type: InfixOperator::And,
                             right: Box::new(new_right),
                         })))
                     }
                     (Some(new_left), None) => Ok(Some(Expression::Infix(InfixExpression {
-                        token: infix.token.clone(),
+                        token: dummy_token_clone(),
                         left: Box::new(new_left),
-                        operator: infix.operator.clone(),
-                        op_type: infix.op_type,
+                        operator: "AND".to_string(),
+                        op_type: InfixOperator::And,
                         right: infix.right.clone(),
                     }))),
                     (None, Some(new_right)) => Ok(Some(Expression::Infix(InfixExpression {
-                        token: infix.token.clone(),
+                        token: dummy_token_clone(),
                         left: infix.left.clone(),
-                        operator: infix.operator.clone(),
-                        op_type: infix.op_type,
+                        operator: "AND".to_string(),
+                        op_type: InfixOperator::And,
                         right: Box::new(new_right),
                     }))),
                     (None, None) => Ok(None),
@@ -3041,25 +3031,25 @@ impl Executor {
                 match (left_opt, right_opt) {
                     (Some(new_left), Some(new_right)) => {
                         Ok(Some(Expression::Infix(InfixExpression {
-                            token: infix.token.clone(),
+                            token: dummy_token_clone(),
                             left: Box::new(new_left),
-                            operator: infix.operator.clone(),
-                            op_type: infix.op_type,
+                            operator: "OR".to_string(),
+                            op_type: InfixOperator::Or,
                             right: Box::new(new_right),
                         })))
                     }
                     (Some(new_left), None) => Ok(Some(Expression::Infix(InfixExpression {
-                        token: infix.token.clone(),
+                        token: dummy_token_clone(),
                         left: Box::new(new_left),
-                        operator: infix.operator.clone(),
-                        op_type: infix.op_type,
+                        operator: "OR".to_string(),
+                        op_type: InfixOperator::Or,
                         right: infix.right.clone(),
                     }))),
                     (None, Some(new_right)) => Ok(Some(Expression::Infix(InfixExpression {
-                        token: infix.token.clone(),
+                        token: dummy_token_clone(),
                         left: infix.left.clone(),
-                        operator: infix.operator.clone(),
-                        op_type: infix.op_type,
+                        operator: "OR".to_string(),
+                        op_type: InfixOperator::Or,
                         right: Box::new(new_right),
                     }))),
                     (None, None) => Ok(None),

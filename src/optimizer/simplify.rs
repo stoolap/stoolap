@@ -22,6 +22,10 @@
 //! - Contradiction detection (1 = 2 → FALSE)
 //! - Range predicate merging (a > 5 AND a > 3 → a > 5)
 //! - De Morgan's law application where beneficial
+//!
+//! IMPORTANT: This module uses Option<Expression> returns to avoid cloning
+//! expressions when no simplification is performed. This is critical for
+//! performance with heavy expressions like EXISTS subqueries.
 
 #![allow(clippy::only_used_in_recursion)]
 
@@ -54,370 +58,398 @@ impl ExpressionSimplifier {
         self.simplified
     }
 
-    /// Simplify an expression, applying all optimization rules
+    /// Simplify an expression, applying all optimization rules.
+    /// Returns Some(simplified) if changes were made, None if expression is unchanged.
+    /// This avoids cloning expressions that can't be simplified (like EXISTS subqueries).
+    pub fn try_simplify(&mut self, expr: &Expression) -> Option<Expression> {
+        self.simplified = false;
+        let result = self.simplify_recursive(expr);
+        if self.simplified {
+            Some(result.unwrap_or_else(|| expr.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Simplify an expression, always returning an Expression.
+    /// Use try_simplify() when you want to avoid cloning unchanged expressions.
     pub fn simplify(&mut self, expr: &Expression) -> Expression {
         self.simplified = false;
         self.simplify_recursive(expr)
+            .unwrap_or_else(|| expr.clone())
     }
 
-    /// Recursively simplify an expression
-    fn simplify_recursive(&mut self, expr: &Expression) -> Expression {
+    /// Recursively simplify an expression.
+    /// Returns Some(new_expr) if simplified, None if unchanged.
+    fn simplify_recursive(&mut self, expr: &Expression) -> Option<Expression> {
         match expr {
             Expression::Infix(infix) => self.simplify_infix(infix),
             Expression::Prefix(prefix) => self.simplify_prefix(prefix),
-            Expression::Between(between) => {
-                // Simplify components of BETWEEN
-                let value = self.simplify_recursive(&between.expr);
-                let lower = self.simplify_recursive(&between.lower);
-                let upper = self.simplify_recursive(&between.upper);
+            Expression::Between(between) => self.simplify_between(between),
+            Expression::In(in_expr) => self.simplify_in(in_expr),
+            // EXISTS and ScalarSubquery contain heavy SelectStatement data.
+            // They can't be simplified to constants, so return None (no clone needed).
+            Expression::Exists(_) | Expression::ScalarSubquery(_) => None,
+            // InHashSet, literals, identifiers, etc. can't be simplified
+            _ => None,
+        }
+    }
 
-                // Check for constant BETWEEN
-                if let (
-                    Expression::IntegerLiteral(v),
-                    Expression::IntegerLiteral(l),
-                    Expression::IntegerLiteral(h),
-                ) = (&value, &lower, &upper)
-                {
-                    self.simplified = true;
-                    let result = v.value >= l.value && v.value <= h.value;
-                    return if between.not {
-                        self.make_bool(!result)
-                    } else {
-                        self.make_bool(result)
-                    };
-                }
+    /// Simplify BETWEEN expression
+    fn simplify_between(
+        &mut self,
+        between: &crate::parser::ast::BetweenExpression,
+    ) -> Option<Expression> {
+        let value_simplified = self.simplify_recursive(&between.expr);
+        let lower_simplified = self.simplify_recursive(&between.lower);
+        let upper_simplified = self.simplify_recursive(&between.upper);
 
-                Expression::Between(crate::parser::ast::BetweenExpression {
-                    token: between.token.clone(),
-                    expr: Box::new(value),
-                    lower: Box::new(lower),
-                    upper: Box::new(upper),
-                    not: between.not,
-                })
-            }
-            Expression::In(in_expr) => {
-                // Simplify IN expression - left is the value, right is the list
-                let value = self.simplify_recursive(&in_expr.left);
-                let list = self.simplify_recursive(&in_expr.right);
+        let value = value_simplified.as_ref().unwrap_or(&between.expr);
+        let lower = lower_simplified.as_ref().unwrap_or(&between.lower);
+        let upper = upper_simplified.as_ref().unwrap_or(&between.upper);
 
-                Expression::In(crate::parser::ast::InExpression {
-                    token: in_expr.token.clone(),
-                    left: Box::new(value),
-                    right: Box::new(list),
-                    not: in_expr.not,
-                })
-            }
-            _ => expr.clone(),
+        // Check for constant BETWEEN
+        if let (
+            Expression::IntegerLiteral(v),
+            Expression::IntegerLiteral(l),
+            Expression::IntegerLiteral(h),
+        ) = (value, lower, upper)
+        {
+            self.simplified = true;
+            let result = v.value >= l.value && v.value <= h.value;
+            return Some(if between.not {
+                self.make_bool(!result)
+            } else {
+                self.make_bool(result)
+            });
+        }
+
+        // If any child was simplified, rebuild the expression
+        if value_simplified.is_some() || lower_simplified.is_some() || upper_simplified.is_some() {
+            Some(Expression::Between(crate::parser::ast::BetweenExpression {
+                token: between.token.clone(),
+                expr: Box::new(value_simplified.unwrap_or_else(|| (*between.expr).clone())),
+                lower: Box::new(lower_simplified.unwrap_or_else(|| (*between.lower).clone())),
+                upper: Box::new(upper_simplified.unwrap_or_else(|| (*between.upper).clone())),
+                not: between.not,
+            }))
+        } else {
+            None
+        }
+    }
+
+    /// Simplify IN expression
+    fn simplify_in(&mut self, in_expr: &crate::parser::ast::InExpression) -> Option<Expression> {
+        let value_simplified = self.simplify_recursive(&in_expr.left);
+        let list_simplified = self.simplify_recursive(&in_expr.right);
+
+        // If any child was simplified, rebuild the expression
+        if value_simplified.is_some() || list_simplified.is_some() {
+            Some(Expression::In(crate::parser::ast::InExpression {
+                token: in_expr.token.clone(),
+                left: Box::new(value_simplified.unwrap_or_else(|| (*in_expr.left).clone())),
+                right: Box::new(list_simplified.unwrap_or_else(|| (*in_expr.right).clone())),
+                not: in_expr.not,
+            }))
+        } else {
+            None
         }
     }
 
     /// Simplify infix (binary) expressions
-    fn simplify_infix(&mut self, infix: &InfixExpression) -> Expression {
+    fn simplify_infix(&mut self, infix: &InfixExpression) -> Option<Expression> {
         // First, recursively simplify children
-        let left = self.simplify_recursive(&infix.left);
-        let right = self.simplify_recursive(&infix.right);
+        let left_simplified = self.simplify_recursive(&infix.left);
+        let right_simplified = self.simplify_recursive(&infix.right);
 
-        match infix.op_type {
-            // Boolean AND simplification
-            InfixOperator::And => {
-                // TRUE AND x → x
-                if self.is_always_true(&left) {
-                    self.simplified = true;
-                    return right;
-                }
-                // x AND TRUE → x
-                if self.is_always_true(&right) {
-                    self.simplified = true;
-                    return left;
-                }
-                // FALSE AND x → FALSE
-                if self.is_always_false(&left) {
-                    self.simplified = true;
-                    return left;
-                }
-                // x AND FALSE → FALSE
-                if self.is_always_false(&right) {
-                    self.simplified = true;
-                    return right;
-                }
-                // x AND x → x
-                if self.expr_equals(&left, &right) {
-                    self.simplified = true;
-                    return left;
-                }
-                // Try to merge range predicates: a > 5 AND a > 3 → a > 5
-                if let Some(merged) = self.try_merge_range_predicates(&left, &right) {
-                    self.simplified = true;
-                    return merged;
-                }
-            }
+        let left = left_simplified.as_ref().unwrap_or(&infix.left);
+        let right = right_simplified.as_ref().unwrap_or(&infix.right);
 
-            // Boolean OR simplification
-            InfixOperator::Or => {
-                // FALSE OR x → x
-                if self.is_always_false(&left) {
-                    self.simplified = true;
-                    return right;
-                }
-                // x OR FALSE → x
-                if self.is_always_false(&right) {
-                    self.simplified = true;
-                    return left;
-                }
-                // TRUE OR x → TRUE
-                if self.is_always_true(&left) {
-                    self.simplified = true;
-                    return left;
-                }
-                // x OR TRUE → TRUE
-                if self.is_always_true(&right) {
-                    self.simplified = true;
-                    return right;
-                }
-                // x OR x → x
-                if self.expr_equals(&left, &right) {
-                    self.simplified = true;
-                    return left;
-                }
-            }
+        // Try operator-specific simplifications
+        let simplified_result = match infix.op_type {
+            InfixOperator::And => self.simplify_and(left, right),
+            InfixOperator::Or => self.simplify_or(left, right),
+            InfixOperator::Equal => self.simplify_equal(left, right),
+            InfixOperator::NotEqual => self.simplify_not_equal(left, right),
+            InfixOperator::LessThan => self.simplify_less_than(left, right),
+            InfixOperator::LessEqual => self.simplify_less_equal(left, right),
+            InfixOperator::GreaterThan => self.simplify_greater_than(left, right),
+            InfixOperator::GreaterEqual => self.simplify_greater_equal(left, right),
+            InfixOperator::Add => self.simplify_add(left, right),
+            InfixOperator::Subtract => self.simplify_subtract(left, right),
+            InfixOperator::Multiply => self.simplify_multiply(left, right),
+            InfixOperator::Divide => self.simplify_divide(left, right),
+            _ => None,
+        };
 
-            // Equality simplification
-            InfixOperator::Equal => {
-                // Constant comparison: 1 = 1 → TRUE, 1 = 2 → FALSE
-                if let Some(result) = self.try_eval_comparison(&left, &right, InfixOperator::Equal)
-                {
-                    self.simplified = true;
-                    return self.make_bool(result);
-                }
-                // x = x → TRUE (for deterministic expressions)
-                if self.is_deterministic(&left) && self.expr_equals(&left, &right) {
-                    self.simplified = true;
-                    return self.make_bool(true);
-                }
-            }
-
-            // Not equal simplification
-            InfixOperator::NotEqual => {
-                // Constant comparison
-                if let Some(result) =
-                    self.try_eval_comparison(&left, &right, InfixOperator::NotEqual)
-                {
-                    self.simplified = true;
-                    return self.make_bool(result);
-                }
-                // x <> x → FALSE (for deterministic expressions)
-                if self.is_deterministic(&left) && self.expr_equals(&left, &right) {
-                    self.simplified = true;
-                    return self.make_bool(false);
-                }
-            }
-
-            // Less than simplification
-            InfixOperator::LessThan => {
-                if let Some(result) =
-                    self.try_eval_comparison(&left, &right, InfixOperator::LessThan)
-                {
-                    self.simplified = true;
-                    return self.make_bool(result);
-                }
-                // x < x → FALSE
-                if self.is_deterministic(&left) && self.expr_equals(&left, &right) {
-                    self.simplified = true;
-                    return self.make_bool(false);
-                }
-            }
-
-            // Less than or equal simplification
-            InfixOperator::LessEqual => {
-                if let Some(result) =
-                    self.try_eval_comparison(&left, &right, InfixOperator::LessEqual)
-                {
-                    self.simplified = true;
-                    return self.make_bool(result);
-                }
-                // x <= x → TRUE
-                if self.is_deterministic(&left) && self.expr_equals(&left, &right) {
-                    self.simplified = true;
-                    return self.make_bool(true);
-                }
-            }
-
-            // Greater than simplification
-            InfixOperator::GreaterThan => {
-                if let Some(result) =
-                    self.try_eval_comparison(&left, &right, InfixOperator::GreaterThan)
-                {
-                    self.simplified = true;
-                    return self.make_bool(result);
-                }
-                // x > x → FALSE
-                if self.is_deterministic(&left) && self.expr_equals(&left, &right) {
-                    self.simplified = true;
-                    return self.make_bool(false);
-                }
-            }
-
-            // Greater than or equal simplification
-            InfixOperator::GreaterEqual => {
-                if let Some(result) =
-                    self.try_eval_comparison(&left, &right, InfixOperator::GreaterEqual)
-                {
-                    self.simplified = true;
-                    return self.make_bool(result);
-                }
-                // x >= x → TRUE
-                if self.is_deterministic(&left) && self.expr_equals(&left, &right) {
-                    self.simplified = true;
-                    return self.make_bool(true);
-                }
-            }
-
-            // Arithmetic simplification
-            InfixOperator::Add => {
-                // x + 0 → x
-                if self.is_zero(&right) {
-                    self.simplified = true;
-                    return left;
-                }
-                // 0 + x → x
-                if self.is_zero(&left) {
-                    self.simplified = true;
-                    return right;
-                }
-                // Constant folding
-                if let Some(result) = self.try_eval_arithmetic(&left, &right, InfixOperator::Add) {
-                    self.simplified = true;
-                    return result;
-                }
-            }
-
-            InfixOperator::Subtract => {
-                // x - 0 → x
-                if self.is_zero(&right) {
-                    self.simplified = true;
-                    return left;
-                }
-                // x - x → 0
-                if self.is_deterministic(&left) && self.expr_equals(&left, &right) {
-                    self.simplified = true;
-                    return self.make_int(0);
-                }
-                // Constant folding
-                if let Some(result) =
-                    self.try_eval_arithmetic(&left, &right, InfixOperator::Subtract)
-                {
-                    self.simplified = true;
-                    return result;
-                }
-            }
-
-            InfixOperator::Multiply => {
-                // x * 1 → x
-                if self.is_one(&right) {
-                    self.simplified = true;
-                    return left;
-                }
-                // 1 * x → x
-                if self.is_one(&left) {
-                    self.simplified = true;
-                    return right;
-                }
-                // x * 0 → 0
-                if self.is_zero(&right) {
-                    self.simplified = true;
-                    return self.make_int(0);
-                }
-                // 0 * x → 0
-                if self.is_zero(&left) {
-                    self.simplified = true;
-                    return self.make_int(0);
-                }
-                // Constant folding
-                if let Some(result) =
-                    self.try_eval_arithmetic(&left, &right, InfixOperator::Multiply)
-                {
-                    self.simplified = true;
-                    return result;
-                }
-            }
-
-            InfixOperator::Divide => {
-                // x / 1 → x
-                if self.is_one(&right) {
-                    self.simplified = true;
-                    return left;
-                }
-                // 0 / x → 0 (if x is non-zero constant)
-                if self.is_zero(&left) && self.is_nonzero_constant(&right) {
-                    self.simplified = true;
-                    return self.make_int(0);
-                }
-            }
-
-            _ => {}
+        if let Some(result) = simplified_result {
+            self.simplified = true;
+            return Some(result);
         }
 
-        // Return simplified expression
-        Expression::Infix(InfixExpression {
-            token: infix.token.clone(),
-            left: Box::new(left),
-            operator: infix.operator.clone(),
-            op_type: infix.op_type,
-            right: Box::new(right),
-        })
+        // If children were simplified but operator wasn't, rebuild with simplified children
+        if left_simplified.is_some() || right_simplified.is_some() {
+            Some(Expression::Infix(InfixExpression {
+                token: infix.token.clone(),
+                left: Box::new(left_simplified.unwrap_or_else(|| (*infix.left).clone())),
+                operator: infix.operator.clone(),
+                op_type: infix.op_type,
+                right: Box::new(right_simplified.unwrap_or_else(|| (*infix.right).clone())),
+            }))
+        } else {
+            None
+        }
+    }
+
+    /// Simplify AND expressions
+    fn simplify_and(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        // TRUE AND x → x
+        if self.is_always_true(left) {
+            return Some(right.clone());
+        }
+        // x AND TRUE → x
+        if self.is_always_true(right) {
+            return Some(left.clone());
+        }
+        // FALSE AND x → FALSE
+        if self.is_always_false(left) {
+            return Some(left.clone());
+        }
+        // x AND FALSE → FALSE
+        if self.is_always_false(right) {
+            return Some(right.clone());
+        }
+        // x AND x → x
+        if self.expr_equals(left, right) {
+            return Some(left.clone());
+        }
+        // Try to merge range predicates: a > 5 AND a > 3 → a > 5
+        self.try_merge_range_predicates(left, right)
+    }
+
+    /// Simplify OR expressions
+    fn simplify_or(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        // FALSE OR x → x
+        if self.is_always_false(left) {
+            return Some(right.clone());
+        }
+        // x OR FALSE → x
+        if self.is_always_false(right) {
+            return Some(left.clone());
+        }
+        // TRUE OR x → TRUE
+        if self.is_always_true(left) {
+            return Some(left.clone());
+        }
+        // x OR TRUE → TRUE
+        if self.is_always_true(right) {
+            return Some(right.clone());
+        }
+        // x OR x → x
+        if self.expr_equals(left, right) {
+            return Some(left.clone());
+        }
+        None
+    }
+
+    /// Simplify equality expressions
+    fn simplify_equal(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        // Constant comparison: 1 = 1 → TRUE, 1 = 2 → FALSE
+        if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::Equal) {
+            return Some(self.make_bool(result));
+        }
+        // x = x → TRUE (for deterministic expressions)
+        if self.is_deterministic(left) && self.expr_equals(left, right) {
+            return Some(self.make_bool(true));
+        }
+        None
+    }
+
+    /// Simplify not-equal expressions
+    fn simplify_not_equal(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::NotEqual) {
+            return Some(self.make_bool(result));
+        }
+        // x <> x → FALSE (for deterministic expressions)
+        if self.is_deterministic(left) && self.expr_equals(left, right) {
+            return Some(self.make_bool(false));
+        }
+        None
+    }
+
+    /// Simplify less-than expressions
+    fn simplify_less_than(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::LessThan) {
+            return Some(self.make_bool(result));
+        }
+        // x < x → FALSE
+        if self.is_deterministic(left) && self.expr_equals(left, right) {
+            return Some(self.make_bool(false));
+        }
+        None
+    }
+
+    /// Simplify less-equal expressions
+    fn simplify_less_equal(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::LessEqual) {
+            return Some(self.make_bool(result));
+        }
+        // x <= x → TRUE
+        if self.is_deterministic(left) && self.expr_equals(left, right) {
+            return Some(self.make_bool(true));
+        }
+        None
+    }
+
+    /// Simplify greater-than expressions
+    fn simplify_greater_than(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::GreaterThan) {
+            return Some(self.make_bool(result));
+        }
+        // x > x → FALSE
+        if self.is_deterministic(left) && self.expr_equals(left, right) {
+            return Some(self.make_bool(false));
+        }
+        None
+    }
+
+    /// Simplify greater-equal expressions
+    fn simplify_greater_equal(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::GreaterEqual) {
+            return Some(self.make_bool(result));
+        }
+        // x >= x → TRUE
+        if self.is_deterministic(left) && self.expr_equals(left, right) {
+            return Some(self.make_bool(true));
+        }
+        None
+    }
+
+    /// Simplify addition expressions
+    fn simplify_add(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        // x + 0 → x
+        if self.is_zero(right) {
+            return Some(left.clone());
+        }
+        // 0 + x → x
+        if self.is_zero(left) {
+            return Some(right.clone());
+        }
+        // Constant folding
+        self.try_eval_arithmetic(left, right, InfixOperator::Add)
+    }
+
+    /// Simplify subtraction expressions
+    fn simplify_subtract(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        // x - 0 → x
+        if self.is_zero(right) {
+            return Some(left.clone());
+        }
+        // x - x → 0
+        if self.is_deterministic(left) && self.expr_equals(left, right) {
+            return Some(self.make_int(0));
+        }
+        // Constant folding
+        self.try_eval_arithmetic(left, right, InfixOperator::Subtract)
+    }
+
+    /// Simplify multiplication expressions
+    fn simplify_multiply(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        // x * 1 → x
+        if self.is_one(right) {
+            return Some(left.clone());
+        }
+        // 1 * x → x
+        if self.is_one(left) {
+            return Some(right.clone());
+        }
+        // x * 0 → 0
+        if self.is_zero(right) {
+            return Some(self.make_int(0));
+        }
+        // 0 * x → 0
+        if self.is_zero(left) {
+            return Some(self.make_int(0));
+        }
+        // Constant folding
+        self.try_eval_arithmetic(left, right, InfixOperator::Multiply)
+    }
+
+    /// Simplify division expressions
+    fn simplify_divide(&self, left: &Expression, right: &Expression) -> Option<Expression> {
+        // x / 1 → x
+        if self.is_one(right) {
+            return Some(left.clone());
+        }
+        // 0 / x → 0 (if x is non-zero constant)
+        if self.is_zero(left) && self.is_nonzero_constant(right) {
+            return Some(self.make_int(0));
+        }
+        None
     }
 
     /// Simplify prefix (unary) expressions
-    fn simplify_prefix(&mut self, prefix: &PrefixExpression) -> Expression {
-        let operand = self.simplify_recursive(&prefix.right);
+    fn simplify_prefix(&mut self, prefix: &PrefixExpression) -> Option<Expression> {
+        let operand_simplified = self.simplify_recursive(&prefix.right);
+        let operand = operand_simplified.as_ref().unwrap_or(&prefix.right);
 
-        match prefix.op_type {
+        let simplified_result = match prefix.op_type {
             PrefixOperator::Not => {
                 // NOT TRUE → FALSE
-                if self.is_always_true(&operand) {
-                    self.simplified = true;
-                    return self.make_bool(false);
+                if self.is_always_true(operand) {
+                    Some(self.make_bool(false))
                 }
                 // NOT FALSE → TRUE
-                if self.is_always_false(&operand) {
-                    self.simplified = true;
-                    return self.make_bool(true);
+                else if self.is_always_false(operand) {
+                    Some(self.make_bool(true))
                 }
                 // NOT NOT x → x
-                if let Expression::Prefix(inner) = &operand {
+                else if let Expression::Prefix(inner) = operand {
                     if inner.op_type == PrefixOperator::Not {
-                        self.simplified = true;
-                        return (*inner.right).clone();
+                        Some((*inner.right).clone())
+                    } else {
+                        None
                     }
+                } else {
+                    None
                 }
             }
             PrefixOperator::Negate => {
                 // -(-x) → x
-                if let Expression::Prefix(inner) = &operand {
+                if let Expression::Prefix(inner) = operand {
                     if inner.op_type == PrefixOperator::Negate {
-                        self.simplified = true;
-                        return (*inner.right).clone();
+                        Some((*inner.right).clone())
+                    } else {
+                        None
                     }
                 }
                 // -(constant) → constant negated
-                if let Expression::IntegerLiteral(lit) = &operand {
-                    self.simplified = true;
-                    return self.make_int(-lit.value);
+                else if let Expression::IntegerLiteral(lit) = operand {
+                    Some(self.make_int(-lit.value))
+                } else {
+                    None
                 }
             }
             PrefixOperator::Plus => {
                 // +x → x
-                self.simplified = true;
-                return operand;
+                Some(operand.clone())
             }
-            _ => {}
+            _ => None,
+        };
+
+        if let Some(result) = simplified_result {
+            self.simplified = true;
+            return Some(result);
         }
 
-        Expression::Prefix(PrefixExpression {
-            token: prefix.token.clone(),
-            operator: prefix.operator.clone(),
-            op_type: prefix.op_type,
-            right: Box::new(operand),
+        // If operand was simplified, rebuild the expression
+        operand_simplified.map(|simplified_operand| {
+            Expression::Prefix(PrefixExpression {
+                token: prefix.token.clone(),
+                operator: prefix.operator.clone(),
+                op_type: prefix.op_type,
+                right: Box::new(simplified_operand),
+            })
         })
     }
 
@@ -722,11 +754,11 @@ pub fn simplify_expression_fixed_point(expr: &Expression) -> Expression {
     const MAX_ITERATIONS: usize = 10;
 
     loop {
-        let simplified = simplifier.simplify(&current);
-        if !simplifier.was_simplified() || iterations >= MAX_ITERATIONS {
+        let simplified = simplifier.try_simplify(&current);
+        if simplified.is_none() || iterations >= MAX_ITERATIONS {
             break;
         }
-        current = simplified;
+        current = simplified.unwrap();
         iterations += 1;
     }
 
@@ -969,5 +1001,17 @@ mod tests {
         } else {
             panic!("Expected IntegerLiteral(0)");
         }
+    }
+
+    #[test]
+    fn test_no_clone_for_unchanged() {
+        // Test that try_simplify returns None for expressions that can't be simplified
+        let mut simplifier = ExpressionSimplifier::new();
+        let x = make_identifier("x");
+
+        // Simple identifier can't be simplified
+        let result = simplifier.try_simplify(&x);
+        assert!(result.is_none());
+        assert!(!simplifier.was_simplified());
     }
 }

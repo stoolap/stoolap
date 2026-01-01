@@ -59,6 +59,7 @@ pub use bloom_filter::BloomFilterOperator;
 pub use hash_join::{HashJoinOperator, JoinSide, JoinType};
 pub use index_nested_loop::{
     BatchIndexNestedLoopJoinOperator, IndexLookupStrategy, IndexNestedLoopJoinOperator,
+    JoinProjection,
 };
 pub use merge_join::MergeJoinOperator;
 pub use nested_loop_join::NestedLoopJoinOperator;

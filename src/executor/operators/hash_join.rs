@@ -165,7 +165,8 @@ pub struct HashJoinOperator {
     right_col_count: usize,
 
     // Probe phase state
-    current_probe_row: Option<Row>,
+    // Uses Arc<Row> for O(1) clone in 1:N join scenarios (also Send+Sync)
+    current_probe_row: Option<Arc<Row>>,
     current_probe_hash: u64,
     current_match_idx: usize,
     current_matches: Vec<usize>,
@@ -431,8 +432,9 @@ impl HashJoinOperator {
 
     /// Combine probe row with a build row by index, avoiding clone.
     /// Uses SharedBuildCompositeRow to reference the build row via Arc.
+    /// Takes Arc<Row> for O(1) clone in 1:N join scenarios (also Send+Sync).
     #[inline]
-    fn combine_rows_shared(&self, probe_row: Row, build_idx: usize) -> RowRef {
+    fn combine_rows_shared(&self, probe_row: Arc<Row>, build_idx: usize) -> RowRef {
         // probe_is_left determines output column order:
         // - true: output = [probe, build]
         // - false: output = [build, probe]
@@ -582,8 +584,9 @@ impl Operator for HashJoinOperator {
                 let build_row = &self.build_rows[build_idx];
 
                 // Verify actual key equality (handle hash collisions)
+                // Deref Rc to get &Row for comparison
                 if verify_key_equality(
-                    self.current_probe_row.as_ref().unwrap(),
+                    self.current_probe_row.as_ref().unwrap().as_ref(),
                     build_row,
                     self.probe_key_indices(),
                     self.build_key_indices(),
@@ -592,9 +595,14 @@ impl Operator for HashJoinOperator {
 
                     // SEMI JOIN: Return probe row only (no build columns), then skip remaining matches
                     if self.join_type.is_semi() {
-                        let probe_row = self.current_probe_row.take().unwrap();
+                        let probe_arc = self.current_probe_row.take().unwrap();
                         // Skip remaining matches for this probe row
                         self.current_match_idx = self.current_matches.len();
+                        // Unwrap Arc or clone if still shared
+                        let probe_row = match Arc::try_unwrap(probe_arc) {
+                            Ok(row) => row,
+                            Err(arc) => (*arc).clone(),
+                        };
                         return Ok(Some(RowRef::Owned(probe_row)));
                     }
 
@@ -613,16 +621,16 @@ impl Operator for HashJoinOperator {
                     // Use SharedBuildComposite to avoid cloning build_row entirely.
                     // The Arc<Vec<Row>> is shared, only refcount is incremented.
                     //
-                    // For probe row: if this is the last match, take ownership instead of cloning.
-                    // This optimizes the common 1:1 join case where each probe has exactly one match.
-                    let probe_row = if self.current_match_idx >= self.current_matches.len() {
-                        // No more matches - take ownership
+                    // For probe row: Arc clone is O(1), so we always clone the Arc.
+                    // On last match, we take ownership (dropping reference count).
+                    let probe_arc = if self.current_match_idx >= self.current_matches.len() {
+                        // No more matches - take ownership of Arc
                         self.current_probe_row.take().unwrap()
                     } else {
-                        // More potential matches - clone
-                        self.current_probe_row.as_ref().unwrap().clone()
+                        // More potential matches - clone Arc (O(1))
+                        Arc::clone(self.current_probe_row.as_ref().unwrap())
                     };
-                    return Ok(Some(self.combine_rows_shared(probe_row, build_idx)));
+                    return Ok(Some(self.combine_rows_shared(probe_arc, build_idx)));
                 }
             }
 
@@ -630,7 +638,12 @@ impl Operator for HashJoinOperator {
             // - ANTI JOIN: Return probe row when NO match found
             // - OUTER JOINs: Return probe row with NULL build columns
             if self.join_type.is_anti() && !self.probe_had_match {
-                if let Some(probe_row) = self.current_probe_row.take() {
+                if let Some(probe_arc) = self.current_probe_row.take() {
+                    // Unwrap Arc or clone if still shared
+                    let probe_row = match Arc::try_unwrap(probe_arc) {
+                        Ok(row) => row,
+                        Err(arc) => (*arc).clone(),
+                    };
                     return Ok(Some(RowRef::Owned(probe_row)));
                 }
             }
@@ -645,7 +658,12 @@ impl Operator for HashJoinOperator {
                 || (matches!(self.join_type, JoinType::Left) && self.build_side == JoinSide::Right);
 
             if needs_unmatched_probe && !self.probe_had_match {
-                if let Some(probe_row) = self.current_probe_row.take() {
+                if let Some(probe_arc) = self.current_probe_row.take() {
+                    // Unwrap Arc or clone if still shared
+                    let probe_row = match Arc::try_unwrap(probe_arc) {
+                        Ok(row) => row,
+                        Err(arc) => (*arc).clone(),
+                    };
                     let null_build = self.null_build_row();
                     return Ok(Some(self.combine_rows_ref(probe_row, null_build)));
                 }
@@ -664,7 +682,8 @@ impl Operator for HashJoinOperator {
                     self.current_matches.clear();
                     self.current_matches.extend(hash_table.probe(hash));
 
-                    self.current_probe_row = Some(probe_row);
+                    // Wrap in Arc for O(1) clone in 1:N scenarios (also Send+Sync)
+                    self.current_probe_row = Some(Arc::new(probe_row));
                     self.current_probe_hash = hash;
                     self.current_match_idx = 0;
                     self.probe_had_match = false;
