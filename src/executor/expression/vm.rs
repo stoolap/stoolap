@@ -1643,7 +1643,9 @@ impl ExprVM {
                 }
 
                 Op::Pop => {
-                    self.stack.pop();
+                    // Use truncate instead of pop to drop in-place without copying value out
+                    let new_len = self.stack.len().saturating_sub(1);
+                    self.stack.truncate(new_len);
                     pc += 1;
                 }
 
@@ -2180,7 +2182,9 @@ impl ExprVM {
                 }
 
                 Op::Pop => {
-                    stack.pop();
+                    // Use truncate instead of pop to drop in-place without copying value out
+                    let new_len = stack.len().saturating_sub(1);
+                    stack.truncate(new_len);
                     pc += 1;
                 }
 

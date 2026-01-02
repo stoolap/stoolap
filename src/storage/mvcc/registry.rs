@@ -68,10 +68,10 @@ impl TxnState {
 }
 
 /// Cache size for thread-local committed transaction cache
-/// 1024 entries (8KB per thread) covers the working set of visible transactions
+/// 65536 entries (512KB per thread) covers the working set of visible transactions
 /// for almost all realistic workloads, eliminating >99% of DashMap lookups during
 /// scans. This significantly reduces atomic contention on the shared registry.
-const COMMITTED_CACHE_SIZE: usize = 1024;
+const COMMITTED_CACHE_SIZE: usize = 65536;
 
 // Thread-local cache for committed transaction IDs
 // Avoids repeated DashMap lookups during table scans

@@ -735,40 +735,59 @@ impl VersionStore {
 
         let checker = self.visibility_checker.as_ref()?;
 
-        // BTreeMap with read lock
+        // ARENA FAST PATH: O(1) HashMap lookup instead of O(log n) BTreeMap
+        // This bypasses BTreeMap entirely when HEAD is visible (common case).
+        // row_arena_index maps row_id → arena_idx for O(1) access.
+        if let Some(&arena_idx) = self.row_arena_index.read().get(&row_id) {
+            if let Some((meta, arc_data)) = self.arena.get_meta_and_arc(arena_idx) {
+                // Check HEAD visibility using arena metadata
+                if checker.is_visible(meta.txn_id, txn_id) {
+                    // HEAD is visible - check if deleted
+                    if meta.deleted_at_txn_id != 0
+                        && checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                    {
+                        return None; // Row is deleted
+                    }
+                    // Return from arena - O(1) total!
+                    return Some(RowVersion {
+                        txn_id: meta.txn_id,
+                        deleted_at_txn_id: meta.deleted_at_txn_id,
+                        data: Row::from_arc(arc_data),
+                        row_id: meta.row_id,
+                        create_time: meta.create_time,
+                    });
+                }
+                // HEAD not visible - fall through to BTreeMap for version chain
+            }
+        }
+
+        // BTREE SLOW PATH: HEAD not visible or row not in arena index
+        // Need BTreeMap for version chain traversal (Snapshot Isolation, AS OF, etc.)
         let versions = self.versions.read();
         let chain = versions.get(&row_id)?;
 
-        // FAST PATH: Check HEAD version first - O(1) for common case
-        // Most readers want latest committed data. If HEAD is visible, return immediately.
-        // This avoids chain traversal even for multi-version rows.
+        // Check HEAD in case arena path was skipped
         let head_txn_id = chain.version.txn_id;
         let head_deleted_at = chain.version.deleted_at_txn_id;
 
         if checker.is_visible(head_txn_id, txn_id) {
-            // HEAD is visible - check if deleted
             if head_deleted_at != 0 && checker.is_visible(head_deleted_at, txn_id) {
-                return None; // Row is deleted
+                return None;
             }
             return Some(chain.version.clone());
         }
 
-        // SLOW PATH: HEAD not visible - need to traverse chain for older versions
-        // This only happens for transactions that need to see historical data
-        // (e.g., Snapshot Isolation reading versions from before they started)
+        // Traverse version chain for older visible versions
         let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
 
         while let Some(e) = current {
             let version_txn_id = e.version.txn_id;
             let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
-            // Check visibility using only txn_ids (no clone needed yet)
             if checker.is_visible(version_txn_id, txn_id) {
-                // Check if deleted and deletion is visible
                 if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
                     return None;
                 }
-                // Only clone the ONE version we actually need
                 return Some(e.version.clone());
             }
             current = e.prev.as_ref().map(|b| b.as_ref());
@@ -829,6 +848,9 @@ impl VersionStore {
     ///
     /// Uses parallel processing for large batches (>1000 row_ids) to leverage
     /// multiple CPU cores for visibility checking and row materialization.
+    ///
+    /// OPTIMIZATION: Uses arena fast path (O(1) HashMap) before falling back to
+    /// BTreeMap (O(log n)) for version chain traversal.
     pub fn get_visible_versions_batch(&self, row_ids: &[i64], txn_id: i64) -> Vec<(i64, Row)> {
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
@@ -839,17 +861,103 @@ impl VersionStore {
             None => return Vec::new(),
         };
 
-        // Pre-acquire arena lock ONCE for all lookups (same optimization as full scan)
+        // Pre-acquire all locks ONCE for all lookups
         let arena_guard = self.arena.read_guard();
         let arena_data = arena_guard.data();
+        let arena_meta = arena_guard.meta();
+        let row_index = self.row_arena_index.read();
+        // BTreeMap for fallback when HEAD not visible (Snapshot Isolation, AS OF)
+        let versions = self.versions.read();
 
         // Parallel processing constants
-        /// Minimum batch size before enabling parallel processing (avoid overhead for small batches)
         const PARALLEL_THRESHOLD: usize = 1000;
-        /// Chunk size for parallel processing (balances parallelism vs. overhead)
         const PARALLEL_CHUNK_SIZE: usize = 512;
 
-        // Helper closure to get row data from arena or version
+        // OPTIMIZED SEQUENTIAL PATH for small batches (common case for JOINs)
+        // Inlined for maximum performance - avoids closure/enum overhead
+        if row_ids.len() < PARALLEL_THRESHOLD {
+            let mut results = Vec::with_capacity(row_ids.len());
+            let arena_len = arena_meta.len();
+
+            for &row_id in row_ids {
+                // ARENA FAST PATH: O(1) HashMap + direct array access
+                if let Some(&arena_idx) = row_index.get(&row_id) {
+                    if arena_idx < arena_len {
+                        // SAFETY: bounds checked above, unchecked access for speed
+                        let meta = &arena_meta[arena_idx];
+
+                        // Check HEAD visibility
+                        if checker.is_visible(meta.txn_id, txn_id) {
+                            // HEAD visible - check deletion
+                            if meta.deleted_at_txn_id == 0
+                                || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                            {
+                                // O(1) success! Return from arena
+                                results.push((
+                                    row_id,
+                                    Row::from_arc(Arc::clone(&arena_data[arena_idx])),
+                                ));
+                            }
+                            // Else: deleted, skip
+                            continue;
+                        }
+                        // HEAD not visible - fall through to BTreeMap
+                    }
+                }
+
+                // BTREE FALLBACK: Version chain traversal for Snapshot Isolation
+                if let Some(chain) = versions.get(&row_id) {
+                    let head_txn_id = chain.version.txn_id;
+                    let head_deleted_at = chain.version.deleted_at_txn_id;
+
+                    if checker.is_visible(head_txn_id, txn_id) {
+                        if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+                            // Get from arena if available, else clone
+                            let row = if let Some(idx) = chain.arena_idx {
+                                if let Some(arc_row) = arena_data.get(idx) {
+                                    Row::from_arc(Arc::clone(arc_row))
+                                } else {
+                                    chain.version.data.clone()
+                                }
+                            } else {
+                                chain.version.data.clone()
+                            };
+                            results.push((row_id, row));
+                        }
+                        continue;
+                    }
+
+                    // Traverse version chain
+                    let mut current: Option<&VersionChainEntry> =
+                        chain.prev.as_ref().map(|b| b.as_ref());
+
+                    while let Some(e) = current {
+                        if checker.is_visible(e.version.txn_id, txn_id) {
+                            if e.version.deleted_at_txn_id == 0
+                                || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
+                            {
+                                let row = if let Some(idx) = e.arena_idx {
+                                    if let Some(arc_row) = arena_data.get(idx) {
+                                        Row::from_arc(Arc::clone(arc_row))
+                                    } else {
+                                        e.version.data.clone()
+                                    }
+                                } else {
+                                    e.version.data.clone()
+                                };
+                                results.push((row_id, row));
+                            }
+                            break;
+                        }
+                        current = e.prev.as_ref().map(|b| b.as_ref());
+                    }
+                }
+            }
+            return results;
+        }
+
+        // PARALLEL PATH for large batches (>1000 rows)
+        // Helper closure for row data
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
@@ -859,96 +967,63 @@ impl VersionStore {
             e.version.data.clone()
         };
 
-        // BTreeMap with RwLock - hold read lock during parallel processing
-        // Read locks are shared, so concurrent readers can proceed
-        // This avoids expensive chain cloning while maintaining MVCC consistency
-        let versions = self.versions.read();
+        row_ids
+            .par_chunks(PARALLEL_CHUNK_SIZE)
+            .flat_map(|chunk| {
+                let mut chunk_results = Vec::with_capacity(chunk.len());
+                let arena_len = arena_meta.len();
 
-        if row_ids.len() >= PARALLEL_THRESHOLD {
-            // Parallel path: process chunks while holding read lock (zero-copy)
-            // RwLock read locks allow concurrent readers, so this is safe and fast
-            row_ids
-                .par_chunks(PARALLEL_CHUNK_SIZE)
-                .flat_map(|chunk| {
-                    let mut chunk_results = Vec::with_capacity(chunk.len());
-                    for &row_id in chunk {
-                        if let Some(chain) = versions.get(&row_id) {
-                            // FAST PATH: Check HEAD version first - O(1) for common case
-                            let head_txn_id = chain.version.txn_id;
-                            let head_deleted_at = chain.version.deleted_at_txn_id;
-
-                            if checker.is_visible(head_txn_id, txn_id) {
-                                // HEAD is visible - check if deleted
-                                if head_deleted_at == 0
-                                    || !checker.is_visible(head_deleted_at, txn_id)
+                for &row_id in chunk {
+                    // Arena fast path
+                    if let Some(&arena_idx) = row_index.get(&row_id) {
+                        if arena_idx < arena_len {
+                            let meta = &arena_meta[arena_idx];
+                            if checker.is_visible(meta.txn_id, txn_id) {
+                                if meta.deleted_at_txn_id == 0
+                                    || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
                                 {
-                                    chunk_results.push((row_id, get_row_data(chain)));
+                                    chunk_results.push((
+                                        row_id,
+                                        Row::from_arc(Arc::clone(&arena_data[arena_idx])),
+                                    ));
                                 }
                                 continue;
                             }
-
-                            // SLOW PATH: HEAD not visible - traverse chain for older versions
-                            let mut current: Option<&VersionChainEntry> =
-                                chain.prev.as_ref().map(|b| b.as_ref());
-
-                            while let Some(e) = current {
-                                let version_txn_id = e.version.txn_id;
-                                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                                if checker.is_visible(version_txn_id, txn_id) {
-                                    if deleted_at_txn_id == 0
-                                        || !checker.is_visible(deleted_at_txn_id, txn_id)
-                                    {
-                                        chunk_results.push((row_id, get_row_data(e)));
-                                    }
-                                    break;
-                                }
-                                current = e.prev.as_ref().map(|b| b.as_ref());
-                            }
                         }
                     }
-                    chunk_results
-                })
-                .collect()
-        } else {
-            // Sequential path for small batches
-            let mut results = Vec::with_capacity(row_ids.len());
-            for &row_id in row_ids {
-                if let Some(chain) = versions.get(&row_id) {
-                    // FAST PATH: Check HEAD version first - O(1) for common case
-                    let head_txn_id = chain.version.txn_id;
-                    let head_deleted_at = chain.version.deleted_at_txn_id;
 
-                    if checker.is_visible(head_txn_id, txn_id) {
-                        // HEAD is visible - check if deleted
-                        if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                            results.push((row_id, get_row_data(chain)));
-                        }
-                        continue;
-                    }
+                    // BTreeMap fallback
+                    if let Some(chain) = versions.get(&row_id) {
+                        let head_txn_id = chain.version.txn_id;
+                        let head_deleted_at = chain.version.deleted_at_txn_id;
 
-                    // SLOW PATH: HEAD not visible - traverse chain for older versions
-                    let mut current: Option<&VersionChainEntry> =
-                        chain.prev.as_ref().map(|b| b.as_ref());
-
-                    while let Some(e) = current {
-                        let version_txn_id = e.version.txn_id;
-                        let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                        if checker.is_visible(version_txn_id, txn_id) {
-                            if deleted_at_txn_id == 0
-                                || !checker.is_visible(deleted_at_txn_id, txn_id)
+                        if checker.is_visible(head_txn_id, txn_id) {
+                            if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id)
                             {
-                                results.push((row_id, get_row_data(e)));
+                                chunk_results.push((row_id, get_row_data(chain)));
                             }
-                            break;
+                            continue;
                         }
-                        current = e.prev.as_ref().map(|b| b.as_ref());
+
+                        let mut current: Option<&VersionChainEntry> =
+                            chain.prev.as_ref().map(|b| b.as_ref());
+
+                        while let Some(e) = current {
+                            if checker.is_visible(e.version.txn_id, txn_id) {
+                                if e.version.deleted_at_txn_id == 0
+                                    || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
+                                {
+                                    chunk_results.push((row_id, get_row_data(e)));
+                                }
+                                break;
+                            }
+                            current = e.prev.as_ref().map(|b| b.as_ref());
+                        }
                     }
                 }
-            }
-            results
-        }
+                chunk_results
+            })
+            .collect()
     }
 
     /// Counts visible versions for batch operations (COUNT optimization)

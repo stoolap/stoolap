@@ -62,6 +62,9 @@ const VISIBILITY_CHECK_BATCH_SIZE: usize = 10;
 // Semi-Join Optimization for EXISTS Subqueries
 // ============================================================================
 
+// Result type for correlation extraction: (outer_col, outer_table, inner_col, remaining_predicate)
+type CorrelationExtraction = (String, Option<String>, String, Option<Arc<Expression>>);
+
 /// Information extracted from an EXISTS subquery for semi-join optimization.
 /// Example: EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > 500)
 /// - outer_column: "u.id" (or "id" with outer table "u")
@@ -82,7 +85,8 @@ pub struct SemiJoinInfo {
     /// The inner table alias if present
     pub inner_alias: Option<String>,
     /// Non-correlated part of the WHERE clause (filters only on inner table)
-    pub non_correlated_where: Option<Expression>,
+    /// Uses Arc to avoid cloning expression trees during semi-join optimization
+    pub non_correlated_where: Option<Arc<Expression>>,
     /// Whether this is NOT EXISTS
     pub is_negated: bool,
 }
@@ -2302,7 +2306,7 @@ impl Executor {
         // Example: WHERE o.customer_id = c.id AND c.country = 'USA'
         // The "c.country = 'USA'" references outer table and can't be pushed to inner query.
         if let Some(ref rem) = remaining {
-            if Self::expression_references_outer_tables(rem, outer_tables, &inner_tables) {
+            if Self::expression_references_outer_tables(rem.as_ref(), outer_tables, &inner_tables) {
                 return None;
             }
         }
@@ -2325,11 +2329,12 @@ impl Executor {
     /// - `o.user_id = u.id AND o.amount > 500` → same, with remaining predicate
     ///
     /// Returns: (outer_column, outer_table, inner_column, remaining_predicates)
+    /// Uses Arc<Expression> for remaining predicates to avoid cloning expression trees.
     fn extract_equality_correlation(
         expr: &Expression,
         outer_tables: &[String],
         inner_tables: &[String],
-    ) -> Option<(String, Option<String>, String, Option<Expression>)> {
+    ) -> Option<CorrelationExtraction> {
         match expr {
             // Direct equality: inner.col = outer.col
             Expression::Infix(infix) if infix.operator == "=" => Self::try_extract_equality_pair(
@@ -2346,9 +2351,8 @@ impl Executor {
                 if let Some((outer_col, outer_tbl, inner_col, left_remaining)) =
                     Self::extract_equality_correlation(&infix.left, outer_tables, inner_tables)
                 {
-                    // Combine remaining from left with right
-                    let remaining =
-                        Self::combine_and_predicates(left_remaining, Some((*infix.right).clone()));
+                    // Combine remaining from left with right (Arc avoids later clones)
+                    let remaining = Self::combine_and_predicates_arc(left_remaining, &infix.right);
                     return Some((outer_col, outer_tbl, inner_col, remaining));
                 }
 
@@ -2356,9 +2360,8 @@ impl Executor {
                 if let Some((outer_col, outer_tbl, inner_col, right_remaining)) =
                     Self::extract_equality_correlation(&infix.right, outer_tables, inner_tables)
                 {
-                    // Combine left with remaining from right
-                    let remaining =
-                        Self::combine_and_predicates(Some((*infix.left).clone()), right_remaining);
+                    // Combine left with remaining from right (Arc avoids later clones)
+                    let remaining = Self::combine_and_predicates_arc(right_remaining, &infix.left);
                     return Some((outer_col, outer_tbl, inner_col, remaining));
                 }
 
@@ -2524,21 +2527,24 @@ impl Executor {
     }
 
     /// Combine two optional predicates with AND.
-    fn combine_and_predicates(
-        left: Option<Expression>,
-        right: Option<Expression>,
-    ) -> Option<Expression> {
-        match (left, right) {
-            (None, None) => None,
-            (Some(l), None) => Some(l),
-            (None, Some(r)) => Some(r),
-            (Some(l), Some(r)) => Some(Expression::Infix(InfixExpression {
-                token: dummy_token_clone(),
-                left: Box::new(l),
-                operator: "AND".to_string(),
-                op_type: InfixOperator::And,
-                right: Box::new(r),
-            })),
+    /// Returns Arc<Expression> to avoid cloning when the result is used multiple times.
+    fn combine_and_predicates_arc(
+        left: Option<Arc<Expression>>,
+        right: &Expression,
+    ) -> Option<Arc<Expression>> {
+        match left {
+            None => Some(Arc::new(right.clone())),
+            Some(l) => {
+                // Unwrap Arc if we're the only owner, otherwise clone
+                let left_expr = Arc::try_unwrap(l).unwrap_or_else(|arc| (*arc).clone());
+                Some(Arc::new(Expression::Infix(InfixExpression {
+                    token: dummy_token_clone(),
+                    left: Box::new(left_expr),
+                    operator: "AND".to_string(),
+                    op_type: InfixOperator::And,
+                    right: Box::new(right.clone()),
+                })))
+            }
         }
     }
 
@@ -2655,7 +2661,7 @@ impl Executor {
         let pred_hash = info
             .non_correlated_where
             .as_ref()
-            .map(compute_expression_hash)
+            .map(|arc| compute_expression_hash(arc.as_ref()))
             .unwrap_or(0);
         let cache_key =
             compute_semi_join_cache_key(&info.inner_table, &info.inner_column, pred_hash);
@@ -2691,7 +2697,10 @@ impl Executor {
             columns: vec![inner_col_expr],
             with: None,
             table_expr: Some(Box::new(table_source)),
-            where_clause: info.non_correlated_where.clone().map(Box::new),
+            where_clause: info
+                .non_correlated_where
+                .as_ref()
+                .map(|arc| Box::new(arc.as_ref().clone())),
             group_by: GroupByClause {
                 columns: vec![],
                 modifier: GroupByModifier::None,
@@ -2762,7 +2771,7 @@ impl Executor {
         let storage_expr = info
             .non_correlated_where
             .as_ref()
-            .and_then(|expr| convert_ast_to_storage_expr(expr));
+            .and_then(|arc| convert_ast_to_storage_expr(arc.as_ref()));
 
         // Get inner table rows with filter pushed down to storage layer
         let inner_all_rows =
@@ -3248,7 +3257,10 @@ impl Executor {
             inner_column,
             inner_table,
             inner_alias,
-            non_correlated_where: subquery.where_clause.as_ref().map(|b| b.as_ref().clone()),
+            non_correlated_where: subquery
+                .where_clause
+                .as_ref()
+                .map(|b| Arc::new(b.as_ref().clone())),
             is_negated: in_expr.not,
         })
     }

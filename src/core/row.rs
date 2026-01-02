@@ -159,6 +159,52 @@ impl Row {
         vec.extend(right.iter().cloned());
     }
 
+    /// Combine rows into buffer: clone left, move right (for JOINs) - reuses allocation
+    /// OPTIMIZATION: Reuses buffer allocation AND moves right values instead of cloning
+    /// This is the most efficient combine for streaming joins where we own the inner row.
+    #[inline]
+    pub fn combine_into_clone_move(&mut self, left: &Row, right: Row) {
+        let vec = self.storage.make_mut();
+        vec.clear();
+        let total_len = left.len() + right.len();
+        if vec.capacity() < total_len {
+            vec.reserve(total_len - vec.capacity());
+        }
+        // Clone left values (borrowed)
+        vec.extend(left.iter().cloned());
+        // Move right values (owned) - no cloning needed for Owned storage
+        match right.storage {
+            RowStorage::Owned(right_vec) => {
+                vec.extend(right_vec);
+            }
+            RowStorage::Shared(arc) => {
+                vec.extend(arc.iter().cloned());
+            }
+        }
+    }
+
+    /// Combine rows into buffer: move both (for JOINs) - reuses allocation
+    /// OPTIMIZATION: Reuses buffer AND moves values from both sides when possible
+    /// Use when both outer and inner rows are owned and no longer needed.
+    #[inline]
+    pub fn combine_into_owned(&mut self, left: Row, right: Row) {
+        let vec = self.storage.make_mut();
+        vec.clear();
+        let total_len = left.len() + right.len();
+        if vec.capacity() < total_len {
+            vec.reserve(total_len - vec.capacity());
+        }
+        // Move or clone based on storage type
+        match left.storage {
+            RowStorage::Owned(left_vec) => vec.extend(left_vec),
+            RowStorage::Shared(arc) => vec.extend(arc.iter().cloned()),
+        }
+        match right.storage {
+            RowStorage::Owned(right_vec) => vec.extend(right_vec),
+            RowStorage::Shared(arc) => vec.extend(arc.iter().cloned()),
+        }
+    }
+
     /// Combine rows: clone left values, move right values (for JOINs)
     /// OPTIMIZATION: Moves right values instead of cloning them - saves ~50% of cloning cost
     #[inline]
@@ -236,6 +282,23 @@ impl Row {
         Self {
             storage: RowStorage::Shared(values),
         }
+    }
+
+    /// Convert Shared storage to Owned in place.
+    /// OPTIMIZATION: Call this before operations that need to move values (like combine).
+    /// Clones values once so subsequent operations can move instead of clone.
+    /// No-op if already Owned.
+    #[inline]
+    pub fn ensure_owned(&mut self) {
+        if let RowStorage::Shared(arc) = &self.storage {
+            self.storage = RowStorage::Owned(arc.to_vec());
+        }
+    }
+
+    /// Check if storage is owned (vs shared Arc)
+    #[inline]
+    pub fn is_owned(&self) -> bool {
+        matches!(self.storage, RowStorage::Owned(_))
     }
 
     /// Create a row with null values for a given schema
@@ -347,6 +410,17 @@ impl Row {
     #[inline]
     pub fn as_slice(&self) -> &[Value] {
         self.storage.as_slice()
+    }
+
+    /// Get mutable Vec with guaranteed capacity, for buffer reuse patterns.
+    /// OPTIMIZATION: Ensures capacity without reallocation if already sufficient.
+    #[inline]
+    pub fn as_mut_slice_with_capacity(&mut self, capacity: usize) -> &mut Vec<Value> {
+        let vec = self.storage.make_mut();
+        if vec.capacity() < capacity {
+            vec.reserve(capacity - vec.len());
+        }
+        vec
     }
 
     /// Convert Row to Arc, consuming self - efficient for arena storage

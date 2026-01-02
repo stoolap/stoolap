@@ -686,8 +686,6 @@ impl QueryResult for ExprMappedResult {
                         }
                     }
                     CompiledProjection::Compiled(program) => {
-                        // Execute pre-compiled expression using Cow-based evaluation
-                        // to avoid cloning row values when possible
                         let ctx = ExecuteContext::new(row_data);
                         let value = self
                             .vm

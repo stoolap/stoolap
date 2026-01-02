@@ -228,6 +228,22 @@ impl RowArena {
         let inner = self.inner.read();
         inner.data.get(arena_idx).cloned()
     }
+
+    /// Get both metadata and Arc for a row by arena index - O(1) with single lock
+    ///
+    /// This is optimized for the visibility fast path where we need to check
+    /// txn_id and deleted_at_txn_id before returning the data.
+    #[inline]
+    pub fn get_meta_and_arc(&self, arena_idx: usize) -> Option<(ArenaRowMeta, Arc<[Value]>)> {
+        let inner = self.inner.read();
+        if arena_idx < inner.meta.len() {
+            let meta = inner.meta[arena_idx];
+            let arc = Arc::clone(&inner.data[arena_idx]);
+            Some((meta, arc))
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for RowArena {

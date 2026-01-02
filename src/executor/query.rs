@@ -3101,19 +3101,12 @@ impl Executor {
                         .map(|col| format!("{}.{}", inner_alias, col.name))
                         .collect();
 
-                    // Build all columns for combined row
-                    // When swapped, result order is outer(orig_right), inner(orig_left)
-                    // But we need final order to be: orig_left, orig_right
-                    let (all_columns, _orig_left_cols, _orig_right_cols) = if swapped {
-                        // Swapped: outer=orig_right, inner=orig_left
-                        let mut all = inner_cols.clone(); // orig_left first
-                        all.extend(outer_cols.clone()); // orig_right second
-                        (all, inner_cols.clone(), outer_cols.clone())
-                    } else {
-                        // Not swapped: outer=orig_left, inner=orig_right
-                        let mut all = outer_cols.clone(); // orig_left first
-                        all.extend(inner_cols.clone()); // orig_right second
-                        (all, outer_cols.clone(), inner_cols.clone())
+                    // Build all_columns to match physical row order (outer, inner)
+                    // This avoids expensive per-row rotation - projections find columns by name
+                    let all_columns = {
+                        let mut all = outer_cols.clone();
+                        all.extend(inner_cols.clone());
+                        all
                     };
 
                     // Create residual filter from nl_right_filter if present
@@ -3220,31 +3213,7 @@ impl Executor {
                     }
                     join_op.close()?;
 
-                    let result_rows = result_rows;
-
-                    // When swapped, reorder columns from (outer, inner) to (orig_left, orig_right)
-                    let result_rows = if swapped {
-                        // Result is (outer=orig_right, inner=orig_left), need (orig_left, orig_right)
-                        let _orig_left_count = inner_cols.len();
-                        let orig_right_count = outer_cols.len();
-                        result_rows
-                            .into_iter()
-                            .map(|row| {
-                                let values = row.as_slice();
-                                // Reorder: [outer(orig_right), inner(orig_left)] -> [orig_left, orig_right]
-                                let mut new_values = Vec::with_capacity(values.len());
-                                // First add inner values (which are orig_left)
-                                new_values.extend(values[orig_right_count..].iter().cloned());
-                                // Then add outer values (which are orig_right)
-                                new_values.extend(values[..orig_right_count].iter().cloned());
-                                Row::from_values(new_values)
-                            })
-                            .collect()
-                    } else {
-                        result_rows
-                    };
-
-                    // No need to apply right_filter again - it was applied during the join
+                    // No rotation needed - all_columns matches physical order
                     let mut final_rows = result_rows;
 
                     // Apply cross-table WHERE filters if any
@@ -4963,27 +4932,28 @@ impl Executor {
         };
         let select_exprs = select_exprs_cow.as_ref();
 
-        // OPTIMIZATION: Pre-compute lowercase column names ONCE and reuse throughout
-        // This avoids repeated to_lowercase() calls in col_index_map building,
-        // QualifiedStar expansion, and row projection loop
-        let all_columns_lower: Vec<String> = all_columns.iter().map(|c| c.to_lowercase()).collect();
+        // OPTIMIZATION: For fast path check, use linear search to avoid HashMap allocation.
+        // Linear search with eq_ignore_ascii_case is faster than HashMap for small N
+        // due to cache locality and zero allocation overhead.
+        // HashMap will be built lazily only if we need project_rows_optimized.
 
-        // Build column index map ONCE with FxHashMap for O(1) lookup
-        // Use the pre-computed lowercase names
-        let mut col_index_map_lower: FxHashMap<String, usize> = FxHashMap::default();
-        for (i, lower) in all_columns_lower.iter().enumerate() {
-            col_index_map_lower.insert(lower.clone(), i);
-
-            // Also add unqualified column names for qualified columns (e.g., "table.column" -> "column")
-            // This allows SELECT column FROM t1 JOIN t2 ON ... to work
-            // Don't overwrite existing entries to handle ambiguous column names correctly
-            if let Some(dot_idx) = lower.rfind('.') {
-                let column_part = &lower[dot_idx + 1..];
-                col_index_map_lower
-                    .entry(column_part.to_string())
-                    .or_insert(i);
-            }
-        }
+        // Helper function for column lookup using linear search
+        let find_column_index = |name: &str, columns: &[String]| -> Option<usize> {
+            // Linear search with case-insensitive comparison
+            columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(name))
+                .or_else(|| {
+                    // Try unqualified match for qualified column names
+                    columns.iter().position(|c| {
+                        if let Some(dot_idx) = c.rfind('.') {
+                            c[dot_idx + 1..].eq_ignore_ascii_case(name)
+                        } else {
+                            false
+                        }
+                    })
+                })
+        };
 
         // Fast path: Check if all expressions are simple column references
         // If so, we can use direct index-based projection without creating Evaluators
@@ -5003,9 +4973,9 @@ impl Executor {
                     let prefix_lower = format!("{}.", qs.qualifier.to_lowercase());
                     let qualifier_lower = qs.qualifier.to_lowercase();
                     let mut found_any = false;
-                    // OPTIMIZATION: Use pre-computed all_columns_lower instead of to_lowercase() per column
-                    for (idx, col_lower) in all_columns_lower.iter().enumerate() {
-                        if col_lower.starts_with(&prefix_lower) {
+                    // Use linear search for qualified star expansion
+                    for (idx, col) in all_columns.iter().enumerate() {
+                        if col.to_lowercase().starts_with(&prefix_lower) {
                             simple_column_indices.push(idx);
                             found_any = true;
                         }
@@ -5014,7 +4984,7 @@ impl Executor {
                     // the qualifier matches the table alias - if so, include all columns
                     if !found_any {
                         if let Some(alias) = table_alias {
-                            if alias.to_lowercase() == qualifier_lower {
+                            if alias.eq_ignore_ascii_case(&qualifier_lower) {
                                 for idx in 0..all_columns.len() {
                                     simple_column_indices.push(idx);
                                 }
@@ -5023,8 +4993,8 @@ impl Executor {
                     }
                 }
                 Expression::Identifier(id) => {
-                    // Use O(1) HashMap lookup instead of O(n) position()
-                    if let Some(&idx) = col_index_map_lower.get(&id.value_lower) {
+                    // Use linear search for fast path check
+                    if let Some(idx) = find_column_index(&id.value_lower, all_columns) {
                         simple_column_indices.push(idx);
                     } else {
                         all_simple = false;
@@ -5035,9 +5005,10 @@ impl Executor {
                     // Try full qualified name first (table.column)
                     let full_name =
                         format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
-                    if let Some(&idx) = col_index_map_lower.get(&full_name) {
+                    if let Some(idx) = find_column_index(&full_name, all_columns) {
                         simple_column_indices.push(idx);
-                    } else if let Some(&idx) = col_index_map_lower.get(&qid.name.value_lower) {
+                    } else if let Some(idx) = find_column_index(&qid.name.value_lower, all_columns)
+                    {
                         simple_column_indices.push(idx);
                     } else {
                         all_simple = false;
@@ -5048,7 +5019,7 @@ impl Executor {
                     // Check if the inner expression is a simple column reference
                     match &*aliased.expression {
                         Expression::Identifier(id) => {
-                            if let Some(&idx) = col_index_map_lower.get(&id.value_lower) {
+                            if let Some(idx) = find_column_index(&id.value_lower, all_columns) {
                                 simple_column_indices.push(idx);
                             } else {
                                 all_simple = false;
@@ -5058,10 +5029,10 @@ impl Executor {
                         Expression::QualifiedIdentifier(qid) => {
                             let full_name =
                                 format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
-                            if let Some(&idx) = col_index_map_lower.get(&full_name) {
+                            if let Some(idx) = find_column_index(&full_name, all_columns) {
                                 simple_column_indices.push(idx);
-                            } else if let Some(&idx) =
-                                col_index_map_lower.get(&qid.name.value_lower)
+                            } else if let Some(idx) =
+                                find_column_index(&qid.name.value_lower, all_columns)
                             {
                                 simple_column_indices.push(idx);
                             } else {
@@ -5103,8 +5074,23 @@ impl Executor {
             // Fall through to slow path if there are duplicates
         }
 
-        // OPTIMIZATION: Pre-compute table alias lowercase (all_columns_lower computed earlier)
+        // OPTIMIZATION: Pre-compute table alias lowercase
         let table_alias_lower: Option<String> = table_alias.map(|a| a.to_lowercase());
+
+        // Build HashMap lazily - only when fast path doesn't apply
+        // (fast path already returned for simple column queries)
+        let all_columns_lower: Vec<String> = all_columns.iter().map(|c| c.to_lowercase()).collect();
+        let mut col_index_map_lower: FxHashMap<String, usize> = FxHashMap::default();
+        for (i, lower) in all_columns_lower.iter().enumerate() {
+            col_index_map_lower.insert(lower.clone(), i);
+            // Also add unqualified column names for qualified columns
+            if let Some(dot_idx) = lower.rfind('.') {
+                let column_part = &lower[dot_idx + 1..];
+                col_index_map_lower
+                    .entry(column_part.to_string())
+                    .or_insert(i);
+            }
+        }
 
         // For non-correlated queries, use the optimized path with pre-compiled expressions
         if !has_correlated_select {

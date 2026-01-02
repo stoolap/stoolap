@@ -32,7 +32,7 @@ use ahash::AHashSet;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use crate::core::{DataType, Error, Result, Row, Value};
+use crate::core::{Error, Result, Row, Value};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
@@ -1968,43 +1968,16 @@ impl Executor {
         }
         join_op.close()?;
 
-        // Store column counts before moving vectors
-        let cte_col_count = cte_qualified.len();
-        let table_col_count = table_qualified.len();
-
-        // Build all_columns in correct order based on original positions
-        let all_columns: Vec<String> = if cte_on_left {
+        // Build all_columns to match physical row order from Index NL (outer=CTE, inner=table)
+        // This avoids expensive per-row rotation - projections find columns by name
+        let all_columns: Vec<String> = {
             let mut cols = cte_qualified;
             cols.extend(table_qualified);
             cols
-        } else {
-            let mut cols = table_qualified;
-            cols.extend(cte_qualified);
-            cols
         };
 
-        // Reorder columns if CTE was on right (Index NL always puts outer first)
-        let final_rows = if !cte_on_left {
-            // Need to swap column order: CTE columns come before table columns in result
-            // but Index NL puts outer (CTE) first in result, which is wrong when CTE is on right
-            result_rows
-                .into_iter()
-                .map(|row| {
-                    let mut values = Vec::with_capacity(cte_col_count + table_col_count);
-                    // Table columns first (they should be on left)
-                    for i in cte_col_count..(cte_col_count + table_col_count) {
-                        values.push(row.get(i).cloned().unwrap_or(Value::Null(DataType::Null)));
-                    }
-                    // CTE columns second (they should be on right)
-                    for i in 0..cte_col_count {
-                        values.push(row.get(i).cloned().unwrap_or(Value::Null(DataType::Null)));
-                    }
-                    Row::from_values(values)
-                })
-                .collect()
-        } else {
-            result_rows
-        };
+        // No rotation needed - all_columns matches physical order
+        let final_rows = result_rows;
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {

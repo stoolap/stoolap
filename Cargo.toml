@@ -89,10 +89,12 @@ proptest = "1.4"
 tempfile = "3.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
 #duckdb = { version = "1.1", features = ["bundled"] }
+dhat = "0.3"
 
 [features]
 default = ["cli"]
 cli = ["clap", "rustyline", "comfy-table", "dirs"]
+dhat-heap = []
 
 [profile.release]
 lto = true

@@ -87,6 +87,9 @@ pub struct IndexNestedLoopJoinOperator {
     // Optimization: Reusable buffer for row IDs to avoid allocation per outer row
     row_id_buffer: Vec<i64>,
 
+    // Optimization: Reusable row buffer to avoid allocation per join output
+    row_buffer: Row,
+
     // Expression for fetching rows (always true - we apply residual separately)
     true_expr: ConstBoolExpr,
 
@@ -122,6 +125,10 @@ impl IndexNestedLoopJoinOperator {
 
         let inner_col_count = inner_schema.len();
 
+        // Pre-allocate row buffer for typical join output size
+        let outer_col_count = outer.schema().len();
+        let total_cols = outer_col_count + inner_col_count;
+
         Self {
             outer,
             inner_table,
@@ -138,6 +145,8 @@ impl IndexNestedLoopJoinOperator {
             outer_had_match: false,
             // Pre-allocate buffer for typical number of matches (small)
             row_id_buffer: Vec::with_capacity(16),
+            // Pre-allocate row buffer to avoid per-row allocation
+            row_buffer: Row::with_capacity(total_cols),
             true_expr: ConstBoolExpr::true_expr(),
             opened: false,
             outer_exhausted: false,
@@ -175,15 +184,67 @@ impl IndexNestedLoopJoinOperator {
         Row::from_values(vec![Value::null_unknown(); self.inner_col_count])
     }
 
-    /// Combine outer and inner rows into output row.
-    /// Takes ownership of inner row to move values instead of cloning.
-    /// When projection is set, creates projected row directly (2.3x faster).
+    /// Combine outer and inner rows into reusable buffer (owns both).
+    /// OPTIMIZATION: Moves both outer and inner values without cloning.
+    /// Use when outer row is no longer needed (last match for this outer).
     ///
     /// # Safety
     /// Uses `get_unchecked` for performance - projection indices are validated
     /// at query planning time against the table schemas.
     #[inline]
-    fn combine(&self, outer: &Row, inner: Row) -> Row {
+    fn combine_owned_into_buffer(&mut self, outer: Row, inner: Row) {
+        match &self.projection {
+            Some(proj) => {
+                // Fused projection into buffer
+                let vec = self.row_buffer.as_mut_slice_with_capacity(
+                    proj.outer_indices.len() + proj.inner_indices.len(),
+                );
+                vec.clear();
+
+                // OPTIMIZATION: Move outer values instead of cloning (we own outer)
+                let mut outer_values = outer.into_values();
+                // SAFETY: outer_indices validated at planning time against outer table schema
+                for &idx in &proj.outer_indices {
+                    vec.push(std::mem::take(unsafe {
+                        outer_values.get_unchecked_mut(idx)
+                    }));
+                }
+
+                // OPTIMIZATION: Move inner values instead of cloning (we own inner)
+                let mut inner_values = inner.into_values();
+                // SAFETY: inner_indices validated at planning time against inner table schema
+                for &idx in &proj.inner_indices {
+                    vec.push(std::mem::take(unsafe {
+                        inner_values.get_unchecked_mut(idx)
+                    }));
+                }
+            }
+            None => {
+                // Use combine_into_owned for buffer reuse
+                self.row_buffer.combine_into_owned(outer, inner);
+            }
+        }
+    }
+
+    /// Take the combined row from the buffer, preserving buffer capacity.
+    /// OPTIMIZATION: Replaces buffer contents with new Vec of same capacity,
+    /// enabling allocator reuse and consistent allocation patterns.
+    #[inline]
+    fn take_from_buffer(&mut self) -> Row {
+        let vec = self.row_buffer.as_mut_slice_with_capacity(0);
+        let capacity = vec.capacity();
+        let values = std::mem::replace(vec, Vec::with_capacity(capacity));
+        Row::from_values(values)
+    }
+
+    /// Create combined row directly (for cases where buffer can't be used).
+    /// When projection is set, creates projected row directly.
+    ///
+    /// # Safety
+    /// Uses `get_unchecked` for performance - projection indices are validated
+    /// at query planning time against the table schemas.
+    #[inline]
+    fn create_combined_row(&self, outer: &Row, inner: Row) -> Row {
         match &self.projection {
             Some(proj) => {
                 // Fused projection: create only the columns we need
@@ -309,26 +370,24 @@ impl Operator for IndexNestedLoopJoinOperator {
                 return Ok(None);
             }
 
-            let outer_row = match &self.current_outer_row {
-                Some(row) => row,
-                None => {
-                    if !self.advance_outer()? {
-                        return Ok(None);
-                    }
-                    self.current_outer_row.as_ref().unwrap()
-                }
-            };
+            // Ensure we have an outer row
+            if self.current_outer_row.is_none() && !self.advance_outer()? {
+                return Ok(None);
+            }
 
             // Try to find a match in current inner rows
-            while self.current_inner_idx < self.current_inner_rows.len() {
+            let inner_len = self.current_inner_rows.len();
+            while self.current_inner_idx < inner_len {
                 let inner_idx = self.current_inner_idx;
                 self.current_inner_idx += 1;
 
-                // Apply residual filter if present (borrow inner_row for check)
+                // Check filter with borrowed references first
                 let passes_filter = {
-                    let inner_row = &self.current_inner_rows[inner_idx].1;
+                    let outer_row = self.current_outer_row.as_ref().unwrap();
+                    // SAFETY: inner_idx < inner_len checked by while condition
+                    let inner_entry = unsafe { self.current_inner_rows.get_unchecked(inner_idx) };
                     if let Some(ref filter) = self.residual_filter {
-                        filter.matches(outer_row, inner_row)
+                        filter.matches(outer_row, &inner_entry.1)
                     } else {
                         true
                     }
@@ -336,10 +395,28 @@ impl Operator for IndexNestedLoopJoinOperator {
 
                 if passes_filter {
                     self.outer_had_match = true;
-                    // Take ownership of inner row - we only visit each row once
-                    let inner_row = std::mem::take(&mut self.current_inner_rows[inner_idx].1);
-                    let combined = self.combine(outer_row, inner_row);
-                    return Ok(Some(RowRef::Owned(combined)));
+                    // SAFETY: inner_idx < inner_len, bounds already checked
+                    let inner_row = std::mem::take(unsafe {
+                        &mut self.current_inner_rows.get_unchecked_mut(inner_idx).1
+                    });
+
+                    // OPTIMIZATION: Check if this is the last inner row to check
+                    // If so, we can take ownership of outer_row and move its values
+                    let is_last_inner = self.current_inner_idx >= inner_len;
+                    if is_last_inner {
+                        // No more inner rows - take ownership of outer and move values
+                        let outer_row = self.current_outer_row.take().unwrap();
+                        self.combine_owned_into_buffer(outer_row, inner_row);
+                        // Pre-advance to next outer for next call
+                        self.advance_outer()?;
+                        return Ok(Some(RowRef::Owned(self.take_from_buffer())));
+                    } else {
+                        // More inner rows to check - create combined row directly
+                        // (Can't use buffer here due to borrow of current_outer_row)
+                        let outer_row = self.current_outer_row.as_ref().unwrap();
+                        let combined = self.create_combined_row(outer_row, inner_row);
+                        return Ok(Some(RowRef::Owned(combined)));
+                    }
                 }
             }
 
@@ -349,9 +426,9 @@ impl Operator for IndexNestedLoopJoinOperator {
                 let outer_row = self.current_outer_row.take().unwrap();
                 self.advance_outer()?;
                 let null_inner = self.null_inner_row();
-                // Use combine method to respect projection settings
-                let combined = self.combine(&outer_row, null_inner);
-                return Ok(Some(RowRef::Owned(combined)));
+                // OPTIMIZATION: Use buffer-based combine since we own outer_row
+                self.combine_owned_into_buffer(outer_row, null_inner);
+                return Ok(Some(RowRef::Owned(self.take_from_buffer())));
             }
 
             // Move to next outer row
