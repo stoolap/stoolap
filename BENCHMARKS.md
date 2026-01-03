@@ -1,6 +1,6 @@
-# Stoolap vs SQLite Benchmark Results
+# Stoolap (v0.2.0) vs SQLite Benchmark Results
 
-Comprehensive performance comparison between Stoolap and SQLite using identical workloads.
+Performance comparison between Stoolap and SQLite using identical workloads.
 
 ## Test Configuration
 
@@ -9,14 +9,14 @@ Comprehensive performance comparison between Stoolap and SQLite using identical 
 | Rows | 10,000 |
 | Iterations | 500 |
 | Mode | In-memory |
-| SQLite Version | Latest (rusqlite) |
+| SQLite Version | rusqlite (v0.32.1) |
 
 ## Overall Score
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                             │
-│   STOOLAP    45 wins   ███████████████████████████████████████████ │
+│   STOOLAP    45 wins   █████████████████████████████████    │
 │   SQLite      8 wins   ████████                             │
 │                                                             │
 │   Win Rate: 84.9%                                           │
