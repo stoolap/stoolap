@@ -3005,7 +3005,7 @@ impl ExprVM {
 
     /// Parse interval string into Duration
     fn parse_interval(&self, s: &str) -> Option<chrono::Duration> {
-        let s = s.trim().to_lowercase();
+        let s = s.trim();
         let parts: Vec<&str> = s.split_whitespace().collect();
 
         if parts.len() < 2 {
@@ -3017,19 +3017,42 @@ impl ExprVM {
         }
 
         let value: i64 = parts[0].parse().ok()?;
-        let unit = parts[1].trim_end_matches('s'); // Remove trailing 's'
+        let unit = parts[1];
 
-        match unit {
-            "year" => Some(chrono::Duration::days(value * 365)),
-            "month" => Some(chrono::Duration::days(value * 30)),
-            "week" => Some(chrono::Duration::weeks(value)),
-            "day" => Some(chrono::Duration::days(value)),
-            "hour" => Some(chrono::Duration::hours(value)),
-            "minute" | "min" => Some(chrono::Duration::minutes(value)),
-            "second" | "sec" => Some(chrono::Duration::seconds(value)),
-            "millisecond" | "ms" => Some(chrono::Duration::milliseconds(value)),
-            "microsecond" | "us" => Some(chrono::Duration::microseconds(value)),
-            _ => None,
+        // Case-insensitive unit matching without allocation
+        // Handle both singular and plural forms
+        if unit.eq_ignore_ascii_case("year") || unit.eq_ignore_ascii_case("years") {
+            Some(chrono::Duration::days(value * 365))
+        } else if unit.eq_ignore_ascii_case("month") || unit.eq_ignore_ascii_case("months") {
+            Some(chrono::Duration::days(value * 30))
+        } else if unit.eq_ignore_ascii_case("week") || unit.eq_ignore_ascii_case("weeks") {
+            Some(chrono::Duration::weeks(value))
+        } else if unit.eq_ignore_ascii_case("day") || unit.eq_ignore_ascii_case("days") {
+            Some(chrono::Duration::days(value))
+        } else if unit.eq_ignore_ascii_case("hour") || unit.eq_ignore_ascii_case("hours") {
+            Some(chrono::Duration::hours(value))
+        } else if unit.eq_ignore_ascii_case("minute")
+            || unit.eq_ignore_ascii_case("minutes")
+            || unit.eq_ignore_ascii_case("min")
+        {
+            Some(chrono::Duration::minutes(value))
+        } else if unit.eq_ignore_ascii_case("second")
+            || unit.eq_ignore_ascii_case("seconds")
+            || unit.eq_ignore_ascii_case("sec")
+        {
+            Some(chrono::Duration::seconds(value))
+        } else if unit.eq_ignore_ascii_case("millisecond")
+            || unit.eq_ignore_ascii_case("milliseconds")
+            || unit.eq_ignore_ascii_case("ms")
+        {
+            Some(chrono::Duration::milliseconds(value))
+        } else if unit.eq_ignore_ascii_case("microsecond")
+            || unit.eq_ignore_ascii_case("microseconds")
+            || unit.eq_ignore_ascii_case("us")
+        {
+            Some(chrono::Duration::microseconds(value))
+        } else {
+            None
         }
     }
 

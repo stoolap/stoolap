@@ -38,6 +38,25 @@ use crate::core::{Result, Row, Value};
 use crate::executor::hash_table::{hash_row_keys, verify_key_equality, JoinHashTable};
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 
+/// Pre-computed column names to avoid format! allocations in hot paths.
+/// Covers most common cases (up to 32 columns).
+const BUILD_COLUMN_NAMES: [&str; 32] = [
+    "build_0", "build_1", "build_2", "build_3", "build_4", "build_5", "build_6", "build_7",
+    "build_8", "build_9", "build_10", "build_11", "build_12", "build_13", "build_14", "build_15",
+    "build_16", "build_17", "build_18", "build_19", "build_20", "build_21", "build_22", "build_23",
+    "build_24", "build_25", "build_26", "build_27", "build_28", "build_29", "build_30", "build_31",
+];
+
+/// Get a build column name efficiently, using pre-computed names when possible.
+#[inline]
+fn get_build_column_name(i: usize) -> String {
+    if i < BUILD_COLUMN_NAMES.len() {
+        BUILD_COLUMN_NAMES[i].to_string()
+    } else {
+        format!("build_{}", i)
+    }
+}
+
 /// Which side of the join to use as the build side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinSide {
@@ -275,11 +294,13 @@ impl HashJoinOperator {
         };
 
         // Build schema based on build side position
-        let mut schema = Vec::new();
+        // Pre-allocate schema with known capacity
+        let total_cols = build_col_count + probe_col_count;
+        let mut schema = Vec::with_capacity(total_cols);
         let (left_col_count, right_col_count) = if build_is_left {
             // Build is left: [build_cols, probe_cols]
             for i in 0..build_col_count {
-                schema.push(ColumnInfo::new(format!("build_{}", i)));
+                schema.push(ColumnInfo::new(get_build_column_name(i)));
             }
             schema.extend(probe.schema().iter().cloned());
             (build_col_count, probe_col_count)
@@ -287,7 +308,7 @@ impl HashJoinOperator {
             // Build is right: [probe_cols, build_cols]
             schema.extend(probe.schema().iter().cloned());
             for i in 0..build_col_count {
-                schema.push(ColumnInfo::new(format!("build_{}", i)));
+                schema.push(ColumnInfo::new(get_build_column_name(i)));
             }
             (probe_col_count, build_col_count)
         };

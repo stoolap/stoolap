@@ -350,9 +350,10 @@ pub struct BatchAggregateLookupInfo {
 }
 
 // Cache for batch aggregate lookup info to avoid recomputing per row.
-// The key is the subquery SQL string, the value is the pre-computed lookup info.
+// The key is the subquery pointer address (usize), avoiding expensive to_string() per row.
+// Value is Arc-wrapped to avoid cloning strings on every lookup.
 thread_local! {
-    static BATCH_AGGREGATE_INFO_CACHE: RefCell<FxHashMap<String, Option<BatchAggregateLookupInfo>>> = RefCell::new(FxHashMap::default());
+    static BATCH_AGGREGATE_INFO_CACHE: RefCell<FxHashMap<usize, Option<Arc<BatchAggregateLookupInfo>>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the batch aggregate info cache.
@@ -364,18 +365,28 @@ pub fn clear_batch_aggregate_info_cache() {
     });
 }
 
-/// Get cached batch aggregate lookup info by subquery string.
+/// Get cached batch aggregate lookup info by subquery pointer address.
+/// Returns Arc to avoid cloning strings on every lookup.
+#[inline]
 pub fn get_cached_batch_aggregate_info(
-    subquery_key: &str,
-) -> Option<Option<BatchAggregateLookupInfo>> {
-    BATCH_AGGREGATE_INFO_CACHE.with(|cache| cache.borrow().get(subquery_key).cloned())
+    subquery_ptr: usize,
+) -> Option<Option<Arc<BatchAggregateLookupInfo>>> {
+    BATCH_AGGREGATE_INFO_CACHE.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
 }
 
-/// Cache batch aggregate lookup info (None means not batchable).
-pub fn cache_batch_aggregate_info(subquery_key: String, info: Option<BatchAggregateLookupInfo>) {
+/// Cache batch aggregate lookup info and return the Arc-wrapped version.
+/// Returns None if info was None (not batchable).
+#[inline]
+pub fn cache_batch_aggregate_info(
+    subquery_ptr: usize,
+    info: Option<BatchAggregateLookupInfo>,
+) -> Option<Arc<BatchAggregateLookupInfo>> {
+    let arc_info = info.map(Arc::new);
+    let result = arc_info.clone();
     BATCH_AGGREGATE_INFO_CACHE.with(|cache| {
-        cache.borrow_mut().insert(subquery_key, info);
+        cache.borrow_mut().insert(subquery_ptr, arc_info);
     });
+    result
 }
 
 use crate::parser::ast::Expression;
@@ -404,8 +415,9 @@ pub struct ExistsCorrelationInfo {
 
 // Cache for EXISTS correlation info to avoid per-row extraction.
 // The key is the subquery pointer address (usize), avoiding format! allocation.
+// Value is Arc-wrapped to avoid cloning strings on every lookup.
 thread_local! {
-    static EXISTS_CORRELATION_CACHE: RefCell<FxHashMap<usize, Option<ExistsCorrelationInfo>>> = RefCell::new(FxHashMap::default());
+    static EXISTS_CORRELATION_CACHE: RefCell<FxHashMap<usize, Option<Arc<ExistsCorrelationInfo>>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the EXISTS correlation cache.
@@ -416,17 +428,27 @@ pub fn clear_exists_correlation_cache() {
 }
 
 /// Get cached EXISTS correlation info by subquery pointer address.
+/// Returns Arc to avoid cloning strings on every lookup.
 #[inline]
-pub fn get_cached_exists_correlation(subquery_ptr: usize) -> Option<Option<ExistsCorrelationInfo>> {
+pub fn get_cached_exists_correlation(
+    subquery_ptr: usize,
+) -> Option<Option<Arc<ExistsCorrelationInfo>>> {
     EXISTS_CORRELATION_CACHE.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
 }
 
-/// Cache EXISTS correlation info (None means correlation not extractable).
+/// Cache EXISTS correlation info and return the Arc-wrapped version.
+/// Returns None if info was None (correlation not extractable).
 #[inline]
-pub fn cache_exists_correlation(subquery_ptr: usize, info: Option<ExistsCorrelationInfo>) {
+pub fn cache_exists_correlation(
+    subquery_ptr: usize,
+    info: Option<ExistsCorrelationInfo>,
+) -> Option<Arc<ExistsCorrelationInfo>> {
+    let arc_info = info.map(Arc::new);
+    let result = arc_info.clone();
     EXISTS_CORRELATION_CACHE.with(|cache| {
-        cache.borrow_mut().insert(subquery_ptr, info);
+        cache.borrow_mut().insert(subquery_ptr, arc_info);
     });
+    result
 }
 
 /// Execution context for SQL queries

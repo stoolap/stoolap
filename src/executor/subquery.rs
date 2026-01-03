@@ -429,9 +429,9 @@ impl Executor {
                         index_cache_key,
                     }
                 });
-                cache_exists_correlation(subquery_ptr, cached_info.clone());
-                match cached_info {
-                    Some(c) => c,
+                // cache_exists_correlation returns the Arc-wrapped version
+                match cache_exists_correlation(subquery_ptr, cached_info) {
+                    Some(arc) => arc,
                     None => return Ok(None),
                 }
             }
@@ -746,9 +746,9 @@ impl Executor {
                         index_cache_key,
                     }
                 });
-                cache_exists_correlation(subquery_ptr, cached_info.clone());
-                match cached_info {
-                    Some(c) => c,
+                // cache_exists_correlation returns the Arc-wrapped version
+                match cache_exists_correlation(subquery_ptr, cached_info) {
+                    Some(arc) => arc,
                     None => return Ok(None),
                 }
             }
@@ -872,15 +872,14 @@ impl Executor {
         // Need outer row context for correlated subquery
         let outer_row = ctx.outer_row()?;
 
-        // Get or compute lookup info (cached to avoid per-row allocations)
-        let subquery_key = subquery.to_string();
-        let lookup_info = match get_cached_batch_aggregate_info(&subquery_key) {
+        // Use pointer address as cache key (O(1) vs O(n) for to_string())
+        let subquery_ptr = subquery as *const _ as usize;
+        let lookup_info = match get_cached_batch_aggregate_info(subquery_ptr) {
             Some(cached) => cached?,
             None => {
                 // First time: compute and cache the lookup info
                 let info = Self::compute_batch_aggregate_info(subquery);
-                cache_batch_aggregate_info(subquery_key, info.clone());
-                info?
+                cache_batch_aggregate_info(subquery_ptr, info)?
             }
         };
 
@@ -2778,18 +2777,16 @@ impl Executor {
             inner_table.collect_all_rows(storage_expr.as_ref().map(|e| e.as_ref()))?;
 
         // Find the inner column index for join key extraction
-        let inner_columns: Vec<String> = inner_table
-            .schema()
-            .columns
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
+        // Use schema's cached lowercase column names to avoid computing to_lowercase()
+        let inner_schema = inner_table.schema();
+        let inner_columns = inner_schema.column_names_arc();
+        let inner_columns_lower = inner_schema.column_names_lower_arc();
 
         let inner_key_source_idx = {
             let search_col = info.inner_column.to_lowercase();
-            inner_columns
+            inner_columns_lower
                 .iter()
-                .position(|c| c.to_lowercase() == search_col)
+                .position(|c| c == &search_col)
                 .ok_or_else(|| {
                     Error::internal(format!(
                         "Anti-join inner key column '{}' not found in table columns: {:?}",
@@ -2818,16 +2815,19 @@ impl Executor {
         }
 
         // Find the outer column index for join key
+        // OPTIMIZATION: Pre-compute lowercase column names once to avoid per-column to_lowercase()
+        let outer_columns_lower: Vec<String> =
+            outer_columns.iter().map(|c| c.to_lowercase()).collect();
+
         let outer_key_idx = {
             let search_col = info.outer_column.to_lowercase();
             let search_suffix = format!(".{}", search_col); // Pre-compute once outside loop
-            outer_columns
+            outer_columns_lower
                 .iter()
                 .position(|c| {
-                    let col_lower = c.to_lowercase();
-                    col_lower == search_col
-                        || col_lower.ends_with(&search_suffix)
-                        || col_lower.split('.').next_back() == Some(&search_col)
+                    c == &search_col
+                        || c.ends_with(&search_suffix)
+                        || c.split('.').next_back() == Some(search_col.as_str())
                 })
                 .ok_or_else(|| {
                     Error::internal(format!(

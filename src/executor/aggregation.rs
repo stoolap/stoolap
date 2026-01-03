@@ -4476,7 +4476,6 @@ impl Executor {
         &self,
         table: &dyn crate::storage::traits::Table,
         stmt: &SelectStatement,
-        all_columns: &[String],
         _ctx: &super::context::ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
@@ -4533,11 +4532,12 @@ impl Executor {
             }
         }
 
-        // Build column index map
-        let col_index_map: rustc_hash::FxHashMap<String, usize> = all_columns
+        // Build column index map using schema's cached lowercase column names
+        let schema_lower = table.schema().column_names_lower_arc();
+        let col_index_map: rustc_hash::FxHashMap<String, usize> = schema_lower
             .iter()
             .enumerate()
-            .map(|(i, c)| (c.to_lowercase(), i))
+            .map(|(i, c)| (c.clone(), i))
             .collect();
 
         // Compute each aggregate
@@ -4647,6 +4647,259 @@ impl Executor {
         Ok(Some(Box::new(super::result::ExecutorMemoryResult::new(
             result_columns,
             vec![row],
+        ))))
+    }
+
+    /// Try to compute global aggregates using streaming (no row materialization).
+    ///
+    /// This is a fallback for queries that can't use direct aggregation pushdown,
+    /// but can still avoid collecting all rows by streaming through a scanner.
+    ///
+    /// Examples of eligible queries:
+    /// - `SELECT AVG(col) * 100 FROM table`  (expression wrapping aggregate)
+    /// - `SELECT SUM(col), COUNT(*) FROM table`  (multiple simple aggregates)
+    ///
+    /// # Returns
+    /// - `Some(result)` if streaming aggregation was used
+    /// - `None` if the query is not eligible for streaming
+    pub(crate) fn try_streaming_global_aggregation(
+        &self,
+        table: &dyn crate::storage::traits::Table,
+        stmt: &SelectStatement,
+        ctx: &super::context::ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
+    ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
+        // Quick eligibility checks using cached classification
+        if classification.has_where {
+            return Ok(None);
+        }
+        if classification.has_group_by {
+            return Ok(None);
+        }
+        if classification.has_having {
+            return Ok(None);
+        }
+        if classification.has_window_functions {
+            return Ok(None);
+        }
+        if classification.has_order_by {
+            return Ok(None);
+        }
+        if classification.has_limit {
+            return Ok(None);
+        }
+
+        // Parse aggregations - allow non-pure expressions (like AVG(col) * 100)
+        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
+
+        // Must have only aggregations, no regular columns
+        if !non_agg_columns.is_empty() {
+            return Ok(None);
+        }
+        if aggregations.is_empty() {
+            return Ok(None);
+        }
+
+        // Check all aggregations are simple enough for streaming
+        // (no ORDER BY, no FILTER, no DISTINCT except COUNT, no expression arguments)
+        for agg in &aggregations {
+            if !agg.order_by.is_empty() || agg.filter.is_some() {
+                return Ok(None);
+            }
+            if agg.distinct && agg.name != "COUNT" {
+                return Ok(None);
+            }
+            // Can't handle expression arguments like SUM(a + b) - need full evaluation
+            if agg.expression.is_some() {
+                return Ok(None);
+            }
+            // Only support COUNT, SUM, MIN, MAX, AVG for streaming
+            match agg.name.as_str() {
+                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {}
+                _ => return Ok(None),
+            }
+        }
+
+        // Build column index map using schema's cached lowercase column names
+        let schema_lower = table.schema().column_names_lower_arc();
+        let col_index_map: rustc_hash::FxHashMap<String, usize> = schema_lower
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), i))
+            .collect();
+
+        // Pre-compute column indices for each aggregation
+        let agg_col_indices: Vec<Option<usize>> = aggregations
+            .iter()
+            .map(|agg| {
+                if agg.column == "*" || agg.expression.is_some() {
+                    None
+                } else {
+                    Self::lookup_column_index(&agg.column_lower, &col_index_map)
+                }
+            })
+            .collect();
+
+        // Initialize aggregate states
+        struct AggState {
+            sum: f64,
+            count: i64,
+            min: Option<Value>,
+            max: Option<Value>,
+            distinct_set: Option<ahash::AHashSet<u64>>,
+        }
+
+        let mut states: Vec<AggState> = aggregations
+            .iter()
+            .map(|agg| AggState {
+                sum: 0.0,
+                count: 0,
+                min: None,
+                max: None,
+                distinct_set: if agg.distinct {
+                    Some(ahash::AHashSet::new())
+                } else {
+                    None
+                },
+            })
+            .collect();
+
+        // Get a scanner and stream through rows
+        let mut scanner = table.scan(&[], None)?;
+
+        while scanner.next() {
+            let row = scanner.row();
+
+            for (i, agg) in aggregations.iter().enumerate() {
+                let state = &mut states[i];
+
+                if agg.column == "*" {
+                    // COUNT(*)
+                    state.count += 1;
+                    continue;
+                }
+
+                let col_idx = match agg_col_indices[i] {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+
+                let value = match row.get(col_idx) {
+                    Some(v) if !v.is_null() => v,
+                    _ => continue, // Skip NULL values
+                };
+
+                // Handle DISTINCT
+                if let Some(ref mut distinct_set) = state.distinct_set {
+                    let hash = {
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = ahash::AHasher::default();
+                        match value {
+                            Value::Integer(i) => i.hash(&mut hasher),
+                            Value::Float(f) => f.to_bits().hash(&mut hasher),
+                            Value::Text(s) => s.hash(&mut hasher),
+                            Value::Boolean(b) => b.hash(&mut hasher),
+                            _ => continue,
+                        }
+                        hasher.finish()
+                    };
+                    if !distinct_set.insert(hash) {
+                        continue; // Already seen this value
+                    }
+                }
+
+                match agg.name.as_str() {
+                    "COUNT" => {
+                        state.count += 1;
+                    }
+                    "SUM" | "AVG" => {
+                        let num = match value {
+                            Value::Integer(i) => *i as f64,
+                            Value::Float(f) => *f,
+                            _ => continue,
+                        };
+                        state.sum += num;
+                        state.count += 1;
+                    }
+                    "MIN" => {
+                        let is_smaller = match (&state.min, value) {
+                            (None, _) => true,
+                            (Some(current), new) => {
+                                new.compare(current).unwrap_or(std::cmp::Ordering::Equal)
+                                    == std::cmp::Ordering::Less
+                            }
+                        };
+                        if is_smaller {
+                            state.min = Some(value.clone());
+                        }
+                    }
+                    "MAX" => {
+                        let is_larger = match (&state.max, value) {
+                            (None, _) => true,
+                            (Some(current), new) => {
+                                new.compare(current).unwrap_or(std::cmp::Ordering::Equal)
+                                    == std::cmp::Ordering::Greater
+                            }
+                        };
+                        if is_larger {
+                            state.max = Some(value.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        scanner.close()?;
+
+        // Build intermediate result columns (raw aggregate values)
+        let mut agg_result_values: Vec<Value> = Vec::with_capacity(aggregations.len());
+        let mut agg_result_columns: Vec<String> = Vec::with_capacity(aggregations.len());
+
+        for (i, agg) in aggregations.iter().enumerate() {
+            let state = &states[i];
+            agg_result_columns.push(agg.get_column_name());
+
+            let value = match agg.name.as_str() {
+                "COUNT" => Value::Integer(state.count),
+                "SUM" => {
+                    if state.count == 0 {
+                        Value::null(crate::core::DataType::Float)
+                    } else if state.sum.fract() == 0.0 && state.sum.abs() < i64::MAX as f64 {
+                        Value::Integer(state.sum as i64)
+                    } else {
+                        Value::Float(state.sum)
+                    }
+                }
+                "AVG" => {
+                    if state.count == 0 {
+                        Value::null(crate::core::DataType::Float)
+                    } else {
+                        Value::Float(state.sum / state.count as f64)
+                    }
+                }
+                "MIN" => state
+                    .min
+                    .clone()
+                    .unwrap_or_else(|| Value::null(crate::core::DataType::Integer)),
+                "MAX" => state
+                    .max
+                    .clone()
+                    .unwrap_or_else(|| Value::null(crate::core::DataType::Integer)),
+                _ => Value::null(crate::core::DataType::Integer),
+            };
+            agg_result_values.push(value);
+        }
+
+        // Apply post-aggregation expressions if needed
+        // This handles cases like AVG(col) * 100
+        let agg_row = Row::from_values(agg_result_values);
+        let (final_columns, final_rows) =
+            self.apply_post_aggregation_expressions(stmt, ctx, agg_result_columns, vec![agg_row])?;
+
+        Ok(Some(Box::new(super::result::ExecutorMemoryResult::new(
+            final_columns,
+            final_rows,
         ))))
     }
 }

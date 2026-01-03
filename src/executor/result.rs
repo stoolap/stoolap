@@ -582,8 +582,8 @@ pub struct ExprMappedResult {
     current_row: Row,
     /// Output column names
     output_columns: Vec<String>,
-    /// Source columns (cached for QualifiedStar matching)
-    source_columns: Vec<String>,
+    /// Pre-computed lowercase source columns (avoids per-row to_lowercase())
+    source_columns_lower: Vec<String>,
 }
 
 // ExprMappedResult is Send because all fields are Send:
@@ -630,13 +630,17 @@ impl ExprMappedResult {
             projections.push(projection);
         }
 
+        // Pre-compute lowercase source columns to avoid per-row to_lowercase() calls
+        let source_columns_lower: Vec<String> =
+            source_columns.iter().map(|c| c.to_lowercase()).collect();
+
         Ok(Self {
             inner,
             projections,
             vm: super::expression::ExprVM::new(),
             current_row: Row::new(),
             output_columns,
-            source_columns,
+            source_columns_lower,
         })
     }
 
@@ -677,10 +681,9 @@ impl QueryResult for ExprMappedResult {
                     }
                     CompiledProjection::QualifiedStar { prefix_lower, .. } => {
                         // Expand columns for specific table/alias
-                        for (idx, col) in self.source_columns.iter().enumerate() {
-                            if col.to_lowercase().starts_with(prefix_lower)
-                                && idx < source_row.len()
-                            {
+                        // Use pre-computed lowercase columns to avoid per-row to_lowercase()
+                        for (idx, col_lower) in self.source_columns_lower.iter().enumerate() {
+                            if col_lower.starts_with(prefix_lower) && idx < source_row.len() {
                                 result_row.push(source_row[idx].clone());
                             }
                         }

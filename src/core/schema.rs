@@ -202,6 +202,9 @@ pub struct Schema {
 
     /// Cached primary key indices (computed lazily on first access)
     pk_indices_cache: OnceLock<Arc<Vec<usize>>>,
+
+    /// Cached lowercase column names (computed lazily on first access)
+    column_names_lower_cache: OnceLock<Arc<Vec<String>>>,
 }
 
 impl Clone for Schema {
@@ -228,6 +231,11 @@ impl Clone for Schema {
             let _ = pk_indices_cache.set(Arc::clone(indices));
         }
 
+        let column_names_lower_cache = OnceLock::new();
+        if let Some(names) = self.column_names_lower_cache.get() {
+            let _ = column_names_lower_cache.set(Arc::clone(names));
+        }
+
         Self {
             table_name: self.table_name.clone(),
             table_name_lower: self.table_name_lower.clone(),
@@ -238,6 +246,7 @@ impl Clone for Schema {
             pk_column_index_cache,
             column_index_map_cache,
             pk_indices_cache,
+            column_names_lower_cache,
         }
     }
 }
@@ -291,6 +300,11 @@ impl Schema {
                 .collect(),
         ));
 
+        let column_names_lower_cache = OnceLock::new();
+        let _ = column_names_lower_cache.set(Arc::new(
+            columns.iter().map(|c| c.name_lower.clone()).collect(),
+        ));
+
         Self {
             table_name: name,
             table_name_lower: name_lower,
@@ -301,6 +315,7 @@ impl Schema {
             pk_column_index_cache,
             column_index_map_cache,
             pk_indices_cache,
+            column_names_lower_cache,
         }
     }
 
@@ -345,6 +360,11 @@ impl Schema {
                 .collect(),
         ));
 
+        let column_names_lower_cache = OnceLock::new();
+        let _ = column_names_lower_cache.set(Arc::new(
+            columns.iter().map(|c| c.name_lower.clone()).collect(),
+        ));
+
         Self {
             table_name: name,
             table_name_lower: name_lower,
@@ -355,6 +375,7 @@ impl Schema {
             pk_column_index_cache,
             column_index_map_cache,
             pk_indices_cache,
+            column_names_lower_cache,
         }
     }
 
@@ -427,6 +448,19 @@ impl Schema {
         Arc::clone(
             self.column_names_cache
                 .get_or_init(|| Arc::new(self.columns.iter().map(|c| c.name.clone()).collect())),
+        )
+    }
+
+    /// Get lowercase column names as Arc for zero-copy sharing
+    ///
+    /// Uses the pre-computed `name_lower` from each SchemaColumn, avoiding
+    /// per-query `to_lowercase()` calls.
+    #[inline]
+    pub fn column_names_lower_arc(&self) -> Arc<Vec<String>> {
+        Arc::clone(
+            self.column_names_lower_cache.get_or_init(|| {
+                Arc::new(self.columns.iter().map(|c| c.name_lower.clone()).collect())
+            }),
         )
     }
 
@@ -535,6 +569,12 @@ impl Schema {
                 .filter(|(_, c)| c.primary_key)
                 .map(|(i, _)| i)
                 .collect(),
+        ));
+
+        // Rebuild lowercase column names cache
+        self.column_names_lower_cache = OnceLock::new();
+        let _ = self.column_names_lower_cache.set(Arc::new(
+            self.columns.iter().map(|c| c.name_lower.clone()).collect(),
         ));
     }
 

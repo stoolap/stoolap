@@ -1110,14 +1110,24 @@ impl CompiledFilter {
             // Scalar function expressions
             CompiledFilter::UpperEq { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.to_uppercase() == value.as_ref()
+                    // Use ASCII fast path when possible, fall back to Unicode
+                    if s.is_ascii() && value.is_ascii() {
+                        s.eq_ignore_ascii_case(value.as_ref())
+                    } else {
+                        s.to_uppercase() == value.as_ref()
+                    }
                 } else {
                     false
                 }
             }
             CompiledFilter::LowerEq { col_idx, value } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    s.to_lowercase() == value.as_ref()
+                    // Use ASCII fast path when possible, fall back to Unicode
+                    if s.is_ascii() && value.is_ascii() {
+                        s.eq_ignore_ascii_case(value.as_ref())
+                    } else {
+                        s.to_lowercase() == value.as_ref()
+                    }
                 } else {
                     false
                 }
@@ -1419,16 +1429,24 @@ impl CompiledFilter {
             // Scalar function expressions
             CompiledFilter::UpperEq { col_idx, value } => {
                 if let Value::Text(s) = get_val!(col_idx) {
-                    // Unicode-aware uppercase comparison
-                    s.to_uppercase() == value.as_ref()
+                    // Use ASCII fast path when possible, fall back to Unicode
+                    if s.is_ascii() && value.is_ascii() {
+                        s.eq_ignore_ascii_case(value.as_ref())
+                    } else {
+                        s.to_uppercase() == value.as_ref()
+                    }
                 } else {
                     false
                 }
             }
             CompiledFilter::LowerEq { col_idx, value } => {
                 if let Value::Text(s) = get_val!(col_idx) {
-                    // Unicode-aware lowercase comparison
-                    s.to_lowercase() == value.as_ref()
+                    // Use ASCII fast path when possible, fall back to Unicode
+                    if s.is_ascii() && value.is_ascii() {
+                        s.eq_ignore_ascii_case(value.as_ref())
+                    } else {
+                        s.to_lowercase() == value.as_ref()
+                    }
                 } else {
                     false
                 }
@@ -1826,6 +1844,62 @@ mod tests {
         assert!(filter.matches(&row1));
         assert!(!filter.matches(&row2));
         assert!(filter.matches(&row3));
+    }
+
+    #[test]
+    fn test_underscore_pattern_matching() {
+        // This pattern has an underscore which is a LIKE wildcard
+        let pattern = CompiledPattern::compile("NAME_1%", false);
+        println!("Pattern type: {:?}", pattern);
+
+        // Test direct pattern matching
+        assert!(
+            pattern.matches("NAME_1", false),
+            "NAME_1 should match NAME_1%"
+        );
+        assert!(
+            pattern.matches("NAME_10", false),
+            "NAME_10 should match NAME_1%"
+        );
+        assert!(
+            !pattern.matches("NAME_0", false),
+            "NAME_0 should NOT match NAME_1%"
+        );
+        assert!(
+            !pattern.matches("NAME_2", false),
+            "NAME_2 should NOT match NAME_1%"
+        );
+    }
+
+    #[test]
+    fn test_underscore_pattern_no_trailing_percent() {
+        // Pattern without trailing % - exact length match with wildcards
+        let pattern = CompiledPattern::compile("NAME__", false);
+        println!("Pattern type: {:?}", pattern);
+
+        // Should match 6-character strings starting with NAME
+        assert!(
+            pattern.matches("NAME_1", false),
+            "NAME_1 should match NAME__"
+        );
+        assert!(
+            pattern.matches("NAME_0", false),
+            "NAME_0 should match NAME__"
+        );
+        assert!(
+            pattern.matches("NAMEZZ", false),
+            "NAMEZZ should match NAME__"
+        );
+
+        // Should NOT match different lengths
+        assert!(
+            !pattern.matches("NAME_10", false),
+            "NAME_10 should NOT match NAME__ (too long)"
+        );
+        assert!(
+            !pattern.matches("NAME_", false),
+            "NAME_ should NOT match NAME__ (too short)"
+        );
     }
 
     #[test]

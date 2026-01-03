@@ -266,6 +266,38 @@ pub trait Table: Send + Sync {
         setter: &mut dyn FnMut(Row) -> (Row, bool),
     ) -> Result<i32>;
 
+    /// Updates rows by their row IDs directly (O(k) lookup instead of O(n) scan).
+    ///
+    /// This is an optimization for UPDATE with IN subquery on INTEGER PRIMARY KEY.
+    /// Instead of scanning all rows and filtering, we directly look up the specific row IDs.
+    ///
+    /// # Arguments
+    /// * `row_ids` - The row IDs to update (should be sorted for cache locality)
+    /// * `setter` - Function that transforms a row in place, returns true if changed
+    ///
+    /// # Returns
+    /// The number of rows updated
+    fn update_by_row_ids(
+        &mut self,
+        row_ids: &[i64],
+        setter: &mut dyn FnMut(Row) -> (Row, bool),
+    ) -> Result<i32>;
+
+    /// Deletes rows by their row IDs directly (O(k) lookup instead of O(n) scan).
+    ///
+    /// This is an optimization for DELETE with IN subquery on INTEGER PRIMARY KEY.
+    ///
+    /// # Arguments
+    /// * `row_ids` - The row IDs to delete (should be sorted for cache locality)
+    ///
+    /// # Returns
+    /// The number of rows deleted
+    fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32>;
+
+    /// Returns all active row IDs visible to the current transaction.
+    /// Used for NOT IN (anti-join) optimization.
+    fn get_active_row_ids(&self) -> Vec<i64>;
+
     /// Deletes rows matching the given expression
     ///
     /// # Arguments

@@ -67,7 +67,7 @@ impl ScalarFunction for DateTruncFunction {
 
         // First argument: unit (string)
         let unit = match &args[0] {
-            Value::Text(s) => s.to_lowercase(),
+            Value::Text(s) => s.as_str(),
             _ if args[0].is_null() => return Ok(Value::null_unknown()),
             _ => {
                 return Err(Error::invalid_argument(
@@ -96,74 +96,63 @@ impl ScalarFunction for DateTruncFunction {
             }
         };
 
-        // Truncate based on unit
-        let result = match unit.as_str() {
-            "year" => Utc
-                .with_ymd_and_hms(ts.year(), 1, 1, 0, 0, 0)
-                .single()
-                .unwrap_or(ts),
-            "month" => Utc
-                .with_ymd_and_hms(ts.year(), ts.month(), 1, 0, 0, 0)
-                .single()
-                .unwrap_or(ts),
-            "day" => Utc
-                .with_ymd_and_hms(ts.year(), ts.month(), ts.day(), 0, 0, 0)
-                .single()
-                .unwrap_or(ts),
-            "hour" => Utc
-                .with_ymd_and_hms(ts.year(), ts.month(), ts.day(), ts.hour(), 0, 0)
-                .single()
-                .unwrap_or(ts),
-            "minute" => Utc
-                .with_ymd_and_hms(
-                    ts.year(),
-                    ts.month(),
-                    ts.day(),
-                    ts.hour(),
-                    ts.minute(),
-                    0,
-                )
-                .single()
-                .unwrap_or(ts),
-            "second" => Utc
-                .with_ymd_and_hms(
-                    ts.year(),
-                    ts.month(),
-                    ts.day(),
-                    ts.hour(),
-                    ts.minute(),
-                    ts.second(),
-                )
-                .single()
-                .unwrap_or(ts),
-            "week" => {
-                // Truncate to start of week (Monday)
-                let weekday = ts.weekday().num_days_from_monday();
-                let start_of_week = ts - Duration::days(weekday as i64);
-                Utc.with_ymd_and_hms(
-                    start_of_week.year(),
-                    start_of_week.month(),
-                    start_of_week.day(),
-                    0,
-                    0,
-                    0,
-                )
+        // Truncate based on unit (case-insensitive without allocation)
+        let result = if unit.eq_ignore_ascii_case("year") {
+            Utc.with_ymd_and_hms(ts.year(), 1, 1, 0, 0, 0)
                 .single()
                 .unwrap_or(ts)
-            }
-            "quarter" => {
-                // Truncate to start of quarter
-                let quarter_month = ((ts.month() - 1) / 3) * 3 + 1;
-                Utc.with_ymd_and_hms(ts.year(), quarter_month, 1, 0, 0, 0)
-                    .single()
-                    .unwrap_or(ts)
-            }
-            _ => {
-                return Err(Error::invalid_argument(format!(
-                    "DATE_TRUNC invalid unit: {}. Valid units are: year, quarter, month, week, day, hour, minute, second",
-                    unit
-                )))
-            }
+        } else if unit.eq_ignore_ascii_case("month") {
+            Utc.with_ymd_and_hms(ts.year(), ts.month(), 1, 0, 0, 0)
+                .single()
+                .unwrap_or(ts)
+        } else if unit.eq_ignore_ascii_case("day") {
+            Utc.with_ymd_and_hms(ts.year(), ts.month(), ts.day(), 0, 0, 0)
+                .single()
+                .unwrap_or(ts)
+        } else if unit.eq_ignore_ascii_case("hour") {
+            Utc.with_ymd_and_hms(ts.year(), ts.month(), ts.day(), ts.hour(), 0, 0)
+                .single()
+                .unwrap_or(ts)
+        } else if unit.eq_ignore_ascii_case("minute") {
+            Utc.with_ymd_and_hms(ts.year(), ts.month(), ts.day(), ts.hour(), ts.minute(), 0)
+                .single()
+                .unwrap_or(ts)
+        } else if unit.eq_ignore_ascii_case("second") {
+            Utc.with_ymd_and_hms(
+                ts.year(),
+                ts.month(),
+                ts.day(),
+                ts.hour(),
+                ts.minute(),
+                ts.second(),
+            )
+            .single()
+            .unwrap_or(ts)
+        } else if unit.eq_ignore_ascii_case("week") {
+            // Truncate to start of week (Monday)
+            let weekday = ts.weekday().num_days_from_monday();
+            let start_of_week = ts - Duration::days(weekday as i64);
+            Utc.with_ymd_and_hms(
+                start_of_week.year(),
+                start_of_week.month(),
+                start_of_week.day(),
+                0,
+                0,
+                0,
+            )
+            .single()
+            .unwrap_or(ts)
+        } else if unit.eq_ignore_ascii_case("quarter") {
+            // Truncate to start of quarter
+            let quarter_month = ((ts.month() - 1) / 3) * 3 + 1;
+            Utc.with_ymd_and_hms(ts.year(), quarter_month, 1, 0, 0, 0)
+                .single()
+                .unwrap_or(ts)
+        } else {
+            return Err(Error::invalid_argument(format!(
+                "DATE_TRUNC invalid unit: {}. Valid units are: year, quarter, month, week, day, hour, minute, second",
+                unit
+            )));
         };
 
         Ok(Value::Timestamp(result))
@@ -424,7 +413,7 @@ impl ScalarFunction for ExtractFunction {
 
         // First argument: field (string)
         let field = match &args[0] {
-            Value::Text(s) => s.to_lowercase(),
+            Value::Text(s) => s.as_str(),
             _ if args[0].is_null() => return Ok(Value::null_unknown()),
             _ => {
                 return Err(Error::invalid_argument(
@@ -450,28 +439,44 @@ impl ScalarFunction for ExtractFunction {
             }
         };
 
-        // Extract based on field
-        let result = match field.as_str() {
-            "year" => ts.year() as i64,
-            "month" => ts.month() as i64,
-            "day" => ts.day() as i64,
-            "hour" => ts.hour() as i64,
-            "minute" => ts.minute() as i64,
-            "second" => ts.second() as i64,
-            "millisecond" | "milliseconds" => (ts.nanosecond() / 1_000_000) as i64,
-            "microsecond" | "microseconds" => (ts.nanosecond() / 1_000) as i64,
-            "dow" | "dayofweek" => ts.weekday().num_days_from_sunday() as i64, // 0-6, Sunday=0
-            "isodow" => ts.weekday().num_days_from_monday() as i64 + 1, // 1-7, Monday=1
-            "doy" | "dayofyear" => ts.ordinal() as i64,
-            "week" | "isoweek" => ts.iso_week().week() as i64,
-            "quarter" => ((ts.month() - 1) / 3 + 1) as i64,
-            "epoch" => ts.timestamp(),
-            _ => {
-                return Err(Error::invalid_argument(format!(
-                    "EXTRACT invalid field: {}. Valid fields are: year, month, day, hour, minute, second, millisecond, microsecond, dow, isodow, doy, week, quarter, epoch",
-                    field
-                )))
-            }
+        // Extract based on field (case-insensitive without allocation)
+        let result = if field.eq_ignore_ascii_case("year") {
+            ts.year() as i64
+        } else if field.eq_ignore_ascii_case("month") {
+            ts.month() as i64
+        } else if field.eq_ignore_ascii_case("day") {
+            ts.day() as i64
+        } else if field.eq_ignore_ascii_case("hour") {
+            ts.hour() as i64
+        } else if field.eq_ignore_ascii_case("minute") {
+            ts.minute() as i64
+        } else if field.eq_ignore_ascii_case("second") {
+            ts.second() as i64
+        } else if field.eq_ignore_ascii_case("millisecond")
+            || field.eq_ignore_ascii_case("milliseconds")
+        {
+            (ts.nanosecond() / 1_000_000) as i64
+        } else if field.eq_ignore_ascii_case("microsecond")
+            || field.eq_ignore_ascii_case("microseconds")
+        {
+            (ts.nanosecond() / 1_000) as i64
+        } else if field.eq_ignore_ascii_case("dow") || field.eq_ignore_ascii_case("dayofweek") {
+            ts.weekday().num_days_from_sunday() as i64 // 0-6, Sunday=0
+        } else if field.eq_ignore_ascii_case("isodow") {
+            ts.weekday().num_days_from_monday() as i64 + 1 // 1-7, Monday=1
+        } else if field.eq_ignore_ascii_case("doy") || field.eq_ignore_ascii_case("dayofyear") {
+            ts.ordinal() as i64
+        } else if field.eq_ignore_ascii_case("week") || field.eq_ignore_ascii_case("isoweek") {
+            ts.iso_week().week() as i64
+        } else if field.eq_ignore_ascii_case("quarter") {
+            ((ts.month() - 1) / 3 + 1) as i64
+        } else if field.eq_ignore_ascii_case("epoch") {
+            ts.timestamp()
+        } else {
+            return Err(Error::invalid_argument(format!(
+                "EXTRACT invalid field: {}. Valid fields are: year, month, day, hour, minute, second, millisecond, microsecond, dow, isodow, doy, week, quarter, epoch",
+                field
+            )));
         };
 
         Ok(Value::Integer(result))
@@ -818,11 +823,11 @@ impl ScalarFunction for DateAddFunction {
         };
 
         // Default to "day" when only 2 arguments provided
-        let unit = if args.len() == 2 {
-            "day".to_string()
+        let unit: &str = if args.len() == 2 {
+            "day"
         } else {
             match &args[2] {
-                Value::Text(s) => s.to_lowercase().to_string(),
+                Value::Text(s) => s.as_str(),
                 _ if args[2].is_null() => return Ok(Value::null_unknown()),
                 _ => {
                     return Err(Error::invalid_argument(
@@ -832,70 +837,71 @@ impl ScalarFunction for DateAddFunction {
             }
         };
 
-        let result = match unit.as_str() {
-            "year" | "years" => {
-                // Check for overflow when adding years
-                let new_year = (ts.year() as i64)
-                    .checked_add(interval)
-                    .and_then(|y| i32::try_from(y).ok());
-                match new_year {
-                    Some(y) if (1..=9999).contains(&y) => Utc
-                        .with_ymd_and_hms(
-                            y,
-                            ts.month(),
-                            ts.day().min(days_in_month(y, ts.month())),
-                            ts.hour(),
-                            ts.minute(),
-                            ts.second(),
-                        )
-                        .single()
-                        .unwrap_or(ts),
-                    _ => {
-                        return Err(Error::invalid_argument(
-                            "DATE_ADD year overflow: result year out of valid range (1-9999)"
-                                .to_string(),
-                        ))
-                    }
+        // Match unit case-insensitively without allocation
+        let result = if unit.eq_ignore_ascii_case("year") || unit.eq_ignore_ascii_case("years") {
+            // Check for overflow when adding years
+            let new_year = (ts.year() as i64)
+                .checked_add(interval)
+                .and_then(|y| i32::try_from(y).ok());
+            match new_year {
+                Some(y) if (1..=9999).contains(&y) => Utc
+                    .with_ymd_and_hms(
+                        y,
+                        ts.month(),
+                        ts.day().min(days_in_month(y, ts.month())),
+                        ts.hour(),
+                        ts.minute(),
+                        ts.second(),
+                    )
+                    .single()
+                    .unwrap_or(ts),
+                _ => {
+                    return Err(Error::invalid_argument(
+                        "DATE_ADD year overflow: result year out of valid range (1-9999)"
+                            .to_string(),
+                    ))
                 }
             }
-            "month" | "months" => {
-                // Use i64 arithmetic to avoid overflow, then check bounds
-                let total_months =
-                    (ts.year() as i64) * 12 + (ts.month() as i64) - 1 + interval;
-                let new_year_i64 = total_months.div_euclid(12);
-                let new_month = (total_months.rem_euclid(12) + 1) as u32;
+        } else if unit.eq_ignore_ascii_case("month") || unit.eq_ignore_ascii_case("months") {
+            // Use i64 arithmetic to avoid overflow, then check bounds
+            let total_months = (ts.year() as i64) * 12 + (ts.month() as i64) - 1 + interval;
+            let new_year_i64 = total_months.div_euclid(12);
+            let new_month = (total_months.rem_euclid(12) + 1) as u32;
 
-                match i32::try_from(new_year_i64) {
-                    Ok(new_year) if (1..=9999).contains(&new_year) => Utc
-                        .with_ymd_and_hms(
-                            new_year,
-                            new_month,
-                            ts.day().min(days_in_month(new_year, new_month)),
-                            ts.hour(),
-                            ts.minute(),
-                            ts.second(),
-                        )
-                        .single()
-                        .unwrap_or(ts),
-                    _ => {
-                        return Err(Error::invalid_argument(
-                            "DATE_ADD month overflow: result year out of valid range (1-9999)"
-                                .to_string(),
-                        ))
-                    }
+            match i32::try_from(new_year_i64) {
+                Ok(new_year) if (1..=9999).contains(&new_year) => Utc
+                    .with_ymd_and_hms(
+                        new_year,
+                        new_month,
+                        ts.day().min(days_in_month(new_year, new_month)),
+                        ts.hour(),
+                        ts.minute(),
+                        ts.second(),
+                    )
+                    .single()
+                    .unwrap_or(ts),
+                _ => {
+                    return Err(Error::invalid_argument(
+                        "DATE_ADD month overflow: result year out of valid range (1-9999)"
+                            .to_string(),
+                    ))
                 }
             }
-            "day" | "days" => ts + Duration::days(interval),
-            "hour" | "hours" => ts + Duration::hours(interval),
-            "minute" | "minutes" => ts + Duration::minutes(interval),
-            "second" | "seconds" => ts + Duration::seconds(interval),
-            "week" | "weeks" => ts + Duration::weeks(interval),
-            _ => {
-                return Err(Error::invalid_argument(format!(
-                    "DATE_ADD invalid unit: {}. Valid units are: year(s), month(s), week(s), day(s), hour(s), minute(s), second(s)",
-                    unit
-                )))
-            }
+        } else if unit.eq_ignore_ascii_case("day") || unit.eq_ignore_ascii_case("days") {
+            ts + Duration::days(interval)
+        } else if unit.eq_ignore_ascii_case("hour") || unit.eq_ignore_ascii_case("hours") {
+            ts + Duration::hours(interval)
+        } else if unit.eq_ignore_ascii_case("minute") || unit.eq_ignore_ascii_case("minutes") {
+            ts + Duration::minutes(interval)
+        } else if unit.eq_ignore_ascii_case("second") || unit.eq_ignore_ascii_case("seconds") {
+            ts + Duration::seconds(interval)
+        } else if unit.eq_ignore_ascii_case("week") || unit.eq_ignore_ascii_case("weeks") {
+            ts + Duration::weeks(interval)
+        } else {
+            return Err(Error::invalid_argument(format!(
+                "DATE_ADD invalid unit: {}. Valid units are: year(s), month(s), week(s), day(s), hour(s), minute(s), second(s)",
+                unit
+            )));
         };
 
         Ok(Value::Timestamp(result))

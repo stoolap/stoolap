@@ -457,8 +457,12 @@ fn cast_to_boolean(value: &Value) -> Result<Value> {
         Value::Integer(v) => Ok(Value::Boolean(*v != 0)),
         Value::Float(v) => Ok(Value::Boolean(*v != 0.0)),
         Value::Text(s) => {
-            let lower = s.to_lowercase();
-            let b = matches!(lower.as_str(), "true" | "1" | "t" | "yes" | "y");
+            // Use case-insensitive comparison to avoid allocation
+            let b = s.eq_ignore_ascii_case("true")
+                || s == "1"
+                || s.eq_ignore_ascii_case("t")
+                || s.eq_ignore_ascii_case("yes")
+                || s.eq_ignore_ascii_case("y");
             Ok(Value::Boolean(b))
         }
         Value::Boolean(b) => Ok(Value::Boolean(*b)),

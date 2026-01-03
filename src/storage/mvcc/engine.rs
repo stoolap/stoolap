@@ -2177,19 +2177,16 @@ impl Engine for MVCCEngine {
         };
 
         // Build column_ids and data_types from schema
+        // Use schema's cached column_index_map for O(1) lookup instead of O(n) linear scan
+        let col_index_map = schema.column_index_map();
         let mut column_ids = Vec::with_capacity(column_names.len());
         let mut data_types = Vec::with_capacity(column_names.len());
 
         for col_name in column_names {
             let col_name_lower = col_name.to_lowercase();
-            if let Some((idx, col)) = schema
-                .columns
-                .iter()
-                .enumerate()
-                .find(|(_, c)| c.name_lower == col_name_lower)
-            {
+            if let Some(&idx) = col_index_map.get(&col_name_lower) {
                 column_ids.push(idx as i32);
-                data_types.push(col.data_type);
+                data_types.push(schema.columns[idx].data_type);
             } else {
                 // Column not found, skip recording
                 return;

@@ -204,7 +204,8 @@ impl JoinHashTable {
         let old_head = self.bucket_heads[bucket];
 
         // Create new entry pointing to old head
-        let entry_idx = self.entries.len() as u32;
+        // Use cached len instead of Vec::len() to avoid repeated length checks
+        let entry_idx = self.len as u32;
         let next = if old_head >= 0 {
             old_head as u32
         } else {

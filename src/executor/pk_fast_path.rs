@@ -136,11 +136,12 @@ impl Executor {
             self.extract_pk_equality(where_clause, pk_column, ctx)?;
 
         // Column must match PK (case-insensitive)
+        // Use schema's pre-computed lowercase for pk_column
         let col_lower = col_name.to_lowercase();
-        let pk_lower = pk_column.to_lowercase();
+        let pk_lower = &schema.columns[pk_idx].name_lower;
 
         // Handle qualified names like "users.id"
-        let matches_pk = col_lower == pk_lower || col_lower.ends_with(&format!(".{}", pk_lower));
+        let matches_pk = col_lower == *pk_lower || col_lower.ends_with(&format!(".{}", pk_lower));
 
         if !matches_pk {
             return None;

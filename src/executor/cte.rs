@@ -1495,6 +1495,9 @@ impl Executor {
         stmt: &SelectStatement,
         with_clause: &WithClause,
     ) -> Option<SelectStatement> {
+        // Early exit: no table expression means nothing to inline
+        let table_expr = stmt.table_expr.as_ref()?;
+
         // Skip inlining if LIMIT pushdown with streaming would be more beneficial.
         // This happens when:
         // 1. Main query has LIMIT (no ORDER BY)
@@ -1504,25 +1507,30 @@ impl Executor {
             return None;
         }
 
-        // Build map of CTE definitions
-        let mut cte_defs: FxHashMap<String, &CommonTableExpression> = FxHashMap::default();
-        for cte in &with_clause.ctes {
-            // Skip recursive CTEs - they must be materialized
-            if cte.is_recursive {
-                return None;
-            }
-            // Skip CTEs with column aliases - these rename the output columns
-            // and the inlined subquery wouldn't preserve the aliases
-            if !cte.column_names.is_empty() {
-                return None;
-            }
-            cte_defs.insert(cte.name.value.to_lowercase(), cte);
-        }
+        // Pre-compute lowercase CTE names once to avoid repeated to_lowercase() calls
+        // Store (lowercase_name, original_cte) pairs
+        let cte_names_lower: Vec<(String, &CommonTableExpression)> = with_clause
+            .ctes
+            .iter()
+            .map(|cte| {
+                // Early exit for conditions that prevent inlining
+                if cte.is_recursive || !cte.column_names.is_empty() {
+                    return Err(());
+                }
+                Ok((cte.name.value.to_lowercase(), cte))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+
+        // Build map from pre-computed lowercase names
+        let cte_defs: FxHashMap<String, &CommonTableExpression> =
+            cte_names_lower.iter().cloned().collect();
+        let cte_name_set: AHashSet<&str> = cte_defs.keys().map(|s| s.as_str()).collect();
 
         // Check if any CTE references another CTE (CTE chaining)
         // These cannot be simply inlined as they have data dependencies
-        for cte in &with_clause.ctes {
-            for other_cte_name in cte_defs.keys() {
+        for (_, cte) in &cte_names_lower {
+            for other_cte_name in &cte_name_set {
                 if self.query_references_cte(&cte.query, other_cte_name) {
                     // CTE references another CTE - can't inline
                     return None;
@@ -1530,19 +1538,14 @@ impl Executor {
             }
         }
 
-        // Count CTE references in the main query
+        // Count CTE references in the main query using pre-computed names
         // Separate counts for table expressions (JOIN targets) vs WHERE clause subqueries
-        let mut table_ref_counts: FxHashMap<String, usize> = FxHashMap::default();
-        let mut where_ref_counts: FxHashMap<String, usize> = FxHashMap::default();
-        for name in cte_defs.keys() {
-            table_ref_counts.insert(name.clone(), 0);
-            where_ref_counts.insert(name.clone(), 0);
-        }
+        let mut table_ref_counts: FxHashMap<String, usize> =
+            cte_defs.keys().map(|name| (name.clone(), 0)).collect();
+        let mut where_ref_counts: FxHashMap<String, usize> = table_ref_counts.clone();
 
         // Count references in table expression (FROM/JOIN)
-        if let Some(ref table_expr) = stmt.table_expr {
-            self.count_cte_references_in_expr(table_expr, &mut table_ref_counts);
-        }
+        self.count_cte_references_in_expr(table_expr, &mut table_ref_counts);
 
         // Count references in WHERE clause (including IN/EXISTS subqueries)
         if let Some(ref where_clause) = stmt.where_clause {
@@ -1569,16 +1572,32 @@ impl Executor {
         }
 
         // All CTEs are single-use - perform inlining
-        let mut new_stmt = stmt.clone();
-        new_stmt.with = None; // Remove WITH clause
-
-        // Replace CTE references with subqueries in the main query
-        if let Some(ref table_expr) = new_stmt.table_expr {
-            let inlined_expr = self.inline_cte_references(table_expr, &cte_defs);
-            new_stmt.table_expr = Some(Box::new(inlined_expr));
+        // OPTIMIZATION: Only clone if something actually changes
+        // First check if any CTE references exist that we can inline
+        let any_refs = table_ref_counts.values().any(|&count| count > 0);
+        if !any_refs {
+            // No CTE references in table expression - no inlining needed
+            return None;
         }
 
-        Some(new_stmt)
+        // Try to inline - if nothing changes, skip the expensive cloning
+        let inlined_expr = self.try_inline_cte_references(table_expr, &cte_defs)?;
+
+        Some(SelectStatement {
+            token: stmt.token.clone(),
+            distinct: stmt.distinct,
+            columns: stmt.columns.clone(),
+            with: None, // Remove WITH clause
+            table_expr: Some(Box::new(inlined_expr)),
+            where_clause: stmt.where_clause.clone(),
+            group_by: stmt.group_by.clone(),
+            having: stmt.having.clone(),
+            window_defs: stmt.window_defs.clone(),
+            order_by: stmt.order_by.clone(),
+            limit: stmt.limit.clone(),
+            offset: stmt.offset.clone(),
+            set_operations: stmt.set_operations.clone(),
+        })
     }
 
     /// Check if a query references a specific CTE by name
@@ -1707,16 +1726,18 @@ impl Executor {
         }
     }
 
-    /// Replace CTE references with subqueries in an expression
-    fn inline_cte_references(
+    /// Replace CTE references with subqueries in an expression.
+    /// Returns Some(new_expr) if any replacement was made, None if no changes needed.
+    fn try_inline_cte_references(
         &self,
         expr: &Expression,
         cte_defs: &FxHashMap<String, &CommonTableExpression>,
-    ) -> Expression {
+    ) -> Option<Expression> {
         match expr {
             Expression::CteReference(cte_ref) => {
-                let name = cte_ref.name.value.to_lowercase();
-                if let Some(cte) = cte_defs.get(&name) {
+                // Use pre-computed lowercase from value_lower if available
+                let name = &cte_ref.name.value_lower;
+                cte_defs.get(name.as_str()).map(|cte| {
                     // Convert CTE to SubquerySource
                     let alias = cte_ref
                         .alias
@@ -1727,13 +1748,12 @@ impl Executor {
                         subquery: cte.query.clone(),
                         alias: Some(alias),
                     })
-                } else {
-                    expr.clone()
-                }
+                })
             }
             Expression::TableSource(ts) => {
-                let name = ts.name.value.to_lowercase();
-                if let Some(cte) = cte_defs.get(&name) {
+                // Use pre-computed lowercase from value_lower
+                let name = &ts.name.value_lower;
+                cte_defs.get(name.as_str()).map(|cte| {
                     // Convert to SubquerySource preserving alias
                     let alias = ts.alias.clone().unwrap_or_else(|| ts.name.clone());
                     Expression::SubquerySource(SubqueryTableSource {
@@ -1741,36 +1761,44 @@ impl Executor {
                         subquery: cte.query.clone(),
                         alias: Some(alias),
                     })
-                } else {
-                    expr.clone()
-                }
-            }
-            Expression::JoinSource(js) => {
-                let left = self.inline_cte_references(&js.left, cte_defs);
-                let right = self.inline_cte_references(&js.right, cte_defs);
-                Expression::JoinSource(Box::new(JoinTableSource {
-                    token: js.token.clone(),
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    join_type: js.join_type.clone(),
-                    condition: js.condition.clone(),
-                    using_columns: js.using_columns.clone(),
-                }))
-            }
-            Expression::SubquerySource(sq) => {
-                // Recursively inline CTEs in nested subqueries
-                let mut new_subquery = (*sq.subquery).clone();
-                if let Some(ref table_expr) = new_subquery.table_expr {
-                    let inlined = self.inline_cte_references(table_expr, cte_defs);
-                    new_subquery.table_expr = Some(Box::new(inlined));
-                }
-                Expression::SubquerySource(SubqueryTableSource {
-                    token: sq.token.clone(),
-                    subquery: Box::new(new_subquery),
-                    alias: sq.alias.clone(),
                 })
             }
-            _ => expr.clone(),
+            Expression::JoinSource(js) => {
+                let left_changed = self.try_inline_cte_references(&js.left, cte_defs);
+                let right_changed = self.try_inline_cte_references(&js.right, cte_defs);
+
+                // Only create new JoinSource if something changed
+                if left_changed.is_some() || right_changed.is_some() {
+                    let left = left_changed.unwrap_or_else(|| (*js.left).clone());
+                    let right = right_changed.unwrap_or_else(|| (*js.right).clone());
+                    Some(Expression::JoinSource(Box::new(JoinTableSource {
+                        token: js.token.clone(),
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        join_type: js.join_type.clone(),
+                        condition: js.condition.clone(),
+                        using_columns: js.using_columns.clone(),
+                    })))
+                } else {
+                    None
+                }
+            }
+            Expression::SubquerySource(sq) => {
+                // Only recurse if there's a table_expr
+                if let Some(ref table_expr) = sq.subquery.table_expr {
+                    if let Some(inlined) = self.try_inline_cte_references(table_expr, cte_defs) {
+                        let mut new_subquery = (*sq.subquery).clone();
+                        new_subquery.table_expr = Some(Box::new(inlined));
+                        return Some(Expression::SubquerySource(SubqueryTableSource {
+                            token: sq.token.clone(),
+                            subquery: Box::new(new_subquery),
+                            alias: sq.alias.clone(),
+                        }));
+                    }
+                }
+                None
+            }
+            _ => None, // No change needed
         }
     }
 

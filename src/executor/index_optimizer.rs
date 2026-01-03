@@ -329,8 +329,16 @@ impl Executor {
         if let Some(rows) = table.collect_rows_pk_keyset(start_after, start_from, ascending, limit)
         {
             // Project rows according to SELECT expressions
-            let projected_rows =
-                self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
+            // Use schema cache for lowercase column names
+            let all_columns_lower = schema.column_names_lower_arc();
+            let projected_rows = self.project_rows_with_alias(
+                &stmt.columns,
+                rows,
+                all_columns,
+                Some(&all_columns_lower),
+                ctx,
+                table_alias,
+            )?;
             let output_columns =
                 Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
 
@@ -1048,8 +1056,16 @@ impl Executor {
         }
 
         // Project rows according to SELECT expressions
-        let projected_rows =
-            self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
+        // Use schema cache for lowercase column names
+        let all_columns_lower = schema.column_names_lower_arc();
+        let projected_rows = self.project_rows_with_alias(
+            &stmt.columns,
+            rows,
+            all_columns,
+            Some(&all_columns_lower),
+            ctx,
+            table_alias,
+        )?;
         let output_columns =
             Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
         let result =
@@ -1260,8 +1276,16 @@ impl Executor {
         }
 
         // Project rows according to SELECT expressions
-        let projected_rows =
-            self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
+        // Use schema cache for lowercase column names
+        let all_columns_lower = schema.column_names_lower_arc();
+        let projected_rows = self.project_rows_with_alias(
+            &stmt.columns,
+            rows,
+            all_columns,
+            Some(&all_columns_lower),
+            ctx,
+            table_alias,
+        )?;
         let output_columns =
             Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
         let result =
@@ -1650,8 +1674,16 @@ impl Executor {
         }
 
         // Project rows according to SELECT expressions
-        let projected_rows =
-            self.project_rows_with_alias(&stmt.columns, rows, all_columns, ctx, table_alias)?;
+        // Use schema cache for lowercase column names
+        let all_columns_lower = schema.column_names_lower_arc();
+        let projected_rows = self.project_rows_with_alias(
+            &stmt.columns,
+            rows,
+            all_columns,
+            Some(&all_columns_lower),
+            ctx,
+            table_alias,
+        )?;
         let output_columns =
             Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
         let result =

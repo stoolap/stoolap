@@ -984,7 +984,8 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
     let cached_col = extract_column_name(&cached_infix.left)?;
     let new_col = extract_column_name(&new_infix.left)?;
 
-    if cached_col.to_lowercase() != new_col.to_lowercase() {
+    // OPTIMIZATION: Use case-insensitive comparison instead of double to_lowercase()
+    if !cached_col.eq_ignore_ascii_case(&new_col) {
         return None;
     }
 

@@ -16,10 +16,10 @@ Comprehensive performance comparison between Stoolap and SQLite using identical 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                             │
-│   STOOLAP    40 wins   ██████████████████████████████████████ │
-│   SQLite     13 wins   █████████████                        │
+│   STOOLAP    45 wins   ███████████████████████████████████████████ │
+│   SQLite      8 wins   ████████                             │
 │                                                             │
-│   Win Rate: 75.5%                                           │
+│   Win Rate: 84.9%                                           │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -29,9 +29,9 @@ Comprehensive performance comparison between Stoolap and SQLite using identical 
 | Category | Stoolap Wins | SQLite Wins | Stoolap Win Rate |
 |----------|-------------|-------------|------------------|
 | Basic Operations | 9 | 2 | 81.8% |
-| Advanced Operations | 8 | 5 | 61.5% |
-| Bottleneck Hunters | 23 | 6 | 79.3% |
-| **Total** | **40** | **13** | **75.5%** |
+| Advanced Operations | 10 | 3 | 76.9% |
+| Bottleneck Hunters | 26 | 3 | 89.7% |
+| **Total** | **45** | **8** | **84.9%** |
 
 ---
 
@@ -39,12 +39,12 @@ Comprehensive performance comparison between Stoolap and SQLite using identical 
 
 | Operation | Stoolap (μs) | SQLite (μs) | Winner | Factor |
 |-----------|-------------|-------------|--------|--------|
-| SELECT by ID | **0.186** | 0.289 | Stoolap | **1.6x** |
-| SELECT by index (exact) | **6.4** | 36.4 | Stoolap | **5.7x** |
+| SELECT by ID | **0.160** | 0.289 | Stoolap | **1.8x** |
+| SELECT by index (exact) | **5.7** | 36.4 | Stoolap | **6.4x** |
 | SELECT by index (range) | **167.6** | 278.1 | Stoolap | **1.7x** |
 | SELECT complex | **382.0** | 528.5 | Stoolap | **1.4x** |
 | SELECT * (full scan) | **119.5** | 527.2 | Stoolap | **4.4x** |
-| UPDATE by ID | 0.939 | **0.616** | SQLite | 1.5x |
+| UPDATE by ID | 1.08 | **0.616** | SQLite | 1.7x |
 | UPDATE complex | **73.2** | 443.1 | Stoolap | **6.1x** |
 | INSERT single | 1.96 | **1.62** | SQLite | 1.2x |
 | DELETE by ID | **1.04** | 1.34 | Stoolap | **1.3x** |
@@ -57,19 +57,19 @@ Comprehensive performance comparison between Stoolap and SQLite using identical 
 
 | Operation | Stoolap (μs) | SQLite (μs) | Winner | Factor |
 |-----------|-------------|-------------|--------|--------|
-| INNER JOIN | 29.7 | **16.6** | SQLite | 1.8x |
-| LEFT JOIN + GROUP BY | 77.7 | **63.6** | SQLite | 1.2x |
+| INNER JOIN | 31.2 | **16.6** | SQLite | 1.9x |
+| LEFT JOIN + GROUP BY | 78.8 | **63.6** | SQLite | 1.2x |
 | Scalar subquery | **191.2** | 392.8 | Stoolap | **2.1x** |
 | IN subquery | **574.2** | 1825.2 | Stoolap | **3.2x** |
 | EXISTS subquery | **4.2** | 41.3 | Stoolap | **9.9x** |
-| CTE + JOIN | **51.0** | 69.8 | Stoolap | **1.4x** |
+| CTE + JOIN | **42.6** | 69.8 | Stoolap | **1.6x** |
 | Window ROW_NUMBER | **699.3** | 1766.7 | Stoolap | **2.5x** |
 | Window ROW_NUMBER (PK) | **7.5** | 21.6 | Stoolap | **2.9x** |
 | Window PARTITION BY | **11.7** | 63.6 | Stoolap | **5.4x** |
-| UNION ALL | 7.1 | **6.8** | SQLite | 1.0x |
-| CASE expression | 10.6 | **5.5** | SQLite | 1.9x |
+| UNION ALL | **6.5** | 6.8 | Stoolap | **1.05x** |
+| CASE expression | **5.9** | 5.5 | Stoolap | **1.08x** |
 | Complex JOIN+GROUP+HAVING | **73.1** | 99.1 | Stoolap | **1.4x** |
-| Batch INSERT (100 rows) | 122.6 | **75.6** | SQLite | 1.6x |
+| Batch INSERT (100 rows) | 119.9 | **75.6** | SQLite | 1.6x |
 
 ---
 
@@ -92,20 +92,20 @@ Comprehensive performance comparison between Stoolap and SQLite using identical 
 | Multi window funcs (3) | **1531.3** | 1782.4 | Stoolap | **1.2x** |
 | Nested subquery (3 lvl) | **4076.0** | 6313.1 | Stoolap | **1.5x** |
 | Multi aggregates (6) | **827.5** | 835.0 | Stoolap | **1.0x** |
-| COALESCE + IS NOT NULL | 7.1 | **2.9** | SQLite | 2.4x |
+| COALESCE + IS NOT NULL | 5.0 | **2.9** | SQLite | 1.7x |
 | Expr in WHERE (funcs) | **8.7** | 15.3 | Stoolap | **1.8x** |
 | Math expressions | **21.7** | 35.1 | Stoolap | **1.6x** |
-| String concat (\|\|) | 12.0 | **5.7** | SQLite | 2.1x |
-| Large result (no LIMIT) | **344.8** | 484.4 | Stoolap | **1.4x** |
-| Multiple CTEs (2) | 27.2 | **22.4** | SQLite | 1.2x |
-| Correlated in SELECT | 528.5 | **497.0** | SQLite | 1.06x |
+| String concat (\|\|) | **6.3** | 5.7 | Stoolap | **1.1x** |
+| Large result (no LIMIT) | **259.8** | 484.4 | Stoolap | **1.9x** |
+| Multiple CTEs (2) | 22.9 | **22.4** | SQLite | 1.02x |
+| Correlated in SELECT | **431.0** | 497.0 | Stoolap | **1.15x** |
 | BETWEEN (non-indexed) | **3.6** | 9.9 | Stoolap | **2.8x** |
 | GROUP BY (2 columns) | **223.8** | 2363.5 | Stoolap | **10.6x** |
 | CROSS JOIN (limited) | **205.0** | 1354.6 | Stoolap | **6.6x** |
-| Derived table (FROM sub) | **823.8** | 858.3 | Stoolap | **1.0x** |
+| Derived table (FROM sub) | **522.6** | 858.3 | Stoolap | **1.6x** |
 | Window ROWS frame | **1288.1** | 1827.1 | Stoolap | **1.4x** |
 | HAVING complex | **125.9** | 1374.3 | Stoolap | **10.9x** |
-| Compare with subquery | 1639.3 | **1404.4** | SQLite | 1.2x |
+| Compare with subquery | **974.6** | 1026.0 | Stoolap | **1.05x** |
 
 ---
 
@@ -126,7 +126,7 @@ Operations where Stoolap significantly outperforms SQLite:
 | EXISTS subquery | **9.9x** | Semi-join optimization |
 | CROSS JOIN (limited) | **6.6x** | Early termination |
 | UPDATE complex | **6.1x** | Index-based updates |
-| SELECT by index (exact) | **5.7x** | Optimized index lookup |
+| SELECT by index (exact) | **6.4x** | Optimized index lookup |
 | Window PARTITION BY | **5.4x** | Optimized partitioning |
 | SELECT * (full scan) | **4.4x** | Columnar scan optimization |
 
@@ -138,15 +138,14 @@ Operations where SQLite performs better:
 
 | Operation | Factor | Reason |
 |-----------|--------|--------|
-| COALESCE | 2.4x | Simple expression evaluation |
-| String concat | 2.1x | String operations |
-| CASE expression | 1.9x | Expression evaluation |
-| INNER JOIN | 1.8x | Highly optimized nested loop |
+| INNER JOIN | 1.9x | Highly optimized nested loop |
+| COALESCE | 1.7x | Simple expression evaluation |
+| UPDATE by ID | 1.7x | Simple update path |
 | Batch INSERT | 1.6x | Insert path optimization |
-| UPDATE by ID | 1.5x | Simple update path |
 | Self JOIN | 1.4x | Join optimization |
-| Multiple CTEs | 1.2x | CTE materialization |
-| Correlated in SELECT | 1.06x | Nearly tied |
+| LEFT JOIN + GROUP BY | 1.2x | Join optimization |
+| INSERT single | 1.2x | Insert path optimization |
+| Multiple CTEs | 1.02x | CTE materialization |
 
 ---
 
@@ -158,7 +157,7 @@ DISTINCT:           ████████████████████
 Aggregations:       ████████████████████  EXCELLENT (10-11x faster)
 Complex DML:        ████████████████████  EXCELLENT (6-83x faster)
 Semi-joins:         ████████████████████  EXCELLENT (10-25x faster)
-Index Lookups:      ████████████████████  EXCELLENT (5.7x faster)
+Index Lookups:      ████████████████████  EXCELLENT (6.4x faster)
 Full Table Scans:   ████████████████████  EXCELLENT (4.4x faster)
 Window Functions:   ████████████████      STRONG (1.2-5.4x faster)
 Subqueries (IN):    ██████████████        GOOD (2.1-3.2x faster)
@@ -175,7 +174,7 @@ Based on benchmark results, Stoolap excels at:
 2. **DISTINCT Operations** - 17-71x faster for deduplication
 3. **Complex DML** - Updates/Deletes with conditions 6-83x faster
 4. **Semi-joins (EXISTS)** - 10x faster with early termination
-5. **Index Lookups** - Exact match queries 5.7x faster
+5. **Index Lookups** - Exact match queries 6.4x faster
 6. **Large Table Scans** - Full scans 4.4x faster
 7. **Window Functions** - Especially PARTITION BY (5.4x faster)
 8. **NOT IN/NOT EXISTS** - Anti-joins 3-25x faster

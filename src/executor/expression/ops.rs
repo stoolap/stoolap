@@ -261,26 +261,61 @@ impl CompiledPattern {
             };
         }
 
-        // Case-insensitive: use specialized methods to avoid allocation where possible
+        // Case-insensitive: use ASCII fast path when possible, fall back to Unicode
         match self {
-            CompiledPattern::Exact(p) => text.eq_ignore_ascii_case(p),
+            CompiledPattern::Exact(p) => {
+                if text.is_ascii() && p.is_ascii() {
+                    text.eq_ignore_ascii_case(p)
+                } else {
+                    text.to_lowercase() == p.to_lowercase()
+                }
+            }
             CompiledPattern::Prefix(p) => {
-                text.len() >= p.len() && text[..p.len()].eq_ignore_ascii_case(p)
+                if text.len() < p.len() {
+                    return false;
+                }
+                if text.is_ascii() && p.is_ascii() {
+                    text[..p.len()].eq_ignore_ascii_case(p)
+                } else {
+                    text.to_lowercase().starts_with(&p.to_lowercase())
+                }
             }
             CompiledPattern::Suffix(p) => {
-                text.len() >= p.len() && text[text.len() - p.len()..].eq_ignore_ascii_case(p)
+                if text.len() < p.len() {
+                    return false;
+                }
+                if text.is_ascii() && p.is_ascii() {
+                    text[text.len() - p.len()..].eq_ignore_ascii_case(p)
+                } else {
+                    text.to_lowercase().ends_with(&p.to_lowercase())
+                }
             }
             CompiledPattern::Contains(p) => {
-                // For contains, we need to scan - use lowercase as fallback
-                let text_lower = text.to_lowercase();
-                text_lower.contains(p)
+                if p.len() > text.len() {
+                    return false;
+                }
+                if text.is_ascii() && p.is_ascii() {
+                    // Fast path: ASCII-only, use byte-level comparison without allocation
+                    text.as_bytes()
+                        .windows(p.len())
+                        .any(|window| window.eq_ignore_ascii_case(p.as_bytes()))
+                } else {
+                    // Unicode path: need proper case folding
+                    text.to_lowercase().contains(&p.to_lowercase())
+                }
             }
             CompiledPattern::PrefixSuffix(prefix, suffix) => {
                 if text.len() < prefix.len() + suffix.len() {
                     return false;
                 }
-                text[..prefix.len()].eq_ignore_ascii_case(prefix)
-                    && text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+                if text.is_ascii() && prefix.is_ascii() && suffix.is_ascii() {
+                    text[..prefix.len()].eq_ignore_ascii_case(prefix)
+                        && text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+                } else {
+                    let text_lower = text.to_lowercase();
+                    text_lower.starts_with(&prefix.to_lowercase())
+                        && text_lower.ends_with(&suffix.to_lowercase())
+                }
             }
             // Regex already has case-insensitivity compiled in
             CompiledPattern::Regex(re) => re.is_match(text),

@@ -1923,6 +1923,114 @@ impl Table for MVCCTable {
         Ok(update_count as i32)
     }
 
+    fn update_by_row_ids(
+        &mut self,
+        row_ids: &[i64],
+        setter: &mut dyn FnMut(Row) -> (Row, bool),
+    ) -> Result<i32> {
+        let schema = &self.cached_schema;
+
+        // Step 1: Check local versions first (single lock acquisition)
+        let mut local_rows: Vec<(i64, Row)> = Vec::with_capacity(row_ids.len() / 4);
+        let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
+
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            for &row_id in row_ids {
+                if let Some(row) = txn_versions.get(row_id) {
+                    // Local version - normalize and apply setter
+                    let row = self.normalize_row_to_schema(row, schema);
+                    let (updated_row, _) = setter(row);
+                    local_rows.push((row_id, updated_row));
+                } else {
+                    remaining_row_ids.push(row_id);
+                }
+            }
+        }
+
+        // Step 2: Batch fetch remaining from version store with original versions
+        let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
+            Vec::with_capacity(remaining_row_ids.len());
+        if !remaining_row_ids.is_empty() {
+            let batch_rows = self
+                .version_store
+                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+            for (row_id, row, version) in batch_rows {
+                let row = self.normalize_row_to_schema(row, schema);
+                let (updated_row, _) = setter(row);
+                rows_with_originals.push((row_id, updated_row, version));
+            }
+        }
+
+        // Step 3: Batch put all updates
+        let update_count = (local_rows.len() + rows_with_originals.len()) as i32;
+        if !local_rows.is_empty() || !rows_with_originals.is_empty() {
+            let mut txn_versions = self.txn_versions.write().unwrap();
+            if !local_rows.is_empty() {
+                txn_versions.put_batch_for_update(local_rows)?;
+            }
+            if !rows_with_originals.is_empty() {
+                txn_versions.put_batch_with_originals(rows_with_originals)?;
+            }
+        }
+
+        Ok(update_count)
+    }
+
+    fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
+        let schema = &self.cached_schema;
+
+        // Step 1: Check local versions first
+        let mut local_deletes: Vec<(i64, Row)> = Vec::with_capacity(row_ids.len() / 4);
+        let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
+
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            for &row_id in row_ids {
+                if let Some(row) = txn_versions.get(row_id) {
+                    // Local version - mark for deletion
+                    let row = self.normalize_row_to_schema(row, schema);
+                    local_deletes.push((row_id, row));
+                } else {
+                    remaining_row_ids.push(row_id);
+                }
+            }
+        }
+
+        // Step 2: Batch fetch remaining from version store
+        let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
+            Vec::with_capacity(remaining_row_ids.len());
+        if !remaining_row_ids.is_empty() {
+            let batch_rows = self
+                .version_store
+                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+            for (row_id, row, version) in batch_rows {
+                let row = self.normalize_row_to_schema(row, schema);
+                rows_with_originals.push((row_id, row, version));
+            }
+        }
+
+        // Step 3: Batch delete all rows
+        let delete_count = (local_deletes.len() + rows_with_originals.len()) as i32;
+        if !local_deletes.is_empty() || !rows_with_originals.is_empty() {
+            let mut txn_versions = self.txn_versions.write().unwrap();
+            // Delete local rows
+            for (row_id, row) in local_deletes {
+                txn_versions.put(row_id, row, true)?;
+            }
+            // Delete rows from version store with originals
+            for (row_id, row, orig) in rows_with_originals {
+                txn_versions.put_with_original(row_id, row, orig, true)?;
+            }
+        }
+
+        Ok(delete_count)
+    }
+
+    fn get_active_row_ids(&self) -> Vec<i64> {
+        self.version_store.get_all_row_ids()
+    }
+
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
         // OPTIMIZATION: Borrow schema instead of cloning - saves allocation per delete
         let schema = &self.cached_schema;

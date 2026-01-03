@@ -529,20 +529,33 @@ impl Executor {
                             _ => None,
                         });
 
+                    // OPTIMIZATION: Pre-compute lowercase column names once before row loop
+                    // This avoids per-row to_lowercase() calls
+                    let columns_lower: Vec<String> =
+                        columns.iter().map(|c| c.to_lowercase()).collect();
+                    // Also pre-compute qualified names if alias is present
+                    let qualified_names: Option<Vec<String>> =
+                        order_table_alias.as_ref().map(|alias| {
+                            columns_lower
+                                .iter()
+                                .map(|c| format!("{}.{}", alias, c))
+                                .collect()
+                        });
+
                     rows.iter()
                         .map(|row| {
                             // Build outer row context from current row
                             let mut outer_row_map: FxHashMap<String, Value> = FxHashMap::default();
-                            for (idx, col_name) in columns.iter().enumerate() {
+                            for (idx, col_lower) in columns_lower.iter().enumerate() {
                                 let val = row.get(idx).cloned().unwrap_or(Value::null_unknown());
-                                let col_lower = col_name.to_lowercase();
-                                // OPTIMIZATION: Clone only when needed, move when possible
-                                if let Some(ref alias) = order_table_alias {
-                                    outer_row_map
-                                        .insert(format!("{}.{}", alias, &col_lower), val.clone());
-                                    outer_row_map.insert(col_lower, val); // move
+                                // Use pre-computed lowercase and qualified names
+                                if let Some(ref qualified) = qualified_names {
+                                    outer_row_map.insert(qualified[idx].clone(), val.clone());
+                                    outer_row_map.insert(col_lower.clone(), val);
+                                // move
                                 } else {
-                                    outer_row_map.insert(col_lower, val); // move directly, no clone
+                                    outer_row_map.insert(col_lower.clone(), val);
+                                    // move directly, no clone
                                 }
                             }
 
@@ -1175,6 +1188,8 @@ impl Executor {
 
         // Build column list from schema (using cached version to avoid repeated clones)
         let all_columns: Vec<String> = table.schema().column_names_owned().to_vec();
+        // Get pre-cached lowercase column names to avoid per-query to_lowercase() calls
+        let all_columns_lower = table.schema().column_names_lower_arc();
 
         // Get table alias for correlated subquery support
         let table_alias: Option<String> = table_source
@@ -1192,13 +1207,18 @@ impl Executor {
         // Must check before any row collection happens
         if classification.has_aggregation && !classification.has_window_functions {
             // First try global aggregation pushdown (no GROUP BY)
-            if let Some(result) = self.try_aggregation_pushdown(
-                table.as_ref(),
-                stmt,
-                &all_columns,
-                ctx,
-                classification,
-            )? {
+            if let Some(result) =
+                self.try_aggregation_pushdown(table.as_ref(), stmt, ctx, classification)?
+            {
+                let columns = Arc::new(result.columns().to_vec());
+                return Ok((result, columns, false));
+            }
+
+            // Try streaming aggregation for expressions like AVG(col) * 100
+            // This avoids collecting all rows by streaming through a scanner
+            if let Some(result) =
+                self.try_streaming_global_aggregation(table.as_ref(), stmt, ctx, classification)?
+            {
                 let columns = Arc::new(result.columns().to_vec());
                 return Ok((result, columns, false));
             }
@@ -1634,6 +1654,7 @@ impl Executor {
                 &stmt.columns,
                 rows,
                 &all_columns,
+                Some(&all_columns_lower),
                 ctx,
                 table_alias.as_deref(),
             )?;
@@ -1820,6 +1841,7 @@ impl Executor {
                                 &stmt.columns,
                                 anti_join_result,
                                 &all_columns,
+                                Some(&all_columns_lower),
                                 ctx,
                                 table_alias.as_deref(),
                             )?;
@@ -2056,6 +2078,7 @@ impl Executor {
                         &stmt.columns,
                         result_rows,
                         &all_columns,
+                        Some(&all_columns_lower),
                         ctx,
                         table_alias.as_deref(),
                     )?;
@@ -2627,6 +2650,7 @@ impl Executor {
                 &stmt.columns,
                 rows,
                 &all_columns,
+                Some(&all_columns_lower),
                 ctx,
                 table_alias.as_deref(),
             )?;
@@ -3062,22 +3086,24 @@ impl Executor {
                 )?;
 
                 // Find the outer key index in outer columns
+                // OPTIMIZATION: Pre-compute lowercase column names to avoid per-column to_lowercase()
+                let outer_cols_lower: Vec<String> =
+                    outer_cols.iter().map(|c| c.to_lowercase()).collect();
                 let outer_col_lower = outer_col.to_lowercase();
-                let outer_key_idx = outer_cols
+                let outer_key_idx = outer_cols_lower
                     .iter()
-                    .position(|c| c.to_lowercase() == outer_col_lower)
+                    .position(|c| c == &outer_col_lower)
                     .or_else(|| {
                         // Try unqualified match
                         let outer_unqualified = outer_col_lower
                             .rfind('.')
                             .map(|p| &outer_col_lower[p + 1..])
                             .unwrap_or(&outer_col_lower);
-                        outer_cols.iter().position(|c| {
-                            let c_lower = c.to_lowercase();
+                        outer_cols_lower.iter().position(|c_lower| {
                             let c_unqualified = c_lower
                                 .rfind('.')
                                 .map(|p| &c_lower[p + 1..])
-                                .unwrap_or(&c_lower);
+                                .unwrap_or(c_lower);
                             c_unqualified == outer_unqualified
                         })
                     });
@@ -4064,6 +4090,10 @@ impl Executor {
         let mut column_indices = Vec::with_capacity(stmt.columns.len());
         let mut output_columns = Vec::with_capacity(stmt.columns.len());
 
+        // OPTIMIZATION: Pre-compute lowercase view column names once
+        let view_columns_lower: Vec<String> =
+            view_columns.iter().map(|c| c.to_lowercase()).collect();
+
         // First pass: check if all are simple column references and build indices
         for col in &stmt.columns {
             match col {
@@ -4078,11 +4108,11 @@ impl Executor {
                     // Expand columns for specific table/alias
                     let prefix = format!("{}.", qs.qualifier);
                     let prefix_lower = prefix.to_lowercase();
-                    for (idx, name) in view_columns.iter().enumerate() {
-                        if name.to_lowercase().starts_with(&prefix_lower) {
+                    for (idx, col_lower) in view_columns_lower.iter().enumerate() {
+                        if col_lower.starts_with(&prefix_lower) {
                             column_indices.push(idx);
                             // Strip the prefix from the column name for the output
-                            output_columns.push(name[prefix.len()..].to_string());
+                            output_columns.push(view_columns[idx][prefix.len()..].to_string());
                         }
                     }
                 }
@@ -4143,10 +4173,12 @@ impl Executor {
                     Expression::QualifiedStar(qs) => {
                         let prefix = format!("{}.", qs.qualifier);
                         let prefix_lower = prefix.to_lowercase();
-                        for name in &view_columns {
-                            if name.to_lowercase().starts_with(&prefix_lower) {
+                        // Use pre-computed lowercase columns from earlier
+                        for (idx, col_lower) in view_columns_lower.iter().enumerate() {
+                            if col_lower.starts_with(&prefix_lower) {
                                 // Strip the prefix from the column name for the output
-                                final_output_columns.push(name[prefix.len()..].to_string());
+                                final_output_columns
+                                    .push(view_columns[idx][prefix.len()..].to_string());
                             }
                         }
                     }
@@ -4857,15 +4889,20 @@ impl Executor {
         all_columns: &[String],
         ctx: &ExecutionContext,
     ) -> Result<Vec<Row>> {
-        self.project_rows_with_alias(select_exprs, rows, all_columns, ctx, None)
+        self.project_rows_with_alias(select_exprs, rows, all_columns, None, ctx, None)
     }
 
     /// Project rows with optional table alias for correlated subquery support
+    ///
+    /// If `all_columns_lower` is provided, it will be used directly instead of
+    /// computing lowercase column names per-query. Pass pre-cached values from
+    /// `schema.column_names_lower_arc()` for optimal performance.
     pub(crate) fn project_rows_with_alias(
         &self,
         select_exprs: &[Expression],
         rows: Vec<Row>,
         all_columns: &[String],
+        all_columns_lower: Option<&[String]>,
         ctx: &ExecutionContext,
         table_alias: Option<&str>,
     ) -> Result<Vec<Row>> {
@@ -4875,18 +4912,32 @@ impl Executor {
             return Ok(rows);
         }
 
+        // OPTIMIZATION: Compute lowercase columns once at the start
+        // This avoids per-column to_lowercase() calls in loops below
+        let computed_lower_early: Vec<String>;
+        let columns_lower: &[String] = if let Some(lower) = all_columns_lower {
+            lower
+        } else {
+            computed_lower_early = all_columns.iter().map(|c| c.to_lowercase()).collect();
+            &computed_lower_early
+        };
+
         // Handle SELECT t.* - filter to only columns matching the qualifier
         if select_exprs.len() == 1 {
             if let Expression::QualifiedStar(qs) = &select_exprs[0] {
-                let prefix = format!("{}.", qs.qualifier);
-                let prefix_lower = prefix.to_lowercase();
+                // Compute lowercase once and reuse
                 let qualifier_lower = qs.qualifier.to_lowercase();
+                let prefix_lower_len = qualifier_lower.len() + 1; // "qualifier."
 
-                // Find indices of columns matching the qualifier
-                let matching_indices: Vec<usize> = all_columns
+                // Find indices of columns matching the qualifier (use pre-computed lowercase)
+                let matching_indices: Vec<usize> = columns_lower
                     .iter()
                     .enumerate()
-                    .filter(|(_, c)| c.to_lowercase().starts_with(&prefix_lower))
+                    .filter(|(_, c)| {
+                        c.len() > prefix_lower_len
+                            && c.starts_with(&qualifier_lower)
+                            && c.as_bytes().get(qualifier_lower.len()) == Some(&b'.')
+                    })
                     .map(|(i, _)| i)
                     .collect();
 
@@ -4894,7 +4945,7 @@ impl Executor {
                 // the qualifier matches the table alias - if so, include all columns
                 let indices_to_use = if matching_indices.is_empty() {
                     if let Some(alias) = table_alias {
-                        if alias.to_lowercase() == qualifier_lower {
+                        if alias.eq_ignore_ascii_case(&qualifier_lower) {
                             (0..all_columns.len()).collect()
                         } else {
                             matching_indices
@@ -4970,12 +5021,16 @@ impl Executor {
                 }
                 Expression::QualifiedStar(qs) => {
                     // Expand columns for specific table/alias
-                    let prefix_lower = format!("{}.", qs.qualifier.to_lowercase());
+                    // Compute lowercase once and reuse
                     let qualifier_lower = qs.qualifier.to_lowercase();
                     let mut found_any = false;
-                    // Use linear search for qualified star expansion
-                    for (idx, col) in all_columns.iter().enumerate() {
-                        if col.to_lowercase().starts_with(&prefix_lower) {
+                    // Use pre-computed lowercase columns to avoid per-column to_lowercase()
+                    for (idx, col_lower) in columns_lower.iter().enumerate() {
+                        // Check if column starts with "qualifier."
+                        if col_lower.len() > qualifier_lower.len()
+                            && col_lower.starts_with(&qualifier_lower)
+                            && col_lower.as_bytes().get(qualifier_lower.len()) == Some(&b'.')
+                        {
                             simple_column_indices.push(idx);
                             found_any = true;
                         }
@@ -5077,11 +5132,11 @@ impl Executor {
         // OPTIMIZATION: Pre-compute table alias lowercase
         let table_alias_lower: Option<String> = table_alias.map(|a| a.to_lowercase());
 
-        // Build HashMap lazily - only when fast path doesn't apply
-        // (fast path already returned for simple column queries)
-        let all_columns_lower: Vec<String> = all_columns.iter().map(|c| c.to_lowercase()).collect();
-        let mut col_index_map_lower: FxHashMap<String, usize> = FxHashMap::default();
-        for (i, lower) in all_columns_lower.iter().enumerate() {
+        // Pre-size HashMap to avoid rehashing (estimate 1.5x for qualified names)
+        // Use columns_lower which was computed early in the function
+        let mut col_index_map_lower: FxHashMap<String, usize> =
+            FxHashMap::with_capacity_and_hasher(all_columns.len() * 3 / 2, Default::default());
+        for (i, lower) in columns_lower.iter().enumerate() {
             col_index_map_lower.insert(lower.clone(), i);
             // Also add unqualified column names for qualified columns
             if let Some(dot_idx) = lower.rfind('.') {
@@ -5098,7 +5153,7 @@ impl Executor {
                 select_exprs,
                 rows,
                 all_columns,
-                &all_columns_lower,
+                columns_lower,
                 &col_index_map_lower,
                 table_alias_lower.as_deref(),
                 ctx,
@@ -5183,7 +5238,7 @@ impl Executor {
                         let prefix_lower = format!("{}.", qs.qualifier.to_lowercase());
                         let qualifier_lower = qs.qualifier.to_lowercase();
                         let mut found_any = false;
-                        for (idx, col_lower) in all_columns_lower.iter().enumerate() {
+                        for (idx, col_lower) in columns_lower.iter().enumerate() {
                             if col_lower.starts_with(&prefix_lower) {
                                 if let Some(val) = row.get(idx) {
                                     values.push(val.clone());
@@ -5237,7 +5292,32 @@ impl Executor {
         // - SimpleColumn: direct column index lookup
         // - StarExpand: expand all columns
         // - QualifiedStarExpand: expand columns for specific qualifier
+        // - Coalesce: inline COALESCE evaluation (no VM overhead)
         // - Compiled: pre-compiled program to execute via VM
+
+        // Argument source for inline function evaluation
+        enum ArgSource {
+            Column(usize),
+            Const(Value),
+        }
+
+        // Simple condition for inline CASE: column comparisons
+        enum CaseCondition {
+            Equals { col_idx: usize, value: Value },
+            NotEquals { col_idx: usize, value: Value },
+            GreaterThan { col_idx: usize, value: Value },
+            GreaterOrEqual { col_idx: usize, value: Value },
+            LessThan { col_idx: usize, value: Value },
+            LessOrEqual { col_idx: usize, value: Value },
+            IsNull { col_idx: usize },
+        }
+
+        // A single WHEN branch for inline CASE
+        struct CaseBranch {
+            condition: CaseCondition,
+            result: ArgSource,
+        }
+
         enum ExprAction {
             SimpleColumn(usize),
             StarExpand,
@@ -5245,7 +5325,258 @@ impl Executor {
                 prefix_lower: String,
                 qualifier_lower: String,
             },
+            /// Inline COALESCE - bypasses VM for 7x speedup
+            Coalesce(smallvec::SmallVec<[ArgSource; 4]>),
+            /// Inline CASE - bypasses VM for simple equality/null checks
+            Case {
+                branches: smallvec::SmallVec<[CaseBranch; 4]>,
+                else_result: Option<ArgSource>,
+            },
+            /// Inline string concatenation (||) - bypasses VM
+            Concat(smallvec::SmallVec<[ArgSource; 6]>),
             Compiled(SharedProgram),
+        }
+
+        // Helper to try building inline COALESCE action (bypasses VM for 7x speedup)
+        fn try_build_coalesce_action(
+            func: &crate::parser::ast::FunctionCall,
+            col_index_map_lower: &FxHashMap<String, usize>,
+        ) -> Option<ExprAction> {
+            if !func.function.eq_ignore_ascii_case("COALESCE") {
+                return None;
+            }
+            if func.arguments.is_empty() {
+                return None;
+            }
+
+            let mut args: smallvec::SmallVec<[ArgSource; 4]> = smallvec::SmallVec::new();
+            for arg in &func.arguments {
+                match arg {
+                    Expression::Identifier(id) => {
+                        let idx = *col_index_map_lower.get(&id.value_lower)?;
+                        args.push(ArgSource::Column(idx));
+                    }
+                    Expression::QualifiedIdentifier(qid) => {
+                        // Try full name first, then just column name
+                        let full_name =
+                            format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                        if let Some(&idx) = col_index_map_lower.get(&full_name) {
+                            args.push(ArgSource::Column(idx));
+                        } else if let Some(&idx) = col_index_map_lower.get(&qid.name.value_lower) {
+                            args.push(ArgSource::Column(idx));
+                        } else {
+                            return None; // Unknown column
+                        }
+                    }
+                    // Handle all literal types
+                    Expression::IntegerLiteral(lit) => {
+                        args.push(ArgSource::Const(Value::Integer(lit.value)));
+                    }
+                    Expression::FloatLiteral(lit) => {
+                        args.push(ArgSource::Const(Value::Float(lit.value)));
+                    }
+                    Expression::StringLiteral(lit) => {
+                        args.push(ArgSource::Const(Value::Text(lit.value.clone().into())));
+                    }
+                    Expression::BooleanLiteral(lit) => {
+                        args.push(ArgSource::Const(Value::Boolean(lit.value)));
+                    }
+                    Expression::NullLiteral(_) => {
+                        args.push(ArgSource::Const(Value::null_unknown()));
+                    }
+                    _ => return None, // Complex arg - fall back to VM
+                }
+            }
+            Some(ExprAction::Coalesce(args))
+        }
+
+        // Helper to extract column index from identifier expressions
+        fn get_col_idx(
+            expr: &Expression,
+            col_index_map_lower: &FxHashMap<String, usize>,
+        ) -> Option<usize> {
+            match expr {
+                Expression::Identifier(id) => col_index_map_lower.get(&id.value_lower).copied(),
+                Expression::QualifiedIdentifier(qid) => {
+                    let full = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                    col_index_map_lower
+                        .get(&full)
+                        .or_else(|| col_index_map_lower.get(&qid.name.value_lower))
+                        .copied()
+                }
+                _ => None,
+            }
+        }
+
+        // Helper to convert expression to ArgSource (column or literal)
+        fn expr_to_arg_source(
+            expr: &Expression,
+            col_index_map_lower: &FxHashMap<String, usize>,
+        ) -> Option<ArgSource> {
+            match expr {
+                Expression::Identifier(id) => {
+                    let idx = *col_index_map_lower.get(&id.value_lower)?;
+                    Some(ArgSource::Column(idx))
+                }
+                Expression::QualifiedIdentifier(qid) => {
+                    let full = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                    let idx = col_index_map_lower
+                        .get(&full)
+                        .or_else(|| col_index_map_lower.get(&qid.name.value_lower))?;
+                    Some(ArgSource::Column(*idx))
+                }
+                Expression::IntegerLiteral(lit) => {
+                    Some(ArgSource::Const(Value::Integer(lit.value)))
+                }
+                Expression::FloatLiteral(lit) => Some(ArgSource::Const(Value::Float(lit.value))),
+                Expression::StringLiteral(lit) => {
+                    Some(ArgSource::Const(Value::Text(lit.value.clone().into())))
+                }
+                Expression::BooleanLiteral(lit) => {
+                    Some(ArgSource::Const(Value::Boolean(lit.value)))
+                }
+                Expression::NullLiteral(_) => Some(ArgSource::Const(Value::null_unknown())),
+                _ => None,
+            }
+        }
+
+        // Helper to convert expression to Value (for condition comparison)
+        fn expr_to_value(expr: &Expression) -> Option<Value> {
+            match expr {
+                Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
+                Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
+                Expression::StringLiteral(lit) => Some(Value::Text(lit.value.clone().into())),
+                Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
+                Expression::NullLiteral(_) => Some(Value::null_unknown()),
+                _ => None,
+            }
+        }
+
+        // Helper to try building inline CASE action (bypasses VM)
+        fn try_build_case_action(
+            case: &crate::parser::ast::CaseExpression,
+            col_index_map_lower: &FxHashMap<String, usize>,
+        ) -> Option<ExprAction> {
+            // Only handle searched CASE (no value expression)
+            if case.value.is_some() {
+                return None;
+            }
+
+            let mut branches: smallvec::SmallVec<[CaseBranch; 4]> = smallvec::SmallVec::new();
+
+            for when_clause in &case.when_clauses {
+                // Parse condition: support comparisons and IS NULL
+                let condition = match &when_clause.condition {
+                    Expression::Infix(infix) => {
+                        // Handle column op literal (e.g., balance > 50000)
+                        if let Some(col_idx) = get_col_idx(&infix.left, col_index_map_lower) {
+                            if let Some(value) = expr_to_value(&infix.right) {
+                                match infix.operator.as_str() {
+                                    "=" => CaseCondition::Equals { col_idx, value },
+                                    "!=" | "<>" => CaseCondition::NotEquals { col_idx, value },
+                                    ">" => CaseCondition::GreaterThan { col_idx, value },
+                                    ">=" => CaseCondition::GreaterOrEqual { col_idx, value },
+                                    "<" => CaseCondition::LessThan { col_idx, value },
+                                    "<=" => CaseCondition::LessOrEqual { col_idx, value },
+                                    _ if infix.operator.eq_ignore_ascii_case("IS") => {
+                                        if matches!(&*infix.right, Expression::NullLiteral(_)) {
+                                            CaseCondition::IsNull { col_idx }
+                                        } else {
+                                            return None;
+                                        }
+                                    }
+                                    _ => return None,
+                                }
+                            } else if infix.operator.eq_ignore_ascii_case("IS") {
+                                if matches!(&*infix.right, Expression::NullLiteral(_)) {
+                                    CaseCondition::IsNull { col_idx }
+                                } else {
+                                    return None;
+                                }
+                            } else {
+                                return None;
+                            }
+                        // Handle literal op column (reversed: 50000 < balance)
+                        } else if let Some(col_idx) = get_col_idx(&infix.right, col_index_map_lower)
+                        {
+                            if let Some(value) = expr_to_value(&infix.left) {
+                                // Reverse the operator since column is on right
+                                match infix.operator.as_str() {
+                                    "=" => CaseCondition::Equals { col_idx, value },
+                                    "!=" | "<>" => CaseCondition::NotEquals { col_idx, value },
+                                    ">" => CaseCondition::LessThan { col_idx, value }, // 5 > col means col < 5
+                                    ">=" => CaseCondition::LessOrEqual { col_idx, value }, // 5 >= col means col <= 5
+                                    "<" => CaseCondition::GreaterThan { col_idx, value }, // 5 < col means col > 5
+                                    "<=" => CaseCondition::GreaterOrEqual { col_idx, value }, // 5 <= col means col >= 5
+                                    _ => return None,
+                                }
+                            } else {
+                                return None;
+                            }
+                        } else {
+                            return None;
+                        }
+                    }
+                    _ => return None, // Complex condition - fall back to VM
+                };
+
+                // Parse result
+                let result = expr_to_arg_source(&when_clause.then_result, col_index_map_lower)?;
+
+                branches.push(CaseBranch { condition, result });
+            }
+
+            // Parse ELSE
+            let else_result = match &case.else_value {
+                Some(expr) => Some(expr_to_arg_source(expr, col_index_map_lower)?),
+                None => None,
+            };
+
+            Some(ExprAction::Case {
+                branches,
+                else_result,
+            })
+        }
+
+        // Helper to flatten nested || concatenations into a list
+        fn flatten_concat(
+            expr: &Expression,
+            col_index_map_lower: &FxHashMap<String, usize>,
+            parts: &mut smallvec::SmallVec<[ArgSource; 6]>,
+        ) -> bool {
+            match expr {
+                Expression::Infix(infix) if infix.operator == "||" => {
+                    // Recursively flatten left and right
+                    flatten_concat(&infix.left, col_index_map_lower, parts)
+                        && flatten_concat(&infix.right, col_index_map_lower, parts)
+                }
+                _ => {
+                    // Try to convert to ArgSource
+                    if let Some(arg) = expr_to_arg_source(expr, col_index_map_lower) {
+                        parts.push(arg);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+        }
+
+        // Helper to try building inline Concat action (bypasses VM)
+        fn try_build_concat_action(
+            expr: &Expression,
+            col_index_map_lower: &FxHashMap<String, usize>,
+        ) -> Option<ExprAction> {
+            // Only handle || operator
+            if let Expression::Infix(infix) = expr {
+                if infix.operator == "||" {
+                    let mut parts: smallvec::SmallVec<[ArgSource; 6]> = smallvec::SmallVec::new();
+                    if flatten_concat(expr, col_index_map_lower, &mut parts) && parts.len() >= 2 {
+                        return Some(ExprAction::Concat(parts));
+                    }
+                }
+            }
+            None
         }
 
         // Analyze and pre-compile all expressions ONCE before the row loop
@@ -5304,11 +5635,69 @@ impl Executor {
                                 ExprAction::Compiled(program)
                             }
                         }
+                        Expression::FunctionCall(func) => {
+                            // Try inline COALESCE optimization
+                            if let Some(action) =
+                                try_build_coalesce_action(func, col_index_map_lower)
+                            {
+                                action
+                            } else {
+                                let program = compile_expression(&aliased.expression, all_columns)?;
+                                ExprAction::Compiled(program)
+                            }
+                        }
+                        Expression::Case(case) => {
+                            // Try inline CASE optimization
+                            if let Some(action) = try_build_case_action(case, col_index_map_lower) {
+                                action
+                            } else {
+                                let program = compile_expression(&aliased.expression, all_columns)?;
+                                ExprAction::Compiled(program)
+                            }
+                        }
+                        Expression::Infix(_) => {
+                            // Try inline concat optimization for ||
+                            if let Some(action) =
+                                try_build_concat_action(&aliased.expression, col_index_map_lower)
+                            {
+                                action
+                            } else {
+                                let program = compile_expression(&aliased.expression, all_columns)?;
+                                ExprAction::Compiled(program)
+                            }
+                        }
                         _ => {
                             // Compile the inner expression (not the Aliased wrapper)
                             let program = compile_expression(&aliased.expression, all_columns)?;
                             ExprAction::Compiled(program)
                         }
+                    }
+                }
+                Expression::FunctionCall(func) => {
+                    // Try inline COALESCE optimization
+                    if let Some(action) = try_build_coalesce_action(func, col_index_map_lower) {
+                        action
+                    } else {
+                        let program = compile_expression(expr, all_columns)?;
+                        ExprAction::Compiled(program)
+                    }
+                }
+                Expression::Case(case) => {
+                    // Try inline CASE optimization
+                    if let Some(action) = try_build_case_action(case, col_index_map_lower) {
+                        action
+                    } else {
+                        let program = compile_expression(expr, all_columns)?;
+                        ExprAction::Compiled(program)
+                    }
+                }
+                Expression::Infix(_) => {
+                    // Try inline concat optimization for ||
+                    if let Some(action) = try_build_concat_action(expr, col_index_map_lower) {
+                        action
+                    } else {
+                        let program = compile_expression(expr, all_columns)?;
+                        ExprAction::Compiled(program)
                     }
                 }
                 _ => {
@@ -5361,8 +5750,11 @@ impl Executor {
                 Some(named_params)
             };
 
+            // Pre-compute capacity outside loop to avoid repeated len() calls
+            let values_capacity = actions.len();
+
             for row in rows {
-                let mut values = Vec::with_capacity(actions.len());
+                let mut values = Vec::with_capacity(values_capacity);
                 let row_slice = row.as_slice();
 
                 // Build VM context with all params in one call (faster than builder chain)
@@ -5376,12 +5768,12 @@ impl Executor {
                 for action in &actions {
                     match action {
                         ExprAction::SimpleColumn(idx) => {
-                            values.push(
-                                row_slice
-                                    .get(*idx)
-                                    .cloned()
-                                    .unwrap_or_else(Value::null_unknown),
-                            );
+                            // Direct index access with bounds check
+                            if let Some(v) = row_slice.get(*idx) {
+                                values.push(v.clone());
+                            } else {
+                                values.push(Value::null_unknown());
+                            }
                         }
                         ExprAction::StarExpand => {
                             for val in row_slice.iter() {
@@ -5409,6 +5801,126 @@ impl Executor {
                                         }
                                     }
                                 }
+                            }
+                        }
+                        ExprAction::Coalesce(args) => {
+                            // Inline COALESCE: direct loop avoids iterator overhead
+                            let mut found = false;
+                            for arg in args.iter() {
+                                let val = match arg {
+                                    ArgSource::Column(idx) => row_slice.get(*idx),
+                                    ArgSource::Const(v) => Some(v),
+                                };
+                                if let Some(v) = val {
+                                    if !v.is_null() {
+                                        values.push(v.clone());
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !found {
+                                values.push(Value::null_unknown());
+                            }
+                        }
+                        ExprAction::Case {
+                            branches,
+                            else_result,
+                        } => {
+                            // Inline CASE: direct loop avoids iterator overhead
+                            let mut matched = false;
+                            for branch in branches.iter() {
+                                let col_val = match &branch.condition {
+                                    CaseCondition::Equals { col_idx, .. }
+                                    | CaseCondition::NotEquals { col_idx, .. }
+                                    | CaseCondition::GreaterThan { col_idx, .. }
+                                    | CaseCondition::GreaterOrEqual { col_idx, .. }
+                                    | CaseCondition::LessThan { col_idx, .. }
+                                    | CaseCondition::LessOrEqual { col_idx, .. }
+                                    | CaseCondition::IsNull { col_idx } => row_slice.get(*col_idx),
+                                };
+                                let cond_matches = match (&branch.condition, col_val) {
+                                    (CaseCondition::Equals { value, .. }, Some(v)) => v == value,
+                                    (CaseCondition::NotEquals { value, .. }, Some(v)) => v != value,
+                                    (CaseCondition::GreaterThan { value, .. }, Some(v)) => {
+                                        v > value
+                                    }
+                                    (CaseCondition::GreaterOrEqual { value, .. }, Some(v)) => {
+                                        v >= value
+                                    }
+                                    (CaseCondition::LessThan { value, .. }, Some(v)) => v < value,
+                                    (CaseCondition::LessOrEqual { value, .. }, Some(v)) => {
+                                        v <= value
+                                    }
+                                    (CaseCondition::IsNull { .. }, Some(v)) => v.is_null(),
+                                    (_, None) => false,
+                                };
+                                if cond_matches {
+                                    match &branch.result {
+                                        ArgSource::Column(idx) => {
+                                            if let Some(v) = row_slice.get(*idx) {
+                                                values.push(v.clone());
+                                            } else {
+                                                values.push(Value::null_unknown());
+                                            }
+                                        }
+                                        ArgSource::Const(v) => values.push(v.clone()),
+                                    }
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                            if !matched {
+                                // No branch matched - use ELSE or NULL
+                                match else_result {
+                                    Some(ArgSource::Column(idx)) => {
+                                        if let Some(v) = row_slice.get(*idx) {
+                                            values.push(v.clone());
+                                        } else {
+                                            values.push(Value::null_unknown());
+                                        }
+                                    }
+                                    Some(ArgSource::Const(v)) => values.push(v.clone()),
+                                    None => values.push(Value::null_unknown()),
+                                }
+                            }
+                        }
+                        ExprAction::Concat(parts) => {
+                            // Inline string concatenation - optimized to avoid to_string()
+                            let mut result = String::with_capacity(64); // Pre-allocate
+                            let mut any_null = false;
+                            for part in parts.iter() {
+                                let val = match part {
+                                    ArgSource::Column(idx) => row_slice.get(*idx),
+                                    ArgSource::Const(v) => Some(v),
+                                };
+                                match val {
+                                    Some(Value::Text(s)) => result.push_str(s.as_str()),
+                                    Some(Value::Integer(i)) => {
+                                        use std::fmt::Write;
+                                        let _ = write!(result, "{}", i);
+                                    }
+                                    Some(Value::Float(f)) => {
+                                        use std::fmt::Write;
+                                        let _ = write!(result, "{}", f);
+                                    }
+                                    Some(Value::Boolean(b)) => {
+                                        result.push_str(if *b { "true" } else { "false" });
+                                    }
+                                    Some(Value::Null(_)) | None => {
+                                        any_null = true;
+                                        break;
+                                    }
+                                    Some(v) => {
+                                        // Fallback for other types (timestamp, json)
+                                        result.push_str(&v.to_string());
+                                    }
+                                }
+                            }
+                            if any_null {
+                                values.push(Value::null_unknown());
+                            } else {
+                                values.push(Value::Text(result.into()));
                             }
                         }
                         ExprAction::Compiled(program) => {
@@ -5614,6 +6126,17 @@ impl Executor {
     ) -> Vec<String> {
         let mut names = Vec::with_capacity(select_exprs.len());
 
+        // OPTIMIZATION: Pre-compute lowercase column names once to avoid per-column to_lowercase()
+        // Only compute if we have QualifiedStar expressions
+        let all_columns_lower: Option<Vec<String>> = if select_exprs
+            .iter()
+            .any(|e| matches!(e, Expression::QualifiedStar(_)))
+        {
+            Some(all_columns.iter().map(|c| c.to_lowercase()).collect())
+        } else {
+            None
+        };
+
         for (i, expr) in select_exprs.iter().enumerate() {
             match expr {
                 Expression::Star(_) => {
@@ -5627,19 +6150,22 @@ impl Executor {
                     let prefix_lower = prefix.to_lowercase();
                     let qualifier_lower = qs.qualifier.to_lowercase();
                     let mut found_any = false;
-                    for col in all_columns {
-                        if col.to_lowercase().starts_with(&prefix_lower) {
-                            // Strip the prefix from the column name for the output
-                            // e.g., "e.name" becomes "name"
-                            names.push(col[prefix.len()..].to_string());
-                            found_any = true;
+                    // Use pre-computed lowercase columns
+                    if let Some(ref cols_lower) = all_columns_lower {
+                        for (idx, col_lower) in cols_lower.iter().enumerate() {
+                            if col_lower.starts_with(&prefix_lower) {
+                                // Strip the prefix from the column name for the output
+                                // e.g., "e.name" becomes "name"
+                                names.push(all_columns[idx][prefix.len()..].to_string());
+                                found_any = true;
+                            }
                         }
                     }
                     // If no columns matched the prefix (single-table query), check if
                     // the qualifier matches the table alias - if so, include all columns
                     if !found_any {
                         if let Some(alias) = table_alias {
-                            if alias.to_lowercase() == qualifier_lower {
+                            if alias.eq_ignore_ascii_case(&qualifier_lower) {
                                 names.extend(all_columns.iter().cloned());
                             }
                         }
@@ -6312,12 +6838,23 @@ impl Executor {
     }
 
     /// Build a map of column aliases to their underlying expressions from SELECT columns
-    fn build_alias_map(columns: &[Expression]) -> FxHashMap<String, Expression> {
-        let mut alias_map = FxHashMap::default();
+    fn build_alias_map(columns: &[Expression]) -> FxHashMap<String, &Expression> {
+        // Count aliases first to pre-size HashMap and avoid rehashing
+        let alias_count = columns
+            .iter()
+            .filter(|e| matches!(e, Expression::Aliased(_)))
+            .count();
+
+        if alias_count == 0 {
+            return FxHashMap::default();
+        }
+
+        let mut alias_map = FxHashMap::with_capacity_and_hasher(alias_count, Default::default());
         for col_expr in columns {
             if let Expression::Aliased(aliased) = col_expr {
                 let alias_name = aliased.alias.value_lower.clone();
-                alias_map.insert(alias_name, (*aliased.expression).clone());
+                // Store reference instead of clone - avoids expensive Expression clone/drop
+                alias_map.insert(alias_name, aliased.expression.as_ref());
             }
         }
         alias_map
@@ -6326,13 +6863,14 @@ impl Executor {
     /// Substitute column aliases in an expression with their underlying expressions
     fn substitute_aliases(
         expr: &Expression,
-        alias_map: &FxHashMap<String, Expression>,
+        alias_map: &FxHashMap<String, &Expression>,
     ) -> Expression {
         match expr {
             Expression::Identifier(id) => {
                 // Check if this identifier is an alias - use pre-computed lowercase
                 if let Some(original) = alias_map.get(&id.value_lower) {
-                    return original.clone();
+                    // Clone only when we actually find an alias match
+                    return (*original).clone();
                 }
                 expr.clone()
             }

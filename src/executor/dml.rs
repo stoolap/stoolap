@@ -19,7 +19,7 @@
 //! - UPDATE
 //! - DELETE
 
-use crate::core::{DataType, Error, Result, Row, Value};
+use crate::core::{DataType, Error, Result, Row, Schema, Value};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::traits::{Engine, QueryResult, Table};
@@ -31,8 +31,8 @@ use super::context::{invalidate_semi_join_cache_for_table, ExecutionContext};
 use super::expression::CompiledEvaluator;
 use super::pushdown;
 use super::result::ExecResult;
+use super::utils::dummy_token_clone;
 use super::Executor;
-
 /// Validate type coercion didn't silently fail.
 /// Returns an error if a non-null value became null during coercion.
 fn validate_coercion(
@@ -72,6 +72,123 @@ fn try_extract_literal(expr: &Expression) -> Option<Value> {
 }
 
 impl Executor {
+    /// Select row_ids for DML operations using the full SELECT executor.
+    /// This reuses all SELECT optimizations (indexes, semi-joins, parallel execution, etc.)
+    /// for UPDATE and DELETE operations.
+    ///
+    /// Returns Some(row_ids) if:
+    /// - Table has a single-column INTEGER PRIMARY KEY
+    /// - WHERE clause exists
+    ///
+    /// Returns None to fall back to storage layer's scan-based approach.
+    fn select_row_ids_for_dml(
+        &self,
+        table_name: &str,
+        where_clause: &Expression,
+        schema: &Schema,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<Vec<i64>>> {
+        // Check if this is a single-column INTEGER PRIMARY KEY
+        let pk_indices = schema.primary_key_indices();
+        if pk_indices.len() != 1 {
+            return Ok(None);
+        }
+
+        let pk_idx = pk_indices[0];
+        let pk_col = &schema.columns[pk_idx];
+
+        // Must be INTEGER type (where value = row_id)
+        if pk_col.data_type != DataType::Integer {
+            return Ok(None);
+        }
+
+        let pk_column_name = &pk_col.name;
+        let pk_column_lower = pk_column_name.to_lowercase();
+
+        // FAST PATH: If WHERE is InHashSet on the PK column, extract row_ids directly
+        // This avoids building and executing a full SELECT statement
+        if let Expression::InHashSet(in_expr) = where_clause {
+            if let Expression::Identifier(id) = in_expr.column.as_ref() {
+                if id.value_lower == pk_column_lower {
+                    if in_expr.not {
+                        // NOT IN: get all active row_ids and exclude the ones in the set
+                        let excluded: rustc_hash::FxHashSet<i64> = in_expr
+                            .values
+                            .iter()
+                            .filter_map(|v| match v {
+                                Value::Integer(i) => Some(*i),
+                                _ => None,
+                            })
+                            .collect();
+
+                        let mut row_ids: Vec<i64> = table
+                            .get_active_row_ids()
+                            .into_iter()
+                            .filter(|id| !excluded.contains(id))
+                            .collect();
+                        row_ids.sort_unstable();
+                        return Ok(Some(row_ids));
+                    } else {
+                        // IN: extract integer values directly from the HashSet
+                        let mut row_ids: Vec<i64> = in_expr
+                            .values
+                            .iter()
+                            .filter_map(|v| match v {
+                                Value::Integer(i) => Some(*i),
+                                _ => None,
+                            })
+                            .collect();
+                        row_ids.sort_unstable();
+                        return Ok(Some(row_ids));
+                    }
+                }
+            }
+        }
+
+        // GENERAL PATH: Build SELECT query and use full executor
+        let select_stmt = SelectStatement {
+            token: dummy_token_clone(),
+            distinct: false,
+            columns: vec![Expression::Identifier(Identifier::new(
+                dummy_token_clone(),
+                pk_column_name.clone(),
+            ))],
+            with: None,
+            table_expr: Some(Box::new(Expression::TableSource(SimpleTableSource {
+                token: dummy_token_clone(),
+                name: Identifier::new(dummy_token_clone(), table_name.to_string()),
+                alias: None,
+                as_of: None,
+            }))),
+            where_clause: Some(Box::new(where_clause.clone())),
+            group_by: GroupByClause::default(),
+            having: None,
+            window_defs: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            set_operations: Vec::new(),
+        };
+
+        // Execute using full SELECT executor (gets all optimizations)
+        let mut result = self.execute_select(&select_stmt, ctx)?;
+
+        // Collect row_ids from result
+        let mut row_ids = Vec::new();
+        while result.next() {
+            let row = result.row();
+            if let Some(Value::Integer(id)) = row.get(0) {
+                row_ids.push(*id);
+            }
+        }
+
+        // Sort for cache locality
+        row_ids.sort_unstable();
+
+        Ok(Some(row_ids))
+    }
+
     /// Execute an INSERT statement
     pub(crate) fn execute_insert(
         &self,
@@ -690,13 +807,13 @@ impl Executor {
             // Build column indices for scanning (all columns)
             let all_col_indices: Vec<usize> = (0..column_names.len()).collect();
 
-            // OPTIMIZATION: Pre-compute lowercase and qualified column names once
-            let col_name_pairs: Vec<(String, String)> = column_names
+            // OPTIMIZATION: Use schema's cached lowercase column names instead of computing
+            let column_names_lower = schema.column_names_lower_arc();
+            let col_name_pairs: Vec<(String, String)> = column_names_lower
                 .iter()
-                .map(|col_name| {
-                    let col_lower = col_name.to_lowercase();
+                .map(|col_lower| {
                     let qualified = format!("{}.{}", table_name, col_lower);
-                    (col_lower, qualified)
+                    (col_lower.clone(), qualified)
                 })
                 .collect();
 
@@ -877,7 +994,24 @@ impl Executor {
                 (row, changed)
             };
 
-            table.update(where_expr.as_deref(), &mut setter)?
+            // OPTIMIZATION: Use SELECT executor to find matching row_ids, then batch update.
+            // This reuses ALL SELECT optimizations: indexes, semi-joins, parallel execution, etc.
+            if let Some(ref where_clause) = memory_where_clause {
+                if let Some(row_ids) = self.select_row_ids_for_dml(
+                    table_name,
+                    where_clause,
+                    schema,
+                    table.as_ref(),
+                    ctx,
+                )? {
+                    table.update_by_row_ids(&row_ids, &mut setter)?
+                } else {
+                    // Fall back to storage layer (non-INTEGER PK or other unsupported case)
+                    table.update(where_expr.as_deref(), &mut setter)?
+                }
+            } else {
+                table.update(where_expr.as_deref(), &mut setter)?
+            }
         };
 
         // Invalidate semantic cache for this table BEFORE commit
@@ -1043,7 +1177,8 @@ impl Executor {
         // Get schema info for RETURNING clause processing
         let column_names_owned = schema.column_names_owned().to_vec();
         let column_count = schema.columns.len();
-        let pk_col_idx = schema.columns.iter().position(|c| c.primary_key);
+        // Use schema's cached pk_column_index for O(1) lookup
+        let pk_col_idx = schema.pk_column_index();
         let pk_col_name = pk_col_idx.map(|idx| schema.columns[idx].name.clone());
 
         // Build column names with effective prefix (alias or table name)
@@ -1077,19 +1212,19 @@ impl Executor {
                 None
             };
 
-            // OPTIMIZATION: Pre-compute lowercase and qualified column names once
+            // OPTIMIZATION: Use schema's cached lowercase column names instead of computing
             // Each entry: (col_lower, effective_qualified, optional_table_qualified)
-            let col_name_triples: Vec<(String, String, Option<String>)> = column_names_owned
+            let column_names_lower = schema.column_names_lower_arc();
+            let col_name_triples: Vec<(String, String, Option<String>)> = column_names_lower
                 .iter()
-                .map(|col_name| {
-                    let col_lower = col_name.to_lowercase();
+                .map(|col_lower| {
                     let effective_qualified = format!("{}.{}", effective_name, col_lower);
                     let table_qualified = if effective_name != table_name {
                         Some(format!("{}.{}", table_name, col_lower))
                     } else {
                         None
                     };
-                    (col_lower, effective_qualified, table_qualified)
+                    (col_lower.clone(), effective_qualified, table_qualified)
                 })
                 .collect();
 
@@ -1193,7 +1328,24 @@ impl Executor {
             delete_count
         } else {
             // Simple WHERE expression without RETURNING - use storage layer directly
-            table.delete(where_expr.as_deref())?
+            // OPTIMIZATION: Use SELECT executor to find matching row_ids, then batch delete.
+            // This reuses ALL SELECT optimizations: indexes, semi-joins, parallel execution, etc.
+            if let Some(ref where_clause) = memory_where_clause {
+                if let Some(row_ids) = self.select_row_ids_for_dml(
+                    table_name,
+                    where_clause,
+                    schema,
+                    table.as_ref(),
+                    ctx,
+                )? {
+                    table.delete_by_row_ids(&row_ids)?
+                } else {
+                    // Fall back to storage layer (non-INTEGER PK or other unsupported case)
+                    table.delete(where_expr.as_deref())?
+                }
+            } else {
+                table.delete(where_expr.as_deref())?
+            }
         };
 
         // Invalidate semantic cache for this table BEFORE commit
@@ -1296,11 +1448,10 @@ impl Executor {
         _ctx: &ExecutionContext,
     ) -> Result<()> {
         // Build a WHERE clause to find the specific row by primary key
+        // Use schema's cached pk_column_index for O(1) lookup
         let pk_col = schema
-            .columns
-            .iter()
-            .find(|c| c.primary_key)
-            .map(|c| c.name.clone());
+            .pk_column_index()
+            .map(|idx| schema.columns[idx].name.clone());
 
         let where_expr: Option<Box<dyn StorageExpr>> = if let Some(pk_name) = pk_col {
             let mut expr =
@@ -1405,17 +1556,14 @@ impl Executor {
         // Get the first matching row's ID
         let result = if scanner.next() {
             let row = scanner.take_row();
-            // Find the primary key column to get the row_id
-            let mut found_id = None;
-            for (i, col) in schema.columns.iter().enumerate() {
-                if col.primary_key {
-                    if let Some(Value::Integer(id)) = row.get(i) {
-                        found_id = Some(*id);
-                        break;
-                    }
+            // Use schema's cached pk_column_index for O(1) lookup
+            schema.pk_column_index().and_then(|pk_idx| {
+                if let Some(Value::Integer(id)) = row.get(pk_idx) {
+                    Some(*id)
+                } else {
+                    None
                 }
-            }
-            found_id
+            })
         } else {
             None
         };
