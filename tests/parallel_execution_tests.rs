@@ -1071,3 +1071,111 @@ fn test_partial_pushdown_optimization() {
         complex_time.as_secs_f64() / mixed_time.as_secs_f64().max(0.0001)
     );
 }
+
+#[test]
+fn test_debug_upper_like_pattern() {
+    use stoolap::Database;
+
+    let db = Database::open_in_memory().unwrap();
+
+    db.execute(
+        "CREATE TABLE test_upper (id INTEGER PRIMARY KEY, name TEXT)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO test_upper VALUES (1, 'name_1')", ())
+        .unwrap();
+    db.execute("INSERT INTO test_upper VALUES (2, 'name_10')", ())
+        .unwrap();
+    db.execute("INSERT INTO test_upper VALUES (3, 'name_2')", ())
+        .unwrap();
+
+    // Check UPPER function works
+    let upper_val: String = db
+        .query_one("SELECT UPPER(name) FROM test_upper WHERE id = 1", ())
+        .unwrap();
+    println!("UPPER('name_1'): '{}'", upper_val);
+
+    // Check UPPER(name) = 'NAME_1' works
+    let eq_test: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM test_upper WHERE UPPER(name) = 'NAME_1'",
+            (),
+        )
+        .unwrap();
+    println!("UPPER(name) = 'NAME_1': {}", eq_test);
+
+    // Test without underscore wildcard - use pattern without _
+    let like_no_underscore: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM test_upper WHERE UPPER(name) LIKE 'NAME%'",
+            (),
+        )
+        .unwrap();
+    println!("UPPER(name) LIKE 'NAME%': {}", like_no_underscore);
+
+    // Test simpler underscore pattern - just one underscore match
+    let like_simple_underscore: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM test_upper WHERE name LIKE 'name__'",
+            (),
+        )
+        .unwrap();
+    println!("name LIKE 'name__': {}", like_simple_underscore);
+
+    // Test just the underscore in the middle
+    let like_middle_underscore: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM test_upper WHERE UPPER(name) LIKE 'NAME__'",
+            (),
+        )
+        .unwrap();
+    println!("UPPER(name) LIKE 'NAME__': {}", like_middle_underscore);
+
+    // Debug: Get the actual values and filter result
+    let debug_query = "SELECT id, name, UPPER(name) as upper_name,
+                       CASE WHEN UPPER(name) LIKE 'NAME__' THEN 1 ELSE 0 END as matches
+                       FROM test_upper";
+    let rows = db.query(debug_query, ()).unwrap();
+    println!("Debug output:");
+    for row in rows.flatten() {
+        println!(
+            "  id={:?}, name={:?}, UPPER={:?}, matches={:?}",
+            row.get::<i64>(0),
+            row.get::<String>(1),
+            row.get::<String>(2),
+            row.get::<i64>(3)
+        );
+    }
+
+    // Check simple LIKE works on uppercase literal
+    let like_test: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM test_upper WHERE 'NAME_1' LIKE 'NAME_1%'",
+            (),
+        )
+        .unwrap();
+    println!("'NAME_1' LIKE 'NAME_1%': {}", like_test);
+
+    // Direct pattern match test
+    let count: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM test_upper WHERE name LIKE 'name_1%'",
+            (),
+        )
+        .unwrap();
+    println!("name LIKE 'name_1%': {}", count);
+
+    // UPPER pattern test
+    let count2: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM test_upper WHERE UPPER(name) LIKE 'NAME_1%'",
+            (),
+        )
+        .unwrap();
+    println!("UPPER(name) LIKE 'NAME_1%': {}", count2);
+
+    assert_eq!(count, 2, "Direct LIKE should match name_1 and name_10");
+    assert_eq!(count2, 2, "UPPER LIKE should match NAME_1 and NAME_10");
+}

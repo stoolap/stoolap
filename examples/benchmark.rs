@@ -395,17 +395,22 @@ fn main() {
             .unwrap();
     }
 
-    // INNER JOIN (20 iterations - moderately slow)
+    // INNER JOIN (100 iterations with warmup)
     let join_stmt = db
         .prepare("SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.status = 'completed' LIMIT 100")
         .unwrap();
+    // Warmup
+    for _ in 0..WARMUP {
+        let rows = join_stmt.query(()).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
-    for _ in 0..20 {
+    for _ in 0..100 {
         let rows = join_stmt.query(()).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 100.0;
     println!(
         "{:<25} | {:>15.3} | {:>12.0}",
         "INNER JOIN",
@@ -413,17 +418,22 @@ fn main() {
         1_000_000.0 / avg_us
     );
 
-    // LEFT JOIN with aggregation (20 iterations - slow)
+    // LEFT JOIN with aggregation (100 iterations with warmup)
     let left_join_stmt = db
         .prepare("SELECT u.name, COUNT(o.id) as order_count, SUM(o.amount) as total FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name LIMIT 100")
         .unwrap();
+    // Warmup
+    for _ in 0..WARMUP {
+        let rows = left_join_stmt.query(()).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
-    for _ in 0..20 {
+    for _ in 0..100 {
         let rows = left_join_stmt.query(()).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 100.0;
     println!(
         "{:<25} | {:>15.3} | {:>12.0}",
         "LEFT JOIN + GROUP BY",
@@ -467,17 +477,22 @@ fn main() {
         1_000_000.0 / avg_us
     );
 
-    // EXISTS subquery (10 iterations - correlated, slow)
+    // EXISTS subquery (100 iterations with warmup for semi-join cache)
     let exists_stmt = db
         .prepare("SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > 500) LIMIT 100")
         .unwrap();
+    // Warmup to populate semi-join cache
+    for _ in 0..WARMUP {
+        let rows = exists_stmt.query(()).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
-    for _ in 0..10 {
+    for _ in 0..100 {
         let rows = exists_stmt.query(()).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_nanos() as f64 / 1000.0 / 10.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 100.0;
     println!(
         "{:<25} | {:>15.3} | {:>12.0}",
         "EXISTS subquery",
@@ -781,17 +796,22 @@ fn main() {
         1_000_000.0 / avg_us
     );
 
-    // NOT EXISTS (alternative anti-join)
+    // NOT EXISTS (alternative anti-join) - 100 iterations with warmup
     let not_exists_stmt = db
         .prepare("SELECT * FROM users u WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.status = 'cancelled') LIMIT 100")
         .unwrap();
+    // Warmup to populate semi-join cache
+    for _ in 0..WARMUP {
+        let rows = not_exists_stmt.query(()).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
-    for _ in 0..10 {
+    for _ in 0..100 {
         let rows = not_exists_stmt.query(()).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_nanos() as f64 / 1000.0 / 10.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 100.0;
     println!(
         "{:<25} | {:>15.3} | {:>12.0}",
         "NOT EXISTS subquery",
@@ -835,17 +855,22 @@ fn main() {
         1_000_000.0 / avg_us
     );
 
-    // Self-join (users with same age)
+    // Self-join (users with same age) - 100 iterations with warmup
     let self_join_stmt = db
         .prepare("SELECT u1.name, u2.name, u1.age FROM users u1 INNER JOIN users u2 ON u1.age = u2.age AND u1.id < u2.id LIMIT 100")
         .unwrap();
+    // Warmup
+    for _ in 0..WARMUP {
+        let rows = self_join_stmt.query(()).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
-    for _ in 0..20 {
+    for _ in 0..100 {
         let rows = self_join_stmt.query(()).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 100.0;
     println!(
         "{:<25} | {:>15.3} | {:>12.0}",
         "Self JOIN (same age)",
@@ -999,17 +1024,22 @@ fn main() {
         1_000_000.0 / avg_us
     );
 
-    // Multiple CTEs
+    // Multiple CTEs (100 iterations with warmup)
     let multi_cte_stmt = db
         .prepare("WITH young AS (SELECT * FROM users WHERE age < 30), rich AS (SELECT * FROM users WHERE balance > 70000) SELECT y.name, r.name FROM young y INNER JOIN rich r ON y.id = r.id LIMIT 50")
         .unwrap();
+    // Warmup
+    for _ in 0..WARMUP {
+        let rows = multi_cte_stmt.query(()).unwrap();
+        for _ in rows {}
+    }
     let start = Instant::now();
-    for _ in 0..20 {
+    for _ in 0..100 {
         let rows = multi_cte_stmt.query(()).unwrap();
         for _ in rows {}
     }
     let total = start.elapsed();
-    let avg_us = total.as_nanos() as f64 / 1000.0 / 20.0;
+    let avg_us = total.as_nanos() as f64 / 1000.0 / 100.0;
     println!(
         "{:<25} | {:>15.3} | {:>12.0}",
         "Multiple CTEs (2)",
