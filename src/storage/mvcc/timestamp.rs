@@ -83,7 +83,7 @@ pub fn get_fast_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use rustc_hash::FxHashSet;
     use std::thread;
 
     #[test]
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn test_timestamp_unique() {
         // Test that all timestamps in sequence are unique
-        let mut timestamps = HashSet::new();
+        let mut timestamps = FxHashSet::default();
         for _ in 0..10000 {
             let ts = get_fast_timestamp();
             assert!(
@@ -131,7 +131,7 @@ mod tests {
             })
             .collect();
 
-        let mut all_timestamps: HashSet<i64> = HashSet::new();
+        let mut all_timestamps: FxHashSet<i64> = FxHashSet::default();
         for handle in handles {
             let timestamps = handle.join().unwrap();
             for ts in timestamps {

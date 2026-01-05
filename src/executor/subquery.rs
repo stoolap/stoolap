@@ -199,19 +199,21 @@ impl Executor {
                             for value in &row {
                                 tuple_exprs.push(value_to_expression(value));
                             }
-                            expressions.push(Expression::ExpressionList(ExpressionList {
-                                token: paren_token.clone(),
-                                expressions: tuple_exprs,
-                            }));
+                            expressions.push(Expression::ExpressionList(Box::new(
+                                ExpressionList {
+                                    token: paren_token.clone(),
+                                    expressions: tuple_exprs,
+                                },
+                            )));
                         }
 
                         return Ok(Expression::In(InExpression {
                             token: in_expr.token.clone(),
                             left: Box::new(processed_left),
-                            right: Box::new(Expression::ExpressionList(ExpressionList {
+                            right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
                                 token: paren_token,
                                 expressions,
-                            })),
+                            }))),
                             not: in_expr.not,
                         }));
                     } else {
@@ -322,12 +324,12 @@ impl Executor {
                     None
                 };
 
-                Ok(Expression::Case(CaseExpression {
+                Ok(Expression::Case(Box::new(CaseExpression {
                     token: case.token.clone(),
                     value: processed_value,
                     when_clauses: processed_whens?,
                     else_value: processed_else,
-                }))
+                })))
             }
 
             Expression::Cast(cast) => {
@@ -347,14 +349,14 @@ impl Executor {
                     .map(|arg| self.process_where_subqueries(arg, ctx))
                     .collect();
 
-                Ok(Expression::FunctionCall(FunctionCall {
+                Ok(Expression::FunctionCall(Box::new(FunctionCall {
                     token: func.token.clone(),
                     function: func.function.clone(),
                     arguments: processed_args?,
                     is_distinct: func.is_distinct,
                     order_by: func.order_by.clone(),
                     filter: func.filter.clone(),
-                }))
+                })))
             }
 
             // For all other expression types, return as-is
@@ -1005,12 +1007,7 @@ impl Executor {
             None => return Ok(None),
         };
 
-        // Must not have additional predicates (only the correlation predicate)
-        if correlation.additional_predicate.is_some() {
-            return Ok(None);
-        }
-
-        // Build cache key
+        // Build cache key (includes additional predicate in key for uniqueness)
         let cache_key = match Self::build_batch_aggregate_key(subquery) {
             Some(k) => k,
             None => return Ok(None),
@@ -1032,11 +1029,33 @@ impl Executor {
         // Clone the aggregate expression from the original subquery
         let agg_expr = subquery.columns[0].clone();
 
+        // Build list of inner table names for outer reference detection
+        let inner_tables = vec![
+            correlation.inner_table.to_lowercase(),
+            correlation.inner_table.clone(), // Also check original case
+        ];
+
+        // Include additional predicate in WHERE clause ONLY if it doesn't reference outer columns.
+        // If the predicate contains outer references (like "o.amount > c.id * 50"),
+        // we can't use batch caching because those references can't be resolved.
+        let where_clause = correlation.additional_predicate.as_ref().and_then(|pred| {
+            if Self::expression_has_outer_reference(pred, &inner_tables) {
+                None // Can't use batch caching with outer references in predicate
+            } else {
+                Some(Box::new(pred.clone()))
+            }
+        });
+
+        // If additional predicate has outer references, we can't use batch caching
+        if correlation.additional_predicate.is_some() && where_clause.is_none() {
+            return Ok(None);
+        }
+
         let batch_query = SelectStatement {
             token: dummy_token("SELECT", TokenType::Keyword),
             columns: vec![inner_col_expr.clone(), agg_expr],
             table_expr: subquery.table_expr.clone(),
-            where_clause: None, // No WHERE - we want all rows
+            where_clause, // Include additional predicate for filtering
             group_by: GroupByClause {
                 columns: vec![inner_col_expr],
                 modifier: GroupByModifier::None,
@@ -1055,15 +1074,19 @@ impl Executor {
         let subquery_ctx = ctx.with_incremented_query_depth();
         let mut result = self.execute_select(&batch_query, &subquery_ctx)?;
 
-        // Build the result map
+        // Build the result map - use take_row() to avoid cloning
         let mut result_map: AHashMap<Value, Value> = AHashMap::new();
         while result.next() {
-            let row = result.row();
+            let row = result.take_row();
             if row.len() >= 2 {
-                let key = row.get(0).cloned().unwrap_or(Value::null_unknown());
-                let value = row.get(1).cloned().unwrap_or(Value::null_unknown());
-                if !key.is_null() {
-                    result_map.insert(key, value);
+                // into_values() uses Arc::try_unwrap() to move without cloning when sole owner
+                let mut values = row.into_values();
+                if values.len() >= 2 {
+                    let value = values.pop().unwrap();
+                    let key = values.swap_remove(0);
+                    if !key.is_null() {
+                        result_map.insert(key, value);
+                    }
                 }
             }
         }
@@ -1178,6 +1201,104 @@ impl Executor {
         }
     }
 
+    /// Check if an expression contains any outer column references.
+    /// Returns true if the expression references columns from tables not in inner_tables.
+    fn expression_has_outer_reference(expr: &Expression, inner_tables: &[String]) -> bool {
+        match expr {
+            Expression::QualifiedIdentifier(qid) => {
+                let table = qid.qualifier.value.to_lowercase();
+                // If NOT in inner_tables, it's an outer reference
+                !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table))
+            }
+            Expression::Infix(infix) => {
+                Self::expression_has_outer_reference(&infix.left, inner_tables)
+                    || Self::expression_has_outer_reference(&infix.right, inner_tables)
+            }
+            Expression::Prefix(prefix) => {
+                Self::expression_has_outer_reference(&prefix.right, inner_tables)
+            }
+            Expression::FunctionCall(func) => func
+                .arguments
+                .iter()
+                .any(|arg| Self::expression_has_outer_reference(arg, inner_tables)),
+            Expression::In(in_expr) => {
+                Self::expression_has_outer_reference(&in_expr.left, inner_tables)
+                    || Self::expression_has_outer_reference(&in_expr.right, inner_tables)
+            }
+            Expression::Between(between) => {
+                Self::expression_has_outer_reference(&between.expr, inner_tables)
+                    || Self::expression_has_outer_reference(&between.lower, inner_tables)
+                    || Self::expression_has_outer_reference(&between.upper, inner_tables)
+            }
+            Expression::Case(case) => {
+                case.value
+                    .as_ref()
+                    .map(|op| Self::expression_has_outer_reference(op, inner_tables))
+                    .unwrap_or(false)
+                    || case.when_clauses.iter().any(|wc| {
+                        Self::expression_has_outer_reference(&wc.condition, inner_tables)
+                            || Self::expression_has_outer_reference(&wc.then_result, inner_tables)
+                    })
+                    || case
+                        .else_value
+                        .as_ref()
+                        .map(|el| Self::expression_has_outer_reference(el, inner_tables))
+                        .unwrap_or(false)
+            }
+            // Cast and Aliased have inner expressions
+            Expression::Cast(cast) => {
+                Self::expression_has_outer_reference(&cast.expr, inner_tables)
+            }
+            Expression::Aliased(aliased) => {
+                Self::expression_has_outer_reference(&aliased.expression, inner_tables)
+            }
+            // Like has left expression (pattern is usually a literal)
+            Expression::Like(like) => {
+                Self::expression_has_outer_reference(&like.left, inner_tables)
+                    || Self::expression_has_outer_reference(&like.pattern, inner_tables)
+            }
+            // Expression lists can contain outer references
+            Expression::ExpressionList(list) => list
+                .expressions
+                .iter()
+                .any(|e| Self::expression_has_outer_reference(e, inner_tables)),
+            Expression::List(list) => list
+                .elements
+                .iter()
+                .any(|e| Self::expression_has_outer_reference(e, inner_tables)),
+            // InHashSet references a column (which could be qualified)
+            Expression::InHashSet(_) => {
+                // InHashSet.column is a String (column name), not an Expression
+                // The column reference is already resolved, so no outer ref possible here
+                false
+            }
+            // Window functions can have outer refs in partition/order expressions
+            Expression::Window(window) => {
+                window
+                    .partition_by
+                    .iter()
+                    .any(|e| Self::expression_has_outer_reference(e, inner_tables))
+                    || window.order_by.iter().any(|ob| {
+                        Self::expression_has_outer_reference(&ob.expression, inner_tables)
+                    })
+            }
+            // Literals and unqualified identifiers don't count as outer references
+            Expression::Identifier(_)
+            | Expression::IntegerLiteral(_)
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
+            | Expression::Parameter(_)
+            | Expression::Star(_)
+            | Expression::QualifiedStar(_) => false,
+            // Subqueries and other complex expressions - conservatively return true
+            // (ScalarSubquery, Exists, AllAny, etc. could have correlated outer refs)
+            _ => true,
+        }
+    }
+
     /// Strip table alias from column references in an expression.
     /// Converts "o.amount" to "amount", "t.name" to "name", etc.
     /// This is needed when evaluating predicates against rows from fetch_rows_by_ids,
@@ -1216,14 +1337,14 @@ impl Executor {
                     .iter()
                     .map(Self::strip_table_alias_from_expr)
                     .collect();
-                Expression::FunctionCall(FunctionCall {
+                Expression::FunctionCall(Box::new(FunctionCall {
                     token: func.token.clone(),
                     function: func.function.clone(),
                     arguments: new_args,
                     is_distinct: func.is_distinct,
                     order_by: func.order_by.clone(),
                     filter: func.filter.clone(),
-                })
+                }))
             }
             // For other expressions, return as-is
             _ => expr.clone(),
@@ -1274,10 +1395,10 @@ impl Executor {
             return Ok(Expression::In(InExpression {
                 token: all_any.token.clone(),
                 left: all_any.left.clone(),
-                right: Box::new(Expression::ExpressionList(ExpressionList {
+                right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
                     token: dummy_token("(", TokenType::Punctuator),
                     expressions: value_exprs,
-                })),
+                }))),
                 not: false,
             }));
         }
@@ -1287,10 +1408,10 @@ impl Executor {
             return Ok(Expression::In(InExpression {
                 token: all_any.token.clone(),
                 left: all_any.left.clone(),
-                right: Box::new(Expression::ExpressionList(ExpressionList {
+                right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
                     token: dummy_token("(", TokenType::Punctuator),
                     expressions: value_exprs,
-                })),
+                }))),
                 not: true,
             }));
         }
@@ -1510,16 +1631,16 @@ impl Executor {
         let subquery_ctx = ctx.with_incremented_query_depth();
         let mut result = self.execute_select(subquery, &subquery_ctx)?;
 
-        // Collect all values from the first column
+        // Collect all values from the first column - use take_row() to avoid cloning
         let mut values = Vec::new();
         while result.next() {
-            let row = result.row();
+            let row = result.take_row();
             if !row.is_empty() {
-                values.push(
-                    row.get(0)
-                        .cloned()
-                        .unwrap_or_else(crate::core::Value::null_unknown),
-                );
+                // into_values() uses Arc::try_unwrap() to move without cloning when sole owner
+                let mut row_values = row.into_values();
+                if !row_values.is_empty() {
+                    values.push(row_values.swap_remove(0));
+                }
             }
         }
 
@@ -1541,13 +1662,13 @@ impl Executor {
         let subquery_ctx = ctx.with_incremented_query_depth();
         let mut result = self.execute_select(subquery, &subquery_ctx)?;
 
-        // Collect all values from all columns
+        // Collect all values from all columns - use take_row() to avoid cloning
         let mut rows = Vec::new();
         while result.next() {
-            let row = result.row();
+            let row = result.take_row();
             if !row.is_empty() {
-                // Convert Row to Vec<Value>
-                rows.push(row.iter().cloned().collect());
+                // into_values() uses Arc::try_unwrap() to move without cloning when sole owner
+                rows.push(row.into_values());
             }
         }
 
@@ -1706,14 +1827,14 @@ impl Executor {
                         .map(|(orig, processed)| processed.unwrap_or_else(|| orig.clone()))
                         .collect();
 
-                    Ok(Some(Expression::FunctionCall(FunctionCall {
+                    Ok(Some(Expression::FunctionCall(Box::new(FunctionCall {
                         token: func.token.clone(),
                         function: func.function.clone(),
                         arguments: final_args,
                         is_distinct: func.is_distinct,
                         order_by: func.order_by.clone(),
                         filter: func.filter.clone(),
-                    })))
+                    }))))
                 } else {
                     Ok(None)
                 }
@@ -1769,12 +1890,12 @@ impl Executor {
                         })
                         .collect();
 
-                    Ok(Some(Expression::Case(CaseExpression {
+                    Ok(Some(Expression::Case(Box::new(CaseExpression {
                         token: case.token.clone(),
                         value: processed_value.or_else(|| case.value.clone()),
                         when_clauses: final_whens,
                         else_value: processed_else.or_else(|| case.else_value.clone()),
-                    })))
+                    }))))
                 } else {
                     Ok(None)
                 }
@@ -1918,14 +2039,14 @@ impl Executor {
                     .map(|arg| self.process_correlated_expression(arg, ctx))
                     .collect();
 
-                Ok(Expression::FunctionCall(FunctionCall {
+                Ok(Expression::FunctionCall(Box::new(FunctionCall {
                     token: func.token.clone(),
                     function: func.function.clone(),
                     arguments: processed_args?,
                     is_distinct: func.is_distinct,
                     order_by: func.order_by.clone(),
                     filter: func.filter.clone(),
-                }))
+                })))
             }
 
             Expression::In(in_expr) => {
@@ -1993,12 +2114,12 @@ impl Executor {
                     None
                 };
 
-                Ok(Expression::Case(CaseExpression {
+                Ok(Expression::Case(Box::new(CaseExpression {
                     token: case.token.clone(),
                     value: processed_value,
                     when_clauses: processed_whens?,
                     else_value: processed_else,
-                }))
+                })))
             }
 
             Expression::Cast(cast) => {

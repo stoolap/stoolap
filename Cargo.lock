@@ -1419,6 +1419,7 @@ dependencies = [
  "dashmap",
  "dhat",
  "dirs",
+ "hashbrown 0.15.5",
  "indexmap",
  "libc",
  "lru",

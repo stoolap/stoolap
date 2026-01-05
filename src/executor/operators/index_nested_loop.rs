@@ -24,6 +24,7 @@
 
 use std::sync::Arc;
 
+use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
@@ -179,9 +180,13 @@ impl IndexNestedLoopJoinOperator {
 
     /// Create a NULL row for the inner side.
     /// Always creates full-width row so combine() can use consistent indexing.
+    /// Uses Owned storage (Arc values) for compatibility with as_arc_slice() in combine methods.
     #[inline]
     fn null_inner_row(&self) -> Row {
-        Row::from_values(vec![Value::null_unknown(); self.inner_col_count])
+        let null_arcs: Vec<Arc<Value>> = (0..self.inner_col_count)
+            .map(|_| Arc::new(NULL_VALUE))
+            .collect();
+        Row::from_arc_values(null_arcs)
     }
 
     /// Combine outer and inner rows into reusable buffer (owns both).
@@ -196,13 +201,13 @@ impl IndexNestedLoopJoinOperator {
         match &self.projection {
             Some(proj) => {
                 // Fused projection into buffer
-                let vec = self.row_buffer.as_mut_slice_with_capacity(
+                let vec = self.row_buffer.as_mut_arc_vec_with_capacity(
                     proj.outer_indices.len() + proj.inner_indices.len(),
                 );
                 vec.clear();
 
-                // OPTIMIZATION: Move outer values instead of cloning (we own outer)
-                let mut outer_values = outer.into_values();
+                // OPTIMIZATION: Move outer Arc<Value> instead of cloning (we own outer)
+                let mut outer_values = outer.into_arc_values();
                 // SAFETY: outer_indices validated at planning time against outer table schema
                 for &idx in &proj.outer_indices {
                     vec.push(std::mem::take(unsafe {
@@ -210,8 +215,8 @@ impl IndexNestedLoopJoinOperator {
                     }));
                 }
 
-                // OPTIMIZATION: Move inner values instead of cloning (we own inner)
-                let mut inner_values = inner.into_values();
+                // OPTIMIZATION: Move inner Arc<Value> instead of cloning (we own inner)
+                let mut inner_values = inner.into_arc_values();
                 // SAFETY: inner_indices validated at planning time against inner table schema
                 for &idx in &proj.inner_indices {
                     vec.push(std::mem::take(unsafe {
@@ -220,8 +225,9 @@ impl IndexNestedLoopJoinOperator {
                 }
             }
             None => {
-                // Use combine_into_owned for buffer reuse
-                self.row_buffer.combine_into_owned(outer, inner);
+                // Use combine_into_arc to keep buffer in Owned (Arc) storage
+                // This prevents type oscillation when take_from_buffer is called
+                self.row_buffer.combine_into_arc(outer, inner);
             }
         }
     }
@@ -231,10 +237,10 @@ impl IndexNestedLoopJoinOperator {
     /// enabling allocator reuse and consistent allocation patterns.
     #[inline]
     fn take_from_buffer(&mut self) -> Row {
-        let vec = self.row_buffer.as_mut_slice_with_capacity(0);
+        let vec = self.row_buffer.as_mut_arc_vec_with_capacity(0);
         let capacity = vec.capacity();
         let values = std::mem::replace(vec, Vec::with_capacity(capacity));
-        Row::from_values(values)
+        Row::from_arc_values(values)
     }
 
     /// Create combined row directly (for cases where buffer can't be used).
@@ -251,14 +257,23 @@ impl IndexNestedLoopJoinOperator {
                 let total = proj.outer_indices.len() + proj.inner_indices.len();
                 let mut values = Vec::with_capacity(total);
 
-                let outer_slice = outer.as_slice();
+                // Handle both Arc and Inline storage for outer row
                 // SAFETY: outer_indices validated at planning time against outer table schema
-                for &idx in &proj.outer_indices {
-                    values.push(unsafe { outer_slice.get_unchecked(idx) }.clone());
+                if let Some(outer_slice) = outer.try_as_arc_slice() {
+                    for &idx in &proj.outer_indices {
+                        values.push(Arc::clone(unsafe { outer_slice.get_unchecked(idx) }));
+                    }
+                } else {
+                    // Inline storage: wrap values in Arc
+                    for &idx in &proj.outer_indices {
+                        if let Some(v) = outer.get(idx) {
+                            values.push(Arc::new(v.clone()));
+                        }
+                    }
                 }
 
-                // OPTIMIZATION: Move inner values instead of cloning (we own inner)
-                let mut inner_values = inner.into_values();
+                // OPTIMIZATION: Move inner Arc<Value> instead of cloning (we own inner)
+                let mut inner_values = inner.into_arc_values();
                 // SAFETY: inner_indices validated at planning time against inner table schema
                 for &idx in &proj.inner_indices {
                     values.push(std::mem::take(unsafe {
@@ -266,7 +281,7 @@ impl IndexNestedLoopJoinOperator {
                     }));
                 }
 
-                Row::from_values(values)
+                Row::from_arc_values(values)
             }
             None => Row::from_combined_clone_move(outer, inner),
         }
@@ -573,22 +588,40 @@ impl BatchIndexNestedLoopJoinOperator {
             Some(proj) => {
                 // Fused projection: create only the columns we need
                 let total = proj.outer_indices.len() + proj.inner_indices.len();
-                let mut values = Vec::with_capacity(total);
+                let mut values: Vec<Arc<Value>> = Vec::with_capacity(total);
 
-                let outer_slice = outer.as_slice();
+                // Handle both Arc and Inline storage for outer row
                 // SAFETY: outer_indices validated at planning time against outer table schema
-                for &idx in &proj.outer_indices {
-                    values.push(unsafe { outer_slice.get_unchecked(idx) }.clone());
+                if let Some(outer_slice) = outer.try_as_arc_slice() {
+                    for &idx in &proj.outer_indices {
+                        values.push(Arc::clone(unsafe { outer_slice.get_unchecked(idx) }));
+                    }
+                } else {
+                    // Inline storage: wrap values in Arc
+                    for &idx in &proj.outer_indices {
+                        if let Some(v) = outer.get(idx) {
+                            values.push(Arc::new(v.clone()));
+                        }
+                    }
                 }
 
-                let inner_slice = inner.as_slice();
+                // Handle both Arc and Inline storage for inner row
                 // SAFETY: inner_indices validated at planning time against inner table schema
                 // null_inner_row() creates full-width rows for consistent indexing
-                for &idx in &proj.inner_indices {
-                    values.push(unsafe { inner_slice.get_unchecked(idx) }.clone());
+                if let Some(inner_slice) = inner.try_as_arc_slice() {
+                    for &idx in &proj.inner_indices {
+                        values.push(Arc::clone(unsafe { inner_slice.get_unchecked(idx) }));
+                    }
+                } else {
+                    // Inline storage: wrap values in Arc
+                    for &idx in &proj.inner_indices {
+                        if let Some(v) = inner.get(idx) {
+                            values.push(Arc::new(v.clone()));
+                        }
+                    }
                 }
 
-                Row::from_values(values)
+                Row::from_arc_values(values)
             }
             None => Row::from_combined(outer, inner),
         }
@@ -596,9 +629,13 @@ impl BatchIndexNestedLoopJoinOperator {
 
     /// Create a NULL row for the inner side.
     /// Always creates full-width row so combine() can use consistent indexing.
+    /// Uses Owned storage (Arc values) for compatibility with as_arc_slice() in combine().
     #[inline]
     fn null_inner_row(&self) -> Row {
-        Row::from_values(vec![Value::null_unknown(); self.inner_col_count])
+        let null_arcs: Vec<Arc<Value>> = (0..self.inner_col_count)
+            .map(|_| Arc::new(NULL_VALUE))
+            .collect();
+        Row::from_arc_values(null_arcs)
     }
 }
 

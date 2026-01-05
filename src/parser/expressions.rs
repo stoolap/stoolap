@@ -401,10 +401,10 @@ impl Parser {
             }
 
             // Return as ExpressionList (tuple)
-            return Some(Expression::ExpressionList(ExpressionList {
+            return Some(Expression::ExpressionList(Box::new(ExpressionList {
                 token,
                 expressions,
-            }));
+            })));
         }
 
         if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
@@ -691,7 +691,7 @@ impl Parser {
             if self.peek_token_is_keyword("OVER") {
                 return self.parse_window_expression(call);
             }
-            return Some(Expression::FunctionCall(call));
+            return Some(Expression::FunctionCall(Box::new(call)));
         }
 
         // Check for * argument (COUNT(*))
@@ -721,7 +721,7 @@ impl Parser {
                 return self.parse_window_expression(call);
             }
 
-            return Some(Expression::FunctionCall(call));
+            return Some(Expression::FunctionCall(Box::new(call)));
         }
 
         // Check for DISTINCT
@@ -799,7 +799,7 @@ impl Parser {
             return self.parse_window_expression(call);
         }
 
-        Some(Expression::FunctionCall(call))
+        Some(Expression::FunctionCall(Box::new(call)))
     }
 
     /// Parse FILTER clause for aggregate functions (FILTER (WHERE condition))
@@ -873,14 +873,14 @@ impl Parser {
         if self.peek_token_is(TokenType::Identifier) {
             self.next_token(); // consume window name
             let window_ref = self.cur_token.literal.clone();
-            return Some(Expression::Window(WindowExpression {
+            return Some(Expression::Window(Box::new(WindowExpression {
                 token,
                 function: Box::new(function),
                 window_ref: Some(window_ref),
                 partition_by: Vec::new(),
                 order_by: Vec::new(),
                 frame: None,
-            }));
+            })));
         }
 
         if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
@@ -950,14 +950,14 @@ impl Parser {
             return None;
         }
 
-        Some(Expression::Window(WindowExpression {
+        Some(Expression::Window(Box::new(WindowExpression {
             token,
             function: Box::new(function),
             window_ref: None,
             partition_by,
             order_by,
             frame,
-        }))
+        })))
     }
 
     /// Parse a window frame (ROWS/RANGE BETWEEN ... AND ...)
@@ -1174,10 +1174,10 @@ impl Parser {
             return Some(Expression::In(InExpression {
                 token,
                 left: Box::new(left),
-                right: Box::new(Expression::ExpressionList(ExpressionList {
+                right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
                     token: list_token,
                     expressions,
-                })),
+                }))),
                 not,
             }));
         }
@@ -1208,10 +1208,10 @@ impl Parser {
         Some(Expression::In(InExpression {
             token,
             left: Box::new(left),
-            right: Box::new(Expression::ExpressionList(ExpressionList {
+            right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
                 token: list_token,
                 expressions,
-            })),
+            }))),
             not,
         }))
     }
@@ -1343,12 +1343,12 @@ impl Parser {
             return None;
         }
 
-        Some(Expression::Case(CaseExpression {
+        Some(Expression::Case(Box::new(CaseExpression {
             token,
             value,
             when_clauses,
             else_value,
-        }))
+        })))
     }
 
     /// Parse a CAST expression
@@ -1472,14 +1472,14 @@ impl Parser {
         // For other fields (DOW, DOY, WEEK, etc.), call EXTRACT(field_str, source)
         let basic_fields = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"];
         if basic_fields.contains(&field.as_str()) {
-            Some(Expression::FunctionCall(FunctionCall {
+            Some(Expression::FunctionCall(Box::new(FunctionCall {
                 token,
                 function: field,
                 arguments: vec![source],
                 is_distinct: false,
                 order_by: Vec::new(),
                 filter: None,
-            }))
+            })))
         } else {
             // Call EXTRACT with field name as string argument
             let field_literal = Expression::StringLiteral(StringLiteral {
@@ -1492,14 +1492,14 @@ impl Parser {
                 value: field.to_lowercase(),
                 type_hint: None,
             });
-            Some(Expression::FunctionCall(FunctionCall {
+            Some(Expression::FunctionCall(Box::new(FunctionCall {
                 token,
                 function: "EXTRACT".to_string(),
                 arguments: vec![field_literal, source],
                 is_distinct: false,
                 order_by: Vec::new(),
                 filter: None,
-            }))
+            })))
         }
     }
 
@@ -1689,7 +1689,8 @@ impl Parser {
 
     /// Parse an expression list (comma-separated)
     pub fn parse_expression_list(&mut self) -> Vec<Expression> {
-        let mut list = Vec::new();
+        // Pre-allocate for common case (most expression lists have 1-8 elements)
+        let mut list = Vec::with_capacity(8);
 
         self.next_token();
         if let Some(expr) = self.parse_expression(Precedence::Lowest) {

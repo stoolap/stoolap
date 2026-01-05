@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rustc_hash::FxHashSet;
+
 use crate::core::{Error, Result};
 use crate::storage::{PersistenceConfig, SyncMode};
 
@@ -1582,8 +1584,8 @@ impl WALManager {
         // Phase 1: Analysis - Identify transaction outcomes
         // Only collect txn_ids, not full entries (memory efficient)
         // =====================================================
-        let mut committed_txns: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        let mut aborted_txns: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut committed_txns: FxHashSet<i64> = FxHashSet::default();
+        let mut aborted_txns: FxHashSet<i64> = FxHashSet::default();
         let mut last_lsn = from_lsn;
 
         for wal_path in &wal_files {
@@ -1739,8 +1741,8 @@ impl WALManager {
     fn scan_wal_for_txn_status(
         wal_path: &Path,
         from_lsn: u64,
-        committed_txns: &mut std::collections::HashSet<i64>,
-        aborted_txns: &mut std::collections::HashSet<i64>,
+        committed_txns: &mut FxHashSet<i64>,
+        aborted_txns: &mut FxHashSet<i64>,
         last_lsn: &mut u64,
     ) -> Result<()> {
         let mut file = match File::open(wal_path) {

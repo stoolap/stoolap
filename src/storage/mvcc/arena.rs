@@ -17,7 +17,7 @@
 //! This module provides Arc-based storage for row data,
 //! enabling O(1) row cloning on read (just Arc::clone).
 //!
-//! Key insight: Store row data as Arc<[Value]> for O(1) clone on read.
+//! Key insight: Store row data as Arc<[Arc<Value>]> for O(1) clone on read.
 //! Single clone on insert, zero clone on read.
 //!
 //! # Lock Design
@@ -57,7 +57,8 @@ impl ArenaRowMeta {
 /// Inner arena data protected by single lock
 pub struct ArenaInner {
     /// Arc storage per row (for O(1) clone on read)
-    pub data: Vec<Arc<[Value]>>,
+    /// Stores Arc<[Arc<Value>]> matching the new Row storage format
+    pub data: Vec<Arc<[Arc<Value>]>>,
     /// Row metadata
     pub meta: Vec<ArenaRowMeta>,
 }
@@ -101,8 +102,9 @@ impl RowArena {
     pub fn insert(&self, row_id: i64, txn_id: i64, create_time: i64, values: &[Value]) -> usize {
         let mut inner = self.inner.write();
 
-        // Store Arc for O(1) clone on read - single clone here
-        inner.data.push(Arc::from(values));
+        // Convert values to Arc<Value> and store
+        let arc_values: Vec<Arc<Value>> = values.iter().map(|v| Arc::new(v.clone())).collect();
+        inner.data.push(Arc::from(arc_values));
 
         let meta = ArenaRowMeta {
             row_id,
@@ -117,12 +119,21 @@ impl RowArena {
     }
 
     /// Insert a row from a Row struct
+    /// Handles all storage types: Inline values are wrapped in Arc, Owned/Shared are cloned.
     #[inline]
     pub fn insert_row(&self, row_id: i64, txn_id: i64, create_time: i64, row: &Row) -> usize {
         let mut inner = self.inner.write();
 
-        // Store Arc for O(1) clone on read - single clone here
-        inner.data.push(Arc::from(row.as_slice()));
+        // Store Arc for O(1) clone on read - handle all storage types
+        let arc_data = match row.try_as_arc_slice() {
+            Some(slice) => Arc::from(slice),
+            None => {
+                // Inline storage: wrap values in Arc
+                let arc_vec: Vec<Arc<Value>> = row.iter().map(|v| Arc::new(v.clone())).collect();
+                Arc::from(arc_vec.into_boxed_slice())
+            }
+        };
+        inner.data.push(arc_data);
 
         let meta = ArenaRowMeta {
             row_id,
@@ -138,6 +149,7 @@ impl RowArena {
 
     /// Insert a row and return both the index AND the Arc
     /// This allows the caller to reuse the Arc for O(1) clones
+    /// Handles all storage types: Inline values are wrapped in Arc, Owned/Shared are cloned.
     #[inline]
     pub fn insert_row_get_arc(
         &self,
@@ -145,11 +157,18 @@ impl RowArena {
         txn_id: i64,
         create_time: i64,
         row: &Row,
-    ) -> (usize, Arc<[Value]>) {
+    ) -> (usize, Arc<[Arc<Value>]>) {
         let mut inner = self.inner.write();
 
-        // Create Arc once, clone for storage and return
-        let arc_data = Arc::from(row.as_slice());
+        // Create Arc once, clone for storage and return - handle all storage types
+        let arc_data = match row.try_as_arc_slice() {
+            Some(slice) => Arc::from(slice),
+            None => {
+                // Inline storage: wrap values in Arc
+                let arc_vec: Vec<Arc<Value>> = row.iter().map(|v| Arc::new(v.clone())).collect();
+                Arc::from(arc_vec.into_boxed_slice())
+            }
+        };
         inner.data.push(Arc::clone(&arc_data));
 
         let meta = ArenaRowMeta {
@@ -172,7 +191,7 @@ impl RowArena {
         row_id: i64,
         txn_id: i64,
         create_time: i64,
-        arc_data: Arc<[Value]>,
+        arc_data: Arc<[Arc<Value>]>,
     ) -> usize {
         let mut inner = self.inner.write();
 
@@ -224,7 +243,7 @@ impl RowArena {
 
     /// Get Arc for a row by arena index - O(1) clone
     #[inline]
-    pub fn get_arc(&self, arena_idx: usize) -> Option<Arc<[Value]>> {
+    pub fn get_arc(&self, arena_idx: usize) -> Option<Arc<[Arc<Value>]>> {
         let inner = self.inner.read();
         inner.data.get(arena_idx).cloned()
     }
@@ -234,7 +253,7 @@ impl RowArena {
     /// This is optimized for the visibility fast path where we need to check
     /// txn_id and deleted_at_txn_id before returning the data.
     #[inline]
-    pub fn get_meta_and_arc(&self, arena_idx: usize) -> Option<(ArenaRowMeta, Arc<[Value]>)> {
+    pub fn get_meta_and_arc(&self, arena_idx: usize) -> Option<(ArenaRowMeta, Arc<[Arc<Value>]>)> {
         let inner = self.inner.read();
         if arena_idx < inner.meta.len() {
             let meta = inner.meta[arena_idx];
@@ -260,7 +279,7 @@ pub struct ArenaReadGuard<'a> {
 impl<'a> ArenaReadGuard<'a> {
     /// Get data slice
     #[inline]
-    pub fn data(&self) -> &[Arc<[Value]>] {
+    pub fn data(&self) -> &[Arc<[Arc<Value>]>] {
         &self.inner.data
     }
 
@@ -321,8 +340,10 @@ mod tests {
 
         for (idx, _meta) in guard.meta().iter().enumerate() {
             count += 1;
-            if let Some(Value::Float(v)) = guard.data()[idx].get(2) {
-                sum += v;
+            if let Some(arc_val) = guard.data()[idx].get(2) {
+                if let Value::Float(v) = &**arc_val {
+                    sum += v;
+                }
             }
         }
 
@@ -343,7 +364,7 @@ mod tests {
         let row_arc = Arc::clone(&guard.data()[0]);
         assert_eq!(row_arc.len(), 2);
 
-        if let Value::Integer(v) = &row_arc[0] {
+        if let Value::Integer(v) = &*row_arc[0] {
             assert_eq!(*v, 42);
         } else {
             panic!("Expected Integer");
@@ -378,19 +399,19 @@ mod tests {
         let guard = arena.read_guard();
 
         // Get column 0
-        let val = guard.data()[0].first().cloned();
+        let val = guard.data()[0].first().map(|arc| (**arc).clone());
         assert_eq!(val, Some(Value::Integer(42)));
 
         // Get column 1
-        let val = guard.data()[0].get(1).cloned();
+        let val = guard.data()[0].get(1).map(|arc| (**arc).clone());
         assert_eq!(val, Some(Value::text("hello")));
 
         // Get column 2
-        let val = guard.data()[0].get(2).cloned();
+        let val = guard.data()[0].get(2).map(|arc| (**arc).clone());
         assert_eq!(val, Some(Value::Float(3.15)));
 
         // Out of bounds column - returns None
-        let val = guard.data()[0].get(3).cloned();
+        let val: Option<Value> = guard.data()[0].get(3).map(|arc| (**arc).clone());
         assert_eq!(val, None);
     }
 

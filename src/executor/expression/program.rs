@@ -21,6 +21,8 @@
 
 use std::sync::Arc;
 
+use rustc_hash::FxHashSet;
+
 use super::ops::Op;
 use crate::core::Value;
 
@@ -363,7 +365,7 @@ impl Program {
         // Build a set of positions that are jump targets - we can't fuse instructions
         // that are jump targets because that would make the jump land in the middle
         // of what becomes a single instruction.
-        let mut jump_targets = std::collections::HashSet::new();
+        let mut jump_targets = FxHashSet::default();
         for op in &ops {
             match op {
                 Op::And(t)

@@ -149,9 +149,10 @@ pub enum RowRef {
     /// Used by join operators to avoid materializing combined rows.
     Composite(CompositeRow),
 
-    /// Shared build composite - combines probe row with an Arc-referenced build row.
-    /// Avoids cloning build rows by keeping a reference to the shared storage.
-    SharedBuildComposite(SharedBuildCompositeRow),
+    /// Direct build composite - combines owned probe row with Arc-referenced build rows.
+    /// OPTIMIZATION: Avoids Arc allocation for probe row (saves 1 allocation per match).
+    /// Used for hash joins where build rows are shared via Arc.
+    DirectBuildComposite(DirectBuildCompositeRow),
 }
 
 impl RowRef {
@@ -173,7 +174,7 @@ impl RowRef {
         match self {
             RowRef::Owned(row) => row.len(),
             RowRef::Composite(comp) => comp.len(),
-            RowRef::SharedBuildComposite(shared) => shared.len(),
+            RowRef::DirectBuildComposite(direct) => direct.len(),
         }
     }
 
@@ -189,21 +190,21 @@ impl RowRef {
         match self {
             RowRef::Owned(row) => row.get(idx),
             RowRef::Composite(comp) => comp.get(idx),
-            RowRef::SharedBuildComposite(shared) => shared.get(idx),
+            RowRef::DirectBuildComposite(direct) => direct.get(idx),
         }
     }
 
     /// Convert to an owned Row.
     ///
     /// For `Owned`, this is a no-op move.
-    /// For `Composite` and `SharedBuildComposite`, this materializes the combined row.
+    /// For `Composite` and `DirectBuildComposite`, this materializes the combined row.
     #[inline]
     pub fn into_owned(self) -> Row {
         match self {
             RowRef::Owned(row) => row,
             // Use materialize_owned to move values instead of cloning
             RowRef::Composite(comp) => comp.materialize_owned(),
-            RowRef::SharedBuildComposite(shared) => shared.materialize_owned(),
+            RowRef::DirectBuildComposite(direct) => direct.materialize_owned(),
         }
     }
 
@@ -214,7 +215,7 @@ impl RowRef {
         match self {
             RowRef::Owned(row) => row.clone(),
             RowRef::Composite(comp) => comp.materialize(),
-            RowRef::SharedBuildComposite(shared) => shared.materialize(),
+            RowRef::DirectBuildComposite(direct) => direct.materialize(),
         }
     }
 
@@ -224,22 +225,22 @@ impl RowRef {
         match self {
             RowRef::Owned(row) => Some(row),
             RowRef::Composite(_) => None,
-            RowRef::SharedBuildComposite(_) => None,
+            RowRef::DirectBuildComposite(_) => None,
         }
     }
 
-    /// Create a shared-build composite RowRef.
+    /// Create a direct-build composite RowRef.
     ///
-    /// This avoids cloning build rows by keeping an Arc reference.
-    /// Takes Arc<Row> for O(1) clone in 1:N join scenarios (also Send+Sync).
+    /// OPTIMIZATION: Avoids Arc allocation for probe row.
+    /// Use this for 1:1 joins where probe row is owned and not shared.
     #[inline]
-    pub fn shared_build_composite(
-        probe: Arc<Row>,
+    pub fn direct_build_composite(
+        probe: Row,
         build_rows: Arc<Vec<Row>>,
         build_idx: usize,
         probe_is_left: bool,
     ) -> Self {
-        RowRef::SharedBuildComposite(SharedBuildCompositeRow::new(
+        RowRef::DirectBuildComposite(DirectBuildCompositeRow::new(
             probe,
             build_rows,
             build_idx,
@@ -343,7 +344,7 @@ impl CompositeRow {
     /// Prefer `materialize_owned()` when you can consume the CompositeRow.
     pub fn materialize(&self) -> Row {
         let total = self.len();
-        let mut values = Vec::with_capacity(total);
+        let mut values: Vec<Value> = Vec::with_capacity(total);
 
         // Copy left values
         values.extend(self.left.iter().cloned());
@@ -387,34 +388,30 @@ impl fmt::Display for CompositeRow {
     }
 }
 
-/// A shared-build composite row that references build rows via Arc.
+/// A direct-build composite row that owns the probe row directly.
 ///
-/// This optimization avoids cloning by storing:
-/// - Arc reference to probe row (O(1) clone for 1:N joins)
-/// - Arc reference to shared build row storage
-/// - Index into the build rows
-///
-/// Arc refcounts are incremented (O(1)) instead of cloning the entire rows.
-#[derive(Debug, Clone)]
-pub struct SharedBuildCompositeRow {
-    /// Probe row (Arc for O(1) clone in 1:N joins, also Send+Sync)
-    probe: Arc<Row>,
+/// This stores the probe Row directly without Arc wrapping, saving one Arc
+/// allocation per matched row. The build rows are shared via Arc for
+/// efficient access.
+#[derive(Debug)]
+pub struct DirectBuildCompositeRow {
+    /// Probe row (owned directly, no Arc overhead)
+    probe: Row,
     /// Shared reference to build rows
     build_rows: Arc<Vec<Row>>,
     /// Index into build_rows
     build_idx: usize,
-    /// Number of columns from the probe (left) side
+    /// Number of columns from the probe side
     probe_cols: usize,
     /// Whether probe is left side (true) or right side (false)
     probe_is_left: bool,
 }
 
-impl SharedBuildCompositeRow {
-    /// Create a new shared-build composite row.
-    /// Takes Arc<Row> for O(1) clone in 1:N join scenarios (also Send+Sync).
+impl DirectBuildCompositeRow {
+    /// Create a new direct-build composite row.
     #[inline]
     pub fn new(
-        probe: Arc<Row>,
+        probe: Row,
         build_rows: Arc<Vec<Row>>,
         build_idx: usize,
         probe_is_left: bool,
@@ -464,18 +461,15 @@ impl SharedBuildCompositeRow {
     }
 
     /// Materialize into an owned Row (cloning version).
-    /// Prefer `materialize_owned()` when you can consume the SharedBuildCompositeRow.
     pub fn materialize(&self) -> Row {
         let build_row = &self.build_rows[self.build_idx];
         let total = self.probe_cols + build_row.len();
-        let mut values = Vec::with_capacity(total);
+        let mut values: Vec<Value> = Vec::with_capacity(total);
 
         if self.probe_is_left {
-            // Output: [probe, build]
             values.extend(self.probe.iter().cloned());
             values.extend(build_row.iter().cloned());
         } else {
-            // Output: [build, probe]
             values.extend(build_row.iter().cloned());
             values.extend(self.probe.iter().cloned());
         }
@@ -483,45 +477,56 @@ impl SharedBuildCompositeRow {
         Row::from_values(values)
     }
 
-    /// Materialize into an owned Row by moving probe values when possible.
+    /// Materialize into an owned Row by moving probe values.
     ///
-    /// If this is the last reference to the probe Arc, values are moved without cloning.
-    /// Otherwise, probe values are cloned. Build values are always cloned (shared via Arc).
+    /// OPTIMIZATION: Uses Arc storage when both rows have Arc storage.
+    /// This allows O(1) Arc::clone instead of O(n) Value::clone for strings.
     #[inline]
     pub fn materialize_owned(self) -> Row {
         let build_row = &self.build_rows[self.build_idx];
         let total = self.probe_cols + build_row.len();
-        let mut values = Vec::with_capacity(total);
 
-        // Try to unwrap Arc - if we're the only holder, we can move values
-        match Arc::try_unwrap(self.probe) {
-            Ok(row) => {
-                // We own the probe row - move values without cloning
-                if self.probe_is_left {
-                    values.extend(row.into_values());
-                    values.extend(build_row.iter().cloned());
-                } else {
-                    values.extend(build_row.iter().cloned());
-                    values.extend(row.into_values());
-                }
+        // Fast path: if both have Arc storage, use Arc::clone (O(1))
+        if let (Some(probe_arcs), Some(build_arcs)) =
+            (self.probe.try_as_arc_slice(), build_row.try_as_arc_slice())
+        {
+            let mut arc_values: Vec<Arc<Value>> = Vec::with_capacity(total);
+            if self.probe_is_left {
+                arc_values.extend(probe_arcs.iter().cloned());
+                arc_values.extend(build_arcs.iter().cloned());
+            } else {
+                arc_values.extend(build_arcs.iter().cloned());
+                arc_values.extend(probe_arcs.iter().cloned());
             }
-            Err(arc) => {
-                // Probe is still shared - must clone values
-                if self.probe_is_left {
-                    values.extend(arc.iter().cloned());
-                    values.extend(build_row.iter().cloned());
-                } else {
-                    values.extend(build_row.iter().cloned());
-                    values.extend(arc.iter().cloned());
-                }
-            }
+            return Row::from_arc_values(arc_values);
         }
 
+        // Fallback: use Inline storage with Value clones
+        let mut values: Vec<Value> = Vec::with_capacity(total);
+        if self.probe_is_left {
+            values.extend(self.probe);
+            values.extend(build_row.iter().cloned());
+        } else {
+            values.extend(build_row.iter().cloned());
+            values.extend(self.probe);
+        }
         Row::from_values(values)
     }
 }
 
-impl fmt::Display for SharedBuildCompositeRow {
+impl Clone for DirectBuildCompositeRow {
+    fn clone(&self) -> Self {
+        Self {
+            probe: self.probe.clone(),
+            build_rows: Arc::clone(&self.build_rows),
+            build_idx: self.build_idx,
+            probe_cols: self.probe_cols,
+            probe_is_left: self.probe_is_left,
+        }
+    }
+}
+
+impl fmt::Display for DirectBuildCompositeRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "(")?;
         for i in 0..self.len() {

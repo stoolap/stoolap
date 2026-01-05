@@ -59,6 +59,8 @@
 //! For production tuning, run representative queries with EXPLAIN ANALYZE
 //! to compare estimated vs actual costs, then adjust constants accordingly.
 
+use ahash::AHashMap;
+
 use crate::core::IndexType;
 use crate::executor::{
     DEFAULT_PARALLEL_FILTER_THRESHOLD, DEFAULT_PARALLEL_JOIN_THRESHOLD,
@@ -1179,7 +1181,7 @@ impl CostEstimator {
     /// * `correlations` - Optional correlation data for the table
     pub fn estimate_and_selectivity(
         &self,
-        column_selectivities: &std::collections::HashMap<String, f64>,
+        column_selectivities: &AHashMap<String, f64>,
         correlations: Option<&ColumnCorrelations>,
     ) -> f64 {
         let selectivities: Vec<(&str, f64)> = column_selectivities
@@ -2577,7 +2579,7 @@ mod tests {
         let mut correlations = ColumnCorrelations::new();
         correlations.add_correlation("a", "b", 0.8);
 
-        let mut selectivities = std::collections::HashMap::new();
+        let mut selectivities = AHashMap::new();
         selectivities.insert("a".to_string(), 0.1);
         selectivities.insert("b".to_string(), 0.1);
 

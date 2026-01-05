@@ -15,6 +15,8 @@
 //! Index trait for database indexes
 //!
 
+use std::sync::Arc;
+
 use rustc_hash::FxHashMap;
 
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, Value};
@@ -50,6 +52,17 @@ pub trait Index: Send + Sync {
     /// Note: Uses `&self` with interior mutability for thread-safe concurrent access
     fn add(&self, values: &[Value], row_id: i64, ref_id: i64) -> Result<()>;
 
+    /// Adds Arc<Value> references to the index - shares ownership without cloning
+    ///
+    /// This is the preferred method when you already have Arc<Value> references
+    /// (e.g., from Row storage) as it avoids cloning the underlying values.
+    ///
+    /// # Arguments
+    /// * `values` - Arc references to the column values to index
+    /// * `row_id` - The row ID in the table
+    /// * `ref_id` - The reference ID in the index
+    fn add_arc(&self, values: &[Arc<Value>], row_id: i64, ref_id: i64) -> Result<()>;
+
     /// Adds multiple entries to the index in a single batch operation
     ///
     /// # Arguments
@@ -65,6 +78,17 @@ pub trait Index: Send + Sync {
     ///
     /// Note: Uses `&self` with interior mutability for thread-safe concurrent access
     fn remove(&self, values: &[Value], row_id: i64, ref_id: i64) -> Result<()>;
+
+    /// Removes Arc<Value> references from the index - avoids cloning when you have Arc refs
+    ///
+    /// This is the preferred method when you already have Arc<Value> references
+    /// (e.g., from Row storage) as it avoids cloning the underlying values.
+    ///
+    /// # Arguments
+    /// * `values` - Arc references to the column values to remove
+    /// * `row_id` - The row ID in the table
+    /// * `ref_id` - The reference ID in the index
+    fn remove_arc(&self, values: &[Arc<Value>], row_id: i64, ref_id: i64) -> Result<()>;
 
     /// Removes multiple entries from the index in a single batch operation
     ///

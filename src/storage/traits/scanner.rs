@@ -71,6 +71,14 @@ pub trait Scanner: Send {
     fn take_row(&mut self) -> Row {
         self.row().clone()
     }
+
+    /// Returns an estimate of the total number of rows in the scan.
+    ///
+    /// This is used for pre-allocating vectors to avoid reallocations.
+    /// Returns None if the count is unknown. Default implementation returns None.
+    fn estimated_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// An empty scanner that immediately returns no rows
@@ -112,6 +120,10 @@ impl Scanner for EmptyScanner {
     fn close(&mut self) -> Result<()> {
         self.closed = true;
         Ok(())
+    }
+
+    fn estimated_count(&self) -> Option<usize> {
+        Some(0)
     }
 }
 
@@ -182,6 +194,10 @@ impl Scanner for VecScanner {
     fn close(&mut self) -> Result<()> {
         self.closed = true;
         Ok(())
+    }
+
+    fn estimated_count(&self) -> Option<usize> {
+        Some(self.rows.len())
     }
 }
 

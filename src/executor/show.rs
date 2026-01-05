@@ -23,6 +23,7 @@
 //! - DESCRIBE
 
 use compact_str::CompactString;
+use rustc_hash::FxHashSet;
 
 use crate::core::{Error, Result, Row, Value};
 use crate::parser::ast::*;
@@ -80,8 +81,7 @@ impl Executor {
         let schema = table.schema();
 
         // Get unique column names from indexes
-        let mut unique_columns: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut unique_columns: FxHashSet<String> = FxHashSet::default();
         if let Ok(indexes) = self.engine.list_table_indexes(table_name) {
             for index_name in indexes.keys() {
                 if let Some(index) = table.get_index(index_name) {

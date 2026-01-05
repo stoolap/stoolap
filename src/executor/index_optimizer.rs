@@ -207,7 +207,7 @@ impl Executor {
         let limit = if let Some(ref limit_expr) = stmt.limit {
             match ExpressionEval::compile(limit_expr, &[])
                 .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
             {
                 Some(Value::Integer(l)) => l as usize,
                 Some(Value::Float(f)) => f as usize,
@@ -220,7 +220,7 @@ impl Executor {
         let offset = if let Some(ref offset_expr) = stmt.offset {
             match ExpressionEval::compile(offset_expr, &[])
                 .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
             {
                 Some(Value::Integer(o)) => o as usize,
                 Some(Value::Float(f)) => f as usize,
@@ -315,7 +315,7 @@ impl Executor {
         let limit = if let Some(ref limit_expr) = stmt.limit {
             match ExpressionEval::compile(limit_expr, &[])
                 .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
             {
                 Some(Value::Integer(l)) => l as usize,
                 Some(Value::Float(f)) => f as usize,
@@ -462,7 +462,7 @@ impl Executor {
                 // Try to evaluate the expression
                 ExpressionEval::compile(expr, &[])
                     .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                     .and_then(|v| match v {
                         Value::Integer(i) => Some(i),
                         Value::Float(f) => Some(f as i64),
@@ -861,7 +861,7 @@ impl Executor {
                     .and_then(|e| {
                         ExpressionEval::compile(e, &[])
                             .ok()
-                            .and_then(|eval| eval.with_context(ctx).eval_slice(&[]).ok())
+                            .and_then(|eval| eval.with_context(ctx).eval_slice(&Row::new()).ok())
                             .and_then(|v| {
                                 if let Value::Integer(o) = v {
                                     Some(o.max(0) as usize)
@@ -878,7 +878,7 @@ impl Executor {
                     .and_then(|e| {
                         ExpressionEval::compile(e, &[])
                             .ok()
-                            .and_then(|eval| eval.with_context(ctx).eval_slice(&[]).ok())
+                            .and_then(|eval| eval.with_context(ctx).eval_slice(&Row::new()).ok())
                             .and_then(|v| {
                                 if let Value::Integer(l) = v {
                                     Some(l.max(0) as usize)
@@ -952,7 +952,7 @@ impl Executor {
                 let offset = if let Some(ref offset_expr) = stmt.offset {
                     match ExpressionEval::compile(offset_expr, &[])
                         .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                     {
                         Some(Value::Integer(o)) if o >= 0 => o as usize,
                         _ => 0,
@@ -964,7 +964,7 @@ impl Executor {
                 let limit = if let Some(ref limit_expr) = stmt.limit {
                     match ExpressionEval::compile(limit_expr, &[])
                         .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                     {
                         Some(Value::Integer(l)) if l >= 0 => l as usize,
                         _ => usize::MAX,
@@ -1029,7 +1029,7 @@ impl Executor {
             let offset = if let Some(ref offset_expr) = stmt.offset {
                 match ExpressionEval::compile(offset_expr, &[])
                     .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                 {
                     Some(Value::Integer(o)) if o >= 0 => o as usize,
                     _ => 0,
@@ -1041,7 +1041,7 @@ impl Executor {
             let limit = if let Some(ref limit_expr) = stmt.limit {
                 match ExpressionEval::compile(limit_expr, &[])
                     .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                 {
                     Some(Value::Integer(l)) if l >= 0 => l as usize,
                     _ => usize::MAX,
@@ -1172,7 +1172,7 @@ impl Executor {
                 let offset = if let Some(ref offset_expr) = stmt.offset {
                     match ExpressionEval::compile(offset_expr, &[])
                         .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                     {
                         Some(Value::Integer(o)) if o >= 0 => o as usize,
                         _ => 0,
@@ -1184,7 +1184,7 @@ impl Executor {
                 let limit = if let Some(ref limit_expr) = stmt.limit {
                     match ExpressionEval::compile(limit_expr, &[])
                         .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                     {
                         Some(Value::Integer(l)) if l >= 0 => l as usize,
                         _ => usize::MAX,
@@ -1249,7 +1249,7 @@ impl Executor {
             let offset = if let Some(ref offset_expr) = stmt.offset {
                 match ExpressionEval::compile(offset_expr, &[])
                     .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                 {
                     Some(Value::Integer(o)) if o >= 0 => o as usize,
                     _ => 0,
@@ -1261,7 +1261,7 @@ impl Executor {
             let limit = if let Some(ref limit_expr) = stmt.limit {
                 match ExpressionEval::compile(limit_expr, &[])
                     .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                 {
                     Some(Value::Integer(l)) if l >= 0 => l as usize,
                     _ => usize::MAX,
@@ -1352,7 +1352,7 @@ impl Executor {
         for expr in exprs {
             // Try to evaluate as a constant expression
             match ExpressionEval::compile(expr, &[]) {
-                Ok(compiled) => match compiled.with_context(ctx).eval_slice(&[]) {
+                Ok(compiled) => match compiled.with_context(ctx).eval_slice(&Row::new()) {
                     Ok(val) => values.push(val),
                     Err(_) => return None, // Can't evaluate as constant
                 },
@@ -1459,7 +1459,7 @@ impl Executor {
                 .and_then(|offset_expr| {
                     ExpressionEval::compile(offset_expr, &[])
                         .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                         .and_then(|v| {
                             if let Value::Integer(o) = v {
                                 Some(o.max(0) as usize)
@@ -1473,7 +1473,7 @@ impl Executor {
             let limit = stmt.limit.as_ref().and_then(|limit_expr| {
                 ExpressionEval::compile(limit_expr, &[])
                     .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                     .and_then(|v| {
                         if let Value::Integer(l) = v {
                             Some(l.max(0) as usize)
@@ -1577,7 +1577,7 @@ impl Executor {
                 let offset = if let Some(ref offset_expr) = stmt.offset {
                     match ExpressionEval::compile(offset_expr, &[])
                         .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                     {
                         Some(Value::Integer(o)) if o >= 0 => o as usize,
                         _ => 0,
@@ -1589,7 +1589,7 @@ impl Executor {
                 let limit = if let Some(ref limit_expr) = stmt.limit {
                     match ExpressionEval::compile(limit_expr, &[])
                         .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                     {
                         Some(Value::Integer(l)) if l >= 0 => l as usize,
                         _ => usize::MAX,
@@ -1647,7 +1647,7 @@ impl Executor {
             let offset = if let Some(ref offset_expr) = stmt.offset {
                 match ExpressionEval::compile(offset_expr, &[])
                     .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                 {
                     Some(Value::Integer(o)) if o >= 0 => o as usize,
                     _ => 0,
@@ -1659,7 +1659,7 @@ impl Executor {
             let limit = if let Some(ref limit_expr) = stmt.limit {
                 match ExpressionEval::compile(limit_expr, &[])
                     .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                 {
                     Some(Value::Integer(l)) if l >= 0 => l as usize,
                     _ => usize::MAX,

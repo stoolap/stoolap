@@ -30,9 +30,11 @@ use std::sync::Arc;
 use super::context::{invalidate_semi_join_cache_for_table, ExecutionContext};
 use super::expression::CompiledEvaluator;
 use super::pushdown;
+use super::query_cache::{CompiledExecution, CompiledInsert};
 use super::result::ExecResult;
 use super::utils::dummy_token_clone;
 use super::Executor;
+use std::sync::RwLock;
 /// Validate type coercion didn't silently fail.
 /// Returns an error if a non-null value became null during coercion.
 fn validate_coercion(
@@ -302,10 +304,10 @@ impl Executor {
         let mut vm = ExprVM::new();
         let params = ctx.params();
         let named_params = ctx.named_params();
-        let empty_row: &[Value] = &[];
+        let empty_row = Row::new();
 
         // OPTIMIZATION: Pre-build ExecuteContext once (reused for all expressions)
-        let mut base_exec_ctx = ExecuteContext::new(empty_row);
+        let mut base_exec_ctx = ExecuteContext::new(&empty_row);
         if !params.is_empty() {
             base_exec_ctx = base_exec_ctx.with_params(params);
         }
@@ -333,13 +335,12 @@ impl Executor {
             // Process each row from the SELECT result
             while select_result.next() {
                 let select_row = select_result.row();
-                let select_values = select_row.as_slice();
 
-                if select_values.len() != column_indices.len() {
+                if select_row.len() != column_indices.len() {
                     return Err(Error::InvalidArgumentMessage(format!(
                         "INSERT has {} columns but SELECT returns {} columns",
                         column_indices.len(),
-                        select_values.len()
+                        select_row.len()
                     )));
                 }
 
@@ -359,7 +360,7 @@ impl Executor {
                 }
 
                 // Fill in values from SELECT using pre-computed indices with type coercion
-                for (i, value) in select_values.iter().enumerate() {
+                for (i, value) in select_row.iter().enumerate() {
                     // Coerce value to target column type
                     let coerced = value.coerce_to_type(column_types[i]);
                     // Validate coercion didn't silently fail
@@ -590,6 +591,337 @@ impl Executor {
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             // Commit the transaction - it will commit all tables via commit_all_tables()
+            if let Some(mut tx) = standalone_tx {
+                tx.commit()?;
+            }
+        }
+
+        // Handle RETURNING clause
+        if has_returning {
+            return self.build_returning_result(
+                &stmt.returning,
+                returning_rows,
+                schema_column_names_arc.as_ref().unwrap(),
+                ctx,
+            );
+        }
+
+        Ok(Box::new(ExecResult::with_rows_affected(rows_affected)))
+    }
+
+    /// Execute an INSERT statement with compiled cache support
+    /// This variant uses the query cache to avoid recomputing schema-derived metadata
+    /// on every INSERT execution, significantly reducing allocations for prepared statements.
+    pub(crate) fn execute_insert_with_compiled_cache(
+        &self,
+        stmt: &InsertStatement,
+        ctx: &ExecutionContext,
+        compiled_cache: &Arc<RwLock<CompiledExecution>>,
+    ) -> Result<Box<dyn QueryResult>> {
+        // ON DUPLICATE KEY UPDATE requires special handling - fall back to non-cached path
+        if stmt.on_duplicate {
+            return self.execute_insert(stmt, ctx);
+        }
+
+        // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
+        let table_name = &stmt.table_name.value_lower;
+
+        // Check if there's an active explicit transaction
+        let mut active_tx = self.active_transaction.lock().unwrap();
+
+        let (mut table, should_auto_commit, standalone_tx) =
+            if let Some(ref mut tx_state) = *active_tx {
+                // Use the active transaction
+                let table = tx_state.transaction.get_table(table_name)?;
+
+                // Store a reference to this table for commit/rollback
+                if !tx_state.tables.contains_key(table_name) {
+                    tx_state.tables.insert(
+                        table_name.to_string(),
+                        tx_state.transaction.get_table(table_name)?,
+                    );
+                }
+
+                (table, false, None)
+            } else {
+                // No active transaction - create a standalone transaction with auto-commit
+                let tx = self.engine.begin_transaction()?;
+                let table = tx.get_table(table_name)?;
+                (table, true, Some(tx))
+            };
+
+        // Drop the lock before doing work
+        drop(active_tx);
+
+        // Try to get cached compilation, or compile fresh if needed
+        let current_epoch = self.engine.schema_epoch();
+        let cached_insert = {
+            let cache_read = compiled_cache.read().unwrap();
+            if let CompiledExecution::Insert(ref cached) = *cache_read {
+                if cached.cached_epoch == current_epoch && &*cached.table_name == table_name {
+                    Some(cached.clone())
+                } else {
+                    None // Stale cache
+                }
+            } else {
+                None
+            }
+        };
+
+        // Use cached metadata or compile fresh
+        let (
+            column_indices,
+            column_types,
+            column_names,
+            all_column_types,
+            default_row_template,
+            check_exprs,
+        ) = if let Some(cached) = cached_insert {
+            // Use cached values (Arc clone is cheap)
+            (
+                cached.column_indices,
+                cached.column_types,
+                cached.column_names,
+                cached.all_column_types,
+                cached.default_row_template,
+                cached.check_exprs,
+            )
+        } else {
+            // Compile and cache
+            let schema = table.schema();
+            let schema_column_count = schema.columns.len();
+
+            // Only collect columns that actually have CHECK constraints
+            let check_exprs: Vec<(usize, String, String)> = schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, c)| {
+                    c.check_expr
+                        .as_ref()
+                        .map(|expr| (idx, c.name.clone(), expr.clone()))
+                })
+                .collect();
+
+            let all_column_types: Vec<DataType> =
+                schema.columns.iter().map(|c| c.data_type).collect();
+
+            // Pre-evaluate all default expressions into a template row
+            // This avoids re-evaluating defaults on every INSERT
+            let default_row_template: Vec<Value> = schema
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if let Some(ref default_expr) = c.default_expr {
+                        match self.evaluate_default_expr(default_expr, all_column_types[i]) {
+                            Ok(val) => val,
+                            Err(_) => Value::null_unknown(),
+                        }
+                    } else {
+                        Value::null_unknown()
+                    }
+                })
+                .collect();
+
+            let (column_indices, column_types, column_names) = if stmt.columns.is_empty() {
+                // No columns specified - insert into all columns in order
+                let indices: Vec<usize> = (0..schema_column_count).collect();
+                let types = all_column_types.clone();
+                let names = schema.column_names_owned().to_vec();
+                (indices, types, names)
+            } else {
+                // Validate columns exist and pre-compute their indices
+                let col_map = schema.column_index_map();
+                let indices: Vec<usize> = stmt
+                    .columns
+                    .iter()
+                    .map(|id| {
+                        col_map
+                            .get(&id.value_lower)
+                            .copied()
+                            .ok_or_else(|| Error::ColumnNotFoundNamed(id.value.clone()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let types: Vec<DataType> = indices
+                    .iter()
+                    .map(|&idx| schema.columns[idx].data_type)
+                    .collect();
+                let names: Vec<String> = indices
+                    .iter()
+                    .map(|&idx| schema.columns[idx].name.clone())
+                    .collect();
+                (indices, types, names)
+            };
+
+            // Store in cache for next execution
+            let compiled = CompiledInsert {
+                table_name: Arc::from(table_name.as_str()),
+                column_indices: Arc::new(column_indices.clone()),
+                column_types: Arc::new(column_types.clone()),
+                column_names: Arc::new(column_names.clone()),
+                all_column_types: Arc::new(all_column_types.clone()),
+                default_row_template: Arc::new(default_row_template.clone()),
+                check_exprs: Arc::new(check_exprs.clone()),
+                cached_epoch: current_epoch,
+            };
+
+            // Update the cache
+            if let Ok(mut cache_write) = compiled_cache.write() {
+                *cache_write = CompiledExecution::Insert(compiled);
+            }
+
+            (
+                Arc::new(column_indices),
+                Arc::new(column_types),
+                Arc::new(column_names),
+                Arc::new(all_column_types),
+                Arc::new(default_row_template),
+                Arc::new(check_exprs),
+            )
+        };
+
+        // Create VM for constant expression evaluation (reused for all INSERT values)
+        use super::expression::{compile_expression, ExecuteContext, ExprVM};
+        let mut vm = ExprVM::new();
+        let params = ctx.params();
+        let named_params = ctx.named_params();
+        let empty_row = Row::new();
+
+        // OPTIMIZATION: Pre-build ExecuteContext once (reused for all expressions)
+        let mut base_exec_ctx = ExecuteContext::new(&empty_row);
+        if !params.is_empty() {
+            base_exec_ctx = base_exec_ctx.with_params(params);
+        }
+        if !named_params.is_empty() {
+            base_exec_ctx = base_exec_ctx.with_named_params(named_params);
+        }
+
+        let mut rows_affected = 0i64;
+
+        // RETURNING clause support - collect inserted rows if RETURNING is specified
+        let has_returning = !stmt.returning.is_empty();
+        let mut returning_rows: Vec<Row> = Vec::new();
+        let schema_column_names_arc = if has_returning {
+            Some(table.schema().column_names_arc())
+        } else {
+            None
+        };
+
+        // Check if this is INSERT ... SELECT
+        if let Some(ref select_stmt) = stmt.select {
+            // Execute the SELECT query
+            let mut select_result = self.execute_select(select_stmt, ctx)?;
+
+            // Process each row from the SELECT result
+            while select_result.next() {
+                let select_row = select_result.row();
+
+                if select_row.len() != column_indices.len() {
+                    return Err(Error::InvalidArgumentMessage(format!(
+                        "INSERT has {} columns but SELECT returns {} columns",
+                        column_indices.len(),
+                        select_row.len()
+                    )));
+                }
+
+                // Clone pre-evaluated defaults (avoids re-evaluation per row)
+                let mut row_values = (*default_row_template).clone();
+
+                // Fill in values from SELECT
+                for (i, value) in select_row.iter().enumerate() {
+                    let coerced = value.coerce_to_type(column_types[i]);
+                    validate_coercion(value, &coerced, &column_names[i], column_types[i])?;
+                    row_values[column_indices[i]] = coerced;
+                }
+
+                // Validate CHECK constraints
+                for (col_idx, col_name, check_expr) in check_exprs.iter() {
+                    let col_type = all_column_types[*col_idx];
+                    self.validate_check_constraint(
+                        check_expr,
+                        col_name,
+                        &row_values[*col_idx],
+                        col_type,
+                    )?;
+                }
+
+                // Insert row
+                let row = Row::from_values(row_values);
+                if has_returning {
+                    let inserted_row = table.insert(row)?;
+                    returning_rows.push(inserted_row);
+                } else {
+                    table.insert_discard(row)?;
+                }
+                rows_affected += 1;
+            }
+        } else {
+            // Regular INSERT with VALUES
+            for value_list in &stmt.values {
+                if value_list.len() != column_indices.len() {
+                    return Err(Error::InvalidArgumentMessage(format!(
+                        "INSERT has {} columns but {} values provided",
+                        column_indices.len(),
+                        value_list.len()
+                    )));
+                }
+
+                // Clone pre-evaluated defaults (avoids re-evaluation per row)
+                let mut row_values = (*default_row_template).clone();
+
+                // Fill in values from VALUES clause
+                for (i, expr) in value_list.iter().enumerate() {
+                    // Handle DEFAULT keyword - skip this column to use pre-initialized default
+                    if matches!(expr, Expression::Default(_)) {
+                        continue;
+                    }
+                    // OPTIMIZATION: Try literal extraction first (avoids VM compilation)
+                    let value = if let Some(lit_val) = try_extract_literal(expr) {
+                        lit_val
+                    } else {
+                        // Fall back to VM evaluation for complex expressions
+                        let program = compile_expression(expr, &[])?;
+                        vm.execute_cow(&program, &base_exec_ctx)?
+                    };
+
+                    let target_type = column_types[i];
+                    let coerced = value.coerce_to_type(target_type);
+                    validate_coercion(&value, &coerced, &column_names[i], target_type)?;
+                    row_values[column_indices[i]] = coerced;
+                }
+
+                // Validate CHECK constraints
+                for (col_idx, col_name, check_expr) in check_exprs.iter() {
+                    let col_type = all_column_types[*col_idx];
+                    self.validate_check_constraint(
+                        check_expr,
+                        col_name,
+                        &row_values[*col_idx],
+                        col_type,
+                    )?;
+                }
+
+                // Insert row
+                let row = Row::from_values(row_values);
+                if has_returning {
+                    let inserted_row = table.insert(row)?;
+                    returning_rows.push(inserted_row);
+                } else {
+                    table.insert_discard(row)?;
+                }
+                rows_affected += 1;
+            }
+        }
+
+        // CRITICAL: Must invalidate before commit to prevent stale data window
+        if rows_affected > 0 {
+            self.semantic_cache.invalidate_table(table_name);
+            invalidate_semi_join_cache_for_table(table_name);
+        }
+
+        // Commit if this is a standalone (auto-commit) transaction
+        if should_auto_commit {
             if let Some(mut tx) = standalone_tx {
                 tx.commit()?;
             }
@@ -965,8 +1297,7 @@ impl Executor {
 
                 // Execute pre-compiled programs (no recompilation per row)
                 let updates_to_apply: Vec<(usize, Value)> = {
-                    let row_data = row.as_slice();
-                    let exec_ctx = ExecuteContext::new(row_data)
+                    let exec_ctx = ExecuteContext::new(&row)
                         .with_params(params)
                         .with_named_params(named_params);
 
@@ -1496,8 +1827,7 @@ impl Executor {
         let mut setter = |mut row: Row| -> (Row, bool) {
             // Collect all updates first to avoid borrow conflicts
             let updates_to_apply: Vec<(usize, Value)> = {
-                let row_data = row.as_slice();
-                let exec_ctx = ExecuteContext::new(row_data);
+                let exec_ctx = ExecuteContext::new(&row);
 
                 compiled_updates
                     .iter()
@@ -1595,7 +1925,7 @@ impl Executor {
         if let crate::parser::ast::Statement::Select(select) = &stmts[0] {
             if let Some(expr) = select.columns.first() {
                 // Constant expression - no row context needed
-                let value = ExpressionEval::compile(expr, &[])?.eval_slice(&[])?;
+                let value = ExpressionEval::compile(expr, &[])?.eval_slice(&Row::new())?;
                 return Ok(value.into_coerce_to_type(target_type));
             }
         }
@@ -1742,9 +2072,8 @@ impl Executor {
         // Evaluate RETURNING expressions for each row
         let mut result_rows = Vec::with_capacity(source_rows.len());
         for row in source_rows {
-            let row_data = row.as_slice();
             // CRITICAL: Include params from context for parameterized queries
-            let exec_ctx = ExecuteContext::new(row_data)
+            let exec_ctx = ExecuteContext::new(&row)
                 .with_params(ctx.params())
                 .with_named_params(ctx.named_params());
 

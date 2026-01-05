@@ -23,7 +23,7 @@
 //! - CREATE VIEW
 //! - DROP VIEW
 
-use crate::core::{DataType, Error, Result, SchemaBuilder, Value};
+use crate::core::{DataType, Error, Result, Row, SchemaBuilder, Value};
 use crate::parser::ast::*;
 use crate::storage::traits::{Engine, QueryResult};
 
@@ -770,7 +770,7 @@ impl Executor {
         if let Statement::Select(select) = &stmts[0] {
             if let Some(expr) = select.columns.first() {
                 let mut eval = ExpressionEval::compile(expr, &[])?;
-                let value = eval.eval_slice(&[])?;
+                let value = eval.eval_slice(&Row::new())?;
                 return Ok(value.into_coerce_to_type(target_type));
             }
         }

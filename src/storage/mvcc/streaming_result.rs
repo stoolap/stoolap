@@ -38,7 +38,7 @@ pub struct VisibleRowInfo {
 /// Zero-copy streaming result that yields references to arena data
 ///
 /// This struct holds the arena read guard for the duration of iteration,
-/// allowing it to yield `&[Value]` slices without any cloning.
+/// allowing it to yield row references without any cloning.
 pub struct StreamingResult<'a> {
     /// Unified arena guard (single lock for both data and metadata)
     arena_guard: ArenaReadGuard<'a>,
@@ -51,7 +51,7 @@ pub struct StreamingResult<'a> {
     /// Temporary row buffer for the current row (to satisfy &Row interface)
     current_row: Row,
     /// Cached Arc for current row (for zero-copy access)
-    current_arc: Option<Arc<[Value]>>,
+    current_arc: Option<Arc<[Arc<Value>]>>,
 }
 
 impl<'a> StreamingResult<'a> {
@@ -90,7 +90,7 @@ impl<'a> StreamingResult<'a> {
 
             // O(1) Arc clones from guard - no data copying
             if let Some(arc) = self.arena_guard.data().get(info.arena_idx) {
-                self.current_row = Row::from_arc(Arc::clone(arc));
+                self.current_row = Row::from_arc_slice(Arc::clone(arc));
                 self.current_arc = Some(Arc::clone(arc));
             } else {
                 self.current_arc = None;
@@ -103,13 +103,10 @@ impl<'a> StreamingResult<'a> {
         }
     }
 
-    /// Get current row as slice (TRUE ZERO-COPY!)
+    /// Get current row as Arc slice (for efficient access)
     #[inline]
-    pub fn row_slice(&self) -> &[Value] {
-        self.current_arc
-            .as_ref()
-            .map(|arc| arc.as_ref())
-            .unwrap_or(&[])
+    pub fn row_arc_slice(&self) -> Option<&Arc<[Arc<Value>]>> {
+        self.current_arc.as_ref()
     }
 
     /// Get current row ID
@@ -130,8 +127,9 @@ impl<'a> StreamingResult<'a> {
     /// Get a specific column value from current row (ZERO-COPY!)
     #[inline]
     pub fn get(&self, col: usize) -> Option<&Value> {
-        let slice = self.row_slice();
-        slice.get(col)
+        self.current_arc
+            .as_ref()
+            .and_then(|arc| arc.get(col).map(|v| v.as_ref()))
     }
 
     /// Get remaining count
@@ -163,12 +161,12 @@ impl<'a> StreamingResult<'a> {
 /// that can be computed in a single pass over contiguous memory with
 /// zero allocations during the scan.
 pub struct AggregationScanner<'a> {
-    arena_data: &'a [Arc<[Value]>],
+    arena_data: &'a [Arc<[Arc<Value>]>],
     visible_indices: &'a [VisibleRowInfo],
 }
 
 impl<'a> AggregationScanner<'a> {
-    pub fn new(arena_data: &'a [Arc<[Value]>], visible_indices: &'a [VisibleRowInfo]) -> Self {
+    pub fn new(arena_data: &'a [Arc<[Arc<Value>]>], visible_indices: &'a [VisibleRowInfo]) -> Self {
         Self {
             arena_data,
             visible_indices,
@@ -181,8 +179,8 @@ impl<'a> AggregationScanner<'a> {
         let mut sum = 0.0f64;
         for info in self.visible_indices {
             if let Some(row) = self.arena_data.get(info.arena_idx) {
-                if let Some(val) = row.get(col_idx) {
-                    match val {
+                if let Some(arc_val) = row.get(col_idx) {
+                    match arc_val.as_ref() {
                         Value::Integer(i) => sum += *i as f64,
                         Value::Float(f) => sum += *f,
                         _ => {}
@@ -205,8 +203,8 @@ impl<'a> AggregationScanner<'a> {
         let mut count = 0;
         for info in self.visible_indices {
             if let Some(row) = self.arena_data.get(info.arena_idx) {
-                if let Some(val) = row.get(col_idx) {
-                    if !val.is_null() {
+                if let Some(arc_val) = row.get(col_idx) {
+                    if !arc_val.is_null() {
                         count += 1;
                     }
                 }
@@ -220,7 +218,8 @@ impl<'a> AggregationScanner<'a> {
         let mut min: Option<Value> = None;
         for info in self.visible_indices {
             if let Some(row) = self.arena_data.get(info.arena_idx) {
-                if let Some(val) = row.get(col_idx) {
+                if let Some(arc_val) = row.get(col_idx) {
+                    let val = arc_val.as_ref();
                     if !val.is_null() {
                         match &min {
                             None => min = Some(val.clone()),
@@ -244,7 +243,8 @@ impl<'a> AggregationScanner<'a> {
         let mut max: Option<Value> = None;
         for info in self.visible_indices {
             if let Some(row) = self.arena_data.get(info.arena_idx) {
-                if let Some(val) = row.get(col_idx) {
+                if let Some(arc_val) = row.get(col_idx) {
+                    let val = arc_val.as_ref();
                     if !val.is_null() {
                         match &max {
                             None => max = Some(val.clone()),
@@ -313,7 +313,7 @@ mod tests {
         // Should return false immediately on empty
         assert!(!result.next());
         assert_eq!(result.remaining(), 0);
-        assert_eq!(result.row_slice(), &[]);
+        assert!(result.row_arc_slice().is_none());
         assert_eq!(result.row_id(), 0);
         assert!(result.get(0).is_none());
     }
@@ -496,14 +496,14 @@ mod tests {
         let mut result = StreamingResult::new(guard, visible, columns);
 
         // Before next(), row_slice should be empty
-        assert_eq!(result.row_slice(), &[]);
+        assert!(result.row_arc_slice().is_none());
 
         // After next()
         assert!(result.next());
-        let slice = result.row_slice();
+        let slice = result.row_arc_slice().unwrap();
         assert_eq!(slice.len(), 2);
-        assert_eq!(slice[0], Value::Integer(42));
-        assert_eq!(slice[1], Value::Float(3.5));
+        assert_eq!(*slice[0], Value::Integer(42));
+        assert_eq!(*slice[1], Value::Float(3.5));
 
         // row() should also work
         let row = result.row();
@@ -528,7 +528,7 @@ mod tests {
         // Should still advance but current_arc will be None
         assert!(result.next());
         assert!(result.current_arc.is_none());
-        assert_eq!(result.row_slice(), &[]);
+        assert!(result.row_arc_slice().is_none());
     }
 
     #[test]

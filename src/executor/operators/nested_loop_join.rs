@@ -22,6 +22,7 @@
 //!
 //! Despite its higher complexity, it supports all join conditions and types.
 
+use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
@@ -67,6 +68,10 @@ pub struct NestedLoopJoinOperator {
     returning_unmatched_right: bool,
     unmatched_right_idx: usize,
 
+    // Cached null rows for OUTER joins (avoid repeated allocation)
+    cached_null_right: Vec<Value>,
+    cached_null_left: Vec<Value>,
+
     // State tracking
     opened: bool,
     left_exhausted: bool,
@@ -110,14 +115,17 @@ impl NestedLoopJoinOperator {
             right_matched: Vec::new(),
             returning_unmatched_right: false,
             unmatched_right_idx: 0,
+            cached_null_right: Vec::new(), // Initialized in open()
+            cached_null_left: Vec::new(),  // Initialized in open()
             opened: false,
             left_exhausted: false,
         }
     }
 
-    /// Create a NULL row for the right side.
+    /// Create a NULL row for the right side (uses cached values).
+    #[inline]
     fn null_right_row(&self) -> Row {
-        Row::from_values(vec![Value::null_unknown(); self.right_col_count])
+        Row::from_values(self.cached_null_right.clone())
     }
 
     /// Combine left and right rows into output row.
@@ -127,6 +135,7 @@ impl NestedLoopJoinOperator {
     }
 
     /// Get the next left row from the outer input.
+    #[inline]
     fn advance_left(&mut self) -> Result<bool> {
         match self.left.next()? {
             Some(row_ref) => {
@@ -148,6 +157,16 @@ impl Operator for NestedLoopJoinOperator {
         // Open both inputs
         self.left.open()?;
         self.right.open()?;
+
+        // Pre-cache null rows for OUTER joins (avoids repeated allocation)
+        // NULL_VALUE is a static constant, cloning Vec is just memcpy
+        if matches!(
+            self.join_type,
+            JoinType::Left | JoinType::Right | JoinType::Full
+        ) {
+            self.cached_null_right = vec![NULL_VALUE; self.right_col_count];
+            self.cached_null_left = vec![NULL_VALUE; self.left_col_count];
+        }
 
         // Build column names for filter compilation
         let left_cols: Vec<String> = self.left.schema().iter().map(|c| c.name.clone()).collect();

@@ -36,6 +36,7 @@
 //! let plan = cache.get("SELECT * FROM users").unwrap();
 //! ```
 
+use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -43,6 +44,16 @@ use rustc_hash::FxHashMap;
 
 use crate::core::Schema;
 use crate::parser::ast::Statement;
+
+/// Convert to lowercase without allocation if already lowercase.
+#[inline]
+fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
+    if s.bytes().all(|b| !b.is_ascii_uppercase()) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(s.to_lowercase())
+    }
+}
 
 /// How to extract the PK value for a compiled PK lookup
 #[derive(Debug, Clone)]
@@ -120,6 +131,29 @@ pub struct CompiledPkDelete {
     pub cached_epoch: u64,
 }
 
+/// Pre-compiled state for INSERT statements
+/// Caches schema-derived information to avoid recomputation on every INSERT execution
+#[derive(Debug, Clone)]
+pub struct CompiledInsert {
+    /// Table name (already lowercased, Arc for O(1) clone)
+    pub table_name: Arc<str>,
+    /// Column indices for INSERT (which schema columns to populate)
+    pub column_indices: Arc<Vec<usize>>,
+    /// Column types for the INSERT columns (for type coercion)
+    pub column_types: Arc<Vec<crate::core::DataType>>,
+    /// Column names for error messages (Arc for zero-copy sharing)
+    pub column_names: Arc<Vec<String>>,
+    /// All column types in the schema (for default value evaluation)
+    pub all_column_types: Arc<Vec<crate::core::DataType>>,
+    /// Pre-evaluated default values for all columns (avoids re-evaluation per row)
+    /// Each element is either the default Value or null_unknown if no default.
+    pub default_row_template: Arc<Vec<crate::core::Value>>,
+    /// CHECK constraint expressions: (column_idx, column_name, check_expr)
+    pub check_exprs: Arc<Vec<(usize, String, String)>>,
+    /// Schema epoch at compilation time (for fast cache invalidation)
+    pub cached_epoch: u64,
+}
+
 /// Pre-compiled execution state for fast paths
 #[derive(Debug, Clone, Default)]
 pub enum CompiledExecution {
@@ -134,6 +168,8 @@ pub enum CompiledExecution {
     PkUpdate(CompiledPkUpdate),
     /// PK-based DELETE fast path
     PkDelete(CompiledPkDelete),
+    /// Cached INSERT compilation (schema-derived info)
+    Insert(CompiledInsert),
 }
 
 /// Default cache size (number of cached plans)
@@ -291,7 +327,7 @@ impl QueryCache {
     /// Invalidate all cached plans that reference a specific table
     /// Called after DDL operations (ALTER TABLE, DROP TABLE, etc.)
     pub fn invalidate_table(&self, table_name: &str) {
-        let table_lower = table_name.to_lowercase();
+        let table_lower = to_lowercase_cow(table_name);
         if let Ok(mut plans) = self.plans.write() {
             // Remove plans that reference this table
             // Check both the compiled PK lookup table name and query text
@@ -299,20 +335,20 @@ impl QueryCache {
                 // Check if compiled lookup references this table
                 if let Ok(compiled) = plan.compiled.read() {
                     if let CompiledExecution::PkLookup(lookup) = &*compiled {
-                        if lookup.table_name == table_lower {
+                        if lookup.table_name == *table_lower {
                             return false; // Remove this plan
                         }
                     }
                 }
                 // Also check query text for table reference (simple heuristic)
-                let query_lower = plan.query_text.to_lowercase();
-                !query_lower.contains(&format!(" {} ", table_lower))
-                    && !query_lower.contains(&format!(" {}\n", table_lower))
-                    && !query_lower.contains(&format!(" {};", table_lower))
-                    && !query_lower.contains(&format!("from {}", table_lower))
-                    && !query_lower.contains(&format!("join {}", table_lower))
-                    && !query_lower.contains(&format!("into {}", table_lower))
-                    && !query_lower.contains(&format!("update {}", table_lower))
+                let query_lower = to_lowercase_cow(&plan.query_text);
+                !query_lower.contains(&format!(" {} ", &*table_lower))
+                    && !query_lower.contains(&format!(" {}\n", &*table_lower))
+                    && !query_lower.contains(&format!(" {};", &*table_lower))
+                    && !query_lower.contains(&format!("from {}", &*table_lower))
+                    && !query_lower.contains(&format!("join {}", &*table_lower))
+                    && !query_lower.contains(&format!("into {}", &*table_lower))
+                    && !query_lower.contains(&format!("update {}", &*table_lower))
             });
         }
     }
@@ -362,17 +398,25 @@ impl QueryCache {
             return;
         }
 
-        // Build a list of all plans sorted by last used time and usage count
-        let mut entries: Vec<(String, Instant, u64)> = plans
+        // Build a list of references sorted by last used time and usage count
+        // Use references to avoid cloning all keys
+        let mut entries: Vec<(&String, Instant, u64)> = plans
             .iter()
-            .map(|(k, p)| (k.clone(), p.last_used, p.usage_count))
+            .map(|(k, p)| (k, p.last_used, p.usage_count))
             .collect();
 
         // Sort by last used (oldest first), then by usage count (least used first)
-        entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
+        entries.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
+
+        // Collect only the keys to remove (clone only what we need)
+        let keys_to_remove: Vec<String> = entries
+            .into_iter()
+            .take(num_to_remove)
+            .map(|(k, _, _)| k.clone())
+            .collect();
 
         // Remove the oldest/least used entries
-        for (key, _, _) in entries.into_iter().take(num_to_remove) {
+        for key in keys_to_remove {
             plans.remove(&key);
         }
     }

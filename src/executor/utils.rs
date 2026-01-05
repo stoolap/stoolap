@@ -27,6 +27,7 @@ use std::sync::LazyLock;
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
+use crate::core::value::NULL_VALUE;
 use crate::core::{DataType, Operator, Row, Value};
 use crate::parser::ast::{
     BetweenExpression, BooleanLiteral, Expression, FloatLiteral, FunctionCall, Identifier,
@@ -202,14 +203,14 @@ fn substitute_outer_references_inner(
                         .collect();
 
                     if any_changed {
-                        Some(Expression::List(ListExpression {
+                        Some(Expression::List(Box::new(ListExpression {
                             token: list.token.clone(),
                             elements: new_elements
                                 .into_iter()
                                 .zip(list.elements.iter())
                                 .map(|(new, old)| new.unwrap_or_else(|| old.clone()))
                                 .collect(),
-                        }))
+                        })))
                     } else {
                         None
                     }
@@ -299,7 +300,7 @@ fn substitute_outer_references_inner(
             }
 
             if any_changed {
-                Some(Expression::FunctionCall(FunctionCall {
+                Some(Expression::FunctionCall(Box::new(FunctionCall {
                     token: func.token.clone(),
                     function: func.function.clone(),
                     arguments: new_args
@@ -314,7 +315,7 @@ fn substitute_outer_references_inner(
                     } else {
                         func.filter.clone()
                     },
-                }))
+                })))
             } else {
                 None
             }
@@ -348,8 +349,8 @@ pub fn build_column_index_map(columns: &[String]) -> FxHashMap<String, usize> {
 #[inline]
 pub fn combine_rows(left: &Row, right: &Row, left_count: usize, right_count: usize) -> Vec<Value> {
     let mut combined = Vec::with_capacity(left_count + right_count);
-    combined.extend_from_slice(left.as_slice());
-    combined.extend_from_slice(right.as_slice());
+    combined.extend(left.iter().cloned());
+    combined.extend(right.iter().cloned());
     combined
 }
 
@@ -363,11 +364,11 @@ pub fn combine_rows_with_nulls(
 ) -> Vec<Value> {
     let mut values = Vec::with_capacity(row_count + null_count);
     if row_is_left {
-        values.extend_from_slice(row.as_slice());
-        values.resize(row_count + null_count, Value::null_unknown());
+        values.extend(row.iter().cloned());
+        values.resize(row_count + null_count, NULL_VALUE);
     } else {
-        values.resize(null_count, Value::null_unknown());
-        values.extend_from_slice(row.as_slice());
+        values.resize(null_count, NULL_VALUE);
+        values.extend(row.iter().cloned());
     }
     values
 }
@@ -871,14 +872,14 @@ pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression
         Expression::In(in_expr) => {
             let new_left = strip_table_qualifier(&in_expr.left, table_alias);
             let new_right = match in_expr.right.as_ref() {
-                Expression::List(list) => Expression::List(ListExpression {
+                Expression::List(list) => Expression::List(Box::new(ListExpression {
                     token: list.token.clone(),
                     elements: list
                         .elements
                         .iter()
                         .map(|e| strip_table_qualifier(e, table_alias))
                         .collect(),
-                }),
+                })),
                 other => strip_table_qualifier(other, table_alias),
             };
             Expression::In(InExpression {
@@ -905,7 +906,7 @@ pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression
                 .as_ref()
                 .map(|e| Box::new(strip_table_qualifier(e, table_alias))),
         }),
-        Expression::FunctionCall(func) => Expression::FunctionCall(FunctionCall {
+        Expression::FunctionCall(func) => Expression::FunctionCall(Box::new(FunctionCall {
             token: func.token.clone(),
             function: func.function.clone(),
             arguments: func
@@ -919,7 +920,7 @@ pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression
                 .filter
                 .as_ref()
                 .map(|f| Box::new(strip_table_qualifier(f, table_alias))),
-        }),
+        })),
         // Return unchanged for other expression types
         other => other.clone(),
     }
@@ -955,14 +956,14 @@ pub fn add_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {
         Expression::In(in_expr) => {
             let new_left = add_table_qualifier(&in_expr.left, table_alias);
             let new_right = match in_expr.right.as_ref() {
-                Expression::List(list) => Expression::List(ListExpression {
+                Expression::List(list) => Expression::List(Box::new(ListExpression {
                     token: list.token.clone(),
                     elements: list
                         .elements
                         .iter()
                         .map(|e| add_table_qualifier(e, table_alias))
                         .collect(),
-                }),
+                })),
                 other => add_table_qualifier(other, table_alias),
             };
             Expression::In(InExpression {
@@ -989,7 +990,7 @@ pub fn add_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {
                 .as_ref()
                 .map(|e| Box::new(add_table_qualifier(e, table_alias))),
         }),
-        Expression::FunctionCall(func) => Expression::FunctionCall(FunctionCall {
+        Expression::FunctionCall(func) => Expression::FunctionCall(Box::new(FunctionCall {
             token: func.token.clone(),
             function: func.function.clone(),
             arguments: func
@@ -1003,7 +1004,7 @@ pub fn add_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {
                 .filter
                 .as_ref()
                 .map(|f| Box::new(add_table_qualifier(f, table_alias))),
-        }),
+        })),
         // Return unchanged for other expression types (literals, qualified identifiers, etc.)
         other => other.clone(),
     }
@@ -2366,7 +2367,7 @@ mod tests {
 
     #[test]
     fn test_expression_contains_aggregate_count() {
-        let expr = Expression::FunctionCall(FunctionCall {
+        let expr = Expression::FunctionCall(Box::new(FunctionCall {
             token: dummy_token("COUNT", TokenType::Identifier),
             function: "COUNT".to_string(),
             arguments: vec![Expression::Identifier(Identifier::new(
@@ -2376,13 +2377,13 @@ mod tests {
             is_distinct: false,
             order_by: vec![],
             filter: None,
-        });
+        }));
         assert!(expression_contains_aggregate(&expr));
     }
 
     #[test]
     fn test_expression_contains_aggregate_non_aggregate() {
-        let expr = Expression::FunctionCall(FunctionCall {
+        let expr = Expression::FunctionCall(Box::new(FunctionCall {
             token: dummy_token("UPPER", TokenType::Identifier),
             function: "UPPER".to_string(),
             arguments: vec![Expression::Identifier(Identifier::new(
@@ -2392,7 +2393,7 @@ mod tests {
             is_distinct: false,
             order_by: vec![],
             filter: None,
-        });
+        }));
         assert!(!expression_contains_aggregate(&expr));
     }
 
