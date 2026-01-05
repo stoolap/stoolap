@@ -336,7 +336,8 @@ impl Row {
         // Use inline storage for intermediate results
         let vec = self.storage.make_mut_inline();
         vec.clear();
-        vec.reserve(total_len.saturating_sub(vec.capacity()));
+        // After clear(), len=0, so reserve(n) ensures capacity >= n
+        vec.reserve(total_len);
         vec.extend(left.iter().cloned());
         vec.extend(right.iter().cloned());
     }
@@ -349,9 +350,8 @@ impl Row {
         let total_len = left.len() + right.len();
         let vec = self.storage.make_mut_inline();
         vec.clear();
-        if vec.capacity() < total_len {
-            vec.reserve(total_len - vec.capacity());
-        }
+        // After clear(), len=0, so reserve(n) ensures capacity >= n
+        vec.reserve(total_len);
         // Clone left values
         vec.extend(left.iter().cloned());
         // Move right values - use try_unwrap to avoid cloning when refcount is 1
@@ -376,9 +376,8 @@ impl Row {
         let total_len = left.len() + right.len();
         let vec = self.storage.make_mut_inline();
         vec.clear();
-        if vec.capacity() < total_len {
-            vec.reserve(total_len - vec.capacity());
-        }
+        // After clear(), len=0, so reserve(n) ensures capacity >= n
+        vec.reserve(total_len);
         // Move based on storage type - use try_unwrap to avoid cloning when refcount is 1
         match left.storage {
             RowStorage::Inline(left_vec) => vec.extend(left_vec),
@@ -408,9 +407,8 @@ impl Row {
         let total_len = left.len() + right.len();
         let vec = self.storage.make_mut_arc();
         vec.clear();
-        if vec.capacity() < total_len {
-            vec.reserve(total_len - vec.capacity());
-        }
+        // After clear(), len=0, so reserve(n) ensures capacity >= n
+        vec.reserve(total_len);
         // Extend with Arc values, moving when possible
         match left.storage {
             RowStorage::Inline(left_vec) => {
