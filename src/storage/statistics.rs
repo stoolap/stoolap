@@ -29,6 +29,8 @@
 //! and populates the system tables. The query planner retrieves these statistics
 //! to estimate cardinalities and choose optimal access paths.
 
+use ahash::AHashMap;
+
 use crate::core::Value;
 
 /// System table name for table-level statistics
@@ -880,10 +882,10 @@ pub type CorrelationCoefficient = f64;
 pub struct ColumnCorrelations {
     /// Correlation coefficients: (col1, col2) -> correlation
     /// Only stores upper triangle (col1 < col2 alphabetically)
-    correlations: std::collections::HashMap<(String, String), CorrelationCoefficient>,
+    correlations: AHashMap<(String, String), CorrelationCoefficient>,
     /// Functional dependencies: col1 -> col2 means col1 determines col2
     /// e.g., zip_code -> city (knowing zip tells you the city)
-    functional_deps: std::collections::HashMap<String, Vec<String>>,
+    functional_deps: AHashMap<String, Vec<String>>,
 }
 
 impl ColumnCorrelations {
@@ -1076,12 +1078,10 @@ impl ColumnCorrelations {
 
     /// Categorical correlation based on conditional entropy
     fn categorical_correlation(col1: &[Value], col2: &[Value]) -> f64 {
-        use std::collections::HashMap;
-
         // Count value pair frequencies
-        let mut pair_counts: HashMap<(String, String), usize> = HashMap::new();
-        let mut col1_counts: HashMap<String, usize> = HashMap::new();
-        let mut col2_counts: HashMap<String, usize> = HashMap::new();
+        let mut pair_counts: AHashMap<(String, String), usize> = AHashMap::new();
+        let mut col1_counts: AHashMap<String, usize> = AHashMap::new();
+        let mut col2_counts: AHashMap<String, usize> = AHashMap::new();
 
         for (v1, v2) in col1.iter().zip(col2.iter()) {
             let s1 = v1.to_string();

@@ -94,6 +94,7 @@
 
 use std::sync::Arc;
 
+use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, Value};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::RowFilter;
@@ -905,9 +906,27 @@ impl JoinExecutor {
         while let Some(row_ref) = op.next()? {
             let row = row_ref.into_owned();
 
-            // Apply residual filters
-            if has_filters && !residual_filters.iter().all(|f| f.matches(&row)) {
-                continue;
+            // Apply residual filters - specialized unrolling for common cases (1-4 filters)
+            if has_filters {
+                let pass = match residual_filters.len() {
+                    1 => residual_filters[0].matches(&row),
+                    2 => residual_filters[0].matches(&row) && residual_filters[1].matches(&row),
+                    3 => {
+                        residual_filters[0].matches(&row)
+                            && residual_filters[1].matches(&row)
+                            && residual_filters[2].matches(&row)
+                    }
+                    4 => {
+                        residual_filters[0].matches(&row)
+                            && residual_filters[1].matches(&row)
+                            && residual_filters[2].matches(&row)
+                            && residual_filters[3].matches(&row)
+                    }
+                    _ => residual_filters.iter().all(|f| f.matches(&row)),
+                };
+                if !pass {
+                    continue;
+                }
             }
 
             rows.push(row);
@@ -953,21 +972,17 @@ impl JoinExecutor {
                             row
                         } else {
                             // Convert to NULL-padded row
-                            let values = row.as_slice();
                             if is_left_outer {
                                 // Keep left, NULL right
-                                let mut new_values = values[..left_col_count].to_vec();
-                                new_values.extend(std::iter::repeat_n(
-                                    Value::null_unknown(),
-                                    right_col_count,
-                                ));
+                                let mut new_values: Vec<Value> =
+                                    row.iter().take(left_col_count).cloned().collect();
+                                new_values.extend(std::iter::repeat_n(NULL_VALUE, right_col_count));
                                 Row::from_values(new_values)
                             } else if is_right_outer {
                                 // NULL left, keep right
                                 let mut new_values: Vec<Value> =
-                                    std::iter::repeat_n(Value::null_unknown(), left_col_count)
-                                        .collect();
-                                new_values.extend(values[left_col_count..].iter().cloned());
+                                    std::iter::repeat_n(NULL_VALUE, left_col_count).collect();
+                                new_values.extend(row.iter().skip(left_col_count).cloned());
                                 Row::from_values(new_values)
                             } else {
                                 // FULL OUTER - keep original for now

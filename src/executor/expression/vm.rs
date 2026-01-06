@@ -30,7 +30,7 @@ use smallvec::SmallVec;
 
 use super::ops::{CompareOp, Op};
 use super::program::Program;
-use crate::core::{DataType, Result, Value, NULL_VALUE};
+use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
 
 /// Stack value that can be borrowed (from row/constants) or owned (from operations)
 type StackValue<'a> = Cow<'a, Value>;
@@ -59,10 +59,10 @@ enum ArithmeticOp {
 /// - Query parameters
 pub struct ExecuteContext<'a> {
     /// Primary row data
-    pub row: &'a [Value],
+    pub row: &'a Row,
 
     /// Second row for joins (optional)
-    pub row2: Option<&'a [Value]>,
+    pub row2: Option<&'a Row>,
 
     /// Outer row context for correlated subqueries
     pub outer_row: Option<&'a FxHashMap<Arc<str>, Value>>,
@@ -84,7 +84,7 @@ pub struct ExecuteContext<'a> {
 impl<'a> ExecuteContext<'a> {
     /// Create a simple context with just a row
     #[inline]
-    pub fn new(row: &'a [Value]) -> Self {
+    pub fn new(row: &'a Row) -> Self {
         Self {
             row,
             row2: None,
@@ -100,7 +100,7 @@ impl<'a> ExecuteContext<'a> {
     /// Only the row field needs to be updated for each iteration
     #[inline]
     pub fn with_common_params(
-        row: &'a [Value],
+        row: &'a Row,
         params: &'a [Value],
         named_params: Option<&'a FxHashMap<String, Value>>,
         transaction_id: Option<u64>,
@@ -117,7 +117,7 @@ impl<'a> ExecuteContext<'a> {
     }
 
     /// Create context for join evaluation
-    pub fn for_join(row1: &'a [Value], row2: &'a [Value]) -> Self {
+    pub fn for_join(row1: &'a Row, row2: &'a Row) -> Self {
         Self {
             row: row1,
             row2: Some(row2),
@@ -216,25 +216,26 @@ pub struct ExprVM {
     stack: SmallVec<[Value; STACK_INLINE_CAPACITY]>,
 
     /// Reusable buffer for function arguments (avoids allocation per call)
-    args_buffer: Vec<Value>,
+    /// Uses SmallVec to avoid heap allocation for functions with <= 8 args
+    args_buffer: SmallVec<[Value; ARGS_BUFFER_CAPACITY]>,
 }
 
 impl ExprVM {
     /// Create a new VM with default stack capacity
-    /// Uses inline storage for up to 8 values (no heap allocation for simple expressions)
+    /// Uses inline storage for up to 16 stack values and 8 args (no heap allocation)
     pub fn new() -> Self {
         Self {
             stack: SmallVec::new(),
-            args_buffer: Vec::with_capacity(ARGS_BUFFER_CAPACITY),
+            args_buffer: SmallVec::new(),
         }
     }
 
     /// Create a VM with specific stack capacity
-    /// If capacity > 8, will spill to heap when needed
+    /// If capacity > 16, will spill to heap when needed
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             stack: SmallVec::with_capacity(capacity),
-            args_buffer: Vec::with_capacity(ARGS_BUFFER_CAPACITY),
+            args_buffer: SmallVec::new(),
         }
     }
 
@@ -3088,6 +3089,7 @@ impl Default for ExprVM {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Row;
     use ahash::AHashSet;
 
     #[test]
@@ -3101,12 +3103,12 @@ mod tests {
         ]);
 
         // Test with row where column 0 > 5
-        let row = vec![Value::Integer(10)];
+        let row = Row::from_values(vec![Value::Integer(10)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
         // Test with row where column 0 <= 5
-        let row = vec![Value::Integer(3)];
+        let row = Row::from_values(vec![Value::Integer(3)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3127,11 +3129,11 @@ mod tests {
             Op::Return,
         ]);
 
-        let row = vec![Value::Integer(10), Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(10), Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Integer(3), Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(3), Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3149,11 +3151,11 @@ mod tests {
             Op::Return,
         ]);
 
-        let row = vec![Value::Integer(2)];
+        let row = Row::from_values(vec![Value::Integer(2)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3164,7 +3166,7 @@ mod tests {
 
     #[test]
     fn test_context_new() {
-        let row = vec![Value::Integer(1), Value::Text("test".into())];
+        let row = Row::from_values(vec![Value::Integer(1), Value::Text("test".into())]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(ctx.row.len(), 2);
         assert!(ctx.row2.is_none());
@@ -3174,17 +3176,17 @@ mod tests {
 
     #[test]
     fn test_context_for_join() {
-        let row1 = vec![Value::Integer(1)];
-        let row2 = vec![Value::Integer(2)];
+        let row1 = Row::from_values(vec![Value::Integer(1)]);
+        let row2 = Row::from_values(vec![Value::Integer(2)]);
         let ctx = ExecuteContext::for_join(&row1, &row2);
         assert_eq!(ctx.row.len(), 1);
         assert!(ctx.row2.is_some());
-        assert_eq!(ctx.row2.unwrap()[0], Value::Integer(2));
+        assert_eq!(*ctx.row2.unwrap().get(0).unwrap(), Value::Integer(2));
     }
 
     #[test]
     fn test_context_with_params() {
-        let row = vec![Value::Integer(1)];
+        let row = Row::from_values(vec![Value::Integer(1)]);
         let params = vec![Value::Text("param1".into())];
         let ctx = ExecuteContext::new(&row).with_params(&params);
         assert_eq!(ctx.params.len(), 1);
@@ -3192,7 +3194,7 @@ mod tests {
 
     #[test]
     fn test_context_with_named_params() {
-        let row = vec![Value::Integer(1)];
+        let row = Row::from_values(vec![Value::Integer(1)]);
         let mut named = FxHashMap::default();
         named.insert("name".to_string(), Value::Text("value".into()));
         let ctx = ExecuteContext::new(&row).with_named_params(&named);
@@ -3201,14 +3203,14 @@ mod tests {
 
     #[test]
     fn test_context_with_transaction_id() {
-        let row = vec![Value::Integer(1)];
+        let row = Row::from_values(vec![Value::Integer(1)]);
         let ctx = ExecuteContext::new(&row).with_transaction_id(Some(12345));
         assert_eq!(ctx.transaction_id, Some(12345));
     }
 
     #[test]
     fn test_context_with_outer_row() {
-        let row = vec![Value::Integer(1)];
+        let row = Row::from_values(vec![Value::Integer(1)]);
         let mut outer: FxHashMap<Arc<str>, Value> = FxHashMap::default();
         outer.insert(Arc::from("outer_col"), Value::Integer(42));
         let ctx = ExecuteContext::new(&row).with_outer_row(&outer);
@@ -3245,7 +3247,11 @@ mod tests {
     fn test_load_column() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadColumn(1), Op::Return]);
-        let row = vec![Value::Integer(10), Value::Integer(20), Value::Integer(30)];
+        let row = Row::from_values(vec![
+            Value::Integer(10),
+            Value::Integer(20),
+            Value::Integer(30),
+        ]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(20));
     }
@@ -3254,7 +3260,7 @@ mod tests {
     fn test_load_column_out_of_bounds() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadColumn(10), Op::Return]);
-        let row = vec![Value::Integer(1)];
+        let row = Row::from_values(vec![Value::Integer(1)]);
         let ctx = ExecuteContext::new(&row);
         // Out of bounds returns null
         assert!(vm.execute(&program, &ctx).unwrap().is_null());
@@ -3264,8 +3270,8 @@ mod tests {
     fn test_load_column2() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadColumn2(0), Op::Return]);
-        let row1 = vec![Value::Integer(1)];
-        let row2 = vec![Value::Integer(2)];
+        let row1 = Row::from_values(vec![Value::Integer(1)]);
+        let row2 = Row::from_values(vec![Value::Integer(2)]);
         let ctx = ExecuteContext::for_join(&row1, &row2);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(2));
     }
@@ -3274,7 +3280,7 @@ mod tests {
     fn test_load_const() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadConst(Value::Float(1.23)), Op::Return]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Float(1.23));
     }
@@ -3283,7 +3289,7 @@ mod tests {
     fn test_load_param() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadParam(0), Op::Return]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let params = vec![Value::Text("hello".into())];
         let ctx = ExecuteContext::new(&row).with_params(&params);
         assert_eq!(
@@ -3296,7 +3302,7 @@ mod tests {
     fn test_load_named_param() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadNamedParam(Arc::from("myvar")), Op::Return]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let mut named = FxHashMap::default();
         named.insert("myvar".to_string(), Value::Integer(999));
         let ctx = ExecuteContext::new(&row).with_named_params(&named);
@@ -3307,7 +3313,7 @@ mod tests {
     fn test_load_null() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadNull(DataType::Integer), Op::Return]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert!(vm.execute(&program, &ctx).unwrap().is_null());
     }
@@ -3319,7 +3325,7 @@ mod tests {
             Op::LoadOuterColumn(Arc::from("outer_val")),
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let mut outer: FxHashMap<Arc<str>, Value> = FxHashMap::default();
         outer.insert(Arc::from("outer_val"), Value::Integer(100));
         let ctx = ExecuteContext::new(&row).with_outer_row(&outer);
@@ -3339,7 +3345,7 @@ mod tests {
             Op::Eq,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3353,7 +3359,7 @@ mod tests {
             Op::Ne,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3367,7 +3373,7 @@ mod tests {
             Op::Lt,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3381,7 +3387,7 @@ mod tests {
             Op::Le,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3395,7 +3401,7 @@ mod tests {
             Op::Ge,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3410,12 +3416,12 @@ mod tests {
         let program = Program::new(vec![Op::LoadColumn(0), Op::IsNull, Op::Return]);
 
         // Test with null
-        let row = vec![Value::Null(DataType::Integer)];
+        let row = Row::from_values(vec![Value::Null(DataType::Integer)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
         // Test with non-null
-        let row = vec![Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3425,11 +3431,11 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadColumn(0), Op::IsNotNull, Op::Return]);
 
-        let row = vec![Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Null(DataType::Integer)];
+        let row = Row::from_values(vec![Value::Null(DataType::Integer)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3445,25 +3451,25 @@ mod tests {
         ]);
 
         // Two nulls are NOT distinct
-        let row = vec![
+        let row = Row::from_values(vec![
             Value::Null(DataType::Integer),
             Value::Null(DataType::Integer),
-        ];
+        ]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
 
         // Null and non-null ARE distinct
-        let row = vec![Value::Null(DataType::Integer), Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Null(DataType::Integer), Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
         // Same values are NOT distinct
-        let row = vec![Value::Integer(5), Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(5), Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
 
         // Different values ARE distinct
-        let row = vec![Value::Integer(5), Value::Integer(10)];
+        let row = Row::from_values(vec![Value::Integer(5), Value::Integer(10)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3479,15 +3485,15 @@ mod tests {
         ]);
 
         // Two nulls ARE "not distinct"
-        let row = vec![
+        let row = Row::from_values(vec![
             Value::Null(DataType::Integer),
             Value::Null(DataType::Integer),
-        ];
+        ]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
         // Same values ARE "not distinct"
-        let row = vec![Value::Integer(5), Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(5), Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3501,11 +3507,11 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::EqColumnConst(0, Value::Integer(42)), Op::Return]);
 
-        let row = vec![Value::Integer(42)];
+        let row = Row::from_values(vec![Value::Integer(42)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Integer(100)];
+        let row = Row::from_values(vec![Value::Integer(100)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3515,7 +3521,7 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::NeColumnConst(0, Value::Integer(42)), Op::Return]);
 
-        let row = vec![Value::Integer(100)];
+        let row = Row::from_values(vec![Value::Integer(100)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3525,11 +3531,11 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LtColumnConst(0, Value::Integer(10)), Op::Return]);
 
-        let row = vec![Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Integer(15)];
+        let row = Row::from_values(vec![Value::Integer(15)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3539,7 +3545,7 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LeColumnConst(0, Value::Integer(10)), Op::Return]);
 
-        let row = vec![Value::Integer(10)];
+        let row = Row::from_values(vec![Value::Integer(10)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3549,7 +3555,7 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::GtColumnConst(0, Value::Integer(10)), Op::Return]);
 
-        let row = vec![Value::Integer(15)];
+        let row = Row::from_values(vec![Value::Integer(15)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3559,7 +3565,7 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::GeColumnConst(0, Value::Integer(10)), Op::Return]);
 
-        let row = vec![Value::Integer(10)];
+        let row = Row::from_values(vec![Value::Integer(10)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3569,11 +3575,11 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::IsNullColumn(0), Op::Return]);
 
-        let row = vec![Value::Null(DataType::Integer)];
+        let row = Row::from_values(vec![Value::Null(DataType::Integer)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Integer(1)];
+        let row = Row::from_values(vec![Value::Integer(1)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3583,7 +3589,7 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::IsNotNullColumn(0), Op::Return]);
 
-        let row = vec![Value::Integer(1)];
+        let row = Row::from_values(vec![Value::Integer(1)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3596,21 +3602,21 @@ mod tests {
             Op::Return,
         ]);
 
-        let row = vec![Value::Integer(10)];
+        let row = Row::from_values(vec![Value::Integer(10)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Integer(20)];
+        let row = Row::from_values(vec![Value::Integer(20)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
 
         // Edge case: value equals lower bound
-        let row = vec![Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
         // Edge case: value equals upper bound
-        let row = vec![Value::Integer(15)];
+        let row = Row::from_values(vec![Value::Integer(15)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -3636,17 +3642,17 @@ mod tests {
         ]);
 
         // First condition true
-        let row = vec![Value::Integer(1), Value::Integer(0)];
+        let row = Row::from_values(vec![Value::Integer(1), Value::Integer(0)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
         // Second condition true
-        let row = vec![Value::Integer(0), Value::Integer(2)];
+        let row = Row::from_values(vec![Value::Integer(0), Value::Integer(2)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
         // Both conditions false
-        let row = vec![Value::Integer(0), Value::Integer(0)];
+        let row = Row::from_values(vec![Value::Integer(0), Value::Integer(0)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3659,7 +3665,7 @@ mod tests {
             Op::Not,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3673,7 +3679,7 @@ mod tests {
             Op::Xor,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
@@ -3700,7 +3706,7 @@ mod tests {
             Op::Add,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(15));
     }
@@ -3714,7 +3720,7 @@ mod tests {
             Op::Add,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Float(6.0));
     }
@@ -3728,7 +3734,7 @@ mod tests {
             Op::Sub,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(7));
     }
@@ -3742,7 +3748,7 @@ mod tests {
             Op::Mul,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(42));
     }
@@ -3756,7 +3762,7 @@ mod tests {
             Op::Div,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(5));
     }
@@ -3770,7 +3776,7 @@ mod tests {
             Op::Mod,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(2));
     }
@@ -3779,7 +3785,7 @@ mod tests {
     fn test_neg() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadConst(Value::Integer(5)), Op::Neg, Op::Return]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(-5));
     }
@@ -3797,7 +3803,7 @@ mod tests {
             Op::BitAnd,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(0b1000));
     }
@@ -3811,7 +3817,7 @@ mod tests {
             Op::BitOr,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(0b1110));
     }
@@ -3825,7 +3831,7 @@ mod tests {
             Op::BitXor,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(0b0110));
     }
@@ -3838,7 +3844,7 @@ mod tests {
             Op::BitNot,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         let result = vm.execute(&program, &ctx).unwrap();
         // Bitwise NOT of 5 is -6 in two's complement
@@ -3854,7 +3860,7 @@ mod tests {
             Op::Shl,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(16));
     }
@@ -3868,7 +3874,7 @@ mod tests {
             Op::Shr,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(4));
     }
@@ -3886,7 +3892,7 @@ mod tests {
             Op::Concat,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(
             vm.execute(&program, &ctx).unwrap(),
@@ -3906,11 +3912,11 @@ mod tests {
             Op::Return,
         ]);
 
-        let row = vec![Value::Text("hello world!".into())];
+        let row = Row::from_values(vec![Value::Text("hello world!".into())]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Text("hello there!".into())];
+        let row = Row::from_values(vec![Value::Text("hello there!".into())]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3927,11 +3933,11 @@ mod tests {
             Op::Return,
         ]);
 
-        let row = vec![Value::Text("document.txt".into())];
+        let row = Row::from_values(vec![Value::Text("document.txt".into())]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Text("document.pdf".into())];
+        let row = Row::from_values(vec![Value::Text("document.pdf".into())]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3951,11 +3957,11 @@ mod tests {
             Op::Return,
         ]);
 
-        let row = vec![Value::Integer(10)];
+        let row = Row::from_values(vec![Value::Integer(10)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Integer(3)];
+        let row = Row::from_values(vec![Value::Integer(3)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3971,11 +3977,11 @@ mod tests {
             Op::Return,
         ]);
 
-        let row = vec![Value::Integer(3)];
+        let row = Row::from_values(vec![Value::Integer(3)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Integer(10)];
+        let row = Row::from_values(vec![Value::Integer(10)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -3997,11 +4003,11 @@ mod tests {
             Op::Return,
         ]);
 
-        let row = vec![Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Integer(2)];
+        let row = Row::from_values(vec![Value::Integer(2)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -4019,7 +4025,7 @@ mod tests {
         ]);
 
         // Value not in set, but set has null -> returns NULL
-        let row = vec![Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         let result = vm.execute(&program, &ctx).unwrap();
         assert!(result.is_null());
@@ -4038,11 +4044,11 @@ mod tests {
 
         let program = Program::new(vec![Op::InSetColumn(0, Arc::new(set), false), Op::Return]);
 
-        let row = vec![Value::Integer(2)];
+        let row = Row::from_values(vec![Value::Integer(2)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Integer(5)];
+        let row = Row::from_values(vec![Value::Integer(5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -4056,15 +4062,15 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadColumn(0), Op::IsTrue, Op::Return]);
 
-        let row = vec![Value::Boolean(true)];
+        let row = Row::from_values(vec![Value::Boolean(true)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Boolean(false)];
+        let row = Row::from_values(vec![Value::Boolean(false)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
 
-        let row = vec![Value::Null(DataType::Boolean)];
+        let row = Row::from_values(vec![Value::Null(DataType::Boolean)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -4074,15 +4080,15 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadColumn(0), Op::IsNotTrue, Op::Return]);
 
-        let row = vec![Value::Boolean(true)];
+        let row = Row::from_values(vec![Value::Boolean(true)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
 
-        let row = vec![Value::Boolean(false)];
+        let row = Row::from_values(vec![Value::Boolean(false)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Null(DataType::Boolean)];
+        let row = Row::from_values(vec![Value::Null(DataType::Boolean)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -4092,11 +4098,11 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadColumn(0), Op::IsFalse, Op::Return]);
 
-        let row = vec![Value::Boolean(false)];
+        let row = Row::from_values(vec![Value::Boolean(false)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Boolean(true)];
+        let row = Row::from_values(vec![Value::Boolean(true)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -4106,15 +4112,15 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadColumn(0), Op::IsNotFalse, Op::Return]);
 
-        let row = vec![Value::Boolean(false)];
+        let row = Row::from_values(vec![Value::Boolean(false)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
 
-        let row = vec![Value::Boolean(true)];
+        let row = Row::from_values(vec![Value::Boolean(true)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Null(DataType::Boolean)];
+        let row = Row::from_values(vec![Value::Null(DataType::Boolean)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -4133,7 +4139,7 @@ mod tests {
             Op::Coalesce(3),
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(42));
     }
@@ -4148,7 +4154,7 @@ mod tests {
             Op::NullIf,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert!(vm.execute(&program, &ctx).unwrap().is_null());
 
@@ -4172,7 +4178,7 @@ mod tests {
             Op::Greatest(3),
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(7));
     }
@@ -4187,7 +4193,7 @@ mod tests {
             Op::Least(3),
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(2));
     }
@@ -4205,7 +4211,7 @@ mod tests {
             Op::Add, // 42 + 42
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(84));
     }
@@ -4220,7 +4226,7 @@ mod tests {
             Op::Sub, // 3 - 10
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(-7));
     }
@@ -4234,7 +4240,7 @@ mod tests {
             Op::Pop, // Discard 42
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(100));
     }
@@ -4252,7 +4258,7 @@ mod tests {
             Op::LoadConst(Value::Integer(2)), // Skipped
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
     }
@@ -4268,7 +4274,7 @@ mod tests {
             Op::LoadConst(Value::Integer(1)), // Executed
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
     }
@@ -4284,7 +4290,7 @@ mod tests {
             Op::LoadConst(Value::Integer(1)), // Executed
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
     }
@@ -4300,7 +4306,7 @@ mod tests {
             Op::LoadConst(Value::Integer(1)), // Executed
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
     }
@@ -4317,7 +4323,7 @@ mod tests {
             Op::LoadConst(Value::Integer(1)), // Executed
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
 
@@ -4351,7 +4357,7 @@ mod tests {
             Op::LoadConst(Value::Integer(42)), // arg3: 42
             Op::Return,                        // end
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(42));
 
@@ -4390,7 +4396,7 @@ mod tests {
     fn test_return_true() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::ReturnTrue]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
     }
@@ -4399,7 +4405,7 @@ mod tests {
     fn test_return_false() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::ReturnFalse]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -4408,7 +4414,7 @@ mod tests {
     fn test_return_null() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::ReturnNull(DataType::Text)]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         let result = vm.execute(&program, &ctx).unwrap();
         assert!(result.is_null());
@@ -4427,7 +4433,7 @@ mod tests {
             Op::Nop,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(42));
     }
@@ -4440,7 +4446,7 @@ mod tests {
     fn test_empty_program() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         let result = vm.execute(&program, &ctx).unwrap();
         assert!(result.is_null());
@@ -4455,11 +4461,11 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::GtColumnConst(0, Value::Integer(5)), Op::Return]);
 
-        let row = vec![Value::Integer(10)];
+        let row = Row::from_values(vec![Value::Integer(10)]);
         let ctx = ExecuteContext::new(&row);
         assert!(vm.execute_bool(&program, &ctx));
 
-        let row = vec![Value::Integer(3)];
+        let row = Row::from_values(vec![Value::Integer(3)]);
         let ctx = ExecuteContext::new(&row);
         assert!(!vm.execute_bool(&program, &ctx));
     }
@@ -4470,7 +4476,7 @@ mod tests {
         let program = Program::new(vec![Op::GtColumnConst(0, Value::Integer(5)), Op::Return]);
 
         // Null comparison returns false (not true)
-        let row = vec![Value::Null(DataType::Integer)];
+        let row = Row::from_values(vec![Value::Null(DataType::Integer)]);
         let ctx = ExecuteContext::new(&row);
         assert!(!vm.execute_bool(&program, &ctx));
     }
@@ -4483,11 +4489,11 @@ mod tests {
             Op::Return,
         ]);
 
-        let row = vec![Value::Integer(10)];
+        let row = Row::from_values(vec![Value::Integer(10)]);
         let ctx = ExecuteContext::new(&row);
         assert!(vm.execute_bool(&program, &ctx));
 
-        let row = vec![Value::Integer(20)];
+        let row = Row::from_values(vec![Value::Integer(20)]);
         let ctx = ExecuteContext::new(&row);
         assert!(!vm.execute_bool(&program, &ctx));
     }
@@ -4497,11 +4503,11 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::IsNullColumn(0), Op::Return]);
 
-        let row = vec![Value::Null(DataType::Integer)];
+        let row = Row::from_values(vec![Value::Null(DataType::Integer)]);
         let ctx = ExecuteContext::new(&row);
         assert!(vm.execute_bool(&program, &ctx));
 
-        let row = vec![Value::Integer(1)];
+        let row = Row::from_values(vec![Value::Integer(1)]);
         let ctx = ExecuteContext::new(&row);
         assert!(!vm.execute_bool(&program, &ctx));
     }
@@ -4511,7 +4517,7 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadConst(Value::Boolean(true)), Op::Return]);
 
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert!(vm.execute_bool(&program, &ctx));
     }
@@ -4528,7 +4534,7 @@ mod tests {
             Op::Cast(DataType::Float),
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Float(42.0));
     }
@@ -4541,7 +4547,7 @@ mod tests {
             Op::Cast(DataType::Integer),
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(42));
     }
@@ -4554,7 +4560,7 @@ mod tests {
             Op::Cast(DataType::Integer),
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(123));
     }
@@ -4574,11 +4580,11 @@ mod tests {
             Op::Return,
         ]);
 
-        let row = vec![Value::Text("testing".into())];
+        let row = Row::from_values(vec![Value::Text("testing".into())]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Text("other".into())];
+        let row = Row::from_values(vec![Value::Text("other".into())]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -4595,7 +4601,7 @@ mod tests {
             Op::TruncateToDate,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         let result = vm.execute(&program, &ctx).unwrap();
         // TruncateToDate returns a Timestamp with time set to 00:00:00
@@ -4624,7 +4630,7 @@ mod tests {
             Op::LoadConst(Value::Integer(1)), // Executed
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
     }
@@ -4640,7 +4646,7 @@ mod tests {
             Op::LoadConst(Value::Integer(1)), // Executed
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
     }
@@ -4658,7 +4664,7 @@ mod tests {
             Op::Add,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Float(12.5));
     }
@@ -4676,7 +4682,7 @@ mod tests {
             Op::Concat,
             Op::Return,
         ]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert_eq!(
             vm.execute(&program, &ctx).unwrap(),
@@ -4693,11 +4699,11 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::GtColumnConst(0, Value::Float(2.5)), Op::Return]);
 
-        let row = vec![Value::Float(3.5)];
+        let row = Row::from_values(vec![Value::Float(3.5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
 
-        let row = vec![Value::Float(1.5)];
+        let row = Row::from_values(vec![Value::Float(1.5)]);
         let ctx = ExecuteContext::new(&row);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
     }
@@ -4710,7 +4716,7 @@ mod tests {
     fn test_load_transaction_id() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadTransactionId, Op::Return]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row).with_transaction_id(Some(12345));
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(12345));
     }
@@ -4719,7 +4725,7 @@ mod tests {
     fn test_load_transaction_id_none() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadTransactionId, Op::Return]);
-        let row: Vec<Value> = vec![];
+        let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         let result = vm.execute(&program, &ctx).unwrap();
         assert!(result.is_null());

@@ -333,8 +333,10 @@ impl Executor {
                     // Fall through to recompile path
                 }
                 CompiledExecution::Unknown => {} // Fall through to compile
-                // These variants are for UPDATE/DELETE fast paths
-                CompiledExecution::PkUpdate(_) | CompiledExecution::PkDelete(_) => return None,
+                // These variants are for UPDATE/DELETE/INSERT - not PK lookups
+                CompiledExecution::PkUpdate(_)
+                | CompiledExecution::PkDelete(_)
+                | CompiledExecution::Insert(_) => return None,
             }
         }
 
@@ -437,8 +439,10 @@ impl Executor {
                 return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
             }
             CompiledExecution::Unknown => {} // Continue with compilation
-            // These variants are for UPDATE/DELETE fast paths
-            CompiledExecution::PkUpdate(_) | CompiledExecution::PkDelete(_) => return None,
+            // These variants are for UPDATE/DELETE/INSERT - not PK lookups
+            CompiledExecution::PkUpdate(_)
+            | CompiledExecution::PkDelete(_)
+            | CompiledExecution::Insert(_) => return None,
         }
 
         // Do full pattern detection (same as try_fast_pk_lookup)

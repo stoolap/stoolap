@@ -212,7 +212,7 @@ impl Transaction {
                     for expr in row_values {
                         // Use ExpressionEval for value expression evaluation
                         let mut eval = ExpressionEval::compile(expr, &[])?.with_context(ctx);
-                        values.push(eval.eval_slice(&[])?);
+                        values.push(eval.eval_slice(&Row::new())?);
                     }
 
                     let row = Row::from_values(values);
@@ -278,8 +278,7 @@ impl Transaction {
                     }
 
                     // Evaluate all expressions first (while we can still borrow row)
-                    let row_data = row.as_slice();
-                    let exec_ctx = ExecuteContext::new(row_data);
+                    let exec_ctx = ExecuteContext::new(&row);
 
                     // CRITICAL: Collect evaluated values, capturing any errors
                     let mut updates_to_apply: Vec<(usize, Value)> =
@@ -350,7 +349,7 @@ impl Transaction {
                             // Use ExpressionEval for constant expression evaluation
                             let mut eval =
                                 ExpressionEval::compile(col_expr, &[])?.with_context(ctx);
-                            values.push(eval.eval_slice(&[])?);
+                            values.push(eval.eval_slice(&Row::new())?);
                         }
 
                         let rows = vec![Row::from_values(values)];
@@ -473,7 +472,7 @@ impl Transaction {
                 // Get value from right side (constant expression, no row context needed)
                 let value = ExpressionEval::compile(&infix.right, &[])?
                     .with_context(ctx)
-                    .eval_slice(&[])?;
+                    .eval_slice(&Row::new())?;
 
                 Ok(Box::new(ComparisonExpr::new(column, op, value)))
             }
@@ -538,8 +537,7 @@ impl Transaction {
 
         // Project each row
         for row in rows {
-            let row_data = row.as_slice();
-            let mut exec_ctx = crate::executor::expression::ExecuteContext::new(row_data);
+            let mut exec_ctx = crate::executor::expression::ExecuteContext::new(&row);
             if !params.is_empty() {
                 exec_ctx = exec_ctx.with_params(params);
             }
@@ -553,7 +551,7 @@ impl Transaction {
                 match compiled {
                     None => {
                         // Star: expand all columns
-                        values.extend_from_slice(row_data);
+                        values.extend(row.iter().cloned());
                     }
                     Some(program) => {
                         // Execute pre-compiled expression

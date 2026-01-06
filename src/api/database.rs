@@ -49,7 +49,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::core::{Error, IsolationLevel, Result, Value};
 use crate::executor::context::ExecutionContextBuilder;
 use crate::executor::Executor;
-use crate::functions::FunctionRegistry;
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::Engine;
 use crate::storage::{Config, SyncMode};
@@ -188,9 +187,8 @@ impl Database {
             }
         };
 
-        // Create executor with function registry
-        let function_registry = Arc::new(FunctionRegistry::new());
-        let executor = Executor::with_function_registry(Arc::clone(&engine), function_registry);
+        // Create executor (uses shared default function registry)
+        let executor = Executor::new(Arc::clone(&engine));
 
         let inner = Arc::new(DatabaseInner {
             engine,
@@ -215,8 +213,8 @@ impl Database {
         engine.open_engine()?;
         let engine = Arc::new(engine);
 
-        let function_registry = Arc::new(FunctionRegistry::new());
-        let executor = Executor::with_function_registry(Arc::clone(&engine), function_registry);
+        // Create executor (uses shared default function registry)
+        let executor = Executor::new(Arc::clone(&engine));
 
         let inner = Arc::new(DatabaseInner {
             engine,

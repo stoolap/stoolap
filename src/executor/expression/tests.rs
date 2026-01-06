@@ -25,6 +25,7 @@ use super::ops::{CompiledPattern, Op};
 use super::program::Program;
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::Value;
+use crate::Row;
 
 #[test]
 fn test_simple_load_and_compare() {
@@ -39,13 +40,13 @@ fn test_simple_load_and_compare() {
     ]);
 
     // True case
-    let row = vec![Value::Integer(10)];
+    let row = Row::from_values(vec![Value::Integer(10)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
     // False case
-    let row = vec![Value::Integer(3)];
+    let row = Row::from_values(vec![Value::Integer(3)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
@@ -63,7 +64,7 @@ fn test_null_comparison() {
         Op::Return,
     ]);
 
-    let row = vec![Value::Null(crate::core::DataType::Integer)];
+    let row = Row::from_values(vec![Value::Null(crate::core::DataType::Integer)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert!(result.is_null());
@@ -90,19 +91,19 @@ fn test_and_short_circuit() {
     ]);
 
     // Both true
-    let row = vec![Value::Integer(10), Value::Integer(5)];
+    let row = Row::from_values(vec![Value::Integer(10), Value::Integer(5)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
     // First false (short circuit)
-    let row = vec![Value::Integer(3), Value::Integer(5)];
+    let row = Row::from_values(vec![Value::Integer(3), Value::Integer(5)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
 
     // First true, second false
-    let row = vec![Value::Integer(10), Value::Integer(15)];
+    let row = Row::from_values(vec![Value::Integer(10), Value::Integer(15)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
@@ -129,19 +130,19 @@ fn test_or_short_circuit() {
     ]);
 
     // First true (short circuit)
-    let row = vec![Value::Integer(3), Value::Integer(5)];
+    let row = Row::from_values(vec![Value::Integer(3), Value::Integer(5)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
     // First false, second true
-    let row = vec![Value::Integer(10), Value::Integer(15)];
+    let row = Row::from_values(vec![Value::Integer(10), Value::Integer(15)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
     // Both false
-    let row = vec![Value::Integer(10), Value::Integer(5)];
+    let row = Row::from_values(vec![Value::Integer(10), Value::Integer(5)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
@@ -161,7 +162,7 @@ fn test_arithmetic() {
         Op::Return,
     ]);
 
-    let row = vec![Value::Integer(5), Value::Integer(3)];
+    let row = Row::from_values(vec![Value::Integer(5), Value::Integer(3)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Integer(11)); // 5 + 3*2 = 11
@@ -182,13 +183,13 @@ fn test_in_set() {
     ]);
 
     // In set
-    let row = vec![Value::Integer(2)];
+    let row = Row::from_values(vec![Value::Integer(2)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
     // Not in set
-    let row = vec![Value::Integer(5)];
+    let row = Row::from_values(vec![Value::Integer(5)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
@@ -208,19 +209,19 @@ fn test_between() {
     ]);
 
     // In range
-    let row = vec![Value::Integer(7)];
+    let row = Row::from_values(vec![Value::Integer(7)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
     // Below range
-    let row = vec![Value::Integer(3)];
+    let row = Row::from_values(vec![Value::Integer(3)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
 
     // Above range
-    let row = vec![Value::Integer(15)];
+    let row = Row::from_values(vec![Value::Integer(15)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
@@ -239,13 +240,13 @@ fn test_like_pattern() {
     ]);
 
     // Match
-    let row = vec![Value::Text(CompactString::from("testing"))];
+    let row = Row::from_values(vec![Value::Text(CompactString::from("testing"))]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
     // No match
-    let row = vec![Value::Text(CompactString::from("other"))];
+    let row = Row::from_values(vec![Value::Text(CompactString::from("other"))]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
@@ -259,13 +260,13 @@ fn test_is_null() {
     let program = Program::new(vec![Op::LoadColumn(0), Op::IsNull, Op::Return]);
 
     // Is null
-    let row = vec![Value::Null(crate::core::DataType::Integer)];
+    let row = Row::from_values(vec![Value::Null(crate::core::DataType::Integer)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
     // Not null
-    let row = vec![Value::Integer(5)];
+    let row = Row::from_values(vec![Value::Integer(5)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
@@ -285,28 +286,28 @@ fn test_coalesce() {
     ]);
 
     // First non-null
-    let row = vec![
+    let row = Row::from_values(vec![
         Value::Text(CompactString::from("first")),
         Value::Text(CompactString::from("second")),
-    ];
+    ]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Text(CompactString::from("first")));
 
     // Second non-null
-    let row = vec![
+    let row = Row::from_values(vec![
         Value::Null(crate::core::DataType::Text),
         Value::Text(CompactString::from("second")),
-    ];
+    ]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Text(CompactString::from("second")));
 
     // Default
-    let row = vec![
+    let row = Row::from_values(vec![
         Value::Null(crate::core::DataType::Text),
         Value::Null(crate::core::DataType::Text),
-    ];
+    ]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Text(CompactString::from("default")));
@@ -324,14 +325,14 @@ fn test_join_context() {
         Op::Return,
     ]);
 
-    let row1 = vec![Value::Integer(5)];
-    let row2 = vec![Value::Integer(5)];
+    let row1 = Row::from_values(vec![Value::Integer(5)]);
+    let row2 = Row::from_values(vec![Value::Integer(5)]);
     let ctx = ExecuteContext::for_join(&row1, &row2);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
-    let row1 = vec![Value::Integer(5)];
-    let row2 = vec![Value::Integer(10)];
+    let row1 = Row::from_values(vec![Value::Integer(5)]);
+    let row2 = Row::from_values(vec![Value::Integer(10)]);
     let ctx = ExecuteContext::for_join(&row1, &row2);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
@@ -349,7 +350,7 @@ fn test_parameters() {
         Op::Return,
     ]);
 
-    let row = vec![Value::Integer(42)];
+    let row = Row::from_values(vec![Value::Integer(42)]);
     let params = vec![Value::Integer(42)];
     let ctx = ExecuteContext::new(&row).with_params(&params);
     let result = vm.execute(&program, &ctx).unwrap();
@@ -373,17 +374,17 @@ fn test_execute_bool() {
     ]);
 
     // True
-    let row = vec![Value::Integer(10)];
+    let row = Row::from_values(vec![Value::Integer(10)]);
     let ctx = ExecuteContext::new(&row);
     assert!(vm.execute_bool(&program, &ctx));
 
     // False
-    let row = vec![Value::Integer(3)];
+    let row = Row::from_values(vec![Value::Integer(3)]);
     let ctx = ExecuteContext::new(&row);
     assert!(!vm.execute_bool(&program, &ctx));
 
     // NULL -> false
-    let row = vec![Value::Null(crate::core::DataType::Integer)];
+    let row = Row::from_values(vec![Value::Null(crate::core::DataType::Integer)]);
     let ctx = ExecuteContext::new(&row);
     assert!(!vm.execute_bool(&program, &ctx));
 }
@@ -433,7 +434,7 @@ fn test_compiler_simple_expression() {
 
     // Execute
     let mut vm = ExprVM::new();
-    let row = vec![Value::Integer(10), Value::Integer(20)];
+    let row = Row::from_values(vec![Value::Integer(10), Value::Integer(20)]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));

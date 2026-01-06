@@ -997,7 +997,8 @@ impl Parser {
 
     /// Parse value lists for INSERT
     fn parse_value_lists(&mut self) -> Option<Vec<Vec<Expression>>> {
-        let mut value_lists = Vec::new();
+        // Pre-allocate for common case (single row INSERT)
+        let mut value_lists = Vec::with_capacity(1);
 
         // Expect (
         if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {

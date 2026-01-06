@@ -107,6 +107,14 @@ pub trait QueryResult: Send {
         None
     }
 
+    /// Returns an estimate of the total number of rows in the result.
+    ///
+    /// This is used for pre-allocating vectors to avoid reallocations.
+    /// Returns None if the count is unknown. Default implementation returns None.
+    fn estimated_count(&self) -> Option<usize> {
+        None
+    }
+
     /// Sets column aliases for this result
     ///
     /// The map keys are alias names, values are original column names.
@@ -180,6 +188,10 @@ impl MemoryResult {
 impl QueryResult for MemoryResult {
     fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    fn estimated_count(&self) -> Option<usize> {
+        Some(self.rows.len())
     }
 
     fn next(&mut self) -> bool {

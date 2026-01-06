@@ -75,12 +75,24 @@
 //! Future enhancement: Per-transaction cache scoping with timestamp-based invalidation
 
 use rustc_hash::{FxHashMap, FxHasher};
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::core::{Result, Row};
+
+/// Convert to lowercase without allocation if already lowercase.
+/// Returns Cow::Borrowed for already-lowercase strings (zero allocation).
+#[inline]
+fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
+    if s.bytes().all(|b| !b.is_ascii_uppercase()) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(s.to_lowercase())
+    }
+}
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::{Expression, InfixOperator};
 
@@ -714,11 +726,11 @@ impl SemanticCache {
 
     /// Invalidate all cache entries for a table (O(1) operation)
     pub fn invalidate_table(&self, table_name: &str) {
-        let table_key = table_name.to_lowercase();
+        let table_key = to_lowercase_cow(table_name);
         match self.cache.write() {
             Ok(mut cache) => {
                 // Count rows being removed for global tracking
-                if let Some(table_cache) = cache.get(&table_key) {
+                if let Some(table_cache) = cache.get(table_key.as_ref()) {
                     let rows_removed: usize = table_cache
                         .values()
                         .flat_map(|entries| entries.iter())
@@ -730,7 +742,7 @@ impl SemanticCache {
                     }
                 }
                 // O(1) removal: just remove the entire table entry
-                cache.remove(&table_key);
+                cache.remove(table_key.as_ref());
             }
             Err(_) => {
                 self.stats.lock_failures.fetch_add(1, Ordering::Relaxed);
@@ -1279,10 +1291,10 @@ mod tests {
         Expression::In(InExpression {
             token: make_token(),
             left: Box::new(make_identifier(col)),
-            right: Box::new(Expression::List(ListExpression {
+            right: Box::new(Expression::List(Box::new(ListExpression {
                 token: make_token(),
                 elements: values.into_iter().map(make_int_literal).collect(),
-            })),
+            }))),
             not: false,
         })
     }

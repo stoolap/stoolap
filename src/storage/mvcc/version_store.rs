@@ -30,7 +30,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::common::{
     new_btree_int64_map, new_int64_map, new_int64_map_with_capacity, BTreeInt64Map, Int64Map,
@@ -45,7 +45,12 @@ use crate::storage::mvcc::streaming_result::{StreamingResult, VisibleRowInfo};
 use crate::storage::Index;
 // radsort removed - BTreeMap iteration is already ordered
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::{smallvec, SmallVec};
+
+/// Type alias for version lists - uses SmallVec to avoid heap allocation
+/// for the common case of a single version per row within a transaction.
+type VersionList = SmallVec<[RowVersion; 1]>;
 
 /// Represents a specific version of a row with complete data
 ///
@@ -168,6 +173,72 @@ pub struct WriteSetEntry {
     /// Sequence number when read
     pub read_version_seq: i64,
 }
+
+// ============================================================================
+// HashMap Pool for TransactionVersionStore
+// ============================================================================
+//
+// Pools recycled HashMaps to avoid allocation overhead when creating many
+// short-lived transactions. Each auto-commit INSERT creates a transaction,
+// and without pooling, this causes ~5.5KB allocation per INSERT.
+//
+// With pooling, maps are returned to the pool on Drop and reused by the next
+// transaction, reducing allocation churn by ~99% for bulk insert workloads.
+
+/// Maximum number of maps to keep in each pool.
+/// Prevents unbounded memory growth while allowing reasonable reuse.
+const MAP_POOL_MAX_SIZE: usize = 64;
+
+/// Global pool for VersionList maps (local_versions in TransactionVersionStore)
+static VERSION_LIST_MAP_POOL: Mutex<Vec<Int64Map<VersionList>>> = Mutex::new(Vec::new());
+
+/// Global pool for WriteSetEntry maps (write_set in TransactionVersionStore)
+static WRITE_SET_MAP_POOL: Mutex<Vec<Int64Map<WriteSetEntry>>> = Mutex::new(Vec::new());
+
+/// Get a VersionList map from pool or create a new one
+#[inline]
+fn get_version_list_map() -> Int64Map<VersionList> {
+    if let Some(map) = VERSION_LIST_MAP_POOL.lock().pop() {
+        map
+    } else {
+        new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY)
+    }
+}
+
+/// Get a WriteSetEntry map from pool or create a new one
+#[inline]
+fn get_write_set_map() -> Int64Map<WriteSetEntry> {
+    if let Some(map) = WRITE_SET_MAP_POOL.lock().pop() {
+        map
+    } else {
+        new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY)
+    }
+}
+
+/// Return a VersionList map to the pool for reuse
+#[inline]
+fn return_version_list_map(mut map: Int64Map<VersionList>) {
+    map.clear();
+    let mut pool = VERSION_LIST_MAP_POOL.lock();
+    if pool.len() < MAP_POOL_MAX_SIZE {
+        pool.push(map);
+    }
+    // If pool is full, map is dropped (deallocated)
+}
+
+/// Return a WriteSetEntry map to the pool for reuse
+#[inline]
+fn return_write_set_map(mut map: Int64Map<WriteSetEntry>) {
+    map.clear();
+    let mut pool = WRITE_SET_MAP_POOL.lock();
+    if pool.len() < MAP_POOL_MAX_SIZE {
+        pool.push(map);
+    }
+    // If pool is full, map is dropped (deallocated)
+}
+
+/// Capacity hint for transaction version maps - used by pool functions
+const TX_VERSION_MAP_INITIAL_CAPACITY: usize = 16;
 
 /// Lightweight row index for deferred materialization
 ///
@@ -509,7 +580,7 @@ impl VersionStore {
                         Arc::clone(&arc_data),
                     );
                     // Reuse the Arc for the version's data - enables O(1) clone on read
-                    new_version.data = Row::from_arc(arc_data);
+                    new_version.data = Row::from_arc_slice(arc_data);
                     // Update row -> arena index mapping
                     self.row_arena_index.write().insert(row_id, idx);
                     Some(idx)
@@ -564,7 +635,7 @@ impl VersionStore {
                     // Update row -> arena index mapping
                     self.row_arena_index.write().insert(row_id, idx);
                     // Create version with Arc-backed data for O(1) clone
-                    v.data = Row::from_arc(arc_data);
+                    v.data = Row::from_arc_slice(arc_data);
                     (Some(idx), v)
                 } else {
                     (None, version)
@@ -637,7 +708,7 @@ impl VersionStore {
                             Arc::clone(&arc_data),
                         );
                         // Reuse the Arc for the version's data
-                        new_version.data = Row::from_arc(arc_data);
+                        new_version.data = Row::from_arc_slice(arc_data);
                         arena_index_updates.push((row_id, idx));
                         Some(idx)
                     } else {
@@ -690,7 +761,7 @@ impl VersionStore {
                         );
                         arena_index_updates.push((row_id, idx));
                         // Create version with Arc-backed data for O(1) clone
-                        v.data = Row::from_arc(arc_data);
+                        v.data = Row::from_arc_slice(arc_data);
                         (Some(idx), v)
                     } else {
                         (None, version)
@@ -714,6 +785,106 @@ impl VersionStore {
             let mut index = self.row_arena_index.write();
             for (row_id, idx) in arena_index_updates {
                 index.insert(row_id, idx);
+            }
+        }
+    }
+
+    /// Add a single version to the store (optimized for auto-commit single-row inserts)
+    ///
+    /// This avoids Vec allocation for the common single-row commit case.
+    #[inline]
+    pub fn add_version_single(&self, row_id: i64, version: RowVersion) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let mut versions = self.versions.write();
+
+        match versions.entry(row_id) {
+            std::collections::btree_map::Entry::Occupied(mut occupied) => {
+                // Extract existing data from the entry
+                let existing = occupied.get();
+                let existing_version = existing.version.clone();
+                let existing_prev = existing.prev.clone();
+                let existing_arena_idx = existing.arena_idx;
+                let existing_depth = existing.chain_depth;
+
+                let mut new_version = version;
+                if new_version.deleted_at_txn_id != 0 && new_version.data.is_empty() {
+                    new_version.data = existing_version.data.clone();
+                }
+
+                if let Some(old_arena_idx) = existing_arena_idx {
+                    self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
+                }
+
+                let arena_idx = if new_version.deleted_at_txn_id == 0 {
+                    let arc_data = std::mem::take(&mut new_version.data).into_arc();
+                    let idx = self.arena.insert_arc(
+                        row_id,
+                        new_version.txn_id,
+                        new_version.create_time,
+                        Arc::clone(&arc_data),
+                    );
+                    new_version.data = Row::from_arc_slice(arc_data);
+                    // Update arena index immediately (single row, no batching needed)
+                    self.row_arena_index.write().insert(row_id, idx);
+                    Some(idx)
+                } else {
+                    None
+                };
+
+                let new_depth = existing_depth + 1;
+                let (keep_prev, prev_depth) =
+                    if self.max_version_history > 0 && new_depth > self.max_version_history {
+                        (None, 0)
+                    } else {
+                        (existing_prev, existing_depth)
+                    };
+
+                let prev_chain = Arc::new(VersionChainEntry {
+                    version: existing_version,
+                    prev: keep_prev,
+                    arena_idx: existing_arena_idx,
+                    chain_depth: prev_depth + 1,
+                });
+                let final_depth = prev_depth + 2;
+
+                let new_entry = VersionChainEntry {
+                    version: new_version,
+                    prev: Some(prev_chain),
+                    arena_idx,
+                    chain_depth: final_depth,
+                };
+
+                occupied.insert(new_entry);
+            }
+            std::collections::btree_map::Entry::Vacant(vacant) => {
+                let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
+                    let mut v = version;
+                    let arc_data = std::mem::take(&mut v.data).into_arc();
+                    let idx = self.arena.insert_arc(
+                        row_id,
+                        v.txn_id,
+                        v.create_time,
+                        Arc::clone(&arc_data),
+                    );
+                    // Update arena index immediately
+                    self.row_arena_index.write().insert(row_id, idx);
+                    v.data = Row::from_arc_slice(arc_data);
+                    (Some(idx), v)
+                } else {
+                    (None, version)
+                };
+
+                let new_entry = VersionChainEntry {
+                    version: final_version,
+                    prev: None,
+                    arena_idx,
+                    chain_depth: 1,
+                };
+
+                vacant.insert(new_entry);
             }
         }
     }
@@ -752,7 +923,7 @@ impl VersionStore {
                     return Some(RowVersion {
                         txn_id: meta.txn_id,
                         deleted_at_txn_id: meta.deleted_at_txn_id,
-                        data: Row::from_arc(arc_data),
+                        data: Row::from_arc_slice(arc_data),
                         row_id: meta.row_id,
                         create_time: meta.create_time,
                     });
@@ -869,161 +1040,85 @@ impl VersionStore {
         // BTreeMap for fallback when HEAD not visible (Snapshot Isolation, AS OF)
         let versions = self.versions.read();
 
-        // Parallel processing constants
-        const PARALLEL_THRESHOLD: usize = 1000;
-        const PARALLEL_CHUNK_SIZE: usize = 512;
+        // Sequential processing - avoids Rayon allocation overhead
+        let mut results = Vec::with_capacity(row_ids.len());
+        let arena_len = arena_meta.len();
 
-        // OPTIMIZED SEQUENTIAL PATH for small batches (common case for JOINs)
-        // Inlined for maximum performance - avoids closure/enum overhead
-        if row_ids.len() < PARALLEL_THRESHOLD {
-            let mut results = Vec::with_capacity(row_ids.len());
-            let arena_len = arena_meta.len();
+        for &row_id in row_ids {
+            // ARENA FAST PATH: O(1) HashMap + direct array access
+            if let Some(&arena_idx) = row_index.get(&row_id) {
+                if arena_idx < arena_len {
+                    // SAFETY: bounds checked above, unchecked access for speed
+                    let meta = &arena_meta[arena_idx];
 
-            for &row_id in row_ids {
-                // ARENA FAST PATH: O(1) HashMap + direct array access
-                if let Some(&arena_idx) = row_index.get(&row_id) {
-                    if arena_idx < arena_len {
-                        // SAFETY: bounds checked above, unchecked access for speed
-                        let meta = &arena_meta[arena_idx];
-
-                        // Check HEAD visibility
-                        if checker.is_visible(meta.txn_id, txn_id) {
-                            // HEAD visible - check deletion
-                            if meta.deleted_at_txn_id == 0
-                                || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
-                            {
-                                // O(1) success! Return from arena
-                                results.push((
-                                    row_id,
-                                    Row::from_arc(Arc::clone(&arena_data[arena_idx])),
-                                ));
-                            }
-                            // Else: deleted, skip
-                            continue;
+                    // Check HEAD visibility
+                    if checker.is_visible(meta.txn_id, txn_id) {
+                        // HEAD visible - check deletion
+                        if meta.deleted_at_txn_id == 0
+                            || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                        {
+                            // O(1) success! Return from arena
+                            results.push((
+                                row_id,
+                                Row::from_arc_slice(Arc::clone(&arena_data[arena_idx])),
+                            ));
                         }
-                        // HEAD not visible - fall through to BTreeMap
+                        // Else: deleted, skip
+                        continue;
                     }
+                    // HEAD not visible - fall through to BTreeMap
                 }
+            }
 
-                // BTREE FALLBACK: Version chain traversal for Snapshot Isolation
-                if let Some(chain) = versions.get(&row_id) {
-                    let head_txn_id = chain.version.txn_id;
-                    let head_deleted_at = chain.version.deleted_at_txn_id;
+            // BTREE FALLBACK: Version chain traversal for Snapshot Isolation
+            if let Some(chain) = versions.get(&row_id) {
+                let head_txn_id = chain.version.txn_id;
+                let head_deleted_at = chain.version.deleted_at_txn_id;
 
-                    if checker.is_visible(head_txn_id, txn_id) {
-                        if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                            // Get from arena if available, else clone
-                            let row = if let Some(idx) = chain.arena_idx {
-                                if let Some(arc_row) = arena_data.get(idx) {
-                                    Row::from_arc(Arc::clone(arc_row))
-                                } else {
-                                    chain.version.data.clone()
-                                }
+                if checker.is_visible(head_txn_id, txn_id) {
+                    if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+                        // Get from arena if available, else clone
+                        let row = if let Some(idx) = chain.arena_idx {
+                            if let Some(arc_row) = arena_data.get(idx) {
+                                Row::from_arc_slice(Arc::clone(arc_row))
                             } else {
                                 chain.version.data.clone()
+                            }
+                        } else {
+                            chain.version.data.clone()
+                        };
+                        results.push((row_id, row));
+                    }
+                    continue;
+                }
+
+                // Traverse version chain
+                let mut current: Option<&VersionChainEntry> =
+                    chain.prev.as_ref().map(|b| b.as_ref());
+
+                while let Some(e) = current {
+                    if checker.is_visible(e.version.txn_id, txn_id) {
+                        if e.version.deleted_at_txn_id == 0
+                            || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
+                        {
+                            let row = if let Some(idx) = e.arena_idx {
+                                if let Some(arc_row) = arena_data.get(idx) {
+                                    Row::from_arc_slice(Arc::clone(arc_row))
+                                } else {
+                                    e.version.data.clone()
+                                }
+                            } else {
+                                e.version.data.clone()
                             };
                             results.push((row_id, row));
                         }
-                        continue;
+                        break;
                     }
-
-                    // Traverse version chain
-                    let mut current: Option<&VersionChainEntry> =
-                        chain.prev.as_ref().map(|b| b.as_ref());
-
-                    while let Some(e) = current {
-                        if checker.is_visible(e.version.txn_id, txn_id) {
-                            if e.version.deleted_at_txn_id == 0
-                                || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
-                            {
-                                let row = if let Some(idx) = e.arena_idx {
-                                    if let Some(arc_row) = arena_data.get(idx) {
-                                        Row::from_arc(Arc::clone(arc_row))
-                                    } else {
-                                        e.version.data.clone()
-                                    }
-                                } else {
-                                    e.version.data.clone()
-                                };
-                                results.push((row_id, row));
-                            }
-                            break;
-                        }
-                        current = e.prev.as_ref().map(|b| b.as_ref());
-                    }
+                    current = e.prev.as_ref().map(|b| b.as_ref());
                 }
             }
-            return results;
         }
-
-        // PARALLEL PATH for large batches (>1000 rows)
-        // Helper closure for row data
-        let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = e.arena_idx {
-                if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
-                }
-            }
-            e.version.data.clone()
-        };
-
-        row_ids
-            .par_chunks(PARALLEL_CHUNK_SIZE)
-            .flat_map(|chunk| {
-                let mut chunk_results = Vec::with_capacity(chunk.len());
-                let arena_len = arena_meta.len();
-
-                for &row_id in chunk {
-                    // Arena fast path
-                    if let Some(&arena_idx) = row_index.get(&row_id) {
-                        if arena_idx < arena_len {
-                            let meta = &arena_meta[arena_idx];
-                            if checker.is_visible(meta.txn_id, txn_id) {
-                                if meta.deleted_at_txn_id == 0
-                                    || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
-                                {
-                                    chunk_results.push((
-                                        row_id,
-                                        Row::from_arc(Arc::clone(&arena_data[arena_idx])),
-                                    ));
-                                }
-                                continue;
-                            }
-                        }
-                    }
-
-                    // BTreeMap fallback
-                    if let Some(chain) = versions.get(&row_id) {
-                        let head_txn_id = chain.version.txn_id;
-                        let head_deleted_at = chain.version.deleted_at_txn_id;
-
-                        if checker.is_visible(head_txn_id, txn_id) {
-                            if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id)
-                            {
-                                chunk_results.push((row_id, get_row_data(chain)));
-                            }
-                            continue;
-                        }
-
-                        let mut current: Option<&VersionChainEntry> =
-                            chain.prev.as_ref().map(|b| b.as_ref());
-
-                        while let Some(e) = current {
-                            if checker.is_visible(e.version.txn_id, txn_id) {
-                                if e.version.deleted_at_txn_id == 0
-                                    || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
-                                {
-                                    chunk_results.push((row_id, get_row_data(e)));
-                                }
-                                break;
-                            }
-                            current = e.prev.as_ref().map(|b| b.as_ref());
-                        }
-                    }
-                }
-                chunk_results
-            })
-            .collect()
+        results
     }
 
     /// Counts visible versions for batch operations (COUNT optimization)
@@ -1171,7 +1266,7 @@ impl VersionStore {
         let get_row = |entry: &VersionChainEntry| -> Row {
             if let Some(idx) = entry.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc_slice(Arc::clone(arc_row));
                 }
             }
             entry.version.data.clone()
@@ -1433,7 +1528,7 @@ impl VersionStore {
         let get_row = |entry: &VersionChainEntry| -> Row {
             if let Some(idx) = entry.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc_slice(Arc::clone(arc_row));
                 }
             }
             entry.version.data.clone()
@@ -1501,7 +1596,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc_slice(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -1574,7 +1669,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc_slice(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -1665,16 +1760,16 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    // Try arena path first (zero-copy filter check)
+                    // Try arena path first (zero-copy filter check using matches_arc_slice)
                     if let Some(idx) = chain.arena_idx {
                         if let Some(arc_row) = arena_data.get(idx) {
-                            // Filter on slice - no allocation!
-                            if compiled_filter.matches_slice(arc_row) {
+                            // Filter directly on Arc slice - no Row allocation for non-matching rows
+                            if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
                                 let mut version_copy = chain.version.clone();
                                 version_copy.create_time = current_seq;
                                 result.push((
                                     row_id,
-                                    Row::from_arc(Arc::clone(arc_row)),
+                                    Row::from_arc_slice(Arc::clone(arc_row)),
                                     version_copy,
                                 ));
                             }
@@ -1699,15 +1794,16 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        // Try arena path first
+                        // Try arena path first (zero-copy filter check using matches_arc_slice)
                         if let Some(idx) = e.arena_idx {
                             if let Some(arc_row) = arena_data.get(idx) {
-                                if compiled_filter.matches_slice(arc_row) {
+                                // Filter directly on Arc slice - no Row allocation for non-matching rows
+                                if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
                                     let mut version_copy = e.version.clone();
                                     version_copy.create_time = current_seq;
                                     result.push((
                                         row_id,
-                                        Row::from_arc(Arc::clone(arc_row)),
+                                        Row::from_arc_slice(Arc::clone(arc_row)),
                                         version_copy,
                                     ));
                                 }
@@ -1753,7 +1849,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc_slice(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -1829,7 +1925,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc_slice(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -1941,7 +2037,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc_slice(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -2004,6 +2100,108 @@ impl VersionStore {
         (result, has_more)
     }
 
+    /// Fetch visible rows into an existing buffer (avoids allocation)
+    ///
+    /// This is the same as `get_visible_rows_batch` but reuses the provided buffer
+    /// instead of allocating a new Vec. The buffer is cleared before filling.
+    ///
+    /// # Arguments
+    /// * `txn_id` - Transaction ID for visibility checks
+    /// * `after_row_id` - Cursor position (exclusive lower bound)
+    /// * `batch_size` - Maximum number of rows to fetch
+    /// * `buffer` - Existing buffer to fill (will be cleared first)
+    ///
+    /// # Returns
+    /// `has_more` - true if there are more rows to fetch after this batch
+    pub fn get_visible_rows_batch_into(
+        &self,
+        txn_id: i64,
+        after_row_id: i64,
+        batch_size: usize,
+        buffer: &mut Vec<(i64, Row)>,
+    ) -> bool {
+        buffer.clear();
+
+        if self.closed.load(Ordering::Acquire) || batch_size == 0 {
+            return false;
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return false,
+        };
+
+        // Pre-acquire arena lock ONCE for this batch
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
+
+        // Helper closure to get row data from arena or version
+        let get_row_data = |e: &VersionChainEntry| -> Row {
+            if let Some(idx) = e.arena_idx {
+                if let Some(arc_row) = arena_data.get(idx) {
+                    return Row::from_arc_slice(Arc::clone(arc_row));
+                }
+            }
+            e.version.data.clone()
+        };
+
+        // BTreeMap is sorted - use range for efficient cursor-based iteration
+        let versions = self.versions.read();
+        buffer.reserve(batch_size);
+        let mut has_more = false;
+
+        // Use range to start after the cursor row_id
+        for (&row_id, chain) in versions.range((
+            std::ops::Bound::Excluded(after_row_id),
+            std::ops::Bound::Unbounded::<i64>,
+        )) {
+            // FAST PATH: Check HEAD version first - O(1) for common case
+            let head_txn_id = chain.version.txn_id;
+            let head_deleted_at = chain.version.deleted_at_txn_id;
+
+            // Track the actual visible entry, not just a boolean
+            let visible_entry: Option<&VersionChainEntry> = if checker
+                .is_visible(head_txn_id, txn_id)
+            {
+                // HEAD is visible - check if deleted
+                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+                    Some(chain)
+                } else {
+                    None
+                }
+            } else {
+                // SLOW PATH: HEAD not visible - traverse chain for older versions
+                let mut found_entry: Option<&VersionChainEntry> = None;
+                let mut current: Option<&VersionChainEntry> =
+                    chain.prev.as_ref().map(|b| b.as_ref());
+                while let Some(e) = current {
+                    let version_txn_id = e.version.txn_id;
+                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                    if checker.is_visible(version_txn_id, txn_id) {
+                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
+                        {
+                            found_entry = Some(e);
+                        }
+                        break;
+                    }
+                    current = e.prev.as_ref().map(|b| b.as_ref());
+                }
+                found_entry
+            };
+
+            if let Some(entry) = visible_entry {
+                if buffer.len() >= batch_size {
+                    has_more = true;
+                    break; // Early termination - found one more than needed
+                }
+                buffer.push((row_id, get_row_data(entry)));
+            }
+        }
+
+        has_more
+    }
+
     /// Collect visible rows ordered by row_id (PRIMARY KEY) with efficient OFFSET/LIMIT
     ///
     /// This method uses BTreeMap range iteration to efficiently skip OFFSET rows
@@ -2042,7 +2240,7 @@ impl VersionStore {
         let get_row_from_entry = |entry: &VersionChainEntry| -> Row {
             if let Some(idx) = entry.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc_slice(Arc::clone(arc_row));
                 }
             }
             entry.version.data.clone()
@@ -2160,7 +2358,7 @@ impl VersionStore {
                     // Read row data from arena or version
                     let row_data = if let Some(idx) = e.arena_idx {
                         if let Some(arc_row) = arena_data.get(idx) {
-                            Row::from_arc(Arc::clone(arc_row))
+                            Row::from_arc_slice(Arc::clone(arc_row))
                         } else {
                             e.version.data.clone()
                         }
@@ -2261,13 +2459,12 @@ impl VersionStore {
                     }
 
                     // OPTIMIZATION: Filter BEFORE cloning to avoid allocation for non-matching rows
-                    // Try arena path first (zero-copy filter check)
+                    // Try arena path first (zero-copy filter check using matches_arc_slice)
                     if let Some(idx) = e.arena_idx {
                         if let Some(arc_row) = arena_data.get(idx) {
-                            // Filter on slice - no allocation!
-                            if compiled_filter.matches_slice(arc_row) {
-                                // Only clone if filter matched
-                                result.push((row_id, Row::from_arc(Arc::clone(arc_row))));
+                            // Filter directly on Arc slice - no Row allocation for non-matching rows
+                            if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
+                                result.push((row_id, Row::from_arc_slice(Arc::clone(arc_row))));
                             }
                             break;
                         }
@@ -2340,15 +2537,15 @@ impl VersionStore {
                     }
 
                     // OPTIMIZATION: Filter BEFORE cloning to avoid allocation for non-matching rows
-                    // Try arena path first (zero-copy filter check)
+                    // Try arena path first (zero-copy filter check using matches_arc_slice)
                     if let Some(idx) = e.arena_idx {
                         if let Some(arc_row) = arena_data.get(idx) {
-                            // Filter on slice - no allocation!
-                            if compiled_filter.matches_slice(arc_row) {
+                            // Filter directly on Arc slice - no Row allocation for non-matching rows
+                            if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
                                 if skipped < offset {
                                     skipped += 1;
                                 } else {
-                                    result.push((row_id, Row::from_arc(Arc::clone(arc_row))));
+                                    result.push((row_id, Row::from_arc_slice(Arc::clone(arc_row))));
                                     if result.len() >= limit {
                                         return result; // Early termination!
                                     }
@@ -2471,14 +2668,71 @@ impl VersionStore {
         indices
     }
 
-    /// Get visible row indices (BTreeMap iteration is already sorted).
+    /// Get visible row indices without guaranteed ordering.
     ///
-    /// Note: With BTreeMap, this is functionally identical to get_visible_row_indices
-    /// since BTreeMap iteration is inherently ordered by row_id. Kept for API compatibility.
+    /// This is optimized for aggregation operations (SUM, MIN, MAX, COUNT) that
+    /// don't need row ordering. It skips the expensive sort in the arena fast path.
     #[inline]
     pub fn get_visible_row_indices_unordered(&self, txn_id: i64) -> Vec<RowIndex> {
-        // Delegate to the sorted version - BTreeMap is always sorted
-        self.get_visible_row_indices(txn_id)
+        let checker = self.visibility_checker.as_ref();
+
+        // Get arena metadata for fast path detection
+        let arena_guard = self.arena.read_guard();
+        let arena_meta = arena_guard.meta();
+        let arena_len = arena_guard.len();
+
+        // FAST PATH: If uncommitted_writes is empty, scan arena directly (NO SORT!)
+        if let Some(checker) = checker {
+            let uncommitted_empty = self.uncommitted_writes.read().is_empty();
+
+            if uncommitted_empty && arena_len > 0 {
+                let mut indices: Vec<RowIndex> = Vec::with_capacity(arena_len);
+
+                for (idx, meta) in arena_meta.iter().enumerate() {
+                    if meta.deleted_at_txn_id == 0 && checker.is_visible(meta.txn_id, txn_id) {
+                        indices.push(RowIndex {
+                            row_id: meta.row_id,
+                            arena_idx: Some(idx),
+                        });
+                    }
+                }
+
+                // Skip sorting - aggregations don't need ordering
+                return indices;
+            }
+        }
+
+        // Drop arena guard before slow path to avoid holding locks
+        drop(arena_guard);
+
+        // SLOW PATH: Full iteration (BTreeMap is sorted but we don't need it)
+        let versions = self.versions.read();
+        let mut indices: Vec<RowIndex> = Vec::with_capacity(versions.len());
+
+        if let Some(checker) = checker {
+            for (&row_id, chain) in versions.iter() {
+                let mut current: Option<&VersionChainEntry> = Some(chain);
+
+                while let Some(e) = current {
+                    let version_txn_id = e.version.txn_id;
+                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                    if checker.is_visible(version_txn_id, txn_id) {
+                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
+                        {
+                            indices.push(RowIndex {
+                                row_id,
+                                arena_idx: e.arena_idx,
+                            });
+                        }
+                        break;
+                    }
+                    current = e.prev.as_ref().map(|b| b.as_ref());
+                }
+            }
+        }
+
+        indices
     }
 
     /// Materialize selected row indices into actual Row data
@@ -2508,7 +2762,7 @@ impl VersionStore {
                 // Fast path: get from arena
                 if arena_idx < arena_len {
                     if let Some(arc_row) = arena_data.get(arena_idx) {
-                        result.push((idx.row_id, Row::from_arc(Arc::clone(arc_row))));
+                        result.push((idx.row_id, Row::from_arc_slice(Arc::clone(arc_row))));
                         continue;
                     }
                 }
@@ -2530,7 +2784,7 @@ impl VersionStore {
             let arena_guard = self.arena.read_guard();
             let arena_data = arena_guard.data();
             if let Some(arc_row) = arena_data.get(arena_idx) {
-                return Some((idx.row_id, Row::from_arc(Arc::clone(arc_row))));
+                return Some((idx.row_id, Row::from_arc_slice(Arc::clone(arc_row))));
             }
         }
 
@@ -2557,7 +2811,7 @@ impl VersionStore {
             let arena_guard = self.arena.read_guard();
             let arena_data = arena_guard.data();
             if let Some(arc_row) = arena_data.get(arena_idx) {
-                return arc_row.get(col_idx).cloned();
+                return arc_row.get(col_idx).map(|arc| arc.as_ref().clone());
             }
         }
 
@@ -2592,7 +2846,7 @@ impl VersionStore {
                 if let Some(arena_idx) = idx.arena_idx {
                     if arena_idx < arena_len {
                         if let Some(arc_row) = arena_data.get(arena_idx) {
-                            return arc_row.get(col_idx).cloned();
+                            return arc_row.get(col_idx).map(|arc| (**arc).clone());
                         }
                     }
                 }
@@ -2691,108 +2945,217 @@ impl VersionStore {
 
     /// Compute SUM(column) without materializing full rows
     ///
-    /// Only loads the specified column values, not entire rows.
+    /// OPTIMIZATION: Single-pass approach that combines visibility checking with summing.
+    /// Avoids Vec allocation and second iteration over indices.
     /// Returns (sum, count_non_null) for proper NULL handling.
     pub fn sum_column(&self, txn_id: i64, col_idx: usize) -> (f64, usize) {
-        let indices = self.get_visible_row_indices_unordered(txn_id);
-        if indices.is_empty() {
-            return (0.0, 0);
-        }
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return (0.0, 0),
+        };
 
         let arena_guard = self.arena.read_guard();
+        let arena_meta = arena_guard.meta();
         let arena_data = arena_guard.data();
+        let arena_len = arena_guard.len();
 
-        // Pre-acquire versions lock ONCE for all slow path lookups
-        let versions = self.versions.read();
-
-        let mut sum = 0.0f64;
+        // OPTIMIZATION: Separate accumulators to avoid i64->f64 conversion per row
+        let mut int_sum = 0i64;
+        let mut float_sum = 0.0f64;
         let mut count = 0usize;
 
-        for idx in &indices {
-            // Try arena path first (fast)
-            if let Some(arena_idx) = idx.arena_idx {
-                if let Some(arc_row) = arena_data.get(arena_idx) {
-                    if let Some(val) = arc_row.get(col_idx) {
-                        match val {
-                            Value::Integer(i) => {
-                                sum += *i as f64;
-                                count += 1;
-                            }
-                            Value::Float(f) => {
-                                sum += *f;
-                                count += 1;
-                            }
-                            _ => {} // NULL or non-numeric
-                        }
-                        continue;
-                    }
+        // Helper to accumulate numeric value
+        #[inline(always)]
+        fn accumulate_sum(int_sum: &mut i64, float_sum: &mut f64, count: &mut usize, val: &Value) {
+            match val {
+                Value::Integer(i) => {
+                    *int_sum = int_sum.wrapping_add(*i);
+                    *count += 1;
                 }
-            }
-            // Slow path: version chain lookup (lock already held)
-            if let Some(entry) = versions.get(&idx.row_id) {
-                if let Some(val) = entry.version.data.get(col_idx) {
-                    match val {
-                        Value::Integer(i) => {
-                            sum += *i as f64;
-                            count += 1;
-                        }
-                        Value::Float(f) => {
-                            sum += *f;
-                            count += 1;
-                        }
-                        _ => {} // NULL or non-numeric
-                    }
+                Value::Float(f) => {
+                    *float_sum += *f;
+                    *count += 1;
                 }
+                _ => {} // NULL or non-numeric
             }
         }
 
-        (sum, count)
+        // FAST PATH: If uncommitted_writes is empty, scan arena directly (single pass)
+        let uncommitted_empty = self.uncommitted_writes.read().is_empty();
+
+        if uncommitted_empty && arena_len > 0 {
+            // OPTIMIZATION: Cache visibility result for repeated txn_ids
+            // When rows are inserted in batches, consecutive rows often have the same txn_id.
+            // Caching avoids repeated thread-local access overhead (~27ms per 100K rows).
+            let mut last_txn_id: i64 = -1;
+            let mut last_visible: bool = false;
+
+            let mut idx = 0;
+            while idx < arena_len {
+                let meta = &arena_meta[idx];
+                if meta.deleted_at_txn_id == 0 {
+                    // Check visibility with cache
+                    let version_txn_id = meta.txn_id;
+                    let is_vis = if version_txn_id == last_txn_id {
+                        last_visible
+                    } else {
+                        let vis = checker.is_visible(version_txn_id, txn_id);
+                        last_txn_id = version_txn_id;
+                        last_visible = vis;
+                        vis
+                    };
+
+                    if is_vis {
+                        if let Some(val) = arena_data[idx].get(col_idx) {
+                            accumulate_sum(&mut int_sum, &mut float_sum, &mut count, val);
+                        }
+                    }
+                }
+                idx += 1;
+            }
+            return (int_sum as f64 + float_sum, count);
+        }
+
+        // Drop arena guard before slow path to avoid holding locks
+        drop(arena_guard);
+
+        // SLOW PATH: Full iteration over version chains (single pass)
+        let versions = self.versions.read();
+
+        // Cache visibility for slow path too
+        let mut last_txn_id: i64 = -1;
+        let mut last_visible: bool = false;
+
+        for chain in versions.values() {
+            let mut current: Option<&VersionChainEntry> = Some(chain);
+
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                let is_vis = if version_txn_id == last_txn_id {
+                    last_visible
+                } else {
+                    let vis = checker.is_visible(version_txn_id, txn_id);
+                    last_txn_id = version_txn_id;
+                    last_visible = vis;
+                    vis
+                };
+
+                if is_vis
+                    && (deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id))
+                {
+                    // This version is visible - accumulate its value
+                    if let Some(val) = e.version.data.get(col_idx) {
+                        accumulate_sum(&mut int_sum, &mut float_sum, &mut count, val);
+                    }
+                    break; // Found visible version, move to next row
+                }
+
+                current = e.prev.as_deref();
+            }
+        }
+
+        (int_sum as f64 + float_sum, count)
     }
 
     /// Compute MIN(column) without materializing full rows
+    ///
+    /// OPTIMIZATION: Single-pass approach that combines visibility checking with min computation.
     pub fn min_column(&self, txn_id: i64, col_idx: usize) -> Option<Value> {
-        let indices = self.get_visible_row_indices_unordered(txn_id);
-        if indices.is_empty() {
-            return None;
-        }
+        let checker = self.visibility_checker.as_ref()?;
 
         let arena_guard = self.arena.read_guard();
+        let arena_meta = arena_guard.meta();
         let arena_data = arena_guard.data();
-
-        // Pre-acquire versions lock ONCE for all slow path lookups
-        let versions = self.versions.read();
+        let arena_len = arena_guard.len();
 
         let mut min_val: Option<Value> = None;
 
         // Helper to update min value
-        let update_min = |min_val: &mut Option<Value>, val: &Value| {
+        #[inline(always)]
+        fn update_min(min_val: &mut Option<Value>, val: &Value) {
             if !val.is_null() {
                 match min_val {
                     None => *min_val = Some(val.clone()),
-                    Some(current) => {
+                    Some(ref current) => {
                         if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
                             *min_val = Some(val.clone());
                         }
                     }
                 }
             }
-        };
+        }
 
-        for idx in &indices {
-            // Try arena path first (fast)
-            if let Some(arena_idx) = idx.arena_idx {
-                if let Some(arc_row) = arena_data.get(arena_idx) {
-                    if let Some(val) = arc_row.get(col_idx) {
-                        update_min(&mut min_val, val);
-                        continue;
+        // FAST PATH: If uncommitted_writes is empty, scan arena directly (single pass)
+        let uncommitted_empty = self.uncommitted_writes.read().is_empty();
+
+        if uncommitted_empty && arena_len > 0 {
+            // OPTIMIZATION: Cache visibility result for repeated txn_ids
+            let mut last_txn_id: i64 = -1;
+            let mut last_visible: bool = false;
+
+            let mut idx = 0;
+            while idx < arena_len {
+                let meta = &arena_meta[idx];
+                if meta.deleted_at_txn_id == 0 {
+                    let version_txn_id = meta.txn_id;
+                    let is_vis = if version_txn_id == last_txn_id {
+                        last_visible
+                    } else {
+                        let vis = checker.is_visible(version_txn_id, txn_id);
+                        last_txn_id = version_txn_id;
+                        last_visible = vis;
+                        vis
+                    };
+
+                    if is_vis {
+                        if let Some(val) = arena_data[idx].get(col_idx) {
+                            update_min(&mut min_val, val);
+                        }
                     }
                 }
+                idx += 1;
             }
-            // Slow path: version chain lookup (lock already held)
-            if let Some(entry) = versions.get(&idx.row_id) {
-                if let Some(val) = entry.version.data.get(col_idx) {
-                    update_min(&mut min_val, val);
+            return min_val;
+        }
+
+        // Drop arena guard before slow path
+        drop(arena_guard);
+
+        // SLOW PATH: Full iteration over version chains (single pass)
+        let versions = self.versions.read();
+
+        // Cache visibility for slow path too
+        let mut last_txn_id: i64 = -1;
+        let mut last_visible: bool = false;
+
+        for chain in versions.values() {
+            let mut current: Option<&VersionChainEntry> = Some(chain);
+
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                let is_vis = if version_txn_id == last_txn_id {
+                    last_visible
+                } else {
+                    let vis = checker.is_visible(version_txn_id, txn_id);
+                    last_txn_id = version_txn_id;
+                    last_visible = vis;
+                    vis
+                };
+
+                if is_vis
+                    && (deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id))
+                {
+                    if let Some(val) = e.version.data.get(col_idx) {
+                        update_min(&mut min_val, val);
+                    }
+                    break;
                 }
+
+                current = e.prev.as_deref();
             }
         }
 
@@ -2800,49 +3163,102 @@ impl VersionStore {
     }
 
     /// Compute MAX(column) without materializing full rows
+    ///
+    /// OPTIMIZATION: Single-pass approach that combines visibility checking with max computation.
     pub fn max_column(&self, txn_id: i64, col_idx: usize) -> Option<Value> {
-        let indices = self.get_visible_row_indices_unordered(txn_id);
-        if indices.is_empty() {
-            return None;
-        }
+        let checker = self.visibility_checker.as_ref()?;
 
         let arena_guard = self.arena.read_guard();
+        let arena_meta = arena_guard.meta();
         let arena_data = arena_guard.data();
-
-        // Pre-acquire versions lock ONCE for all slow path lookups
-        let versions = self.versions.read();
+        let arena_len = arena_guard.len();
 
         let mut max_val: Option<Value> = None;
 
         // Helper to update max value
-        let update_max = |max_val: &mut Option<Value>, val: &Value| {
+        #[inline(always)]
+        fn update_max(max_val: &mut Option<Value>, val: &Value) {
             if !val.is_null() {
                 match max_val {
                     None => *max_val = Some(val.clone()),
-                    Some(current) => {
+                    Some(ref current) => {
                         if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
                             *max_val = Some(val.clone());
                         }
                     }
                 }
             }
-        };
+        }
 
-        for idx in &indices {
-            // Try arena path first (fast)
-            if let Some(arena_idx) = idx.arena_idx {
-                if let Some(arc_row) = arena_data.get(arena_idx) {
-                    if let Some(val) = arc_row.get(col_idx) {
-                        update_max(&mut max_val, val);
-                        continue;
+        // FAST PATH: If uncommitted_writes is empty, scan arena directly (single pass)
+        let uncommitted_empty = self.uncommitted_writes.read().is_empty();
+
+        if uncommitted_empty && arena_len > 0 {
+            // OPTIMIZATION: Cache visibility result for repeated txn_ids
+            let mut last_txn_id: i64 = -1;
+            let mut last_visible: bool = false;
+
+            let mut idx = 0;
+            while idx < arena_len {
+                let meta = &arena_meta[idx];
+                if meta.deleted_at_txn_id == 0 {
+                    let version_txn_id = meta.txn_id;
+                    let is_vis = if version_txn_id == last_txn_id {
+                        last_visible
+                    } else {
+                        let vis = checker.is_visible(version_txn_id, txn_id);
+                        last_txn_id = version_txn_id;
+                        last_visible = vis;
+                        vis
+                    };
+
+                    if is_vis {
+                        if let Some(val) = arena_data[idx].get(col_idx) {
+                            update_max(&mut max_val, val);
+                        }
                     }
                 }
+                idx += 1;
             }
-            // Slow path: version chain lookup (lock already held)
-            if let Some(entry) = versions.get(&idx.row_id) {
-                if let Some(val) = entry.version.data.get(col_idx) {
-                    update_max(&mut max_val, val);
+            return max_val;
+        }
+
+        // Drop arena guard before slow path
+        drop(arena_guard);
+
+        // SLOW PATH: Full iteration over version chains (single pass)
+        let versions = self.versions.read();
+
+        // Cache visibility for slow path too
+        let mut last_txn_id: i64 = -1;
+        let mut last_visible: bool = false;
+
+        for chain in versions.values() {
+            let mut current: Option<&VersionChainEntry> = Some(chain);
+
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                let is_vis = if version_txn_id == last_txn_id {
+                    last_visible
+                } else {
+                    let vis = checker.is_visible(version_txn_id, txn_id);
+                    last_txn_id = version_txn_id;
+                    last_visible = vis;
+                    vis
+                };
+
+                if is_vis
+                    && (deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id))
+                {
+                    if let Some(val) = e.version.data.get(col_idx) {
+                        update_max(&mut max_val, val);
+                    }
+                    break;
                 }
+
+                current = e.prev.as_deref();
             }
         }
 
@@ -3217,7 +3633,7 @@ impl VersionStore {
         let mut best_match: Option<(Arc<dyn Index>, usize)> = None;
 
         // Create a set of predicate columns for O(1) lookup
-        let pred_set: std::collections::HashSet<&str> = predicate_columns.iter().copied().collect();
+        let pred_set: FxHashSet<&str> = predicate_columns.iter().copied().collect();
 
         for index in indexes.values() {
             let index_columns = index.column_names();
@@ -3373,6 +3789,7 @@ impl VersionStore {
         }
 
         // Update indexes with the new row data (if not deleted)
+        // Use get_arc + add_arc for zero-copy Arc sharing
         if !is_deleted {
             let indexes = self.indexes.read();
             for index in indexes.values() {
@@ -3381,9 +3798,9 @@ impl VersionStore {
                     continue;
                 }
                 let col_id = column_ids[0] as usize;
-                if let Some(value) = row_data.get(col_id) {
+                if let Some(arc_value) = row_data.get_arc(col_id) {
                     // Ignore errors during recovery - index might already have this entry
-                    let _ = index.add(std::slice::from_ref(value), row_id, row_id);
+                    let _ = index.add_arc(std::slice::from_ref(&arc_value), row_id, row_id);
                 }
             }
         }
@@ -3528,8 +3945,9 @@ impl VersionStore {
                 for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
                     if !version.is_deleted() {
-                        if let Some(value) = version.data.get(col_idx) {
-                            let _ = index.add(std::slice::from_ref(value), row_id, row_id);
+                        // Use get_arc + add_arc for zero-copy Arc sharing
+                        if let Some(arc_value) = version.data.get_arc(col_idx) {
+                            let _ = index.add_arc(std::slice::from_ref(&arc_value), row_id, row_id);
                         }
                     }
                 }
@@ -3537,7 +3955,7 @@ impl VersionStore {
 
             self.add_index(meta.name.clone(), index);
         } else {
-            // Multi-column index: use MultiColumnIndex (always, regardless of index_type)
+            // Multi-column index: use MultiColumnIndex
             let index = crate::storage::mvcc::MultiColumnIndex::new(
                 meta.name.clone(),
                 meta.table_name.clone(),
@@ -3557,16 +3975,18 @@ impl VersionStore {
                 for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
                     if !version.is_deleted() {
-                        let values: Vec<crate::core::Value> =
-                            col_indices
-                                .iter()
-                                .map(|&idx| {
-                                    version.data.get(idx).cloned().unwrap_or(
-                                        crate::core::Value::Null(crate::core::DataType::Null),
-                                    )
+                        // Use get_arc + add_arc for zero-copy Arc sharing
+                        let arc_values: Vec<std::sync::Arc<crate::core::Value>> = col_indices
+                            .iter()
+                            .map(|&idx| {
+                                version.data.get_arc(idx).unwrap_or_else(|| {
+                                    std::sync::Arc::new(crate::core::Value::Null(
+                                        crate::core::DataType::Null,
+                                    ))
                                 })
-                                .collect();
-                        let _ = index.add(&values, row_id, row_id);
+                            })
+                            .collect();
+                        let _ = index.add_arc(&arc_values, row_id, row_id);
                     }
                 }
             }
@@ -3619,26 +4039,26 @@ impl VersionStore {
                 continue;
             }
 
-            // Add to each index
+            // Add to each index - use get_arc + add_arc for zero-copy Arc sharing
             for (col_indices, index) in &index_infos {
                 if col_indices.len() == 1 {
                     // Single-column index
-                    if let Some(value) = version.data.get(col_indices[0]) {
-                        let _ = index.add(std::slice::from_ref(value), row_id, row_id);
+                    if let Some(arc_value) = version.data.get_arc(col_indices[0]) {
+                        let _ = index.add_arc(std::slice::from_ref(&arc_value), row_id, row_id);
                     }
                 } else {
                     // Multi-column index
-                    let values: Vec<crate::core::Value> = col_indices
+                    let arc_values: Vec<std::sync::Arc<crate::core::Value>> = col_indices
                         .iter()
                         .map(|&idx| {
-                            version
-                                .data
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
+                            version.data.get_arc(idx).unwrap_or_else(|| {
+                                std::sync::Arc::new(crate::core::Value::Null(
+                                    crate::core::DataType::Null,
+                                ))
+                            })
                         })
                         .collect();
-                    let _ = index.add(&values, row_id, row_id);
+                    let _ = index.add_arc(&arc_values, row_id, row_id);
                 }
             }
         }
@@ -4001,9 +4421,10 @@ impl fmt::Debug for VersionStore {
 /// Transaction-local version store for uncommitted changes
 pub struct TransactionVersionStore {
     /// Local versions for this transaction - stores version history per row for savepoint support
-    /// The Vec is ordered by create_time (oldest first, newest last)
-    /// Lazily allocated on first write to avoid allocation overhead for read-only queries
-    local_versions: Option<Int64Map<Vec<RowVersion>>>,
+    /// The list is ordered by create_time (oldest first, newest last)
+    /// Lazily allocated on first write to avoid allocation overhead for read-only queries.
+    /// Uses SmallVec<[RowVersion; 1]> to avoid heap allocation for single-version rows.
+    local_versions: Option<Int64Map<VersionList>>,
     /// Parent (shared) version store
     parent_store: Arc<VersionStore>,
     /// This transaction's ID
@@ -4012,11 +4433,6 @@ pub struct TransactionVersionStore {
     /// Lazily allocated on first write to avoid allocation overhead for read-only queries
     write_set: Option<Int64Map<WriteSetEntry>>,
 }
-
-/// Default capacity for transaction-local maps.
-/// Pre-sizing to 16 entries balances memory efficiency for small transactions
-/// while avoiding rehashing for operations affecting up to ~11 rows.
-const TX_VERSION_MAP_INITIAL_CAPACITY: usize = 16;
 
 impl TransactionVersionStore {
     /// Creates a new transaction-local version store
@@ -4039,18 +4455,18 @@ impl TransactionVersionStore {
         self.txn_id
     }
 
-    /// Ensures local_versions map is allocated, returning a mutable reference
+    /// Ensures local_versions map is allocated, returning a mutable reference.
+    /// Uses pooled maps when available to reduce allocation overhead.
     #[inline]
-    fn ensure_local_versions(&mut self) -> &mut Int64Map<Vec<RowVersion>> {
-        self.local_versions
-            .get_or_insert_with(|| new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY))
+    fn ensure_local_versions(&mut self) -> &mut Int64Map<VersionList> {
+        self.local_versions.get_or_insert_with(get_version_list_map)
     }
 
-    /// Ensures write_set map is allocated, returning a mutable reference
+    /// Ensures write_set map is allocated, returning a mutable reference.
+    /// Uses pooled maps when available to reduce allocation overhead.
     #[inline]
     fn ensure_write_set(&mut self) -> &mut Int64Map<WriteSetEntry> {
-        self.write_set
-            .get_or_insert_with(|| new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY))
+        self.write_set.get_or_insert_with(get_write_set_map)
     }
 
     /// Put adds or updates a row in the transaction's local store
@@ -4104,7 +4520,7 @@ impl TransactionVersionStore {
                     self.parent_store.try_claim_row(row_id, self.txn_id)?;
                 }
             }
-            self.ensure_local_versions().insert(row_id, vec![rv]);
+            self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
         Ok(())
     }
@@ -4177,7 +4593,7 @@ impl TransactionVersionStore {
                 // Claim the row for update
                 self.parent_store.try_claim_row(row_id, self.txn_id)?;
             }
-            self.ensure_local_versions().insert(row_id, vec![rv]);
+            self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
         Ok(())
     }
@@ -4237,7 +4653,7 @@ impl TransactionVersionStore {
             }
 
             // Insert new version history for this row
-            self.ensure_local_versions().insert(row_id, vec![rv]);
+            self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
         Ok(())
     }
@@ -4299,7 +4715,7 @@ impl TransactionVersionStore {
             if let Some(versions) = local_versions.get_mut(&row_id) {
                 versions.push(rv);
             } else {
-                local_versions.insert(row_id, vec![rv]);
+                local_versions.insert(row_id, smallvec![rv]);
             }
         }
         Ok(())
@@ -4352,7 +4768,7 @@ impl TransactionVersionStore {
             }
 
             // Insert deleted version for this row
-            self.ensure_local_versions().insert(row_id, vec![rv]);
+            self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
         Ok(())
     }
@@ -4440,7 +4856,29 @@ impl TransactionVersionStore {
             return Ok(());
         };
 
-        // Collect row_ids for inserts (read_version is None) that need conflict checking
+        // OPTIMIZATION: For single-row auto-commit (common case), avoid Vec allocation
+        // by checking directly without collecting
+        if write_set.len() == 1 {
+            // Single entry - check directly
+            if let Some((row_id, write_entry)) = write_set.iter().next() {
+                if write_entry.read_version.is_none() {
+                    // Single insert - check conflict directly without Vec
+                    if self
+                        .parent_store
+                        .has_any_visible_version(&[*row_id], self.txn_id)
+                        .is_some()
+                    {
+                        return Err(Error::internal(format!(
+                            "write conflict: row {} was inserted by another transaction",
+                            row_id
+                        )));
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Multi-row path: collect row_ids for inserts that need conflict checking
         let insert_row_ids: Vec<i64> = write_set
             .iter()
             .filter_map(|(row_id, write_entry)| {
@@ -4497,10 +4935,26 @@ impl TransactionVersionStore {
         // Detect conflicts first
         self.detect_conflicts()?;
 
-        // Batch apply all local versions to parent store (single lock acquisition)
-        // Only commit the most recent version per row
-        // Use drain() to take ownership instead of cloning
+        // OPTIMIZATION: Single-row fast path (common auto-commit INSERT case)
+        // Avoids Vec allocation for both local_versions and write_set
         if let Some(local_versions) = self.local_versions.as_mut() {
+            if local_versions.len() == 1 {
+                // Single-row commit - no Vec allocation needed
+                if let Some((row_id, mut versions)) = local_versions.drain().next() {
+                    if let Some(version) = versions.pop() {
+                        self.parent_store.add_version_single(row_id, version);
+                    }
+                }
+                // Release single claim directly
+                if let Some(write_set) = self.write_set.as_mut() {
+                    if let Some((row_id, _)) = write_set.drain().next() {
+                        self.parent_store.release_row_claim(row_id, self.txn_id);
+                    }
+                }
+                return Ok(());
+            }
+
+            // Multi-row path: collect into Vec
             let batch: Vec<(i64, RowVersion)> = local_versions
                 .drain()
                 .filter_map(|(row_id, mut versions)| versions.pop().map(|v| (row_id, v)))
@@ -4509,7 +4963,7 @@ impl TransactionVersionStore {
             self.parent_store.add_versions_batch(batch);
         }
 
-        // Release all claims - drain write_set to get row_ids and avoid double iteration
+        // Release all claims - drain write_set to get row_ids
         if let Some(write_set) = self.write_set.as_mut() {
             let row_ids: Vec<i64> = write_set.drain().map(|(row_id, _)| row_id).collect();
             self.parent_store
@@ -4567,6 +5021,20 @@ impl TransactionVersionStore {
         let row_ids: Vec<i64> = write_set.keys().copied().collect();
         self.parent_store
             .release_row_claims_batch(&row_ids, self.txn_id);
+    }
+}
+
+impl Drop for TransactionVersionStore {
+    fn drop(&mut self) {
+        // Return maps to the pool for reuse by future transactions.
+        // This reduces allocation overhead from ~5.5KB per transaction to near zero
+        // for bulk insert workloads where many short-lived transactions are created.
+        if let Some(map) = self.local_versions.take() {
+            return_version_list_map(map);
+        }
+        if let Some(map) = self.write_set.take() {
+            return_write_set_map(map);
+        }
     }
 }
 
@@ -5462,7 +5930,7 @@ mod tests {
 
         while stream.next() {
             count += 1;
-            let slice = stream.row_slice();
+            let slice = stream.row_arc_slice().unwrap();
             assert!(!slice.is_empty());
         }
 

@@ -160,6 +160,7 @@ impl Value {
     }
 
     /// Returns true if this value is NULL
+    #[inline(always)]
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null(_))
     }
@@ -699,16 +700,14 @@ impl fmt::Display for Value {
 }
 
 impl PartialEq for Value {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // Handle NULL: NULL equals NULL
-        if self.is_null() && other.is_null() {
-            return true;
-        }
-        if self.is_null() || other.is_null() {
-            return false;
-        }
-
+        // Single match handles NULL and all type comparisons without redundant is_null() calls
         match (self, other) {
+            // NULL handling: NULL == NULL (SQL equality semantics for grouping)
+            (Value::Null(_), Value::Null(_)) => true,
+            // NULL != any non-NULL value
+            (Value::Null(_), _) | (_, Value::Null(_)) => false,
             // Same type comparisons
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => {
@@ -741,9 +740,9 @@ impl Hash for Value {
         // Since Integer(5) == Float(5.0), they must hash the same.
         // We achieve this by hashing numeric types as their f64 bit representation.
         match self {
-            Value::Null(dt) => {
+            Value::Null(_) => {
                 0u8.hash(state); // discriminant for Null
-                dt.hash(state);
+                                 // Don't hash DataType: all NULLs must hash the same since PartialEq treats them as equal
             }
             Value::Integer(v) => {
                 // Hash as f64 bits so Integer(5) and Float(5.0) hash the same
@@ -1390,9 +1389,9 @@ mod tests {
 
     #[test]
     fn test_hash() {
-        use std::collections::HashSet;
+        use ahash::AHashSet;
 
-        let mut set = HashSet::new();
+        let mut set = AHashSet::new();
         set.insert(Value::integer(42));
         set.insert(Value::integer(42)); // Duplicate
         set.insert(Value::integer(43));

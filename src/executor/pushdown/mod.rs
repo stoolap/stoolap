@@ -329,14 +329,14 @@ mod tests {
     #[test]
     fn test_function_pushable() {
         let schema = test_schema();
-        let func = ast::Expression::FunctionCall(ast::FunctionCall {
+        let func = ast::Expression::FunctionCall(Box::new(ast::FunctionCall {
             token: dummy_token(),
             function: "LENGTH".to_string(),
             arguments: vec![make_ident("name")],
             is_distinct: false,
             order_by: vec![],
             filter: None,
-        });
+        }));
         let expr = make_infix(func, ">", make_int(5));
 
         let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);
@@ -350,14 +350,14 @@ mod tests {
         let schema = test_schema();
         // id = 1 AND LENGTH(name) > 5
         let pushable = make_infix(make_ident("id"), "=", make_int(1));
-        let func = ast::Expression::FunctionCall(ast::FunctionCall {
+        let func = ast::Expression::FunctionCall(Box::new(ast::FunctionCall {
             token: dummy_token(),
             function: "LENGTH".to_string(),
             arguments: vec![make_ident("name")],
             is_distinct: false,
             order_by: vec![],
             filter: None,
-        });
+        }));
         let also_pushable = make_infix(func, ">=", make_int(5)); // "Alice" has length 5
         let expr = make_infix(pushable, "AND", also_pushable);
 
@@ -399,10 +399,12 @@ mod tests {
         let expr = ast::Expression::In(ast::InExpression {
             token: dummy_token(),
             left: Box::new(make_ident("id")),
-            right: Box::new(ast::Expression::ExpressionList(ast::ExpressionList {
-                token: dummy_token(),
-                expressions: vec![make_int(1), make_int(2), make_int(3)],
-            })),
+            right: Box::new(ast::Expression::ExpressionList(Box::new(
+                ast::ExpressionList {
+                    token: dummy_token(),
+                    expressions: vec![make_int(1), make_int(2), make_int(3)],
+                },
+            ))),
             not: false,
         });
 
@@ -472,14 +474,14 @@ mod tests {
     fn test_or_with_function_pushable() {
         let schema = test_schema();
         let left = make_infix(make_ident("id"), "=", make_int(1));
-        let func = ast::Expression::FunctionCall(ast::FunctionCall {
+        let func = ast::Expression::FunctionCall(Box::new(ast::FunctionCall {
             token: dummy_token(),
             function: "LENGTH".to_string(),
             arguments: vec![make_ident("name")],
             is_distinct: false,
             order_by: vec![],
             filter: None,
-        });
+        }));
         let right = make_infix(func, ">", make_int(5));
         let expr = make_infix(left, "OR", right);
 

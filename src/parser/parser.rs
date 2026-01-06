@@ -14,8 +14,9 @@
 
 //! SQL Parser - Main Parser struct and core parsing logic
 
-use std::collections::HashSet;
 use std::sync::LazyLock;
+
+use rustc_hash::FxHashSet;
 
 use super::ast::*;
 use super::error::{ParseError, ParseErrors};
@@ -24,7 +25,7 @@ use super::precedence::Precedence;
 use super::token::{Token, TokenType};
 
 /// Reserved SQL keywords that cannot be used as identifiers (O(1) lookup)
-static RESERVED_KEYWORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+static RESERVED_KEYWORDS: LazyLock<FxHashSet<&'static str>> = LazyLock::new(|| {
     [
         // Core SQL keywords that should never be identifiers
         "SELECT",
@@ -141,7 +142,8 @@ impl Parser {
 
     /// Parse the input and return a Program
     pub fn parse_program(&mut self) -> Result<Program, ParseErrors> {
-        let mut statements = Vec::new();
+        // Pre-allocate for common case (most queries have 1 statement)
+        let mut statements = Vec::with_capacity(1);
 
         while !self.cur_token_is(TokenType::Eof) {
             // Skip comments

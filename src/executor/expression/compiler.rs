@@ -23,12 +23,11 @@
 // 3. Handle short-circuit evaluation with jumps
 // 4. Pre-compute constant expressions where possible
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use ahash::AHashSet;
 use compact_str::CompactString;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::ops::{CompareOp, CompiledPattern, Op};
 use super::program::{Program, ProgramBuilder};
@@ -96,7 +95,7 @@ pub struct CompileContext<'a> {
     columns2: Option<FxHashMap<String, u16>>,
 
     /// Tables that belong to row2 (for tracking which tables are from second row)
-    row2_tables: HashSet<String>,
+    row2_tables: FxHashSet<String>,
 
     /// Outer query columns (for correlated subqueries)
     outer_columns: Option<FxHashMap<Arc<str>, u16>>,
@@ -141,7 +140,7 @@ impl<'a> CompileContext<'a> {
             columns: col_map,
             qualified_columns: qualified_map,
             columns2: None,
-            row2_tables: HashSet::new(),
+            row2_tables: FxHashSet::default(),
             outer_columns: None,
             functions,
             expression_aliases: FxHashMap::default(),

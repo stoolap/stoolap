@@ -930,18 +930,42 @@ fn hash_expression_structure(expr: &Expression, hasher: &mut FxHasher) {
         Expression::List(list) => {
             list.elements.len().hash(hasher);
         }
-        Expression::ScalarSubquery(_)
-        | Expression::SubquerySource(_)
-        | Expression::Exists(_)
-        | Expression::AllAny(_) => {
-            // Mark as having subquery without deep hashing
-            "SUBQUERY".hash(hasher);
+        Expression::ScalarSubquery(subquery) => {
+            // Hash subquery WHERE structure to distinguish correlated vs uncorrelated
+            if let Some(ref where_clause) = subquery.subquery.where_clause {
+                hash_expression_structure(where_clause, hasher);
+            }
+        }
+        Expression::SubquerySource(subquery) => {
+            // Hash subquery WHERE structure to distinguish correlated vs uncorrelated
+            if let Some(ref where_clause) = subquery.subquery.where_clause {
+                hash_expression_structure(where_clause, hasher);
+            }
+        }
+        Expression::Exists(exists) => {
+            // Hash EXISTS subquery WHERE structure to distinguish correlated vs uncorrelated
+            if let Some(ref where_clause) = exists.subquery.where_clause {
+                hash_expression_structure(where_clause, hasher);
+            }
+        }
+        Expression::AllAny(all_any) => {
+            // Hash ALL/ANY subquery WHERE structure
+            if let Some(ref where_clause) = all_any.subquery.where_clause {
+                hash_expression_structure(where_clause, hasher);
+            }
+        }
+        Expression::QualifiedIdentifier(qi) => {
+            // CRITICAL: Hash the qualifier (table name/alias) to distinguish correlated references
+            // e.g., "c.id" vs "o.id" - the qualifier determines if it's an outer reference
+            for c in qi.qualifier.value_lower.bytes() {
+                c.hash(hasher);
+            }
         }
         Expression::Parameter(param) => {
             param.index.hash(hasher);
         }
         _ => {
-            // For literals and identifiers, just use discriminant
+            // For literals and unqualified identifiers, just use discriminant
         }
     }
 }

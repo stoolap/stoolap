@@ -17,7 +17,7 @@
 //! Provides the main MVCC storage engine implementation.
 //!
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1604,7 +1604,7 @@ impl MVCCEngine {
         }
 
         // Check for duplicate column names
-        let mut seen_names = std::collections::HashSet::new();
+        let mut seen_names = FxHashSet::default();
         for col in &schema.columns {
             if col.name.is_empty() {
                 return Err(Error::internal("column name cannot be empty"));
@@ -2049,8 +2049,7 @@ impl Engine for MVCCEngine {
 
         if all_succeeded {
             // Collect unique directories that need syncing
-            let mut dirs_to_sync: std::collections::HashSet<std::path::PathBuf> =
-                std::collections::HashSet::new();
+            let mut dirs_to_sync: FxHashSet<std::path::PathBuf> = FxHashSet::default();
 
             for (temp_path, final_path, table_name) in &pending_snapshots {
                 if let Err(e) = std::fs::rename(temp_path, final_path) {

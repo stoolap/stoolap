@@ -77,10 +77,21 @@ pub mod utils;
 mod window;
 
 use rustc_hash::FxHashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::core::{Error, Result, Value};
 use crate::functions::FunctionRegistry;
+
+/// Default function registry - shared across all executors to avoid per-database allocation
+static DEFAULT_FUNCTION_REGISTRY: OnceLock<Arc<FunctionRegistry>> = OnceLock::new();
+
+/// Get the default function registry (lazily initialized, shared across all executors)
+#[inline]
+fn default_function_registry() -> Arc<FunctionRegistry> {
+    DEFAULT_FUNCTION_REGISTRY
+        .get_or_init(|| Arc::new(FunctionRegistry::new()))
+        .clone()
+}
 use crate::parser::ast::{Program, Statement};
 use crate::parser::Parser;
 use crate::storage::mvcc::engine::MVCCEngine;
@@ -170,7 +181,7 @@ impl Executor {
     pub fn new(engine: Arc<MVCCEngine>) -> Self {
         Self {
             engine,
-            function_registry: Arc::new(FunctionRegistry::new()),
+            function_registry: default_function_registry(),
             default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
             query_cache: QueryCache::default(),
             semantic_cache: SemanticCache::default(),
@@ -199,7 +210,7 @@ impl Executor {
     pub fn with_cache_size(engine: Arc<MVCCEngine>, cache_size: usize) -> Self {
         Self {
             engine,
-            function_registry: Arc::new(FunctionRegistry::new()),
+            function_registry: default_function_registry(),
             default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
             query_cache: QueryCache::new(cache_size),
             semantic_cache: SemanticCache::default(),
@@ -424,6 +435,10 @@ impl Executor {
                         return result;
                     }
                 }
+                // INSERT: Use compiled cache to avoid recomputing schema metadata
+                Statement::Insert(stmt) => {
+                    return self.execute_insert_with_compiled_cache(stmt, ctx, &cached.compiled);
+                }
                 _ => {}
             }
 
@@ -469,6 +484,14 @@ impl Executor {
                     {
                         return result;
                     }
+                }
+                // INSERT: Use compiled cache to avoid recomputing schema metadata
+                Statement::Insert(insert) => {
+                    return self.execute_insert_with_compiled_cache(
+                        insert,
+                        ctx,
+                        &cached_plan.compiled,
+                    );
                 }
                 _ => {}
             }

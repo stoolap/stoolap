@@ -66,8 +66,8 @@ pub enum Expression {
     Prefix(PrefixExpression),
     /// Infix expression (a + b, a = b)
     Infix(InfixExpression),
-    /// List of expressions (for IN clause)
-    List(ListExpression),
+    /// List of expressions (for IN clause) - Boxed to reduce enum size
+    List(Box<ListExpression>),
     /// DISTINCT expression
     Distinct(DistinctExpression),
     /// EXISTS subquery
@@ -85,18 +85,18 @@ pub enum Expression {
     Like(LikeExpression),
     /// Scalar subquery
     ScalarSubquery(ScalarSubquery),
-    /// Expression list (for IN values)
-    ExpressionList(ExpressionList),
-    /// CASE expression
-    Case(CaseExpression),
+    /// Expression list (for IN values) - Boxed to reduce enum size
+    ExpressionList(Box<ExpressionList>),
+    /// CASE expression - Boxed to reduce enum size
+    Case(Box<CaseExpression>),
     /// CAST expression
     Cast(CastExpression),
-    /// Function call
-    FunctionCall(FunctionCall),
+    /// Function call - Boxed to reduce enum size (has 2 Vecs)
+    FunctionCall(Box<FunctionCall>),
     /// Aliased expression (expr AS alias)
     Aliased(AliasedExpression),
-    /// Window expression
-    Window(WindowExpression),
+    /// Window expression - Boxed to reduce enum size (has 2 Vecs)
+    Window(Box<WindowExpression>),
     /// Simple table source
     TableSource(SimpleTableSource),
     /// Join table source

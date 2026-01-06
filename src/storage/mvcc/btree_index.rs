@@ -33,9 +33,8 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
-use ahash::AHashMap;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -55,27 +54,23 @@ type RowIdSet = SmallVec<[i64; 4]>;
 ///
 /// This index stores column values in sorted order using BTreeMap for:
 /// - O(log n + k) range queries (k = number of matching values)
-/// - O(1) point lookups via hash index
+/// - O(log n) point lookups via BTreeMap
 /// - O(1) MIN/MAX queries via cached values
 /// - Efficient IN list queries
 /// - NULL handling
 ///
 /// ## Memory Optimization
 ///
+/// - Uses `Arc<Value>` for value deduplication. Each unique value is wrapped
+///   in Arc for O(1) cloning (8 bytes per reference).
 /// - Uses SmallVec<[i64; 4]> for row IDs per value. Since most values have
 ///   few duplicate rows, this avoids heap allocation for the common case.
-/// - Maintains dual index structures (BTreeMap + FxHashMap) for optimal query
-///   performance at the cost of ~2x memory for unique values. This tradeoff
-///   provides O(1) equality lookups via FxHashMap and O(log n + k) range queries
-///   via BTreeMap. For memory-constrained environments, consider using only
-///   BTreeMap (O(log n) equality lookups are still fast).
 ///
 /// ## Lock Ordering (Deadlock Prevention)
 ///
 /// When acquiring multiple write locks simultaneously, always use this order:
-/// 1. `value_to_rows` (hash index)
-/// 2. `sorted_values` (B-tree index)
-/// 3. `row_to_value` (reverse mapping)
+/// 1. `sorted_values` (B-tree index)
+/// 2. `row_to_value` (reverse mapping)
 ///
 /// When locks are acquired in separate scopes (not held simultaneously), the order
 /// doesn't affect deadlock safety, but this ordering should still be preferred
@@ -98,23 +93,20 @@ pub struct BTreeIndex {
     /// Whether the index is closed
     closed: AtomicBool,
 
-    /// Sorted value to row IDs mapping (main index for range queries)
+    /// Sorted value to row IDs mapping (main index for range and equality queries)
     /// BTreeMap provides O(log n) lookups and efficient range iteration
-    sorted_values: RwLock<BTreeMap<Value, RowIdSet>>,
-
-    /// Hash-based value to row IDs mapping (for O(1) equality lookups)
-    /// Used when we know we're doing exact equality checks (AHash for Value keys)
-    value_to_rows: RwLock<AHashMap<Value, RowIdSet>>,
+    /// Uses Arc<Value> to share references with ValueArena (8 bytes per entry)
+    sorted_values: RwLock<BTreeMap<Arc<Value>, RowIdSet>>,
 
     /// Row ID to value mapping (for removal operations)
-    /// Uses FxHashMap for O(1) lookups
-    row_to_value: RwLock<FxHashMap<i64, Value>>,
+    /// Uses FxHashMap for O(1) lookups with Arc<Value> (8 bytes per entry)
+    row_to_value: RwLock<FxHashMap<i64, Arc<Value>>>,
 
     /// Cached minimum value (excluding NULLs)
-    cached_min: RwLock<Option<Value>>,
+    cached_min: RwLock<Option<Arc<Value>>>,
 
     /// Cached maximum value (excluding NULLs)
-    cached_max: RwLock<Option<Value>>,
+    cached_max: RwLock<Option<Arc<Value>>>,
 
     /// Whether the min/max cache is valid
     cache_valid: AtomicBool,
@@ -142,7 +134,6 @@ impl BTreeIndex {
             unique,
             closed: AtomicBool::new(false),
             sorted_values: RwLock::new(BTreeMap::new()),
-            value_to_rows: RwLock::new(AHashMap::default()),
             row_to_value: RwLock::new(FxHashMap::default()),
             cached_min: RwLock::new(None),
             cached_max: RwLock::new(None),
@@ -197,24 +188,27 @@ impl BTreeIndex {
     /// Gets all values (sorted by BTreeMap ordering)
     pub fn get_all_values(&self) -> Vec<Value> {
         let sorted_values = self.sorted_values.read().unwrap();
-        sorted_values.keys().cloned().collect()
+        sorted_values.keys().map(|arc| (**arc).clone()).collect()
     }
 
     /// Gets all row IDs for a specific value
-    /// Uses the hash index for O(1) lookup
+    /// Uses the BTreeMap for O(log n) lookup
     pub fn get_row_ids_for_value(&self, value: &Value) -> Vec<i64> {
-        let value_to_rows = self.value_to_rows.read().unwrap();
-        value_to_rows
-            .get(value)
+        let sorted_values = self.sorted_values.read().unwrap();
+        // Create a temporary Arc for lookup (BTreeMap compares by value, not pointer)
+        let lookup_key = Arc::new(value.clone());
+        sorted_values
+            .get(&lookup_key)
             .map(|set| set.iter().copied().collect())
             .unwrap_or_default()
     }
 
     /// Checks if a value exists in the index
-    /// Uses hash index for O(1) lookup
+    /// Uses BTreeMap for O(log n) lookup
     pub fn contains_value(&self, value: &Value) -> bool {
-        let value_to_rows = self.value_to_rows.read().unwrap();
-        value_to_rows.contains_key(value)
+        let sorted_values = self.sorted_values.read().unwrap();
+        let lookup_key = Arc::new(value.clone());
+        sorted_values.contains_key(&lookup_key)
     }
 
     /// Checks if a row ID exists in the index
@@ -227,36 +221,6 @@ impl BTreeIndex {
     #[inline]
     fn invalidate_cache(&self) {
         self.cache_valid.store(false, AtomicOrdering::Release);
-    }
-
-    /// Remove a row_id from both indexes for a given value
-    /// Helper method used when updating a row's value
-    fn remove_row_from_indexes(&self, row_id: i64, value: &Value) {
-        // Remove from hash index (row_ids are sorted, use binary search)
-        {
-            let mut value_to_rows = self.value_to_rows.write().unwrap();
-            if let Some(rows) = value_to_rows.get_mut(value) {
-                if let Ok(pos) = rows.binary_search(&row_id) {
-                    rows.remove(pos);
-                }
-                if rows.is_empty() {
-                    value_to_rows.remove(value);
-                }
-            }
-        }
-
-        // Remove from sorted index (row_ids are sorted, use binary search)
-        {
-            let mut sorted_values = self.sorted_values.write().unwrap();
-            if let Some(rows) = sorted_values.get_mut(value) {
-                if let Ok(pos) = rows.binary_search(&row_id) {
-                    rows.remove(pos);
-                }
-                if rows.is_empty() {
-                    sorted_values.remove(value);
-                }
-            }
-        }
     }
 
     /// Update the min/max cache if needed
@@ -277,14 +241,14 @@ impl BTreeIndex {
         let min = sorted_values
             .iter()
             .find(|(v, _)| !v.is_null())
-            .map(|(v, _)| v.clone());
+            .map(|(v, _)| Arc::clone(v));
 
         // Find last non-null max
         let max = sorted_values
             .iter()
             .rev()
             .find(|(v, _)| !v.is_null())
-            .map(|(v, _)| v.clone());
+            .map(|(v, _)| Arc::clone(v));
 
         drop(sorted_values);
 
@@ -308,46 +272,44 @@ impl BTreeIndex {
     /// Internal method to find row IDs matching an operator
     /// Uses BTreeMap for O(log n + k) range queries instead of O(n) full scans
     fn find_with_op(&self, op: Operator, value: &Value) -> Vec<i64> {
+        let sorted_values = self.sorted_values.read().unwrap();
+        // Create lookup key for BTreeMap operations
+        let lookup_key = Arc::new(value.clone());
+
         match op {
-            // Equality uses hash index for O(1) lookup
-            Operator::Eq | Operator::In => {
-                let value_to_rows = self.value_to_rows.read().unwrap();
-                value_to_rows
-                    .get(value)
-                    .map(|rows| rows.iter().copied().collect())
-                    .unwrap_or_default()
-            }
+            // Equality uses BTreeMap for O(log n) lookup
+            Operator::Eq | Operator::In => sorted_values
+                .get(&lookup_key)
+                .map(|rows| rows.iter().copied().collect())
+                .unwrap_or_default(),
 
             // Range queries use BTreeMap for O(log n + k) performance
             Operator::Lt => {
-                let sorted_values = self.sorted_values.read().unwrap();
                 // range(..value) gives us all values < value
                 let capacity = sorted_values.len() / 4; // Estimate
                 let mut results = Vec::with_capacity(capacity);
-                for (_, rows) in sorted_values.range(..value.clone()) {
+                for (_, rows) in sorted_values.range(..lookup_key) {
                     results.extend(rows.iter().copied());
                 }
                 results
             }
 
             Operator::Lte => {
-                let sorted_values = self.sorted_values.read().unwrap();
                 // range(..=value) gives us all values <= value
                 let capacity = sorted_values.len() / 4;
                 let mut results = Vec::with_capacity(capacity);
-                for (_, rows) in sorted_values.range(..=value.clone()) {
+                for (_, rows) in sorted_values.range(..=lookup_key) {
                     results.extend(rows.iter().copied());
                 }
                 results
             }
 
             Operator::Gt => {
-                let sorted_values = self.sorted_values.read().unwrap();
                 // range((Excluded(value), Unbounded)) gives us all values > value
                 let capacity = sorted_values.len() / 4;
                 let mut results = Vec::with_capacity(capacity);
                 for (_, rows) in
-                    sorted_values.range((Bound::Excluded(value.clone()), Bound::Unbounded))
+                    sorted_values.range((Bound::Excluded(lookup_key), Bound::Unbounded))
                 {
                     results.extend(rows.iter().copied());
                 }
@@ -355,11 +317,10 @@ impl BTreeIndex {
             }
 
             Operator::Gte => {
-                let sorted_values = self.sorted_values.read().unwrap();
                 // range(value..) gives us all values >= value
                 let capacity = sorted_values.len() / 4;
                 let mut results = Vec::with_capacity(capacity);
-                for (_, rows) in sorted_values.range(value.clone()..) {
+                for (_, rows) in sorted_values.range(lookup_key..) {
                     results.extend(rows.iter().copied());
                 }
                 results
@@ -367,11 +328,10 @@ impl BTreeIndex {
 
             // Not equal and NotIn require full scan
             Operator::Ne | Operator::NotIn => {
-                let value_to_rows = self.value_to_rows.read().unwrap();
-                let capacity = value_to_rows.len();
+                let capacity = sorted_values.len();
                 let mut results = Vec::with_capacity(capacity);
-                for (v, rows) in value_to_rows.iter() {
-                    if v != value {
+                for (v, rows) in sorted_values.iter() {
+                    if v.as_ref() != value {
                         results.extend(rows.iter().copied());
                     }
                 }
@@ -383,9 +343,8 @@ impl BTreeIndex {
 
             // NULL operators need to check all values
             Operator::IsNull => {
-                let value_to_rows = self.value_to_rows.read().unwrap();
                 let mut results = Vec::new();
-                for (v, rows) in value_to_rows.iter() {
+                for (v, rows) in sorted_values.iter() {
                     if v.is_null() {
                         results.extend(rows.iter().copied());
                     }
@@ -394,10 +353,9 @@ impl BTreeIndex {
             }
 
             Operator::IsNotNull => {
-                let value_to_rows = self.value_to_rows.read().unwrap();
-                let capacity = value_to_rows.len();
+                let capacity = sorted_values.len();
                 let mut results = Vec::with_capacity(capacity);
-                for (v, rows) in value_to_rows.iter() {
+                for (v, rows) in sorted_values.iter() {
                     if !v.is_null() {
                         results.extend(rows.iter().copied());
                     }
@@ -431,29 +389,38 @@ impl Index for BTreeIndex {
         }
 
         // BTree index only uses the first value (single column)
-        let value = values[0].clone();
+        let value = &values[0];
+
+        // Wrap value in Arc for O(1) cloning
+        let arc_value = Arc::new(value.clone());
+
+        // Hold write locks for entire operation to prevent race conditions
+        // (read-then-write pattern is unsafe with concurrent modifications)
+        let mut sorted_values = self.sorted_values.write().unwrap();
+        let mut row_to_value = self.row_to_value.write().unwrap();
 
         // Check if this row_id already exists with the same value (no-op)
         // or different value (need to remove old entry first)
-        // This is O(1) via row_to_value HashMap, avoiding O(n) SmallVec contains
-        let existing_value = {
-            let row_to_value = self.row_to_value.read().unwrap();
-            row_to_value.get(&row_id).cloned()
-        };
-
-        if let Some(ref old_value) = existing_value {
-            if old_value == &value {
+        if let Some(old_arc) = row_to_value.get(&row_id) {
+            if old_arc.as_ref() == value {
                 // Same value, nothing to do
                 return Ok(());
             }
-            // Different value - remove old entry first (will be re-added below)
-            self.remove_row_from_indexes(row_id, old_value);
+            // Different value - remove old entry from sorted index
+            let old_arc = old_arc.clone();
+            if let Some(rows) = sorted_values.get_mut(&old_arc) {
+                if let Ok(pos) = rows.binary_search(&row_id) {
+                    rows.remove(pos);
+                }
+                if rows.is_empty() {
+                    sorted_values.remove(&old_arc);
+                }
+            }
         }
 
-        // Check uniqueness constraint
+        // Check uniqueness constraint using BTreeMap O(log n) lookup
         if self.unique && !value.is_null() {
-            let value_to_rows = self.value_to_rows.read().unwrap();
-            if let Some(rows) = value_to_rows.get(&value) {
+            if let Some(rows) = sorted_values.get(&arc_value) {
                 // Check if any OTHER row has this value (allow updating same row)
                 for existing_row_id in rows.iter() {
                     if *existing_row_id != row_id {
@@ -467,40 +434,86 @@ impl Index for BTreeIndex {
             }
         }
 
-        // Add to both indexes and row mapping
-        // Acquire all locks together to minimize lock contention
-        // We need 3 copies: hash index, sorted index, row mapping
-        // So we clone twice (the original goes to row_to_value)
-        {
-            let mut value_to_rows = self.value_to_rows.write().unwrap();
-            let mut sorted_values = self.sorted_values.write().unwrap();
-            let mut row_to_value = self.row_to_value.write().unwrap();
-
-            // Clone for hash index and sorted index
-            let value_for_hash = value.clone();
-            let value_for_btree = value.clone();
-
-            // Add to hash index (for O(1) equality lookups)
-            // Insert in sorted order for O(N+M) intersection/union without re-sorting
-            let hash_rows = value_to_rows.entry(value_for_hash).or_default();
-            if let Err(pos) = hash_rows.binary_search(&row_id) {
-                hash_rows.insert(pos, row_id);
-            }
-
-            // Add to sorted index (for O(log n) range queries)
-            // Insert in sorted order for O(N+M) intersection/union without re-sorting
-            let btree_rows = sorted_values.entry(value_for_btree).or_default();
-            if let Err(pos) = btree_rows.binary_search(&row_id) {
-                btree_rows.insert(pos, row_id);
-            }
-
-            // Add to row -> value mapping (consumes the original value)
-            row_to_value.insert(row_id, value);
+        // Add to sorted index (for O(log n) range and equality queries)
+        // Insert in sorted order for O(N+M) intersection/union without re-sorting
+        let btree_rows = sorted_values.entry(Arc::clone(&arc_value)).or_default();
+        if let Err(pos) = btree_rows.binary_search(&row_id) {
+            btree_rows.insert(pos, row_id);
         }
+
+        // Add to row -> value mapping (stores Arc reference)
+        row_to_value.insert(row_id, arc_value);
+
+        // Drop locks before invalidating cache
+        drop(sorted_values);
+        drop(row_to_value);
 
         // Invalidate min/max cache
         self.invalidate_cache();
 
+        Ok(())
+    }
+
+    fn add_arc(&self, values: &[Arc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
+        self.check_closed()?;
+
+        if values.is_empty() {
+            return Ok(());
+        }
+
+        // BTree index only uses the first value (single column)
+        let arc_value = &values[0];
+
+        // Hold write locks for entire operation to prevent race conditions
+        let mut sorted_values = self.sorted_values.write().unwrap();
+        let mut row_to_value = self.row_to_value.write().unwrap();
+
+        // Check if this row_id already exists with the same value (no-op)
+        // or different value (need to remove old entry first)
+        if let Some(old_arc) = row_to_value.get(&row_id) {
+            if old_arc == arc_value {
+                // Same value, nothing to do
+                return Ok(());
+            }
+            // Different value - remove old entry from sorted index
+            let old_arc = old_arc.clone();
+            if let Some(rows) = sorted_values.get_mut(&old_arc) {
+                if let Ok(pos) = rows.binary_search(&row_id) {
+                    rows.remove(pos);
+                }
+                if rows.is_empty() {
+                    sorted_values.remove(&old_arc);
+                }
+            }
+        }
+
+        // Check uniqueness constraint using BTreeMap O(log n) lookup
+        if self.unique && !arc_value.is_null() {
+            if let Some(rows) = sorted_values.get(arc_value) {
+                for existing_row_id in rows.iter() {
+                    if *existing_row_id != row_id {
+                        return Err(Error::unique_constraint(
+                            &self.name,
+                            &self.column_name,
+                            format!("{:?}", arc_value),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Add to sorted index and row mapping - O(1) Arc clone, no Value clone!
+        let btree_rows = sorted_values.entry(Arc::clone(arc_value)).or_default();
+        if let Err(pos) = btree_rows.binary_search(&row_id) {
+            btree_rows.insert(pos, row_id);
+        }
+        row_to_value.insert(row_id, Arc::clone(arc_value));
+
+        // Drop locks before invalidating cache
+        drop(sorted_values);
+        drop(row_to_value);
+
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -516,50 +529,36 @@ impl Index for BTreeIndex {
     fn remove(&self, _values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         self.check_closed()?;
 
-        // First check if the row exists
-        let stored_value = {
-            let row_to_value = self.row_to_value.read().unwrap();
-            row_to_value.get(&row_id).cloned()
-        };
+        // Hold write locks for entire operation to prevent race conditions
+        let mut sorted_values = self.sorted_values.write().unwrap();
+        let mut row_to_value = self.row_to_value.write().unwrap();
 
-        if let Some(value) = stored_value {
-            // Remove from hash index (row_ids are sorted, use binary search)
-            {
-                let mut value_to_rows = self.value_to_rows.write().unwrap();
-                if let Some(rows) = value_to_rows.get_mut(&value) {
-                    if let Ok(pos) = rows.binary_search(&row_id) {
-                        rows.remove(pos);
-                    }
-                    if rows.is_empty() {
-                        value_to_rows.remove(&value);
-                    }
-                }
-            }
-
+        // Check if the row exists and remove atomically
+        if let Some(arc_value) = row_to_value.remove(&row_id) {
             // Remove from sorted index (row_ids are sorted, use binary search)
-            {
-                let mut sorted_values = self.sorted_values.write().unwrap();
-                if let Some(rows) = sorted_values.get_mut(&value) {
-                    if let Ok(pos) = rows.binary_search(&row_id) {
-                        rows.remove(pos);
-                    }
-                    if rows.is_empty() {
-                        sorted_values.remove(&value);
-                    }
+            if let Some(rows) = sorted_values.get_mut(&arc_value) {
+                if let Ok(pos) = rows.binary_search(&row_id) {
+                    rows.remove(pos);
+                }
+                if rows.is_empty() {
+                    sorted_values.remove(&arc_value);
                 }
             }
 
-            // Remove from row -> value mapping
-            {
-                let mut row_to_value = self.row_to_value.write().unwrap();
-                row_to_value.remove(&row_id);
-            }
+            // Drop locks before invalidating cache
+            drop(sorted_values);
+            drop(row_to_value);
 
             // Invalidate min/max cache
             self.invalidate_cache();
         }
 
         Ok(())
+    }
+
+    fn remove_arc(&self, _values: &[Arc<Value>], row_id: i64, ref_id: i64) -> Result<()> {
+        // BTreeIndex looks up by row_id, so values aren't used - delegate to remove
+        self.remove(&[], row_id, ref_id)
     }
 
     fn remove_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
@@ -599,10 +598,11 @@ impl Index for BTreeIndex {
         }
 
         let value = &values[0];
-        let value_to_rows = self.value_to_rows.read().unwrap();
+        let sorted_values = self.sorted_values.read().unwrap();
+        let lookup_key = Arc::new(value.clone());
 
-        let entries = value_to_rows
-            .get(value)
+        let entries = sorted_values
+            .get(&lookup_key)
             .map(|rows| {
                 rows.iter()
                     .map(|&row_id| IndexEntry {
@@ -634,17 +634,20 @@ impl Index for BTreeIndex {
 
         let sorted_values = self.sorted_values.read().unwrap();
 
-        // Build the range bounds for BTreeMap
+        // Build the range bounds for BTreeMap using Arc<Value>
+        let min_arc = Arc::new(min_val.clone());
+        let max_arc = Arc::new(max_val.clone());
+
         let min_bound = if min_inclusive {
-            Bound::Included(min_val.clone())
+            Bound::Included(min_arc)
         } else {
-            Bound::Excluded(min_val.clone())
+            Bound::Excluded(min_arc)
         };
 
         let max_bound = if max_inclusive {
-            Bound::Included(max_val.clone())
+            Bound::Included(max_arc)
         } else {
-            Bound::Excluded(max_val.clone())
+            Bound::Excluded(max_arc)
         };
 
         // Estimate capacity based on range
@@ -695,9 +698,10 @@ impl Index for BTreeIndex {
         }
 
         let value = &values[0];
-        let value_to_rows = self.value_to_rows.read().unwrap();
+        let sorted_values = self.sorted_values.read().unwrap();
+        let lookup_key = Arc::new(value.clone());
 
-        if let Some(rows) = value_to_rows.get(value) {
+        if let Some(rows) = sorted_values.get(&lookup_key) {
             // Optimization: SmallVec can be iterated quickly
             buffer.extend(rows.iter().copied());
         }
@@ -714,9 +718,41 @@ impl Index for BTreeIndex {
             return Vec::new();
         }
 
-        self.find_range(min_value, max_value, include_min, include_max)
-            .map(|entries| entries.into_iter().map(|e| e.row_id).collect())
-            .unwrap_or_default()
+        // OPTIMIZATION: Collect row_ids directly without intermediate IndexEntry allocation
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Vec::new();
+        }
+
+        let min_val = &min_value[0];
+        let max_val = &max_value[0];
+
+        let sorted_values = self.sorted_values.read().unwrap();
+
+        // Build the range bounds for BTreeMap using Arc<Value>
+        let min_arc = Arc::new(min_val.clone());
+        let max_arc = Arc::new(max_val.clone());
+
+        let min_bound = if include_min {
+            Bound::Included(min_arc)
+        } else {
+            Bound::Excluded(min_arc)
+        };
+
+        let max_bound = if include_max {
+            Bound::Included(max_arc)
+        } else {
+            Bound::Excluded(max_arc)
+        };
+
+        // Estimate capacity based on range - collect directly into Vec<i64>
+        let capacity = sorted_values.len() / 4;
+        let mut row_ids = Vec::with_capacity(capacity);
+
+        for (_, rows) in sorted_values.range((min_bound, max_bound)) {
+            row_ids.extend(rows.iter().copied());
+        }
+
+        row_ids
     }
 
     fn get_filtered_row_ids(&self, expr: &dyn Expression) -> Vec<i64> {
@@ -816,8 +852,9 @@ impl Index for BTreeIndex {
             let pairs: Vec<_> = row_to_value.iter().collect();
             pairs
                 .par_iter()
-                .filter_map(|&(&row_id, value)| {
-                    let row = crate::core::Row::from_values(vec![value.clone()]);
+                .filter_map(|&(&row_id, arc_value)| {
+                    // Dereference Arc to get the Value
+                    let row = crate::core::Row::from_values(vec![(**arc_value).clone()]);
                     if expr.evaluate(&row).unwrap_or(false) {
                         Some(row_id)
                     } else {
@@ -828,8 +865,9 @@ impl Index for BTreeIndex {
         } else {
             // Sequential for small datasets
             let mut results = Vec::with_capacity(row_to_value.len() / 4);
-            for (&row_id, value) in row_to_value.iter() {
-                let row = crate::core::Row::from_values(vec![value.clone()]);
+            for (&row_id, arc_value) in row_to_value.iter() {
+                // Dereference Arc to get the Value
+                let row = crate::core::Row::from_values(vec![(**arc_value).clone()]);
                 if expr.evaluate(&row).unwrap_or(false) {
                     results.push(row_id);
                 }
@@ -850,9 +888,9 @@ impl Index for BTreeIndex {
         // Update cache if needed
         self.update_cache_if_needed();
 
-        // Return cached min
+        // Return cached min (clone the inner Value from Arc)
         let cached_min = self.cached_min.read().unwrap();
-        cached_min.clone()
+        cached_min.as_ref().map(|arc| (**arc).clone())
     }
 
     /// Returns the maximum value in the index
@@ -867,9 +905,9 @@ impl Index for BTreeIndex {
         // Update cache if needed
         self.update_cache_if_needed();
 
-        // Return cached max
+        // Return cached max (clone the inner Value from Arc)
         let cached_max = self.cached_max.read().unwrap();
-        cached_max.clone()
+        cached_max.as_ref().map(|arc| (**arc).clone())
     }
 
     fn get_all_values(&self) -> Vec<Value> {
@@ -878,7 +916,7 @@ impl Index for BTreeIndex {
         }
         // Use sorted_values for deterministic ordering
         let sorted_values = self.sorted_values.read().unwrap();
-        sorted_values.keys().cloned().collect()
+        sorted_values.keys().map(|arc| (**arc).clone()).collect()
     }
 
     fn get_row_ids_ordered(
@@ -949,7 +987,7 @@ impl Index for BTreeIndex {
         // Convert BTreeMap entries to (Value, Vec<i64>) pairs in sorted order
         let result: Vec<(Value, Vec<i64>)> = sorted_values
             .iter()
-            .map(|(value, row_ids)| (value.clone(), row_ids.to_vec()))
+            .map(|(arc_value, row_ids)| ((**arc_value).clone(), row_ids.to_vec()))
             .collect();
 
         Some(result)
@@ -966,9 +1004,9 @@ impl Index for BTreeIndex {
         let sorted_values = self.sorted_values.read().unwrap();
 
         // Iterate through groups in sorted order without collecting
-        for (value, row_ids) in sorted_values.iter() {
-            // Pass slice reference directly - no allocation
-            match callback(value, row_ids.as_slice()) {
+        for (arc_value, row_ids) in sorted_values.iter() {
+            // Pass slice reference directly - no allocation (Arc dereferences to Value)
+            match callback(arc_value.as_ref(), row_ids.as_slice()) {
                 Ok(true) => continue,          // Continue to next group
                 Ok(false) => break,            // Early termination requested
                 Err(e) => return Some(Err(e)), // Propagate error
@@ -985,10 +1023,6 @@ impl Index for BTreeIndex {
         {
             let mut sorted_values = self.sorted_values.write().unwrap();
             sorted_values.clear();
-        }
-        {
-            let mut value_to_rows = self.value_to_rows.write().unwrap();
-            value_to_rows.clear();
         }
         {
             let mut row_to_value = self.row_to_value.write().unwrap();

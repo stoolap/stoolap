@@ -434,14 +434,14 @@ mod tests {
     #[test]
     fn test_cannot_convert_function_call() {
         // Function calls can't be pushed down
-        let ast_expr = ast::Expression::FunctionCall(ast::FunctionCall {
+        let ast_expr = ast::Expression::FunctionCall(Box::new(ast::FunctionCall {
             token: dummy_token("UPPER", TokenType::Identifier),
             function: "UPPER".to_string(),
             arguments: vec![make_ident("name")],
             is_distinct: false,
             order_by: vec![],
             filter: None,
-        });
+        }));
 
         let storage_expr = convert_ast_to_storage_expr(&ast_expr);
         assert!(storage_expr.is_none());

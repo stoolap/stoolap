@@ -506,8 +506,7 @@ impl RowFilter {
         }
 
         VM.with(|vm| {
-            let row_data = row.as_slice();
-            let mut ctx = ExecuteContext::new(row_data);
+            let mut ctx = ExecuteContext::new(row);
 
             if !self.params.is_empty() {
                 ctx = ctx.with_params(&self.params);
@@ -536,8 +535,7 @@ impl RowFilter {
         }
 
         VM.with(|vm| {
-            let row_data = row.as_slice();
-            let mut ctx = ExecuteContext::new(row_data);
+            let mut ctx = ExecuteContext::new(row);
 
             if !self.params.is_empty() {
                 ctx = ctx.with_params(&self.params);
@@ -619,7 +617,7 @@ impl JoinFilter {
         }
 
         VM.with(|vm| {
-            let ctx = ExecuteContext::for_join(left_row.as_slice(), right_row.as_slice());
+            let ctx = ExecuteContext::for_join(left_row, right_row);
 
             // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
             // If the VM is already borrowed, create a temporary one for this call.
@@ -837,8 +835,7 @@ impl ExpressionEval {
     /// Evaluate the expression for a row.
     #[inline]
     pub fn eval(&mut self, row: &Row) -> Result<Value> {
-        let row_data = row.as_slice();
-        let mut ctx = ExecuteContext::new(row_data);
+        let mut ctx = ExecuteContext::new(row);
 
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
@@ -857,8 +854,7 @@ impl ExpressionEval {
     /// Evaluate as boolean (for WHERE/HAVING).
     #[inline]
     pub fn eval_bool(&mut self, row: &Row) -> bool {
-        let row_data = row.as_slice();
-        let mut ctx = ExecuteContext::new(row_data);
+        let mut ctx = ExecuteContext::new(row);
 
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
@@ -877,20 +873,20 @@ impl ExpressionEval {
     /// Evaluate with two rows (for joins).
     #[inline]
     pub fn eval_join(&mut self, left: &Row, right: &Row) -> Result<Value> {
-        let ctx = ExecuteContext::for_join(left.as_slice(), right.as_slice());
+        let ctx = ExecuteContext::for_join(left, right);
         self.vm.execute_cow(&self.program, &ctx)
     }
 
     /// Evaluate join as boolean.
     #[inline]
     pub fn eval_join_bool(&mut self, left: &Row, right: &Row) -> bool {
-        let ctx = ExecuteContext::for_join(left.as_slice(), right.as_slice());
+        let ctx = ExecuteContext::for_join(left, right);
         self.vm.execute_bool(&self.program, &ctx)
     }
 
-    /// Evaluate with raw slice data (avoids Row wrapper overhead).
+    /// Evaluate with a row reference.
     #[inline]
-    pub fn eval_slice(&mut self, row: &[Value]) -> Result<Value> {
+    pub fn eval_slice(&mut self, row: &Row) -> Result<Value> {
         let mut ctx = ExecuteContext::new(row);
 
         if !self.params.is_empty() {
@@ -907,9 +903,9 @@ impl ExpressionEval {
         self.vm.execute_cow(&self.program, &ctx)
     }
 
-    /// Evaluate slice as boolean.
+    /// Evaluate as boolean.
     #[inline]
-    pub fn eval_slice_bool(&mut self, row: &[Value]) -> bool {
+    pub fn eval_slice_bool(&mut self, row: &Row) -> bool {
         let mut ctx = ExecuteContext::new(row);
 
         if !self.params.is_empty() {
@@ -1040,8 +1036,7 @@ impl MultiExpressionEval {
     /// Evaluate all expressions for a row, returning values in order.
     #[inline]
     pub fn eval_all(&mut self, row: &Row) -> Result<Vec<Value>> {
-        let row_data = row.as_slice();
-        let mut ctx = ExecuteContext::new(row_data);
+        let mut ctx = ExecuteContext::new(row);
 
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
@@ -1060,8 +1055,7 @@ impl MultiExpressionEval {
     /// Evaluate all expressions, writing results into provided buffer.
     #[inline]
     pub fn eval_into(&mut self, row: &Row, output: &mut Vec<Value>) -> Result<()> {
-        let row_data = row.as_slice();
-        let mut ctx = ExecuteContext::new(row_data);
+        let mut ctx = ExecuteContext::new(row);
 
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
@@ -1182,10 +1176,10 @@ pub struct CompiledEvaluator<'a> {
     local_cache: FxHashMap<u64, SharedProgram>,
 
     /// Current row values for execution (owned copy for safety)
-    current_row: Option<Vec<Value>>,
+    current_row: Option<Row>,
 
     /// Second row for joins (owned copy for safety)
-    current_row2: Option<Vec<Value>>,
+    current_row2: Option<Row>,
 }
 
 // CompiledEvaluator is Send + Sync because all fields are Send + Sync:
@@ -1359,7 +1353,7 @@ impl<'a> CompiledEvaluator<'a> {
     /// Call init_columns() once before using this method.
     #[inline]
     pub fn set_row_array(&mut self, row: &Row) {
-        self.current_row = Some(row.as_slice().to_vec());
+        self.current_row = Some(row.clone());
         // Clear join mode
         self.current_row2 = None;
     }
@@ -1367,8 +1361,8 @@ impl<'a> CompiledEvaluator<'a> {
     /// Set two rows for join condition evaluation
     #[inline]
     pub fn set_join_rows(&mut self, left_row: &Row, right_row: &Row) {
-        self.current_row = Some(left_row.as_slice().to_vec());
-        self.current_row2 = Some(right_row.as_slice().to_vec());
+        self.current_row = Some(left_row.clone());
+        self.current_row2 = Some(right_row.clone());
     }
 
     /// Initialize join columns
@@ -1734,11 +1728,14 @@ impl<'a> CompiledEvaluator<'a> {
         // Compile the expression first
         let program = self.get_or_compile(expr)?;
 
+        // Static empty row for fallback
+        static EMPTY_ROW: std::sync::LazyLock<Row> = std::sync::LazyLock::new(Row::new);
+
         // Get row data from owned copy
-        let row = self.current_row.as_deref().unwrap_or(&[]);
+        let row = self.current_row.as_ref().unwrap_or(&EMPTY_ROW);
 
         // Get second row if in join mode
-        let row2 = self.current_row2.as_deref();
+        let row2 = self.current_row2.as_ref();
 
         // Build execution context
         let mut ctx = if let Some(r2) = row2 {
@@ -1776,11 +1773,14 @@ impl<'a> CompiledEvaluator<'a> {
         // Compile the expression first
         let program = self.get_or_compile(expr)?;
 
+        // Static empty row for fallback
+        static EMPTY_ROW: std::sync::LazyLock<Row> = std::sync::LazyLock::new(Row::new);
+
         // Get row data from owned copy
-        let row = self.current_row.as_deref().unwrap_or(&[]);
+        let row = self.current_row.as_ref().unwrap_or(&EMPTY_ROW);
 
         // Get second row if in join mode
-        let row2 = self.current_row2.as_deref();
+        let row2 = self.current_row2.as_ref();
 
         // Build execution context
         let mut ctx = if let Some(r2) = row2 {

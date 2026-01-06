@@ -126,9 +126,8 @@ impl BufferPool {
         match self.pool.pop() {
             Some(mut buf) => {
                 buf.clear();
-                if buf.capacity() < capacity {
-                    buf.reserve(capacity - buf.capacity());
-                }
+                // After clear(), len=0, so reserve(n) ensures capacity >= n
+                buf.reserve(capacity);
                 buf
             }
             None => {

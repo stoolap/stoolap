@@ -17,7 +17,8 @@
 //! Provides MVCC isolation for table operations.
 //!
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::sync::{Arc, RwLock};
 
 use crate::common::Int64Set;
@@ -27,7 +28,7 @@ use crate::storage::mvcc::bitmap_index::BitmapIndex;
 use crate::storage::mvcc::btree_index::BTreeIndex;
 use crate::storage::mvcc::hash_index::HashIndex;
 use crate::storage::mvcc::multi_column_index::MultiColumnIndex;
-use crate::storage::mvcc::scanner::{LazyMVCCScanner, MVCCScanner};
+use crate::storage::mvcc::scanner::MVCCScanner;
 use crate::storage::mvcc::{TransactionVersionStore, VersionStore};
 use crate::storage::traits::{Index, QueryResult, ScanPlan, Scanner, Table};
 use crate::storage::MemoryResult;
@@ -560,7 +561,7 @@ impl MVCCTable {
                     if !row_ids.is_empty() {
                         // Multi-column index gave us results - check if we need to apply
                         // additional filters for columns not covered by the index
-                        let covered_columns: std::collections::HashSet<&str> = index_columns
+                        let covered_columns: FxHashSet<&str> = index_columns
                             .iter()
                             .take(matched_count)
                             .map(|s| s.as_str())
@@ -1039,63 +1040,66 @@ impl MVCCTable {
                                     continue;
                                 }
 
-                                // Values differ - now collect and update
-                                let old_values: Vec<Value> = column_ids
+                                // Values differ - collect and update using Arc variants
+                                let old_values: SmallVec<[Arc<Value>; 2]> = column_ids
                                     .iter()
                                     .map(|&col_id| {
-                                        old_r
-                                            .get(col_id as usize)
-                                            .cloned()
-                                            .unwrap_or(Value::Null(DataType::Null))
+                                        old_r.get_arc(col_id as usize).unwrap_or_else(|| {
+                                            Arc::new(Value::Null(DataType::Null))
+                                        })
                                     })
                                     .collect();
 
-                                let new_values: Vec<Value> = column_ids
+                                let new_values: SmallVec<[Arc<Value>; 2]> = column_ids
                                     .iter()
                                     .map(|&col_id| {
-                                        new_row
-                                            .get(col_id as usize)
-                                            .cloned()
-                                            .unwrap_or(Value::Null(DataType::Null))
+                                        new_row.get_arc(col_id as usize).unwrap_or_else(|| {
+                                            Arc::new(Value::Null(DataType::Null))
+                                        })
                                     })
                                     .collect();
 
-                                let _ = index.remove(&old_values, row_id, row_id);
-                                index.add(&new_values, row_id, row_id)?;
+                                let _ = index.remove_arc(&old_values, row_id, row_id);
+                                index.add_arc(&new_values, row_id, row_id)?;
                                 continue;
                             }
                         }
 
-                        // INSERT or DELETE case: collect values (allocation needed)
-                        let new_values: Vec<Value> = column_ids
-                            .iter()
-                            .map(|&col_id| {
-                                new_row
-                                    .get(col_id as usize)
-                                    .cloned()
-                                    .unwrap_or(Value::Null(DataType::Null))
-                            })
-                            .collect();
-
                         if is_deleted {
-                            // DELETE: remove from index using old values if available
-                            if let Some(old_r) = old_row {
-                                let old_values: Vec<Value> = column_ids
-                                    .iter()
-                                    .map(|&col_id| {
-                                        old_r
-                                            .get(col_id as usize)
-                                            .cloned()
-                                            .unwrap_or(Value::Null(DataType::Null))
-                                    })
-                                    .collect();
-                                let _ = index.remove(&old_values, row_id, row_id);
-                            } else {
-                                let _ = index.remove(&new_values, row_id, row_id);
-                            }
+                            // DELETE: remove from index using Arc values
+                            let values_to_remove: SmallVec<[Arc<Value>; 2]> =
+                                if let Some(old_r) = old_row {
+                                    column_ids
+                                        .iter()
+                                        .map(|&col_id| {
+                                            old_r.get_arc(col_id as usize).unwrap_or_else(|| {
+                                                Arc::new(Value::Null(DataType::Null))
+                                            })
+                                        })
+                                        .collect()
+                                } else {
+                                    column_ids
+                                        .iter()
+                                        .map(|&col_id| {
+                                            new_row.get_arc(col_id as usize).unwrap_or_else(|| {
+                                                Arc::new(Value::Null(DataType::Null))
+                                            })
+                                        })
+                                        .collect()
+                                };
+                            let _ = index.remove_arc(&values_to_remove, row_id, row_id);
                         } else {
-                            // INSERT: just add new values
-                            index.add(&new_values, row_id, row_id)?;
+                            // INSERT: use add_arc to avoid Value cloning
+                            // SmallVec inlines 1-2 values (most indexes are single-column)
+                            let new_values: SmallVec<[Arc<Value>; 2]> = column_ids
+                                .iter()
+                                .map(|&col_id| {
+                                    new_row
+                                        .get_arc(col_id as usize)
+                                        .unwrap_or_else(|| Arc::new(Value::Null(DataType::Null)))
+                                })
+                                .collect();
+                            index.add_arc(&new_values, row_id, row_id)?;
                         }
                     }
                 }
@@ -2311,23 +2315,8 @@ impl Table for MVCCTable {
             }
         }
 
-        // Fall back to full scan
-        // Check if we can use lazy scanning (no local uncommitted changes)
-        let has_local = self.txn_versions.read().unwrap().has_local_changes();
-
-        if !has_local && where_expr.is_none() {
-            // Use lazy scanner for unfiltered full scans with no local changes
-            // This enables early termination and reduced memory usage
-            let scanner = LazyMVCCScanner::new(
-                Arc::clone(&self.version_store),
-                self.txn_id,
-                &schema,
-                column_indices.to_vec(),
-            );
-            return Ok(Box::new(scanner));
-        }
-
-        // Fall back to eager scanning with filtering
+        // Fall back to full scan - collect all visible rows at once
+        // This is faster than lazy batching for most workloads due to reduced per-batch overhead
         let rows = self.collect_visible_rows(where_expr);
         let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
         Ok(Box::new(scanner))
@@ -2348,16 +2337,19 @@ impl Table for MVCCTable {
         // Collect visible rows and project directly during collection
         // This avoids the double-clone overhead of the scanner interface
         let rows = self.collect_visible_rows(None);
-        let num_cols = column_indices.len();
 
         Ok(rows
             .into_iter()
             .map(|(_, row)| {
-                let mut values = Vec::with_capacity(num_cols);
-                for &idx in column_indices {
-                    values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
-                }
-                Row::from_values(values)
+                // Use get_arc() for O(1) Arc clone on Shared/Owned storage
+                let arc_values: Vec<std::sync::Arc<Value>> = column_indices
+                    .iter()
+                    .map(|&idx| {
+                        row.get_arc(idx)
+                            .unwrap_or_else(|| std::sync::Arc::new(Value::null_unknown()))
+                    })
+                    .collect();
+                Row::from_arc_values(arc_values)
             })
             .collect())
     }

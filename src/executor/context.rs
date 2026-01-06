@@ -21,10 +21,20 @@ use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::core::{Result, Row, Value};
+
+// Static defaults for ExecutionContext to avoid allocations for empty values.
+// These are shared across all contexts and only require Arc refcount bump on clone.
+// Note: cancelled is NOT shared - each context needs its own cancellation flag.
+static EMPTY_PARAMS: LazyLock<Arc<Vec<Value>>> = LazyLock::new(|| Arc::new(Vec::new()));
+static EMPTY_NAMED_PARAMS: LazyLock<Arc<FxHashMap<String, Value>>> =
+    LazyLock::new(|| Arc::new(FxHashMap::default()));
+static EMPTY_DATABASE: LazyLock<Arc<Option<String>>> = LazyLock::new(|| Arc::new(None));
+static EMPTY_SESSION_VARS: LazyLock<Arc<AHashMap<String, Value>>> =
+    LazyLock::new(|| Arc::new(AHashMap::new()));
 
 // Cache for scalar subquery results to avoid re-execution.
 // Thread-local to avoid synchronization overhead.
@@ -509,14 +519,15 @@ impl Default for ExecutionContext {
 
 impl ExecutionContext {
     /// Create a new empty execution context
+    /// Uses static defaults for empty collections to avoid allocations
     pub fn new() -> Self {
         Self {
-            params: Arc::new(Vec::new()),
-            named_params: Arc::new(FxHashMap::default()),
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
             auto_commit: true,
-            cancelled: Arc::new(AtomicBool::new(false)),
-            current_database: Arc::new(None),
-            session_vars: Arc::new(AHashMap::new()),
+            cancelled: Arc::new(AtomicBool::new(false)), // Each context needs own flag
+            current_database: EMPTY_DATABASE.clone(),
+            session_vars: EMPTY_SESSION_VARS.clone(),
             timeout_ms: 0,
             view_depth: 0,
             query_depth: 0,

@@ -1286,17 +1286,16 @@ impl Executor {
         for row in rows {
             // OPTIMIZATION: Pre-allocate Vec with estimated capacity
             let mut values = Vec::with_capacity(columns.len().max(row.len()));
-            let row_data = row.as_slice();
             // CRITICAL: Include params from context for parameterized queries
-            let exec_ctx = ExecuteContext::new(row_data)
+            let exec_ctx = ExecuteContext::new(row)
                 .with_params(ctx.params())
                 .with_named_params(ctx.named_params());
 
             for compiled in &compiled_columns {
                 match compiled {
                     CompiledColumn::Star => {
-                        // OPTIMIZATION: Use extend_from_slice instead of to_vec()
-                        values.extend_from_slice(row_data);
+                        // OPTIMIZATION: Extend with row values
+                        values.extend(row.iter().cloned());
                     }
                     CompiledColumn::Identifier(Some(idx)) => {
                         values.push(row.get(*idx).cloned().unwrap_or_else(Value::null_unknown));

@@ -25,6 +25,8 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use rustc_hash::FxHashSet;
+
 use crate::core::{DataType, Error, Result, Schema, SchemaColumn};
 use crate::storage::mvcc::persistence::{deserialize_row_version, serialize_row_version};
 use crate::storage::mvcc::version_store::RowVersion;
@@ -906,7 +908,7 @@ pub struct SnapshotReader {
     /// Index mapping row_id -> file offset (BTreeMap for ordered access)
     index: BTreeMap<i64, u64>,
     /// Track which row_ids have been loaded to memory
-    loaded_row_ids: RwLock<std::collections::HashSet<i64>>,
+    loaded_row_ids: RwLock<FxHashSet<i64>>,
     /// Length buffer for reuse
     len_buffer: [u8; 4],
 }
@@ -1055,7 +1057,7 @@ impl SnapshotReader {
             footer,
             schema,
             index,
-            loaded_row_ids: RwLock::new(std::collections::HashSet::new()),
+            loaded_row_ids: RwLock::new(FxHashSet::default()),
             len_buffer: [0u8; 4],
         })
     }

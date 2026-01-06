@@ -233,7 +233,7 @@ impl Executor {
         let limit = if let Some(ref limit_expr) = stmt.limit {
             match ExpressionEval::compile(limit_expr, &[])?
                 .with_context(ctx)
-                .eval_slice(&[])?
+                .eval_slice(&Row::new())?
             {
                 Value::Integer(l) => {
                     if l < 0 {
@@ -268,7 +268,7 @@ impl Executor {
         let offset = if let Some(ref offset_expr) = stmt.offset {
             match ExpressionEval::compile(offset_expr, &[])
                 .ok()
-                .and_then(|eval| eval.with_context(ctx).eval_slice(&[]).ok())
+                .and_then(|eval| eval.with_context(ctx).eval_slice(&Row::new()).ok())
             {
                 Some(Value::Integer(o)) => {
                     if o < 0 {
@@ -877,7 +877,7 @@ impl Executor {
             let processed_where = self.process_where_subqueries(where_clause, ctx)?;
             let where_result = ExpressionEval::compile(&processed_where, &[])?
                 .with_context(ctx)
-                .eval_slice(&[])?;
+                .eval_slice(&Row::new())?;
             let passes = match where_result {
                 Value::Boolean(b) => b,
                 Value::Null(_) => false, // NULL in WHERE is treated as false
@@ -932,7 +932,7 @@ impl Executor {
             // Evaluate expression
             let value = ExpressionEval::compile(col_expr, &[])?
                 .with_context(ctx)
-                .eval_slice(&[])?;
+                .eval_slice(&Row::new())?;
             values.push(value);
         }
 
@@ -1594,7 +1594,7 @@ impl Executor {
             let limit = if let Some(ref limit_expr) = stmt.limit {
                 match ExpressionEval::compile(limit_expr, &[])?
                     .with_context(ctx)
-                    .eval_slice(&[])?
+                    .eval_slice(&Row::new())?
                 {
                     Value::Integer(l) if l >= 0 => l as usize,
                     Value::Integer(l) => {
@@ -1619,7 +1619,7 @@ impl Executor {
             let offset = if let Some(ref offset_expr) = stmt.offset {
                 match ExpressionEval::compile(offset_expr, &[])?
                     .with_context(ctx)
-                    .eval_slice(&[])?
+                    .eval_slice(&Row::new())?
                 {
                     Value::Integer(o) if o >= 0 => o as usize,
                     Value::Integer(o) => {
@@ -1992,7 +1992,7 @@ impl Executor {
                         .and_then(|offset_expr| {
                             ExpressionEval::compile(offset_expr, &[])
                                 .ok()
-                                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                                 .and_then(|v| {
                                     if let Value::Integer(o) = v {
                                         Some(o.max(0) as usize)
@@ -2006,7 +2006,7 @@ impl Executor {
                     stmt.limit.as_ref().and_then(|limit_expr| {
                         ExpressionEval::compile(limit_expr, &[])
                             .ok()
-                            .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                            .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                             .and_then(|v| {
                                 if let Value::Integer(l) = v {
                                     Some(offset + l.max(0) as usize)
@@ -2176,7 +2176,7 @@ impl Executor {
                             .and_then(|offset_expr| {
                                 ExpressionEval::compile(offset_expr, &[])
                                     .ok()
-                                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                                     .and_then(|v| {
                                         if let Value::Integer(o) = v {
                                             Some(o.max(0) as usize)
@@ -2190,7 +2190,7 @@ impl Executor {
                         stmt.limit.as_ref().and_then(|limit_expr| {
                             ExpressionEval::compile(limit_expr, &[])
                                 .ok()
-                                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                                 .and_then(|v| {
                                     if let Value::Integer(l) = v {
                                         Some(offset + l.max(0) as usize)
@@ -2208,7 +2208,8 @@ impl Executor {
                 // because it depends on outer row values that change per row
                 let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
 
-                let mut rows = Vec::new();
+                // Pre-allocate to reduce reallocations - 64 avoids first 6 grow operations
+                let mut rows = Vec::with_capacity(64);
                 let mut row_count = 0u64;
                 while scanner.next() {
                     // Check for cancellation every 100 rows (more frequent for slow queries)
@@ -2370,7 +2371,8 @@ impl Executor {
             let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
 
             // OPTIMIZATION: Use take_row() to avoid cloning each row
-            let mut rows = Vec::new();
+            // Pre-allocate to reduce reallocations - 64 avoids first 6 grow operations
+            let mut rows = Vec::with_capacity(64);
             let mut row_count = 0u64;
             while scanner.next() {
                 // Check for cancellation every 100 rows
@@ -3062,7 +3064,7 @@ impl Executor {
                     stmt.limit.as_ref().and_then(|limit_expr| {
                         ExpressionEval::compile(limit_expr, &[])
                             .ok()
-                            .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                            .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                             .and_then(|v| match v {
                                 Value::Integer(n) if n >= 0 => Some(n as u64),
                                 _ => None,
@@ -3316,7 +3318,9 @@ impl Executor {
                             .and_then(|e| {
                                 ExpressionEval::compile(e, &[])
                                     .ok()
-                                    .and_then(|eval| eval.with_context(ctx).eval_slice(&[]).ok())
+                                    .and_then(|eval| {
+                                        eval.with_context(ctx).eval_slice(&Row::new()).ok()
+                                    })
                                     .and_then(|v| match v {
                                         Value::Integer(n) if n >= 0 => Some(n as usize),
                                         _ => None,
@@ -3330,7 +3334,9 @@ impl Executor {
                             .and_then(|e| {
                                 ExpressionEval::compile(e, &[])
                                     .ok()
-                                    .and_then(|eval| eval.with_context(ctx).eval_slice(&[]).ok())
+                                    .and_then(|eval| {
+                                        eval.with_context(ctx).eval_slice(&Row::new()).ok()
+                                    })
                                     .and_then(|v| match v {
                                         Value::Integer(n) if n >= 0 => Some(n as usize),
                                         _ => None,
@@ -3401,7 +3407,7 @@ impl Executor {
                 stmt.limit.as_ref().and_then(|limit_expr| {
                     ExpressionEval::compile(limit_expr, &[])
                         .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                         .and_then(|v| match v {
                             Value::Integer(n) if (0..=100).contains(&n) => Some(n as u64),
                             _ => None,
@@ -3710,7 +3716,7 @@ impl Executor {
             stmt.limit.as_ref().and_then(|limit_expr| {
                 ExpressionEval::compile(limit_expr, &[])
                     .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                     .and_then(|v| match v {
                         Value::Integer(n) if n >= 0 => Some(n as u64),
                         _ => None,
@@ -4057,7 +4063,7 @@ impl Executor {
         // Handle aggregation: if outer query has aggregates, materialize view result and aggregate
         if classification.has_aggregation {
             // Materialize the view result into rows
-            let mut rows = Vec::new();
+            let mut rows = Vec::with_capacity(64);
             while result.next() {
                 rows.push(result.take_row());
             }
@@ -4308,7 +4314,7 @@ impl Executor {
             for expr in row_exprs {
                 let value = ExpressionEval::compile(expr, &[])?
                     .with_context(ctx)
-                    .eval_slice(&[])?;
+                    .eval_slice(&Row::new())?;
                 row_values.push(value);
             }
             let row = Row::from_values(row_values);
@@ -4443,8 +4449,8 @@ impl Executor {
             for (col_idx, col_expr) in stmt.columns.iter().enumerate() {
                 match col_expr {
                     Expression::Star(_) | Expression::QualifiedStar(_) => {
-                        // OPTIMIZATION: Use extend_from_slice instead of iter().cloned()
-                        new_values.extend_from_slice(row.as_slice());
+                        // Extend with all values from the row
+                        new_values.extend(row.iter().cloned());
                     }
                     Expression::Identifier(id) => {
                         // Use pre-computed lowercase
@@ -4849,7 +4855,12 @@ impl Executor {
 
     /// Materialize a result into a vector of rows
     pub(crate) fn materialize_result(mut result: Box<dyn QueryResult>) -> Result<Vec<Row>> {
-        let mut rows = Vec::new();
+        // Pre-allocate based on estimate to avoid reallocations
+        let mut rows = if let Some(estimate) = result.estimated_count() {
+            Vec::with_capacity(estimate)
+        } else {
+            Vec::new()
+        };
         while result.next() {
             rows.push(result.take_row());
         }
@@ -4868,8 +4879,12 @@ impl Executor {
             return Ok(arc_rows);
         }
 
-        // Fallback: iterate and collect
-        let mut rows = Vec::new();
+        // Pre-allocate based on estimate to avoid reallocations
+        let mut rows = if let Some(estimate) = result.estimated_count() {
+            Vec::with_capacity(estimate)
+        } else {
+            Vec::new()
+        };
         while result.next() {
             rows.push(result.take_row());
         }
@@ -5119,6 +5134,18 @@ impl Executor {
                 .any(|&idx| !seen_indices.insert(idx));
 
             if !has_duplicates {
+                // OPTIMIZATION: Check if this is an identity projection (all columns in order)
+                // If so, skip the map entirely - no transformation needed
+                let is_identity = simple_column_indices.len() == all_columns.len()
+                    && simple_column_indices
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &idx)| i == idx);
+
+                if is_identity {
+                    return Ok(rows);
+                }
+
                 // OPTIMIZATION: Use take_columns to move values instead of cloning
                 let projected: Vec<Row> = rows
                     .into_iter()
@@ -5755,11 +5782,10 @@ impl Executor {
 
             for row in rows {
                 let mut values = Vec::with_capacity(values_capacity);
-                let row_slice = row.as_slice();
 
                 // Build VM context with all params in one call (faster than builder chain)
                 let vm_ctx = ExecuteContext::with_common_params(
-                    row_slice,
+                    &row,
                     params,
                     named_params_opt,
                     transaction_id,
@@ -5769,14 +5795,14 @@ impl Executor {
                     match action {
                         ExprAction::SimpleColumn(idx) => {
                             // Direct index access with bounds check
-                            if let Some(v) = row_slice.get(*idx) {
+                            if let Some(v) = row.get(*idx) {
                                 values.push(v.clone());
                             } else {
                                 values.push(Value::null_unknown());
                             }
                         }
                         ExprAction::StarExpand => {
-                            for val in row_slice.iter() {
+                            for val in row.iter() {
                                 values.push(val.clone());
                             }
                         }
@@ -5787,7 +5813,7 @@ impl Executor {
                             let mut found_any = false;
                             for (idx, col_lower) in all_columns_lower.iter().enumerate() {
                                 if col_lower.starts_with(prefix_lower) {
-                                    if let Some(val) = row_slice.get(idx) {
+                                    if let Some(val) = row.get(idx) {
                                         values.push(val.clone());
                                         found_any = true;
                                     }
@@ -5796,7 +5822,7 @@ impl Executor {
                             if !found_any {
                                 if let Some(alias_lower) = table_alias_lower {
                                     if alias_lower == qualifier_lower {
-                                        for val in row_slice.iter() {
+                                        for val in row.iter() {
                                             values.push(val.clone());
                                         }
                                     }
@@ -5807,8 +5833,8 @@ impl Executor {
                             // Inline COALESCE: direct loop avoids iterator overhead
                             let mut found = false;
                             for arg in args.iter() {
-                                let val = match arg {
-                                    ArgSource::Column(idx) => row_slice.get(*idx),
+                                let val: Option<&Value> = match arg {
+                                    ArgSource::Column(idx) => row.get(*idx),
                                     ArgSource::Const(v) => Some(v),
                                 };
                                 if let Some(v) = val {
@@ -5830,14 +5856,14 @@ impl Executor {
                             // Inline CASE: direct loop avoids iterator overhead
                             let mut matched = false;
                             for branch in branches.iter() {
-                                let col_val = match &branch.condition {
+                                let col_val: Option<&Value> = match &branch.condition {
                                     CaseCondition::Equals { col_idx, .. }
                                     | CaseCondition::NotEquals { col_idx, .. }
                                     | CaseCondition::GreaterThan { col_idx, .. }
                                     | CaseCondition::GreaterOrEqual { col_idx, .. }
                                     | CaseCondition::LessThan { col_idx, .. }
                                     | CaseCondition::LessOrEqual { col_idx, .. }
-                                    | CaseCondition::IsNull { col_idx } => row_slice.get(*col_idx),
+                                    | CaseCondition::IsNull { col_idx } => row.get(*col_idx),
                                 };
                                 let cond_matches = match (&branch.condition, col_val) {
                                     (CaseCondition::Equals { value, .. }, Some(v)) => v == value,
@@ -5858,7 +5884,7 @@ impl Executor {
                                 if cond_matches {
                                     match &branch.result {
                                         ArgSource::Column(idx) => {
-                                            if let Some(v) = row_slice.get(*idx) {
+                                            if let Some(v) = row.get(*idx) {
                                                 values.push(v.clone());
                                             } else {
                                                 values.push(Value::null_unknown());
@@ -5874,7 +5900,7 @@ impl Executor {
                                 // No branch matched - use ELSE or NULL
                                 match else_result {
                                     Some(ArgSource::Column(idx)) => {
-                                        if let Some(v) = row_slice.get(*idx) {
+                                        if let Some(v) = row.get(*idx) {
                                             values.push(v.clone());
                                         } else {
                                             values.push(Value::null_unknown());
@@ -5890,8 +5916,8 @@ impl Executor {
                             let mut result = String::with_capacity(64); // Pre-allocate
                             let mut any_null = false;
                             for part in parts.iter() {
-                                let val = match part {
-                                    ArgSource::Column(idx) => row_slice.get(*idx),
+                                let val: Option<&Value> = match part {
+                                    ArgSource::Column(idx) => row.get(*idx),
                                     ArgSource::Const(v) => Some(v),
                                 };
                                 match val {
@@ -6609,7 +6635,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         let value = ExpressionEval::compile(&stmt.expression, &[])?
             .with_context(ctx)
-            .eval_slice(&[])?;
+            .eval_slice(&Row::new())?;
         let columns = vec!["result".to_string()];
         let rows = vec![Row::from_values(vec![value])];
 
@@ -6663,7 +6689,7 @@ impl Executor {
         let _output_columns = result.columns().to_vec();
 
         // Collect rows for further processing (projection, aggregation, etc.)
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(64);
         let mut result_iter = result;
         while result_iter.next() {
             rows.push(result_iter.take_row());
@@ -6712,7 +6738,7 @@ impl Executor {
     fn parse_temporal_value(&self, as_of: &AsOfClause, ctx: &ExecutionContext) -> Result<i64> {
         let value = ExpressionEval::compile(&as_of.value, &[])?
             .with_context(ctx)
-            .eval_slice(&[])?;
+            .eval_slice(&Row::new())?;
 
         match as_of.as_of_type.to_uppercase().as_str() {
             "TRANSACTION" => {
@@ -6900,7 +6926,7 @@ impl Executor {
                 right: Box::new(Self::substitute_aliases(&in_expr.right, alias_map)),
                 not: in_expr.not,
             }),
-            Expression::FunctionCall(func) => Expression::FunctionCall(FunctionCall {
+            Expression::FunctionCall(func) => Expression::FunctionCall(Box::new(FunctionCall {
                 token: func.token.clone(),
                 function: func.function.clone(),
                 arguments: func
@@ -6911,8 +6937,8 @@ impl Executor {
                 is_distinct: func.is_distinct,
                 order_by: func.order_by.clone(),
                 filter: func.filter.clone(),
-            }),
-            Expression::Case(case) => Expression::Case(CaseExpression {
+            })),
+            Expression::Case(case) => Expression::Case(Box::new(CaseExpression {
                 token: case.token.clone(),
                 value: case
                     .value
@@ -6931,15 +6957,15 @@ impl Executor {
                     .else_value
                     .as_ref()
                     .map(|e| Box::new(Self::substitute_aliases(e, alias_map))),
-            }),
-            Expression::List(list) => Expression::List(ListExpression {
+            })),
+            Expression::List(list) => Expression::List(Box::new(ListExpression {
                 token: list.token.clone(),
                 elements: list
                     .elements
                     .iter()
                     .map(|e| Self::substitute_aliases(e, alias_map))
                     .collect(),
-            }),
+            })),
             Expression::Like(like) => Expression::Like(LikeExpression {
                 token: like.token.clone(),
                 left: Box::new(Self::substitute_aliases(&like.left, alias_map)),
@@ -7050,7 +7076,7 @@ impl Executor {
             let limit_value = stmt.limit.as_ref().and_then(|e| {
                 ExpressionEval::compile(e, &[])
                     .ok()
-                    .and_then(|mut eval| eval.eval_slice(&[]).ok())
+                    .and_then(|mut eval| eval.eval_slice(&Row::new()).ok())
                     .and_then(|v| match v {
                         Value::Integer(n) if n > 0 => Some(n as usize),
                         _ => None,
@@ -7070,7 +7096,7 @@ impl Executor {
         let limit_value = stmt.limit.as_ref().and_then(|e| {
             ExpressionEval::compile(e, &[])
                 .ok()
-                .and_then(|mut eval| eval.eval_slice(&[]).ok())
+                .and_then(|mut eval| eval.eval_slice(&Row::new()).ok())
                 .and_then(|v| match v {
                     Value::Integer(n) if n > 0 => Some(n as usize),
                     _ => None,
@@ -7417,10 +7443,10 @@ impl Executor {
         Some(Expression::In(InExpression {
             token: Token::new(TokenType::Keyword, "IN", Position::default()),
             left: Box::new(col_expr),
-            right: Box::new(Expression::ExpressionList(ExpressionList {
+            right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
                 token: Token::new(TokenType::Punctuator, "(", Position::default()),
                 expressions: value_exprs,
-            })),
+            }))),
             not: false,
         }))
     }
@@ -7651,7 +7677,7 @@ impl Executor {
         let limit_for_early_exit = stmt.limit.as_ref().and_then(|limit_expr| {
             ExpressionEval::compile(limit_expr, &[])
                 .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&[]).ok())
+                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                 .and_then(|v| match v {
                     Value::Integer(n) if n > 0 => Some(n as usize),
                     _ => None,
@@ -7853,7 +7879,7 @@ impl Executor {
         // Apply LIMIT if present
         if let Some(ref limit_expr) = stmt.limit {
             if let Ok(Value::Integer(n)) = ExpressionEval::compile(limit_expr, &[])
-                .and_then(|e| e.with_context(ctx).eval_slice(&[]))
+                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()))
             {
                 if n >= 0 {
                     result_rows.truncate(n as usize);

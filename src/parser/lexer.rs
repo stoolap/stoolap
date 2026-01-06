@@ -21,12 +21,15 @@ use super::token::{
 };
 
 /// SQL Lexer for tokenizing input
+///
+/// Uses byte-based indexing for efficiency. SQL is predominantly ASCII,
+/// so we can work with bytes directly and only decode UTF-8 when needed.
 pub struct Lexer {
-    /// Input string
-    input: Vec<char>,
-    /// Current position in input (points to current char)
+    /// Input string as bytes (avoids Vec<char> allocation)
+    input: Box<[u8]>,
+    /// Current byte position in input
     position: usize,
-    /// Current reading position in input (after current char)
+    /// Next byte position in input (after current char)
     read_position: usize,
     /// Current character under examination
     ch: char,
@@ -39,9 +42,10 @@ pub struct Lexer {
 impl Lexer {
     /// Create a new lexer for the given input
     pub fn new(input: &str) -> Self {
-        let chars: Vec<char> = input.chars().collect();
+        // Store as bytes - much more memory efficient than Vec<char>
+        let bytes: Box<[u8]> = input.as_bytes().into();
         let mut lexer = Self {
-            input: chars,
+            input: bytes,
             position: 0,
             read_position: 0,
             ch: '\0',
@@ -50,6 +54,38 @@ impl Lexer {
         };
         lexer.read_char();
         lexer
+    }
+
+    /// Decode UTF-8 character at given byte position
+    /// Returns (char, byte_length)
+    #[inline]
+    fn decode_char_at(&self, pos: usize) -> (char, usize) {
+        if pos >= self.input.len() {
+            return ('\0', 0);
+        }
+
+        let b = self.input[pos];
+
+        // Fast path: ASCII (most common in SQL)
+        if b < 0x80 {
+            return (b as char, 1);
+        }
+
+        // Slow path: multi-byte UTF-8
+        let remaining = &self.input[pos..];
+        match std::str::from_utf8(remaining) {
+            Ok(s) => {
+                if let Some(c) = s.chars().next() {
+                    (c, c.len_utf8())
+                } else {
+                    ('\0', 0)
+                }
+            }
+            Err(_) => {
+                // Invalid UTF-8, treat as replacement character
+                ('\u{FFFD}', 1)
+            }
+        }
     }
 
     /// Read the next character
@@ -64,32 +100,42 @@ impl Lexer {
 
         if self.read_position >= self.input.len() {
             self.ch = '\0'; // EOF
-        } else {
-            self.ch = self.input[self.read_position];
             self.position = self.read_position;
-            self.read_position += 1;
+        } else {
+            let (ch, len) = self.decode_char_at(self.read_position);
+            self.ch = ch;
+            self.position = self.read_position;
+            self.read_position += len;
         }
 
         self.pos.offset = self.position;
     }
 
     /// Peek at the next character without advancing
+    #[inline]
     fn peek_char(&self) -> char {
-        if self.read_position >= self.input.len() {
-            '\0'
-        } else {
-            self.input[self.read_position]
-        }
+        self.decode_char_at(self.read_position).0
     }
 
     /// Peek at a character N positions ahead without advancing
+    /// N=1 means peek at read_position, N=2 means one character after that, etc.
     fn peek_char_n(&self, n: usize) -> char {
-        let pos = self.read_position + n - 1;
-        if pos >= self.input.len() {
-            '\0'
-        } else {
-            self.input[pos]
+        if n == 0 {
+            return self.ch;
         }
+
+        let mut pos = self.read_position;
+        for i in 1..n {
+            if pos >= self.input.len() {
+                return '\0';
+            }
+            let (_, len) = self.decode_char_at(pos);
+            pos += len;
+            if i == n - 1 {
+                break;
+            }
+        }
+        self.decode_char_at(pos).0
     }
 
     /// Check if a character marks the start of a line comment after --

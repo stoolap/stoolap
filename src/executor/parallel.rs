@@ -41,6 +41,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, Value};
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::Expression;
@@ -913,38 +914,18 @@ fn combine_join_rows(
     if swapped {
         // Build was originally left, probe was originally right
         for i in 0..build_col_count {
-            combined.push(
-                build_row
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown),
-            );
+            combined.push(build_row.get(i).cloned().unwrap_or(NULL_VALUE));
         }
         for i in 0..probe_col_count {
-            combined.push(
-                probe_row
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown),
-            );
+            combined.push(probe_row.get(i).cloned().unwrap_or(NULL_VALUE));
         }
     } else {
         // Probe is left, build is right
         for i in 0..probe_col_count {
-            combined.push(
-                probe_row
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown),
-            );
+            combined.push(probe_row.get(i).cloned().unwrap_or(NULL_VALUE));
         }
         for i in 0..build_col_count {
-            combined.push(
-                build_row
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown),
-            );
+            combined.push(build_row.get(i).cloned().unwrap_or(NULL_VALUE));
         }
     }
     combined
@@ -961,30 +942,16 @@ fn combine_with_nulls(
     let mut combined = Vec::with_capacity(probe_col_count + build_col_count);
     if swapped {
         // Build (left) is NULL, probe (right) has values
-        for _ in 0..build_col_count {
-            combined.push(Value::null_unknown());
-        }
+        combined.extend(std::iter::repeat_n(NULL_VALUE, build_col_count));
         for i in 0..probe_col_count {
-            combined.push(
-                probe_row
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown),
-            );
+            combined.push(probe_row.get(i).cloned().unwrap_or(NULL_VALUE));
         }
     } else {
         // Probe (left) has values, build (right) is NULL
         for i in 0..probe_col_count {
-            combined.push(
-                probe_row
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown),
-            );
+            combined.push(probe_row.get(i).cloned().unwrap_or(NULL_VALUE));
         }
-        for _ in 0..build_col_count {
-            combined.push(Value::null_unknown());
-        }
+        combined.extend(std::iter::repeat_n(NULL_VALUE, build_col_count));
     }
     combined
 }
@@ -1001,28 +968,14 @@ fn combine_build_with_nulls(
     if swapped {
         // Build (left) has values, probe (right) is NULL
         for i in 0..build_col_count {
-            combined.push(
-                build_row
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown),
-            );
+            combined.push(build_row.get(i).cloned().unwrap_or(NULL_VALUE));
         }
-        for _ in 0..probe_col_count {
-            combined.push(Value::null_unknown());
-        }
+        combined.extend(std::iter::repeat_n(NULL_VALUE, probe_col_count));
     } else {
         // Probe (left) is NULL, build (right) has values
-        for _ in 0..probe_col_count {
-            combined.push(Value::null_unknown());
-        }
+        combined.extend(std::iter::repeat_n(NULL_VALUE, probe_col_count));
         for i in 0..build_col_count {
-            combined.push(
-                build_row
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown),
-            );
+            combined.push(build_row.get(i).cloned().unwrap_or(NULL_VALUE));
         }
     }
     combined
