@@ -77,6 +77,10 @@ hashbrown = "0.15"  # HashMap with raw_entry API for efficient group-by
 roaring = "0.10"  # Compressed bitmap indexes (used by Lucene, Druid, Spark)
 lru = "0.12"  # O(1) LRU cache for compiled expression programs
 
+# Optional benchmark dependencies (for comparison benchmarks)
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+duckdb = { version = "1.4.3", features = ["bundled"], optional = true }
+
 # Platform-specific file locking
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -88,14 +92,22 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.4"
 tempfile = "3.9"
-rusqlite = { version = "0.32", features = ["bundled"] }
-#duckdb = { version = "1.1", features = ["bundled"] }
 dhat = "0.3"
 
 [features]
 default = ["cli"]
 cli = ["clap", "rustyline", "comfy-table", "dirs"]
 dhat-heap = []
+sqlite = ["dep:rusqlite"]
+duckdb = ["dep:duckdb"]
+
+[[example]]
+name = "benchmark_sqlite"
+required-features = ["sqlite"]
+
+[[example]]
+name = "benchmark_duckdb"
+required-features = ["duckdb"]
 
 [profile.release]
 lto = true
