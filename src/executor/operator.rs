@@ -416,6 +416,12 @@ impl DirectBuildCompositeRow {
         build_idx: usize,
         probe_is_left: bool,
     ) -> Self {
+        debug_assert!(
+            build_idx < build_rows.len(),
+            "build_idx {} out of bounds (len={})",
+            build_idx,
+            build_rows.len()
+        );
         let probe_cols = probe.len();
         Self {
             probe,

@@ -223,21 +223,6 @@ impl BTreeIndex {
         self.cache_valid.store(false, AtomicOrdering::Release);
     }
 
-    /// Remove a row_id from the sorted index for a given value
-    /// Helper method used when updating a row's value
-    fn remove_row_from_indexes(&self, row_id: i64, value: &Arc<Value>) {
-        // Remove from sorted index (row_ids are sorted, use binary search)
-        let mut sorted_values = self.sorted_values.write().unwrap();
-        if let Some(rows) = sorted_values.get_mut(value) {
-            if let Ok(pos) = rows.binary_search(&row_id) {
-                rows.remove(pos);
-            }
-            if rows.is_empty() {
-                sorted_values.remove(value);
-            }
-        }
-    }
-
     /// Update the min/max cache if needed
     ///
     /// Thread-safety: Writes cache values BEFORE setting cache_valid=true.
@@ -406,29 +391,35 @@ impl Index for BTreeIndex {
         // BTree index only uses the first value (single column)
         let value = &values[0];
 
+        // Wrap value in Arc for O(1) cloning
+        let arc_value = Arc::new(value.clone());
+
+        // Hold write locks for entire operation to prevent race conditions
+        // (read-then-write pattern is unsafe with concurrent modifications)
+        let mut sorted_values = self.sorted_values.write().unwrap();
+        let mut row_to_value = self.row_to_value.write().unwrap();
+
         // Check if this row_id already exists with the same value (no-op)
         // or different value (need to remove old entry first)
-        // This is O(1) via row_to_value HashMap, avoiding O(n) SmallVec contains
-        let existing_arc = {
-            let row_to_value = self.row_to_value.read().unwrap();
-            row_to_value.get(&row_id).cloned()
-        };
-
-        if let Some(ref old_arc) = existing_arc {
+        if let Some(old_arc) = row_to_value.get(&row_id) {
             if old_arc.as_ref() == value {
                 // Same value, nothing to do
                 return Ok(());
             }
-            // Different value - remove old entry first (will be re-added below)
-            self.remove_row_from_indexes(row_id, old_arc);
+            // Different value - remove old entry from sorted index
+            let old_arc = old_arc.clone();
+            if let Some(rows) = sorted_values.get_mut(&old_arc) {
+                if let Ok(pos) = rows.binary_search(&row_id) {
+                    rows.remove(pos);
+                }
+                if rows.is_empty() {
+                    sorted_values.remove(&old_arc);
+                }
+            }
         }
-
-        // Wrap value in Arc for O(1) cloning
-        let arc_value = Arc::new(value.clone());
 
         // Check uniqueness constraint using BTreeMap O(log n) lookup
         if self.unique && !value.is_null() {
-            let sorted_values = self.sorted_values.read().unwrap();
             if let Some(rows) = sorted_values.get(&arc_value) {
                 // Check if any OTHER row has this value (allow updating same row)
                 for existing_row_id in rows.iter() {
@@ -443,22 +434,19 @@ impl Index for BTreeIndex {
             }
         }
 
-        // Add to sorted index and row mapping
-        // Only need Arc clones (8 bytes each) instead of full Value clones
-        {
-            let mut sorted_values = self.sorted_values.write().unwrap();
-            let mut row_to_value = self.row_to_value.write().unwrap();
-
-            // Add to sorted index (for O(log n) range and equality queries)
-            // Insert in sorted order for O(N+M) intersection/union without re-sorting
-            let btree_rows = sorted_values.entry(Arc::clone(&arc_value)).or_default();
-            if let Err(pos) = btree_rows.binary_search(&row_id) {
-                btree_rows.insert(pos, row_id);
-            }
-
-            // Add to row -> value mapping (stores Arc reference)
-            row_to_value.insert(row_id, arc_value);
+        // Add to sorted index (for O(log n) range and equality queries)
+        // Insert in sorted order for O(N+M) intersection/union without re-sorting
+        let btree_rows = sorted_values.entry(Arc::clone(&arc_value)).or_default();
+        if let Err(pos) = btree_rows.binary_search(&row_id) {
+            btree_rows.insert(pos, row_id);
         }
+
+        // Add to row -> value mapping (stores Arc reference)
+        row_to_value.insert(row_id, arc_value);
+
+        // Drop locks before invalidating cache
+        drop(sorted_values);
+        drop(row_to_value);
 
         // Invalidate min/max cache
         self.invalidate_cache();
@@ -476,25 +464,31 @@ impl Index for BTreeIndex {
         // BTree index only uses the first value (single column)
         let arc_value = &values[0];
 
+        // Hold write locks for entire operation to prevent race conditions
+        let mut sorted_values = self.sorted_values.write().unwrap();
+        let mut row_to_value = self.row_to_value.write().unwrap();
+
         // Check if this row_id already exists with the same value (no-op)
         // or different value (need to remove old entry first)
-        let existing_arc = {
-            let row_to_value = self.row_to_value.read().unwrap();
-            row_to_value.get(&row_id).cloned()
-        };
-
-        if let Some(ref old_arc) = existing_arc {
+        if let Some(old_arc) = row_to_value.get(&row_id) {
             if old_arc == arc_value {
                 // Same value, nothing to do
                 return Ok(());
             }
-            // Different value - remove old entry first
-            self.remove_row_from_indexes(row_id, old_arc);
+            // Different value - remove old entry from sorted index
+            let old_arc = old_arc.clone();
+            if let Some(rows) = sorted_values.get_mut(&old_arc) {
+                if let Ok(pos) = rows.binary_search(&row_id) {
+                    rows.remove(pos);
+                }
+                if rows.is_empty() {
+                    sorted_values.remove(&old_arc);
+                }
+            }
         }
 
         // Check uniqueness constraint using BTreeMap O(log n) lookup
         if self.unique && !arc_value.is_null() {
-            let sorted_values = self.sorted_values.read().unwrap();
             if let Some(rows) = sorted_values.get(arc_value) {
                 for existing_row_id in rows.iter() {
                     if *existing_row_id != row_id {
@@ -509,17 +503,15 @@ impl Index for BTreeIndex {
         }
 
         // Add to sorted index and row mapping - O(1) Arc clone, no Value clone!
-        {
-            let mut sorted_values = self.sorted_values.write().unwrap();
-            let mut row_to_value = self.row_to_value.write().unwrap();
-
-            let btree_rows = sorted_values.entry(Arc::clone(arc_value)).or_default();
-            if let Err(pos) = btree_rows.binary_search(&row_id) {
-                btree_rows.insert(pos, row_id);
-            }
-
-            row_to_value.insert(row_id, Arc::clone(arc_value));
+        let btree_rows = sorted_values.entry(Arc::clone(arc_value)).or_default();
+        if let Err(pos) = btree_rows.binary_search(&row_id) {
+            btree_rows.insert(pos, row_id);
         }
+        row_to_value.insert(row_id, Arc::clone(arc_value));
+
+        // Drop locks before invalidating cache
+        drop(sorted_values);
+        drop(row_to_value);
 
         self.invalidate_cache();
         Ok(())
@@ -537,31 +529,25 @@ impl Index for BTreeIndex {
     fn remove(&self, _values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         self.check_closed()?;
 
-        // First check if the row exists
-        let stored_arc = {
-            let row_to_value = self.row_to_value.read().unwrap();
-            row_to_value.get(&row_id).cloned()
-        };
+        // Hold write locks for entire operation to prevent race conditions
+        let mut sorted_values = self.sorted_values.write().unwrap();
+        let mut row_to_value = self.row_to_value.write().unwrap();
 
-        if let Some(arc_value) = stored_arc {
+        // Check if the row exists and remove atomically
+        if let Some(arc_value) = row_to_value.remove(&row_id) {
             // Remove from sorted index (row_ids are sorted, use binary search)
-            {
-                let mut sorted_values = self.sorted_values.write().unwrap();
-                if let Some(rows) = sorted_values.get_mut(&arc_value) {
-                    if let Ok(pos) = rows.binary_search(&row_id) {
-                        rows.remove(pos);
-                    }
-                    if rows.is_empty() {
-                        sorted_values.remove(&arc_value);
-                    }
+            if let Some(rows) = sorted_values.get_mut(&arc_value) {
+                if let Ok(pos) = rows.binary_search(&row_id) {
+                    rows.remove(pos);
+                }
+                if rows.is_empty() {
+                    sorted_values.remove(&arc_value);
                 }
             }
 
-            // Remove from row -> value mapping
-            {
-                let mut row_to_value = self.row_to_value.write().unwrap();
-                row_to_value.remove(&row_id);
-            }
+            // Drop locks before invalidating cache
+            drop(sorted_values);
+            drop(row_to_value);
 
             // Invalidate min/max cache
             self.invalidate_cache();
