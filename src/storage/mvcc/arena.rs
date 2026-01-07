@@ -218,6 +218,35 @@ impl RowArena {
         }
     }
 
+    /// Update data at an existing arena index (for slot reuse during UPDATEs)
+    ///
+    /// This replaces both data and metadata at the given index, avoiding
+    /// unbounded arena growth during update-heavy workloads.
+    /// Returns true if the update was successful, false if index out of bounds.
+    #[inline]
+    pub fn update_at(
+        &self,
+        arena_idx: usize,
+        row_id: i64,
+        txn_id: i64,
+        create_time: i64,
+        arc_data: Arc<[Arc<Value>]>,
+    ) -> bool {
+        let mut inner = self.inner.write();
+        if arena_idx < inner.meta.len() {
+            inner.data[arena_idx] = arc_data;
+            inner.meta[arena_idx] = ArenaRowMeta {
+                row_id,
+                txn_id,
+                deleted_at_txn_id: 0,
+                create_time,
+            };
+            true
+        } else {
+            false
+        }
+    }
+
     /// Get the number of rows (including deleted)
     #[inline]
     pub fn len(&self) -> usize {

@@ -251,7 +251,7 @@ impl Transaction {
                         let idx = columns
                             .iter()
                             .position(|c| c.eq_ignore_ascii_case(col_name))
-                            .ok_or_else(|| Error::ColumnNotFoundNamed(col_name.clone()))?;
+                            .ok_or_else(|| Error::ColumnNotFoundNamed(col_name.to_string()))?;
                         let program = compile_expression(expr, &columns)?;
                         Ok((idx, program))
                     })
@@ -341,8 +341,8 @@ impl Transaction {
 
                         for (i, col_expr) in stmt.columns.iter().enumerate() {
                             let col_name = match col_expr {
-                                Expression::Aliased(a) => a.alias.value.clone(),
-                                Expression::Identifier(id) => id.value.clone(),
+                                Expression::Aliased(a) => a.alias.value.to_string(),
+                                Expression::Identifier(id) => id.value.to_string(),
                                 _ => format!("expr{}", i + 1),
                             };
                             columns.push(col_name);
@@ -508,11 +508,11 @@ impl Transaction {
                     compiled_exprs.push(None); // Star marker
                 }
                 Expression::Aliased(a) => {
-                    result_columns.push(a.alias.value.clone());
+                    result_columns.push(a.alias.value.to_string());
                     compiled_exprs.push(Some(compile_expression(col_expr, source_columns)?));
                 }
                 Expression::Identifier(id) => {
-                    result_columns.push(id.value.clone());
+                    result_columns.push(id.value.to_string());
                     compiled_exprs.push(Some(compile_expression(col_expr, source_columns)?));
                 }
                 _ => {

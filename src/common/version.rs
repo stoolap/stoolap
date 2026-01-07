@@ -17,23 +17,29 @@
 //!
 //! This module provides version constants and build information.
 
-/// Major version number
-pub const MAJOR: u32 = 0;
+/// Full version string from Cargo.toml (single source of truth)
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Minor version number
-pub const MINOR: u32 = 2;
+/// Major version number (parsed at runtime for compatibility)
+pub const MAJOR: u32 = parse_version_component(env!("CARGO_PKG_VERSION_MAJOR"));
 
-/// Patch version number
-pub const PATCH: u32 = 0;
+/// Minor version number (parsed at runtime for compatibility)
+pub const MINOR: u32 = parse_version_component(env!("CARGO_PKG_VERSION_MINOR"));
 
-use std::sync::OnceLock;
+/// Patch version number (parsed at runtime for compatibility)
+pub const PATCH: u32 = parse_version_component(env!("CARGO_PKG_VERSION_PATCH"));
 
-/// Full version string in semver format (e.g., "0.2.0")
-static VERSION: OnceLock<String> = OnceLock::new();
-
-/// Get the version string
-fn get_version() -> &'static String {
-    VERSION.get_or_init(|| format!("{}.{}.{}", MAJOR, MINOR, PATCH))
+/// Parse version component at compile time
+const fn parse_version_component(s: &str) -> u32 {
+    let bytes = s.as_bytes();
+    let mut result: u32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let digit = bytes[i] - b'0';
+        result = result * 10 + digit as u32;
+        i += 1;
+    }
+    result
 }
 
 /// Git commit hash at build time
@@ -52,16 +58,14 @@ pub const BUILD_TIME: &str = match option_env!("STOOLAP_BUILD_TIME") {
 
 /// Returns the full version string
 pub fn version() -> &'static str {
-    get_version()
+    VERSION
 }
 
 /// Returns version info as a formatted string
 pub fn version_info() -> String {
     format!(
         "stoolap {} (commit: {}, built: {})",
-        get_version(),
-        GIT_COMMIT,
-        BUILD_TIME
+        VERSION, GIT_COMMIT, BUILD_TIME
     )
 }
 

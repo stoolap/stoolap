@@ -29,6 +29,7 @@
 //! Note: Recursive CTEs are parsed but not yet executed.
 
 use ahash::AHashSet;
+use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -69,13 +70,9 @@ type JoinDataResult = (
 /// Handles nested function calls, multiple arguments, and various expression types.
 fn expr_to_normalized_string(expr: &Expression) -> String {
     match expr {
-        Expression::Identifier(id) => id.value.to_lowercase(),
+        Expression::Identifier(id) => id.value_lower.to_string(),
         Expression::QualifiedIdentifier(qi) => {
-            format!(
-                "{}.{}",
-                qi.qualifier.value.to_lowercase(),
-                qi.name.value.to_lowercase()
-            )
+            format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower)
         }
         Expression::FunctionCall(fc) => {
             let func_name = fc.function.to_lowercase();
@@ -229,7 +226,8 @@ impl Executor {
         // Execute each CTE in order
         for cte in &with_clause.ctes {
             // Check if we have a pushdown hint for this CTE
-            let pushdown_hint = cte_limit_hints.get(&cte.name.value.to_lowercase());
+            let cte_name_lower: String = cte.name.value_lower.to_string();
+            let pushdown_hint = cte_limit_hints.get(&cte_name_lower);
 
             // Execute the CTE query (handles recursive CTEs)
             let (columns, rows) = if cte.is_recursive {
@@ -260,7 +258,7 @@ impl Executor {
                     .enumerate()
                     .map(|(i, alias)| {
                         if i < columns.len() {
-                            alias.value.clone()
+                            alias.value.to_string()
                         } else {
                             columns
                                 .get(i)
@@ -401,7 +399,7 @@ impl Executor {
                 .enumerate()
                 .map(|(i, alias)| {
                     if i < anchor_columns.len() {
-                        alias.value.clone()
+                        alias.value.to_string()
                     } else {
                         anchor_columns
                             .get(i)
@@ -1023,10 +1021,11 @@ impl Executor {
     /// or (None, column_name) for simple identifiers.
     fn extract_qualified_column(&self, expr: &Expression) -> Option<(Option<String>, String)> {
         match expr {
-            Expression::Identifier(id) => Some((None, id.value.clone())),
-            Expression::QualifiedIdentifier(qi) => {
-                Some((Some(qi.qualifier.value.clone()), qi.name.value.clone()))
-            }
+            Expression::Identifier(id) => Some((None, id.value.to_string())),
+            Expression::QualifiedIdentifier(qi) => Some((
+                Some(qi.qualifier.value.to_string()),
+                qi.name.value.to_string(),
+            )),
             _ => None,
         }
     }
@@ -1158,11 +1157,11 @@ impl Executor {
     /// Extract the base CTE/table name for registry lookup (ignores aliases)
     fn extract_cte_name_for_lookup(&self, expr: &Expression) -> Option<String> {
         match expr {
-            Expression::CteReference(cte_ref) => Some(cte_ref.name.value.clone()),
+            Expression::CteReference(cte_ref) => Some(cte_ref.name.value.to_string()),
             Expression::TableSource(simple_table_source) => {
-                Some(simple_table_source.name.value.clone())
+                Some(simple_table_source.name.value.to_string())
             }
-            Expression::Identifier(id) => Some(id.value.clone()),
+            Expression::Identifier(id) => Some(id.value.to_string()),
             _ => None,
         }
     }
@@ -1174,20 +1173,20 @@ impl Executor {
             Expression::CteReference(cte_ref) => {
                 // Use alias if present, otherwise use the CTE name
                 if let Some(ref alias) = cte_ref.alias {
-                    Some(alias.value.clone())
+                    Some(alias.value.to_string())
                 } else {
-                    Some(cte_ref.name.value.clone())
+                    Some(cte_ref.name.value.to_string())
                 }
             }
             Expression::TableSource(simple_table_source) => {
                 // Use alias if present, otherwise use the table name
                 if let Some(ref alias) = simple_table_source.alias {
-                    Some(alias.value.clone())
+                    Some(alias.value.to_string())
                 } else {
-                    Some(simple_table_source.name.value.clone())
+                    Some(simple_table_source.name.value.to_string())
                 }
             }
-            Expression::Identifier(id) => Some(id.value.clone()),
+            Expression::Identifier(id) => Some(id.value.to_string()),
             _ => None,
         }
     }
@@ -1206,10 +1205,10 @@ impl Executor {
                     output_columns.extend(cte_columns.iter().cloned());
                 }
                 Expression::Identifier(id) => {
-                    output_columns.push(id.value.clone());
+                    output_columns.push(id.value.to_string());
                 }
                 Expression::Aliased(aliased) => {
-                    output_columns.push(aliased.alias.value.clone());
+                    output_columns.push(aliased.alias.value.to_string());
                 }
                 _ => {
                     output_columns.push(format!("expr{}", i + 1));
@@ -1265,7 +1264,7 @@ impl Executor {
             .map(|col_expr| match col_expr {
                 Expression::Star(_) => Ok(CompiledColumn::Star),
                 Expression::Identifier(id) => {
-                    let idx = col_index_map.get(&id.value_lower).copied();
+                    let idx = col_index_map.get(id.value_lower.as_str()).copied();
                     Ok(CompiledColumn::Identifier(idx))
                 }
                 Expression::Aliased(aliased) => {
@@ -1339,14 +1338,16 @@ impl Executor {
             .iter()
             .map(|ob| {
                 let col_idx = match &ob.expression {
-                    Expression::Identifier(id) => col_index_map.get(&id.value_lower).copied(),
+                    Expression::Identifier(id) => {
+                        col_index_map.get(id.value_lower.as_str()).copied()
+                    }
                     Expression::QualifiedIdentifier(qi) => {
                         // Try both qualified and unqualified names
                         let full_name =
                             format!("{}.{}", qi.qualifier, qi.name.value).to_lowercase();
                         col_index_map
                             .get(&full_name)
-                            .or_else(|| col_index_map.get(&qi.name.value_lower))
+                            .or_else(|| col_index_map.get(qi.name.value_lower.as_str()))
                             .copied()
                     }
                     Expression::IntegerLiteral(lit) => {
@@ -1458,7 +1459,7 @@ impl Executor {
             .ctes
             .iter()
             .filter(|c| !c.is_recursive && !c.query.group_by.columns.is_empty())
-            .map(|c| c.name.value.to_lowercase())
+            .map(|c| c.name.value_lower.to_string())
             .collect();
 
         if cte_names.is_empty() {
@@ -1516,7 +1517,7 @@ impl Executor {
                 if cte.is_recursive || !cte.column_names.is_empty() {
                     return Err(());
                 }
-                Ok((cte.name.value.to_lowercase(), cte))
+                Ok((cte.name.value_lower.to_string(), cte))
             })
             .collect::<std::result::Result<Vec<_>, _>>()
             .ok()?;
@@ -1677,20 +1678,20 @@ impl Executor {
     ) {
         match expr {
             Expression::CteReference(cte_ref) => {
-                let name = cte_ref.name.value.to_lowercase();
-                if let Some(count) = ref_counts.get_mut(&name) {
+                let name: &str = cte_ref.name.value_lower.as_str();
+                if let Some(count) = ref_counts.get_mut(name) {
                     *count += 1;
                 }
             }
             Expression::TableSource(ts) => {
-                let name = ts.name.value.to_lowercase();
-                if let Some(count) = ref_counts.get_mut(&name) {
+                let name: &str = ts.name.value_lower.as_str();
+                if let Some(count) = ref_counts.get_mut(name) {
                     *count += 1;
                 }
             }
             Expression::Identifier(id) => {
-                let name = id.value.to_lowercase();
-                if let Some(count) = ref_counts.get_mut(&name) {
+                let name: &str = id.value_lower.as_str();
+                if let Some(count) = ref_counts.get_mut(name) {
                     *count += 1;
                 }
             }
@@ -1742,11 +1743,11 @@ impl Executor {
                         .alias
                         .clone()
                         .unwrap_or_else(|| cte_ref.name.clone());
-                    Expression::SubquerySource(SubqueryTableSource {
+                    Expression::SubquerySource(Box::new(SubqueryTableSource {
                         token: Token::new(TokenType::Punctuator, "(", Position::new(0, 0, 0)),
                         subquery: cte.query.clone(),
                         alias: Some(alias),
-                    })
+                    }))
                 })
             }
             Expression::TableSource(ts) => {
@@ -1755,11 +1756,11 @@ impl Executor {
                 cte_defs.get(name.as_str()).map(|cte| {
                     // Convert to SubquerySource preserving alias
                     let alias = ts.alias.clone().unwrap_or_else(|| ts.name.clone());
-                    Expression::SubquerySource(SubqueryTableSource {
+                    Expression::SubquerySource(Box::new(SubqueryTableSource {
                         token: Token::new(TokenType::Punctuator, "(", Position::new(0, 0, 0)),
                         subquery: cte.query.clone(),
                         alias: Some(alias),
-                    })
+                    }))
                 })
             }
             Expression::JoinSource(js) => {
@@ -1788,11 +1789,11 @@ impl Executor {
                     if let Some(inlined) = self.try_inline_cte_references(table_expr, cte_defs) {
                         let mut new_subquery = (*sq.subquery).clone();
                         new_subquery.table_expr = Some(Box::new(inlined));
-                        return Some(Expression::SubquerySource(SubqueryTableSource {
+                        return Some(Expression::SubquerySource(Box::new(SubqueryTableSource {
                             token: sq.token.clone(),
                             subquery: Box::new(new_subquery),
                             alias: sq.alias.clone(),
-                        }));
+                        })));
                     }
                 }
                 None
@@ -1840,10 +1841,10 @@ impl Executor {
         };
 
         // Extract table name from table expression
-        let table_name = match table_expr {
-            Expression::TableSource(ts) => ts.name.value_lower.clone(),
+        let table_name: String = match table_expr {
+            Expression::TableSource(ts) => ts.name.value_lower.to_string(),
             Expression::Aliased(aliased) => match aliased.expression.as_ref() {
-                Expression::TableSource(ts) => ts.name.value_lower.clone(),
+                Expression::TableSource(ts) => ts.name.value_lower.to_string(),
                 _ => return Ok(None),
             },
             _ => return Ok(None),
@@ -2126,7 +2127,7 @@ impl Executor {
             .ctes
             .iter()
             .filter(|c| !c.is_recursive) // Skip recursive CTEs
-            .map(|c| c.name.value.to_lowercase())
+            .map(|c| c.name.value_lower.to_string())
             .collect();
 
         // Check if one side of the join is a CTE
@@ -2150,7 +2151,7 @@ impl Executor {
         let cte = with_clause
             .ctes
             .iter()
-            .find(|c| c.name.value.to_lowercase() == cte_name);
+            .find(|c| c.name.value_lower.as_str() == cte_name);
 
         if let Some(cte) = cte {
             // CTE must have GROUP BY for streaming optimization to help
@@ -2203,7 +2204,7 @@ impl Executor {
         let cte_columns: Vec<String> = if !cte.column_names.is_empty() {
             cte.column_names
                 .iter()
-                .map(|n| n.value.to_lowercase())
+                .map(|n| n.value_lower.to_string())
                 .collect()
         } else {
             // Extract from SELECT columns
@@ -2213,11 +2214,11 @@ impl Executor {
                 .filter_map(|col| {
                     // Handle Aliased expressions (e.g., SUM(amount) AS total)
                     if let Expression::Aliased(aliased) = col {
-                        return Some(aliased.alias.value.to_lowercase());
+                        return Some(aliased.alias.value_lower.to_string());
                     }
                     // Handle plain identifiers
                     if let Expression::Identifier(id) = col {
-                        return Some(id.value_lower.clone());
+                        return Some(id.value_lower.to_string());
                     }
                     // Handle function calls (e.g., SUM(amount), ROUND(SUM(x), 2))
                     // Use expr_to_normalized_string for robust handling of nested functions,
@@ -2235,13 +2236,12 @@ impl Executor {
 
         for order_item in &stmt.order_by {
             // Check if this ORDER BY item references a CTE column
-            let col_name = match &order_item.expression {
-                Expression::Identifier(id) => Some(id.value_lower.clone()),
+            let col_name: Option<String> = match &order_item.expression {
+                Expression::Identifier(id) => Some(id.value_lower.to_string()),
                 Expression::QualifiedIdentifier(qi) => {
                     // table.column format
-                    let table = qi.qualifier.value.to_lowercase();
-                    if table == cte_alias_lower {
-                        Some(qi.name.value.to_lowercase())
+                    if qi.qualifier.value_lower.as_str() == cte_alias_lower {
+                        Some(qi.name.value_lower.to_string())
                     } else {
                         // References different table - can't push
                         return vec![];
@@ -2258,14 +2258,15 @@ impl Executor {
                 // Check if column exists in CTE (exact match only)
                 if cte_columns.iter().any(|c| c == &col) {
                     // Create ORDER BY item without table qualifier
+                    let col_compact: CompactString = col.clone().into();
                     let new_expr = Expression::Identifier(Identifier {
                         token: Token::new(
                             TokenType::Identifier,
-                            col.clone(),
+                            col_compact.clone(),
                             Position::new(0, 0, 0),
                         ),
-                        value: col.clone(),
-                        value_lower: col,
+                        value: col_compact.clone(),
+                        value_lower: col_compact,
                     });
                     result.push(OrderByExpression {
                         expression: new_expr,

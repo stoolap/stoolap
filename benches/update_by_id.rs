@@ -15,6 +15,7 @@
 //! Fair benchmark comparison: Stoolap vs SQLite for UPDATE by ID
 //!
 //! Run with: cargo bench --bench update_by_id
+//! Run with SQLite comparison: cargo bench --bench update_by_id --features sqlite
 //!
 //! This benchmark ensures fair comparison by:
 //! 1. Using prepared statements for both databases
@@ -24,6 +25,7 @@
 //! 5. Statistical analysis of results
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+#[cfg(feature = "sqlite")]
 use rusqlite::Connection;
 use stoolap::Database;
 
@@ -31,10 +33,10 @@ const ROW_COUNT: usize = 10_000;
 
 /// Setup Stoolap database with test data
 fn setup_stoolap() -> Database {
-    let db = Database::open("memory://").unwrap();
+    let db = Database::open_in_memory().unwrap();
 
     db.execute(
-        "CREATE TABLE IF NOT EXISTS users (
+        "CREATE TABLE users (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             email TEXT NOT NULL,
@@ -46,14 +48,6 @@ fn setup_stoolap() -> Database {
         (),
     )
     .unwrap();
-
-    // Check if data already exists (for shared memory database case)
-    let count_result = db.query("SELECT COUNT(*) FROM users", ()).unwrap();
-    let count_row = count_result.into_iter().next().unwrap().unwrap();
-    let count: i64 = count_row.get(0).unwrap();
-    if count > 0 {
-        return db;
-    }
 
     let insert_stmt = db
         .prepare("INSERT INTO users (id, name, email, age, balance, active, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
@@ -79,6 +73,7 @@ fn setup_stoolap() -> Database {
 }
 
 /// Setup SQLite database with test data
+#[cfg(feature = "sqlite")]
 fn setup_sqlite() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
 
@@ -122,6 +117,7 @@ fn bench_update_by_id(c: &mut Criterion) {
 
     // Setup databases
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     // Prepare statements - update balance by ID
@@ -129,6 +125,7 @@ fn bench_update_by_id(c: &mut Criterion) {
         .prepare("UPDATE users SET balance = $1 WHERE id = $2")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("UPDATE users SET balance = ?1 WHERE id = ?2")
         .unwrap();
@@ -149,6 +146,7 @@ fn bench_update_by_id(c: &mut Criterion) {
     });
 
     // Benchmark SQLite
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         let mut idx = 0;
         b.iter(|| {
@@ -170,6 +168,7 @@ fn bench_update_by_id_batch(c: &mut Criterion) {
 
     // Setup databases
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     // Prepare statements
@@ -177,6 +176,7 @@ fn bench_update_by_id_batch(c: &mut Criterion) {
         .prepare("UPDATE users SET balance = $1 WHERE id = $2")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("UPDATE users SET balance = ?1 WHERE id = ?2")
         .unwrap();
@@ -198,6 +198,7 @@ fn bench_update_by_id_batch(c: &mut Criterion) {
     });
 
     // Benchmark SQLite - 100 updates per iteration
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         let mut iter_count = 0;
         b.iter(|| {

@@ -19,6 +19,7 @@
 
 use super::token::{Position, Token};
 use ahash::AHashSet;
+use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -97,16 +98,16 @@ pub enum Expression {
     Aliased(AliasedExpression),
     /// Window expression - Boxed to reduce enum size (has 2 Vecs)
     Window(Box<WindowExpression>),
-    /// Simple table source
-    TableSource(SimpleTableSource),
+    /// Simple table source - Boxed to reduce enum size
+    TableSource(Box<SimpleTableSource>),
     /// Join table source
     JoinSource(Box<JoinTableSource>),
-    /// Subquery table source
-    SubquerySource(SubqueryTableSource),
-    /// VALUES table source (e.g., VALUES (1, 'a'), (2, 'b'))
-    ValuesSource(ValuesTableSource),
-    /// CTE reference
-    CteReference(CteReference),
+    /// Subquery table source - Boxed to reduce enum size (216 bytes unboxed)
+    SubquerySource(Box<SubqueryTableSource>),
+    /// VALUES table source - Boxed to reduce enum size (256 bytes unboxed)
+    ValuesSource(Box<ValuesTableSource>),
+    /// CTE reference - Boxed to reduce enum size (336 bytes unboxed)
+    CteReference(Box<CteReference>),
     /// Star (*) for SELECT *
     Star(StarExpression),
     /// Qualified star (table.*) for SELECT table.*
@@ -206,14 +207,16 @@ impl Expression {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Identifier {
     pub token: Token,
-    pub value: String,
+    pub value: CompactString,
     /// Pre-computed lowercase value for fast case-insensitive lookups
-    pub value_lower: String,
+    pub value_lower: CompactString,
 }
 
 impl Identifier {
     /// Create a new identifier with pre-computed lowercase value
-    pub fn new(token: Token, value: String) -> Self {
+    #[inline]
+    pub fn new(token: Token, value: impl Into<CompactString>) -> Self {
+        let value = value.into();
         let value_lower = value.to_lowercase();
         Self {
             token,
@@ -273,9 +276,9 @@ impl fmt::Display for FloatLiteral {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StringLiteral {
     pub token: Token,
-    pub value: String,
+    pub value: CompactString,
     /// Optional type hint (DATE, TIME, JSON, etc.)
-    pub type_hint: Option<String>,
+    pub type_hint: Option<CompactString>,
 }
 
 impl fmt::Display for StringLiteral {
@@ -313,9 +316,9 @@ impl fmt::Display for NullLiteral {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntervalLiteral {
     pub token: Token,
-    pub value: String,
+    pub value: CompactString,
     pub quantity: i64,
-    pub unit: String,
+    pub unit: CompactString,
 }
 
 impl fmt::Display for IntervalLiteral {
@@ -328,7 +331,7 @@ impl fmt::Display for IntervalLiteral {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Parameter {
     pub token: Token,
-    pub name: String,
+    pub name: CompactString,
     pub index: usize,
 }
 
@@ -491,7 +494,7 @@ impl fmt::Display for StarExpression {
 #[derive(Debug, Clone, PartialEq)]
 pub struct QualifiedStarExpression {
     pub token: Token,
-    pub qualifier: String,
+    pub qualifier: CompactString,
 }
 
 impl fmt::Display for QualifiedStarExpression {
@@ -516,7 +519,7 @@ impl fmt::Display for DefaultExpression {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrefixExpression {
     pub token: Token,
-    pub operator: String,
+    pub operator: CompactString,
     /// Pre-computed operator type for fast evaluation (no string comparison)
     pub op_type: PrefixOperator,
     pub right: Box<Expression>,
@@ -525,7 +528,8 @@ pub struct PrefixExpression {
 impl PrefixExpression {
     /// Create a new prefix expression with auto-computed op_type
     #[inline]
-    pub fn new(token: Token, operator: String, right: Box<Expression>) -> Self {
+    pub fn new(token: Token, operator: impl Into<CompactString>, right: Box<Expression>) -> Self {
+        let operator = operator.into();
         let op_type = PrefixOperator::from_str(&operator);
         Self {
             token,
@@ -551,7 +555,7 @@ impl fmt::Display for PrefixExpression {
 pub struct InfixExpression {
     pub token: Token,
     pub left: Box<Expression>,
-    pub operator: String,
+    pub operator: CompactString,
     /// Pre-computed operator type for fast evaluation (no string comparison)
     pub op_type: InfixOperator,
     pub right: Box<Expression>,
@@ -563,9 +567,10 @@ impl InfixExpression {
     pub fn new(
         token: Token,
         left: Box<Expression>,
-        operator: String,
+        operator: impl Into<CompactString>,
         right: Box<Expression>,
     ) -> Self {
+        let operator = operator.into();
         let op_type = InfixOperator::from_str(&operator);
         Self {
             token,
@@ -644,7 +649,7 @@ impl fmt::Display for AllAnyType {
 pub struct AllAnyExpression {
     pub token: Token,
     pub left: Box<Expression>,
-    pub operator: String,
+    pub operator: CompactString,
     pub all_any_type: AllAnyType,
     pub subquery: Box<SelectStatement>,
 }
@@ -744,7 +749,7 @@ pub struct LikeExpression {
     pub left: Box<Expression>,
     pub pattern: Box<Expression>,
     /// The operator: LIKE, ILIKE, NOT LIKE, NOT ILIKE, GLOB, NOT GLOB, REGEXP, RLIKE, NOT REGEXP, NOT RLIKE
-    pub operator: String,
+    pub operator: CompactString,
     /// Optional escape character
     pub escape: Option<Box<Expression>>,
 }
@@ -831,7 +836,7 @@ impl fmt::Display for WhenClause {
 pub struct CastExpression {
     pub token: Token,
     pub expr: Box<Expression>,
-    pub type_name: String,
+    pub type_name: CompactString,
 }
 
 impl fmt::Display for CastExpression {
@@ -844,7 +849,7 @@ impl fmt::Display for CastExpression {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionCall {
     pub token: Token,
-    pub function: String,
+    pub function: CompactString,
     pub arguments: Vec<Expression>,
     pub is_distinct: bool,
     pub order_by: Vec<OrderByExpression>,
@@ -909,7 +914,7 @@ pub struct WindowExpression {
     pub token: Token,
     pub function: Box<FunctionCall>,
     /// Named window reference (e.g., OVER w)
-    pub window_ref: Option<String>,
+    pub window_ref: Option<CompactString>,
     pub partition_by: Vec<Expression>,
     pub order_by: Vec<OrderByExpression>,
     pub frame: Option<WindowFrame>,
@@ -1000,7 +1005,7 @@ impl fmt::Display for WindowFrameBound {
 /// Named window definition (WINDOW w AS (...))
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowDefinition {
-    pub name: String,
+    pub name: CompactString,
     pub partition_by: Vec<Expression>,
     pub order_by: Vec<OrderByExpression>,
     pub frame: Option<WindowFrame>,
@@ -1061,7 +1066,7 @@ impl fmt::Display for SimpleTableSource {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AsOfClause {
     pub token: Token,
-    pub as_of_type: String, // "TRANSACTION" or "TIMESTAMP"
+    pub as_of_type: CompactString, // "TRANSACTION" or "TIMESTAMP"
     pub value: Box<Expression>,
 }
 
@@ -1076,7 +1081,7 @@ impl fmt::Display for AsOfClause {
 pub struct JoinTableSource {
     pub token: Token,
     pub left: Box<Expression>,
-    pub join_type: String,
+    pub join_type: CompactString,
     pub right: Box<Expression>,
     pub condition: Option<Box<Expression>>,
     /// USING clause columns (e.g., USING(id, name))
@@ -1217,7 +1222,8 @@ pub enum Statement {
     Truncate(TruncateStatement),
     CreateTable(CreateTableStatement),
     DropTable(DropTableStatement),
-    AlterTable(AlterTableStatement),
+    /// Boxed to reduce enum size (776 bytes unboxed)
+    AlterTable(Box<AlterTableStatement>),
     CreateIndex(CreateIndexStatement),
     DropIndex(DropIndexStatement),
     CreateColumnarIndex(CreateColumnarIndexStatement),
@@ -1228,7 +1234,8 @@ pub enum Statement {
     Commit(CommitStatement),
     Rollback(RollbackStatement),
     Savepoint(SavepointStatement),
-    Set(SetStatement),
+    /// Boxed to reduce enum size (424 bytes unboxed)
+    Set(Box<SetStatement>),
     Pragma(PragmaStatement),
     ShowTables(ShowTablesStatement),
     ShowViews(ShowViewsStatement),
@@ -1549,7 +1556,7 @@ impl fmt::Display for InsertStatement {
 pub struct UpdateStatement {
     pub token: Token,
     pub table_name: Identifier,
-    pub updates: FxHashMap<String, Expression>,
+    pub updates: FxHashMap<CompactString, Expression>,
     pub where_clause: Option<Box<Expression>>,
     /// RETURNING clause expressions
     pub returning: Vec<Expression>,
@@ -1648,7 +1655,7 @@ impl fmt::Display for CreateTableStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDefinition {
     pub name: Identifier,
-    pub data_type: String,
+    pub data_type: CompactString,
     pub constraints: Vec<ColumnConstraint>,
 }
 
@@ -1709,12 +1716,12 @@ impl fmt::Display for TableConstraint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TableConstraint::Unique(cols) => {
-                let col_names: Vec<String> = cols.iter().map(|c| c.value.clone()).collect();
+                let col_names: Vec<&str> = cols.iter().map(|c| c.value.as_str()).collect();
                 write!(f, "UNIQUE({})", col_names.join(", "))
             }
             TableConstraint::Check(expr) => write!(f, "CHECK({})", expr),
             TableConstraint::PrimaryKey(cols) => {
-                let col_names: Vec<String> = cols.iter().map(|c| c.value.clone()).collect();
+                let col_names: Vec<&str> = cols.iter().map(|c| c.value.as_str()).collect();
                 write!(f, "PRIMARY KEY({})", col_names.join(", "))
             }
         }
@@ -1982,7 +1989,7 @@ impl fmt::Display for DropViewStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BeginStatement {
     pub token: Token,
-    pub isolation_level: Option<String>,
+    pub isolation_level: Option<CompactString>,
 }
 
 impl fmt::Display for BeginStatement {
@@ -2181,7 +2188,7 @@ impl fmt::Display for ExplainStatement {
 pub struct AnalyzeStatement {
     pub token: Token,
     /// Table name to analyze (None = analyze all tables)
-    pub table_name: Option<String>,
+    pub table_name: Option<CompactString>,
 }
 
 impl fmt::Display for AnalyzeStatement {
@@ -2240,7 +2247,7 @@ mod tests {
     fn test_string_literal_display() {
         let lit = StringLiteral {
             token: make_token(TokenType::String, "'hello'"),
-            value: "hello".to_string(),
+            value: "hello".into(),
             type_hint: None,
         };
         assert_eq!(lit.to_string(), "'hello'");
@@ -2254,7 +2261,7 @@ mod tests {
                 token: make_token(TokenType::Integer, "1"),
                 value: 1,
             })),
-            "+".to_string(),
+            "+",
             Box::new(Expression::IntegerLiteral(IntegerLiteral {
                 token: make_token(TokenType::Integer, "2"),
                 value: 2,
@@ -2267,7 +2274,7 @@ mod tests {
     fn test_function_call_display() {
         let fc = FunctionCall {
             token: make_token(TokenType::Identifier, "COUNT"),
-            function: "COUNT".to_string(),
+            function: "COUNT".into(),
             arguments: vec![Expression::Star(StarExpression {
                 token: make_token(TokenType::Operator, "*"),
             })],
@@ -2287,15 +2294,14 @@ mod tests {
                 token: make_token(TokenType::Operator, "*"),
             })],
             with: None,
-            table_expr: Some(Box::new(Expression::TableSource(SimpleTableSource {
-                token: make_token(TokenType::Identifier, "users"),
-                name: Identifier::new(
-                    make_token(TokenType::Identifier, "users"),
-                    "users".to_string(),
-                ),
-                alias: None,
-                as_of: None,
-            }))),
+            table_expr: Some(Box::new(Expression::TableSource(Box::new(
+                SimpleTableSource {
+                    token: make_token(TokenType::Identifier, "users"),
+                    name: Identifier::new(make_token(TokenType::Identifier, "users"), "users"),
+                    alias: None,
+                    as_of: None,
+                },
+            )))),
             where_clause: None,
             group_by: GroupByClause::default(),
             having: None,
@@ -2312,26 +2318,17 @@ mod tests {
     fn test_create_table_display() {
         let stmt = CreateTableStatement {
             token: make_token(TokenType::Keyword, "CREATE"),
-            table_name: Identifier::new(
-                make_token(TokenType::Identifier, "users"),
-                "users".to_string(),
-            ),
+            table_name: Identifier::new(make_token(TokenType::Identifier, "users"), "users"),
             if_not_exists: true,
             columns: vec![
                 ColumnDefinition {
-                    name: Identifier::new(
-                        make_token(TokenType::Identifier, "id"),
-                        "id".to_string(),
-                    ),
-                    data_type: "INTEGER".to_string(),
+                    name: Identifier::new(make_token(TokenType::Identifier, "id"), "id"),
+                    data_type: "INTEGER".into(),
                     constraints: vec![ColumnConstraint::PrimaryKey],
                 },
                 ColumnDefinition {
-                    name: Identifier::new(
-                        make_token(TokenType::Identifier, "name"),
-                        "name".to_string(),
-                    ),
-                    data_type: "TEXT".to_string(),
+                    name: Identifier::new(make_token(TokenType::Identifier, "name"), "name"),
+                    data_type: "TEXT".into(),
                     constraints: vec![ColumnConstraint::NotNull],
                 },
             ],
@@ -2348,16 +2345,10 @@ mod tests {
     fn test_insert_statement_display() {
         let stmt = InsertStatement {
             token: make_token(TokenType::Keyword, "INSERT"),
-            table_name: Identifier::new(
-                make_token(TokenType::Identifier, "users"),
-                "users".to_string(),
-            ),
+            table_name: Identifier::new(make_token(TokenType::Identifier, "users"), "users"),
             columns: vec![
-                Identifier::new(make_token(TokenType::Identifier, "id"), "id".to_string()),
-                Identifier::new(
-                    make_token(TokenType::Identifier, "name"),
-                    "name".to_string(),
-                ),
+                Identifier::new(make_token(TokenType::Identifier, "id"), "id"),
+                Identifier::new(make_token(TokenType::Identifier, "name"), "name"),
             ],
             values: vec![vec![
                 Expression::IntegerLiteral(IntegerLiteral {
@@ -2366,7 +2357,7 @@ mod tests {
                 }),
                 Expression::StringLiteral(StringLiteral {
                     token: make_token(TokenType::String, "'Alice'"),
-                    value: "Alice".to_string(),
+                    value: "Alice".into(),
                     type_hint: None,
                 }),
             ]],

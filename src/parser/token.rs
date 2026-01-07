@@ -16,6 +16,7 @@
 //!
 //! This module defines the token types used by the SQL lexer and parser.
 
+use compact_str::CompactString;
 use rustc_hash::FxHashSet;
 use std::fmt;
 use std::sync::LazyLock;
@@ -103,50 +104,48 @@ impl fmt::Display for TokenType {
 }
 
 /// Token represents a lexical token
+///
+/// Uses CompactString for literal to avoid heap allocation for tokens up to 24 bytes
+/// (covers most SQL tokens: keywords, operators, short identifiers, numbers).
+/// For error tokens, the literal field contains the error message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     /// The type of the token
     pub token_type: TokenType,
-    /// The literal string value
-    pub literal: String,
+    /// The literal string value (CompactString inlines strings up to 24 bytes)
+    /// For error tokens, this contains the error message instead.
+    pub literal: CompactString,
     /// The position in the source
     pub position: Position,
-    /// Error message (if token_type is Error)
-    pub error: Option<String>,
 }
 
 impl Token {
     /// Create a new token
-    pub fn new(token_type: TokenType, literal: impl Into<String>, position: Position) -> Self {
+    #[inline]
+    pub fn new(token_type: TokenType, literal: impl AsRef<str>, position: Position) -> Self {
         Self {
             token_type,
-            literal: literal.into(),
+            literal: CompactString::from(literal.as_ref()),
             position,
-            error: None,
         }
     }
 
-    /// Create an error token
-    pub fn error(
-        message: impl Into<String>,
-        literal: impl Into<String>,
-        position: Position,
-    ) -> Self {
+    /// Create an error token (error message is stored in literal field)
+    pub fn error(message: impl AsRef<str>, _literal: impl AsRef<str>, position: Position) -> Self {
         Self {
             token_type: TokenType::Error,
-            literal: literal.into(),
+            literal: CompactString::from(message.as_ref()),
             position,
-            error: Some(message.into()),
         }
     }
 
     /// Create an EOF token
+    #[inline]
     pub fn eof(position: Position) -> Self {
         Self {
             token_type: TokenType::Eof,
-            literal: String::new(),
+            literal: CompactString::const_new(""),
             position,
-            error: None,
         }
     }
 
@@ -179,12 +178,11 @@ impl Token {
 impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.token_type == TokenType::Error {
+            // For error tokens, literal contains the error message
             write!(
                 f,
                 "{}: {} at {}",
-                self.token_type,
-                self.error.as_deref().unwrap_or("unknown error"),
-                self.position
+                self.token_type, self.literal, self.position
             )
         } else if self.token_type == TokenType::Keyword {
             write!(
@@ -487,7 +485,8 @@ mod tests {
     fn test_error_token() {
         let token = Token::error("unexpected character", "x", Position::new(5, 1, 6));
         assert!(token.is_error());
-        assert_eq!(token.error, Some("unexpected character".to_string()));
+        // Error message is stored in literal field
+        assert_eq!(token.literal.as_str(), "unexpected character");
     }
 
     #[test]

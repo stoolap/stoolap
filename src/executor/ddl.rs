@@ -46,7 +46,7 @@ impl Executor {
             if stmt.if_not_exists {
                 return Ok(Box::new(ExecResult::empty()));
             }
-            return Err(Error::TableExists(table_name.clone()));
+            return Err(Error::TableExists(table_name.to_string()));
         }
 
         // Check if a view with the same name exists
@@ -68,7 +68,7 @@ impl Executor {
         }
 
         // Build schema from column definitions
-        let mut schema_builder = SchemaBuilder::new(table_name);
+        let mut schema_builder = SchemaBuilder::new(table_name.as_str());
 
         // Collect columns with UNIQUE constraints to create indexes after table creation
         let mut unique_columns: Vec<String> = Vec::new();
@@ -123,7 +123,7 @@ impl Executor {
 
             // Use add_with_constraints to include DEFAULT and CHECK
             schema_builder = schema_builder.add_with_constraints(
-                col_name,
+                col_name.as_str(),
                 data_type,
                 nullable && !is_primary_key,
                 is_primary_key,
@@ -134,7 +134,7 @@ impl Executor {
 
             // Track UNIQUE columns for index creation
             if is_unique && !is_primary_key {
-                unique_columns.push(col_name.clone());
+                unique_columns.push(col_name.to_string());
             }
         }
 
@@ -144,7 +144,7 @@ impl Executor {
         let mut table_unique_constraints: Vec<Vec<String>> = Vec::new();
         for constraint in &stmt.table_constraints {
             if let TableConstraint::Unique(cols) = constraint {
-                let col_names: Vec<String> = cols.iter().map(|c| c.value.clone()).collect();
+                let col_names: Vec<String> = cols.iter().map(|c| c.value.to_string()).collect();
                 table_unique_constraints.push(col_names);
             }
             // Note: TableConstraint::Check is not yet supported at schema level
@@ -338,7 +338,7 @@ impl Executor {
             if stmt.if_exists {
                 return Ok(Box::new(ExecResult::empty()));
             }
-            return Err(Error::TableNotFoundByName(table_name.clone()));
+            return Err(Error::TableNotFoundByName(table_name.to_string()));
         }
 
         // Check if there's an active transaction
@@ -376,7 +376,7 @@ impl Executor {
 
         // Check if table exists
         if !self.engine.table_exists(table_name)? {
-            return Err(Error::TableNotFoundByName(table_name.clone()));
+            return Err(Error::TableNotFoundByName(table_name.to_string()));
         }
 
         // Check if index already exists
@@ -401,13 +401,16 @@ impl Executor {
         // Validate columns
         for col_id in &stmt.columns {
             let col_name = &col_id.value;
-            if !schema.column_index_map().contains_key(&col_id.value_lower) {
-                return Err(Error::ColumnNotFoundNamed(col_name.clone()));
+            if !schema
+                .column_index_map()
+                .contains_key(col_id.value_lower.as_str())
+            {
+                return Err(Error::ColumnNotFoundNamed(col_name.to_string()));
             }
         }
 
         // Collect column names
-        let column_names: Vec<String> = stmt.columns.iter().map(|c| c.value.clone()).collect();
+        let column_names: Vec<String> = stmt.columns.iter().map(|c| c.value.to_string()).collect();
         let column_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
 
         // Check if IF NOT EXISTS should suppress errors:
@@ -464,7 +467,7 @@ impl Executor {
 
         // Get table name if specified
         let table_name = match &stmt.table_name {
-            Some(t) => t.value.clone(),
+            Some(t) => t.value.to_string(),
             None => {
                 return Err(Error::InvalidArgumentMessage(
                     "DROP INDEX requires table name".to_string(),
@@ -509,7 +512,7 @@ impl Executor {
 
         // Check if table exists
         if !self.engine.table_exists(table_name)? {
-            return Err(Error::TableNotFoundByName(table_name.clone()));
+            return Err(Error::TableNotFoundByName(table_name.to_string()));
         }
 
         // Get the table for modifications

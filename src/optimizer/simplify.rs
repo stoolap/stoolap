@@ -705,8 +705,8 @@ impl ExpressionSimplifier {
     /// Extract column name from identifier expression
     fn extract_column(&self, expr: &Expression) -> Option<String> {
         match expr {
-            Expression::Identifier(id) => Some(id.value.clone()),
-            Expression::QualifiedIdentifier(qid) => Some(qid.name.value.clone()),
+            Expression::Identifier(id) => Some(id.value.to_string()),
+            Expression::QualifiedIdentifier(qid) => Some(qid.name.value.to_string()),
             _ => None,
         }
     }
@@ -811,7 +811,7 @@ mod tests {
         Expression::Infix(InfixExpression {
             token: Token::new(TokenType::Operator, op_str, Position::default()),
             left: Box::new(left),
-            operator: op_str.to_string(),
+            operator: op_str.into(),
             op_type: op,
             right: Box::new(right),
         })

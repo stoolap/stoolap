@@ -67,14 +67,21 @@ static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<FxHashMap<String, Arc<Datab
     std::sync::LazyLock::new(|| RwLock::new(FxHashMap::default()));
 
 /// Inner database state (shared between Database instances with same DSN)
-struct DatabaseInner {
+pub(crate) struct DatabaseInner {
     engine: Arc<MVCCEngine>,
     executor: Mutex<Executor>,
     dsn: String,
 }
 
+/// Type alias for Statement to use (avoids exposing DatabaseInner directly)
+pub(crate) type DatabaseInnerHandle = DatabaseInner;
+
 impl Drop for DatabaseInner {
     fn drop(&mut self) {
+        // Clear all thread-local caches to release references to engine internals
+        // This prevents memory leaks from cached Arc<dyn Index> and closures
+        crate::executor::clear_all_thread_local_caches();
+
         // Close the engine when the last reference is dropped
         let _ = self.engine.close_engine();
     }
@@ -110,9 +117,27 @@ impl Drop for DatabaseInner {
 ///     println!("{}: {}", row.get::<i64>("id")?, row.get::<String>("name")?);
 /// }
 /// ```
-#[derive(Clone)]
 pub struct Database {
     inner: Arc<DatabaseInner>,
+}
+
+impl Clone for Database {
+    fn clone(&self) -> Self {
+        Database {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // If this is the last reference, clear thread-local caches BEFORE
+        // the Arc is dropped. This breaks circular references where caches
+        // hold Arc<dyn Index> or closures that capture engine internals.
+        if Arc::strong_count(&self.inner) == 1 {
+            crate::executor::clear_all_thread_local_caches();
+        }
+    }
 }
 
 impl Database {
@@ -577,7 +602,13 @@ impl Database {
     /// }
     /// ```
     pub fn prepare(&self, sql: &str) -> Result<Statement> {
-        Statement::new(self.clone(), sql.to_string())
+        Statement::new(Arc::downgrade(&self.inner), sql.to_string(), self)
+    }
+
+    /// Create a Database from an existing Arc<DatabaseInner>.
+    /// Used by Statement to upgrade weak references.
+    pub(crate) fn from_inner(inner: Arc<DatabaseInner>) -> Self {
+        Database { inner }
     }
 
     /// Execute a statement with named parameters

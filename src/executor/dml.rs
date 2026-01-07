@@ -24,6 +24,7 @@ use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::traits::{Engine, QueryResult, Table};
 use ahash::AHashMap;
+use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -60,7 +61,7 @@ fn try_extract_literal(expr: &Expression) -> Option<Value> {
     match expr {
         Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
         Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-        Expression::StringLiteral(lit) => Some(Value::text(&lit.value)),
+        Expression::StringLiteral(lit) => Some(Value::text(lit.value.as_str())),
         Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
         Expression::NullLiteral(_) => Some(Value::null_unknown()),
         // Negative numbers: -5, -3.14
@@ -157,12 +158,14 @@ impl Executor {
                 pk_column_name.clone(),
             ))],
             with: None,
-            table_expr: Some(Box::new(Expression::TableSource(SimpleTableSource {
-                token: dummy_token_clone(),
-                name: Identifier::new(dummy_token_clone(), table_name.to_string()),
-                alias: None,
-                as_of: None,
-            }))),
+            table_expr: Some(Box::new(Expression::TableSource(Box::new(
+                SimpleTableSource {
+                    token: dummy_token_clone(),
+                    name: Identifier::new(dummy_token_clone(), table_name.to_string()),
+                    alias: None,
+                    as_of: None,
+                },
+            )))),
             where_clause: Some(Box::new(where_clause.clone())),
             group_by: GroupByClause::default(),
             having: None,
@@ -210,7 +213,7 @@ impl Executor {
                 let table = tx_state.transaction.get_table(table_name)?;
 
                 // Store a reference to this table for commit/rollback
-                if !tx_state.tables.contains_key(table_name) {
+                if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
                         tx_state.transaction.get_table(table_name)?,
@@ -281,9 +284,9 @@ impl Executor {
                     .map(|id| {
                         // Use pre-computed lowercase value from AST
                         col_map
-                            .get(&id.value_lower)
+                            .get(id.value_lower.as_str())
                             .copied()
-                            .ok_or_else(|| Error::ColumnNotFoundNamed(id.value.clone()))
+                            .ok_or_else(|| Error::ColumnNotFoundNamed(id.value.to_string()))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 // Get column types for the specified columns
@@ -635,7 +638,7 @@ impl Executor {
                 let table = tx_state.transaction.get_table(table_name)?;
 
                 // Store a reference to this table for commit/rollback
-                if !tx_state.tables.contains_key(table_name) {
+                if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
                         tx_state.transaction.get_table(table_name)?,
@@ -658,7 +661,7 @@ impl Executor {
         let cached_insert = {
             let cache_read = compiled_cache.read().unwrap();
             if let CompiledExecution::Insert(ref cached) = *cache_read {
-                if cached.cached_epoch == current_epoch && &*cached.table_name == table_name {
+                if cached.cached_epoch == current_epoch && *cached.table_name == table_name {
                     Some(cached.clone())
                 } else {
                     None // Stale cache
@@ -692,14 +695,14 @@ impl Executor {
             let schema_column_count = schema.columns.len();
 
             // Only collect columns that actually have CHECK constraints
-            let check_exprs: Vec<(usize, String, String)> = schema
+            let check_exprs: Vec<(usize, CompactString, CompactString)> = schema
                 .columns
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, c)| {
                     c.check_expr
                         .as_ref()
-                        .map(|expr| (idx, c.name.clone(), expr.clone()))
+                        .map(|expr| (idx, CompactString::new(&c.name), CompactString::new(expr)))
                 })
                 .collect();
 
@@ -728,7 +731,11 @@ impl Executor {
                 // No columns specified - insert into all columns in order
                 let indices: Vec<usize> = (0..schema_column_count).collect();
                 let types = all_column_types.clone();
-                let names = schema.column_names_owned().to_vec();
+                let names: Vec<CompactString> = schema
+                    .columns
+                    .iter()
+                    .map(|c| CompactString::new(&c.name))
+                    .collect();
                 (indices, types, names)
             } else {
                 // Validate columns exist and pre-compute their indices
@@ -738,25 +745,25 @@ impl Executor {
                     .iter()
                     .map(|id| {
                         col_map
-                            .get(&id.value_lower)
+                            .get(id.value_lower.as_str())
                             .copied()
-                            .ok_or_else(|| Error::ColumnNotFoundNamed(id.value.clone()))
+                            .ok_or_else(|| Error::ColumnNotFoundNamed(id.value.to_string()))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let types: Vec<DataType> = indices
                     .iter()
                     .map(|&idx| schema.columns[idx].data_type)
                     .collect();
-                let names: Vec<String> = indices
+                let names: Vec<CompactString> = indices
                     .iter()
-                    .map(|&idx| schema.columns[idx].name.clone())
+                    .map(|&idx| CompactString::new(&schema.columns[idx].name))
                     .collect();
                 (indices, types, names)
             };
 
             // Store in cache for next execution
             let compiled = CompiledInsert {
-                table_name: Arc::from(table_name.as_str()),
+                table_name: CompactString::new(table_name),
                 column_indices: Arc::new(column_indices.clone()),
                 column_types: Arc::new(column_types.clone()),
                 column_names: Arc::new(column_names.clone()),
@@ -959,7 +966,7 @@ impl Executor {
                 let table = tx_state.transaction.get_table(table_name)?;
 
                 // Store a reference to this table for commit/rollback
-                if !tx_state.tables.contains_key(table_name) {
+                if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
                         tx_state.transaction.get_table(table_name)?,
@@ -1006,7 +1013,7 @@ impl Executor {
                     .iter()
                     .map(|(col_name, expr)| {
                         let processed_expr = self.process_where_subqueries(expr, ctx)?;
-                        Ok((col_name.clone(), processed_expr))
+                        Ok((col_name.to_string(), processed_expr))
                     })
                     .collect();
                 Some(processed?)
@@ -1027,7 +1034,7 @@ impl Executor {
                         .filter_map(|(col_name, expr)| {
                             let is_correlated =
                                 Self::has_subqueries(expr) && Self::has_correlated_subqueries(expr);
-                            let col_lower = col_name.to_lowercase();
+                            let col_lower: String = col_name.to_lowercase().into();
                             col_map.get(&col_lower).map(|&idx| {
                                 (
                                     idx,
@@ -1267,7 +1274,7 @@ impl Executor {
                     stmt.updates
                         .iter()
                         .filter_map(|(col_name, expr)| {
-                            let col_lower = col_name.to_lowercase();
+                            let col_lower: String = col_name.to_lowercase().into();
                             col_map.get(&col_lower).and_then(|&idx| {
                                 compile_expression(expr, &column_names)
                                     .ok()
@@ -1396,7 +1403,7 @@ impl Executor {
                 let table = tx_state.transaction.get_table(table_name)?;
 
                 // Store a reference to this table for commit/rollback
-                if !tx_state.tables.contains_key(table_name) {
+                if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
                         tx_state.transaction.get_table(table_name)?,
@@ -1728,7 +1735,7 @@ impl Executor {
                 let table = tx_state.transaction.get_table(table_name)?;
 
                 // Store a reference to this table for commit/rollback
-                if !tx_state.tables.contains_key(table_name) {
+                if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
                         tx_state.transaction.get_table(table_name)?,
@@ -1802,7 +1809,7 @@ impl Executor {
             .zip(stmt.update_expressions.iter())
             .filter_map(|(col, expr)| {
                 col_map
-                    .get(&col.value_lower)
+                    .get(col.value_lower.as_str())
                     .map(|&idx| (idx, schema.columns[idx].data_type, expr))
             })
             .collect();
@@ -2095,10 +2102,10 @@ impl Executor {
     /// Get a column name for a RETURNING expression
     fn get_returning_column_name(expr: &Expression, index: usize) -> String {
         match expr {
-            Expression::Identifier(id) => id.value.clone(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+            Expression::Identifier(id) => id.value.to_string(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
             Expression::Star(_) => "*".to_string(),
-            Expression::Aliased(aliased) => aliased.alias.value.clone(),
+            Expression::Aliased(aliased) => aliased.alias.value.to_string(),
             Expression::FunctionCall(func) => {
                 let args: Vec<String> = func
                     .arguments

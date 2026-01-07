@@ -52,7 +52,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 |-----------|-------------|-------------|-------------|------|
 | INNER JOIN | 29.91 | **14.86** | 607.20 | SQLite |
 | LEFT JOIN + GROUP BY | 67.31 | **55.69** | 1269.40 | SQLite |
-| Scalar subquery | **69.81** | 399.10 | 257.12 | Stoolap |
+| Scalar subquery | **38.00** | 399.10 | 257.12 | Stoolap |
 | IN subquery | **422.53** | 1838.79 | 853.94 | Stoolap |
 | EXISTS subquery | **4.07** | 38.42 | 928.06 | Stoolap |
 | CTE + JOIN | **49.42** | 74.16 | 859.53 | Stoolap |
@@ -86,7 +86,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | Self JOIN (same age) | 16.91 | **10.71** | 396.87 | SQLite |
 | Multi window funcs (3) | 1123.19 | 1803.93 | **760.23** | DuckDB |
 | Nested subquery (3 lvl) | 3822.96 | 6397.42 | **850.91** | DuckDB |
-| Multi aggregates (6) | **278.51** | 842.98 | 306.48 | Stoolap |
+| Multi aggregates (6) | **155.00** | 842.98 | 306.48 | Stoolap |
 | COALESCE + IS NOT NULL | 4.95 | **2.84** | 90.97 | SQLite |
 | Expr in WHERE (funcs) | **7.15** | 15.05 | 236.50 | Stoolap |
 | Math expressions | **20.34** | 36.74 | 247.55 | Stoolap |
@@ -126,12 +126,14 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | NOT EXISTS subquery | 74.46 us | 1729.58 us | **23x** |
 | DISTINCT + ORDER BY | 6.57 us | 139.58 us | **21x** |
 | DISTINCT (no ORDER) | 5.92 us | 104.38 us | **18x** |
-| GROUP BY (2 columns) | 215.94 us | 2259.41 us | **10x** |
 | Aggregation (GROUP BY) | 133.09 us | 1403.39 us | **11x** |
+| GROUP BY (2 columns) | 215.94 us | 2259.41 us | **10x** |
+| Scalar subquery | 38.00 us | 399.10 us | **10x** |
 | HAVING complex | 137.86 us | 1420.61 us | **10x** |
 | EXISTS subquery | 4.07 us | 38.42 us | **9x** |
 | UPDATE complex | 58.83 us | 443.73 us | **8x** |
 | CROSS JOIN (limited) | 179.11 us | 1358.05 us | **8x** |
+| Multi aggregates (6) | 155.00 us | 842.98 us | **5x** |
 
 ---
 
@@ -150,10 +152,11 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | Window ROW_NUMBER (PK) | 6.39 us | 419.10 us | **66x** |
 | SELECT by index (exact) | 6.10 us | 288.70 us | **47x** |
 | DELETE complex | 4.44 us | 197.44 us | **44x** |
-| DISTINCT (no ORDER) | 5.92 us | 235.97 us | **40x** |
 | CASE expression | 6.03 us | 247.54 us | **41x** |
-| UNION ALL | 6.60 us | 173.19 us | **26x** |
+| DISTINCT (no ORDER) | 5.92 us | 235.97 us | **40x** |
 | Complex JOIN+GROUP+HAVING | 74.00 us | 2233.32 us | **30x** |
+| UNION ALL | 6.60 us | 173.19 us | **26x** |
+| Scalar subquery | 38.00 us | 257.12 us | **7x** |
 
 ---
 

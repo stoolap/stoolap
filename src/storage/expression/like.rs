@@ -33,6 +33,15 @@ thread_local! {
     static LIKE_REGEX_CACHE: RefCell<FxHashMap<String, Regex>> = RefCell::new(FxHashMap::default());
 }
 
+/// Clear the thread-local LIKE regex cache to release memory
+pub fn clear_like_regex_cache() {
+    LIKE_REGEX_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+}
+
 /// Get or compile a regex pattern, using thread-local cache
 fn get_or_compile_like_regex(pattern: &str) -> Option<Regex> {
     LIKE_REGEX_CACHE.with(|cache| {

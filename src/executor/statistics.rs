@@ -51,7 +51,7 @@ impl Executor {
         // Get list of tables to analyze
         let tables_to_analyze: Vec<String> = if let Some(ref table_name) = stmt.table_name {
             // Analyze specific table
-            vec![table_name.clone()]
+            vec![table_name.to_string()]
         } else {
             // Analyze all tables - need a transaction to list tables
             let tx = self.engine.begin_transaction()?;

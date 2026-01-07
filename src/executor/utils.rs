@@ -82,7 +82,7 @@ pub fn value_to_expression(v: &Value) -> Expression {
         }),
         Value::Text(s) => Expression::StringLiteral(StringLiteral {
             token: dummy_token(&format!("'{}'", s), TokenType::String),
-            value: s.to_string(),
+            value: s.as_str().into(),
             type_hint: None,
         }),
         Value::Boolean(b) => Expression::BooleanLiteral(BooleanLiteral {
@@ -94,7 +94,7 @@ pub fn value_to_expression(v: &Value) -> Expression {
         }),
         _ => Expression::StringLiteral(StringLiteral {
             token: dummy_token(&format!("'{}'", v), TokenType::String),
-            value: v.to_string(),
+            value: v.to_string().into(),
             type_hint: None,
         }),
     }
@@ -138,7 +138,7 @@ fn substitute_outer_references_inner(
                 return Some(value_to_expression(value));
             }
             // Try just the column name
-            if let Some(value) = outer_row.get(&qid.name.value_lower) {
+            if let Some(value) = outer_row.get(qid.name.value_lower.as_str()) {
                 return Some(value_to_expression(value));
             }
             // Not an outer reference, no change
@@ -147,7 +147,7 @@ fn substitute_outer_references_inner(
 
         // Check unqualified identifiers too
         Expression::Identifier(id) => {
-            if let Some(value) = outer_row.get(&id.value_lower) {
+            if let Some(value) = outer_row.get(id.value_lower.as_str()) {
                 return Some(value_to_expression(value));
             }
             None
@@ -563,9 +563,9 @@ pub fn rows_equal(a: &Row, b: &Row) -> bool {
 #[inline]
 pub fn extract_column_name(expr: &Expression) -> Option<String> {
     match expr {
-        Expression::Identifier(Identifier { value, .. }) => Some(value.clone()),
+        Expression::Identifier(Identifier { value, .. }) => Some(value.to_string()),
         Expression::QualifiedIdentifier(QualifiedIdentifier { name, .. }) => {
-            Some(name.value.clone())
+            Some(name.value.to_string())
         }
         _ => None,
     }
@@ -578,7 +578,7 @@ pub fn extract_literal_value(expr: &Expression) -> Option<Value> {
     match expr {
         Expression::IntegerLiteral(i) => Some(Value::Integer(i.value)),
         Expression::FloatLiteral(f) => Some(Value::Float(f.value)),
-        Expression::StringLiteral(s) => Some(Value::Text(s.value.clone().into())),
+        Expression::StringLiteral(s) => Some(Value::Text(s.value.clone())),
         Expression::BooleanLiteral(b) => Some(Value::Boolean(b.value)),
         Expression::NullLiteral(_) => Some(Value::Null(DataType::Text)),
         _ => None,
@@ -789,7 +789,7 @@ pub fn collect_table_qualifiers(expr: &Expression) -> FxHashSet<String> {
 fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<String>) {
     match expr {
         Expression::QualifiedIdentifier(qi) => {
-            qualifiers.insert(qi.qualifier.value.to_lowercase());
+            qualifiers.insert(qi.qualifier.value_lower.to_string());
         }
         Expression::Infix(infix) => {
             collect_table_qualifiers_impl(&infix.left, qualifiers);
@@ -837,10 +837,10 @@ pub fn get_table_alias_from_expr(expr: &Expression) -> Option<String> {
         Expression::TableSource(ts) => Some(
             ts.alias
                 .as_ref()
-                .map(|a| a.value.clone())
-                .unwrap_or_else(|| ts.name.value.clone()),
+                .map(|a| a.value.to_string())
+                .unwrap_or_else(|| ts.name.value.to_string()),
         ),
-        Expression::SubquerySource(ss) => ss.alias.as_ref().map(|a| a.value.clone()),
+        Expression::SubquerySource(ss) => ss.alias.as_ref().map(|a| a.value.to_string()),
         _ => None,
     }
 }
@@ -851,7 +851,7 @@ pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression
     let alias_lower = table_alias.to_lowercase();
 
     match expr {
-        Expression::QualifiedIdentifier(qi) if qi.qualifier.value.to_lowercase() == alias_lower => {
+        Expression::QualifiedIdentifier(qi) if qi.qualifier.value_lower.as_str() == alias_lower => {
             // Convert to simple identifier
             Expression::Identifier(Identifier::new(
                 qi.name.token.clone(),
@@ -1068,10 +1068,10 @@ pub fn expression_contains_aggregate(expr: &Expression) -> bool {
 #[inline]
 pub fn extract_column_name_with_qualifier(expr: &Expression) -> Option<(Option<String>, String)> {
     match expr {
-        Expression::Identifier(id) => Some((None, id.value_lower.clone())),
+        Expression::Identifier(id) => Some((None, id.value_lower.to_string())),
         Expression::QualifiedIdentifier(qid) => Some((
-            Some(qid.qualifier.value_lower.clone()),
-            qid.name.value_lower.clone(),
+            Some(qid.qualifier.value_lower.to_string()),
+            qid.name.value_lower.to_string(),
         )),
         _ => None,
     }
@@ -1255,7 +1255,7 @@ pub fn string_to_datatype(type_str: &str) -> DataType {
 /// Used for expression alias matching and display purposes.
 pub fn expression_to_string(expr: &Expression) -> String {
     match expr {
-        Expression::Identifier(id) => id.value.clone(),
+        Expression::Identifier(id) => id.value.to_string(),
         Expression::QualifiedIdentifier(qid) => {
             format!("{}.{}", qid.qualifier.value, qid.name.value)
         }
@@ -1383,12 +1383,12 @@ fn expression_contains_column(expr: &Expression, target_lower: &str) -> bool {
     match expr {
         // Direct column reference
         Expression::Identifier(ident) => {
-            let col_lower = ident.value.to_lowercase();
-            col_lower == target_lower || extract_base_column_name(&ident.value) == target_lower
+            ident.value_lower.as_str() == target_lower
+                || extract_base_column_name(&ident.value) == target_lower
         }
         Expression::QualifiedIdentifier(qi) => {
-            let col_lower = qi.name.value.to_lowercase();
-            col_lower == target_lower || extract_base_column_name(&qi.name.value) == target_lower
+            qi.name.value_lower.as_str() == target_lower
+                || extract_base_column_name(&qi.name.value) == target_lower
         }
 
         // Function calls - check all arguments (e.g., LOWER(col), COALESCE(col, 0))
@@ -1687,7 +1687,7 @@ pub fn compute_join_projection(
                     } else {
                         inner_indices.push(idx - outer_col_count);
                     }
-                    output_columns.push(id.value.clone());
+                    output_columns.push(id.value.to_string());
                 } else {
                     // Column not found - cannot push down
                     return None;
@@ -1705,15 +1705,15 @@ pub fn compute_join_projection(
                     }
                     // Output column name is just the column name, not qualified
                     // (SQL standard: SELECT e.name produces column "name", not "e.name")
-                    output_columns.push(qid.name.value.clone());
-                } else if let Some(&idx) = col_index_map.get(&qid.name.value_lower) {
+                    output_columns.push(qid.name.value.to_string());
+                } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
                     // Fall back to unqualified name
                     if idx < outer_col_count {
                         outer_indices.push(idx);
                     } else {
                         inner_indices.push(idx - outer_col_count);
                     }
-                    output_columns.push(qid.name.value.clone());
+                    output_columns.push(qid.name.value.to_string());
                 } else {
                     // Column not found - cannot push down
                     return None;
@@ -1722,7 +1722,7 @@ pub fn compute_join_projection(
 
             Expression::Aliased(aliased) => {
                 // Handle aliased expressions - check if inner is a simple column
-                let alias_name = aliased.alias.value.clone();
+                let alias_name = aliased.alias.value.to_string();
                 match &*aliased.expression {
                     Expression::Identifier(id) => {
                         let col_lower = id.value_lower.as_str();
@@ -1747,7 +1747,8 @@ pub fn compute_join_projection(
                                 inner_indices.push(idx - outer_col_count);
                             }
                             output_columns.push(alias_name);
-                        } else if let Some(&idx) = col_index_map.get(&qid.name.value_lower) {
+                        } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str())
+                        {
                             if idx < outer_col_count {
                                 outer_indices.push(idx);
                             } else {
@@ -2130,7 +2131,7 @@ mod tests {
     fn test_extract_literal_value_string() {
         let expr = Expression::StringLiteral(StringLiteral {
             token: dummy_token("'hello'", TokenType::String),
-            value: "hello".to_string(),
+            value: "hello".into(),
             type_hint: None,
         });
         assert_eq!(
@@ -2369,7 +2370,7 @@ mod tests {
     fn test_expression_contains_aggregate_count() {
         let expr = Expression::FunctionCall(Box::new(FunctionCall {
             token: dummy_token("COUNT", TokenType::Identifier),
-            function: "COUNT".to_string(),
+            function: "COUNT".into(),
             arguments: vec![Expression::Identifier(Identifier::new(
                 dummy_token("*", TokenType::Operator),
                 "*".to_string(),
@@ -2385,7 +2386,7 @@ mod tests {
     fn test_expression_contains_aggregate_non_aggregate() {
         let expr = Expression::FunctionCall(Box::new(FunctionCall {
             token: dummy_token("UPPER", TokenType::Identifier),
-            function: "UPPER".to_string(),
+            function: "UPPER".into(),
             arguments: vec![Expression::Identifier(Identifier::new(
                 dummy_token("name", TokenType::Identifier),
                 "name".to_string(),
@@ -2495,7 +2496,7 @@ mod tests {
         use crate::parser::ast::Parameter;
         let expr = Expression::Parameter(Parameter {
             token: dummy_token("$1", TokenType::Parameter),
-            name: "$1".to_string(),
+            name: "$1".into(),
             index: 1,
         });
         assert!(expression_has_parameters(&expr));
@@ -2519,13 +2520,13 @@ mod tests {
         ));
         let right = Expression::Parameter(Parameter {
             token: dummy_token("$1", TokenType::Parameter),
-            name: "$1".to_string(),
+            name: "$1".into(),
             index: 1,
         });
         let expr = Expression::Infix(InfixExpression::new(
             dummy_token("=", TokenType::Operator),
             Box::new(left),
-            "=".to_string(),
+            "=",
             Box::new(right),
         ));
         assert!(expression_has_parameters(&expr));

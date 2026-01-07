@@ -405,44 +405,44 @@ pub fn extract_column_from_predicate(expr: &Expression) -> Option<String> {
         Expression::Infix(infix) => {
             // Check if left side is a column
             if let Expression::Identifier(id) = &*infix.left {
-                return Some(id.value.clone());
+                return Some(id.value.to_string());
             }
             if let Expression::QualifiedIdentifier(qid) = &*infix.left {
-                return Some(qid.name.value.clone());
+                return Some(qid.name.value.to_string());
             }
             // Check if right side is a column (for reversed comparisons)
             if let Expression::Identifier(id) = &*infix.right {
-                return Some(id.value.clone());
+                return Some(id.value.to_string());
             }
             if let Expression::QualifiedIdentifier(qid) = &*infix.right {
-                return Some(qid.name.value.clone());
+                return Some(qid.name.value.to_string());
             }
             None
         }
         Expression::Between(between) => {
             if let Expression::Identifier(id) = &*between.expr {
-                return Some(id.value.clone());
+                return Some(id.value.to_string());
             }
             if let Expression::QualifiedIdentifier(qid) = &*between.expr {
-                return Some(qid.name.value.clone());
+                return Some(qid.name.value.to_string());
             }
             None
         }
         Expression::In(in_expr) => {
             if let Expression::Identifier(id) = &*in_expr.left {
-                return Some(id.value.clone());
+                return Some(id.value.to_string());
             }
             if let Expression::QualifiedIdentifier(qid) = &*in_expr.left {
-                return Some(qid.name.value.clone());
+                return Some(qid.name.value.to_string());
             }
             None
         }
         Expression::Like(like) => {
             if let Expression::Identifier(id) = &*like.left {
-                return Some(id.value.clone());
+                return Some(id.value.to_string());
             }
             if let Expression::QualifiedIdentifier(qid) = &*like.left {
-                return Some(qid.name.value.clone());
+                return Some(qid.name.value.to_string());
             }
             None
         }
@@ -493,7 +493,7 @@ mod tests {
         Expression::Infix(InfixExpression {
             token: Token::new(TokenType::Operator, "=", Position::new(0, 1, 1)),
             left: Box::new(make_identifier(col)),
-            operator: "=".to_string(),
+            operator: "=".into(),
             op_type: InfixOperator::Equal,
             right: Box::new(make_literal_int(val)),
         })

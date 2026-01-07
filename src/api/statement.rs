@@ -39,9 +39,11 @@
 //! }
 //! ```
 
+use std::sync::Weak;
+
 use crate::core::{Error, Result};
 
-use super::database::{Database, FromValue};
+use super::database::{Database, DatabaseInnerHandle, FromValue};
 use super::params::Params;
 use super::rows::Rows;
 
@@ -53,12 +55,18 @@ use super::rows::Rows;
 ///
 /// # Thread Safety
 ///
-/// Statement holds a reference to the Database and can be used from
+/// Statement holds a weak reference to the Database and can be used from
 /// multiple threads, but each execution is serialized through the
 /// database's executor lock.
+///
+/// # Lifetime
+///
+/// The Statement becomes invalid when the Database is dropped. Attempting
+/// to use a Statement after its Database is dropped will return an error.
 #[derive(Clone)]
 pub struct Statement {
-    db: Database,
+    /// Weak reference to database - doesn't prevent cleanup
+    db_weak: Weak<DatabaseInnerHandle>,
     sql: String,
 }
 
@@ -66,7 +74,11 @@ impl Statement {
     /// Create a new prepared statement
     ///
     /// This validates the SQL syntax by pre-warming the query cache.
-    pub(crate) fn new(db: Database, sql: String) -> Result<Self> {
+    pub(crate) fn new(
+        db_weak: Weak<DatabaseInnerHandle>,
+        sql: String,
+        db: &Database,
+    ) -> Result<Self> {
         // Pre-warm the cache by executing with empty params check
         // This validates the SQL syntax
         {
@@ -79,7 +91,17 @@ impl Statement {
             let _ = executor.query_cache().get(&sql);
         }
 
-        Ok(Self { db, sql })
+        Ok(Self { db_weak, sql })
+    }
+
+    /// Get the database, upgrading the weak reference.
+    /// Returns an error if the database was dropped.
+    #[inline]
+    fn get_db(&self) -> Result<Database> {
+        self.db_weak
+            .upgrade()
+            .map(Database::from_inner)
+            .ok_or_else(|| Error::internal("Database was dropped"))
     }
 
     /// Execute the prepared statement
@@ -94,7 +116,7 @@ impl Statement {
     /// stmt.execute((2, "Bob"))?;
     /// ```
     pub fn execute<P: Params>(&self, params: P) -> Result<i64> {
-        self.db.execute(&self.sql, params)
+        self.get_db()?.execute(&self.sql, params)
     }
 
     /// Query using the prepared statement
@@ -112,7 +134,7 @@ impl Statement {
     /// }
     /// ```
     pub fn query<P: Params>(&self, params: P) -> Result<Rows> {
-        self.db.query(&self.sql, params)
+        self.get_db()?.query(&self.sql, params)
     }
 
     /// Query and return a single value
@@ -124,7 +146,7 @@ impl Statement {
     /// let name: String = stmt.query_one((1,))?;
     /// ```
     pub fn query_one<T: FromValue, P: Params>(&self, params: P) -> Result<T> {
-        self.db.query_one(&self.sql, params)
+        self.get_db()?.query_one(&self.sql, params)
     }
 
     /// Query and return an optional single value
@@ -136,7 +158,7 @@ impl Statement {
     /// let name: Option<String> = stmt.query_opt((999,))?;
     /// ```
     pub fn query_opt<T: FromValue, P: Params>(&self, params: P) -> Result<Option<T>> {
-        self.db.query_opt(&self.sql, params)
+        self.get_db()?.query_opt(&self.sql, params)
     }
 
     /// Get the SQL text of this statement

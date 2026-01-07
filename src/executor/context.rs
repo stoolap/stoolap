@@ -437,6 +437,77 @@ pub fn clear_exists_correlation_cache() {
     });
 }
 
+/// Clear ALL thread-local caches to release memory.
+/// Call this when a database is dropped to prevent memory leaks.
+/// This also shrinks all cache capacities to zero.
+pub fn clear_all_thread_local_caches() {
+    // Clear and shrink all executor caches
+    SCALAR_SUBQUERY_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    IN_SUBQUERY_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    SEMI_JOIN_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    EXISTS_PREDICATE_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    EXISTS_INDEX_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    EXISTS_FETCHER_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    COUNT_COUNTER_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    EXISTS_SCHEMA_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    EXISTS_PRED_KEY_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    BATCH_AGGREGATE_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    BATCH_AGGREGATE_INFO_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    EXISTS_CORRELATION_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+
+    // Clear storage expression caches (regex patterns)
+    crate::storage::expression::clear_regex_cache();
+    crate::storage::expression::clear_like_regex_cache();
+}
+
 /// Get cached EXISTS correlation info by subquery pointer address.
 /// Returns Arc to avoid cloning strings on every lookup.
 #[inline]
