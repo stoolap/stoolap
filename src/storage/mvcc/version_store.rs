@@ -550,67 +550,88 @@ impl VersionStore {
             std::collections::btree_map::Entry::Occupied(mut occupied) => {
                 // Extract existing data from the entry
                 let existing = occupied.get();
-                let existing_version = existing.version.clone();
-                let existing_prev = existing.prev.clone();
                 let existing_arena_idx = existing.arena_idx;
                 let existing_depth = existing.chain_depth;
 
-                // Create new entry with previous version
-                let mut new_version = version;
-                // For deletes, if no data provided, preserve data from current version
-                if new_version.deleted_at_txn_id != 0 && new_version.data.is_empty() {
-                    new_version.data = existing_version.data.clone();
-                }
+                // O(1) chain management with depth tracking
+                // When limit exceeded: drop old chain AND reuse arena slot
+                let new_depth = existing_depth + 1;
+                let can_reuse_arena =
+                    self.max_version_history > 0 && new_depth > self.max_version_history;
 
-                // Mark old arena entry as deleted to avoid double-counting
-                if let Some(old_arena_idx) = existing_arena_idx {
-                    self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
+                // Only clone existing version data when needed:
+                // 1. For delete operations that need to preserve data
+                // 2. When keeping version history (not pruning)
+                let mut new_version = version;
+                if new_version.deleted_at_txn_id != 0 && new_version.data.is_empty() {
+                    // For deletes, preserve data from current version
+                    new_version.data = existing.version.data.clone();
                 }
 
                 // Store in arena (only for non-deleted versions)
-                // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
+                // OPTIMIZATION: Always reuse arena slot - historical data is in prev_chain
                 let arena_idx = if new_version.deleted_at_txn_id == 0 {
                     // Convert Row to Arc once (takes ownership, no copy if already Arc)
                     let arc_data = std::mem::take(&mut new_version.data).into_arc();
-                    // Insert Arc into arena (just Arc::clone, no data copy)
-                    let idx = self.arena.insert_arc(
-                        row_id,
-                        new_version.txn_id,
-                        new_version.create_time,
-                        Arc::clone(&arc_data),
-                    );
+
+                    // Always reuse existing arena slot if available
+                    // Historical versions are stored in prev_chain.version.data
+                    let idx = if let Some(old_idx) = existing_arena_idx {
+                        // Reuse the arena slot - prevents unbounded growth
+                        self.arena.update_at(
+                            old_idx,
+                            row_id,
+                            new_version.txn_id,
+                            new_version.create_time,
+                            Arc::clone(&arc_data),
+                        );
+                        old_idx
+                    } else {
+                        // No existing slot (shouldn't happen for updates), append
+                        self.arena.insert_arc(
+                            row_id,
+                            new_version.txn_id,
+                            new_version.create_time,
+                            Arc::clone(&arc_data),
+                        )
+                    };
+
                     // Reuse the Arc for the version's data - enables O(1) clone on read
                     new_version.data = Row::from_arc_slice(arc_data);
                     // Update row -> arena index mapping
                     self.row_arena_index.write().insert(row_id, idx);
+
                     Some(idx)
                 } else {
-                    None
+                    // Deleted version - mark arena as deleted for visibility
+                    if let Some(old_arena_idx) = existing_arena_idx {
+                        self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
+                    }
+                    existing_arena_idx
                 };
 
-                // O(1) chain management with depth tracking
-                // When limit exceeded: drop old chain (no cloning, truly O(1))
-                let new_depth = existing_depth + 1;
-                let (keep_prev, prev_depth) =
-                    if self.max_version_history > 0 && new_depth > self.max_version_history {
-                        // Exceeded limit - drop old chain (O(1), no cloning)
-                        (None, 0)
-                    } else {
-                        // Under limit - keep chain as-is
-                        (existing_prev, existing_depth)
-                    };
-
-                let prev_chain = Arc::new(VersionChainEntry {
-                    version: existing_version,
-                    prev: keep_prev,
-                    arena_idx: existing_arena_idx,
-                    chain_depth: prev_depth + 1,
-                });
-                let final_depth = prev_depth + 2;
+                // Build version chain entry
+                // When limit exceeded: drop entire history (no prev_chain allocation)
+                // When under limit: create prev_chain with existing version
+                let (final_prev, final_depth) = if can_reuse_arena {
+                    // Exceeded limit - drop all history, no allocation
+                    (None, 1)
+                } else {
+                    // Under limit - clone existing version and create chain
+                    let existing_version = existing.version.clone();
+                    let existing_prev = existing.prev.clone();
+                    let prev_chain = Arc::new(VersionChainEntry {
+                        version: existing_version,
+                        prev: existing_prev,
+                        arena_idx: existing_arena_idx,
+                        chain_depth: existing_depth, // Preserve existing chain depth
+                    });
+                    (Some(prev_chain), existing_depth + 1) // New entry is one deeper
+                };
 
                 let new_entry = VersionChainEntry {
                     version: new_version,
-                    prev: Some(prev_chain),
+                    prev: final_prev,
                     arena_idx,
                     chain_depth: final_depth,
                 };
@@ -678,66 +699,87 @@ impl VersionStore {
                 std::collections::btree_map::Entry::Occupied(mut occupied) => {
                     // Extract existing data from the entry
                     let existing = occupied.get();
-                    let existing_version = existing.version.clone();
-                    let existing_prev = existing.prev.clone();
                     let existing_arena_idx = existing.arena_idx;
                     let existing_depth = existing.chain_depth;
 
-                    // Create new entry with previous version
-                    let mut new_version = version;
-                    // For deletes, if no data provided, preserve data from current version
-                    if new_version.deleted_at_txn_id != 0 && new_version.data.is_empty() {
-                        new_version.data = existing_version.data.clone();
-                    }
+                    // O(1) chain management with depth tracking
+                    // When limit exceeded: drop old chain AND reuse arena slot
+                    let new_depth = existing_depth + 1;
+                    let can_reuse_arena =
+                        self.max_version_history > 0 && new_depth > self.max_version_history;
 
-                    // Mark old arena entry as deleted to avoid double-counting
-                    if let Some(old_arena_idx) = existing_arena_idx {
-                        self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
+                    // Only clone existing version data when needed:
+                    // 1. For delete operations that need to preserve data
+                    // 2. When keeping version history (not pruning)
+                    let mut new_version = version;
+                    if new_version.deleted_at_txn_id != 0 && new_version.data.is_empty() {
+                        // For deletes, preserve data from current version
+                        new_version.data = existing.version.data.clone();
                     }
 
                     // Update arena with Arc reuse for O(1) clones on read
-                    // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
+                    // OPTIMIZATION: Always reuse arena slot - historical data is in prev_chain
                     let arena_idx = if new_version.deleted_at_txn_id == 0 {
                         // Convert Row to Arc once (takes ownership, no copy if already Arc)
                         let arc_data = std::mem::take(&mut new_version.data).into_arc();
-                        // Insert Arc into arena (just Arc::clone, no data copy)
-                        let idx = self.arena.insert_arc(
-                            row_id,
-                            new_version.txn_id,
-                            new_version.create_time,
-                            Arc::clone(&arc_data),
-                        );
+
+                        // Always reuse existing arena slot if available
+                        // Historical versions are stored in prev_chain.version.data
+                        let idx = if let Some(old_idx) = existing_arena_idx {
+                            // Reuse the arena slot - prevents unbounded growth
+                            self.arena.update_at(
+                                old_idx,
+                                row_id,
+                                new_version.txn_id,
+                                new_version.create_time,
+                                Arc::clone(&arc_data),
+                            );
+                            old_idx
+                        } else {
+                            // No existing slot (shouldn't happen for updates), append
+                            self.arena.insert_arc(
+                                row_id,
+                                new_version.txn_id,
+                                new_version.create_time,
+                                Arc::clone(&arc_data),
+                            )
+                        };
+
                         // Reuse the Arc for the version's data
                         new_version.data = Row::from_arc_slice(arc_data);
                         arena_index_updates.push((row_id, idx));
+
                         Some(idx)
                     } else {
-                        None
+                        // Deleted version - mark arena as deleted for visibility
+                        if let Some(old_arena_idx) = existing_arena_idx {
+                            self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
+                        }
+                        existing_arena_idx
                     };
 
-                    // O(1) chain management with depth tracking
-                    // When limit exceeded: drop old chain (no cloning, truly O(1))
-                    let new_depth = existing_depth + 1;
-                    let (keep_prev, prev_depth) =
-                        if self.max_version_history > 0 && new_depth > self.max_version_history {
-                            // Exceeded limit - drop old chain (O(1), no cloning)
-                            (None, 0)
-                        } else {
-                            // Under limit - keep chain as-is
-                            (existing_prev, existing_depth)
-                        };
-
-                    let prev_chain = Arc::new(VersionChainEntry {
-                        version: existing_version,
-                        prev: keep_prev,
-                        arena_idx: existing_arena_idx,
-                        chain_depth: prev_depth + 1,
-                    });
-                    let final_depth = prev_depth + 2;
+                    // Build version chain entry
+                    // When limit exceeded: drop entire history (no prev_chain allocation)
+                    // When under limit: create prev_chain with existing version
+                    let (final_prev, final_depth) = if can_reuse_arena {
+                        // Exceeded limit - drop all history, no allocation
+                        (None, 1)
+                    } else {
+                        // Under limit - clone existing version and create chain
+                        let existing_version = existing.version.clone();
+                        let existing_prev = existing.prev.clone();
+                        let prev_chain = Arc::new(VersionChainEntry {
+                            version: existing_version,
+                            prev: existing_prev,
+                            arena_idx: existing_arena_idx,
+                            chain_depth: existing_depth, // Preserve existing chain depth
+                        });
+                        (Some(prev_chain), existing_depth + 1) // New entry is one deeper
+                    };
 
                     let new_entry = VersionChainEntry {
                         version: new_version,
-                        prev: Some(prev_chain),
+                        prev: final_prev,
                         arena_idx,
                         chain_depth: final_depth,
                     };
@@ -804,55 +846,85 @@ impl VersionStore {
             std::collections::btree_map::Entry::Occupied(mut occupied) => {
                 // Extract existing data from the entry
                 let existing = occupied.get();
-                let existing_version = existing.version.clone();
-                let existing_prev = existing.prev.clone();
                 let existing_arena_idx = existing.arena_idx;
                 let existing_depth = existing.chain_depth;
 
+                // O(1) chain management with depth tracking
+                // When limit exceeded: drop old chain AND reuse arena slot
+                let new_depth = existing_depth + 1;
+                let can_reuse_arena =
+                    self.max_version_history > 0 && new_depth > self.max_version_history;
+
+                // Only clone existing version data when needed:
+                // 1. For delete operations that need to preserve data
+                // 2. When keeping version history (not pruning)
                 let mut new_version = version;
                 if new_version.deleted_at_txn_id != 0 && new_version.data.is_empty() {
-                    new_version.data = existing_version.data.clone();
+                    // For deletes, preserve data from current version
+                    new_version.data = existing.version.data.clone();
                 }
 
-                if let Some(old_arena_idx) = existing_arena_idx {
-                    self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
-                }
-
+                // OPTIMIZATION: Always reuse arena slot - historical data is in prev_chain
                 let arena_idx = if new_version.deleted_at_txn_id == 0 {
                     let arc_data = std::mem::take(&mut new_version.data).into_arc();
-                    let idx = self.arena.insert_arc(
-                        row_id,
-                        new_version.txn_id,
-                        new_version.create_time,
-                        Arc::clone(&arc_data),
-                    );
+
+                    // Always reuse existing arena slot if available
+                    // Historical versions are stored in prev_chain.version.data
+                    let idx = if let Some(old_idx) = existing_arena_idx {
+                        // Reuse the arena slot - prevents unbounded growth
+                        self.arena.update_at(
+                            old_idx,
+                            row_id,
+                            new_version.txn_id,
+                            new_version.create_time,
+                            Arc::clone(&arc_data),
+                        );
+                        old_idx
+                    } else {
+                        // No existing slot (shouldn't happen for updates), append
+                        self.arena.insert_arc(
+                            row_id,
+                            new_version.txn_id,
+                            new_version.create_time,
+                            Arc::clone(&arc_data),
+                        )
+                    };
+
                     new_version.data = Row::from_arc_slice(arc_data);
                     // Update arena index immediately (single row, no batching needed)
                     self.row_arena_index.write().insert(row_id, idx);
+
                     Some(idx)
                 } else {
-                    None
+                    // Deleted version - mark arena as deleted for visibility
+                    if let Some(old_arena_idx) = existing_arena_idx {
+                        self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
+                    }
+                    existing_arena_idx
                 };
 
-                let new_depth = existing_depth + 1;
-                let (keep_prev, prev_depth) =
-                    if self.max_version_history > 0 && new_depth > self.max_version_history {
-                        (None, 0)
-                    } else {
-                        (existing_prev, existing_depth)
-                    };
-
-                let prev_chain = Arc::new(VersionChainEntry {
-                    version: existing_version,
-                    prev: keep_prev,
-                    arena_idx: existing_arena_idx,
-                    chain_depth: prev_depth + 1,
-                });
-                let final_depth = prev_depth + 2;
+                // Build version chain entry
+                // When limit exceeded: drop entire history (no prev_chain allocation)
+                // When under limit: create prev_chain with existing version
+                let (final_prev, final_depth) = if can_reuse_arena {
+                    // Exceeded limit - drop all history, no allocation
+                    (None, 1)
+                } else {
+                    // Under limit - clone existing version and create chain
+                    let existing_version = existing.version.clone();
+                    let existing_prev = existing.prev.clone();
+                    let prev_chain = Arc::new(VersionChainEntry {
+                        version: existing_version,
+                        prev: existing_prev,
+                        arena_idx: existing_arena_idx,
+                        chain_depth: existing_depth, // Preserve existing chain depth
+                    });
+                    (Some(prev_chain), existing_depth + 1) // New entry is one deeper
+                };
 
                 let new_entry = VersionChainEntry {
                     version: new_version,
-                    prev: Some(prev_chain),
+                    prev: final_prev,
                     arena_idx,
                     chain_depth: final_depth,
                 };
@@ -5455,7 +5527,8 @@ mod tests {
 
         store.add_versions_batch(batch);
 
-        // Verify chain is bounded (between 2 and limit+1)
+        // Verify chain is bounded (at most limit+1)
+        // Chain can be as short as 1 right after pruning (when new_depth > limit)
         let versions = store.versions.read();
         let entry = versions.get(&row_id).expect("Row should exist");
 
@@ -5471,7 +5544,9 @@ mod tests {
             "Chain length {} exceeds limit+1 (4) after batch",
             count
         );
-        assert!(count >= 2, "Chain length {} should be at least 2", count);
+        // With consistent logic: after 7 versions with limit 3,
+        // the 7th version triggers pruning (depth 4 > 3), resulting in depth = 1
+        assert!(count >= 1, "Chain length {} should be at least 1", count);
     }
 
     #[test]

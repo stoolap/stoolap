@@ -15,6 +15,7 @@
 //! Fair benchmark comparison: Stoolap vs SQLite for complex SELECT queries
 //!
 //! Run with: cargo bench --bench select_complex
+//! Run with SQLite comparison: cargo bench --bench select_complex --features sqlite
 //!
 //! This benchmark compares complex query patterns:
 //! - SELECT with WHERE + ORDER BY + LIMIT
@@ -25,6 +26,7 @@
 //! - CTEs
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+#[cfg(feature = "sqlite")]
 use rusqlite::Connection;
 use stoolap::Database;
 
@@ -32,10 +34,10 @@ const ROW_COUNT: usize = 10_000;
 
 /// Setup Stoolap database with test data
 fn setup_stoolap() -> Database {
-    let db = Database::open("memory://").unwrap();
+    let db = Database::open_in_memory().unwrap();
 
     db.execute(
-        "CREATE TABLE IF NOT EXISTS users (
+        "CREATE TABLE users (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             email TEXT NOT NULL,
@@ -48,21 +50,10 @@ fn setup_stoolap() -> Database {
     )
     .unwrap();
 
-    db.execute("CREATE INDEX IF NOT EXISTS idx_users_age ON users(age)", ())
+    db.execute("CREATE INDEX idx_users_age ON users(age)", ())
         .unwrap();
-    db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)",
-        (),
-    )
-    .unwrap();
-
-    // Check if data already exists
-    let count_result = db.query("SELECT COUNT(*) FROM users", ()).unwrap();
-    let count_row = count_result.into_iter().next().unwrap().unwrap();
-    let count: i64 = count_row.get(0).unwrap();
-    if count > 0 {
-        return db;
-    }
+    db.execute("CREATE INDEX idx_users_active ON users(active)", ())
+        .unwrap();
 
     let insert_stmt = db
         .prepare("INSERT INTO users (id, name, email, age, balance, active, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
@@ -86,7 +77,7 @@ fn setup_stoolap() -> Database {
 
     // Create orders table for JOIN benchmarks
     db.execute(
-        "CREATE TABLE IF NOT EXISTS orders (
+        "CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             user_id INTEGER NOT NULL,
             amount REAL NOT NULL,
@@ -97,16 +88,10 @@ fn setup_stoolap() -> Database {
     )
     .unwrap();
 
-    db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)",
-        (),
-    )
-    .unwrap();
-    db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
-        (),
-    )
-    .unwrap();
+    db.execute("CREATE INDEX idx_orders_user_id ON orders(user_id)", ())
+        .unwrap();
+    db.execute("CREATE INDEX idx_orders_status ON orders(status)", ())
+        .unwrap();
 
     // Populate orders (3 orders per user on average)
     let insert_order = db
@@ -127,6 +112,7 @@ fn setup_stoolap() -> Database {
 }
 
 /// Setup SQLite database with test data
+#[cfg(feature = "sqlite")]
 fn setup_sqlite() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
 
@@ -204,12 +190,14 @@ fn bench_select_complex(c: &mut Criterion) {
     let mut group = c.benchmark_group("SELECT complex (WHERE+ORDER+LIMIT)");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db
         .prepare("SELECT id, name, balance FROM users WHERE age >= 25 AND age <= 45 AND active = true ORDER BY balance DESC LIMIT 100")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT id, name, balance FROM users WHERE age >= 25 AND age <= 45 AND active = 1 ORDER BY balance DESC LIMIT 100")
         .unwrap();
@@ -223,6 +211,7 @@ fn bench_select_complex(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();
@@ -239,12 +228,14 @@ fn bench_aggregation(c: &mut Criterion) {
     let mut group = c.benchmark_group("Aggregation (GROUP BY)");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db
         .prepare("SELECT age, COUNT(*), AVG(balance) FROM users GROUP BY age")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT age, COUNT(*), AVG(balance) FROM users GROUP BY age")
         .unwrap();
@@ -258,6 +249,7 @@ fn bench_aggregation(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();
@@ -274,12 +266,14 @@ fn bench_inner_join(c: &mut Criterion) {
     let mut group = c.benchmark_group("INNER JOIN");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db
         .prepare("SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.status = 'completed' LIMIT 100")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.status = 'completed' LIMIT 100")
         .unwrap();
@@ -293,6 +287,7 @@ fn bench_inner_join(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();
@@ -309,12 +304,14 @@ fn bench_left_join_with_agg(c: &mut Criterion) {
     let mut group = c.benchmark_group("LEFT JOIN + GROUP BY");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db
         .prepare("SELECT u.name, COUNT(o.id) as order_count, SUM(o.amount) as total FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name LIMIT 100")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT u.name, COUNT(o.id) as order_count, SUM(o.amount) as total FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name LIMIT 100")
         .unwrap();
@@ -328,6 +325,7 @@ fn bench_left_join_with_agg(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();
@@ -344,12 +342,14 @@ fn bench_scalar_subquery(c: &mut Criterion) {
     let mut group = c.benchmark_group("Scalar subquery");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db
         .prepare("SELECT name, balance FROM users WHERE balance > (SELECT AVG(balance) FROM users) LIMIT 100")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT name, balance FROM users WHERE balance > (SELECT AVG(balance) FROM users) LIMIT 100")
         .unwrap();
@@ -363,6 +363,7 @@ fn bench_scalar_subquery(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();
@@ -379,12 +380,14 @@ fn bench_in_subquery(c: &mut Criterion) {
     let mut group = c.benchmark_group("IN subquery");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db
         .prepare("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE status = 'completed') LIMIT 100")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE status = 'completed') LIMIT 100")
         .unwrap();
@@ -398,6 +401,7 @@ fn bench_in_subquery(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();
@@ -414,12 +418,14 @@ fn bench_exists_subquery(c: &mut Criterion) {
     let mut group = c.benchmark_group("EXISTS subquery");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db
         .prepare("SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > 500) LIMIT 100")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > 500) LIMIT 100")
         .unwrap();
@@ -433,6 +439,7 @@ fn bench_exists_subquery(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();
@@ -449,12 +456,14 @@ fn bench_cte(c: &mut Criterion) {
     let mut group = c.benchmark_group("CTE + JOIN");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db
         .prepare("WITH high_value AS (SELECT user_id, SUM(amount) as total FROM orders GROUP BY user_id HAVING SUM(amount) > 1000) SELECT u.name, h.total FROM users u INNER JOIN high_value h ON u.id = h.user_id LIMIT 100")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("WITH high_value AS (SELECT user_id, SUM(amount) as total FROM orders GROUP BY user_id HAVING SUM(amount) > 1000) SELECT u.name, h.total FROM users u INNER JOIN high_value h ON u.id = h.user_id LIMIT 100")
         .unwrap();
@@ -468,6 +477,7 @@ fn bench_cte(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();
@@ -484,12 +494,14 @@ fn bench_window_function(c: &mut Criterion) {
     let mut group = c.benchmark_group("Window ROW_NUMBER");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db
         .prepare("SELECT name, balance, ROW_NUMBER() OVER (ORDER BY balance DESC) as rank FROM users LIMIT 100")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT name, balance, ROW_NUMBER() OVER (ORDER BY balance DESC) as rank FROM users LIMIT 100")
         .unwrap();
@@ -503,6 +515,7 @@ fn bench_window_function(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();
@@ -519,12 +532,14 @@ fn bench_distinct(c: &mut Criterion) {
     let mut group = c.benchmark_group("DISTINCT");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db
         .prepare("SELECT DISTINCT age FROM users")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT DISTINCT age FROM users")
         .unwrap();
@@ -538,6 +553,7 @@ fn bench_distinct(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();
@@ -554,12 +570,14 @@ fn bench_count_distinct(c: &mut Criterion) {
     let mut group = c.benchmark_group("COUNT DISTINCT");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db
         .prepare("SELECT COUNT(DISTINCT age) FROM users")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT COUNT(DISTINCT age) FROM users")
         .unwrap();
@@ -573,6 +591,7 @@ fn bench_count_distinct(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();
@@ -589,10 +608,12 @@ fn bench_full_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("SELECT * (full scan)");
 
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     let stoolap_stmt = stoolap_db.prepare("SELECT * FROM users").unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn.prepare("SELECT * FROM users").unwrap();
 
     group.bench_function("stoolap", |b| {
@@ -604,6 +625,7 @@ fn bench_full_scan(c: &mut Criterion) {
         });
     });
 
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             let mut rows = sqlite_stmt.query([]).unwrap();

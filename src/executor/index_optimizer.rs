@@ -60,7 +60,7 @@ impl Executor {
             Expression::FunctionCall(func) => (func, None),
             Expression::Aliased(aliased) => {
                 if let Expression::FunctionCall(func) = aliased.expression.as_ref() {
-                    (func, Some(aliased.alias.value.clone()))
+                    (func, Some(aliased.alias.value.to_string()))
                 } else {
                     return Ok(None);
                 }
@@ -85,8 +85,8 @@ impl Executor {
         }
 
         let column_name = match &func.arguments[0] {
-            Expression::Identifier(id) => id.value.clone(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+            Expression::Identifier(id) => id.value.to_string(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
             _ => return Ok(None),
         };
 
@@ -134,7 +134,7 @@ impl Executor {
             Expression::FunctionCall(func) => (func, None),
             Expression::Aliased(aliased) => {
                 if let Expression::FunctionCall(func) = aliased.expression.as_ref() {
-                    (func, Some(aliased.alias.value.clone()))
+                    (func, Some(aliased.alias.value.to_string()))
                 } else {
                     return Ok(None);
                 }
@@ -643,12 +643,12 @@ impl Executor {
         expr: &Expression,
         filter: Option<&Expression>,
     ) -> u64 {
-        // Extract table name from expression
-        let table_name = match expr {
-            Expression::TableSource(ts) => ts.name.value.to_lowercase(),
+        // Extract table name from expression (use pre-computed lowercase)
+        let table_name: &str = match expr {
+            Expression::TableSource(ts) => ts.name.value_lower.as_str(),
             Expression::Aliased(aliased) => {
                 if let Expression::TableSource(ts) = aliased.expression.as_ref() {
-                    ts.name.value.to_lowercase()
+                    ts.name.value_lower.as_str()
                 } else {
                     return u64::MAX; // Can't estimate subqueries/complex sources
                 }
@@ -658,7 +658,7 @@ impl Executor {
 
         // Use the planner's estimate_scan_rows for accurate estimation
         self.get_query_planner()
-            .estimate_scan_rows(&table_name, filter)
+            .estimate_scan_rows(table_name, filter)
             .unwrap_or(u64::MAX)
     }
 
@@ -686,8 +686,8 @@ impl Executor {
 
                 let order = &order_by[0];
                 let column_name = match &order.expression {
-                    Expression::Identifier(id) => id.value.clone(),
-                    Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+                    Expression::Identifier(id) => id.value.to_string(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
                     _ => return None, // Complex expression, can't optimize
                 };
 
@@ -727,8 +727,8 @@ impl Executor {
                 // Get PARTITION BY column
                 let partition_col = &window_expr.partition_by[0];
                 let column_name = match partition_col {
-                    Expression::Identifier(id) => id.value.clone(),
-                    Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+                    Expression::Identifier(id) => id.value.to_string(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
                     _ => return None, // Complex expression, can't optimize
                 };
 
@@ -1304,8 +1304,8 @@ impl Executor {
             Expression::In(in_expr) => {
                 // Get the column name from the left side (lowercase for case-insensitive match)
                 let column_name = match in_expr.left.as_ref() {
-                    Expression::Identifier(id) => id.value_lower.clone(),
-                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.clone(),
+                    Expression::Identifier(id) => id.value_lower.to_string(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
                     _ => return None, // Can't optimize complex left expressions
                 };
 
@@ -1372,8 +1372,8 @@ impl Executor {
             Expression::In(in_expr) => {
                 // Get the column name from the left side (lowercase for case-insensitive match)
                 let column_name = match in_expr.left.as_ref() {
-                    Expression::Identifier(id) => id.value_lower.clone(),
-                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.clone(),
+                    Expression::Identifier(id) => id.value_lower.to_string(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
                     _ => return None, // Can't optimize complex left expressions
                 };
 
@@ -1702,8 +1702,8 @@ impl Executor {
             Expression::InHashSet(in_hash) => {
                 // Get the column name from the column expression (lowercase for case-insensitive match)
                 let column_name = match in_hash.column.as_ref() {
-                    Expression::Identifier(id) => id.value_lower.clone(),
-                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.clone(),
+                    Expression::Identifier(id) => id.value_lower.to_string(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
                     _ => return None, // Can't optimize complex column expressions
                 };
 

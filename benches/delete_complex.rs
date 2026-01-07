@@ -15,6 +15,7 @@
 //! Fair benchmark comparison: Stoolap vs SQLite for complex DELETE queries
 //!
 //! Run with: cargo bench --bench delete_complex
+//! Run with SQLite comparison: cargo bench --bench delete_complex --features sqlite
 //!
 //! This benchmark compares complex DELETE patterns:
 //! - DELETE with WHERE + multiple conditions (range + boolean)
@@ -23,6 +24,7 @@
 //! - DELETE with IN subquery
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+#[cfg(feature = "sqlite")]
 use rusqlite::Connection;
 use stoolap::Database;
 
@@ -30,10 +32,10 @@ const ROW_COUNT: usize = 10_000;
 
 /// Setup Stoolap database with test data
 fn setup_stoolap() -> Database {
-    let db = Database::open("memory://").unwrap();
+    let db = Database::open_in_memory().unwrap();
 
     db.execute(
-        "CREATE TABLE IF NOT EXISTS users (
+        "CREATE TABLE users (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             email TEXT NOT NULL,
@@ -46,21 +48,10 @@ fn setup_stoolap() -> Database {
     )
     .unwrap();
 
-    db.execute("CREATE INDEX IF NOT EXISTS idx_users_age ON users(age)", ())
+    db.execute("CREATE INDEX idx_users_age ON users(age)", ())
         .unwrap();
-    db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)",
-        (),
-    )
-    .unwrap();
-
-    // Check if data already exists
-    let count_result = db.query("SELECT COUNT(*) FROM users", ()).unwrap();
-    let count_row = count_result.into_iter().next().unwrap().unwrap();
-    let count: i64 = count_row.get(0).unwrap();
-    if count > 0 {
-        return db;
-    }
+    db.execute("CREATE INDEX idx_users_active ON users(active)", ())
+        .unwrap();
 
     let insert_stmt = db
         .prepare("INSERT INTO users (id, name, email, age, balance, active, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
@@ -84,7 +75,7 @@ fn setup_stoolap() -> Database {
 
     // Create orders table for subquery benchmarks
     db.execute(
-        "CREATE TABLE IF NOT EXISTS orders (
+        "CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             user_id INTEGER NOT NULL,
             amount REAL NOT NULL,
@@ -95,16 +86,10 @@ fn setup_stoolap() -> Database {
     )
     .unwrap();
 
-    db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)",
-        (),
-    )
-    .unwrap();
-    db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
-        (),
-    )
-    .unwrap();
+    db.execute("CREATE INDEX idx_orders_user_id ON orders(user_id)", ())
+        .unwrap();
+    db.execute("CREATE INDEX idx_orders_status ON orders(status)", ())
+        .unwrap();
 
     // Populate orders (3 orders per user on average)
     let insert_order = db
@@ -125,6 +110,7 @@ fn setup_stoolap() -> Database {
 }
 
 /// Setup SQLite database with test data
+#[cfg(feature = "sqlite")]
 fn setup_sqlite() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
 
@@ -225,6 +211,7 @@ fn bench_delete_range_with_boolean(c: &mut Criterion) {
     });
 
     // Benchmark SQLite - fresh database per batch
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter_batched(
             setup_sqlite,
@@ -267,6 +254,7 @@ fn bench_delete_index_range(c: &mut Criterion) {
     });
 
     // Benchmark SQLite - fresh database per batch
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter_batched(
             setup_sqlite,
@@ -308,6 +296,7 @@ fn bench_delete_with_exists(c: &mut Criterion) {
     });
 
     // Benchmark SQLite - fresh database per batch
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter_batched(
             setup_sqlite,
@@ -349,6 +338,7 @@ fn bench_delete_with_in_subquery(c: &mut Criterion) {
     });
 
     // Benchmark SQLite - fresh database per batch
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter_batched(
             setup_sqlite,
@@ -399,6 +389,7 @@ fn bench_delete_full_scan_small(c: &mut Criterion) {
     });
 
     // Benchmark SQLite - fresh database per batch
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter_batched(
             || {

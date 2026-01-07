@@ -1833,8 +1833,8 @@ mod tests {
     fn make_identifier(name: &str) -> Expression {
         Expression::Identifier(Identifier {
             token: dummy_token(),
-            value: name.to_string(),
-            value_lower: name.to_lowercase(),
+            value: name.into(),
+            value_lower: name.to_lowercase().into(),
         })
     }
 
@@ -1857,7 +1857,7 @@ mod tests {
         Expression::Infix(InfixExpression {
             token: dummy_token(),
             left: Box::new(left),
-            operator: op_str.to_string(),
+            operator: op_str.into(),
             op_type: op,
             right: Box::new(right),
         })

@@ -14,6 +14,7 @@
 
 //! Statement parsing methods for the SQL Parser
 
+use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 
 use super::ast::*;
@@ -44,12 +45,16 @@ impl Parser {
                 "TRUNCATE" => self.parse_truncate_statement().map(Statement::Truncate),
                 "CREATE" => self.parse_create_statement(),
                 "DROP" => self.parse_drop_statement(),
-                "ALTER" => self.parse_alter_statement().map(Statement::AlterTable),
+                "ALTER" => self
+                    .parse_alter_statement()
+                    .map(|s| Statement::AlterTable(Box::new(s))),
                 "BEGIN" => self.parse_begin_statement().map(Statement::Begin),
                 "COMMIT" => self.parse_commit_statement().map(Statement::Commit),
                 "ROLLBACK" => self.parse_rollback_statement().map(Statement::Rollback),
                 "SAVEPOINT" => self.parse_savepoint_statement().map(Statement::Savepoint),
-                "SET" => self.parse_set_statement().map(Statement::Set),
+                "SET" => self
+                    .parse_set_statement()
+                    .map(|s| Statement::Set(Box::new(s))),
                 "PRAGMA" => self.parse_pragma_statement().map(Statement::Pragma),
                 "SHOW" => self.parse_show_statement(),
                 "DESCRIBE" | "DESC" => self.parse_describe_statement().map(Statement::Describe),
@@ -469,11 +474,11 @@ impl Parser {
                     ));
                 }
 
-                return Some(Expression::SubquerySource(SubqueryTableSource {
+                return Some(Expression::SubquerySource(Box::new(SubqueryTableSource {
                     token: self.cur_token.clone(),
                     subquery: Box::new(subquery),
                     alias,
-                }));
+                })));
             } else if self.cur_token_is_keyword("VALUES") {
                 // Parse VALUES clause as table source
                 return self.parse_values_table_source();
@@ -567,12 +572,12 @@ impl Parser {
             }
         }
 
-        Some(Expression::TableSource(SimpleTableSource {
+        Some(Expression::TableSource(Box::new(SimpleTableSource {
             token,
             name,
             alias,
             as_of,
-        }))
+        })))
     }
 
     /// Parse a JOIN table expression
@@ -581,13 +586,13 @@ impl Parser {
             // Check for JOIN keywords
             let join_type = if self.peek_token_is_keyword("JOIN") {
                 self.next_token();
-                "INNER".to_string()
+                CompactString::const_new("INNER")
             } else if self.peek_token_is_keyword("INNER") {
                 self.next_token();
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                "INNER".to_string()
+                CompactString::const_new("INNER")
             } else if self.peek_token_is_keyword("LEFT") {
                 self.next_token();
                 if self.peek_token_is_keyword("OUTER") {
@@ -596,7 +601,7 @@ impl Parser {
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                "LEFT".to_string()
+                CompactString::const_new("LEFT")
             } else if self.peek_token_is_keyword("RIGHT") {
                 self.next_token();
                 if self.peek_token_is_keyword("OUTER") {
@@ -605,7 +610,7 @@ impl Parser {
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                "RIGHT".to_string()
+                CompactString::const_new("RIGHT")
             } else if self.peek_token_is_keyword("FULL") {
                 self.next_token();
                 if self.peek_token_is_keyword("OUTER") {
@@ -614,13 +619,13 @@ impl Parser {
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                "FULL".to_string()
+                CompactString::const_new("FULL")
             } else if self.peek_token_is_keyword("CROSS") {
                 self.next_token();
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                "CROSS".to_string()
+                CompactString::const_new("CROSS")
             } else if self.peek_token_is_keyword("NATURAL") {
                 self.next_token();
                 let natural_type = if self.peek_token_is_keyword("LEFT") {
@@ -641,11 +646,11 @@ impl Parser {
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                natural_type.to_string()
+                CompactString::const_new(natural_type)
             } else if self.peek_token_is_punctuator(",") {
                 // Implicit CROSS JOIN with comma syntax: FROM t1, t2
                 self.next_token(); // consume comma
-                "CROSS".to_string()
+                CompactString::const_new("CROSS")
             } else {
                 // No more joins
                 break;
@@ -1105,12 +1110,12 @@ impl Parser {
             }
         }
 
-        Some(Expression::ValuesSource(ValuesTableSource {
+        Some(Expression::ValuesSource(Box::new(ValuesTableSource {
             token,
             rows,
             alias,
             column_aliases,
-        }))
+        })))
     }
 
     /// Parse an UPDATE statement
@@ -2157,15 +2162,15 @@ impl Parser {
                     if self.peek_token_is_keyword("READ") {
                         self.next_token();
                     }
-                    "REPEATABLE READ".to_string()
+                    CompactString::const_new("REPEATABLE READ")
                 }
                 "READ" => {
                     if self.peek_token_is_keyword("UNCOMMITTED") {
                         self.next_token();
-                        "READ UNCOMMITTED".to_string()
+                        CompactString::const_new("READ UNCOMMITTED")
                     } else if self.peek_token_is_keyword("COMMITTED") {
                         self.next_token();
-                        "READ COMMITTED".to_string()
+                        CompactString::const_new("READ COMMITTED")
                     } else {
                         self.add_error(format!(
                             "expected UNCOMMITTED or COMMITTED after READ at {}",

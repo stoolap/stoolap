@@ -704,11 +704,11 @@ impl QueryClassification {
     fn collect_tables_recursive(expr: &Expression, tables: &mut Vec<String>) {
         match expr {
             Expression::Identifier(ident) => {
-                tables.push(ident.value_lower.clone());
+                tables.push(ident.value_lower.to_string());
             }
             Expression::Aliased(aliased) => {
                 // Add alias (use value_lower for case-insensitive matching)
-                tables.push(aliased.alias.value_lower.clone());
+                tables.push(aliased.alias.value_lower.to_string());
                 // Also collect from inner expression
                 Self::collect_tables_recursive(&aliased.expression, tables);
             }
@@ -719,14 +719,14 @@ impl QueryClassification {
             Expression::SubquerySource(subquery) => {
                 // Subquery has an alias, collect it
                 if let Some(ref alias) = subquery.alias {
-                    tables.push(alias.value_lower.clone());
+                    tables.push(alias.value_lower.to_string());
                 }
             }
             Expression::TableSource(table) => {
                 // Add table name and alias if present
-                tables.push(table.name.value_lower.clone());
+                tables.push(table.name.value_lower.to_string());
                 if let Some(ref alias) = table.alias {
-                    tables.push(alias.value_lower.clone());
+                    tables.push(alias.value_lower.to_string());
                 }
             }
             _ => {}

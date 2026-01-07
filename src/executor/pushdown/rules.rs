@@ -520,7 +520,7 @@ impl LikeRule {
 
 fn extract_pattern(expr: &ast::Expression) -> Option<String> {
     match expr {
-        ast::Expression::StringLiteral(s) => Some(s.value.clone()),
+        ast::Expression::StringLiteral(s) => Some(s.value.to_string()),
         _ => None,
     }
 }

@@ -64,6 +64,15 @@ thread_local! {
     static REGEX_CACHE: RefCell<FxHashMap<String, regex::Regex>> = RefCell::new(FxHashMap::default());
 }
 
+/// Clear the thread-local regex cache to release memory
+pub fn clear_regex_cache() {
+    REGEX_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+}
+
 /// Get or compile a regex pattern, using thread-local cache
 fn get_or_compile_regex(pattern: &str) -> regex::Regex {
     REGEX_CACHE.with(|cache| {

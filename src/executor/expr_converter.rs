@@ -367,7 +367,7 @@ mod tests {
     fn make_str(value: &str) -> ast::Expression {
         ast::Expression::StringLiteral(ast::StringLiteral {
             token: dummy_token(value, TokenType::String),
-            value: value.to_string(),
+            value: value.into(),
             type_hint: None,
         })
     }
@@ -377,7 +377,7 @@ mod tests {
         ast::InfixExpression::new(
             dummy_token(op, TokenType::Operator),
             Box::new(left),
-            op.to_string(),
+            op,
             Box::new(right),
         )
     }
@@ -436,7 +436,7 @@ mod tests {
         // Function calls can't be pushed down
         let ast_expr = ast::Expression::FunctionCall(Box::new(ast::FunctionCall {
             token: dummy_token("UPPER", TokenType::Identifier),
-            function: "UPPER".to_string(),
+            function: "UPPER".into(),
             arguments: vec![make_ident("name")],
             is_distinct: false,
             order_by: vec![],

@@ -28,8 +28,10 @@
 
 use std::sync::{Arc, RwLock};
 
+use compact_str::CompactString;
+
 use crate::core::{Result, Row, Schema, Value};
-use crate::parser::ast::{Expression, SelectStatement, SimpleTableSource};
+use crate::parser::ast::{Expression, SelectStatement};
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
@@ -100,14 +102,14 @@ impl Executor {
         }
 
         // Extract table name (must be a simple table reference, not a join or subquery)
-        // Lowercase once here to avoid repeated to_lowercase() calls in storage layer
-        let table_name = match table_expr.as_ref() {
-            Expression::TableSource(SimpleTableSource { name, .. }) => name.value.to_lowercase(),
+        // Use pre-computed lowercase from Identifier (avoids allocation and case conversion)
+        let table_name: &str = match table_expr.as_ref() {
+            Expression::TableSource(ts) => ts.name.value_lower.as_str(),
             _ => return None, // Join, subquery, or other complex source
         };
 
         // Try to extract PK lookup info from WHERE clause
-        let lookup_info = self.extract_pk_lookup_info(&table_name, where_clause, ctx)?;
+        let lookup_info = self.extract_pk_lookup_info(table_name, where_clause, ctx)?;
 
         // Execute the fast-path lookup
         Some(self.execute_pk_lookup(lookup_info))
@@ -199,7 +201,7 @@ impl Executor {
     ) -> Option<(String, i64, PkValueSource)> {
         // Get column name
         let col_name = match col_expr {
-            Expression::Identifier(id) => id.value.clone(),
+            Expression::Identifier(id) => id.value.to_string(),
             Expression::QualifiedIdentifier(q) => format!("{}.{}", q.qualifier, q.name),
             _ => return None,
         };
@@ -410,7 +412,7 @@ impl Executor {
         for (_, row) in rows {
             result_rows.push(Self::normalize_row_to_schema(row, &lookup.schema));
         }
-        // Use Arc columns to avoid clone (O(1) Arc clone vs O(n) Vec clone)
+        // Use Arc columns - O(1) clone since column_names is Arc<Vec<String>>
         Ok(Box::new(ExecutorMemoryResult::with_arc_columns(
             lookup.column_names.clone(),
             result_rows,
@@ -472,9 +474,9 @@ impl Executor {
             return None;
         }
 
-        // Extract table name
-        let table_name = match table_expr.as_ref() {
-            Expression::TableSource(SimpleTableSource { name, .. }) => name.value.to_lowercase(),
+        // Extract table name (use pre-computed lowercase)
+        let table_name: &str = match table_expr.as_ref() {
+            Expression::TableSource(ts) => ts.name.value_lower.as_str(),
             _ => {
                 *compiled_guard = CompiledExecution::NotOptimizable;
                 return None;
@@ -482,14 +484,14 @@ impl Executor {
         };
 
         // Try to extract PK lookup info
-        match self.extract_pk_lookup_info(&table_name, where_clause, ctx) {
+        match self.extract_pk_lookup_info(table_name, where_clause, ctx) {
             Some(info) => {
                 // Build and cache compiled lookup
-                // Use schema's cached column names - O(1) Arc clone
+                // Use schema's column_names_arc() directly - O(1) Arc clone on execution
                 let column_names = info.schema.column_names_arc();
                 let cached_epoch = self.engine.schema_epoch();
                 let compiled_lookup = CompiledPkLookup {
-                    table_name: info.table_name.clone(),
+                    table_name: CompactString::new(&info.table_name),
                     schema: info.schema.clone(),
                     column_names,
                     pk_value_source: info.pk_value_source.clone(),

@@ -282,7 +282,7 @@ mod tests {
     fn make_str(value: &str) -> ast::Expression {
         ast::Expression::StringLiteral(ast::StringLiteral {
             token: dummy_token(),
-            value: value.to_string(),
+            value: value.into(),
             type_hint: None,
         })
     }
@@ -291,7 +291,7 @@ mod tests {
         ast::Expression::Infix(ast::InfixExpression::new(
             dummy_token(),
             Box::new(left),
-            op.to_string(),
+            op,
             Box::new(right),
         ))
     }
@@ -331,7 +331,7 @@ mod tests {
         let schema = test_schema();
         let func = ast::Expression::FunctionCall(Box::new(ast::FunctionCall {
             token: dummy_token(),
-            function: "LENGTH".to_string(),
+            function: "LENGTH".into(),
             arguments: vec![make_ident("name")],
             is_distinct: false,
             order_by: vec![],
@@ -352,7 +352,7 @@ mod tests {
         let pushable = make_infix(make_ident("id"), "=", make_int(1));
         let func = ast::Expression::FunctionCall(Box::new(ast::FunctionCall {
             token: dummy_token(),
-            function: "LENGTH".to_string(),
+            function: "LENGTH".into(),
             arguments: vec![make_ident("name")],
             is_distinct: false,
             order_by: vec![],
@@ -423,7 +423,7 @@ mod tests {
         let expr = ast::Expression::Like(ast::LikeExpression {
             token: dummy_token(),
             left: Box::new(make_ident("name")),
-            operator: "LIKE".to_string(),
+            operator: "LIKE".into(),
             pattern: Box::new(make_str("Ali%")),
             escape: None,
         });
@@ -476,7 +476,7 @@ mod tests {
         let left = make_infix(make_ident("id"), "=", make_int(1));
         let func = ast::Expression::FunctionCall(Box::new(ast::FunctionCall {
             token: dummy_token(),
-            function: "LENGTH".to_string(),
+            function: "LENGTH".into(),
             arguments: vec![make_ident("name")],
             is_distinct: false,
             order_by: vec![],

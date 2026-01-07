@@ -27,6 +27,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use compact_str::CompactString;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::{Error, Result, Row, Value};
@@ -516,15 +517,15 @@ impl Executor {
                     // For correlated subqueries, we need to process per-row with outer context
                     let columns_arc = Arc::clone(&columns);
                     // Extract table alias for qualified column names
-                    let order_table_alias: Option<String> =
+                    let order_table_alias: Option<CompactString> =
                         stmt.table_expr.as_ref().and_then(|te| match te.as_ref() {
                             crate::parser::ast::Expression::TableSource(source) => source
                                 .alias
                                 .as_ref()
-                                .map(|a| a.value.to_lowercase())
-                                .or_else(|| Some(source.name.value.to_lowercase())),
+                                .map(|a| a.value_lower.clone())
+                                .or_else(|| Some(source.name.value_lower.clone())),
                             crate::parser::ast::Expression::Aliased(aliased) => {
-                                Some(aliased.alias.value.to_lowercase())
+                                Some(aliased.alias.value_lower.clone())
                             }
                             _ => None,
                         });
@@ -886,10 +887,10 @@ impl Executor {
             if !passes {
                 // WHERE clause is false, return empty result
                 // Still need to determine column names for the schema
-                let mut columns = Vec::new();
+                let mut columns: Vec<String> = Vec::new();
                 for (i, col_expr) in stmt.columns.iter().enumerate() {
                     let col_name = if let Expression::Aliased(aliased) = col_expr {
-                        aliased.alias.value.clone()
+                        aliased.alias.value.to_string()
                     } else {
                         format!("column{}", i + 1)
                     };
@@ -923,7 +924,7 @@ impl Executor {
         for (i, col_expr) in columns_to_use.iter().enumerate() {
             // Get column name
             let col_name = if let Expression::Aliased(aliased) = col_expr {
-                aliased.alias.value.clone()
+                aliased.alias.value.to_string()
             } else {
                 format!("column{}", i + 1)
             };
@@ -1015,11 +1016,11 @@ impl Executor {
         // Check if any ORDER BY column is not in SELECT
         for ob in &stmt.order_by {
             if let Expression::Identifier(id) = &ob.expression {
-                if !select_columns.contains(&id.value_lower) {
+                if !select_columns.contains(id.value_lower.as_str()) {
                     // Verify this column exists in the table (use eq_ignore_ascii_case to avoid allocation)
                     if all_columns
                         .iter()
-                        .any(|c| c.eq_ignore_ascii_case(&id.value_lower))
+                        .any(|c| c.eq_ignore_ascii_case(id.value_lower.as_str()))
                     {
                         return true;
                     }
@@ -1034,8 +1035,8 @@ impl Executor {
     #[allow(clippy::only_used_in_recursion)]
     fn extract_select_column_name(&self, expr: &Expression) -> Option<String> {
         match expr {
-            Expression::Identifier(id) => Some(id.value.clone()),
-            Expression::QualifiedIdentifier(qid) => Some(qid.name.value.clone()),
+            Expression::Identifier(id) => Some(id.value.to_string()),
+            Expression::QualifiedIdentifier(qid) => Some(qid.name.value.to_string()),
             Expression::Aliased(aliased) => self.extract_select_column_name(&aliased.expression),
             Expression::Star(_) | Expression::QualifiedStar(_) => None, // SELECT * or t.* includes all columns
             _ => None,
@@ -1091,11 +1092,11 @@ impl Executor {
 
         // Get the column name (must be a simple identifier, not an expression)
         let column_name = match &stmt.columns[0] {
-            Expression::Identifier(id) => id.value_lower.clone(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value_lower.clone(),
+            Expression::Identifier(id) => id.value_lower.to_string(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
             Expression::Aliased(aliased) => match &*aliased.expression {
-                Expression::Identifier(id) => id.value_lower.clone(),
-                Expression::QualifiedIdentifier(qid) => qid.name.value_lower.clone(),
+                Expression::Identifier(id) => id.value_lower.to_string(),
+                Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
                 _ => return Ok(None),
             },
             _ => return Ok(None),
@@ -1113,9 +1114,9 @@ impl Executor {
         if let Some(distinct_values) = table.get_partition_values(&column_name) {
             // Build output column name (use alias if present)
             let output_name = match &stmt.columns[0] {
-                Expression::Aliased(aliased) => aliased.alias.value.clone(),
-                Expression::Identifier(id) => id.value.clone(),
-                Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+                Expression::Aliased(aliased) => aliased.alias.value.to_string(),
+                Expression::Identifier(id) => id.value.to_string(),
+                Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
                 _ => column_name,
             };
 
@@ -1195,8 +1196,8 @@ impl Executor {
         let table_alias: Option<String> = table_source
             .alias
             .as_ref()
-            .map(|a| a.value_lower.clone())
-            .or_else(|| Some(table_name.clone()));
+            .map(|a| a.value_lower.to_string())
+            .or_else(|| Some(table_name.to_string()));
 
         // classification is passed from caller to avoid redundant cache lookups
 
@@ -2641,7 +2642,7 @@ impl Executor {
                         .iter()
                         .any(|c| c.eq_ignore_ascii_case(&id.value_lower))
                     {
-                        output_columns.push(id.value.clone());
+                        output_columns.push(id.value.to_string());
                     }
                 }
             }
@@ -3611,7 +3612,7 @@ impl Executor {
                 let using_col_names: Vec<String> = join_source
                     .using_columns
                     .iter()
-                    .map(|c| c.value.to_lowercase())
+                    .map(|c| c.value_lower.to_string())
                     .collect();
 
                 // Find matching column pairs and track excluded right-side columns
@@ -4124,7 +4125,7 @@ impl Executor {
                 }
                 Expression::Identifier(id) => {
                     // Simple column reference
-                    output_columns.push(id.value.clone());
+                    output_columns.push(id.value.to_string());
                     let name_lower = &id.value_lower;
                     if let Some(idx) = view_columns
                         .iter()
@@ -4132,11 +4133,11 @@ impl Executor {
                     {
                         column_indices.push(idx);
                     } else {
-                        return Err(Error::ColumnNotFoundNamed(id.value.clone()));
+                        return Err(Error::ColumnNotFoundNamed(id.value.to_string()));
                     }
                 }
                 Expression::Aliased(aliased) => {
-                    output_columns.push(aliased.alias.value.clone());
+                    output_columns.push(aliased.alias.value.to_string());
                     // Check if inner is a simple identifier
                     if let Expression::Identifier(id) = aliased.expression.as_ref() {
                         let name_lower = &id.value_lower;
@@ -4146,7 +4147,7 @@ impl Executor {
                         {
                             column_indices.push(idx);
                         } else {
-                            return Err(Error::ColumnNotFoundNamed(id.value.clone()));
+                            return Err(Error::ColumnNotFoundNamed(id.value.to_string()));
                         }
                     } else {
                         // Complex expression in alias - need ExprMappedResult
@@ -4189,7 +4190,7 @@ impl Executor {
                         }
                     }
                     Expression::Aliased(aliased) => {
-                        final_output_columns.push(aliased.alias.value.clone());
+                        final_output_columns.push(aliased.alias.value.to_string());
                     }
                     _ => {
                         final_output_columns.push(Self::get_expression_column_name(col));
@@ -4222,7 +4223,7 @@ impl Executor {
                         }
                     }
                     Expression::Aliased(aliased) => {
-                        cols.push(aliased.alias.value.clone());
+                        cols.push(aliased.alias.value.to_string());
                     }
                     _ => {
                         cols.push(Self::get_expression_column_name(col));
@@ -4258,7 +4259,7 @@ impl Executor {
         let table_alias = values_source
             .alias
             .as_ref()
-            .map(|a| a.value.clone())
+            .map(|a| a.value.to_string())
             .unwrap_or_default();
 
         let column_names: Vec<String> = if !values_source.column_aliases.is_empty() {
@@ -4266,7 +4267,7 @@ impl Executor {
             values_source
                 .column_aliases
                 .iter()
-                .map(|id| id.value.clone())
+                .map(|id| id.value.to_string())
                 .collect()
         } else {
             // Generate default column names: column1, column2, ...
@@ -4377,13 +4378,13 @@ impl Executor {
                     projected_columns.extend(column_names_arc.iter().cloned());
                 }
                 Expression::Aliased(a) => {
-                    projected_columns.push(a.alias.value.clone());
+                    projected_columns.push(a.alias.value.to_string());
                 }
                 Expression::Identifier(id) => {
-                    projected_columns.push(id.value.clone());
+                    projected_columns.push(id.value.to_string());
                 }
                 Expression::QualifiedIdentifier(qi) => {
-                    projected_columns.push(qi.name.value.clone());
+                    projected_columns.push(qi.name.value.to_string());
                 }
                 _ => {
                     projected_columns.push(format!("expr{}", i + 1));
@@ -4431,7 +4432,7 @@ impl Executor {
                     col_index_map
                         .get(&key)
                         .copied()
-                        .or_else(|| col_index_map.get(&qi.name.value_lower).copied()),
+                        .or_else(|| col_index_map.get(qi.name.value_lower.as_str()).copied()),
                 );
             } else {
                 qualified_col_indices.push(None);
@@ -4454,7 +4455,7 @@ impl Executor {
                     }
                     Expression::Identifier(id) => {
                         // Use pre-computed lowercase
-                        if let Some(&idx) = col_index_map.get(&id.value_lower) {
+                        if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
                             if let Some(val) = row.get(idx) {
                                 new_values.push(val.clone());
                             } else {
@@ -4791,15 +4792,15 @@ impl Executor {
 
         // Only optimize if we have a limit
         if let Some(limit) = row_limit {
-            let table_name = ts.name.value.to_lowercase();
+            let table_name = ts.name.value_lower.as_str();
 
             // Skip if this is a CTE reference - CTEs are already materialized
-            if ctx.get_cte(&table_name).is_some() {
+            if ctx.get_cte(table_name).is_some() {
                 return self.execute_table_expression_with_filter(expr, ctx, filter);
             }
 
             // Skip if this is a view
-            if self.engine.get_view_lowercase(&table_name)?.is_some() {
+            if self.engine.get_view_lowercase(table_name)?.is_some() {
                 return self.execute_table_expression_with_filter(expr, ctx, filter);
             }
 
@@ -4941,7 +4942,7 @@ impl Executor {
         if select_exprs.len() == 1 {
             if let Expression::QualifiedStar(qs) = &select_exprs[0] {
                 // Compute lowercase once and reuse
-                let qualifier_lower = qs.qualifier.to_lowercase();
+                let qualifier_lower: String = qs.qualifier.to_lowercase().into();
                 let prefix_lower_len = qualifier_lower.len() + 1; // "qualifier."
 
                 // Find indices of columns matching the qualifier (use pre-computed lowercase)
@@ -5037,7 +5038,7 @@ impl Executor {
                 Expression::QualifiedStar(qs) => {
                     // Expand columns for specific table/alias
                     // Compute lowercase once and reuse
-                    let qualifier_lower = qs.qualifier.to_lowercase();
+                    let qualifier_lower: String = qs.qualifier.to_lowercase().into();
                     let mut found_any = false;
                     // Use pre-computed lowercase columns to avoid per-column to_lowercase()
                     for (idx, col_lower) in columns_lower.iter().enumerate() {
@@ -5380,7 +5381,7 @@ impl Executor {
             for arg in &func.arguments {
                 match arg {
                     Expression::Identifier(id) => {
-                        let idx = *col_index_map_lower.get(&id.value_lower)?;
+                        let idx = *col_index_map_lower.get(id.value_lower.as_str())?;
                         args.push(ArgSource::Column(idx));
                     }
                     Expression::QualifiedIdentifier(qid) => {
@@ -5389,7 +5390,9 @@ impl Executor {
                             format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
                         if let Some(&idx) = col_index_map_lower.get(&full_name) {
                             args.push(ArgSource::Column(idx));
-                        } else if let Some(&idx) = col_index_map_lower.get(&qid.name.value_lower) {
+                        } else if let Some(&idx) =
+                            col_index_map_lower.get(qid.name.value_lower.as_str())
+                        {
                             args.push(ArgSource::Column(idx));
                         } else {
                             return None; // Unknown column
@@ -5403,7 +5406,7 @@ impl Executor {
                         args.push(ArgSource::Const(Value::Float(lit.value)));
                     }
                     Expression::StringLiteral(lit) => {
-                        args.push(ArgSource::Const(Value::Text(lit.value.clone().into())));
+                        args.push(ArgSource::Const(Value::Text(lit.value.clone())));
                     }
                     Expression::BooleanLiteral(lit) => {
                         args.push(ArgSource::Const(Value::Boolean(lit.value)));
@@ -5423,12 +5426,14 @@ impl Executor {
             col_index_map_lower: &FxHashMap<String, usize>,
         ) -> Option<usize> {
             match expr {
-                Expression::Identifier(id) => col_index_map_lower.get(&id.value_lower).copied(),
+                Expression::Identifier(id) => {
+                    col_index_map_lower.get(id.value_lower.as_str()).copied()
+                }
                 Expression::QualifiedIdentifier(qid) => {
                     let full = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
                     col_index_map_lower
                         .get(&full)
-                        .or_else(|| col_index_map_lower.get(&qid.name.value_lower))
+                        .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))
                         .copied()
                 }
                 _ => None,
@@ -5442,14 +5447,14 @@ impl Executor {
         ) -> Option<ArgSource> {
             match expr {
                 Expression::Identifier(id) => {
-                    let idx = *col_index_map_lower.get(&id.value_lower)?;
+                    let idx = *col_index_map_lower.get(id.value_lower.as_str())?;
                     Some(ArgSource::Column(idx))
                 }
                 Expression::QualifiedIdentifier(qid) => {
                     let full = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
                     let idx = col_index_map_lower
                         .get(&full)
-                        .or_else(|| col_index_map_lower.get(&qid.name.value_lower))?;
+                        .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))?;
                     Some(ArgSource::Column(*idx))
                 }
                 Expression::IntegerLiteral(lit) => {
@@ -5457,7 +5462,7 @@ impl Executor {
                 }
                 Expression::FloatLiteral(lit) => Some(ArgSource::Const(Value::Float(lit.value))),
                 Expression::StringLiteral(lit) => {
-                    Some(ArgSource::Const(Value::Text(lit.value.clone().into())))
+                    Some(ArgSource::Const(Value::Text(lit.value.clone())))
                 }
                 Expression::BooleanLiteral(lit) => {
                     Some(ArgSource::Const(Value::Boolean(lit.value)))
@@ -5472,7 +5477,7 @@ impl Executor {
             match expr {
                 Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
                 Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-                Expression::StringLiteral(lit) => Some(Value::Text(lit.value.clone().into())),
+                Expression::StringLiteral(lit) => Some(Value::Text(lit.value.clone())),
                 Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
                 Expression::NullLiteral(_) => Some(Value::null_unknown()),
                 _ => None,
@@ -5614,10 +5619,10 @@ impl Executor {
                 Expression::Star(_) => ExprAction::StarExpand,
                 Expression::QualifiedStar(qs) => ExprAction::QualifiedStarExpand {
                     prefix_lower: format!("{}.", qs.qualifier.to_lowercase()),
-                    qualifier_lower: qs.qualifier.to_lowercase(),
+                    qualifier_lower: qs.qualifier.to_lowercase().into(),
                 },
                 Expression::Identifier(id) => {
-                    if let Some(&idx) = col_index_map_lower.get(&id.value_lower) {
+                    if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
                         ExprAction::SimpleColumn(idx)
                     } else {
                         // Unknown identifier - compile as expression (might be alias)
@@ -5630,7 +5635,9 @@ impl Executor {
                         format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
                     if let Some(&idx) = col_index_map_lower.get(&full_name) {
                         ExprAction::SimpleColumn(idx)
-                    } else if let Some(&idx) = col_index_map_lower.get(&qid.name.value_lower) {
+                    } else if let Some(&idx) =
+                        col_index_map_lower.get(qid.name.value_lower.as_str())
+                    {
                         ExprAction::SimpleColumn(idx)
                     } else {
                         let program = compile_expression(expr, all_columns)?;
@@ -5641,7 +5648,7 @@ impl Executor {
                     // Recurse into the inner expression
                     match &*aliased.expression {
                         Expression::Identifier(id) => {
-                            if let Some(&idx) = col_index_map_lower.get(&id.value_lower) {
+                            if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
                                 ExprAction::SimpleColumn(idx)
                             } else {
                                 let program = compile_expression(&aliased.expression, all_columns)?;
@@ -5654,7 +5661,7 @@ impl Executor {
                             if let Some(&idx) = col_index_map_lower.get(&full_name) {
                                 ExprAction::SimpleColumn(idx)
                             } else if let Some(&idx) =
-                                col_index_map_lower.get(&qid.name.value_lower)
+                                col_index_map_lower.get(qid.name.value_lower.as_str())
                             {
                                 ExprAction::SimpleColumn(idx)
                             } else {
@@ -5994,8 +6001,11 @@ impl Executor {
         let mut extra_order_indices: Vec<usize> = Vec::new();
         for ob in order_by {
             if let Expression::Identifier(id) = &ob.expression {
-                if !select_column_names.contains(&id.value_lower) {
-                    if let Some(&idx) = col_index_map_lower.get(&id.value_lower) {
+                if !select_column_names
+                    .iter()
+                    .any(|s| s == id.value_lower.as_str())
+                {
+                    if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
                         if !extra_order_indices.contains(&idx) {
                             extra_order_indices.push(idx);
                         }
@@ -6009,20 +6019,27 @@ impl Executor {
         for expr in select_exprs.iter() {
             match expr {
                 Expression::Identifier(id) => {
-                    select_column_indices.push(col_index_map_lower.get(&id.value_lower).copied());
+                    select_column_indices
+                        .push(col_index_map_lower.get(id.value_lower.as_str()).copied());
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    select_column_indices
-                        .push(col_index_map_lower.get(&qid.name.value_lower).copied());
+                    select_column_indices.push(
+                        col_index_map_lower
+                            .get(qid.name.value_lower.as_str())
+                            .copied(),
+                    );
                 }
                 Expression::Aliased(aliased) => match &*aliased.expression {
                     Expression::Identifier(id) => {
                         select_column_indices
-                            .push(col_index_map_lower.get(&id.value_lower).copied());
+                            .push(col_index_map_lower.get(id.value_lower.as_str()).copied());
                     }
                     Expression::QualifiedIdentifier(qid) => {
-                        select_column_indices
-                            .push(col_index_map_lower.get(&qid.name.value_lower).copied());
+                        select_column_indices.push(
+                            col_index_map_lower
+                                .get(qid.name.value_lower.as_str())
+                                .copied(),
+                        );
                     }
                     _ => select_column_indices.push(None),
                 },
@@ -6110,10 +6127,10 @@ impl Executor {
             // Simple column reference - get from row by index using O(1) HashMap lookup
             Expression::Identifier(id) => {
                 // Use pre-computed value_lower for O(1) lookup - no allocation!
-                if let Some(&idx) = col_index_map.get(&id.value_lower) {
+                if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
                     Ok(row.get(idx).cloned().unwrap_or(Value::null_unknown()))
                 } else {
-                    Err(Error::ColumnNotFoundNamed(id.value.clone()))
+                    Err(Error::ColumnNotFoundNamed(id.value.to_string()))
                 }
             }
             // Qualified identifier (table.column) - O(1) lookup
@@ -6123,7 +6140,7 @@ impl Executor {
                 let full_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
                 if let Some(&idx) = col_index_map.get(&full_name) {
                     Ok(row.get(idx).cloned().unwrap_or(Value::null_unknown()))
-                } else if let Some(&idx) = col_index_map.get(&qid.name.value_lower) {
+                } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
                     // Fallback to unqualified name for single-table queries or aliases
                     Ok(row.get(idx).cloned().unwrap_or(Value::null_unknown()))
                 } else {
@@ -6201,22 +6218,22 @@ impl Executor {
                 _ => {}
             }
             let name = match expr {
-                Expression::Identifier(id) => id.value.clone(),
+                Expression::Identifier(id) => id.value.to_string(),
                 Expression::QualifiedIdentifier(qid) => {
                     // For qualified identifiers, just use the base column name
                     // Ambiguity in output is only an issue if the same base name appears
                     // multiple times in the SELECT clause itself (handled below)
-                    qid.name.value.clone()
+                    qid.name.value.to_string()
                 }
-                Expression::Aliased(aliased) => aliased.alias.value.clone(),
+                Expression::Aliased(aliased) => aliased.alias.value.to_string(),
                 Expression::FunctionCall(func) => {
                     // Use function name as column name
-                    func.function.clone()
+                    func.function.to_string()
                 }
                 Expression::Cast(cast) => {
                     // Try to derive name from inner expression
                     match &*cast.expr {
-                        Expression::Identifier(id) => id.value.clone(),
+                        Expression::Identifier(id) => id.value.to_string(),
                         _ => format!("CAST(expr{})", i + 1),
                     }
                 }
@@ -6255,17 +6272,17 @@ impl Executor {
         for expr in select_exprs {
             match expr {
                 Expression::Identifier(id) => {
-                    if let Some(&idx) = col_index_map.get(&id.value_lower) {
+                    if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
                         indices.push(idx);
-                        names.push(id.value.clone());
+                        names.push(id.value.to_string());
                     } else {
                         return None;
                     }
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    if let Some(&idx) = col_index_map.get(&qid.name.value_lower) {
+                    if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
                         indices.push(idx);
-                        names.push(qid.name.value.clone());
+                        names.push(qid.name.value.to_string());
                     } else {
                         return None;
                     }
@@ -6274,17 +6291,17 @@ impl Executor {
                     // Check if inner expression is simple
                     match &*aliased.expression {
                         Expression::Identifier(id) => {
-                            if let Some(&idx) = col_index_map.get(&id.value_lower) {
+                            if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
                                 indices.push(idx);
-                                names.push(aliased.alias.value.clone());
+                                names.push(aliased.alias.value.to_string());
                             } else {
                                 return None;
                             }
                         }
                         Expression::QualifiedIdentifier(qid) => {
-                            if let Some(&idx) = col_index_map.get(&qid.name.value_lower) {
+                            if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
                                 indices.push(idx);
-                                names.push(aliased.alias.value.clone());
+                                names.push(aliased.alias.value.to_string());
                             } else {
                                 return None;
                             }
@@ -6508,7 +6525,7 @@ impl Executor {
             }
             "SNAPSHOT_INTERVAL" => {
                 let config = self.engine.config();
-                let columns = vec![pragma_name.to_lowercase()];
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
                 if let Some(ref value) = stmt.value {
                     // Set mode: PRAGMA snapshot_interval = 60
@@ -6528,7 +6545,7 @@ impl Executor {
             }
             "KEEP_SNAPSHOTS" => {
                 let config = self.engine.config();
-                let columns = vec![pragma_name.to_lowercase()];
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
                 if let Some(ref value) = stmt.value {
                     let new_value = self.extract_pragma_int_value(value)?;
@@ -6546,7 +6563,7 @@ impl Executor {
             }
             "SYNC_MODE" => {
                 let config = self.engine.config();
-                let columns = vec![pragma_name.to_lowercase()];
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
                 if let Some(ref value) = stmt.value {
                     let new_value = self.extract_pragma_int_value(value)?;
@@ -6573,7 +6590,7 @@ impl Executor {
             }
             "WAL_FLUSH_TRIGGER" => {
                 let config = self.engine.config();
-                let columns = vec![pragma_name.to_lowercase()];
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
                 if let Some(ref value) = stmt.value {
                     let new_value = self.extract_pragma_int_value(value)?;
@@ -6814,11 +6831,13 @@ impl Executor {
         let mut columns = Vec::new();
         for expr in &stmt.columns {
             match expr {
-                Expression::Identifier(id) => columns.push(id.value.clone()),
-                Expression::QualifiedIdentifier(qid) => columns.push(qid.name.value.clone()),
+                Expression::Identifier(id) => columns.push(id.value.to_string()),
+                Expression::QualifiedIdentifier(qid) => columns.push(qid.name.value.to_string()),
                 Expression::Aliased(aliased) => match &*aliased.expression {
-                    Expression::Identifier(id) => columns.push(id.value.clone()),
-                    Expression::QualifiedIdentifier(qid) => columns.push(qid.name.value.clone()),
+                    Expression::Identifier(id) => columns.push(id.value.to_string()),
+                    Expression::QualifiedIdentifier(qid) => {
+                        columns.push(qid.name.value.to_string())
+                    }
                     _ => return Ok(all_columns.to_vec()), // Complex expression - need all columns
                 },
                 Expression::Star(_) | Expression::QualifiedStar(_) => {
@@ -6878,7 +6897,7 @@ impl Executor {
         let mut alias_map = FxHashMap::with_capacity_and_hasher(alias_count, Default::default());
         for col_expr in columns {
             if let Expression::Aliased(aliased) = col_expr {
-                let alias_name = aliased.alias.value_lower.clone();
+                let alias_name = aliased.alias.value_lower.to_string();
                 // Store reference instead of clone - avoids expensive Expression clone/drop
                 alias_map.insert(alias_name, aliased.expression.as_ref());
             }
@@ -6894,7 +6913,7 @@ impl Executor {
         match expr {
             Expression::Identifier(id) => {
                 // Check if this identifier is an alias - use pre-computed lowercase
-                if let Some(original) = alias_map.get(&id.value_lower) {
+                if let Some(original) = alias_map.get(id.value_lower.as_str()) {
                     // Clone only when we actually find an alias match
                     return (*original).clone();
                 }
@@ -6987,12 +7006,12 @@ impl Executor {
     /// Returns a reasonable name based on the expression type.
     fn get_expression_column_name(expr: &Expression) -> String {
         match expr {
-            Expression::Identifier(id) => id.value.clone(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
-            Expression::Aliased(aliased) => aliased.alias.value.clone(),
+            Expression::Identifier(id) => id.value.to_string(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
+            Expression::Aliased(aliased) => aliased.alias.value.to_string(),
             Expression::FunctionCall(func) => {
                 // Use function name as column name
-                func.function.clone()
+                func.function.to_string()
             }
             Expression::Infix(infix) => {
                 // For arithmetic, use the operator as hint
@@ -7009,7 +7028,7 @@ impl Executor {
             Expression::QualifiedStar(qs) => format!("{}.*", qs.qualifier),
             Expression::IntegerLiteral(lit) => format!("{}", lit.value),
             Expression::FloatLiteral(lit) => format!("{}", lit.value),
-            Expression::StringLiteral(lit) => lit.value.clone(),
+            Expression::StringLiteral(lit) => lit.value.to_string(),
             Expression::BooleanLiteral(lit) => format!("{}", lit.value),
             Expression::NullLiteral(_) => "NULL".to_string(),
             _ => "expr".to_string(),
@@ -7155,7 +7174,7 @@ impl Executor {
             Expression::QualifiedIdentifier(qid) => {
                 Some(format!("{}.{}", qid.qualifier.value, qid.name.value))
             }
-            Expression::Identifier(id) => Some(id.value.clone()),
+            Expression::Identifier(id) => Some(id.value.to_string()),
             _ => None,
         }
     }
@@ -7191,15 +7210,15 @@ impl Executor {
         // Extract table name and effective alias from right side
         // Supports: TableSource, Aliased TableSource, and simple SubquerySource
         let (table_name, effective_alias) = match right_expr {
-            Expression::TableSource(ts) => (ts.name.value_lower.clone(), None),
+            Expression::TableSource(ts) => (ts.name.value_lower.to_string(), None),
             Expression::Aliased(aliased) => {
                 match aliased.expression.as_ref() {
-                    Expression::TableSource(ts) => (ts.name.value_lower.clone(), None),
+                    Expression::TableSource(ts) => (ts.name.value_lower.to_string(), None),
                     Expression::SubquerySource(sq) => {
                         // Check if subquery is a simple passthrough
                         if let Some(underlying) = self.extract_simple_subquery_table(&sq.subquery) {
                             // Use the subquery's alias as the effective alias for join condition matching
-                            let alias = sq.alias.as_ref().map(|a| a.value.clone());
+                            let alias = sq.alias.as_ref().map(|a| a.value.to_string());
                             (underlying, alias)
                         } else {
                             return None;
@@ -7211,7 +7230,7 @@ impl Executor {
             Expression::SubquerySource(sq) => {
                 // Check if subquery is a simple passthrough
                 if let Some(underlying) = self.extract_simple_subquery_table(&sq.subquery) {
-                    let alias = sq.alias.as_ref().map(|a| a.value.clone());
+                    let alias = sq.alias.as_ref().map(|a| a.value.to_string());
                     (underlying, alias)
                 } else {
                     return None;
@@ -7364,10 +7383,10 @@ impl Executor {
         // Must have a table expression that is a simple TableSource
         let table_expr = stmt.table_expr.as_ref()?;
         match table_expr.as_ref() {
-            Expression::TableSource(ts) => Some(ts.name.value_lower.clone()),
+            Expression::TableSource(ts) => Some(ts.name.value_lower.to_string()),
             Expression::Aliased(aliased) => {
                 if let Expression::TableSource(ts) = aliased.expression.as_ref() {
-                    Some(ts.name.value_lower.clone())
+                    Some(ts.name.value_lower.to_string())
                 } else {
                     None
                 }
@@ -7421,8 +7440,8 @@ impl Executor {
                     value: *f,
                 }),
                 Value::Text(s) => Expression::StringLiteral(StringLiteral {
-                    token: Token::new(TokenType::String, s.to_string(), Position::default()),
-                    value: s.to_string(),
+                    token: Token::new(TokenType::String, s.as_str(), Position::default()),
+                    value: s.as_str().into(),
                     type_hint: None,
                 }),
                 Value::Boolean(b) => Expression::BooleanLiteral(BooleanLiteral {
@@ -7498,11 +7517,11 @@ impl Executor {
                         } else if let Some(Expression::Star(_)) = fc.arguments.first() {
                             "*".to_string()
                         } else if let Some(Expression::Identifier(id)) = fc.arguments.first() {
-                            id.value_lower.clone()
+                            id.value_lower.to_string()
                         } else {
                             continue; // Skip complex expressions
                         };
-                        result.push((func_upper, col_name, None));
+                        result.push((func_upper.into(), col_name, None));
                     }
                 }
                 Expression::Aliased(aliased) => {
@@ -7514,11 +7533,15 @@ impl Executor {
                             } else if let Some(Expression::Star(_)) = fc.arguments.first() {
                                 "*".to_string()
                             } else if let Some(Expression::Identifier(id)) = fc.arguments.first() {
-                                id.value_lower.clone()
+                                id.value_lower.to_string()
                             } else {
                                 continue; // Skip complex expressions
                             };
-                            result.push((func_upper, col_name, Some(aliased.alias.value.clone())));
+                            result.push((
+                                func_upper.into(),
+                                col_name,
+                                Some(aliased.alias.value.to_string()),
+                            ));
                         }
                     }
                 }
@@ -7556,8 +7579,8 @@ impl Executor {
         }
 
         // Check if GROUP BY is a simple column reference
-        let group_col_name = match &stmt.group_by.columns[0] {
-            Expression::Identifier(id) => id.value_lower.clone(),
+        let group_col_name: String = match &stmt.group_by.columns[0] {
+            Expression::Identifier(id) => id.value_lower.to_string(),
             _ => return Ok(None),
         };
 
@@ -7633,7 +7656,7 @@ impl Executor {
                             let func_upper = fc.function.to_uppercase();
                             aggregations
                                 .iter()
-                                .position(|(name, _, _)| name == &func_upper)
+                                .position(|(name, _, _)| name == func_upper.as_str())
                         }
                         _ => None,
                     };

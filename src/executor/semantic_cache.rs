@@ -1243,9 +1243,8 @@ mod tests {
     fn make_token() -> Token {
         Token {
             token_type: TokenType::Integer,
-            literal: "".to_string(),
+            literal: "".into(),
             position: Position::new(0, 1, 1),
-            error: None,
         }
     }
 

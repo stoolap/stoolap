@@ -97,7 +97,7 @@ use crate::parser::Parser;
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 
-pub use context::{ExecutionContext, TimeoutGuard};
+pub use context::{clear_all_thread_local_caches, ExecutionContext, TimeoutGuard};
 pub use expression::{
     CompileContext, CompileError, CompiledEvaluator, ExecuteContext, ExprCompiler, ExprVM,
     Program as ExprProgram,

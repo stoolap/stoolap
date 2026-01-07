@@ -149,3 +149,25 @@ pub use api::{
     Database, FromRow, FromValue, NamedParams, Params, ResultRow, Rows, Statement, ToParam,
     Transaction as ApiTransaction,
 };
+
+#[cfg(test)]
+mod size_tests {
+    #[test]
+    fn check_ast_sizes() {
+        use std::mem::size_of;
+        println!("\n=== AST Type Sizes ===");
+        println!("Token: {} bytes", size_of::<crate::parser::token::Token>());
+        println!(
+            "Identifier: {} bytes",
+            size_of::<crate::parser::ast::Identifier>()
+        );
+        println!(
+            "Expression: {} bytes",
+            size_of::<crate::parser::ast::Expression>()
+        );
+        println!(
+            "Statement: {} bytes",
+            size_of::<crate::parser::ast::Statement>()
+        );
+    }
+}

@@ -1979,10 +1979,10 @@ mod tests {
             token: dummy_token(">", TokenType::Operator),
             left: Box::new(Expression::Identifier(Identifier {
                 token: dummy_token("value", TokenType::Identifier),
-                value: "value".to_string(),
-                value_lower: "value".to_string(),
+                value: "value".into(),
+                value_lower: "value".into(),
             })),
-            operator: ">".to_string(),
+            operator: ">".into(),
             op_type: InfixOperator::GreaterThan,
             right: Box::new(Expression::IntegerLiteral(IntegerLiteral {
                 token: dummy_token("15", TokenType::Integer),

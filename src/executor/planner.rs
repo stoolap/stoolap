@@ -892,8 +892,8 @@ impl QueryPlanner {
     /// Extract column name from an expression
     fn extract_column_name(&self, expr: &Expression) -> Option<String> {
         match expr {
-            Expression::Identifier(id) => Some(id.value_lower.clone()),
-            Expression::QualifiedIdentifier(qid) => Some(qid.name.value_lower.clone()),
+            Expression::Identifier(id) => Some(id.value_lower.to_string()),
+            Expression::QualifiedIdentifier(qid) => Some(qid.name.value_lower.to_string()),
             _ => None,
         }
     }
@@ -903,7 +903,7 @@ impl QueryPlanner {
         match expr {
             Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
             Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-            Expression::StringLiteral(lit) => Some(Value::Text(lit.value.clone().into())),
+            Expression::StringLiteral(lit) => Some(Value::Text(lit.value.to_string().into())),
             Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
             Expression::NullLiteral(_) => None, // NULL doesn't have a comparable value
             _ => None,
@@ -913,7 +913,7 @@ impl QueryPlanner {
     /// Extract string value from an expression
     fn extract_string_value(&self, expr: &Expression) -> Option<String> {
         match expr {
-            Expression::StringLiteral(lit) => Some(lit.value.clone()),
+            Expression::StringLiteral(lit) => Some(lit.value.to_string()),
             _ => None,
         }
     }

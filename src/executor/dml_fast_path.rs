@@ -24,6 +24,8 @@
 
 use std::sync::{Arc, RwLock};
 
+use compact_str::CompactString;
+
 use crate::core::{Result, Row, Value};
 use crate::parser::ast::{DeleteStatement, Expression, UpdateStatement};
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpression};
@@ -179,8 +181,8 @@ impl Executor {
     ) -> Option<(String, i64, PkValueSource)> {
         // Get column name
         let col_name = match col_expr {
-            Expression::Identifier(id) => id.value.clone(),
-            Expression::QualifiedIdentifier(q) => q.name.value.clone(),
+            Expression::Identifier(id) => id.value.to_string(),
+            Expression::QualifiedIdentifier(q) => q.name.value.to_string(),
             _ => return None,
         };
 
@@ -328,7 +330,7 @@ impl Executor {
 
         // Build WHERE expression for PK lookup
         let mut pk_expr = ComparisonExpr::new(
-            &compiled.pk_column_name,
+            compiled.pk_column_name.as_str(),
             crate::core::Operator::Eq,
             Value::Integer(pk_value),
         );
@@ -377,7 +379,7 @@ impl Executor {
 
         // Build WHERE expression for PK lookup using cached column name
         let mut pk_expr = ComparisonExpr::new(
-            &compiled.pk_column_name,
+            compiled.pk_column_name.as_str(),
             crate::core::Operator::Eq,
             Value::Integer(pk_value),
         );
@@ -437,7 +439,7 @@ impl Executor {
 
         // Build WHERE expression for PK lookup using cached schema and column name
         let mut pk_expr = ComparisonExpr::new(
-            &compiled.pk_column_name,
+            compiled.pk_column_name.as_str(),
             crate::core::Operator::Eq,
             Value::Integer(pk_value),
         );
@@ -529,7 +531,7 @@ impl Executor {
         let mut compiled_updates = Vec::with_capacity(stmt.updates.len());
         for (col_name, expr) in &stmt.updates {
             let col_lower = col_name.to_lowercase();
-            let col_idx = match col_map.get(&col_lower) {
+            let col_idx = match col_map.get(col_lower.as_str()) {
                 Some(&idx) => idx,
                 None => {
                     *compiled_guard = CompiledExecution::NotOptimizable;
@@ -555,9 +557,9 @@ impl Executor {
 
         // Build compiled state
         let compiled_update = CompiledPkUpdate {
-            table_name: table_name.clone(),
+            table_name: CompactString::new(table_name),
             schema: Arc::new((*schema).clone()),
-            pk_column_name: pk_column.clone(),
+            pk_column_name: CompactString::new(pk_column),
             pk_value_source: pk_source,
             updates: compiled_updates,
             cached_epoch: self.engine.schema_epoch(),
@@ -630,9 +632,9 @@ impl Executor {
 
         // Build compiled state
         let compiled_delete = CompiledPkDelete {
-            table_name: table_name.clone(),
+            table_name: CompactString::new(table_name),
             schema: Arc::new((*schema).clone()),
-            pk_column_name: pk_column.clone(),
+            pk_column_name: CompactString::new(pk_column),
             pk_value_source: pk_source,
             cached_epoch: self.engine.schema_epoch(),
         };
@@ -654,7 +656,7 @@ impl Executor {
                 Some(UpdateValueSource::Literal(Value::Float(lit.value)))
             }
             Expression::StringLiteral(lit) => {
-                Some(UpdateValueSource::Literal(Value::text(&lit.value)))
+                Some(UpdateValueSource::Literal(Value::text(lit.value.as_str())))
             }
             Expression::BooleanLiteral(lit) => {
                 Some(UpdateValueSource::Literal(Value::Boolean(lit.value)))

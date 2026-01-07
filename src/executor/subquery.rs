@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
+use compact_str::CompactString;
 
 use crate::core::{Error, Result, Value};
 use crate::parser::ast::*;
@@ -273,7 +274,7 @@ impl Executor {
                     })),
                     crate::core::Value::Text(s) => Ok(Expression::StringLiteral(StringLiteral {
                         token: dummy_token(&format!("'{}'", s), TokenType::String),
-                        value: s.to_string(),
+                        value: s.as_str().into(),
                         type_hint: None,
                     })),
                     crate::core::Value::Boolean(b) => {
@@ -290,7 +291,7 @@ impl Executor {
                     })),
                     _ => Ok(Expression::StringLiteral(StringLiteral {
                         token: dummy_token(&format!("'{}'", value), TokenType::String),
-                        value: value.to_string(),
+                        value: value.to_string().into(),
                         type_hint: None,
                     })),
                 }
@@ -613,10 +614,12 @@ impl Executor {
         let where_clause = subquery.where_clause.as_ref()?;
 
         // Extract correlation condition
-        let inner_tables = vec![inner_alias
+        let inner_table_lower: String = inner_alias
             .clone()
             .unwrap_or_else(|| inner_table.to_lowercase())
-            .to_lowercase()];
+            .to_lowercase()
+            .into();
+        let inner_tables = vec![inner_table_lower];
 
         Self::extract_correlation_for_index(where_clause, &inner_tables, &inner_table)
     }
@@ -854,7 +857,7 @@ impl Executor {
             Expression::FunctionCall(func) => {
                 let name = func.function.to_uppercase();
                 if matches!(name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
-                    Some(name)
+                    Some(name.into())
                 } else {
                     None
                 }
@@ -1020,10 +1023,11 @@ impl Executor {
 
         // Build the batch aggregate query:
         // SELECT correlation_column, AGG(...) FROM table GROUP BY correlation_column
+        let inner_col_val: CompactString = correlation.inner_column.clone().into();
         let inner_col_expr = Expression::Identifier(Identifier {
             token: dummy_token(&correlation.inner_column, TokenType::Identifier),
-            value: correlation.inner_column.clone(),
-            value_lower: correlation.inner_column.to_lowercase(),
+            value: inner_col_val.clone(),
+            value_lower: inner_col_val.to_lowercase(),
         });
 
         // Clone the aggregate expression from the original subquery
@@ -1165,16 +1169,16 @@ impl Executor {
     fn get_inner_column_name(expr: &Expression, inner_tables: &[String]) -> Option<String> {
         match expr {
             Expression::QualifiedIdentifier(qid) => {
-                let table = qid.qualifier.value.to_lowercase();
-                if inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table)) {
-                    Some(qid.name.value.clone())
+                let table = qid.qualifier.value_lower.as_str();
+                if inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table)) {
+                    Some(qid.name.value.to_string())
                 } else {
                     None
                 }
             }
             Expression::Identifier(id) => {
                 // Unqualified identifier assumed to be inner if in context
-                Some(id.value.clone())
+                Some(id.value.to_string())
             }
             _ => None,
         }
@@ -1188,10 +1192,13 @@ impl Executor {
     ) -> Option<(String, Option<String>)> {
         match expr {
             Expression::QualifiedIdentifier(qid) => {
-                let table = qid.qualifier.value.to_lowercase();
+                let table = qid.qualifier.value_lower.as_str();
                 // If NOT in inner_tables, it's an outer reference
-                if !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table)) {
-                    Some((qid.name.value.clone(), Some(qid.qualifier.value.clone())))
+                if !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table)) {
+                    Some((
+                        qid.name.value.to_string(),
+                        Some(qid.qualifier.value.to_string()),
+                    ))
                 } else {
                     None
                 }
@@ -1206,9 +1213,9 @@ impl Executor {
     fn expression_has_outer_reference(expr: &Expression, inner_tables: &[String]) -> bool {
         match expr {
             Expression::QualifiedIdentifier(qid) => {
-                let table = qid.qualifier.value.to_lowercase();
+                let table = qid.qualifier.value_lower.as_str();
                 // If NOT in inner_tables, it's an outer reference
-                !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(&table))
+                !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
             }
             Expression::Infix(infix) => {
                 Self::expression_has_outer_reference(&infix.left, inner_tables)
@@ -2177,9 +2184,9 @@ impl Executor {
                 // not the original table name. So for `FROM t t2`, only `t2` is valid.
                 // If there's no alias, use the table name.
                 if let Some(ref alias) = ts.alias {
-                    tables.push(alias.value.to_lowercase());
+                    tables.push(alias.value_lower.to_string());
                 } else {
-                    tables.push(ts.name.value.to_lowercase());
+                    tables.push(ts.name.value_lower.to_string());
                 }
             }
             Expression::JoinSource(js) => {
@@ -2189,7 +2196,7 @@ impl Executor {
             Expression::SubquerySource(ss) => {
                 // Subquery source has an optional alias
                 if let Some(ref alias) = ss.alias {
-                    tables.push(alias.value.to_lowercase());
+                    tables.push(alias.value_lower.to_string());
                 }
             }
             _ => {}
@@ -2398,22 +2405,23 @@ impl Executor {
         let subquery = &exists.subquery;
 
         // 1. Check for simple table source (not a join)
-        let (inner_table, inner_alias) = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
-            Some(Expression::TableSource(ts)) => {
-                let alias = ts.alias.as_ref().map(|a| a.value.clone());
-                (ts.name.value.clone(), alias)
-            }
-            _ => return None, // Can't optimize subquery joins or derived tables
-        };
+        let (inner_table, inner_alias): (String, Option<String>) =
+            match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
+                Some(Expression::TableSource(ts)) => {
+                    let alias = ts.alias.as_ref().map(|a| a.value.to_string());
+                    (ts.name.value.to_string(), alias)
+                }
+                _ => return None, // Can't optimize subquery joins or derived tables
+            };
 
         // 2. Parse WHERE clause to find correlation condition
         let where_clause = subquery.where_clause.as_ref()?;
 
         // Get inner table identifiers for distinguishing inner vs outer references
-        let inner_tables = vec![inner_alias
+        let inner_table_lower: String = inner_alias
             .clone()
-            .unwrap_or_else(|| inner_table.to_lowercase())
-            .to_lowercase()];
+            .unwrap_or_else(|| inner_table.to_lowercase());
+        let inner_tables = vec![inner_table_lower.to_lowercase()];
 
         // Try to extract: outer.col = inner.col (or inner.col = outer.col)
         let extraction =
@@ -2529,12 +2537,15 @@ impl Executor {
         match expr {
             Expression::QualifiedIdentifier(qid) => {
                 // Use pre-computed value_lower to avoid allocation
-                let table = &qid.qualifier.value_lower;
+                let table = qid.qualifier.value_lower.as_str();
                 // Must be in outer tables and NOT in inner tables
                 if outer_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
                     && !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
                 {
-                    Some((qid.name.value.clone(), Some(qid.qualifier.value.clone())))
+                    Some((
+                        qid.name.value.to_string(),
+                        Some(qid.qualifier.value.to_string()),
+                    ))
                 } else {
                     None
                 }
@@ -2550,9 +2561,9 @@ impl Executor {
         match expr {
             Expression::QualifiedIdentifier(qid) => {
                 // Use pre-computed value_lower to avoid allocation
-                let table = &qid.qualifier.value_lower;
+                let table = qid.qualifier.value_lower.as_str();
                 if inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table)) {
-                    Some(qid.name.value.clone())
+                    Some(qid.name.value.to_string())
                 } else {
                     None
                 }
@@ -2560,7 +2571,7 @@ impl Executor {
             Expression::Identifier(id) => {
                 // Unqualified identifier - assume it's inner table column
                 // This is safe because outer refs should be qualified in correlated subqueries
-                Some(id.value.clone())
+                Some(id.value.to_string())
             }
             _ => None,
         }
@@ -2660,7 +2671,7 @@ impl Executor {
                 Some(Arc::new(Expression::Infix(InfixExpression {
                     token: dummy_token_clone(),
                     left: Box::new(left_expr),
-                    operator: "AND".to_string(),
+                    operator: "AND".into(),
                     op_type: InfixOperator::And,
                     right: Box::new(right.clone()),
                 })))
@@ -2798,7 +2809,7 @@ impl Executor {
             info.inner_column.clone(),
         ));
 
-        let table_source = Expression::TableSource(SimpleTableSource {
+        let table_source = Expression::TableSource(Box::new(SimpleTableSource {
             token: dummy_token_clone(),
             name: Identifier::new(dummy_token_clone(), info.inner_table.clone()),
             alias: info
@@ -2806,7 +2817,7 @@ impl Executor {
                 .as_ref()
                 .map(|a| Identifier::new(dummy_token_clone(), a.clone())),
             as_of: None,
-        });
+        }));
 
         let select_stmt = SelectStatement {
             token: dummy_token_clone(),
@@ -3119,7 +3130,7 @@ impl Executor {
                         Ok(Some(Expression::Infix(InfixExpression {
                             token: dummy_token_clone(),
                             left: Box::new(new_left),
-                            operator: "AND".to_string(),
+                            operator: "AND".into(),
                             op_type: InfixOperator::And,
                             right: Box::new(new_right),
                         })))
@@ -3127,14 +3138,14 @@ impl Executor {
                     (Some(new_left), None) => Ok(Some(Expression::Infix(InfixExpression {
                         token: dummy_token_clone(),
                         left: Box::new(new_left),
-                        operator: "AND".to_string(),
+                        operator: "AND".into(),
                         op_type: InfixOperator::And,
                         right: infix.right.clone(),
                     }))),
                     (None, Some(new_right)) => Ok(Some(Expression::Infix(InfixExpression {
                         token: dummy_token_clone(),
                         left: infix.left.clone(),
-                        operator: "AND".to_string(),
+                        operator: "AND".into(),
                         op_type: InfixOperator::And,
                         right: Box::new(new_right),
                     }))),
@@ -3163,7 +3174,7 @@ impl Executor {
                         Ok(Some(Expression::Infix(InfixExpression {
                             token: dummy_token_clone(),
                             left: Box::new(new_left),
-                            operator: "OR".to_string(),
+                            operator: "OR".into(),
                             op_type: InfixOperator::Or,
                             right: Box::new(new_right),
                         })))
@@ -3171,14 +3182,14 @@ impl Executor {
                     (Some(new_left), None) => Ok(Some(Expression::Infix(InfixExpression {
                         token: dummy_token_clone(),
                         left: Box::new(new_left),
-                        operator: "OR".to_string(),
+                        operator: "OR".into(),
                         op_type: InfixOperator::Or,
                         right: infix.right.clone(),
                     }))),
                     (None, Some(new_right)) => Ok(Some(Expression::Infix(InfixExpression {
                         token: dummy_token_clone(),
                         left: infix.left.clone(),
-                        operator: "OR".to_string(),
+                        operator: "OR".into(),
                         op_type: InfixOperator::Or,
                         right: Box::new(new_right),
                     }))),
@@ -3325,11 +3336,12 @@ impl Executor {
         outer_tables: &[String],
     ) -> Option<SemiJoinInfo> {
         // 1. Extract outer column from left side of IN
-        let (outer_column, outer_table) = match in_expr.left.as_ref() {
-            Expression::QualifiedIdentifier(qid) => {
-                (qid.name.value.clone(), Some(qid.qualifier.value.clone()))
-            }
-            Expression::Identifier(id) => (id.value.clone(), None),
+        let (outer_column, outer_table): (String, Option<String>) = match in_expr.left.as_ref() {
+            Expression::QualifiedIdentifier(qid) => (
+                qid.name.value.to_string(),
+                Some(qid.qualifier.value.to_string()),
+            ),
+            Expression::Identifier(id) => (id.value.to_string(), None),
             _ => return None, // Complex expression on left side, can't optimize
         };
 
@@ -3339,31 +3351,32 @@ impl Executor {
         }
 
         // Extract inner column name from SELECT
-        let inner_column = match &subquery.columns[0] {
-            Expression::Identifier(id) => id.value.clone(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+        let inner_column: String = match &subquery.columns[0] {
+            Expression::Identifier(id) => id.value.to_string(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
             Expression::Aliased(a) => match a.expression.as_ref() {
-                Expression::Identifier(id) => id.value.clone(),
-                Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+                Expression::Identifier(id) => id.value.to_string(),
+                Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
                 _ => return None,
             },
             _ => return None, // Can't handle expressions in SELECT
         };
 
         // 3. Check for simple table source (not a join)
-        let (inner_table, inner_alias) = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
-            Some(Expression::TableSource(ts)) => {
-                let alias = ts.alias.as_ref().map(|a| a.value.clone());
-                (ts.name.value.clone(), alias)
-            }
-            _ => return None, // Can't optimize subquery joins or derived tables
-        };
+        let (inner_table, inner_alias): (String, Option<String>) =
+            match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
+                Some(Expression::TableSource(ts)) => {
+                    let alias = ts.alias.as_ref().map(|a| a.value.to_string());
+                    (ts.name.value.to_string(), alias)
+                }
+                _ => return None, // Can't optimize subquery joins or derived tables
+            };
 
         // 4. Get inner table identifiers
-        let inner_tables = vec![inner_alias
+        let inner_table_lower: String = inner_alias
             .clone()
-            .unwrap_or_else(|| inner_table.to_lowercase())
-            .to_lowercase()];
+            .unwrap_or_else(|| inner_table.to_lowercase());
+        let inner_tables = vec![inner_table_lower.to_lowercase()];
 
         // 5. Check if WHERE clause references outer tables
         if let Some(ref where_clause) = subquery.where_clause {

@@ -15,6 +15,7 @@
 //! Fair benchmark comparison: Stoolap vs SQLite for SELECT by ID
 //!
 //! Run with: cargo bench --bench select_by_id
+//! Run with SQLite comparison: cargo bench --bench select_by_id --features sqlite
 //!
 //! This benchmark ensures fair comparison by:
 //! 1. Using prepared statements for both databases
@@ -24,6 +25,7 @@
 //! 5. Statistical analysis of results
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+#[cfg(feature = "sqlite")]
 use rusqlite::Connection;
 use stoolap::Database;
 
@@ -31,10 +33,10 @@ const ROW_COUNT: usize = 10_000;
 
 /// Setup Stoolap database with test data
 fn setup_stoolap() -> Database {
-    let db = Database::open("memory://").unwrap();
+    let db = Database::open_in_memory().unwrap();
 
     db.execute(
-        "CREATE TABLE IF NOT EXISTS users (
+        "CREATE TABLE users (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             email TEXT NOT NULL,
@@ -46,14 +48,6 @@ fn setup_stoolap() -> Database {
         (),
     )
     .unwrap();
-
-    // Check if data already exists (for shared memory database case)
-    let count_result = db.query("SELECT COUNT(*) FROM users", ()).unwrap();
-    let count_row = count_result.into_iter().next().unwrap().unwrap();
-    let count: i64 = count_row.get(0).unwrap();
-    if count > 0 {
-        return db;
-    }
 
     let insert_stmt = db
         .prepare("INSERT INTO users (id, name, email, age, balance, active, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
@@ -79,6 +73,7 @@ fn setup_stoolap() -> Database {
 }
 
 /// Setup SQLite database with test data
+#[cfg(feature = "sqlite")]
 fn setup_sqlite() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
 
@@ -120,8 +115,9 @@ fn setup_sqlite() -> Connection {
 fn bench_select_by_id(c: &mut Criterion) {
     let mut group = c.benchmark_group("SELECT by ID");
 
-    // Setup databases (each benchmark group gets its own databases)
+    // Setup databases
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     // Prepare statements
@@ -129,6 +125,7 @@ fn bench_select_by_id(c: &mut Criterion) {
         .prepare("SELECT * FROM users WHERE id = $1")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT * FROM users WHERE id = ?1")
         .unwrap();
@@ -149,6 +146,7 @@ fn bench_select_by_id(c: &mut Criterion) {
     });
 
     // Benchmark SQLite
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         let mut idx = 0;
         b.iter(|| {
@@ -167,8 +165,9 @@ fn bench_select_by_id(c: &mut Criterion) {
 fn bench_select_by_id_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("SELECT by ID (batch of 100)");
 
-    // Setup databases (each benchmark group gets its own databases)
+    // Setup databases
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     // Prepare statements
@@ -176,6 +175,7 @@ fn bench_select_by_id_batch(c: &mut Criterion) {
         .prepare("SELECT * FROM users WHERE id = $1")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT * FROM users WHERE id = ?1")
         .unwrap();
@@ -195,6 +195,7 @@ fn bench_select_by_id_batch(c: &mut Criterion) {
     });
 
     // Benchmark SQLite - 100 queries per iteration
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         b.iter(|| {
             for &id in &ids {
@@ -212,8 +213,9 @@ fn bench_select_by_id_batch(c: &mut Criterion) {
 fn bench_select_by_id_with_result_processing(c: &mut Criterion) {
     let mut group = c.benchmark_group("SELECT by ID (full row processing)");
 
-    // Setup databases (each benchmark group gets its own databases)
+    // Setup databases
     let stoolap_db = setup_stoolap();
+    #[cfg(feature = "sqlite")]
     let sqlite_conn = setup_sqlite();
 
     // Prepare statements
@@ -221,6 +223,7 @@ fn bench_select_by_id_with_result_processing(c: &mut Criterion) {
         .prepare("SELECT * FROM users WHERE id = $1")
         .unwrap();
 
+    #[cfg(feature = "sqlite")]
     let mut sqlite_stmt = sqlite_conn
         .prepare("SELECT * FROM users WHERE id = ?1")
         .unwrap();
@@ -248,6 +251,7 @@ fn bench_select_by_id_with_result_processing(c: &mut Criterion) {
     });
 
     // Benchmark SQLite - read all columns
+    #[cfg(feature = "sqlite")]
     group.bench_function("sqlite", |b| {
         let mut idx = 0;
         b.iter(|| {

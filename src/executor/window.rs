@@ -290,8 +290,8 @@ impl Executor {
         // - COALESCE(SUM(val), 0) AS total -> maps "sum(val)" to column index of "total"
         for col_expr in stmt.columns.iter() {
             if let Expression::Aliased(aliased) = col_expr {
-                let alias_lower = aliased.alias.value.to_lowercase();
-                if let Some(&idx) = col_index_map.get(&alias_lower) {
+                let alias_lower = aliased.alias.value_lower.as_str();
+                if let Some(&idx) = col_index_map.get(alias_lower) {
                     // Extract all aggregate patterns from this expression (including nested ones)
                     let patterns =
                         Self::extract_aggregate_patterns(aliased.expression.as_ref(), self);
@@ -853,7 +853,7 @@ impl Executor {
                 Expression::Aliased(aliased) => {
                     if let Expression::Window(_) = aliased.expression.as_ref() {
                         // Aliased window function
-                        let alias = aliased.alias.value.clone();
+                        let alias = aliased.alias.value.to_string();
                         items.push(SelectItem {
                             output_name: alias.clone(),
                             // OPTIMIZATION: Store lowercase for O(1) lookup in window_value_map
@@ -862,14 +862,14 @@ impl Executor {
                         wf_idx += 1;
                     } else if let Expression::Identifier(id) = aliased.expression.as_ref() {
                         // Aliased column reference - use pre-computed lowercase
-                        if let Some(&idx) = col_index_map.get(&id.value_lower) {
+                        if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
                             items.push(SelectItem {
-                                output_name: aliased.alias.value.clone(),
+                                output_name: aliased.alias.value.to_string(),
                                 source: SelectItemSource::BaseColumn(idx),
                             });
                         } else {
                             items.push(SelectItem {
-                                output_name: aliased.alias.value.clone(),
+                                output_name: aliased.alias.value.to_string(),
                                 source: SelectItemSource::Expression(
                                     aliased.expression.as_ref().clone(),
                                 ),
@@ -885,7 +885,7 @@ impl Executor {
                             format!("__wf_{}", wf_idx)
                         };
                         items.push(SelectItem {
-                            output_name: aliased.alias.value.clone(),
+                            output_name: aliased.alias.value.to_string(),
                             source: SelectItemSource::ExpressionWithWindow(
                                 aliased.expression.as_ref().clone(),
                                 wf_name.to_lowercase(),
@@ -896,16 +896,16 @@ impl Executor {
                         // Aliased function call - check if it's an aggregate that's already in base_columns
                         // This happens when window functions are combined with GROUP BY aggregation
                         // The aggregate result is stored under the alias name (e.g., "total" for SUM(val) as total)
-                        let alias_lower = aliased.alias.value.to_lowercase();
-                        if let Some(&idx) = col_index_map.get(&alias_lower) {
+                        let alias_lower = aliased.alias.value_lower.as_str();
+                        if let Some(&idx) = col_index_map.get(alias_lower) {
                             items.push(SelectItem {
-                                output_name: aliased.alias.value.clone(),
+                                output_name: aliased.alias.value.to_string(),
                                 source: SelectItemSource::BaseColumn(idx),
                             });
                         } else {
                             // Not found by alias, try expression evaluation
                             items.push(SelectItem {
-                                output_name: aliased.alias.value.clone(),
+                                output_name: aliased.alias.value.to_string(),
                                 source: SelectItemSource::Expression(
                                     aliased.expression.as_ref().clone(),
                                 ),
@@ -914,7 +914,7 @@ impl Executor {
                     } else {
                         // Other aliased expression
                         items.push(SelectItem {
-                            output_name: aliased.alias.value.clone(),
+                            output_name: aliased.alias.value.to_string(),
                             source: SelectItemSource::Expression(
                                 aliased.expression.as_ref().clone(),
                             ),
@@ -923,9 +923,9 @@ impl Executor {
                 }
                 Expression::Identifier(id) => {
                     // Simple column reference - use pre-computed lowercase
-                    if let Some(&idx) = col_index_map.get(&id.value_lower) {
+                    if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
                         items.push(SelectItem {
-                            output_name: id.value.clone(),
+                            output_name: id.value.to_string(),
                             source: SelectItemSource::BaseColumn(idx),
                         });
                     } else {
@@ -936,7 +936,7 @@ impl Executor {
                         for (col_name, &idx) in &col_index_map {
                             if col_name.ends_with(&suffix) {
                                 items.push(SelectItem {
-                                    output_name: id.value.clone(),
+                                    output_name: id.value.to_string(),
                                     source: SelectItemSource::BaseColumn(idx),
                                 });
                                 found = true;
@@ -946,7 +946,7 @@ impl Executor {
                         if !found {
                             // Still not found - treat as expression and let evaluator handle it
                             items.push(SelectItem {
-                                output_name: id.value.clone(),
+                                output_name: id.value.to_string(),
                                 source: SelectItemSource::Expression(col_expr.clone()),
                             });
                         }
@@ -962,10 +962,10 @@ impl Executor {
                             output_name: format!("{}.{}", qid.qualifier.value, qid.name.value),
                             source: SelectItemSource::BaseColumn(idx),
                         });
-                    } else if let Some(&idx) = col_index_map.get(&qid.name.value_lower) {
+                    } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
                         // Fall back to unqualified name
                         items.push(SelectItem {
-                            output_name: qid.name.value.clone(),
+                            output_name: qid.name.value.to_string(),
                             source: SelectItemSource::BaseColumn(idx),
                         });
                     } else {
@@ -1069,7 +1069,7 @@ impl Executor {
                     if let Expression::Window(window_expr) = aliased.expression.as_ref() {
                         let mut wf_info =
                             self.extract_window_function_info(window_expr, &stmt.window_defs)?;
-                        wf_info.column_name = aliased.alias.value.clone();
+                        wf_info.column_name = aliased.alias.value.to_string();
                         window_functions.push(wf_info);
                     } else if let Some(window_expr) =
                         Self::find_window_in_expression(aliased.expression.as_ref())
@@ -1252,7 +1252,7 @@ impl Executor {
         let partition_by: Vec<String> = partition_by_exprs
             .iter()
             .filter_map(|e| match e {
-                Expression::Identifier(id) => Some(id.value.clone()),
+                Expression::Identifier(id) => Some(id.value.to_string()),
                 Expression::QualifiedIdentifier(qid) => {
                     // Keep the full qualified name for JOIN cases
                     Some(format!("{}.{}", qid.qualifier.value, qid.name.value))
@@ -1266,7 +1266,7 @@ impl Executor {
 
         // OPTIMIZATION: func.function is already uppercase from parsing
         Ok(WindowFunctionInfo {
-            name: func.function.clone(),
+            name: func.function.to_string(),
             arguments: func.arguments.clone(),
             partition_by,
             order_by,
@@ -2004,7 +2004,7 @@ impl Executor {
     /// Extract column name from expression
     fn extract_column_from_expr(&self, expr: &Expression) -> Option<String> {
         match expr {
-            Expression::Identifier(id) => Some(id.value.clone()),
+            Expression::Identifier(id) => Some(id.value.to_string()),
             Expression::QualifiedIdentifier(qid) => {
                 // Return fully qualified name "qualifier.column" for JOIN results
                 Some(format!("{}.{}", qid.qualifier.value, qid.name.value))
@@ -2025,7 +2025,7 @@ impl Executor {
         col_index_map: &FxHashMap<String, usize>,
     ) -> Option<usize> {
         match expr {
-            Expression::Identifier(id) => col_index_map.get(&id.value_lower).copied(),
+            Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
             Expression::QualifiedIdentifier(qid) => {
                 // Try fully qualified name first (e.g., "s.qty")
                 let qualified =
@@ -2033,7 +2033,7 @@ impl Executor {
                 col_index_map
                     .get(&qualified)
                     // Then try unqualified (e.g., "qty") for CTE/subquery cases
-                    .or_else(|| col_index_map.get(&qid.name.value_lower))
+                    .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))
                     .copied()
             }
             Expression::FunctionCall(func) => {
@@ -2153,13 +2153,15 @@ impl Executor {
             let order_by_indices: Vec<Option<usize>> = order_by
                 .iter()
                 .map(|ob| match &ob.expression {
-                    Expression::Identifier(id) => col_index_map.get(&id.value_lower).copied(),
+                    Expression::Identifier(id) => {
+                        col_index_map.get(id.value_lower.as_str()).copied()
+                    }
                     Expression::QualifiedIdentifier(qid) => {
                         let qualified =
                             format!("{}.{}", qid.qualifier.value, qid.name.value).to_lowercase();
                         col_index_map
                             .get(&qualified)
-                            .or_else(|| col_index_map.get(&qid.name.value_lower))
+                            .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))
                             .copied()
                     }
                     _ => None,

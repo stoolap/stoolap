@@ -443,7 +443,7 @@ impl<'a> ExprCompiler<'a> {
                     } else if let Some(name) = self.ctx.resolve_outer_column(column) {
                         builder.emit(Op::LoadOuterColumn(name));
                     } else {
-                        return Err(CompileError::ColumnNotFound(id.value.clone()));
+                        return Err(CompileError::ColumnNotFound(id.value.to_string()));
                     }
                 } else if let Some(source) = self.ctx.resolve_column(&id.value_lower) {
                     match source {
@@ -453,7 +453,7 @@ impl<'a> ExprCompiler<'a> {
                 } else if let Some(name) = self.ctx.resolve_outer_column(&id.value_lower) {
                     builder.emit(Op::LoadOuterColumn(name));
                 } else {
-                    return Err(CompileError::ColumnNotFound(id.value.clone()));
+                    return Err(CompileError::ColumnNotFound(id.value.to_string()));
                 }
             }
 
@@ -1466,7 +1466,7 @@ impl<'a> ExprCompiler<'a> {
         } else {
             // Check if it's an aggregate being referenced post-aggregation
             // This would be handled via LoadAggregateResult in a real implementation
-            Err(CompileError::FunctionNotFound(func_name))
+            Err(CompileError::FunctionNotFound(func_name.to_string()))
         }
     }
 }
@@ -1502,13 +1502,12 @@ mod tests {
     fn make_token() -> Token {
         Token {
             token_type: TokenType::Integer,
-            literal: "1".to_string(),
+            literal: "1".into(),
             position: Position {
                 offset: 0,
                 line: 1,
                 column: 1,
             },
-            error: None,
         }
     }
 
@@ -1525,7 +1524,7 @@ mod tests {
                 make_token(),
                 "a".to_string(),
             ))),
-            operator: ">".to_string(),
+            operator: ">".into(),
             op_type: InfixOperator::GreaterThan,
             right: Box::new(Expression::IntegerLiteral(IntegerLiteral {
                 token: make_token(),
@@ -1553,14 +1552,14 @@ mod tests {
                     make_token(),
                     "a".to_string(),
                 ))),
-                operator: ">".to_string(),
+                operator: ">".into(),
                 op_type: InfixOperator::GreaterThan,
                 right: Box::new(Expression::IntegerLiteral(IntegerLiteral {
                     token: make_token(),
                     value: 5,
                 })),
             })),
-            operator: "AND".to_string(),
+            operator: "AND".into(),
             op_type: InfixOperator::And,
             right: Box::new(Expression::Infix(InfixExpression {
                 token: make_token(),
@@ -1568,7 +1567,7 @@ mod tests {
                     make_token(),
                     "b".to_string(),
                 ))),
-                operator: "<".to_string(),
+                operator: "<".into(),
                 op_type: InfixOperator::LessThan,
                 right: Box::new(Expression::IntegerLiteral(IntegerLiteral {
                     token: make_token(),

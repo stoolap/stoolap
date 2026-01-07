@@ -224,9 +224,9 @@ struct GroupingSet {
 /// All string-based keys are lowercased for case-insensitive matching.
 fn expression_canonical_key(expr: &Expression) -> String {
     match expr {
-        Expression::Identifier(id) => id.value.to_lowercase(),
+        Expression::Identifier(id) => id.value_lower.to_string(),
         Expression::QualifiedIdentifier(qid) => {
-            format!("{}.{}", qid.qualifier.value, qid.name.value).to_lowercase()
+            format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower)
         }
         Expression::IntegerLiteral(lit) => format!("$pos:{}", lit.value),
         Expression::FloatLiteral(lit) => format!("$float:{}", lit.value),
@@ -644,8 +644,8 @@ impl Executor {
             if let Expression::Aliased(aliased) = col_expr {
                 if let Expression::FunctionCall(func) = aliased.expression.as_ref() {
                     if is_aggregate_function(&func.function) {
-                        let expr_name = self.get_aggregate_column_name(func).to_lowercase();
-                        let alias_lower = aliased.alias.value.to_lowercase();
+                        let expr_name: String = self.get_aggregate_column_name(func).to_lowercase();
+                        let alias_lower: String = aliased.alias.value_lower.to_string();
                         // If the alias exists in the map but the expression doesn't, add the expression
                         if let Some(&idx) = agg_col_index_map.get(&alias_lower) {
                             agg_col_index_map.entry(expr_name).or_insert(idx);
@@ -660,7 +660,7 @@ impl Executor {
                 }
             } else if let Expression::FunctionCall(func) = col_expr {
                 if is_aggregate_function(&func.function) {
-                    let expr_name = self.get_aggregate_column_name(func).to_lowercase();
+                    let expr_name: String = self.get_aggregate_column_name(func).to_lowercase();
                     // Check if any aliased version exists for this expression
                     for other_col in &stmt.columns {
                         if let Expression::Aliased(other_aliased) = other_col {
@@ -668,10 +668,11 @@ impl Executor {
                                 other_aliased.expression.as_ref()
                             {
                                 if is_aggregate_function(&other_func.function) {
-                                    let other_expr =
+                                    let other_expr: String =
                                         self.get_aggregate_column_name(other_func).to_lowercase();
                                     if other_expr == expr_name {
-                                        let alias_lower = other_aliased.alias.value.to_lowercase();
+                                        let alias_lower: String =
+                                            other_aliased.alias.value_lower.to_string();
                                         if let Some(&idx) = agg_col_index_map.get(&alias_lower) {
                                             agg_col_index_map
                                                 .entry(expr_name.clone())
@@ -719,12 +720,12 @@ impl Executor {
             // Check if columns are in the same order
             let mut columns_match = true;
             for (i, col_expr) in columns_to_use.iter().enumerate() {
-                let expected_name = match col_expr {
-                    Expression::Identifier(id) => id.value.to_lowercase(),
+                let expected_name: String = match col_expr {
+                    Expression::Identifier(id) => id.value_lower.to_string(),
                     Expression::QualifiedIdentifier(qid) => {
-                        format!("{}.{}", qid.qualifier.value, qid.name.value).to_lowercase()
+                        format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower)
                     }
-                    Expression::Aliased(a) => a.alias.value.to_lowercase(),
+                    Expression::Aliased(a) => a.alias.value_lower.to_string(),
                     Expression::FunctionCall(func) if is_aggregate_function(&func.function) => {
                         self.get_aggregate_column_name(func).to_lowercase()
                     }
@@ -762,15 +763,16 @@ impl Executor {
 
             match col_expr {
                 Expression::Identifier(id) => {
-                    final_columns.push(id.value.clone());
-                    column_sources.push(ColumnSource::AggColumn(id.value.to_lowercase()));
+                    final_columns.push(id.value.to_string());
+                    column_sources.push(ColumnSource::AggColumn(id.value_lower.to_string()));
                 }
                 Expression::QualifiedIdentifier(qid) => {
                     let name = format!("{}.{}", qid.qualifier.value, qid.name.value);
                     final_columns.push(name.clone());
                     // Try qualified name first, then fall back to unqualified column name
-                    let qualified_lower = name.to_lowercase();
-                    let unqualified_lower = qid.name.value.to_lowercase();
+                    let qualified_lower =
+                        format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                    let unqualified_lower: String = qid.name.value_lower.to_string();
                     if agg_col_index_map.contains_key(&qualified_lower) {
                         column_sources.push(ColumnSource::AggColumn(qualified_lower));
                     } else {
@@ -809,8 +811,8 @@ impl Executor {
                     }
                 }
                 Expression::Aliased(aliased) => {
-                    final_columns.push(aliased.alias.value.clone());
-                    let alias_lower = aliased.alias.value.to_lowercase();
+                    final_columns.push(aliased.alias.value.to_string());
+                    let alias_lower: String = aliased.alias.value_lower.to_string();
 
                     // First check if the alias matches an aggregation column name
                     // This handles GROUP BY expression columns like UPPER(name) AS upper_name
@@ -941,12 +943,12 @@ impl Executor {
                 match table_expr.as_ref() {
                     Expression::TableSource(source) => {
                         if let Some(ref alias) = source.alias {
-                            Some(alias.value.to_lowercase())
+                            Some(alias.value_lower.to_string())
                         } else {
-                            Some(source.name.value.to_lowercase())
+                            Some(source.name.value_lower.to_string())
                         }
                     }
-                    Expression::Aliased(aliased) => Some(aliased.alias.value.to_lowercase()),
+                    Expression::Aliased(aliased) => Some(aliased.alias.value_lower.to_string()),
                     _ => None,
                 }
             } else {
@@ -1082,9 +1084,9 @@ impl Executor {
         }
 
         let arg = &func.arguments[0];
-        let arg_name = match arg {
-            Expression::Identifier(id) => id.value.to_lowercase(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.to_lowercase(),
+        let arg_name: &str = match arg {
+            Expression::Identifier(id) => id.value_lower.as_str(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value_lower.as_str(),
             _ => return None,
         };
 
@@ -1280,7 +1282,7 @@ impl Executor {
                         self.extract_agg_column(&func.arguments)?;
                     let column_lower = column.to_lowercase();
                     aggregations.push(SqlAggregateFunction {
-                        name: func.function.clone(),
+                        name: func.function.to_string(),
                         column,
                         column_lower,
                         alias: None,
@@ -1304,7 +1306,7 @@ impl Executor {
                 self.extract_aggregates_from_aliased(aliased, aggregations, non_agg_columns)?;
             }
             Expression::Identifier(id) => {
-                non_agg_columns.push(id.value.clone());
+                non_agg_columns.push(id.value.to_string());
             }
             Expression::Case(case) => {
                 // Extract aggregates from CASE expression
@@ -1364,10 +1366,10 @@ impl Executor {
                         self.extract_agg_column(&func.arguments)?;
                     let column_lower = column.to_lowercase();
                     aggregations.push(SqlAggregateFunction {
-                        name: func.function.clone(),
+                        name: func.function.to_string(),
                         column,
                         column_lower,
-                        alias: Some(aliased.alias.value.clone()),
+                        alias: Some(aliased.alias.value.to_string()),
                         distinct: distinct || func.is_distinct,
                         extra_args,
                         expression,
@@ -1433,7 +1435,7 @@ impl Executor {
 
         let (column, distinct, expression) = match &args[0] {
             Expression::Star(_) => ("*".to_string(), false, None),
-            Expression::Identifier(id) => (id.value.clone(), false, None),
+            Expression::Identifier(id) => (id.value.to_string(), false, None),
             Expression::QualifiedIdentifier(qid) => {
                 // Use full qualified name (e.g., "p.price" instead of just "price")
                 // This is needed for JOIN queries where columns are qualified with table aliases
@@ -1452,7 +1454,7 @@ impl Executor {
         for arg in args.iter().skip(1) {
             match arg {
                 Expression::StringLiteral(lit) => {
-                    extra_args.push(Value::text(&lit.value));
+                    extra_args.push(Value::text(lit.value.as_str()));
                 }
                 Expression::IntegerLiteral(lit) => {
                     extra_args.push(Value::Integer(lit.value));
@@ -1490,7 +1492,7 @@ impl Executor {
             .filter_map(|col| {
                 if let Expression::Aliased(aliased) = col {
                     Some((
-                        aliased.alias.value.to_lowercase(),
+                        aliased.alias.value_lower.to_string(),
                         (*aliased.expression).clone(),
                     ))
                 } else {
@@ -1524,15 +1526,16 @@ impl Executor {
             match expr {
                 Expression::Identifier(id) => {
                     // Check if this identifier is an alias defined in SELECT
-                    if let Some(aliased_expr) = alias_map.get(&id.value.to_lowercase()) {
+                    let id_lower: &str = id.value_lower.as_str();
+                    if let Some(aliased_expr) = alias_map.get(id_lower) {
                         // Use the aliased expression, with the alias as the display name
                         group_items.push(GroupByItem::Expression {
                             expr: aliased_expr.clone(),
-                            display_name: id.value.clone(),
+                            display_name: id.value.to_string(),
                         });
                     } else {
                         // Regular column reference
-                        group_items.push(GroupByItem::Column(id.value.clone()));
+                        group_items.push(GroupByItem::Column(id.value.to_string()));
                     }
                 }
                 Expression::QualifiedIdentifier(qid) => {
@@ -1549,20 +1552,20 @@ impl Executor {
                         match select_col {
                             Expression::Identifier(id) => {
                                 // Simple column reference - use the column name
-                                group_items.push(GroupByItem::Column(id.value.clone()));
+                                group_items.push(GroupByItem::Column(id.value.to_string()));
                             }
                             Expression::Aliased(aliased) => {
                                 // Aliased expression - extract the underlying expression
                                 match aliased.expression.as_ref() {
                                     Expression::Identifier(id) => {
                                         // Aliased column reference
-                                        group_items.push(GroupByItem::Column(id.value.clone()));
+                                        group_items.push(GroupByItem::Column(id.value.to_string()));
                                     }
                                     expr => {
                                         // Complex expression with alias
                                         group_items.push(GroupByItem::Expression {
                                             expr: expr.clone(),
-                                            display_name: aliased.alias.value.clone(),
+                                            display_name: aliased.alias.value.to_string(),
                                         });
                                     }
                                 }
@@ -1612,7 +1615,7 @@ impl Executor {
                 let aliased_str = self.expression_to_string(&aliased.expression);
                 let target_str = self.expression_to_string(target_expr);
                 if aliased_str == target_str {
-                    return aliased.alias.value.clone();
+                    return aliased.alias.value.to_string();
                 }
             }
         }
@@ -1632,7 +1635,7 @@ impl Executor {
                     .collect();
                 format!("{}({})", func.function, args.join(", "))
             }
-            Expression::Identifier(id) => id.value.clone(),
+            Expression::Identifier(id) => id.value.to_string(),
             Expression::QualifiedIdentifier(qid) => {
                 format!("{}.{}", qid.qualifier.value, qid.name.value)
             }

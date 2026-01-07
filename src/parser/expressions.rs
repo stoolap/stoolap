@@ -14,6 +14,8 @@
 
 //! Expression parsing methods for the SQL Parser
 
+use compact_str::CompactString;
+
 use super::ast::*;
 use super::parser::Parser;
 use super::precedence::Precedence;
@@ -142,19 +144,21 @@ impl Parser {
             // Note: We don't convert \" to " because:
             // 1. In SQL, double quotes don't need escaping inside single-quoted strings
             // 2. Converting \" to " breaks JSON content like {"key":"value with \"quotes\""}
-            inner
-                .replace("\\n", "\n")
-                .replace("\\t", "\t")
-                .replace("\\r", "\r")
-                .replace("\\'", "'")
-                .replace("\\\\", "\\")
+            CompactString::from(
+                inner
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t")
+                    .replace("\\r", "\r")
+                    .replace("\\'", "'")
+                    .replace("\\\\", "\\"),
+            )
         } else {
             literal.clone()
         };
 
         // Check for JSON type hint
         let type_hint = if value.starts_with('{') && value.ends_with('}') {
-            Some("JSON".to_string())
+            Some(CompactString::const_new("JSON"))
         } else {
             None
         };
@@ -376,7 +380,7 @@ impl Parser {
         if self.cur_token_is_punctuator(")") {
             return Some(Expression::Identifier(Identifier::new(
                 self.cur_token.clone(),
-                "()".to_string(),
+                compact_str::CompactString::const_new("()"),
             )));
         }
 
@@ -462,7 +466,7 @@ impl Parser {
         &mut self,
         left: Expression,
         token: Token,
-        operator: String,
+        operator: compact_str::CompactString,
     ) -> Option<Expression> {
         use super::ast::{AllAnyExpression, AllAnyType};
 
@@ -552,19 +556,39 @@ impl Parser {
                     self.parse_between_expression(left, true)
                 } else if self.peek_token_is_keyword("LIKE") {
                     self.next_token(); // consume LIKE
-                    self.parse_like_expression(left, "LIKE".to_string(), true)
+                    self.parse_like_expression(
+                        left,
+                        compact_str::CompactString::const_new("LIKE"),
+                        true,
+                    )
                 } else if self.peek_token_is_keyword("ILIKE") {
                     self.next_token(); // consume ILIKE
-                    self.parse_like_expression(left, "ILIKE".to_string(), true)
+                    self.parse_like_expression(
+                        left,
+                        compact_str::CompactString::const_new("ILIKE"),
+                        true,
+                    )
                 } else if self.peek_token_is_keyword("GLOB") {
                     self.next_token(); // consume GLOB
-                    self.parse_like_expression(left, "GLOB".to_string(), true)
+                    self.parse_like_expression(
+                        left,
+                        compact_str::CompactString::const_new("GLOB"),
+                        true,
+                    )
                 } else if self.peek_token_is_keyword("REGEXP") {
                     self.next_token(); // consume REGEXP
-                    self.parse_like_expression(left, "REGEXP".to_string(), true)
+                    self.parse_like_expression(
+                        left,
+                        compact_str::CompactString::const_new("REGEXP"),
+                        true,
+                    )
                 } else if self.peek_token_is_keyword("RLIKE") {
                     self.next_token(); // consume RLIKE
-                    self.parse_like_expression(left, "RLIKE".to_string(), true)
+                    self.parse_like_expression(
+                        left,
+                        compact_str::CompactString::const_new("RLIKE"),
+                        true,
+                    )
                 } else {
                     let token = self.cur_token.clone();
                     self.next_token();
@@ -572,7 +596,7 @@ impl Parser {
                     Some(Expression::Infix(InfixExpression::new(
                         token,
                         Box::new(left),
-                        "NOT".to_string(),
+                        compact_str::CompactString::const_new("NOT"),
                         Box::new(right),
                     )))
                 }
@@ -604,7 +628,7 @@ impl Parser {
                 Some(Expression::Infix(InfixExpression::new(
                     token,
                     Box::new(left),
-                    "*".to_string(),
+                    compact_str::CompactString::const_new("*"),
                     Box::new(right),
                 )))
             }
@@ -1243,11 +1267,15 @@ impl Parser {
     fn parse_like_expression(
         &mut self,
         left: Expression,
-        op: String,
+        op: compact_str::CompactString,
         not: bool,
     ) -> Option<Expression> {
         let token = self.cur_token.clone();
-        let operator = if not { format!("NOT {}", op) } else { op };
+        let operator = if not {
+            compact_str::CompactString::from(format!("NOT {}", op))
+        } else {
+            op
+        };
         let precedence = self.cur_precedence();
 
         self.next_token();
@@ -1487,14 +1515,13 @@ impl Parser {
                     token_type: TokenType::String,
                     literal: field.to_lowercase(),
                     position: token.position,
-                    error: None,
                 },
                 value: field.to_lowercase(),
                 type_hint: None,
             });
             Some(Expression::FunctionCall(Box::new(FunctionCall {
                 token,
-                function: "EXTRACT".to_string(),
+                function: CompactString::const_new("EXTRACT"),
                 arguments: vec![field_literal, source],
                 is_distinct: false,
                 order_by: Vec::new(),
@@ -1609,28 +1636,28 @@ impl Parser {
                 }
             };
 
-            let value = format!("{} {}", quantity, unit);
+            let value = CompactString::from(format!("{} {}", quantity, unit));
             Some(Expression::IntervalLiteral(IntervalLiteral {
                 token,
                 value,
                 quantity,
-                unit: unit.to_string(),
+                unit: CompactString::from(unit),
             }))
         } else if self.expect_peek(TokenType::String) {
             // INTERVAL '1 month' syntax (original)
             let literal = &self.cur_token.literal;
-            let value = if literal.len() >= 2 {
-                literal[1..literal.len() - 1].to_string()
+            let value_str = if literal.len() >= 2 {
+                &literal[1..literal.len() - 1]
             } else {
-                literal.clone()
+                literal.as_str()
             };
 
             // Parse the interval value
-            let parts: Vec<&str> = value.split_whitespace().collect();
+            let parts: Vec<&str> = value_str.split_whitespace().collect();
             if parts.len() < 2 {
                 self.add_error(format!(
                     "invalid interval format: {} at {}",
-                    value, self.cur_token.position
+                    value_str, self.cur_token.position
                 ));
                 return None;
             }
@@ -1646,11 +1673,11 @@ impl Parser {
                 }
             };
 
-            let unit = parts[1].to_lowercase().trim_end_matches('s').to_string();
+            let unit = CompactString::from(parts[1].to_lowercase().trim_end_matches('s'));
 
             Some(Expression::IntervalLiteral(IntervalLiteral {
                 token,
-                value,
+                value: CompactString::from(value_str),
                 quantity,
                 unit,
             }))
@@ -1675,7 +1702,7 @@ impl Parser {
 
         let literal = &self.cur_token.literal;
         let value = if literal.len() >= 2 && literal.starts_with('\'') && literal.ends_with('\'') {
-            literal[1..literal.len() - 1].to_string()
+            CompactString::from(&literal[1..literal.len() - 1])
         } else {
             literal.clone()
         };

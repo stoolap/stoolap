@@ -405,13 +405,12 @@ fn test_compiler_simple_expression() {
     fn make_token() -> Token {
         Token {
             token_type: TokenType::Integer,
-            literal: "1".to_string(),
+            literal: "1".into(),
             position: Position {
                 offset: 0,
                 line: 1,
                 column: 1,
             },
-            error: None,
         }
     }
 
@@ -422,7 +421,7 @@ fn test_compiler_simple_expression() {
             make_token(),
             "a".to_string(),
         ))),
-        operator: ">".to_string(),
+        operator: ">".into(),
         op_type: InfixOperator::GreaterThan,
         right: Box::new(Expression::IntegerLiteral(IntegerLiteral {
             token: make_token(),
