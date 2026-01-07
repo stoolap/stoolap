@@ -540,7 +540,7 @@ impl Parser {
                 self.cur_token.clone(),
                 self.cur_token.literal.clone(),
             ));
-        } else if self.peek_token_is(TokenType::Identifier) && as_of.is_none() {
+        } else if self.peek_token_is(TokenType::Identifier) {
             // Check if this might be a join keyword or clause keyword
             let peek_upper = self.peek_token.literal.to_uppercase();
             if !matches!(

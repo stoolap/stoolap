@@ -7258,11 +7258,24 @@ impl Executor {
 
         // Extract table name and effective alias from right side
         // Supports: TableSource, Aliased TableSource, and simple SubquerySource
+        // Note: Index NL does not support AS OF (temporal) queries - they need full table scan
         let (table_name, effective_alias) = match right_expr {
-            Expression::TableSource(ts) => (ts.name.value_lower.to_string(), None),
+            Expression::TableSource(ts) => {
+                // Disable Index NL for temporal (AS OF) queries
+                if ts.as_of.is_some() {
+                    return None;
+                }
+                (ts.name.value_lower.to_string(), None)
+            }
             Expression::Aliased(aliased) => {
                 match aliased.expression.as_ref() {
-                    Expression::TableSource(ts) => (ts.name.value_lower.to_string(), None),
+                    Expression::TableSource(ts) => {
+                        // Disable Index NL for temporal (AS OF) queries
+                        if ts.as_of.is_some() {
+                            return None;
+                        }
+                        (ts.name.value_lower.to_string(), None)
+                    }
                     Expression::SubquerySource(sq) => {
                         // Check if subquery is a simple passthrough
                         if let Some(underlying) = self.extract_simple_subquery_table(&sq.subquery) {

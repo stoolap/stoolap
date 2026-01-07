@@ -243,6 +243,7 @@ impl Executor {
     /// This handles schema evolution (ALTER TABLE ADD/DROP COLUMN):
     /// - If row has fewer columns than schema, append default values (or NULLs) for missing columns
     /// - If row has more columns than schema, truncate the row
+    #[inline]
     fn normalize_row_to_schema(mut row: Row, schema: &Schema) -> Row {
         let schema_cols = schema.columns.len();
         let row_cols = row.len();

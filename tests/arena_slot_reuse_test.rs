@@ -81,9 +81,9 @@ fn test_arena_slot_reuse_snapshot_isolation() {
     );
     assert!(historical_result.is_ok(), "AS OF query should execute");
 
-    let mut rows = historical_result.unwrap();
+    let rows = historical_result.unwrap();
     let mut found = false;
-    while let Some(row_result) = rows.next() {
+    for row_result in rows {
         let row = row_result.expect("Row iteration failed");
         let historical_balance: i64 = row.get(0).expect("Get balance failed");
         found = true;
