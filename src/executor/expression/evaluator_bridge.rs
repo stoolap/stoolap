@@ -583,6 +583,10 @@ const _: () = {
 pub struct JoinFilter {
     /// Pre-compiled program
     program: SharedProgram,
+    /// Query parameters (shared Arc to avoid cloning)
+    params: Arc<Vec<Value>>,
+    /// Named parameters (shared Arc to avoid cloning)
+    named_params: Arc<FxHashMap<String, Value>>,
 }
 
 impl JoinFilter {
@@ -606,7 +610,18 @@ impl JoinFilter {
             .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
         Ok(Self {
             program: Arc::new(program),
+            params: Arc::new(Vec::new()),
+            named_params: Arc::new(FxHashMap::default()),
         })
+    }
+
+    /// Set parameters from execution context.
+    /// This is required when the join condition contains parameter placeholders ($1, $2, etc.).
+    #[inline]
+    pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
+        self.params = Arc::clone(ctx.params_arc());
+        self.named_params = Arc::clone(ctx.named_params_arc());
+        self
     }
 
     /// Check if a pair of rows satisfies the join condition.
@@ -617,7 +632,15 @@ impl JoinFilter {
         }
 
         VM.with(|vm| {
-            let ctx = ExecuteContext::for_join(left_row, right_row);
+            let mut ctx = ExecuteContext::for_join(left_row, right_row);
+
+            // Apply params if present (required for parameter placeholders like $1, $2)
+            if !self.params.is_empty() {
+                ctx = ctx.with_params(&self.params);
+            }
+            if !self.named_params.is_empty() {
+                ctx = ctx.with_named_params(&self.named_params);
+            }
 
             // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
             // If the VM is already borrowed, create a temporary one for this call.

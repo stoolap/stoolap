@@ -3150,6 +3150,7 @@ impl Executor {
                             &self.function_registry,
                         )
                         .ok()
+                        .map(|f| f.with_context(ctx))
                     } else {
                         None
                     };
@@ -3247,7 +3248,7 @@ impl Executor {
 
                     // Apply cross-table WHERE filters if any
                     if let Some(ref cross) = cross_filter {
-                        let filter = RowFilter::new(cross, &all_columns)?;
+                        let filter = RowFilter::new(cross, &all_columns)?.with_context(ctx);
                         final_rows.retain(|row| filter.matches(row));
                     }
 
@@ -4575,6 +4576,12 @@ impl Executor {
         ctx: &ExecutionContext,
         filter: Option<&Expression>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[EXEC_TABLE_EXPR_FILTER] expr_type={:?}, filter={:?}",
+            std::mem::discriminant(expr),
+            filter.map(|f| f.to_string())
+        );
         match expr {
             Expression::TableSource(ts) => {
                 // Check if this is a CTE from context (for subqueries referencing outer CTEs)
@@ -4594,12 +4601,23 @@ impl Executor {
                     // Apply filter to CTE data if present, or use shared Arc for zero-copy
                     let result: Box<dyn QueryResult> = if let Some(filter_expr) = filter {
                         // Need to clone matching rows
-                        let row_filter = RowFilter::new(filter_expr, columns)?;
+                        // Must apply execution context for parameter support
+                        // Use qualified_columns for filter column resolution since WHERE clause
+                        // has qualified names like "ds.avg_salary" not just "avg_salary"
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "[CTE_FILTER] table={}, filter={:?}, columns={:?}, qualified={:?}, rows_before={}",
+                            table_name, filter_expr.to_string(), columns, qualified_columns, rows.len()
+                        );
+                        let row_filter =
+                            RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
                         let filtered_rows: Vec<Row> = rows
                             .iter()
                             .filter(|row| row_filter.matches(row))
                             .cloned()
                             .collect();
+                        #[cfg(debug_assertions)]
+                        eprintln!("[CTE_FILTER] rows_after={}", filtered_rows.len());
                         Box::new(super::result::ExecutorMemoryResult::new(
                             columns.to_vec(),
                             filtered_rows,
@@ -4721,15 +4739,41 @@ impl Executor {
 
                 // Prefix column names with subquery alias (required for proper ON condition resolution)
                 // Without this, ON a.id = b.id cannot resolve qualified column names
-                if let Some(alias) = &ss.alias {
-                    let qualified_columns: Vec<String> = columns
+                let qualified_columns: Vec<String> = if let Some(alias) = &ss.alias {
+                    columns
                         .iter()
                         .map(|col| format!("{}.{}", alias.value, col))
-                        .collect();
-                    return Ok((result, qualified_columns));
+                        .collect()
+                } else {
+                    columns.clone()
+                };
+
+                // Apply filter to subquery result if present
+                // This is needed when WHERE clause conditions are pushed down to subquery sources
+                if let Some(filter_expr) = filter {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[SUBQUERY_FILTER] filter={:?}, columns={:?}, qualified={:?}",
+                        filter_expr.to_string(),
+                        columns,
+                        qualified_columns
+                    );
+                    // Use qualified_columns for filter column resolution since WHERE clause
+                    // has qualified names like "ds.avg_salary" not just "avg_salary"
+                    let row_filter =
+                        RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
+                    // Materialize and filter
+                    let mut materialized = Self::materialize_result(result)?;
+                    materialized.retain(|row| row_filter.matches(row));
+                    #[cfg(debug_assertions)]
+                    eprintln!("[SUBQUERY_FILTER] rows_after={}", materialized.len());
+                    let filtered_result: Box<dyn QueryResult> = Box::new(
+                        super::result::ExecutorMemoryResult::new(columns, materialized),
+                    );
+                    return Ok((filtered_result, qualified_columns));
                 }
 
-                Ok((result, columns))
+                Ok((result, qualified_columns))
             }
             Expression::ValuesSource(vs) => {
                 // Create a simple SELECT * statement to execute the VALUES
@@ -4851,6 +4895,11 @@ impl Executor {
         }
 
         // Fall back to standard execution for other cases
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[EXEC_EXPR_LIMIT_FALLBACK] calling execute_table_expression_with_filter, filter={:?}",
+            filter.map(|f| f.to_string())
+        );
         self.execute_table_expression_with_filter(expr, ctx, filter)
     }
 

@@ -1004,9 +1004,10 @@ impl Executor {
                 remaining.clone()
             };
 
-            // Compile the filter using RowFilter
+            // Compile the filter using RowFilter (with params for $1 etc.)
             let columns_slice: Vec<String> = all_columns.to_vec();
-            let row_filter = RowFilter::new(&processed_remaining, &columns_slice)?;
+            let row_filter =
+                RowFilter::new(&processed_remaining, &columns_slice)?.with_context(ctx);
 
             // Filter rows
             rows.retain(|row| row_filter.matches(row));
@@ -1224,9 +1225,10 @@ impl Executor {
                 remaining.clone()
             };
 
-            // Compile the filter using RowFilter
+            // Compile the filter using RowFilter (with params for $1 etc.)
             let columns_slice: Vec<String> = all_columns.to_vec();
-            let row_filter = RowFilter::new(&processed_remaining, &columns_slice)?;
+            let row_filter =
+                RowFilter::new(&processed_remaining, &columns_slice)?.with_context(ctx);
 
             // Filter rows
             rows.retain(|row| row_filter.matches(row));
@@ -1622,9 +1624,9 @@ impl Executor {
 
         // Apply remaining predicate if any
         if let Some(ref remaining) = remaining_predicate {
-            // Compile the filter using RowFilter
+            // Compile the filter using RowFilter (with params for $1 etc.)
             let columns_slice: Vec<String> = all_columns.to_vec();
-            let row_filter = RowFilter::new(remaining, &columns_slice)?;
+            let row_filter = RowFilter::new(remaining, &columns_slice)?.with_context(ctx);
 
             // Filter rows
             rows.retain(|row| row_filter.matches(row));
