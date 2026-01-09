@@ -32,15 +32,15 @@
 //! tx.commit()?;
 //! ```
 
-use crate::core::{Error, Result, Row, Value};
-use crate::executor::context::ExecutionContext;
-use crate::executor::expression::ExpressionEval;
-use crate::executor::result::ExecutorMemoryResult;
-use crate::parser::ast::{Expression, Statement};
+use std::sync::Arc;
+
+use crate::core::{Error, Result, Value};
+use crate::executor::ExternalTransactionGuard;
+use crate::parser::ast::Statement;
 use crate::parser::Parser;
 use crate::storage::traits::{QueryResult, Transaction as StorageTransaction};
 
-use super::database::FromValue;
+use super::database::{DatabaseInner, FromValue};
 use super::params::Params;
 use super::rows::Rows;
 
@@ -48,17 +48,26 @@ use super::rows::Rows;
 ///
 /// Provides ACID guarantees for a series of database operations.
 /// Must be explicitly committed or rolled back.
+///
+/// Transactions use the full query executor, providing all optimizations
+/// including index scans, JOIN support, and streaming results.
 pub struct Transaction {
+    /// The storage-level transaction handle
     tx: Option<Box<dyn StorageTransaction>>,
+    /// Reference to the database internals (executor, engine)
+    db_inner: Arc<DatabaseInner>,
+    /// Whether the transaction has been committed
     committed: bool,
+    /// Whether the transaction has been rolled back
     rolled_back: bool,
 }
 
 impl Transaction {
     /// Create a new transaction wrapper
-    pub(crate) fn new(tx: Box<dyn StorageTransaction>) -> Self {
+    pub(crate) fn new(tx: Box<dyn StorageTransaction>, db_inner: Arc<DatabaseInner>) -> Self {
         Self {
             tx: Some(tx),
+            db_inner,
             committed: false,
             rolled_back: false,
         }
@@ -165,405 +174,74 @@ impl Transaction {
         }
     }
 
-    /// Internal SQL execution
+    /// Internal SQL execution using the full query executor.
+    ///
+    /// This method routes SQL execution through the complete query pipeline,
+    /// providing all optimizations including:
+    /// - Index scans for WHERE clauses
+    /// - Cost-based query planning
+    /// - JOIN support (hash join, merge join, nested loop)
+    /// - Streaming results (no full materialization)
+    /// - Subquery optimization
     fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<Box<dyn QueryResult>> {
-        // Parse the SQL
+        // Parse first to reject transaction control statements
         let mut parser = Parser::new(sql);
-        let program = parser
-            .parse_program()
-            .map_err(|e| Error::parse(e.to_string()))?;
+        let program = parser.parse_program().map_err(|e| Error::parse(e.to_string()))?;
+        for stmt in &program.statements {
+            Self::reject_transaction_control_statement(stmt)?;
+        }
 
-        // Create execution context with parameters
-        let ctx = if params.is_empty() {
-            ExecutionContext::new()
+        // Get the executor and use RAII guard for panic safety
+        let executor = self
+            .db_inner
+            .executor
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+
+        // The guard takes the transaction from self.tx, installs it into the executor,
+        // and restores it back to self.tx when dropped (even on panic)
+        let _guard = ExternalTransactionGuard::new(&executor, &mut self.tx)?;
+
+        // Execute using the full query pipeline
+        if params.is_empty() {
+            executor.execute(sql)
         } else {
-            ExecutionContext::with_params(params.to_vec())
-        };
-
-        // Execute each statement
-        let mut last_result: Option<Box<dyn QueryResult>> = None;
-
-        for statement in &program.statements {
-            last_result = Some(self.execute_statement(statement, &ctx)?);
+            executor.execute_with_params(sql, params)
         }
-
-        last_result.ok_or(Error::NoStatementsToExecute)
+        // Guard's Drop impl will restore self.tx automatically
     }
 
-    /// Execute a single statement
-    fn execute_statement(
-        &mut self,
-        statement: &Statement,
-        ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        use crate::executor::result::ExecResult;
-
-        let tx = self.tx.as_mut().ok_or(Error::TransactionNotStarted)?;
-
-        match statement {
-            Statement::Insert(stmt) => {
-                let table_name = &stmt.table_name.value;
-                let mut table = tx.get_table(table_name)?;
-
-                let mut total_inserted = 0i64;
-
-                for row_values in &stmt.values {
-                    let mut values = Vec::with_capacity(row_values.len());
-                    for expr in row_values {
-                        // Use ExpressionEval for value expression evaluation
-                        let mut eval = ExpressionEval::compile(expr, &[])?.with_context(ctx);
-                        values.push(eval.eval_slice(&Row::new())?);
-                    }
-
-                    let row = Row::from_values(values);
-                    let _ = table.insert(row)?;
-                    total_inserted += 1;
-                }
-
-                Ok(Box::new(ExecResult::with_rows_affected(total_inserted)))
+    /// Reject transaction control statements that would corrupt state.
+    ///
+    /// These statements must be rejected because:
+    /// - BEGIN: Would create a nested transaction (unsupported)
+    /// - COMMIT/ROLLBACK: Would consume the transaction from the executor,
+    ///   making it impossible to restore to self.tx
+    /// - SAVEPOINT operations: Should use the Transaction API methods instead
+    fn reject_transaction_control_statement(stmt: &Statement) -> Result<()> {
+        match stmt {
+            Statement::Begin(_) => {
+                Err(Error::internal(
+                    "Cannot execute BEGIN inside a transaction. Use nested savepoints via create_savepoint() instead.",
+                ))
             }
-            Statement::Update(stmt) => {
-                use crate::executor::expression::{
-                    compile_expression, ExecuteContext, ExprVM, RowFilter, SharedProgram,
-                };
-
-                let table_name = &stmt.table_name.value;
-                let mut table = tx.get_table(table_name)?;
-                // Get column names owned to avoid borrow conflict with table.update()
-                let columns: Vec<String> = table.schema().column_names_owned().to_vec();
-
-                // Build the setter function that applies updates
-                let updates = stmt.updates.clone();
-
-                // OPTIMIZATION: Pre-compile WHERE clause (if present) using RowFilter
-                // CRITICAL: Must include context for parameter support
-                let where_filter: Option<RowFilter> = stmt
-                    .where_clause
-                    .as_ref()
-                    .map(|expr| RowFilter::new(expr, &columns).map(|f| f.with_context(ctx)))
-                    .transpose()?;
-
-                // OPTIMIZATION: Pre-compile update expressions and compute column indices
-                // CRITICAL: Return errors instead of silently skipping failed compilations
-                let compiled_updates: Vec<(usize, SharedProgram)> = updates
-                    .iter()
-                    .map(|(col_name, expr)| {
-                        let idx = columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(col_name))
-                            .ok_or_else(|| Error::ColumnNotFoundNamed(col_name.to_string()))?;
-                        let program = compile_expression(expr, &columns)?;
-                        Ok((idx, program))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                // Create VM for expression execution (reused for all rows)
-                let mut vm = ExprVM::new();
-
-                // CRITICAL: Capture errors from setter since closure can't return Result
-                use std::cell::RefCell;
-                let update_error: RefCell<Option<Error>> = RefCell::new(None);
-
-                let mut setter = |row: Row| -> (Row, bool) {
-                    // If we already have an error, skip processing
-                    if update_error.borrow().is_some() {
-                        return (row, false);
-                    }
-
-                    // Check WHERE clause if present (uses thread-local VM internally)
-                    if let Some(ref filter) = where_filter {
-                        if !filter.matches(&row) {
-                            return (row, false);
-                        }
-                    }
-
-                    // Evaluate all expressions first (while we can still borrow row)
-                    let exec_ctx = ExecuteContext::new(&row);
-
-                    // CRITICAL: Collect evaluated values, capturing any errors
-                    let mut updates_to_apply: Vec<(usize, Value)> =
-                        Vec::with_capacity(compiled_updates.len());
-                    for (idx, program) in compiled_updates.iter() {
-                        match vm.execute(program, &exec_ctx) {
-                            Ok(v) => updates_to_apply.push((*idx, v)),
-                            Err(e) => {
-                                *update_error.borrow_mut() = Some(e);
-                                return (row, false);
-                            }
-                        }
-                    }
-
-                    // Now apply updates - take ownership of row
-                    let mut new_values = row.into_values();
-                    for (idx, value) in updates_to_apply {
-                        new_values[idx] = value;
-                    }
-
-                    (Row::from_values(new_values), true)
-                };
-
-                // Use None for where_expr since we handle WHERE in the setter
-                let updated_count = table.update(None, &mut setter)?;
-
-                // Check if any errors were captured during update
-                if let Some(err) = update_error.into_inner() {
-                    return Err(err);
-                }
-
-                Ok(Box::new(ExecResult::with_rows_affected(
-                    updated_count as i64,
-                )))
+            Statement::Commit(_) => {
+                Err(Error::internal(
+                    "Cannot execute COMMIT inside execute(). Use Transaction::commit() instead.",
+                ))
             }
-            Statement::Delete(stmt) => {
-                let table_name = &stmt.table_name.value;
-                let mut table = tx.get_table(table_name)?;
-
-                // Convert WHERE clause to Expression if present
-                let where_expr = stmt
-                    .where_clause
-                    .as_ref()
-                    .map(|expr| self.convert_to_storage_expression(expr, ctx))
-                    .transpose()?;
-
-                let deleted_count = table.delete(where_expr.as_deref())?;
-
-                Ok(Box::new(ExecResult::with_rows_affected(
-                    deleted_count as i64,
-                )))
+            Statement::Rollback(_) => {
+                Err(Error::internal(
+                    "Cannot execute ROLLBACK inside execute(). Use Transaction::rollback() instead.",
+                ))
             }
-            Statement::Select(stmt) => {
-                // Handle SELECT without FROM
-                let table_expr = match &stmt.table_expr {
-                    Some(expr) => expr,
-                    None => {
-                        let mut columns = Vec::new();
-                        let mut values = Vec::new();
-
-                        for (i, col_expr) in stmt.columns.iter().enumerate() {
-                            let col_name = match col_expr {
-                                Expression::Aliased(a) => a.alias.value.to_string(),
-                                Expression::Identifier(id) => id.value.to_string(),
-                                _ => format!("expr{}", i + 1),
-                            };
-                            columns.push(col_name);
-                            // Use ExpressionEval for constant expression evaluation
-                            let mut eval =
-                                ExpressionEval::compile(col_expr, &[])?.with_context(ctx);
-                            values.push(eval.eval_slice(&Row::new())?);
-                        }
-
-                        let rows = vec![Row::from_values(values)];
-                        return Ok(Box::new(ExecutorMemoryResult::new(columns, rows)));
-                    }
-                };
-
-                // Get table name
-                let table_name = match table_expr.as_ref() {
-                    Expression::TableSource(ts) => &ts.name.value,
-                    Expression::Identifier(id) => &id.value,
-                    _ => {
-                        return Err(Error::NotSupportedMessage(
-                            "Complex FROM clauses not supported in transactions".to_string(),
-                        ))
-                    }
-                };
-
-                let table = tx.get_table(table_name)?;
-                let schema = table.schema();
-                let columns: Vec<String> = schema.column_names_owned().to_vec();
-
-                // Get all column indices for scan
-                let column_indices: Vec<usize> = (0..columns.len()).collect();
-
-                // Convert WHERE clause
-                let where_expr = stmt
-                    .where_clause
-                    .as_ref()
-                    .map(|expr| self.convert_to_storage_expression(expr, ctx))
-                    .transpose()?;
-
-                // Scan table
-                let mut scanner = table.scan(&column_indices, where_expr.as_deref())?;
-                let mut rows = Vec::new();
-
-                while scanner.next() {
-                    rows.push(scanner.take_row());
-                }
-
-                // Check for scanner error
-                if let Some(err) = scanner.err() {
-                    return Err(err.clone());
-                }
-
-                // Project columns if needed
-                let (result_columns, result_rows) = if stmt.columns.len() == 1 {
-                    if let Expression::Star(_) = &stmt.columns[0] {
-                        (columns, rows)
-                    } else {
-                        self.project_columns(stmt, &columns, rows, ctx)?
-                    }
-                } else {
-                    self.project_columns(stmt, &columns, rows, ctx)?
-                };
-
-                Ok(Box::new(ExecutorMemoryResult::new(
-                    result_columns,
-                    result_rows,
-                )))
+            Statement::Savepoint(_) => {
+                Err(Error::internal(
+                    "Cannot execute SAVEPOINT inside execute(). Use Transaction::create_savepoint() instead.",
+                ))
             }
-            _ => Err(Error::NotSupportedMessage(
-                "Only DML statements are supported in transactions".to_string(),
-            )),
+            _ => Ok(()),
         }
-    }
-
-    /// Convert AST expression to storage expression
-    fn convert_to_storage_expression(
-        &self,
-        expr: &Expression,
-        ctx: &ExecutionContext,
-    ) -> Result<Box<dyn crate::storage::expression::Expression>> {
-        use crate::core::Operator;
-        use crate::storage::expression::{AndExpr, ComparisonExpr, OrExpr};
-
-        match expr {
-            Expression::Infix(infix) => {
-                let op_str = infix.operator.as_str();
-                match op_str {
-                    "AND" => {
-                        let left = self.convert_to_storage_expression(&infix.left, ctx)?;
-                        let right = self.convert_to_storage_expression(&infix.right, ctx)?;
-                        return Ok(Box::new(AndExpr::and(left, right)));
-                    }
-                    "OR" => {
-                        let left = self.convert_to_storage_expression(&infix.left, ctx)?;
-                        let right = self.convert_to_storage_expression(&infix.right, ctx)?;
-                        return Ok(Box::new(OrExpr::or(left, right)));
-                    }
-                    _ => {}
-                }
-
-                let op = match op_str {
-                    "=" | "==" => Operator::Eq,
-                    "!=" | "<>" => Operator::Ne,
-                    "<" => Operator::Lt,
-                    "<=" => Operator::Lte,
-                    ">" => Operator::Gt,
-                    ">=" => Operator::Gte,
-                    _ => {
-                        return Err(Error::NotSupportedMessage(format!(
-                            "Operator {} not supported in transaction WHERE clause",
-                            infix.operator
-                        )));
-                    }
-                };
-
-                // Get column name from left side
-                let column = match infix.left.as_ref() {
-                    Expression::Identifier(id) => id.value.clone(),
-                    _ => {
-                        return Err(Error::NotSupportedMessage(
-                            "Only column references supported on left side of comparison"
-                                .to_string(),
-                        ));
-                    }
-                };
-
-                // Get value from right side (constant expression, no row context needed)
-                let value = ExpressionEval::compile(&infix.right, &[])?
-                    .with_context(ctx)
-                    .eval_slice(&Row::new())?;
-
-                Ok(Box::new(ComparisonExpr::new(column, op, value)))
-            }
-            _ => Err(Error::NotSupportedMessage(format!(
-                "Expression type {:?} not supported in transaction WHERE clause",
-                expr
-            ))),
-        }
-    }
-
-    /// Project columns from rows
-    fn project_columns(
-        &self,
-        stmt: &crate::parser::ast::SelectStatement,
-        source_columns: &[String],
-        rows: Vec<Row>,
-        ctx: &ExecutionContext,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
-        use crate::executor::expression::compile_expression;
-
-        let mut result_columns = Vec::new();
-        let mut result_rows = Vec::new();
-
-        // Pre-compile expressions and determine output columns
-        // Store either None for Star or Some(program) for compiled expressions
-        let mut compiled_exprs: Vec<Option<crate::executor::expression::SharedProgram>> =
-            Vec::with_capacity(stmt.columns.len());
-
-        for (i, col_expr) in stmt.columns.iter().enumerate() {
-            match col_expr {
-                Expression::Star(_) => {
-                    result_columns.extend(source_columns.iter().cloned());
-                    compiled_exprs.push(None); // Star marker
-                }
-                Expression::Aliased(a) => {
-                    result_columns.push(a.alias.value.to_string());
-                    compiled_exprs.push(Some(compile_expression(col_expr, source_columns)?));
-                }
-                Expression::Identifier(id) => {
-                    result_columns.push(id.value.to_string());
-                    compiled_exprs.push(Some(compile_expression(col_expr, source_columns)?));
-                }
-                _ => {
-                    result_columns.push(format!("expr{}", i + 1));
-                    compiled_exprs.push(Some(compile_expression(col_expr, source_columns)?));
-                }
-            }
-        }
-
-        // Create execution context with parameters
-        let params = ctx.params();
-        // Convert HashMap to FxHashMap for ExecuteContext
-        let named_params: rustc_hash::FxHashMap<String, Value> = ctx
-            .named_params()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        // Create VM for execution (reused for all rows and expressions)
-        let mut vm = crate::executor::expression::ExprVM::new();
-        let num_cols = stmt.columns.len();
-
-        // Project each row
-        for row in rows {
-            let mut exec_ctx = crate::executor::expression::ExecuteContext::new(&row);
-            if !params.is_empty() {
-                exec_ctx = exec_ctx.with_params(params);
-            }
-            if !named_params.is_empty() {
-                exec_ctx = exec_ctx.with_named_params(&named_params);
-            }
-
-            let mut values = Vec::with_capacity(num_cols.max(row.len()));
-
-            for compiled in &compiled_exprs {
-                match compiled {
-                    None => {
-                        // Star: expand all columns
-                        values.extend(row.iter().cloned());
-                    }
-                    Some(program) => {
-                        // Execute pre-compiled expression
-                        values.push(vm.execute(program, &exec_ctx)?);
-                    }
-                }
-            }
-
-            result_rows.push(Row::from_values(values));
-        }
-
-        Ok((result_columns, result_rows))
     }
 
     /// Commit the transaction
@@ -739,5 +417,275 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let tx = db.begin().unwrap();
         assert!(tx.id() > 0);
+    }
+
+    #[test]
+    fn test_transaction_join_support() {
+        // This test verifies that JOINs work inside transactions
+        // (previously they failed with "Complex FROM clauses not supported in transactions")
+        let db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ())
+            .unwrap();
+        db.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')", ())
+            .unwrap();
+        db.execute(
+            "INSERT INTO orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150)",
+            (),
+        )
+        .unwrap();
+
+        let mut tx = db.begin().unwrap();
+
+        // JOIN should now work inside transaction
+        let rows: Vec<_> = tx
+            .query(
+                "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = $1",
+                (1,),
+            )
+            .unwrap()
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_transaction_subquery_support() {
+        // Verifies that subqueries work inside transactions
+        let db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, category TEXT, price INTEGER)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO products VALUES (1, 'A', 100), (2, 'A', 200), (3, 'B', 150)",
+            (),
+        )
+        .unwrap();
+
+        let mut tx = db.begin().unwrap();
+
+        // Scalar subquery
+        // Inner subquery: AVG of category 'A' = (100 + 200) / 2 = 150
+        // Outer: prices > 150 = only 200, so AVG = 200
+        let avg_price: i64 = tx
+            .query_one(
+                "SELECT AVG(price) FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category = 'A')",
+                (),
+            )
+            .unwrap();
+        assert_eq!(avg_price, 200);
+
+        // IN subquery
+        let count: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM products WHERE category IN (SELECT DISTINCT category FROM products WHERE price > 100)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_transaction_function_support() {
+        // Verifies that SQL functions work inside transactions
+        let db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT)", ())
+            .unwrap();
+        db.execute("INSERT INTO names VALUES (1, 'alice'), (2, 'BOB')", ())
+            .unwrap();
+
+        let mut tx = db.begin().unwrap();
+
+        // UPPER function
+        let result: String = tx
+            .query_one("SELECT UPPER(name) FROM names WHERE id = 1", ())
+            .unwrap();
+        assert_eq!(result, "ALICE");
+
+        // LOWER function
+        let result: String = tx
+            .query_one("SELECT LOWER(name) FROM names WHERE id = 2", ())
+            .unwrap();
+        assert_eq!(result, "bob");
+
+        // LENGTH function
+        let len: i64 = tx
+            .query_one("SELECT LENGTH(name) FROM names WHERE id = 1", ())
+            .unwrap();
+        assert_eq!(len, 5);
+
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_transaction_aggregation_support() {
+        // Verifies that aggregations work inside transactions
+        let db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO sales VALUES (1, 'East', 100), (2, 'East', 200), (3, 'West', 150), (4, 'West', 250)",
+            (),
+        )
+        .unwrap();
+
+        let mut tx = db.begin().unwrap();
+
+        // GROUP BY with aggregation
+        let mut rows = tx
+            .query(
+                "SELECT region, SUM(amount) as total FROM sales GROUP BY region ORDER BY region",
+                (),
+            )
+            .unwrap();
+
+        let row1 = rows.next().unwrap().unwrap();
+        assert_eq!(row1.get::<String>(0).unwrap(), "East");
+        assert_eq!(row1.get::<i64>(1).unwrap(), 300);
+
+        let row2 = rows.next().unwrap().unwrap();
+        assert_eq!(row2.get::<String>(0).unwrap(), "West");
+        assert_eq!(row2.get::<i64>(1).unwrap(), 400);
+
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_transaction_update_uses_index() {
+        // This test verifies that UPDATE with WHERE uses indexes (not full table scan)
+        // We can't directly test index usage, but we verify the behavior is correct
+        let db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, status TEXT)",
+            (),
+        )
+        .unwrap();
+
+        // Insert many rows
+        for i in 1..=100 {
+            db.execute("INSERT INTO items VALUES ($1, 'active')", (i,))
+                .unwrap();
+        }
+
+        let mut tx = db.begin().unwrap();
+
+        // Update by primary key - should use index
+        let updated = tx
+            .execute("UPDATE items SET status = 'inactive' WHERE id = $1", (50,))
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        // Verify the update
+        let status: String = tx
+            .query_one("SELECT status FROM items WHERE id = $1", (50,))
+            .unwrap();
+        assert_eq!(status, "inactive");
+
+        // Other rows unchanged
+        let status: String = tx
+            .query_one("SELECT status FROM items WHERE id = $1", (49,))
+            .unwrap();
+        assert_eq!(status, "active");
+
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_transaction_streaming_results() {
+        // Verifies that results can be iterated without full materialization
+        let db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE nums (id INTEGER PRIMARY KEY, val INTEGER)",
+            (),
+        )
+        .unwrap();
+
+        // Insert rows
+        for i in 1..=50 {
+            db.execute("INSERT INTO nums VALUES ($1, $2)", (i, i * 10))
+                .unwrap();
+        }
+
+        let mut tx = db.begin().unwrap();
+
+        // Query and iterate - should stream results
+        let mut sum = 0i64;
+        for row in tx.query("SELECT val FROM nums", ()).unwrap() {
+            let val: i64 = row.unwrap().get(0).unwrap();
+            sum += val;
+        }
+
+        assert_eq!(sum, (1..=50).map(|x| x * 10).sum::<i64>());
+
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_transaction_rejects_begin() {
+        // Verifies that BEGIN inside a transaction is rejected
+        let db = Database::open_in_memory().unwrap();
+        let mut tx = db.begin().unwrap();
+
+        let result = tx.execute("BEGIN", ());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("BEGIN"));
+
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn test_transaction_rejects_commit_sql() {
+        // Verifies that COMMIT inside execute() is rejected
+        let db = Database::open_in_memory().unwrap();
+        let mut tx = db.begin().unwrap();
+
+        let result = tx.execute("COMMIT", ());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("COMMIT"));
+
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn test_transaction_rejects_rollback_sql() {
+        // Verifies that ROLLBACK inside execute() is rejected
+        let db = Database::open_in_memory().unwrap();
+        let mut tx = db.begin().unwrap();
+
+        let result = tx.execute("ROLLBACK", ());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("ROLLBACK"));
+
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn test_transaction_rejects_savepoint_sql() {
+        // Verifies that SAVEPOINT inside execute() is rejected
+        let db = Database::open_in_memory().unwrap();
+        let mut tx = db.begin().unwrap();
+
+        let result = tx.execute("SAVEPOINT sp1", ());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("SAVEPOINT"));
+
+        tx.rollback().unwrap();
     }
 }
