@@ -30,7 +30,7 @@ use std::sync::Arc;
 use compact_str::CompactString;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::core::{Error, Result, Row, Value};
+use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
@@ -74,9 +74,9 @@ use super::parallel::{self, ParallelConfig};
 use super::pushdown;
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
-    DistinctResult, ExecResult, ExecutorMemoryResult, ExprMappedResult, FilteredResult,
-    LimitedResult, OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult,
-    StreamingProjectionResult, TopNResult,
+    DistinctResult, ExecResult, ExecutorResult, ExprMappedResult, FilteredResult, LimitedResult,
+    OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult, StreamingProjectionResult,
+    TopNResult,
 };
 use super::utils::compute_join_projection;
 use super::utils::{
@@ -492,9 +492,11 @@ impl Executor {
             // If ORDER BY has complex expressions, evaluate them and sort by keys
             if has_complex_order_by {
                 // Materialize current result if needed
-                let mut rows: Vec<Row> = Vec::new();
+                let mut rows = RowVec::new();
+                let mut row_id_counter = 0i64;
                 while result.next() {
-                    rows.push(result.take_row());
+                    rows.push((row_id_counter, result.take_row()));
+                    row_id_counter += 1;
                 }
 
                 // Create evaluator for ORDER BY expressions
@@ -544,7 +546,7 @@ impl Executor {
                         });
 
                     rows.iter()
-                        .map(|row| {
+                        .map(|(_, row)| {
                             // Build outer row context from current row
                             let mut outer_row_map: FxHashMap<String, Value> = FxHashMap::default();
                             for (idx, col_lower) in columns_lower.iter().enumerate() {
@@ -597,7 +599,7 @@ impl Executor {
                         .collect()
                 } else {
                     rows.iter()
-                        .map(|row| {
+                        .map(|(_, row)| {
                             evaluator.set_row_array(row);
                             stmt.order_by
                                 .iter()
@@ -666,14 +668,15 @@ impl Executor {
                 // Reorder rows using sorted indices
                 // OPTIMIZATION: For LIMIT queries, only collect needed rows
                 // For full results, use in-place cycle-based permutation
-                let final_rows = if limit.is_some() || offset > 0 {
+                let final_rows: RowVec = if limit.is_some() || offset > 0 {
                     // With LIMIT/OFFSET: Only collect the rows we actually need
                     let take_count = limit.unwrap_or(usize::MAX);
                     indices
                         .into_iter()
                         .skip(offset)
                         .take(take_count)
-                        .map(|i| std::mem::take(&mut rows[i]))
+                        .enumerate()
+                        .map(|(new_idx, i)| (new_idx as i64, std::mem::take(&mut rows[i].1)))
                         .collect()
                 } else {
                     // No LIMIT: Use in-place cycle-based permutation (no cloning!)
@@ -705,7 +708,7 @@ impl Executor {
                 // Project to expected columns if needed
                 let mut result_rows = final_rows;
                 if columns.len() > expected_columns && expected_columns > 0 {
-                    for row in &mut result_rows {
+                    for (_, row) in result_rows.iter_mut() {
                         row.truncate(expected_columns);
                     }
                 }
@@ -716,7 +719,7 @@ impl Executor {
                 } else {
                     Arc::clone(&columns)
                 };
-                return Ok(Box::new(ExecutorMemoryResult::with_arc_columns(
+                return Ok(Box::new(ExecutorResult::with_arc_columns(
                     output_columns,
                     result_rows,
                 )));
@@ -833,12 +836,12 @@ impl Executor {
                 let table_name = &table_source.name.value_lower;
                 if let Some((columns, rows)) = ctx.get_cte(table_name) {
                     // Execute query against CTE data
-                    // Dereference Arc to get &Vec<Row>, then clone to Vec<Row>
+                    // Dereference Arc to get &Vec<(i64, Row)>, then wrap in RowVec
                     return self.execute_query_on_memory_result(
                         stmt,
                         ctx,
                         columns.to_vec(),
-                        (**rows).clone(),
+                        RowVec::from_vec((**rows).clone()),
                     );
                 }
 
@@ -897,7 +900,7 @@ impl Executor {
                     columns.push(col_name);
                 }
                 let columns = Arc::new(columns);
-                let result = ExecutorMemoryResult::with_arc_columns(Arc::clone(&columns), vec![]);
+                let result = ExecutorResult::with_arc_columns(Arc::clone(&columns), RowVec::new());
                 return Ok((Box::new(result), columns, false));
             }
         }
@@ -906,7 +909,8 @@ impl Executor {
         // This handles cases like SELECT SUM(3+5) or SELECT COALESCE(SUM(1), 0)
         if classification.has_aggregation {
             // Create a single dummy row for aggregation to process
-            let dummy_rows = vec![Row::from_values(vec![])];
+            let mut dummy_rows = RowVec::new();
+            dummy_rows.push((0, Row::from_values(vec![])));
             let empty_columns: Vec<String> = vec![];
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, dummy_rows, &empty_columns)?;
@@ -939,7 +943,9 @@ impl Executor {
 
         let row = Row::from_values(values);
         let columns = Arc::new(columns);
-        let result = ExecutorMemoryResult::with_arc_columns(Arc::clone(&columns), vec![row]);
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((0, row));
+        let result = ExecutorResult::with_arc_columns(Arc::clone(&columns), rows);
 
         Ok((Box::new(result), columns, false))
     }
@@ -950,14 +956,14 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         columns: Vec<String>,
-        rows: Vec<Row>,
+        rows: RowVec,
     ) -> SelectResult {
         // Use the CTE execution logic from cte.rs
         let (result_cols, result_rows) =
             self.execute_query_on_cte_result(stmt, ctx, columns, rows)?;
         let result_cols = Arc::new(result_cols);
         Ok((
-            Box::new(ExecutorMemoryResult::with_arc_columns(
+            Box::new(ExecutorResult::with_arc_columns(
                 Arc::clone(&result_cols),
                 result_rows,
             )),
@@ -1121,12 +1127,13 @@ impl Executor {
             };
 
             // Convert values to rows
-            let rows: Vec<Row> = distinct_values
+            let rows: RowVec = distinct_values
                 .into_iter()
-                .map(|v| Row::from_values(vec![v]))
+                .enumerate()
+                .map(|(i, v)| (i as i64, Row::from_values(vec![v])))
                 .collect();
 
-            let result = ExecutorMemoryResult::new(vec![output_name], rows);
+            let result = ExecutorResult::new(vec![output_name], rows);
             return Ok(Some(Box::new(result)));
         }
 
@@ -1213,6 +1220,17 @@ impl Executor {
             {
                 let columns = Arc::new(result.columns().to_vec());
                 return Ok((result, columns, false));
+            }
+
+            // Try storage-level GROUP BY aggregation (no WHERE clause)
+            // This computes aggregates directly from arena without materializing Row objects
+            if classification.has_group_by && !classification.has_where {
+                if let Some(result) =
+                    self.try_storage_aggregation(table.as_ref(), stmt, &all_columns, classification)
+                {
+                    let columns = Arc::new(result.columns().to_vec());
+                    return Ok((result, columns, false));
+                }
             }
 
             // Try streaming aggregation for expressions like AVG(col) * 100
@@ -1349,7 +1367,7 @@ impl Executor {
                             &all_columns,
                             table_alias.as_deref(),
                         ));
-                        let result = ExecutorMemoryResult::with_arc_columns_shared_rows(
+                        let result = ExecutorResult::with_arc_columns_shared_rows(
                             Arc::clone(&output_columns),
                             rows_arc,
                         );
@@ -1363,18 +1381,24 @@ impl Executor {
                         // Subsumption hit - filter cached rows
                         // Clone the Vec since we need to filter (creates new Vec anyway)
                         use super::semantic_cache::SemanticCache;
-                        let filtered_rows = SemanticCache::filter_rows(
+                        let filtered_vec = SemanticCache::filter_rows(
                             (*rows_arc).clone(),
                             &filter,
                             &columns,
                             &self.function_registry,
                         )?;
+                        // Convert Vec<Row> to RowVec
+                        let filtered_rows: RowVec = filtered_vec
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, row)| (i as i64, row))
+                            .collect();
                         let output_columns = Arc::new(self.get_output_column_names(
                             &stmt.columns,
                             &all_columns,
                             table_alias.as_deref(),
                         ));
-                        let result = ExecutorMemoryResult::with_arc_columns(
+                        let result = ExecutorResult::with_arc_columns(
                             Arc::clone(&output_columns),
                             filtered_rows,
                         );
@@ -1449,8 +1473,10 @@ impl Executor {
                         &all_columns,
                         table_alias.as_deref(),
                     ));
-                    let result =
-                        ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), vec![]);
+                    let result = ExecutorResult::with_arc_columns(
+                        Arc::clone(&output_columns),
+                        RowVec::new(),
+                    );
                     return Ok((Box::new(result), output_columns, true));
                 }
             }
@@ -1645,6 +1671,7 @@ impl Executor {
             // Pass storage_expr to filter while scanning with limit
             // Use unordered version since ORDER BY is already confirmed empty by can_pushdown_limit
             // This enables true early termination without sorting overhead
+            // Now returns RowVec directly with row IDs preserved
             let rows =
                 table.collect_rows_with_limit_unordered(storage_expr.as_deref(), limit, offset)?;
 
@@ -1666,7 +1693,7 @@ impl Executor {
             ));
 
             let result =
-                ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
+                ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
             // LIMIT/OFFSET already applied at storage level
             return Ok((Box::new(result), output_columns, true));
         }
@@ -1827,12 +1854,12 @@ impl Executor {
                             eprintln!("[ANTI_JOIN] Using anti-join optimization for NOT EXISTS");
 
                             // Materialize outer table rows
-                            let outer_rows = table.collect_all_rows(storage_expr.as_deref())?;
+                            let mut outer_rows = table.collect_all_rows(storage_expr.as_deref())?;
 
                             // Execute anti-join
                             let anti_join_result = self.execute_anti_join(
                                 &not_exists_info,
-                                Arc::new(outer_rows),
+                                Arc::new(outer_rows.drain_rows().collect()),
                                 &all_columns,
                                 ctx,
                             )?;
@@ -1879,7 +1906,7 @@ impl Executor {
                                 projected_rows
                             };
 
-                            let result = ExecutorMemoryResult::with_arc_columns(
+                            let result = ExecutorResult::with_arc_columns(
                                 Arc::clone(&output_columns),
                                 final_rows,
                             );
@@ -2025,7 +2052,7 @@ impl Executor {
                     // OPTIMIZATION: For memory-filter + LIMIT, use iterative fetching
                     // with early termination. We fetch in batches to avoid loading
                     // all rows when only a few are needed.
-                    let mut result_rows = Vec::with_capacity(target.min(1000));
+                    let mut result_rows = RowVec::with_capacity(target.min(1000));
 
                     if needs_memory_filter {
                         // PARTIAL PUSHDOWN: Storage handles some filtering, memory handles rest.
@@ -2039,6 +2066,7 @@ impl Executor {
 
                         loop {
                             // Fetch batch from storage with storage filter + limit
+                            // Now returns RowVec directly with row IDs preserved
                             let batch = table.collect_rows_with_limit(
                                 storage_expr.as_deref(),
                                 batch_size,
@@ -2050,9 +2078,9 @@ impl Executor {
                             }
 
                             // Apply full WHERE filter (includes both pushed and non-pushed parts)
-                            for row in batch {
+                            for (row_id, row) in batch {
                                 if memory_eval.eval_bool(&row) {
-                                    result_rows.push(row);
+                                    result_rows.push((row_id, row));
                                     if result_rows.len() >= target {
                                         break;
                                     }
@@ -2069,7 +2097,7 @@ impl Executor {
                         }
                     } else {
                         // NO MEMORY FILTER NEEDED: Full filter pushed to storage.
-                        // Use storage-level limit directly.
+                        // Use storage-level limit directly. Returns RowVec directly.
                         result_rows =
                             table.collect_rows_with_limit(storage_expr.as_deref(), target, 0)?;
                     }
@@ -2088,7 +2116,7 @@ impl Executor {
                         &all_columns,
                         table_alias.as_deref(),
                     ));
-                    let result = ExecutorMemoryResult::with_arc_columns(
+                    let result = ExecutorResult::with_arc_columns(
                         Arc::clone(&output_columns),
                         projected_rows,
                     );
@@ -2098,39 +2126,21 @@ impl Executor {
                 // Normal path: collect all rows first (for ORDER BY, aggregation, etc.)
                 // Now we create the scanner since we need all rows
                 let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
-                let mut all_rows = Vec::new();
+                let mut all_rows = RowVec::new();
                 while scanner.next() {
-                    all_rows.push(scanner.take_row());
+                    all_rows.push(scanner.take_row_with_id());
                 }
 
                 // Apply parallel filtering if we have enough rows
                 // CRITICAL: Propagate errors with ? instead of silently swallowing them
-                if parallel_config.should_parallel_filter(all_rows.len()) {
-                    (
-                        parallel::parallel_filter(
-                            all_rows,
-                            where_expr,
-                            &all_columns,
-                            &self.function_registry,
-                            &parallel_config,
-                        )?,
-                        None,
-                        None,
-                    )
-                } else {
-                    // Sequential filter for small datasets using pre-compiled expression
-                    let mut eval =
-                        ExpressionEval::compile(where_expr, &all_columns)?.with_context(ctx);
-
-                    (
-                        all_rows
-                            .into_iter()
-                            .filter(|row| eval.eval_bool(row))
-                            .collect(),
-                        None,
-                        None,
-                    )
-                }
+                let filtered = parallel::parallel_filter(
+                    all_rows,
+                    where_expr,
+                    &all_columns,
+                    &self.function_registry,
+                    &parallel_config,
+                )?;
+                (filtered, None, None)
             } else {
                 // SEQUENTIAL PATH: For correlated subqueries or complex cases
                 // Create evaluator once and reuse for all rows
@@ -2210,7 +2220,7 @@ impl Executor {
                 let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
 
                 // Pre-allocate to reduce reallocations - 64 avoids first 6 grow operations
-                let mut rows = Vec::with_capacity(64);
+                let mut rows: RowVec = RowVec::with_capacity(64);
                 let mut row_count = 0u64;
                 while scanner.next() {
                     // Check for cancellation every 100 rows (more frequent for slow queries)
@@ -2353,7 +2363,7 @@ impl Executor {
                         }
                     }
 
-                    rows.push(row);
+                    rows.push((row_count as i64, row));
 
                     // LIMIT EARLY TERMINATION: Stop if we have enough rows
                     if let Some(target) = early_termination_target {
@@ -2367,13 +2377,12 @@ impl Executor {
         } else if storage_expr.is_some() {
             // Path 2: WHERE clause with pushdown - use scanner for index optimization
             // Note: We fetch all columns here because downstream projection uses all_columns indices
-            // Column pruning is handled by Path 3 (collect_projected_rows) when no WHERE clause
             let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
             let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
 
             // OPTIMIZATION: Use take_row() to avoid cloning each row
             // Pre-allocate to reduce reallocations - 64 avoids first 6 grow operations
-            let mut rows = Vec::with_capacity(64);
+            let mut rows = RowVec::with_capacity(64);
             let mut row_count = 0u64;
             while scanner.next() {
                 // Check for cancellation every 100 rows
@@ -2381,12 +2390,12 @@ impl Executor {
                 if row_count.is_multiple_of(100) {
                     ctx.check_cancelled()?;
                 }
-                rows.push(scanner.take_row());
+                // Use row_count as synthetic row ID for scanner-based paths
+                rows.push((row_count as i64, scanner.take_row()));
             }
             (rows, None, None)
         } else {
             // Path 3: Full scan without WHERE - use collect_all_rows
-            // Note: collect_projected_rows was SLOWER due to extra allocations per row
             // Projection is handled later by the executor which is more efficient
             //
             // OPTIMIZATION: For window functions, check if we can use index-based fetching:
@@ -2440,7 +2449,7 @@ impl Executor {
                             table.collect_rows_grouped_by_partition(&partition_col)
                         {
                             // Flatten rows and build partition map
-                            let mut all_rows: Vec<Row> = Vec::new();
+                            let mut all_rows = RowVec::new();
                             let mut partition_map: rustc_hash::FxHashMap<
                                 smallvec::SmallVec<[Value; 4]>,
                                 Vec<usize>,
@@ -2449,7 +2458,10 @@ impl Executor {
                             for (partition_value, partition_rows) in grouped_data {
                                 let start_idx = all_rows.len();
                                 let partition_size = partition_rows.len();
-                                all_rows.extend(partition_rows);
+                                // Extend RowVec with (row_id, Row) tuples
+                                for item in partition_rows {
+                                    all_rows.push(item);
+                                }
 
                                 // Build partition key and indices
                                 let key: smallvec::SmallVec<[Value; 4]> =
@@ -2536,7 +2548,7 @@ impl Executor {
 
         // Destructure: rows and optional window optimization states
         let (rows, window_presorted_state, window_pregrouped_state): (
-            Vec<Row>,
+            RowVec,
             Option<WindowPreSortedState>,
             Option<WindowPreGroupedState>,
         ) = rows_result;
@@ -2571,13 +2583,13 @@ impl Executor {
             // Both aggregation and window functions:
             // 1. First apply GROUP BY aggregation
             // 2. Then apply window functions on the aggregated result
-            let agg_result = self.execute_aggregation_for_window(stmt, ctx, rows, &all_columns)?;
+            let agg_result = self.execute_aggregation_for_window(stmt, ctx, &rows, &all_columns)?;
             let agg_columns = agg_result.0.clone();
             let agg_rows = agg_result.1;
 
             // Apply window functions on aggregated rows
             let result =
-                self.execute_select_with_window_functions(stmt, ctx, agg_rows, &agg_columns)?;
+                self.execute_select_with_window_functions(stmt, ctx, &agg_rows, &agg_columns)?;
             let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
@@ -2590,7 +2602,7 @@ impl Executor {
                 self.execute_select_with_window_functions_pregrouped(
                     stmt,
                     ctx,
-                    rows,
+                    &rows,
                     &all_columns,
                     pregrouped,
                 )?
@@ -2599,13 +2611,13 @@ impl Executor {
                 self.execute_select_with_window_functions_presorted(
                     stmt,
                     ctx,
-                    rows,
+                    &rows,
                     &all_columns,
                     window_presorted_state,
                 )?
             } else {
                 // Default path: no optimization
-                self.execute_select_with_window_functions(stmt, ctx, rows, &all_columns)?
+                self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns)?
             };
             let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
@@ -2665,30 +2677,23 @@ impl Executor {
         // SEMANTIC CACHE: Insert result for eligible queries
         // For SELECT * queries, cache the raw rows before returning
         //
-        // Optimization: We wrap in Arc and share between cache and result to avoid
-        // full Vec clone. The cache stores Arc<Vec<Row>>, and we try_unwrap for the
-        // result (avoiding clone if we're the only owner).
-        let projected_rows = if cache_eligible {
+        // Note: The cache stores Vec<Row>, so we extract rows from RowVec for caching.
+        // The result keeps the original RowVec.
+        if cache_eligible {
             if let Some(where_expr) = where_to_use {
-                let rows_arc = std::sync::Arc::new(projected_rows);
-                self.semantic_cache.insert_arc(
+                // Clone rows for cache (cache needs Vec<Row>)
+                let rows_for_cache: Vec<Row> = projected_rows.rows().cloned().collect();
+                self.semantic_cache.insert(
                     table_name,
                     all_columns.clone(),
-                    std::sync::Arc::clone(&rows_arc),
+                    rows_for_cache,
                     Some(where_expr.clone()),
                 );
-                // Try to reclaim ownership; if cache still holds a reference, clone
-                std::sync::Arc::try_unwrap(rows_arc).unwrap_or_else(|arc| (*arc).clone())
-            } else {
-                projected_rows
             }
-        } else {
-            projected_rows
-        };
+        }
 
         let output_columns = Arc::new(output_columns);
-        let result =
-            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
+        let result = ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok((Box::new(result), output_columns, false))
     }
 
@@ -3230,11 +3235,13 @@ impl Executor {
                         }
                     };
 
-                    // Execute and collect results
+                    // Execute and collect results with synthetic row IDs
                     join_op.open()?;
-                    let mut result_rows = Vec::new();
+                    let mut result_rows = RowVec::new();
+                    let mut row_id = 0i64;
                     while let Some(row_ref) = join_op.next()? {
-                        result_rows.push(row_ref.into_owned());
+                        result_rows.push((row_id, row_ref.into_owned()));
+                        row_id += 1;
                         if let Some(lim) = join_limit {
                             if result_rows.len() >= lim as usize {
                                 break;
@@ -3249,7 +3256,7 @@ impl Executor {
                     // Apply cross-table WHERE filters if any
                     if let Some(ref cross) = cross_filter {
                         let filter = RowFilter::new(cross, &all_columns)?.with_context(ctx);
-                        final_rows.retain(|row| filter.matches(row));
+                        final_rows.retain(|(_, row)| filter.matches(row));
                     }
 
                     // Apply ORDER BY if present
@@ -3262,7 +3269,7 @@ impl Executor {
                         // Compute sort keys and indices
                         let sort_keys: Vec<Vec<Value>> = final_rows
                             .iter()
-                            .map(|row| {
+                            .map(|(_, row)| {
                                 evaluator.set_row_array(row);
                                 stmt.order_by
                                     .iter()
@@ -3359,15 +3366,21 @@ impl Executor {
                     } else if let Some(proj) = projection_pushdown {
                         // Projection was pushed down - rows are already projected
                         let output_columns = Arc::new(proj.output_columns);
-                        let result = ExecutorMemoryResult::with_arc_columns(
+                        let result = ExecutorResult::with_arc_columns(
                             Arc::clone(&output_columns),
                             final_rows,
                         );
                         return Ok((Box::new(result), output_columns, false));
                     } else {
                         // Project rows according to SELECT expressions
-                        let projected_rows =
-                            self.project_rows(&stmt.columns, final_rows, &all_columns, ctx)?;
+                        let projected_rows = self.project_rows_with_alias(
+                            &stmt.columns,
+                            final_rows,
+                            &all_columns,
+                            None,
+                            ctx,
+                            None,
+                        )?;
                         let output_columns = Arc::new(self.get_output_column_names(
                             &stmt.columns,
                             &all_columns,
@@ -3375,7 +3388,7 @@ impl Executor {
                         ));
 
                         // Return with projected results
-                        let result = ExecutorMemoryResult::with_arc_columns(
+                        let result = ExecutorResult::with_arc_columns(
                             Arc::clone(&output_columns),
                             projected_rows,
                         );
@@ -3550,12 +3563,18 @@ impl Executor {
                     let join_result = join_executor.execute_streaming(streaming_request)?;
 
                     // Project and return results
-                    let projected_rows =
-                        self.project_rows(&stmt.columns, join_result.rows, &all_cols, ctx)?;
+                    let projected_rows = self.project_rows_with_alias(
+                        &stmt.columns,
+                        join_result.rows,
+                        &all_cols,
+                        None,
+                        ctx,
+                        None,
+                    )?;
                     let output_columns =
                         Arc::new(self.get_output_column_names(&stmt.columns, &all_cols, None));
 
-                    let result = ExecutorMemoryResult::with_arc_columns(
+                    let result = ExecutorResult::with_arc_columns(
                         Arc::clone(&output_columns),
                         projected_rows,
                     );
@@ -3809,7 +3828,7 @@ impl Executor {
 
             result_rows
                 .into_iter()
-                .filter(|row| where_filter.matches(row))
+                .filter(|(_, row)| where_filter.matches(row))
                 .collect()
         } else {
             result_rows
@@ -3853,10 +3872,10 @@ impl Executor {
                     })
                     .collect();
 
-                // Filter row values using clone_subset
-                let filtered_rows: Vec<Row> = filtered_rows
+                // Filter row values using clone_subset, preserving row IDs
+                let filtered_rows: RowVec = filtered_rows
                     .into_iter()
-                    .map(|row| row.clone_subset(&kept_indices))
+                    .map(|(row_id, row)| (row_id, row.clone_subset(&kept_indices)))
                     .collect();
 
                 (filtered_columns, filtered_rows)
@@ -3875,13 +3894,13 @@ impl Executor {
             // 1. First apply GROUP BY aggregation
             // 2. Then apply window functions on the aggregated result
             let agg_result =
-                self.execute_aggregation_for_window(stmt, ctx, final_rows, &final_columns)?;
+                self.execute_aggregation_for_window(stmt, ctx, &final_rows, &final_columns)?;
             let agg_columns = agg_result.0.clone();
             let agg_rows = agg_result.1;
 
-            // Apply window functions on aggregated rows
+            // Apply window functions on aggregated rows (agg_rows is already RowVec with IDs)
             let result =
-                self.execute_select_with_window_functions(stmt, ctx, agg_rows, &agg_columns)?;
+                self.execute_select_with_window_functions(stmt, ctx, &agg_rows, &agg_columns)?;
             let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
@@ -3889,7 +3908,7 @@ impl Executor {
         // Check if we need window functions only (no aggregation)
         if has_window {
             let result =
-                self.execute_select_with_window_functions(stmt, ctx, final_rows, &final_columns)?;
+                self.execute_select_with_window_functions(stmt, ctx, &final_rows, &final_columns)?;
             let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
@@ -3903,7 +3922,14 @@ impl Executor {
         }
 
         // Project rows according to SELECT expressions
-        let projected_rows = self.project_rows(&stmt.columns, final_rows, &final_columns, ctx)?;
+        let projected_rows = self.project_rows_with_alias(
+            &stmt.columns,
+            final_rows,
+            &final_columns,
+            None,
+            ctx,
+            None,
+        )?;
 
         // Determine output column names
         // Note: For JOIN results, columns are already qualified (e.g., "a.id", "b.id"),
@@ -3911,8 +3937,7 @@ impl Executor {
         let output_columns =
             Arc::new(self.get_output_column_names(&stmt.columns, &final_columns, None));
 
-        let result =
-            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
+        let result = ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok((Box::new(result), output_columns, false))
     }
 
@@ -3932,15 +3957,21 @@ impl Executor {
         let result = self.execute_select(&subquery_source.subquery, &subquery_ctx)?;
         let columns = result.columns().to_vec();
 
-        // Materialize the subquery result
-        let rows = Self::materialize_result(result)?;
+        // Materialize the subquery result directly with synthetic row IDs
+        let mut rows = RowVec::new();
+        let mut result = result;
+        let mut row_id = 0i64;
+        while result.next() {
+            rows.push((row_id, result.take_row()));
+            row_id += 1;
+        }
 
         // Apply WHERE clause if present
-        let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
+        let filtered_rows: RowVec = if let Some(ref where_clause) = stmt.where_clause {
             let where_filter = RowFilter::new(where_clause, &columns)?.with_context(ctx);
 
             rows.into_iter()
-                .filter(|row| where_filter.matches(row))
+                .filter(|(_, row)| where_filter.matches(row))
                 .collect()
         } else {
             rows
@@ -3949,7 +3980,7 @@ impl Executor {
         // Check if we need window functions
         if classification.has_window_functions {
             let result =
-                self.execute_select_with_window_functions(stmt, ctx, filtered_rows, &columns)?;
+                self.execute_select_with_window_functions(stmt, ctx, &filtered_rows, &columns)?;
             let out_columns = Arc::new(result.columns().to_vec());
             return Ok((result, out_columns, false));
         }
@@ -3963,7 +3994,8 @@ impl Executor {
         }
 
         // Project rows according to SELECT expressions
-        let projected_rows = self.project_rows(&stmt.columns, filtered_rows, &columns, ctx)?;
+        let projected_rows =
+            self.project_rows_with_alias(&stmt.columns, filtered_rows, &columns, None, ctx, None)?;
 
         // Determine output column names
         let subquery_alias = subquery_source
@@ -3973,8 +4005,7 @@ impl Executor {
         let output_columns =
             Arc::new(self.get_output_column_names(&stmt.columns, &columns, subquery_alias));
 
-        let result =
-            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
+        let result = ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok((Box::new(result), output_columns, false))
     }
 
@@ -4064,10 +4095,12 @@ impl Executor {
 
         // Handle aggregation: if outer query has aggregates, materialize view result and aggregate
         if classification.has_aggregation {
-            // Materialize the view result into rows
-            let mut rows = Vec::with_capacity(64);
+            // Materialize the view result into rows with synthetic IDs
+            let mut rows = RowVec::with_capacity(64);
+            let mut idx = 0i64;
             while result.next() {
-                rows.push(result.take_row());
+                rows.push((idx, result.take_row()));
+                idx += 1;
             }
 
             // Execute aggregation on the view's rows
@@ -4310,7 +4343,8 @@ impl Executor {
         };
 
         // Evaluate all rows
-        let mut result_rows = Vec::with_capacity(values_source.rows.len());
+        let mut result_rows = RowVec::with_capacity(values_source.rows.len());
+        let mut row_id = 0i64;
         for row_exprs in &values_source.rows {
             let mut row_values = Vec::with_capacity(row_exprs.len());
             for expr in row_exprs {
@@ -4325,17 +4359,19 @@ impl Executor {
             if let (Some(wf), Some(qf)) = (&where_filter, &qualified_filter) {
                 // Try with simple column names first, then qualified
                 if wf.matches(&row) || qf.matches(&row) {
-                    result_rows.push(row);
+                    result_rows.push((row_id, row));
+                    row_id += 1;
                 }
             } else {
-                result_rows.push(row);
+                result_rows.push((row_id, row));
+                row_id += 1;
             }
         }
 
         // Check if we need window functions
         if classification.has_window_functions {
             let result =
-                self.execute_select_with_window_functions(stmt, ctx, result_rows, &column_names)?;
+                self.execute_select_with_window_functions(stmt, ctx, &result_rows, &column_names)?;
             let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
@@ -4351,7 +4387,7 @@ impl Executor {
         // Create the result - use Arc for column names
         let column_names_arc = Arc::new(column_names);
         let values_result =
-            ExecutorMemoryResult::with_arc_columns(Arc::clone(&column_names_arc), result_rows);
+            ExecutorResult::with_arc_columns(Arc::clone(&column_names_arc), result_rows);
 
         // If the SELECT has projections, apply them
         if stmt.columns.len() == 1
@@ -4366,7 +4402,8 @@ impl Executor {
 
         // Apply column projection
         let mut projected_columns = Vec::new();
-        let mut projected_rows = Vec::new();
+        let mut projected_rows = RowVec::new();
+        let mut proj_row_id = 0i64;
 
         // Determine output columns
         for (i, col_expr) in stmt.columns.iter().enumerate() {
@@ -4547,14 +4584,13 @@ impl Executor {
                 }
             }
 
-            projected_rows.push(Row::from_values(new_values));
+            projected_rows.push((proj_row_id, Row::from_values(new_values)));
+            proj_row_id += 1;
         }
 
         let projected_columns_arc = Arc::new(projected_columns);
-        let final_result = ExecutorMemoryResult::with_arc_columns(
-            Arc::clone(&projected_columns_arc),
-            projected_rows,
-        );
+        let final_result =
+            ExecutorResult::with_arc_columns(Arc::clone(&projected_columns_arc), projected_rows);
         Ok((Box::new(final_result), projected_columns_arc, false))
     }
 
@@ -4598,7 +4634,7 @@ impl Executor {
                         .map(|col| format!("{}.{}", table_alias, col))
                         .collect();
 
-                    // Apply filter to CTE data if present, or use shared Arc for zero-copy
+                    // Apply filter to CTE data if present, or convert to RowVec
                     let result: Box<dyn QueryResult> = if let Some(filter_expr) = filter {
                         // Need to clone matching rows
                         // Must apply execution context for parameter support
@@ -4611,22 +4647,24 @@ impl Executor {
                         );
                         let row_filter =
                             RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
-                        let filtered_rows: Vec<Row> = rows
+                        // CTE stores Arc<Vec<(i64, Row)>>, filter on the Row part
+                        let filtered_rows: RowVec = rows
                             .iter()
-                            .filter(|row| row_filter.matches(row))
+                            .filter(|(_, row)| row_filter.matches(row))
                             .cloned()
                             .collect();
                         #[cfg(debug_assertions)]
                         eprintln!("[CTE_FILTER] rows_after={}", filtered_rows.len());
-                        Box::new(super::result::ExecutorMemoryResult::new(
+                        Box::new(super::result::ExecutorResult::new(
                             columns.to_vec(),
                             filtered_rows,
                         ))
                     } else {
-                        // Zero-copy: share the Arc<Vec<Row>> directly
-                        Box::new(super::result::ExecutorMemoryResult::with_shared_rows(
+                        // Convert CTE Arc<Vec<(i64, Row)>> to RowVec
+                        let rows_vec = RowVec::from_vec((**rows).clone());
+                        Box::new(super::result::ExecutorResult::new(
                             columns.to_vec(),
-                            Arc::clone(rows),
+                            rows_vec,
                         ))
                     };
 
@@ -4762,14 +4800,13 @@ impl Executor {
                     // has qualified names like "ds.avg_salary" not just "avg_salary"
                     let row_filter =
                         RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
-                    // Materialize and filter
+                    // Materialize and filter - materialized is RowVec = Vec<(i64, Row)>
                     let mut materialized = Self::materialize_result(result)?;
-                    materialized.retain(|row| row_filter.matches(row));
+                    materialized.retain(|(_, row)| row_filter.matches(row));
                     #[cfg(debug_assertions)]
                     eprintln!("[SUBQUERY_FILTER] rows_after={}", materialized.len());
-                    let filtered_result: Box<dyn QueryResult> = Box::new(
-                        super::result::ExecutorMemoryResult::new(columns, materialized),
-                    );
+                    let filtered_result: Box<dyn QueryResult> =
+                        Box::new(super::result::ExecutorResult::new(columns, materialized));
                     return Ok((filtered_result, qualified_columns));
                 }
 
@@ -4903,16 +4940,18 @@ impl Executor {
         self.execute_table_expression_with_filter(expr, ctx, filter)
     }
 
-    /// Materialize a result into a vector of rows
-    pub(crate) fn materialize_result(mut result: Box<dyn QueryResult>) -> Result<Vec<Row>> {
+    /// Materialize a result into a RowVec
+    pub(crate) fn materialize_result(mut result: Box<dyn QueryResult>) -> Result<RowVec> {
         // Pre-allocate based on estimate to avoid reallocations
         let mut rows = if let Some(estimate) = result.estimated_count() {
-            Vec::with_capacity(estimate)
+            RowVec::with_capacity(estimate)
         } else {
-            Vec::new()
+            RowVec::new()
         };
+        let mut row_id = 0i64;
         while result.next() {
-            rows.push(result.take_row());
+            rows.push((row_id, result.take_row()));
+            row_id += 1;
         }
         Ok(rows)
     }
@@ -4950,10 +4989,10 @@ impl Executor {
     pub(crate) fn project_rows(
         &self,
         select_exprs: &[Expression],
-        rows: Vec<Row>,
+        rows: RowVec,
         all_columns: &[String],
         ctx: &ExecutionContext,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         self.project_rows_with_alias(select_exprs, rows, all_columns, None, ctx, None)
     }
 
@@ -4965,16 +5004,16 @@ impl Executor {
     pub(crate) fn project_rows_with_alias(
         &self,
         select_exprs: &[Expression],
-        rows: Vec<Row>,
+        rows: RowVec,
         all_columns: &[String],
         all_columns_lower: Option<&[String]>,
         ctx: &ExecutionContext,
         table_alias: Option<&str>,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         // Check if this is SELECT * (no projection needed)
         // Note: QualifiedStar (t.*) DOES need projection to filter columns
         if select_exprs.len() == 1 && matches!(&select_exprs[0], Expression::Star(_)) {
-            return Ok(rows);
+            return Ok(rows); // Pass through directly - pooled
         }
 
         // OPTIMIZATION: Compute lowercase columns once at the start
@@ -5023,11 +5062,10 @@ impl Executor {
                 };
 
                 // Project rows to only include matching columns
-                let projected: Vec<Row> = rows
-                    .into_iter()
-                    .map(|row| row.clone_subset(&indices_to_use))
-                    .collect();
-
+                let mut projected = RowVec::with_capacity(rows.len());
+                for (id, row) in rows.into_iter() {
+                    projected.push((id, row.clone_subset(&indices_to_use)));
+                }
                 return Ok(projected);
             }
         }
@@ -5193,14 +5231,14 @@ impl Executor {
                         .all(|(i, &idx)| i == idx);
 
                 if is_identity {
-                    return Ok(rows);
+                    return Ok(rows); // Pass through directly - pooled
                 }
 
                 // OPTIMIZATION: Use take_columns to move values instead of cloning
-                let projected: Vec<Row> = rows
-                    .into_iter()
-                    .map(|row| row.take_columns(&simple_column_indices))
-                    .collect();
+                let mut projected = RowVec::with_capacity(rows.len());
+                for (id, row) in rows.into_iter() {
+                    projected.push((id, row.take_columns(&simple_column_indices)));
+                }
                 return Ok(projected);
             }
             // Fall through to slow path if there are duplicates
@@ -5238,7 +5276,7 @@ impl Executor {
         }
 
         // Correlated subquery path: expressions change per-row, use CompiledEvaluator
-        let mut projected = Vec::with_capacity(rows.len());
+        let mut projected = RowVec::with_capacity(rows.len());
 
         // Create evaluator once and reuse for all rows
         let mut evaluator = CompiledEvaluator::new(&self.function_registry);
@@ -5256,7 +5294,7 @@ impl Executor {
         // OPTIMIZATION: Wrap all_columns in Arc once, reuse for all rows
         let all_columns_arc: Arc<Vec<String>> = Arc::new(all_columns.to_vec());
 
-        for row in rows {
+        for (id, row) in rows.into_iter() {
             let mut values = Vec::with_capacity(select_exprs.len());
 
             evaluator.set_row_array(&row);
@@ -5345,7 +5383,7 @@ impl Executor {
                 }
             }
 
-            projected.push(Row::from_values(values));
+            projected.push((id, Row::from_values(values)));
         }
 
         Ok(projected)
@@ -5357,13 +5395,13 @@ impl Executor {
     fn project_rows_optimized(
         &self,
         select_exprs: &[Expression],
-        rows: Vec<Row>,
+        rows: RowVec,
         all_columns: &[String],
         all_columns_lower: &[String],
         col_index_map_lower: &FxHashMap<String, usize>,
         table_alias_lower: Option<&str>,
         ctx: &ExecutionContext,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         // Analyze expressions and pre-compile complex ones
         // Each element represents how to evaluate each SELECT expression:
         // - SimpleColumn: direct column index lookup
@@ -5806,7 +5844,7 @@ impl Executor {
             .all(|a| matches!(a, ExprAction::SimpleColumn(_)));
 
         // Project rows using pre-analyzed actions
-        let mut projected = Vec::with_capacity(rows.len());
+        let mut projected = RowVec::with_capacity(rows.len());
 
         if all_simple_columns {
             // Super fast path: just extract column indices and use take_columns
@@ -5821,8 +5859,8 @@ impl Executor {
                 })
                 .collect();
 
-            for row in rows {
-                projected.push(row.take_columns(&indices));
+            for (id, row) in rows.into_iter() {
+                projected.push((id, row.take_columns(&indices)));
             }
         } else {
             // General path: mixed actions
@@ -5836,7 +5874,7 @@ impl Executor {
             // Pre-compute capacity outside loop to avoid repeated len() calls
             let values_capacity = actions.len();
 
-            for row in rows {
+            for (id, row) in rows.into_iter() {
                 let mut values = Vec::with_capacity(values_capacity);
 
                 // Build VM context with all params in one call (faster than builder chain)
@@ -6012,7 +6050,7 @@ impl Executor {
                     }
                 }
 
-                projected.push(Row::from_values(values));
+                projected.push((id, Row::from_values(values)));
             }
         }
 
@@ -6025,10 +6063,10 @@ impl Executor {
         &self,
         select_exprs: &[Expression],
         order_by: &[crate::parser::ast::OrderByExpression],
-        rows: Vec<Row>,
+        mut rows: RowVec,
         all_columns: &[String],
         ctx: &ExecutionContext,
-    ) -> Result<(Vec<Row>, Vec<String>)> {
+    ) -> Result<(RowVec, Vec<String>)> {
         // Process scalar subqueries in SELECT columns before evaluation (single-pass)
         let processed = self.try_process_select_subqueries(select_exprs, ctx)?;
         let select_exprs = match &processed {
@@ -6101,11 +6139,11 @@ impl Executor {
 
         if all_simple {
             // Fast path
-            let mut projected = Vec::with_capacity(rows.len());
+            let mut projected = RowVec::with_capacity(rows.len());
             let num_select_cols = select_column_indices.len();
             let num_extra_cols = extra_order_indices.len();
 
-            for row in rows {
+            for (row_id, row) in rows.drain_rows().enumerate() {
                 let mut values = Vec::with_capacity(num_select_cols + num_extra_cols);
                 // Add SELECT columns
                 for idx in &select_column_indices {
@@ -6119,14 +6157,14 @@ impl Executor {
                 for &idx in &extra_order_indices {
                     values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
                 }
-                projected.push(Row::from_values(values));
+                projected.push((row_id as i64, Row::from_values(values)));
             }
 
             // Output column names will be computed in caller
             Ok((projected, vec![]))
         } else {
             // Slow path: Use Evaluator for complex expressions
-            let mut projected = Vec::with_capacity(rows.len());
+            let mut projected = RowVec::with_capacity(rows.len());
 
             // Create evaluator once and reuse for all rows
             let mut evaluator = CompiledEvaluator::new(&self.function_registry);
@@ -6134,7 +6172,7 @@ impl Executor {
             evaluator.init_columns(all_columns);
 
             // OPTIMIZATION: Reuse col_index_map_lower for O(1) lookup
-            for row in rows {
+            for (row_id, row) in rows.drain_rows().enumerate() {
                 let mut values = Vec::with_capacity(select_exprs.len() + extra_order_indices.len());
 
                 evaluator.set_row_array(&row);
@@ -6155,7 +6193,7 @@ impl Executor {
                     values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
                 }
 
-                projected.push(Row::from_values(values));
+                projected.push((row_id as i64, Row::from_values(values)));
             }
 
             Ok((projected, vec![]))
@@ -6553,10 +6591,12 @@ impl Executor {
 
                 // Return success result
                 let columns = vec!["result".to_string()];
-                let rows = vec![Row::from_values(vec![Value::text(
-                    "Snapshot created successfully",
-                )])];
-                Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![Value::text("Snapshot created successfully")]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
             "CHECKPOINT" => {
                 // Alias for SNAPSHOT (SQLite-style)
@@ -6567,10 +6607,12 @@ impl Executor {
                 self.engine.create_snapshot()?;
 
                 let columns = vec!["result".to_string()];
-                let rows = vec![Row::from_values(vec![Value::text(
-                    "Checkpoint created successfully",
-                )])];
-                Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![Value::text("Checkpoint created successfully")]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
             "SNAPSHOT_INTERVAL" => {
                 let config = self.engine.config();
@@ -6582,14 +6624,19 @@ impl Executor {
                     let mut new_config = config.clone();
                     new_config.persistence.snapshot_interval = new_value as u32;
                     self.engine.update_engine_config(new_config)?;
-                    let rows = vec![Row::from_values(vec![Value::Integer(new_value)])];
-                    Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 } else {
                     // Read mode: PRAGMA snapshot_interval
-                    let rows = vec![Row::from_values(vec![Value::Integer(
-                        config.persistence.snapshot_interval as i64,
-                    )])];
-                    Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((
+                        0,
+                        Row::from_values(vec![Value::Integer(
+                            config.persistence.snapshot_interval as i64,
+                        )]),
+                    ));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
             }
             "KEEP_SNAPSHOTS" => {
@@ -6601,13 +6648,18 @@ impl Executor {
                     let mut new_config = config.clone();
                     new_config.persistence.keep_snapshots = new_value as u32;
                     self.engine.update_engine_config(new_config)?;
-                    let rows = vec![Row::from_values(vec![Value::Integer(new_value)])];
-                    Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 } else {
-                    let rows = vec![Row::from_values(vec![Value::Integer(
-                        config.persistence.keep_snapshots as i64,
-                    )])];
-                    Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((
+                        0,
+                        Row::from_values(vec![Value::Integer(
+                            config.persistence.keep_snapshots as i64,
+                        )]),
+                    ));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
             }
             "SYNC_MODE" => {
@@ -6628,13 +6680,16 @@ impl Executor {
                         }
                     };
                     self.engine.update_engine_config(new_config)?;
-                    let rows = vec![Row::from_values(vec![Value::Integer(new_value)])];
-                    Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 } else {
-                    let rows = vec![Row::from_values(vec![Value::Integer(
-                        config.persistence.sync_mode as i64,
-                    )])];
-                    Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((
+                        0,
+                        Row::from_values(vec![Value::Integer(config.persistence.sync_mode as i64)]),
+                    ));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
             }
             "WAL_FLUSH_TRIGGER" => {
@@ -6646,13 +6701,18 @@ impl Executor {
                     let mut new_config = config.clone();
                     new_config.persistence.wal_flush_trigger = new_value as usize;
                     self.engine.update_engine_config(new_config)?;
-                    let rows = vec![Row::from_values(vec![Value::Integer(new_value)])];
-                    Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 } else {
-                    let rows = vec![Row::from_values(vec![Value::Integer(
-                        config.persistence.wal_flush_trigger as i64,
-                    )])];
-                    Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((
+                        0,
+                        Row::from_values(vec![Value::Integer(
+                            config.persistence.wal_flush_trigger as i64,
+                        )]),
+                    ));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
             }
             _ => {
@@ -6703,9 +6763,10 @@ impl Executor {
             .with_context(ctx)
             .eval_slice(&Row::new())?;
         let columns = vec!["result".to_string()];
-        let rows = vec![Row::from_values(vec![value])];
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((0, Row::from_values(vec![value])));
 
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+        Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
 
     /// Execute a temporal query (AS OF TRANSACTION or AS OF TIMESTAMP)
@@ -6755,10 +6816,13 @@ impl Executor {
         let _output_columns = result.columns().to_vec();
 
         // Collect rows for further processing (projection, aggregation, etc.)
-        let mut rows = Vec::with_capacity(64);
+        // Use synthetic row IDs since temporal queries don't preserve original IDs
+        let mut rows = RowVec::with_capacity(64);
         let mut result_iter = result;
+        let mut row_id = 0i64;
         while result_iter.next() {
-            rows.push(result_iter.take_row());
+            rows.push((row_id, result_iter.take_row()));
+            row_id += 1;
         }
 
         // Apply in-memory WHERE filter if storage expression couldn't handle it fully
@@ -6766,14 +6830,14 @@ impl Executor {
             if let Some(where_expr) = &stmt.where_clause {
                 let where_filter = RowFilter::new(where_expr, &all_columns)?.with_context(ctx);
 
-                rows.retain(|row| where_filter.matches(row));
+                rows.retain(|(_, row)| where_filter.matches(row));
             }
         }
 
         // Check for window functions
         if classification.has_window_functions {
             let result =
-                self.execute_select_with_window_functions(stmt, ctx, rows, &all_columns)?;
+                self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns)?;
             let columns = Arc::new(result.columns().to_vec());
             return Ok((result, columns, false));
         }
@@ -6791,7 +6855,7 @@ impl Executor {
 
         let final_columns_arc = Arc::new(final_columns);
         Ok((
-            Box::new(ExecutorMemoryResult::with_arc_columns(
+            Box::new(ExecutorResult::with_arc_columns(
                 Arc::clone(&final_columns_arc),
                 projected_rows,
             )),
@@ -6908,10 +6972,10 @@ impl Executor {
     fn project_rows_for_select(
         &self,
         stmt: &SelectStatement,
-        rows: Vec<Row>,
+        rows: RowVec,
         all_columns: &[String],
         ctx: &ExecutionContext,
-    ) -> Result<(Vec<Row>, Vec<String>)> {
+    ) -> Result<(RowVec, Vec<String>)> {
         // Check for SELECT * or t.*
         if stmt.columns.len() == 1
             && matches!(
@@ -7754,7 +7818,8 @@ impl Executor {
         }
 
         // Streaming aggregation: iterate through groups in sorted order
-        let mut result_rows = Vec::new();
+        let mut result_rows = RowVec::new();
+        let mut result_row_id = 0i64;
         let num_aggs = simple_aggs.len();
 
         // Parse LIMIT for early termination
@@ -7777,7 +7842,7 @@ impl Executor {
         // 4. Reusable row buffer avoids per-group allocations
 
         // Pre-allocate reusable buffer for row fetching (avoids alloc/dealloc per group)
-        let mut row_buffer: Vec<(i64, crate::core::Row)> = Vec::with_capacity(256);
+        let mut row_buffer = crate::core::RowVec::with_capacity(256);
         // Create true expression once outside loop
         use crate::storage::expression::logical::ConstBoolExpr;
         let true_expr = ConstBoolExpr::true_expr();
@@ -7942,7 +8007,8 @@ impl Executor {
                     };
                     values.push(value);
                 }
-                result_rows.push(Row::from_values(values));
+                result_rows.push((result_row_id, Row::from_values(values)));
+                result_row_id += 1;
 
                 // Early termination: stop once we have LIMIT groups that passed HAVING
                 if let Some(limit) = limit_for_early_exit {
@@ -7973,8 +8039,7 @@ impl Executor {
         }
 
         let result_columns = Arc::new(result_columns);
-        let result =
-            ExecutorMemoryResult::with_arc_columns(Arc::clone(&result_columns), result_rows);
+        let result = ExecutorResult::with_arc_columns(Arc::clone(&result_columns), result_rows);
         Ok(Some((Box::new(result), result_columns)))
     }
 }

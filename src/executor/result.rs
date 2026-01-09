@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use crate::core::{Result, Row, Value};
+use crate::core::{Result, Row, RowVec, Value};
 use crate::parser::ast::Expression;
 use crate::storage::traits::QueryResult;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -118,10 +118,10 @@ impl QueryResult for ExecResult {
 ///
 /// This result type stores all rows in memory, suitable for
 /// small to medium result sets.
-/// Storage for result rows - either owned or shared via Arc
+/// Storage for result rows - either owned (pooled) or shared via Arc
 enum RowStorage {
-    /// Owned rows - can be modified/taken
-    Owned(Vec<Row>),
+    /// Owned rows - pooled, returns to thread-local cache on drop
+    Owned(RowVec),
     /// Shared rows from cache - read-only, clone on take
     Shared(Arc<Vec<Row>>),
 }
@@ -130,7 +130,7 @@ impl RowStorage {
     #[inline]
     fn len(&self) -> usize {
         match self {
-            RowStorage::Owned(rows) => rows.len(),
+            RowStorage::Owned(rv) => rv.len(),
             RowStorage::Shared(rows) => rows.len(),
         }
     }
@@ -138,7 +138,7 @@ impl RowStorage {
     #[inline]
     fn get(&self, index: usize) -> Option<&Row> {
         match self {
-            RowStorage::Owned(rows) => rows.get(index),
+            RowStorage::Owned(rv) => rv.get(index).map(|(_, row)| row),
             RowStorage::Shared(rows) => rows.get(index),
         }
     }
@@ -146,14 +146,14 @@ impl RowStorage {
     #[inline]
     fn take(&mut self, index: usize) -> Row {
         match self {
-            RowStorage::Owned(rows) => std::mem::take(&mut rows[index]),
+            RowStorage::Owned(rv) => std::mem::take(&mut rv[index].1),
             // For shared storage, we must clone since we can't take ownership
             RowStorage::Shared(rows) => rows[index].clone(),
         }
     }
 }
 
-pub struct ExecutorMemoryResult {
+pub struct ExecutorResult {
     /// Column names (Arc for zero-copy sharing with API layer)
     columns: Arc<Vec<String>>,
     /// Result rows - either owned or shared
@@ -170,9 +170,9 @@ pub struct ExecutorMemoryResult {
     insert_id: i64,
 }
 
-impl ExecutorMemoryResult {
-    /// Create a new memory result with columns and rows
-    pub fn new(columns: Vec<String>, rows: Vec<Row>) -> Self {
+impl ExecutorResult {
+    /// Create a new memory result with columns and pooled rows
+    pub fn new(columns: Vec<String>, rows: RowVec) -> Self {
         let len = rows.len();
         Self {
             columns: Arc::new(columns),
@@ -186,7 +186,7 @@ impl ExecutorMemoryResult {
     }
 
     /// Create a new memory result with Arc columns (zero-copy)
-    pub fn with_arc_columns(columns: Arc<Vec<String>>, rows: Vec<Row>) -> Self {
+    pub fn with_arc_columns(columns: Arc<Vec<String>>, rows: RowVec) -> Self {
         let len = rows.len();
         Self {
             columns,
@@ -245,27 +245,31 @@ impl ExecutorMemoryResult {
 
     /// Create an empty memory result
     pub fn empty() -> Self {
-        Self::new(Vec::new(), Vec::new())
+        Self::new(Vec::new(), RowVec::new())
     }
 
     /// Create with columns only (no rows yet)
     pub fn with_columns(columns: Vec<String>) -> Self {
-        Self::new(columns, Vec::new())
+        Self::new(columns, RowVec::new())
     }
 
     /// Create with schema
-    pub fn with_schema(columns: Vec<String>, rows: Vec<Row>, _schema: crate::core::Schema) -> Self {
+    pub fn with_schema(columns: Vec<String>, rows: RowVec, _schema: crate::core::Schema) -> Self {
         Self::new(columns, rows)
     }
 
     /// Add a row to the result
     pub fn add_row(&mut self, row: Row) {
-        // Convert to owned if needed
+        // Convert from shared to owned if needed
         if let RowStorage::Shared(arc_rows) = &self.rows {
-            self.rows = RowStorage::Owned(arc_rows.as_ref().clone());
+            let mut rv = RowVec::with_capacity(arc_rows.len() + 1);
+            for (idx, r) in arc_rows.iter().enumerate() {
+                rv.push((idx as i64, r.clone()));
+            }
+            self.rows = RowStorage::Owned(rv);
         }
-        if let RowStorage::Owned(rows) = &mut self.rows {
-            rows.push(row);
+        if let RowStorage::Owned(rv) = &mut self.rows {
+            rv.push((self.len as i64, row));
             self.len += 1;
         }
     }
@@ -276,18 +280,16 @@ impl ExecutorMemoryResult {
         self.len
     }
 
-    /// Get all rows
-    pub fn rows(&self) -> &[Row] {
-        match &self.rows {
-            RowStorage::Owned(rows) => rows,
-            RowStorage::Shared(rows) => rows,
-        }
+    /// Get row by index
+    #[inline]
+    pub fn get_row(&self, index: usize) -> Option<&Row> {
+        self.rows.get(index)
     }
 
-    /// Take ownership of all rows
+    /// Take ownership of all rows (extracts Row from RowVec)
     pub fn into_rows(self) -> Vec<Row> {
         match self.rows {
-            RowStorage::Owned(rows) => rows,
+            RowStorage::Owned(mut rv) => rv.drain_rows().collect(),
             RowStorage::Shared(rows) => {
                 // Must clone if shared
                 Arc::try_unwrap(rows).unwrap_or_else(|arc| (*arc).clone())
@@ -299,7 +301,7 @@ impl ExecutorMemoryResult {
     /// Returns Arc<Vec<Row>> - wraps owned rows or clones Arc for shared
     pub fn into_arc_rows(self) -> Arc<Vec<Row>> {
         match self.rows {
-            RowStorage::Owned(rows) => Arc::new(rows),
+            RowStorage::Owned(mut rv) => Arc::new(rv.drain_rows().collect()),
             RowStorage::Shared(rows) => rows,
         }
     }
@@ -320,7 +322,7 @@ impl ExecutorMemoryResult {
     }
 }
 
-impl QueryResult for ExecutorMemoryResult {
+impl QueryResult for ExecutorResult {
     fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -398,10 +400,10 @@ impl QueryResult for ExecutorMemoryResult {
 
     fn try_into_arc_rows(&mut self) -> Option<Arc<Vec<Row>>> {
         // Take ownership of rows and return as Arc
-        let rows = std::mem::replace(&mut self.rows, RowStorage::Owned(Vec::new()));
+        let rows = std::mem::replace(&mut self.rows, RowStorage::Owned(RowVec::new()));
         self.closed = true; // Mark as consumed
         match rows {
-            RowStorage::Owned(rows) => Some(Arc::new(rows)),
+            RowStorage::Owned(mut rv) => Some(Arc::new(rv.drain_rows().collect())),
             RowStorage::Shared(arc) => Some(arc),
         }
     }
@@ -861,7 +863,7 @@ impl QueryResult for LimitedResult {
 /// Ordered result that sorts rows by ORDER BY expressions
 pub struct OrderedResult {
     /// Materialized and sorted rows
-    inner: ExecutorMemoryResult,
+    inner: ExecutorResult,
 }
 
 /// Order specification for radix sort
@@ -886,17 +888,19 @@ impl OrderedResult {
     {
         let columns = inner.columns().to_vec();
 
-        // Materialize all rows
-        let mut rows = Vec::new();
+        // Materialize all rows into RowVec
+        let mut rows = RowVec::new();
+        let mut idx = 0i64;
         while inner.next() {
-            rows.push(inner.take_row());
+            rows.push((idx, inner.take_row()));
+            idx += 1;
         }
 
-        // Sort rows (use sort_unstable_by for ~10-20% speedup, stability not needed)
-        rows.sort_unstable_by(compare);
+        // Sort rows (comparing only the Row part, ignoring IDs)
+        rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
 
         // Create memory result
-        let memory_result = ExecutorMemoryResult::new(columns, rows);
+        let memory_result = ExecutorResult::new(columns, rows);
 
         Self {
             inner: memory_result,
@@ -922,10 +926,12 @@ impl OrderedResult {
     {
         let columns = inner.columns().to_vec();
 
-        // Materialize all rows
-        let mut rows = Vec::new();
+        // Materialize all rows into RowVec
+        let mut rows = RowVec::new();
+        let mut idx = 0i64;
         while inner.next() {
-            rows.push(inner.take_row());
+            rows.push((idx, inner.take_row()));
+            idx += 1;
         }
 
         // Check if any column has explicit NULLS FIRST/LAST setting
@@ -938,7 +944,7 @@ impl OrderedResult {
                 let spec = &order_specs[0];
                 if Self::try_radix_sort_single_int(&mut rows, spec.col_idx, spec.ascending) {
                     return Self {
-                        inner: ExecutorMemoryResult::new(columns, rows),
+                        inner: ExecutorResult::new(columns, rows),
                     };
                 }
             }
@@ -946,24 +952,24 @@ impl OrderedResult {
             // Try radix sort for multiple integer columns
             if order_specs.len() <= 4 && Self::try_radix_sort_multi_int(&mut rows, order_specs) {
                 return Self {
-                    inner: ExecutorMemoryResult::new(columns, rows),
+                    inner: ExecutorResult::new(columns, rows),
                 };
             }
         }
 
         // Fallback to comparison sort (use sort_unstable_by for better performance)
-        rows.sort_unstable_by(fallback_compare);
+        rows.sort_unstable_by(|(_, a), (_, b)| fallback_compare(a, b));
 
         Self {
-            inner: ExecutorMemoryResult::new(columns, rows),
+            inner: ExecutorResult::new(columns, rows),
         }
     }
 
     /// Try to sort by a single integer column using radix sort
     /// Returns true if successful, false if column is not all integers
-    fn try_radix_sort_single_int(rows: &mut [Row], col_idx: usize, ascending: bool) -> bool {
+    fn try_radix_sort_single_int(rows: &mut RowVec, col_idx: usize, ascending: bool) -> bool {
         // Check if all values in this column are integers
-        for row in rows.iter() {
+        for (_, row) in rows.iter() {
             match row.get(col_idx) {
                 Some(Value::Integer(_)) => continue,
                 Some(Value::Null(_)) => continue, // NULLs are OK, we handle them
@@ -971,10 +977,10 @@ impl OrderedResult {
             }
         }
 
-        // All integers - use radix sort
+        // All integers - use radix sort on (id, Row) tuples
         // We use radsort which handles negative numbers correctly
         if ascending {
-            radsort::sort_by_key(rows, |row| {
+            radsort::sort_by_key(rows, |(_, row)| {
                 match row.get(col_idx) {
                     Some(Value::Integer(i)) => *i,
                     _ => i64::MIN, // NULLs sort first in ascending order
@@ -983,7 +989,7 @@ impl OrderedResult {
         } else {
             // For descending, we negate the key (radix sort is ascending only)
             // But we need to be careful with i64::MIN
-            radsort::sort_by_key(rows, |row| {
+            radsort::sort_by_key(rows, |(_, row)| {
                 match row.get(col_idx) {
                     Some(Value::Integer(i)) => {
                         // Negate for descending order, handle overflow
@@ -999,9 +1005,9 @@ impl OrderedResult {
 
     /// Try to sort by multiple integer columns using radix sort
     /// This uses a composite key approach for up to 4 columns
-    fn try_radix_sort_multi_int(rows: &mut [Row], order_specs: &[RadixOrderSpec]) -> bool {
+    fn try_radix_sort_multi_int(rows: &mut RowVec, order_specs: &[RadixOrderSpec]) -> bool {
         // First verify all columns are integers
-        for row in rows.iter() {
+        for (_, row) in rows.iter() {
             for spec in order_specs {
                 match row.get(spec.col_idx) {
                     Some(Value::Integer(_)) => continue,
@@ -1016,12 +1022,12 @@ impl OrderedResult {
         // This is stable, so later sorts preserve order from earlier ones
         for spec in order_specs.iter().rev() {
             if spec.ascending {
-                radsort::sort_by_key(rows, |row| match row.get(spec.col_idx) {
+                radsort::sort_by_key(rows, |(_, row)| match row.get(spec.col_idx) {
                     Some(Value::Integer(i)) => *i,
                     _ => i64::MIN,
                 });
             } else {
-                radsort::sort_by_key(rows, |row| match row.get(spec.col_idx) {
+                radsort::sort_by_key(rows, |(_, row)| match row.get(spec.col_idx) {
                     Some(Value::Integer(i)) => i.wrapping_neg().wrapping_sub(1),
                     _ => i64::MAX,
                 });
@@ -1076,215 +1082,20 @@ impl QueryResult for OrderedResult {
 /// For large datasets with small limits (e.g., 1M rows, LIMIT 10), this can be 5-50x faster.
 pub struct TopNResult {
     /// Materialized top-N rows
-    inner: ExecutorMemoryResult,
+    inner: ExecutorResult,
 }
 
-/// Order specification for TopN: (column_index, ascending, nulls_first)
-pub type OrderSpec = (Option<usize>, bool, Option<bool>);
-
 impl TopNResult {
-    /// Create a new top-N result using a bounded heap with pre-extracted sort keys
+    /// Create a new top-N result using BinaryHeap for bounded sorting
     ///
-    /// OPTIMIZATION: Pre-extracts sort key values once per row instead of calling
-    /// a comparison closure on every heap operation. This reduces comparison overhead
-    /// from ~33ms to ~5ms for large datasets.
-    ///
-    /// # Arguments
-    /// * `inner` - Source result to process
-    /// * `order_specs` - Order specifications: (col_idx, ascending, nulls_first)
-    /// * `limit` - Maximum number of rows to return
-    /// * `offset` - Number of rows to skip (we need limit + offset rows in heap)
-    pub fn new_with_specs(
-        mut inner: Box<dyn QueryResult>,
-        order_specs: &[OrderSpec],
-        limit: usize,
-        offset: usize,
-    ) -> Self {
-        use std::cmp::Ordering;
-        use std::collections::BinaryHeap;
-
-        let columns = inner.columns().to_vec();
-        let heap_capacity = limit.saturating_add(offset);
-
-        // If no limit, fall back to empty result
-        if heap_capacity == 0 {
-            return Self {
-                inner: ExecutorMemoryResult::new(columns, Vec::new()),
-            };
-        }
-
-        // Pre-compute effective nulls_first for each column (avoids branching in comparison)
-        let effective_specs: Vec<(usize, bool, bool)> = order_specs
-            .iter()
-            .filter_map(|(col_idx, ascending, nulls_first)| {
-                col_idx.map(|idx| {
-                    // Default: NULLS LAST for ASC, NULLS FIRST for DESC
-                    let effective_nulls_first = nulls_first.unwrap_or(!*ascending);
-                    (idx, *ascending, effective_nulls_first)
-                })
-            })
-            .collect();
-
-        // Pre-extracted sort key with O(1) clone via Arc
-        // Stores extracted values + row together to avoid repeated Row::get calls
-        // SmallVec avoids heap allocation for typical ORDER BY (1-4 columns)
-        type SortKeys = smallvec::SmallVec<[Value; 4]>;
-
-        struct HeapRow {
-            row: Row,
-            /// Pre-extracted sort key values (cloned once on insert)
-            /// SmallVec stores up to 4 values inline (no heap allocation)
-            keys: SortKeys,
-        }
-
-        impl HeapRow {
-            #[inline]
-            fn extract_keys(row: &Row, specs: &[(usize, bool, bool)]) -> SortKeys {
-                use crate::core::types::DataType;
-                let mut keys = SortKeys::with_capacity(specs.len());
-                for (idx, _, _) in specs {
-                    keys.push(
-                        row.get(*idx)
-                            .cloned()
-                            .unwrap_or(Value::Null(DataType::Null)),
-                    );
-                }
-                keys
-            }
-
-            /// Compare two HeapRows using pre-extracted keys
-            /// Returns ordering for max-heap (worst element at top)
-            #[inline]
-            fn compare_keys(
-                a_keys: &[Value],
-                b_keys: &[Value],
-                specs: &[(usize, bool, bool)],
-            ) -> Ordering {
-                for (i, (_, ascending, nulls_first)) in specs.iter().enumerate() {
-                    let a_val = &a_keys[i];
-                    let b_val = &b_keys[i];
-
-                    // Handle NULL comparison
-                    let a_is_null = a_val.is_null();
-                    let b_is_null = b_val.is_null();
-
-                    if a_is_null || b_is_null {
-                        if a_is_null && b_is_null {
-                            continue;
-                        }
-                        let cmp = if a_is_null {
-                            if *nulls_first {
-                                Ordering::Less
-                            } else {
-                                Ordering::Greater
-                            }
-                        } else {
-                            // b_is_null
-                            if *nulls_first {
-                                Ordering::Greater
-                            } else {
-                                Ordering::Less
-                            }
-                        };
-                        return cmp;
-                    }
-
-                    // Both non-NULL - direct Value comparison
-                    let cmp = a_val.cmp(b_val);
-                    let cmp = if !*ascending { cmp.reverse() } else { cmp };
-
-                    if cmp != Ordering::Equal {
-                        return cmp;
-                    }
-                }
-                Ordering::Equal
-            }
-        }
-
-        // Wrapper that implements Ord using pre-extracted keys
-        struct HeapEntry {
-            heap_row: HeapRow,
-            /// Shared reference to specs (avoids per-entry allocation)
-            specs: Arc<[(usize, bool, bool)]>,
-        }
-
-        impl PartialEq for HeapEntry {
-            fn eq(&self, other: &Self) -> bool {
-                HeapRow::compare_keys(&self.heap_row.keys, &other.heap_row.keys, &self.specs)
-                    == Ordering::Equal
-            }
-        }
-
-        impl Eq for HeapEntry {}
-
-        impl PartialOrd for HeapEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        impl Ord for HeapEntry {
-            fn cmp(&self, other: &Self) -> Ordering {
-                // For TOP-N with max-heap, worst element (largest for ASC) at top
-                HeapRow::compare_keys(&self.heap_row.keys, &other.heap_row.keys, &self.specs)
-            }
-        }
-
-        let specs: Arc<[(usize, bool, bool)]> = effective_specs.into();
-        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(heap_capacity + 1);
-
-        while inner.next() {
-            let row = inner.take_row();
-            let keys = HeapRow::extract_keys(&row, &specs);
-
-            if heap.len() < heap_capacity {
-                heap.push(HeapEntry {
-                    heap_row: HeapRow { row, keys },
-                    specs: Arc::clone(&specs),
-                });
-            } else if let Some(worst) = heap.peek() {
-                // Compare new row's keys against worst (top of max-heap)
-                if HeapRow::compare_keys(&keys, &worst.heap_row.keys, &specs) == Ordering::Less {
-                    heap.pop();
-                    heap.push(HeapEntry {
-                        heap_row: HeapRow { row, keys },
-                        specs: Arc::clone(&specs),
-                    });
-                }
-            }
-        }
-
-        // Extract rows and sort them (heap gives us top-N but not in order)
-        let mut rows: Vec<(Row, SortKeys)> = heap
-            .into_iter()
-            .map(|entry| (entry.heap_row.row, entry.heap_row.keys))
-            .collect();
-
-        rows.sort_unstable_by(|(_, a_keys), (_, b_keys)| {
-            HeapRow::compare_keys(a_keys, b_keys, &specs)
-        });
-
-        // Apply offset
-        let mut final_rows: Vec<Row> = rows.into_iter().map(|(row, _)| row).collect();
-        if offset > 0 && offset < final_rows.len() {
-            final_rows.drain(..offset);
-        } else if offset >= final_rows.len() {
-            final_rows.clear();
-        }
-
-        Self {
-            inner: ExecutorMemoryResult::new(columns, final_rows),
-        }
-    }
-
-    /// Create a new top-N result using a bounded heap (legacy closure-based API)
+    /// Uses a max-heap of size k (limit + offset) to efficiently find top-k elements.
+    /// Only keeps k rows in memory at any time, making it memory-efficient for small limits.
     ///
     /// # Arguments
     /// * `inner` - Source result to process
     /// * `compare` - Comparison function for ordering (returns Less if a should come before b)
     /// * `limit` - Maximum number of rows to return
     /// * `offset` - Number of rows to skip (we need limit + offset rows in heap)
-    #[allow(dead_code)]
     pub fn new<F>(mut inner: Box<dyn QueryResult>, compare: F, limit: usize, offset: usize) -> Self
     where
         F: Fn(&Row, &Row) -> std::cmp::Ordering + Clone,
@@ -1294,20 +1105,20 @@ impl TopNResult {
         let columns = inner.columns().to_vec();
         let heap_capacity = limit.saturating_add(offset);
 
-        // If no limit, fall back to full sort
+        // If no limit, fall back to empty result
         if heap_capacity == 0 {
             return Self {
-                inner: ExecutorMemoryResult::new(columns, Vec::new()),
+                inner: ExecutorResult::new(columns, RowVec::new()),
             };
         }
 
         // Use Arc to wrap compare function - cloning Arc is O(1)
-        let compare = Arc::new(compare);
+        let compare = std::sync::Arc::new(compare);
 
         // Wrapper for Row with Arc-wrapped comparison (O(1) clone)
         struct HeapRow<F: Fn(&Row, &Row) -> std::cmp::Ordering> {
             row: Row,
-            compare: Arc<F>,
+            compare: std::sync::Arc<F>,
         }
 
         impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> PartialEq for HeapRow<F> {
@@ -1340,30 +1151,39 @@ impl TopNResult {
             if heap.len() < heap_capacity {
                 heap.push(HeapRow {
                     row,
-                    compare: Arc::clone(&compare),
+                    compare: std::sync::Arc::clone(&compare),
                 });
             } else if let Some(worst) = heap.peek() {
                 if compare(&row, &worst.row) == std::cmp::Ordering::Less {
                     heap.pop();
                     heap.push(HeapRow {
                         row,
-                        compare: Arc::clone(&compare),
+                        compare: std::sync::Arc::clone(&compare),
                     });
                 }
             }
         }
 
+        // Extract rows from heap and sort them
         let mut rows: Vec<Row> = heap.into_iter().map(|hr| hr.row).collect();
         rows.sort_unstable_by(|a, b| compare(a, b));
 
+        // Apply offset
         if offset > 0 && offset < rows.len() {
             rows.drain(..offset);
         } else if offset >= rows.len() {
             rows.clear();
         }
 
+        // Convert to RowVec format
+        let result_rows: RowVec = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| (i as i64, row))
+            .collect();
+
         Self {
-            inner: ExecutorMemoryResult::new(columns, rows),
+            inner: ExecutorResult::new(columns, result_rows),
         }
     }
 }
@@ -1919,6 +1739,16 @@ impl QueryResult for StreamingProjectionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::row_vec::RowVec;
+
+    /// Helper to create RowVec from Vec<Row> for tests
+    fn make_rows(rows: Vec<Row>) -> RowVec {
+        let mut rv = RowVec::with_capacity(rows.len());
+        for (i, row) in rows.into_iter().enumerate() {
+            rv.push((i as i64, row));
+        }
+        rv
+    }
 
     #[test]
     fn test_exec_result() {
@@ -1938,12 +1768,12 @@ mod tests {
     #[test]
     fn test_memory_result() {
         let columns = vec!["id".to_string(), "name".to_string()];
-        let rows = vec![
+        let rows = make_rows(vec![
             Row::from_values(vec![Value::Integer(1), Value::text("Alice")]),
             Row::from_values(vec![Value::Integer(2), Value::text("Bob")]),
-        ];
+        ]);
 
-        let mut result = ExecutorMemoryResult::new(columns, rows);
+        let mut result = ExecutorResult::new(columns, rows);
         assert_eq!(result.columns().len(), 2);
         assert_eq!(result.row_count(), 2);
 
@@ -1962,13 +1792,13 @@ mod tests {
     #[test]
     fn test_filtered_result() {
         let columns = vec!["id".to_string(), "value".to_string()];
-        let rows = vec![
+        let rows = make_rows(vec![
             Row::from_values(vec![Value::Integer(1), Value::Integer(10)]),
             Row::from_values(vec![Value::Integer(2), Value::Integer(20)]),
             Row::from_values(vec![Value::Integer(3), Value::Integer(30)]),
-        ];
+        ]);
 
-        let inner = Box::new(ExecutorMemoryResult::new(columns, rows));
+        let inner = Box::new(ExecutorResult::new(columns, rows));
 
         // Filter for value > 15 using Expression
         use crate::executor::utils::dummy_token;
@@ -2005,15 +1835,15 @@ mod tests {
     #[test]
     fn test_limited_result() {
         let columns = vec!["id".to_string()];
-        let rows = vec![
+        let rows = make_rows(vec![
             Row::from_values(vec![Value::Integer(1)]),
             Row::from_values(vec![Value::Integer(2)]),
             Row::from_values(vec![Value::Integer(3)]),
             Row::from_values(vec![Value::Integer(4)]),
             Row::from_values(vec![Value::Integer(5)]),
-        ];
+        ]);
 
-        let inner = Box::new(ExecutorMemoryResult::new(columns.clone(), rows.clone()));
+        let inner = Box::new(ExecutorResult::new(columns, rows));
         let mut result = LimitedResult::new(inner, Some(2), 1);
 
         // Skip first row (offset 1), then take 2 rows
@@ -2029,13 +1859,13 @@ mod tests {
     #[test]
     fn test_ordered_result() {
         let columns = vec!["id".to_string(), "value".to_string()];
-        let rows = vec![
+        let rows = make_rows(vec![
             Row::from_values(vec![Value::Integer(3), Value::Integer(30)]),
             Row::from_values(vec![Value::Integer(1), Value::Integer(10)]),
             Row::from_values(vec![Value::Integer(2), Value::Integer(20)]),
-        ];
+        ]);
 
-        let inner = Box::new(ExecutorMemoryResult::new(columns, rows));
+        let inner = Box::new(ExecutorResult::new(columns, rows));
 
         // Sort by id ascending
         let mut result = OrderedResult::new(inner, |a, b| {
@@ -2059,14 +1889,14 @@ mod tests {
     #[test]
     fn test_distinct_result() {
         let columns = vec!["name".to_string()];
-        let rows = vec![
+        let rows = make_rows(vec![
             Row::from_values(vec![Value::text("Alice")]),
             Row::from_values(vec![Value::text("Bob")]),
             Row::from_values(vec![Value::text("Alice")]), // Duplicate
             Row::from_values(vec![Value::text("Charlie")]),
-        ];
+        ]);
 
-        let inner = Box::new(ExecutorMemoryResult::new(columns, rows));
+        let inner = Box::new(ExecutorResult::new(columns, rows));
         let mut result = DistinctResult::new(inner);
 
         let mut names = Vec::new();
@@ -2085,12 +1915,12 @@ mod tests {
     #[test]
     fn test_aliased_result() {
         let columns = vec!["id".to_string(), "name".to_string()];
-        let rows = vec![Row::from_values(vec![
+        let rows = make_rows(vec![Row::from_values(vec![
             Value::Integer(1),
             Value::text("Alice"),
-        ])];
+        ])]);
 
-        let inner = Box::new(ExecutorMemoryResult::new(columns, rows));
+        let inner = Box::new(ExecutorResult::new(columns, rows));
 
         let mut aliases = FxHashMap::default();
         aliases.insert("user_name".to_string(), "name".to_string());

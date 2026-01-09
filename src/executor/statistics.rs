@@ -22,7 +22,7 @@ use std::time::SystemTime;
 use rand::Rng;
 use rustc_hash::FxHashSet;
 
-use crate::core::{Error, Result, Row, Value};
+use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::parser::ast::AnalyzeStatement;
 use crate::storage::mvcc::zonemap::{ZoneMapBuilder, DEFAULT_SEGMENT_SIZE};
 use crate::storage::statistics::{
@@ -32,7 +32,7 @@ use crate::storage::statistics::{
 use crate::storage::traits::{Engine, QueryResult, Transaction};
 
 use super::context::ExecutionContext;
-use super::result::ExecutorMemoryResult;
+use super::result::ExecutorResult;
 use super::Executor;
 
 impl Executor {
@@ -97,9 +97,10 @@ impl Executor {
 
         // Return result showing how many tables were analyzed
         let columns = vec!["tables_analyzed".to_string()];
-        let rows = vec![Row::from_values(vec![Value::Integer(analyzed_count)])];
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((0, Row::from_values(vec![Value::Integer(analyzed_count)])));
 
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+        Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
 
     /// Ensure the system statistics tables exist
@@ -154,20 +155,23 @@ impl Executor {
         let row_count = table.row_count();
 
         // Collect all rows for zone map building (zone maps need complete data)
-        let all_rows = table.collect_all_rows(None)?;
+        let mut all_rows = table.collect_all_rows(None)?;
+
+        // Extract rows without IDs for statistics computation (these APIs expect Row, not (i64, Row))
+        let rows_vec: Vec<Row> = all_rows.drain_rows().collect();
 
         // Build zone maps from all rows
-        let zone_maps = self.build_zone_maps(&all_rows, &schema);
+        let zone_maps = self.build_zone_maps(&rows_vec, &schema);
 
         // Store zone maps in the table
         table.set_zone_maps(zone_maps);
 
         // For statistics, use sampling for large tables
-        let rows = if all_rows.len() > DEFAULT_SAMPLE_SIZE {
+        let rows = if rows_vec.len() > DEFAULT_SAMPLE_SIZE {
             // Sample from collected rows for statistics
-            self.sample_from_rows(all_rows.clone(), DEFAULT_SAMPLE_SIZE)
+            self.sample_from_rows(rows_vec, DEFAULT_SAMPLE_SIZE)
         } else {
-            all_rows.clone()
+            rows_vec
         };
 
         let actual_row_count = rows.len();

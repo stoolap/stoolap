@@ -19,13 +19,14 @@
 //! - INTERSECT / INTERSECT ALL
 //! - EXCEPT / EXCEPT ALL
 
+use crate::core::row_vec::RowVec;
 use crate::core::Result;
 use crate::parser::ast::{SetOperation, SetOperationType};
 use crate::storage::traits::QueryResult;
 use rustc_hash::FxHashMap;
 
 use super::context::ExecutionContext;
-use super::result::ExecutorMemoryResult;
+use super::result::ExecutorResult;
 use super::utils::{hash_row, rows_equal};
 use super::Executor;
 
@@ -50,12 +51,14 @@ impl Executor {
 
         let mut result_rows = if let (true, Some(lim)) = (all_union_all, limit) {
             // Only materialize up to limit rows from left side
-            let mut rows = Vec::with_capacity(lim.min(1024));
+            let mut rows = RowVec::with_capacity(lim.min(1024));
             let mut left_result = left_result;
+            let mut row_id = 0i64;
             while left_result.next() {
-                rows.push(left_result.take_row());
+                rows.push((row_id, left_result.take_row()));
+                row_id += 1;
                 if rows.len() >= lim {
-                    return Ok(Box::new(ExecutorMemoryResult::new(columns, rows)));
+                    return Ok(Box::new(ExecutorResult::new(columns, rows)));
                 }
             }
             rows
@@ -102,37 +105,40 @@ impl Executor {
                     let right_rows = Self::materialize_result(right_result)?;
                     // Use hash map: hash -> list of indices to detect duplicates with collision handling
                     let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    let mut unique_rows = Vec::new();
+                    let mut unique_rows = RowVec::new();
+                    let mut row_id = 0i64;
 
                     // Add left rows (dedup)
-                    for row in result_rows {
+                    for (_, row) in result_rows {
                         let hash = hash_row(&row);
                         let indices = hash_to_indices.entry(hash).or_default();
 
                         // Check if this exact row already exists (handle hash collisions)
                         let is_duplicate = indices
                             .iter()
-                            .any(|&idx| rows_equal(&unique_rows[idx], &row));
+                            .any(|&idx| rows_equal(&unique_rows[idx].1, &row));
 
                         if !is_duplicate {
                             indices.push(unique_rows.len());
-                            unique_rows.push(row);
+                            unique_rows.push((row_id, row));
+                            row_id += 1;
                         }
                     }
 
                     // Add right rows (dedup)
-                    for row in right_rows {
+                    for (_, row) in right_rows {
                         let hash = hash_row(&row);
                         let indices = hash_to_indices.entry(hash).or_default();
 
                         // Check if this exact row already exists (handle hash collisions)
                         let is_duplicate = indices
                             .iter()
-                            .any(|&idx| rows_equal(&unique_rows[idx], &row));
+                            .any(|&idx| rows_equal(&unique_rows[idx].1, &row));
 
                         if !is_duplicate {
                             indices.push(unique_rows.len());
-                            unique_rows.push(row);
+                            unique_rows.push((row_id, row));
+                            row_id += 1;
                         }
                     }
 
@@ -146,14 +152,20 @@ impl Executor {
                         if needed > 0 {
                             let mut right_result = right_result;
                             let mut count = 0;
+                            let mut row_id = result_rows.len() as i64;
                             while right_result.next() && count < needed {
-                                result_rows.push(right_result.take_row());
+                                result_rows.push((row_id, right_result.take_row()));
+                                row_id += 1;
                                 count += 1;
                             }
                         }
                     } else {
                         let right_rows = Self::materialize_result(right_result)?;
-                        result_rows.extend(right_rows);
+                        let mut row_id = result_rows.len() as i64;
+                        for (_, row) in right_rows {
+                            result_rows.push((row_id, row));
+                            row_id += 1;
+                        }
                     }
                 }
                 SetOperationType::Intersect => {
@@ -162,16 +174,17 @@ impl Executor {
 
                     // Build hash map: hash -> list of right rows with that hash
                     let mut right_hash_map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    for (idx, row) in right_rows.iter().enumerate() {
+                    for (idx, (_, row)) in right_rows.iter().enumerate() {
                         let hash = hash_row(row);
                         right_hash_map.entry(hash).or_default().push(idx);
                     }
 
                     // Track which left rows we've already added (for deduplication)
                     let mut left_seen: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    let mut intersected_rows = Vec::new();
+                    let mut intersected_rows = RowVec::new();
+                    let mut row_id = 0i64;
 
-                    for left_row in result_rows {
+                    for (_, left_row) in result_rows {
                         let hash = hash_row(&left_row);
 
                         // Check if this hash exists in right side
@@ -179,18 +192,19 @@ impl Executor {
                             // Check if any right row with this hash actually equals this left row
                             let has_match = right_indices
                                 .iter()
-                                .any(|&idx| rows_equal(&left_row, &right_rows[idx]));
+                                .any(|&idx| rows_equal(&left_row, &right_rows[idx].1));
 
                             if has_match {
                                 // Check if we've already added this left row (dedup)
                                 let left_indices = left_seen.entry(hash).or_default();
                                 let is_duplicate = left_indices
                                     .iter()
-                                    .any(|&idx| rows_equal(&intersected_rows[idx], &left_row));
+                                    .any(|&idx| rows_equal(&intersected_rows[idx].1, &left_row));
 
                                 if !is_duplicate {
                                     left_indices.push(intersected_rows.len());
-                                    intersected_rows.push(left_row);
+                                    intersected_rows.push((row_id, left_row));
+                                    row_id += 1;
                                 }
                             }
                         }
@@ -205,7 +219,7 @@ impl Executor {
                     // Build hash map: hash -> list of (row_index, remaining_count)
                     // Each unique row in right side gets its own counter
                     let mut right_hash_map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    for (idx, row) in right_rows.iter().enumerate() {
+                    for (idx, (_, row)) in right_rows.iter().enumerate() {
                         let hash = hash_row(row);
                         right_hash_map.entry(hash).or_default().push(idx);
                     }
@@ -219,7 +233,7 @@ impl Executor {
                             // Find if this row already exists in unique_rows_in_bucket
                             if let Some(entry) =
                                 unique_rows_in_bucket.iter_mut().find(|(rep_idx, _)| {
-                                    rows_equal(&right_rows[*rep_idx], &right_rows[idx])
+                                    rows_equal(&right_rows[*rep_idx].1, &right_rows[idx].1)
                                 })
                             {
                                 entry.1 += 1; // Increment count
@@ -230,18 +244,20 @@ impl Executor {
                         right_row_counts.insert(hash, unique_rows_in_bucket);
                     }
 
-                    let mut intersected_rows = Vec::new();
-                    for left_row in result_rows {
+                    let mut intersected_rows = RowVec::new();
+                    let mut row_id = 0i64;
+                    for (_, left_row) in result_rows {
                         let hash = hash_row(&left_row);
 
                         // Find matching right row and decrement its count
                         if let Some(bucket) = right_row_counts.get_mut(&hash) {
                             // Find the first matching row with count > 0
                             if let Some(entry) = bucket.iter_mut().find(|(rep_idx, count)| {
-                                *count > 0 && rows_equal(&left_row, &right_rows[*rep_idx])
+                                *count > 0 && rows_equal(&left_row, &right_rows[*rep_idx].1)
                             }) {
                                 entry.1 -= 1; // Decrement count
-                                intersected_rows.push(left_row);
+                                intersected_rows.push((row_id, left_row));
+                                row_id += 1;
                             }
                         }
                     }
@@ -254,16 +270,17 @@ impl Executor {
 
                     // Build hash map: hash -> list of right row indices
                     let mut right_hash_map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    for (idx, row) in right_rows.iter().enumerate() {
+                    for (idx, (_, row)) in right_rows.iter().enumerate() {
                         let hash = hash_row(row);
                         right_hash_map.entry(hash).or_default().push(idx);
                     }
 
                     // Track which left rows we've already added (for deduplication)
                     let mut left_seen: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    let mut excepted_rows = Vec::new();
+                    let mut excepted_rows = RowVec::new();
+                    let mut row_id = 0i64;
 
-                    for left_row in result_rows {
+                    for (_, left_row) in result_rows {
                         let hash = hash_row(&left_row);
 
                         // Check if this row exists in right side
@@ -271,7 +288,7 @@ impl Executor {
                         {
                             right_indices
                                 .iter()
-                                .any(|&idx| rows_equal(&left_row, &right_rows[idx]))
+                                .any(|&idx| rows_equal(&left_row, &right_rows[idx].1))
                         } else {
                             false
                         };
@@ -281,11 +298,12 @@ impl Executor {
                             let left_indices = left_seen.entry(hash).or_default();
                             let is_duplicate = left_indices
                                 .iter()
-                                .any(|&idx| rows_equal(&excepted_rows[idx], &left_row));
+                                .any(|&idx| rows_equal(&excepted_rows[idx].1, &left_row));
 
                             if !is_duplicate {
                                 left_indices.push(excepted_rows.len());
-                                excepted_rows.push(left_row);
+                                excepted_rows.push((row_id, left_row));
+                                row_id += 1;
                             }
                         }
                     }
@@ -298,7 +316,7 @@ impl Executor {
 
                     // Build hash map: hash -> list of row indices
                     let mut right_hash_map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    for (idx, row) in right_rows.iter().enumerate() {
+                    for (idx, (_, row)) in right_rows.iter().enumerate() {
                         let hash = hash_row(row);
                         right_hash_map.entry(hash).or_default().push(idx);
                     }
@@ -312,7 +330,7 @@ impl Executor {
                             // Find if this row already exists in unique_rows_in_bucket
                             if let Some(entry) =
                                 unique_rows_in_bucket.iter_mut().find(|(rep_idx, _)| {
-                                    rows_equal(&right_rows[*rep_idx], &right_rows[idx])
+                                    rows_equal(&right_rows[*rep_idx].1, &right_rows[idx].1)
                                 })
                             {
                                 entry.1 += 1; // Increment count
@@ -323,8 +341,9 @@ impl Executor {
                         right_row_counts.insert(hash, unique_rows_in_bucket);
                     }
 
-                    let mut excepted_rows = Vec::new();
-                    for left_row in result_rows {
+                    let mut excepted_rows = RowVec::new();
+                    let mut row_id = 0i64;
+                    for (_, left_row) in result_rows {
                         let hash = hash_row(&left_row);
 
                         // Check if this row should be removed (exists in right with count > 0)
@@ -332,7 +351,7 @@ impl Executor {
                         if let Some(bucket) = right_row_counts.get_mut(&hash) {
                             // Find the first matching row with count > 0
                             if let Some(entry) = bucket.iter_mut().find(|(rep_idx, count)| {
-                                *count > 0 && rows_equal(&left_row, &right_rows[*rep_idx])
+                                *count > 0 && rows_equal(&left_row, &right_rows[*rep_idx].1)
                             }) {
                                 entry.1 -= 1; // Decrement count
                                 should_remove = true;
@@ -340,7 +359,8 @@ impl Executor {
                         }
 
                         if !should_remove {
-                            excepted_rows.push(left_row);
+                            excepted_rows.push((row_id, left_row));
+                            row_id += 1;
                         }
                     }
 
@@ -349,6 +369,6 @@ impl Executor {
             }
         }
 
-        Ok(Box::new(ExecutorMemoryResult::new(columns, result_rows)))
+        Ok(Box::new(ExecutorResult::new(columns, result_rows)))
     }
 }

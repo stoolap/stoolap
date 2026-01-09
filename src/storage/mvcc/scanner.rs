@@ -19,14 +19,14 @@
 
 use std::sync::Arc;
 
-use crate::core::{Result, Row, Schema};
+use crate::core::{Result, Row, RowVec, Schema};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Scanner;
 
 /// MVCC Scanner for iterating over versioned rows
 pub struct MVCCScanner {
-    /// Source rows with their IDs
-    rows: Vec<(i64, Row)>,
+    /// Source rows with their IDs (cached - returns to pool on drop)
+    rows: RowVec,
     /// Current index in the rows vector
     current_index: isize,
     /// Column indices to include in projection
@@ -49,13 +49,13 @@ pub struct MVCCScanner {
 impl MVCCScanner {
     /// Creates a new MVCC scanner with filtering (legacy method)
     pub fn new(
-        rows: Vec<(i64, Row)>,
+        rows: RowVec,
         schema: Arc<Schema>,
         column_indices: Vec<usize>,
         filter: Option<Box<dyn Expression>>,
     ) -> Self {
         // Filter rows if needed
-        let filtered_rows: Vec<(i64, Row)> = if let Some(ref expr) = filter {
+        let filtered_rows: RowVec = if let Some(ref expr) = filter {
             rows.into_iter()
                 .filter(|(_, row)| expr.evaluate(row).unwrap_or_default())
                 .collect()
@@ -66,16 +66,9 @@ impl MVCCScanner {
         Self::from_rows(filtered_rows, schema, column_indices)
     }
 
-    /// Creates scanner from pre-filtered rows with optional projection
-    ///
-    /// If column_indices is a proper subset of columns, projects rows upfront
-    /// to avoid repeated projection on each row() call.
+    /// Creates scanner from RowVec
     #[inline]
-    pub fn from_rows(
-        rows: Vec<(i64, Row)>,
-        schema: Arc<Schema>,
-        column_indices: Vec<usize>,
-    ) -> Self {
+    pub fn from_rows(rows: RowVec, schema: Arc<Schema>, column_indices: Vec<usize>) -> Self {
         let num_schema_cols = schema.columns.len();
 
         // Check if we need projection (column_indices is a proper subset)
@@ -84,7 +77,7 @@ impl MVCCScanner {
             && !column_indices.iter().enumerate().all(|(i, &idx)| i == idx);
 
         // Project rows upfront if needed
-        let projected_rows = if needs_projection {
+        let projected_rows: RowVec = if needs_projection {
             rows.into_iter()
                 .map(|(id, row)| {
                     let projected_values: Vec<crate::core::Value> = column_indices
@@ -122,7 +115,7 @@ impl MVCCScanner {
     #[inline]
     pub fn empty(schema: Arc<Schema>, column_indices: Vec<usize>) -> Self {
         Self {
-            rows: Vec::new(),
+            rows: RowVec::new(),
             current_index: -1,
             column_indices,
             schema,
@@ -135,8 +128,10 @@ impl MVCCScanner {
 
     /// Creates a scanner with a single row
     pub fn single(row: Row, schema: Arc<Schema>, column_indices: Vec<usize>) -> Self {
+        let mut rows = RowVec::new();
+        rows.push((0, row));
         Self {
-            rows: vec![(0, row)],
+            rows,
             current_index: -1,
             column_indices: column_indices.clone(),
             schema,
@@ -158,26 +153,6 @@ impl MVCCScanner {
     /// Returns true if the scanner has no rows
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
-    }
-
-    /// Consumes the scanner and returns all rows without cloning
-    ///
-    /// This is more efficient than iterating and cloning each row.
-    /// Use this when you need all rows and won't use the scanner afterwards.
-    #[inline]
-    pub fn into_rows(self) -> Vec<Row> {
-        self.rows.into_iter().map(|(_, row)| row).collect()
-    }
-
-    /// Takes ownership of the rows, leaving the scanner empty
-    ///
-    /// This is more efficient than iterating and cloning each row.
-    #[inline]
-    pub fn take_rows(&mut self) -> Vec<Row> {
-        std::mem::take(&mut self.rows)
-            .into_iter()
-            .map(|(_, row)| row)
-            .collect()
     }
 }
 
@@ -274,7 +249,7 @@ pub struct RangeScanner {
     #[allow(dead_code)]
     projected_row: Row,
     /// Row iterator (stores pre-fetched rows)
-    rows: Vec<(i64, Row)>,
+    rows: RowVec,
     /// Current position in rows
     row_index: isize,
 }
@@ -288,11 +263,11 @@ impl RangeScanner {
         txn_id: i64,
         schema: Arc<Schema>,
         column_indices: Vec<usize>,
-        rows: Vec<(i64, Row)>,
+        rows: RowVec,
     ) -> Self {
         // Filter rows to only include those in range
         let actual_end = if inclusive { end_id } else { end_id - 1 };
-        let filtered_rows: Vec<(i64, Row)> = rows
+        let filtered_rows: RowVec = rows
             .into_iter()
             .filter(|(id, _)| *id >= start_id && *id <= actual_end)
             .collect();
@@ -492,13 +467,12 @@ mod tests {
     fn test_mvcc_scanner_multiple_rows() {
         let schema = test_schema();
 
-        let rows = vec![
-            (1, Row::from_values(vec![Value::Integer(1)])),
-            (2, Row::from_values(vec![Value::Integer(2)])),
-            (3, Row::from_values(vec![Value::Integer(3)])),
-        ];
+        let mut rows = RowVec::new();
+        rows.push((1, Row::from_values(vec![Value::Integer(1)])));
+        rows.push((2, Row::from_values(vec![Value::Integer(2)])));
+        rows.push((3, Row::from_values(vec![Value::Integer(3)])));
 
-        let mut scanner = MVCCScanner::new(rows, schema, vec![0], None);
+        let mut scanner = MVCCScanner::from_rows(rows, schema, vec![0]);
 
         assert_eq!(scanner.len(), 3);
 
@@ -519,9 +493,10 @@ mod tests {
     fn test_mvcc_scanner_close() {
         let schema = test_schema();
 
-        let rows = vec![(1, Row::from_values(vec![Value::Integer(1)]))];
+        let mut rows = RowVec::new();
+        rows.push((1, Row::from_values(vec![Value::Integer(1)])));
 
-        let mut scanner = MVCCScanner::new(rows, schema, vec![0], None);
+        let mut scanner = MVCCScanner::from_rows(rows, schema, vec![0]);
 
         assert!(scanner.next());
         assert!(scanner.close().is_ok());
@@ -558,12 +533,11 @@ mod tests {
     fn test_range_scanner() {
         let schema = test_schema();
 
-        let rows = vec![
-            (1, Row::from_values(vec![Value::Integer(1)])),
-            (2, Row::from_values(vec![Value::Integer(2)])),
-            (3, Row::from_values(vec![Value::Integer(3)])),
-            (5, Row::from_values(vec![Value::Integer(5)])),
-        ];
+        let mut rows = RowVec::new();
+        rows.push((1, Row::from_values(vec![Value::Integer(1)])));
+        rows.push((2, Row::from_values(vec![Value::Integer(2)])));
+        rows.push((3, Row::from_values(vec![Value::Integer(3)])));
+        rows.push((5, Row::from_values(vec![Value::Integer(5)])));
 
         // Inclusive range 1-3
         let mut scanner = RangeScanner::new(1, 3, true, 1, schema, vec![0], rows);

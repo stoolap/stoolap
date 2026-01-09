@@ -26,14 +26,14 @@ use std::sync::Arc;
 use ahash::AHashSet;
 use rustc_hash::FxHashSet;
 
-use crate::core::{Result, Row, Value};
+use crate::core::{Result, Row, RowVec, Value};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
 use super::context::{cache_in_subquery, get_cached_in_subquery, ExecutionContext};
 use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
-use super::result::ExecutorMemoryResult;
+use super::result::ExecutorResult;
 use super::Executor;
 
 impl Executor {
@@ -101,11 +101,10 @@ impl Executor {
             // Build result - wrap columns in Arc once for zero-copy sharing
             let col_name = alias.unwrap_or_else(|| format!("{}({})", func.function, column_name));
             let columns = Arc::new(vec![col_name]);
-            let rows = vec![Row::from_values(vec![val])];
-            let result: Box<dyn QueryResult> = Box::new(ExecutorMemoryResult::with_arc_columns(
-                Arc::clone(&columns),
-                rows,
-            ));
+            let mut rows = RowVec::with_capacity(1);
+            rows.push((0, Row::from_values(vec![val])));
+            let result: Box<dyn QueryResult> =
+                Box::new(ExecutorResult::with_arc_columns(Arc::clone(&columns), rows));
             return Ok(Some((result, columns)));
         }
 
@@ -172,11 +171,10 @@ impl Executor {
         // Build result - wrap columns in Arc once for zero-copy sharing
         let col_name = alias.unwrap_or_else(|| "COUNT(*)".to_string());
         let columns = Arc::new(vec![col_name]);
-        let rows = vec![Row::from_values(vec![Value::Integer(count as i64)])];
-        let result: Box<dyn QueryResult> = Box::new(ExecutorMemoryResult::with_arc_columns(
-            Arc::clone(&columns),
-            rows,
-        ));
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((0, Row::from_values(vec![Value::Integer(count as i64)])));
+        let result: Box<dyn QueryResult> =
+            Box::new(ExecutorResult::with_arc_columns(Arc::clone(&columns), rows));
         Ok(Some((result, columns)))
     }
 
@@ -243,7 +241,7 @@ impl Executor {
                 Arc::new(self.get_output_column_names(&stmt.columns, all_columns, None));
 
             let result =
-                ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
+                ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
             return Ok(Some((Box::new(result), output_columns)));
         }
 
@@ -343,7 +341,7 @@ impl Executor {
                 Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
 
             let result =
-                ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
+                ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
             return Ok(Some((Box::new(result), output_columns)));
         }
 
@@ -829,7 +827,7 @@ impl Executor {
                 let output_columns =
                     Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
                 let result =
-                    ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), vec![]);
+                    ExecutorResult::with_arc_columns(Arc::clone(&output_columns), RowVec::new());
                 return Ok(Some((Box::new(result), output_columns)));
             }
         }
@@ -988,12 +986,8 @@ impl Executor {
         let filter: Box<dyn crate::storage::expression::Expression> =
             Box::new(ConstBoolExpr::true_expr());
 
-        // Fetch rows by row_ids
-        let fetched_rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
-
-        // Convert (row_id, Row) to just Row
-        let mut rows: Vec<crate::core::Row> =
-            fetched_rows.into_iter().map(|(_, row)| row).collect();
+        // Fetch rows by row_ids - returns RowVec directly
+        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
 
         // Apply remaining predicate if any
         if let Some(ref remaining) = remaining_predicate {
@@ -1009,8 +1003,8 @@ impl Executor {
             let row_filter =
                 RowFilter::new(&processed_remaining, &columns_slice)?.with_context(ctx);
 
-            // Filter rows
-            rows.retain(|row| row_filter.matches(row));
+            // Filter rows (retain works on (i64, Row) tuples via Deref)
+            rows.retain(|(_, row)| row_filter.matches(row));
         }
 
         // Apply LIMIT/OFFSET if present (and no ORDER BY)
@@ -1069,8 +1063,7 @@ impl Executor {
         )?;
         let output_columns =
             Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
-        let result =
-            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
+        let result = ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok(Some((Box::new(result), output_columns)))
     }
 
@@ -1132,7 +1125,7 @@ impl Executor {
                 let output_columns =
                     Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
                 let result =
-                    ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), vec![]);
+                    ExecutorResult::with_arc_columns(Arc::clone(&output_columns), RowVec::new());
                 return Ok(Some((Box::new(result), output_columns)));
             }
         }
@@ -1209,12 +1202,8 @@ impl Executor {
         let filter: Box<dyn crate::storage::expression::Expression> =
             Box::new(ConstBoolExpr::true_expr());
 
-        // Fetch rows by row_ids
-        let fetched_rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
-
-        // Convert (row_id, Row) to just Row
-        let mut rows: Vec<crate::core::Row> =
-            fetched_rows.into_iter().map(|(_, row)| row).collect();
+        // Fetch rows by row_ids - returns RowVec directly
+        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
 
         // Apply remaining predicate if any
         if let Some(ref remaining) = remaining_predicate {
@@ -1230,8 +1219,8 @@ impl Executor {
             let row_filter =
                 RowFilter::new(&processed_remaining, &columns_slice)?.with_context(ctx);
 
-            // Filter rows
-            rows.retain(|row| row_filter.matches(row));
+            // Filter rows (retain works on (i64, Row) tuples via Deref)
+            rows.retain(|(_, row)| row_filter.matches(row));
         }
 
         // Apply LIMIT/OFFSET if present (and no ORDER BY)
@@ -1290,8 +1279,7 @@ impl Executor {
         )?;
         let output_columns =
             Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
-        let result =
-            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
+        let result = ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok(Some((Box::new(result), output_columns)))
     }
 
@@ -1563,7 +1551,7 @@ impl Executor {
             let output_columns =
                 Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
             let result =
-                ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), vec![]);
+                ExecutorResult::with_arc_columns(Arc::clone(&output_columns), RowVec::new());
             return Ok(Some((Box::new(result), output_columns)));
         }
 
@@ -1615,12 +1603,8 @@ impl Executor {
         let filter: Box<dyn crate::storage::expression::Expression> =
             Box::new(ConstBoolExpr::true_expr());
 
-        // Fetch rows by row_ids
-        let fetched_rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
-
-        // Convert (row_id, Row) to just Row
-        let mut rows: Vec<crate::core::Row> =
-            fetched_rows.into_iter().map(|(_, row)| row).collect();
+        // Fetch rows by row_ids - returns RowVec directly
+        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
 
         // Apply remaining predicate if any
         if let Some(ref remaining) = remaining_predicate {
@@ -1628,8 +1612,8 @@ impl Executor {
             let columns_slice: Vec<String> = all_columns.to_vec();
             let row_filter = RowFilter::new(remaining, &columns_slice)?.with_context(ctx);
 
-            // Filter rows
-            rows.retain(|row| row_filter.matches(row));
+            // Filter rows (retain works on (i64, Row) tuples via Deref)
+            rows.retain(|(_, row)| row_filter.matches(row));
         }
 
         // Apply LIMIT/OFFSET if present (and no ORDER BY)
@@ -1688,8 +1672,7 @@ impl Executor {
         )?;
         let output_columns =
             Arc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
-        let result =
-            ExecutorMemoryResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
+        let result = ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
         Ok(Some((Box::new(result), output_columns)))
     }
 

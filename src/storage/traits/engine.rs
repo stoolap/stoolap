@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 
 use std::sync::Arc;
 
-use crate::core::{IsolationLevel, Result, Row, Schema};
+use crate::core::{IsolationLevel, Result, RowVec, Schema};
 use crate::storage::config::Config;
 use crate::storage::traits::{Index, Transaction};
 
@@ -198,7 +198,7 @@ pub trait Engine: Send + Sync {
     /// of creating a new transaction per EXISTS probe.
     ///
     /// The returned rows represent the latest committed state visible to any reader.
-    fn fetch_rows_by_ids(&self, table_name: &str, row_ids: &[i64]) -> Result<Vec<(i64, Row)>> {
+    fn fetch_rows_by_ids(&self, table_name: &str, row_ids: &[i64]) -> Result<RowVec> {
         // Default implementation: fall back to creating a transaction
         // Concrete implementations can override for better performance
         let _ = (table_name, row_ids);
@@ -216,7 +216,7 @@ pub trait Engine: Send + Sync {
     fn get_row_fetcher(
         &self,
         table_name: &str,
-    ) -> Result<Box<dyn Fn(&[i64]) -> Vec<(i64, Row)> + Send + Sync>> {
+    ) -> Result<Box<dyn Fn(&[i64]) -> RowVec + Send + Sync>> {
         // Default implementation: fall back to fetch_rows_by_ids
         let _ = table_name;
         Err(crate::core::Error::internal(

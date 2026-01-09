@@ -81,6 +81,9 @@ lru = "0.12"  # O(1) LRU cache for compiled expression programs
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 duckdb = { version = "1.4.3", features = ["bundled"], optional = true }
 
+# Optional allocators
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
 # Platform-specific file locking
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -100,6 +103,7 @@ cli = ["clap", "rustyline", "comfy-table", "dirs"]
 dhat-heap = []
 sqlite = ["dep:rusqlite"]
 duckdb = ["dep:duckdb"]
+mimalloc = ["dep:mimalloc"]
 
 [[example]]
 name = "benchmark_sqlite"

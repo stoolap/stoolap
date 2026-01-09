@@ -42,7 +42,7 @@ use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::core::value::NULL_VALUE;
-use crate::core::{Result, Row, Value};
+use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::Expression;
 
@@ -142,6 +142,8 @@ impl ParallelConfig {
 /// 2. Evaluating the WHERE predicate on each chunk in parallel
 /// 3. Collecting matching rows from all chunks
 ///
+/// Works with `(i64, Row)` tuples, preserving the row ID throughout filtering.
+///
 /// # Performance
 ///
 /// For a table with 1M rows and 50% selectivity:
@@ -152,131 +154,127 @@ impl ParallelConfig {
 /// - Number of CPU cores
 /// - Complexity of the WHERE predicate
 /// - Selectivity (how many rows pass the filter)
-///
-/// CRITICAL: This function now returns Result to properly propagate compilation errors.
-/// Previously, errors were silently swallowed which could cause data loss.
 pub fn parallel_filter(
-    rows: Vec<Row>,
+    rows: RowVec,
     filter_expr: &Expression,
     columns: &[String],
-    function_registry: &FunctionRegistry,
+    _function_registry: &FunctionRegistry,
     config: &ParallelConfig,
-) -> Result<Vec<Row>> {
+) -> Result<RowVec> {
     let row_count = rows.len();
 
     // Check if parallel execution is beneficial
     if !config.should_parallel_filter(row_count) {
         // Fall back to sequential filtering
-        return sequential_filter(rows, filter_expr, columns, function_registry);
+        return sequential_filter(rows, filter_expr, columns);
     }
 
     // Calculate optimal chunk size based on available parallelism
     // Goal: Create ~2-4 chunks per thread for good load balancing
-    // Formula: max(config.chunk_size, row_count / (num_threads * 4), 512)
-    // This ensures chunks aren't too small (scheduling overhead) or too large (poor balancing)
     let num_threads = rayon::current_num_threads();
-    let target_chunks = num_threads * 4; // 4 chunks per thread for work-stealing
+    let target_chunks = num_threads * 4;
     let chunk_size = (row_count / target_chunks).max(config.chunk_size).max(512);
 
     // Pre-compile the filter expression once (RowFilter is Send+Sync)
-    // This avoids compiling the expression in each thread
-    // CRITICAL: Propagate compilation errors instead of silently falling back
     let columns_vec: Vec<String> = columns.to_vec();
     let filter = RowFilter::new(filter_expr, &columns_vec)?;
 
-    // Process chunks in parallel
-    let filtered_chunks: Vec<Vec<Row>> = rows
+    // Process chunks in parallel, using plain Vec inside workers to avoid
+    // thread-local cache churn (each Rayon worker has its own cache)
+    let row_vec: Vec<(i64, Row)> = rows.into_vec();
+    let filtered: Vec<(i64, Row)> = row_vec
         .into_par_iter()
         .chunks(chunk_size)
-        .map(|chunk| {
-            let mut filtered = Vec::with_capacity(chunk.len() / 2); // Estimate 50% selectivity
-
-            for row in chunk {
-                // SQL semantics: NULL or error in WHERE predicate => row excluded
-                // This matches standard SQL behavior where NULL is neither true nor false,
-                // so rows with NULL predicate results are filtered out.
-                // Errors (e.g., type mismatches) are treated the same way.
-                if filter.matches(&row) {
-                    filtered.push(row);
-                }
-            }
-
-            filtered
+        .flat_map(|chunk| {
+            // Use plain Vec, not RowVec - avoids worker thread cache allocations
+            chunk
+                .into_iter()
+                .filter(|(_, row)| filter.matches(row))
+                .collect::<Vec<_>>()
         })
         .collect();
 
-    // Merge results from all chunks
-    // Pre-calculate total capacity for single allocation
-    let total_size: usize = filtered_chunks.iter().map(|c| c.len()).sum();
-    let mut result = Vec::with_capacity(total_size);
-    for chunk in filtered_chunks {
-        result.extend(chunk);
-    }
-
-    Ok(result)
+    // Wrap final result in RowVec (uses main thread's cache)
+    Ok(RowVec::from_vec(filtered))
 }
 
 /// Sequential filter for small datasets or when parallel is disabled
-///
-/// CRITICAL: This function now returns Result to properly propagate compilation errors.
-/// Previously, errors were silently swallowed which could cause data loss.
-fn sequential_filter(
-    rows: Vec<Row>,
-    filter_expr: &Expression,
-    columns: &[String],
-    _function_registry: &FunctionRegistry,
-) -> Result<Vec<Row>> {
+fn sequential_filter(rows: RowVec, filter_expr: &Expression, columns: &[String]) -> Result<RowVec> {
     let columns_vec: Vec<String> = columns.to_vec();
-    // CRITICAL: Propagate compilation errors instead of silently returning empty
     let mut eval = ExpressionEval::compile(filter_expr, &columns_vec)?;
 
-    Ok(rows.into_iter().filter(|row| eval.eval_bool(row)).collect())
+    Ok(rows
+        .into_iter()
+        .filter(|(_, row)| eval.eval_bool(row))
+        .collect())
 }
 
 /// Parallel filter with ownership transfer (more efficient for large results)
 ///
-/// This variant uses parallel iterators that take ownership of rows,
-/// which is more efficient when most rows pass the filter.
+/// Uses parallel boolean marking + sequential extraction to minimize allocations.
+/// Only allocates: 1 bit-vec for marks + 1 RowVec for results.
 pub fn parallel_filter_owned(
-    rows: Vec<Row>,
+    rows: RowVec,
     predicate: impl Fn(&Row) -> bool + Sync + Send,
     config: &ParallelConfig,
-) -> Vec<Row> {
+) -> RowVec {
     let row_count = rows.len();
 
     if !config.should_parallel_filter(row_count) {
-        // Sequential fallback
-        return rows.into_iter().filter(|r| predicate(r)).collect();
+        // Sequential fallback - efficient, uses RowVec cache
+        return rows.into_iter().filter(|(_, r)| predicate(r)).collect();
     }
 
-    // Use rayon's parallel filter
-    rows.into_par_iter().filter(|r| predicate(r)).collect()
+    // Phase 1: Parallel marking - each thread marks matching rows
+    // Uses Vec<bool> which is 1 byte per row (could use bitvec for 1 bit)
+    let chunk_size = (row_count / rayon::current_num_threads()).max(1000);
+    let marks: Vec<bool> = rows
+        .par_chunks(chunk_size)
+        .flat_map(|chunk| {
+            chunk
+                .iter()
+                .map(|(_, row)| predicate(row))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Count matches for pre-allocation
+    let match_count = marks.iter().filter(|&&b| b).count();
+
+    // Phase 2: Sequential extraction into RowVec (from cache)
+    let mut result = RowVec::with_capacity(match_count);
+    for ((id, row), keep) in rows.into_iter().zip(marks) {
+        if keep {
+            result.push((id, row));
+        }
+    }
+    result
 }
 
 /// Parallel sort using rayon's par_sort_unstable_by
 ///
 /// For large datasets, parallel sort can provide 2-4x speedup.
 /// Uses unstable sort (faster, doesn't preserve order of equal elements).
-pub fn parallel_sort<F>(rows: &mut [Row], compare: F, config: &ParallelConfig)
+pub fn parallel_sort<F>(rows: &mut [(i64, Row)], compare: F, config: &ParallelConfig)
 where
     F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
 {
     if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_unstable_by(compare);
+        rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
     } else {
-        rows.sort_unstable_by(compare);
+        rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
     }
 }
 
 /// Parallel sort that's unstable (faster but doesn't preserve order of equal elements)
-pub fn parallel_sort_unstable<F>(rows: &mut [Row], compare: F, config: &ParallelConfig)
+pub fn parallel_sort_unstable<F>(rows: &mut [(i64, Row)], compare: F, config: &ParallelConfig)
 where
     F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
 {
     if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_unstable_by(compare);
+        rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
     } else {
-        rows.sort_unstable_by(compare);
+        rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
     }
 }
 
@@ -289,7 +287,7 @@ where
 ///
 /// This implementation correctly handles hash collisions by storing actual rows
 /// and comparing them for equality, not just their hashes.
-pub fn parallel_distinct(rows: Vec<Row>, config: &ParallelConfig) -> Vec<Row> {
+pub fn parallel_distinct(rows: RowVec, config: &ParallelConfig) -> RowVec {
     let row_count = rows.len();
 
     if !config.should_parallel_filter(row_count) {
@@ -305,30 +303,30 @@ pub fn parallel_distinct(rows: Vec<Row>, config: &ParallelConfig) -> Vec<Row> {
     let chunk_size = config.chunk_size.max(row_count / num_threads).max(1000);
 
     // Phase 1: Parallel local dedup within chunks
+    // Note: We must convert to Vec for into_par_iter (RowVec doesn't impl IntoParallelIterator)
     // Each chunk produces unique rows (within that chunk) along with their hashes
-    // We store (hash, row) pairs to avoid recomputing hashes
-    let deduped_chunks: Vec<Vec<(u64, Row)>> = rows
+    let row_vec: Vec<(i64, Row)> = rows.into_vec();
+    let deduped_chunks: Vec<Vec<(u64, i64, Row)>> = row_vec
         .into_par_iter()
         .chunks(chunk_size)
         .map(|chunk| {
             // Use hash map: hash -> list of indices into unique_with_hashes
-            // OPTIMIZATION: Use FxHashMap for fastest hash operations with trusted keys
             let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-            // Store (hash, row) pairs to avoid recomputing hash later
-            let mut unique_with_hashes: Vec<(u64, Row)> = Vec::with_capacity(chunk.len());
+            // Store (hash, row_id, row) tuples
+            let mut unique_with_hashes: Vec<(u64, i64, Row)> = Vec::with_capacity(chunk.len());
 
-            for row in chunk {
+            for (row_id, row) in chunk {
                 let hash = hash_row(&row);
                 let indices = hash_to_indices.entry(hash).or_default();
 
                 // Check if this exact row already exists (handle hash collisions)
                 let is_duplicate = indices
                     .iter()
-                    .any(|&idx| rows_equal(&unique_with_hashes[idx].1, &row));
+                    .any(|&idx| rows_equal(&unique_with_hashes[idx].2, &row));
 
                 if !is_duplicate {
                     indices.push(unique_with_hashes.len());
-                    unique_with_hashes.push((hash, row));
+                    unique_with_hashes.push((hash, row_id, row));
                 }
             }
 
@@ -337,26 +335,21 @@ pub fn parallel_distinct(rows: Vec<Row>, config: &ParallelConfig) -> Vec<Row> {
         .collect();
 
     // Phase 2: Sequential final dedup across chunks with full equality verification
-    // Use hash map: hash -> list of indices into result vec
-    // OPTIMIZATION: Use FxHashMap for fastest hash operations with trusted keys
     let total_size: usize = deduped_chunks.iter().map(|chunk| chunk.len()).sum();
-    // OPTIMIZATION: Estimate final size accounting for cross-chunk duplicates
-    // Phase 1 removed intra-chunk dupes, but inter-chunk dupes remain
-    // Empirically, 75% of phase 1 output survives phase 2 (25% are cross-chunk dupes)
     let estimated_size = (total_size * 3) / 4;
-    let mut result = Vec::with_capacity(estimated_size);
+    let mut result = RowVec::with_capacity(estimated_size);
     let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
 
     for chunk in deduped_chunks {
-        for (hash, row) in chunk {
+        for (hash, row_id, row) in chunk {
             let indices = hash_to_indices.entry(hash).or_default();
 
             // Check if this exact row already exists globally (handle hash collisions)
-            let is_duplicate = indices.iter().any(|&idx| rows_equal(&result[idx], &row));
+            let is_duplicate = indices.iter().any(|&idx| rows_equal(&result[idx].1, &row));
 
             if !is_duplicate {
                 indices.push(result.len());
-                result.push(row); // Move, no clone
+                result.push((row_id, row));
             }
         }
     }
@@ -365,22 +358,20 @@ pub fn parallel_distinct(rows: Vec<Row>, config: &ParallelConfig) -> Vec<Row> {
 }
 
 /// Sequential DISTINCT with proper equality checking for hash collisions
-fn sequential_distinct(rows: Vec<Row>) -> Vec<Row> {
-    // Use hash map: hash -> list of indices into result vec (no cloning needed)
-    // OPTIMIZATION: Use FxHashMap for fastest hash operations with trusted keys
+fn sequential_distinct(rows: RowVec) -> RowVec {
     let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-    let mut result = Vec::with_capacity(rows.len());
+    let mut result = RowVec::with_capacity(rows.len());
 
-    for row in rows {
+    for (row_id, row) in rows {
         let hash = hash_row(&row);
         let indices = hash_to_indices.entry(hash).or_default();
 
         // Check if this exact row already exists (handle hash collisions)
-        let is_duplicate = indices.iter().any(|&idx| rows_equal(&result[idx], &row));
+        let is_duplicate = indices.iter().any(|&idx| rows_equal(&result[idx].1, &row));
 
         if !is_duplicate {
             indices.push(result.len());
-            result.push(row); // Move, no clone
+            result.push((row_id, row));
         }
     }
 
@@ -391,17 +382,33 @@ fn sequential_distinct(rows: Vec<Row>) -> Vec<Row> {
 ///
 /// For complex SELECT expressions (not simple column references),
 /// parallel evaluation can speed up projection significantly.
-pub fn parallel_project<F>(rows: Vec<Row>, project_fn: F, config: &ParallelConfig) -> Vec<Row>
+/// Uses in-place parallel mapping to minimize allocations.
+pub fn parallel_project<F>(rows: RowVec, project_fn: F, config: &ParallelConfig) -> RowVec
 where
     F: Fn(&Row) -> Row + Sync + Send,
 {
     let row_count = rows.len();
 
     if !config.should_parallel_filter(row_count) {
-        return rows.iter().map(&project_fn).collect();
+        return rows
+            .into_iter()
+            .map(|(id, r)| (id, project_fn(&r)))
+            .collect();
     }
 
-    rows.into_par_iter().map(|r| project_fn(&r)).collect()
+    // Parallel projection using par_chunks for better cache locality
+    let chunk_size = (row_count / rayon::current_num_threads()).max(1000);
+    let projected: Vec<(i64, Row)> = rows
+        .par_chunks(chunk_size)
+        .flat_map(|chunk| {
+            chunk
+                .iter()
+                .map(|(id, row)| (*id, project_fn(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    RowVec::from_vec(projected)
 }
 
 /// Statistics about parallel execution for monitoring/debugging
@@ -1013,8 +1020,12 @@ pub struct SortSpec {
 /// For 100K rows:
 /// - Sequential: ~50ms
 /// - Parallel (8 cores): ~15ms (3x speedup)
-pub fn parallel_order_by(rows: &mut [Row], sort_specs: &[SortSpec], config: &ParallelConfig) {
-    let compare = |a: &Row, b: &Row| -> std::cmp::Ordering {
+pub fn parallel_order_by(
+    rows: &mut [(i64, Row)],
+    sort_specs: &[SortSpec],
+    config: &ParallelConfig,
+) {
+    let compare = |(_, a): &(i64, Row), (_, b): &(i64, Row)| -> std::cmp::Ordering {
         for spec in sort_specs {
             let a_val = a.get(spec.column_index);
             let b_val = b.get(spec.column_index);
@@ -1071,26 +1082,26 @@ pub fn parallel_order_by(rows: &mut [Row], sort_specs: &[SortSpec], config: &Par
 ///
 /// More flexible version that accepts any comparison function.
 /// Uses unstable sort for better performance.
-pub fn parallel_order_by_fn<F>(rows: &mut [Row], compare: F, config: &ParallelConfig)
+pub fn parallel_order_by_fn<F>(rows: &mut [(i64, Row)], compare: F, config: &ParallelConfig)
 where
     F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
 {
     if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_unstable_by(compare);
+        rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
     } else {
-        rows.sort_unstable_by(compare);
+        rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
     }
 }
 
 /// Parallel ORDER BY with unstable sort (faster, but doesn't preserve order of equal elements)
-pub fn parallel_order_by_unstable<F>(rows: &mut [Row], compare: F, config: &ParallelConfig)
+pub fn parallel_order_by_unstable<F>(rows: &mut [(i64, Row)], compare: F, config: &ParallelConfig)
 where
     F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
 {
     if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_unstable_by(compare);
+        rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
     } else {
-        rows.sort_unstable_by(compare);
+        rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
     }
 }
 
@@ -1098,12 +1109,12 @@ where
 ///
 /// CRITICAL: This function now returns Result to properly propagate compilation errors.
 pub fn parallel_filter_with_stats(
-    rows: Vec<Row>,
+    rows: RowVec,
     filter_expr: &Expression,
     columns: &[String],
     function_registry: &FunctionRegistry,
     config: &ParallelConfig,
-) -> Result<(Vec<Row>, ParallelStats)> {
+) -> Result<(RowVec, ParallelStats)> {
     let row_count = rows.len();
     let parallel_used = config.should_parallel_filter(row_count);
 
@@ -1120,11 +1131,7 @@ pub fn parallel_filter_with_stats(
     let chunks_used = row_count.div_ceil(chunk_size);
 
     // CRITICAL: Propagate errors with ? instead of silently swallowing them
-    let result = if parallel_used {
-        parallel_filter(rows, filter_expr, columns, function_registry, config)?
-    } else {
-        sequential_filter(rows, filter_expr, columns, function_registry)?
-    };
+    let result = parallel_filter(rows, filter_expr, columns, function_registry, config)?;
 
     let stats = ParallelStats {
         rows_processed: row_count,
@@ -1141,13 +1148,16 @@ mod tests {
     use super::*;
     use crate::core::Value;
 
-    fn make_test_rows(count: usize) -> Vec<Row> {
+    fn make_test_rows(count: usize) -> RowVec {
         (0..count)
             .map(|i| {
-                Row::from_values(vec![
-                    Value::Integer(i as i64),
-                    Value::Integer(i as i64 % 10),
-                ])
+                (
+                    i as i64,
+                    Row::from_values(vec![
+                        Value::Integer(i as i64),
+                        Value::Integer(i as i64 % 10),
+                    ]),
+                )
             })
             .collect()
     }
@@ -1155,10 +1165,10 @@ mod tests {
     #[test]
     fn test_parallel_distinct() {
         // Create rows with duplicates
-        let mut rows = Vec::new();
-        for i in 0..1000 {
+        let mut rows = RowVec::new();
+        for i in 0i64..1000 {
             // Each value appears 10 times
-            rows.push(Row::from_values(vec![Value::Integer(i % 100)]));
+            rows.push((i, Row::from_values(vec![Value::Integer(i % 100)])));
         }
 
         let config = ParallelConfig {
@@ -1174,9 +1184,9 @@ mod tests {
 
     #[test]
     fn test_parallel_sort() {
-        let mut rows: Vec<Row> = (0..1000)
+        let mut rows: RowVec = (0..1000)
             .rev()
-            .map(|i| Row::from_values(vec![Value::Integer(i)]))
+            .map(|i| (i, Row::from_values(vec![Value::Integer(i)])))
             .collect();
 
         let config = ParallelConfig {
@@ -1195,7 +1205,7 @@ mod tests {
         );
 
         // Verify sorted
-        for (i, row) in rows.iter().enumerate() {
+        for (i, (_, row)) in rows.iter().enumerate() {
             assert_eq!(row.get(0), Some(&Value::Integer(i as i64)));
         }
     }
@@ -1350,12 +1360,15 @@ mod tests {
     #[test]
     fn test_parallel_order_by() {
         // Create rows with random-ish order
-        let mut rows: Vec<Row> = (0..1000)
+        let mut rows: RowVec = (0..1000)
             .map(|i| {
-                Row::from_values(vec![
-                    Value::Integer((i * 7 + 13) % 1000), // Scrambled order
-                    Value::Text(format!("row_{}", i).into()),
-                ])
+                (
+                    i,
+                    Row::from_values(vec![
+                        Value::Integer((i * 7 + 13) % 1000), // Scrambled order
+                        Value::Text(format!("row_{}", i).into()),
+                    ]),
+                )
             })
             .collect();
 
@@ -1374,16 +1387,16 @@ mod tests {
 
         // Verify sorted ascending
         for i in 1..rows.len() {
-            let prev = rows[i - 1].get(0).and_then(|v| v.as_int64()).unwrap();
-            let curr = rows[i].get(0).and_then(|v| v.as_int64()).unwrap();
+            let prev = rows[i - 1].1.get(0).and_then(|v| v.as_int64()).unwrap();
+            let curr = rows[i].1.get(0).and_then(|v| v.as_int64()).unwrap();
             assert!(prev <= curr, "Row {} should be <= row {}", i - 1, i);
         }
     }
 
     #[test]
     fn test_parallel_order_by_descending() {
-        let mut rows: Vec<Row> = (0..500)
-            .map(|i| Row::from_values(vec![Value::Integer(i)]))
+        let mut rows: RowVec = (0..500)
+            .map(|i| (i, Row::from_values(vec![Value::Integer(i)])))
             .collect();
 
         let config = ParallelConfig {
@@ -1401,21 +1414,20 @@ mod tests {
 
         // Verify sorted descending
         for i in 1..rows.len() {
-            let prev = rows[i - 1].get(0).and_then(|v| v.as_int64()).unwrap();
-            let curr = rows[i].get(0).and_then(|v| v.as_int64()).unwrap();
+            let prev = rows[i - 1].1.get(0).and_then(|v| v.as_int64()).unwrap();
+            let curr = rows[i].1.get(0).and_then(|v| v.as_int64()).unwrap();
             assert!(prev >= curr, "Row {} should be >= row {}", i - 1, i);
         }
     }
 
     #[test]
     fn test_parallel_order_by_with_nulls() {
-        let mut rows: Vec<Row> = vec![
-            Row::from_values(vec![Value::Integer(3)]),
-            Row::from_values(vec![Value::null_unknown()]),
-            Row::from_values(vec![Value::Integer(1)]),
-            Row::from_values(vec![Value::null_unknown()]),
-            Row::from_values(vec![Value::Integer(2)]),
-        ];
+        let mut rows = RowVec::new();
+        rows.push((0, Row::from_values(vec![Value::Integer(3)])));
+        rows.push((1, Row::from_values(vec![Value::null_unknown()])));
+        rows.push((2, Row::from_values(vec![Value::Integer(1)])));
+        rows.push((3, Row::from_values(vec![Value::null_unknown()])));
+        rows.push((4, Row::from_values(vec![Value::Integer(2)])));
 
         let config = ParallelConfig {
             min_rows_for_parallel_sort: 1, // Force parallel for test
@@ -1432,12 +1444,12 @@ mod tests {
         parallel_order_by(&mut rows, &sort_specs, &config);
 
         // First two should be NULL
-        assert!(rows[0].get(0).map(|v| v.is_null()).unwrap_or(false));
-        assert!(rows[1].get(0).map(|v| v.is_null()).unwrap_or(false));
+        assert!(rows[0].1.get(0).map(|v| v.is_null()).unwrap_or(false));
+        assert!(rows[1].1.get(0).map(|v| v.is_null()).unwrap_or(false));
         // Then 1, 2, 3
-        assert_eq!(rows[2].get(0), Some(&Value::Integer(1)));
-        assert_eq!(rows[3].get(0), Some(&Value::Integer(2)));
-        assert_eq!(rows[4].get(0), Some(&Value::Integer(3)));
+        assert_eq!(rows[2].1.get(0), Some(&Value::Integer(1)));
+        assert_eq!(rows[3].1.get(0), Some(&Value::Integer(2)));
+        assert_eq!(rows[4].1.get(0), Some(&Value::Integer(3)));
     }
 
     // ========================================================================
@@ -1450,13 +1462,27 @@ mod tests {
     fn test_distinct_hash_collision_handling() {
         // Create rows that might have hash collisions by having different values
         // that could theoretically hash to the same value
-        let rows = vec![
+        let mut rows = RowVec::new();
+        rows.push((
+            0,
             Row::from_values(vec![Value::Integer(1), Value::Text("a".into())]),
-            Row::from_values(vec![Value::Integer(1), Value::Text("b".into())]), // Different from above
-            Row::from_values(vec![Value::Integer(1), Value::Text("a".into())]), // Duplicate of first
-            Row::from_values(vec![Value::Integer(2), Value::Text("a".into())]), // Different from all
-            Row::from_values(vec![Value::Integer(2), Value::Text("a".into())]), // Duplicate
-        ];
+        ));
+        rows.push((
+            1,
+            Row::from_values(vec![Value::Integer(1), Value::Text("b".into())]),
+        )); // Different from above
+        rows.push((
+            2,
+            Row::from_values(vec![Value::Integer(1), Value::Text("a".into())]),
+        )); // Duplicate of first
+        rows.push((
+            3,
+            Row::from_values(vec![Value::Integer(2), Value::Text("a".into())]),
+        )); // Different from all
+        rows.push((
+            4,
+            Row::from_values(vec![Value::Integer(2), Value::Text("a".into())]),
+        )); // Duplicate
 
         let config = ParallelConfig {
             min_rows_for_parallel_filter: 1, // Force parallel path
@@ -1470,13 +1496,13 @@ mod tests {
         assert_eq!(result.len(), 3, "Should have 3 unique rows");
 
         // Verify all three distinct combinations are present
-        let has_1_a = result.iter().any(|r| {
+        let has_1_a = result.iter().any(|(_, r)| {
             r.get(0) == Some(&Value::Integer(1)) && r.get(1) == Some(&Value::Text("a".into()))
         });
-        let has_1_b = result.iter().any(|r| {
+        let has_1_b = result.iter().any(|(_, r)| {
             r.get(0) == Some(&Value::Integer(1)) && r.get(1) == Some(&Value::Text("b".into()))
         });
-        let has_2_a = result.iter().any(|r| {
+        let has_2_a = result.iter().any(|(_, r)| {
             r.get(0) == Some(&Value::Integer(2)) && r.get(1) == Some(&Value::Text("a".into()))
         });
 
@@ -1488,12 +1514,11 @@ mod tests {
     /// Test sequential distinct also handles hash collisions
     #[test]
     fn test_sequential_distinct_hash_collision() {
-        let rows = vec![
-            Row::from_values(vec![Value::Integer(100)]),
-            Row::from_values(vec![Value::Integer(200)]),
-            Row::from_values(vec![Value::Integer(100)]), // Duplicate
-            Row::from_values(vec![Value::Integer(300)]),
-        ];
+        let mut rows = RowVec::new();
+        rows.push((0, Row::from_values(vec![Value::Integer(100)])));
+        rows.push((1, Row::from_values(vec![Value::Integer(200)])));
+        rows.push((2, Row::from_values(vec![Value::Integer(100)]))); // Duplicate
+        rows.push((3, Row::from_values(vec![Value::Integer(300)])));
 
         // Use high threshold to force sequential path
         let config = ParallelConfig {

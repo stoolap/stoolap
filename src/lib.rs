@@ -63,6 +63,12 @@
 //! - [`optimizer`] - Cost-based query optimizer with cardinality feedback
 //! - [`common`] - Utilities (BufferPool, Int64Map, version)
 
+// Use mimalloc as global allocator when feature is enabled
+// (but not when dhat-heap is enabled, as it needs its own allocator)
+#[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod api;
 pub mod common;
 pub mod core;
@@ -79,10 +85,7 @@ pub use core::{
 };
 
 // Re-export common utilities
-pub use common::{
-    BufferPool, ConcurrentInt64Map, ConcurrentUInt64Map, ConcurrentUsizeMap, Int64Map, Int64Set,
-    PoolStats, SemVer, UInt64Map, UInt64Set, UsizeMap, UsizeSet,
-};
+pub use common::{BufferPool, ConcurrentInt64Map, Int64Map, Int64Set, PoolStats, SemVer};
 
 // Re-export storage/expression types
 pub use storage::{
@@ -141,7 +144,7 @@ pub use functions::{
 // Re-export executor types
 pub use executor::{
     CacheStats, CachedQueryPlan, ColumnStatsCache, ExecResult, ExecutionContext, Executor,
-    ExecutorMemoryResult, QueryCache, QueryPlanner, StatsHealth,
+    ExecutorResult, QueryCache, QueryPlanner, StatsHealth,
 };
 
 // Re-export API types

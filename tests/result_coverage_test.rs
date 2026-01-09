@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Result types integration tests
-// Tests for result.rs - ExecResult, ExecutorMemoryResult, FilteredResult,
+// Tests for result.rs - ExecResult, ExecutorResult, FilteredResult,
 // ExprMappedResult, LimitedResult, OrderedResult, TopNResult, DistinctResult,
 // AliasedResult, ProjectedResult, ScannerResult, StreamingProjectionResult
 

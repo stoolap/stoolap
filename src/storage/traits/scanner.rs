@@ -79,6 +79,25 @@ pub trait Scanner: Send {
     fn estimated_count(&self) -> Option<usize> {
         None
     }
+
+    /// Takes ownership of the current row along with its row ID
+    ///
+    /// This is more efficient than `row().clone()` when you need to move
+    /// the row data out of the scanner with its associated ID. After calling this,
+    /// the internal row buffer may be empty until `next()` is called again.
+    /// The default implementation returns the current position as the ID.
+    fn take_row_with_id(&mut self) -> (i64, Row) {
+        (0, self.take_row())
+    }
+
+    /// Returns the current row ID
+    ///
+    /// Returns the internal row ID for the current row. This is used for
+    /// row-level operations that need to track row identity.
+    /// Default implementation returns 0.
+    fn current_row_id(&self) -> i64 {
+        0
+    }
 }
 
 /// An empty scanner that immediately returns no rows

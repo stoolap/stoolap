@@ -210,7 +210,7 @@ pub fn cache_exists_index(key: String, index: std::sync::Arc<dyn Index>) {
 }
 
 /// Type alias for row fetcher function used in EXISTS/COUNT optimization.
-pub type RowFetcher = Box<dyn Fn(&[i64]) -> Vec<(i64, crate::core::Row)> + Send + Sync>;
+pub type RowFetcher = Box<dyn Fn(&[i64]) -> crate::core::RowVec + Send + Sync>;
 
 /// Type alias for row counter function used in COUNT(*) optimization.
 /// This only counts visible rows without cloning their data.
@@ -575,10 +575,11 @@ pub struct ExecutionContext {
 }
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
-type CteData = (Arc<Vec<String>>, Arc<Vec<Row>>);
+/// Uses Vec<(i64, Row)> for rows - same structure as RowVec but Arc-shareable
+type CteData = (Arc<Vec<String>>, Arc<Vec<(i64, Row)>>);
 
 /// Type alias for CTE data map to reduce type complexity
-/// Uses Arc<Vec<String>> for columns and Arc<Vec<Row>> for rows
+/// Uses Arc<Vec<String>> for columns and Arc<Vec<(i64, Row)>> for rows
 /// to enable zero-copy sharing of CTE results with joins
 type CteDataMap = FxHashMap<String, CteData>;
 

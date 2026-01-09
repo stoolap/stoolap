@@ -2366,11 +2366,7 @@ impl Engine for MVCCEngine {
         self.record_ddl(old_table_name, WALOperationType::AlterTable, &data);
     }
 
-    fn fetch_rows_by_ids(
-        &self,
-        table_name: &str,
-        row_ids: &[i64],
-    ) -> Result<Vec<(i64, crate::core::Row)>> {
+    fn fetch_rows_by_ids(&self, table_name: &str, row_ids: &[i64]) -> Result<crate::core::RowVec> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2387,7 +2383,7 @@ impl Engine for MVCCEngine {
     fn get_row_fetcher(
         &self,
         table_name: &str,
-    ) -> Result<Box<dyn Fn(&[i64]) -> Vec<(i64, crate::core::Row)> + Send + Sync>> {
+    ) -> Result<Box<dyn Fn(&[i64]) -> crate::core::RowVec + Send + Sync>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }

@@ -18,8 +18,9 @@
 use rustc_hash::FxHashMap;
 use std::fmt;
 
-use crate::core::{DataType, Error, IndexType, Result, Row, Schema, Value};
+use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, Value};
 use crate::storage::expression::Expression;
+use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
 use crate::storage::traits::{Index, QueryResult, Scanner};
 
 /// Describes the access method that will be used for a table scan
@@ -330,37 +331,8 @@ pub trait Table: Send + Sync {
     /// * `where_expr` - Expression to filter rows (None means all rows)
     ///
     /// # Returns
-    /// A vector of all matching rows (ownership transferred, not cloned)
-    fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<Vec<Row>>;
-
-    /// Collects rows with projection applied directly
-    ///
-    /// This is more efficient than using scan() for simple column projections,
-    /// as it projects rows during collection without intermediate cloning.
-    ///
-    /// # Arguments
-    /// * `column_indices` - Indices of columns to include in the result
-    ///
-    /// # Returns
-    /// A vector of projected rows (ownership transferred, not cloned)
-    fn collect_projected_rows(&self, column_indices: &[usize]) -> Result<Vec<Row>> {
-        // Default implementation: collect all and project
-        let all_rows = self.collect_all_rows(None)?;
-        Ok(all_rows
-            .into_iter()
-            .map(|row| {
-                let values: Vec<crate::core::Value> = column_indices
-                    .iter()
-                    .map(|&idx| {
-                        row.get(idx)
-                            .cloned()
-                            .unwrap_or(crate::core::Value::null_unknown())
-                    })
-                    .collect();
-                Row::from_values(values)
-            })
-            .collect())
-    }
+    /// Cached row vector - returns to cache on drop for reuse
+    fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec>;
 
     /// Collects rows with an optional limit (LIMIT pushdown optimization)
     ///
@@ -373,13 +345,13 @@ pub trait Table: Send + Sync {
     /// * `offset` - Number of rows to skip before returning
     ///
     /// # Returns
-    /// A vector of rows up to the limit (after offset)
+    /// A RowVec containing rows up to the limit (after offset) with row IDs
     fn collect_rows_with_limit(
         &self,
         where_expr: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         // Default implementation: collect all and apply limit/offset
         let all_rows = self.collect_all_rows(where_expr)?;
         Ok(all_rows.into_iter().skip(offset).take(limit).collect())
@@ -398,13 +370,13 @@ pub trait Table: Send + Sync {
     /// * `offset` - Number of rows to skip before returning
     ///
     /// # Returns
-    /// A vector of rows up to the limit (after offset), in arbitrary order
+    /// A RowVec containing rows up to the limit (after offset), in arbitrary order
     fn collect_rows_with_limit_unordered(
         &self,
         where_expr: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         // Default implementation: delegate to ordered version
         self.collect_rows_with_limit(where_expr, limit, offset)
     }
@@ -415,8 +387,8 @@ pub trait Table: Send + Sync {
     /// By skipping the O(n log n) sort, this provides significant speedup for large tables.
     ///
     /// # Returns
-    /// A vector of all rows in arbitrary (storage iteration) order
-    fn collect_all_rows_unsorted(&self) -> Result<Vec<Row>> {
+    /// Cached row vector in arbitrary (storage iteration) order
+    fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
         // Default implementation: delegate to ordered version
         self.collect_all_rows(None)
     }
@@ -446,7 +418,7 @@ pub trait Table: Send + Sync {
         // Default implementation: collect all, sort, take limit
         // Concrete implementations can override with deferred materialization
         let mut rows = self.collect_all_rows(None)?;
-        rows.sort_by(|a, b| {
+        rows.sort_by(|(_, a), (_, b)| {
             let va = a.get(sort_col_idx);
             let vb = b.get(sort_col_idx);
             let cmp = match (va, vb) {
@@ -461,7 +433,12 @@ pub trait Table: Send + Sync {
                 cmp.reverse()
             }
         });
-        Ok(rows.into_iter().skip(offset).take(limit).collect())
+        Ok(rows
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(_, row)| row)
+            .collect())
     }
 
     /// Closes the table and releases any resources
@@ -691,14 +668,14 @@ pub trait Table: Send + Sync {
     /// * `offset` - Number of rows to skip
     ///
     /// # Returns
-    /// Some(Vec<Row>) if the column has an index, None otherwise
+    /// Some(RowVec) if the column has an index, None otherwise
     fn collect_rows_ordered_by_index(
         &self,
         column_name: &str,
         ascending: bool,
         limit: usize,
         offset: usize,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<RowVec> {
         let _ = (column_name, ascending, limit, offset);
         None // Default implementation - override in concrete tables
     }
@@ -716,14 +693,14 @@ pub trait Table: Send + Sync {
     /// * `limit` - Maximum number of rows to return
     ///
     /// # Returns
-    /// Some(Vec<Row>) if the table has an INTEGER PRIMARY KEY, None otherwise
+    /// Some(RowVec) if the table has an INTEGER PRIMARY KEY, None otherwise
     fn collect_rows_pk_keyset(
         &self,
         start_after: Option<i64>,
         start_from: Option<i64>,
         ascending: bool,
         limit: usize,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<RowVec> {
         let _ = (start_after, start_from, ascending, limit);
         None // Default implementation - override in concrete tables
     }
@@ -738,12 +715,9 @@ pub trait Table: Send + Sync {
     /// * `column_name` - The indexed column to partition by
     ///
     /// # Returns
-    /// Some(Vec<(Value, Vec<Row>)>) where each tuple is (partition_value, rows_in_partition)
+    /// Some(Vec<(Value, RowVec)>) where each tuple is (partition_value, rows_in_partition)
     /// Returns None if the column has no index
-    fn collect_rows_grouped_by_partition(
-        &self,
-        column_name: &str,
-    ) -> Option<Vec<(Value, Vec<Row>)>> {
+    fn collect_rows_grouped_by_partition(&self, column_name: &str) -> Option<Vec<(Value, RowVec)>> {
         let _ = column_name;
         None // Default implementation - override in concrete tables
     }
@@ -769,12 +743,12 @@ pub trait Table: Send + Sync {
     /// * `partition_value` - The specific partition value to fetch rows for
     ///
     /// # Returns
-    /// Some(Vec<Row>) with rows matching the partition value, or None if column has no index
+    /// Some(RowVec) with rows matching the partition value, or None if column has no index
     fn get_rows_for_partition_value(
         &self,
         column_name: &str,
         partition_value: &Value,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<RowVec> {
         let _ = (column_name, partition_value);
         None // Default implementation - override in concrete tables
     }
@@ -786,19 +760,19 @@ pub trait Table: Send + Sync {
     /// * `filter` - Filter expression to apply to fetched rows
     ///
     /// # Returns
-    /// Vector of (row_id, Row) pairs for visible, non-deleted rows that pass the filter
-    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Vec<(i64, Row)> {
-        let mut results = Vec::new();
+    /// RowVec of (row_id, Row) pairs for visible, non-deleted rows that pass the filter
+    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> RowVec {
+        let mut results = RowVec::with_capacity(row_ids.len());
         self.fetch_rows_by_ids_into(row_ids, filter, &mut results);
         results
     }
 
-    /// Fetch rows into a reusable buffer
+    /// Fetch rows into a reusable RowVec buffer
     fn fetch_rows_by_ids_into(
         &self,
         row_ids: &[i64],
         filter: &dyn Expression,
-        buffer: &mut Vec<(i64, Row)>,
+        buffer: &mut RowVec,
     ) {
         let _ = (row_ids, filter, buffer);
         // Default implementation does nothing
@@ -981,6 +955,25 @@ pub trait Table: Send + Sync {
     /// * `col_idx` - Column index to find maximum
     fn max_column(&self, _col_idx: usize) -> Option<Option<Value>> {
         None // Default implementation - override in concrete tables
+    }
+
+    /// Compute grouped aggregates at the storage level.
+    ///
+    /// This performs GROUP BY aggregation directly on arena storage without
+    /// materializing Row objects, significantly reducing memory allocations.
+    ///
+    /// # Arguments
+    /// * `group_by_indices` - Column indices to group by
+    /// * `aggregates` - List of (operation, column_index) pairs
+    ///
+    /// # Returns
+    /// Some(results) if optimization is available, None otherwise
+    fn compute_grouped_aggregates(
+        &self,
+        _group_by_indices: &[usize],
+        _aggregates: &[(AggregateOp, usize)],
+    ) -> Option<Vec<GroupedAggregateResult>> {
+        None // Default: not supported
     }
 }
 

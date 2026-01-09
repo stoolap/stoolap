@@ -17,7 +17,8 @@
 //! This module provides the lexer for tokenizing SQL input strings.
 
 use super::token::{
-    is_keyword, is_operator, is_operator_char, is_punctuator, Position, Token, TokenType,
+    is_keyword, is_operator, is_operator_char, is_punctuator, punctuator_str, Position, Token,
+    TokenType,
 };
 use compact_str::CompactString;
 
@@ -238,10 +239,11 @@ impl Lexer {
                 Token::new(TokenType::Operator, "*", pos)
             }
 
-            // Regular punctuator
+            // Regular punctuator - use static string to avoid allocation
             c if is_punctuator(c) => {
                 self.read_char();
-                Token::new(TokenType::Punctuator, c.to_string(), pos)
+                // SAFETY: We already checked is_punctuator(c), so punctuator_str always returns Some
+                Token::new(TokenType::Punctuator, punctuator_str(c).unwrap(), pos)
             }
 
             // Operator

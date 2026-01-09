@@ -35,7 +35,8 @@ use parking_lot::{Mutex, RwLock};
 use crate::common::{
     new_btree_int64_map, new_int64_map, new_int64_map_with_capacity, BTreeInt64Map, Int64Map,
 };
-use crate::core::{Error, Row, Schema, Value};
+use crate::core::types::DataType;
+use crate::core::{Error, Row, RowVec, Schema, Value};
 use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::RowArena;
 use crate::storage::mvcc::get_fast_timestamp;
@@ -51,6 +52,50 @@ use smallvec::{smallvec, SmallVec};
 /// Type alias for version lists - uses SmallVec to avoid heap allocation
 /// for the common case of a single version per row within a transaction.
 type VersionList = SmallVec<[RowVersion; 1]>;
+
+/// Group key using Arc<Value> to avoid cloning during aggregation.
+/// Uses Arc::clone (O(1) atomic increment) instead of Value::clone (deep copy).
+#[derive(Clone, Debug)]
+pub enum GroupKey {
+    Single(Arc<Value>),
+    Multi(Vec<Arc<Value>>),
+}
+
+impl PartialEq for GroupKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (GroupKey::Single(a), GroupKey::Single(b)) => **a == **b,
+            (GroupKey::Multi(a), GroupKey::Multi(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| **x == **y)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for GroupKey {}
+
+impl std::hash::Hash for GroupKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            GroupKey::Single(v) => (**v).hash(state),
+            GroupKey::Multi(vs) => {
+                for v in vs {
+                    (**v).hash(state);
+                }
+            }
+        }
+    }
+}
+
+/// Result of storage-level grouped aggregation
+#[derive(Debug, Clone)]
+pub struct GroupedAggregateResult {
+    /// Group key values
+    pub group_values: Vec<Value>,
+    /// Aggregate results in order of requested aggregates
+    pub aggregate_values: Vec<Value>,
+}
 
 /// Represents a specific version of a row with complete data
 ///
@@ -263,6 +308,7 @@ pub struct RowIndex {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggregateOp {
     Count,
+    CountStar,
     Sum,
     Min,
     Max,
@@ -1094,14 +1140,14 @@ impl VersionStore {
     ///
     /// OPTIMIZATION: Uses arena fast path (O(1) HashMap) before falling back to
     /// BTreeMap (O(log n)) for version chain traversal.
-    pub fn get_visible_versions_batch(&self, row_ids: &[i64], txn_id: i64) -> Vec<(i64, Row)> {
+    pub fn get_visible_versions_batch(&self, row_ids: &[i64], txn_id: i64) -> RowVec {
         if self.closed.load(Ordering::Acquire) {
-            return Vec::new();
+            return RowVec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return RowVec::new(),
         };
 
         // Pre-acquire all locks ONCE for all lookups
@@ -1113,7 +1159,7 @@ impl VersionStore {
         let versions = self.versions.read();
 
         // Sequential processing - avoids Rayon allocation overhead
-        let mut results = Vec::with_capacity(row_ids.len());
+        let mut results = RowVec::with_capacity(row_ids.len());
         let arena_len = arena_meta.len();
 
         for &row_id in row_ids {
@@ -1575,21 +1621,21 @@ impl VersionStore {
     /// because it batches the visibility checks and avoids repeated map lookups.
     /// Results are already sorted by row_id (BTreeMap iteration order).
     #[inline]
-    pub fn get_all_visible_rows(&self, txn_id: i64) -> Vec<(i64, Row)> {
+    pub fn get_all_visible_rows(&self, txn_id: i64) -> RowVec {
         // BTreeMap is already sorted, no additional sorting needed!
         self.get_all_visible_rows_internal(txn_id)
     }
 
     /// Internal implementation for getting all visible rows
     #[inline]
-    fn get_all_visible_rows_internal(&self, txn_id: i64) -> Vec<(i64, Row)> {
+    fn get_all_visible_rows_internal(&self, txn_id: i64) -> RowVec {
         if self.closed.load(Ordering::Acquire) {
-            return Vec::new();
+            return RowVec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return RowVec::new(),
         };
 
         // Pre-acquire arena lock for O(1) Arc clones
@@ -1608,7 +1654,7 @@ impl VersionStore {
 
         // Collect all versions in one pass (BTreeMap is sorted)
         let versions = self.versions.read();
-        let mut results = Vec::with_capacity(versions.len());
+        let mut results = RowVec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
             // FAST PATH: Check HEAD version first - O(1) for common case
@@ -1650,14 +1696,14 @@ impl VersionStore {
     /// 2. Reading directly during visibility iteration (single pass)
     /// 3. Using contiguous arena memory for cache locality
     #[inline]
-    pub fn get_all_visible_rows_arena(&self, txn_id: i64) -> Vec<(i64, Row)> {
+    pub fn get_all_visible_rows_arena(&self, txn_id: i64) -> RowVec {
         if self.closed.load(Ordering::Acquire) {
-            return Vec::new();
+            return RowVec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return RowVec::new(),
         };
 
         // Pre-acquire arena lock ONCE for the entire operation
@@ -1676,7 +1722,7 @@ impl VersionStore {
 
         // Single-pass: read directly from arena during visibility check (BTreeMap is sorted)
         let versions = self.versions.read();
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(versions.len());
+        let mut result = RowVec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
             // FAST PATH: Check HEAD version first - O(1) for common case
@@ -1708,6 +1754,79 @@ impl VersionStore {
         }
 
         // BTreeMap already iterates in sorted order, no need to sort
+        result
+    }
+
+    /// Returns all visible rows using RowVec for zero-allocation reuse.
+    ///
+    /// Same as `get_all_visible_rows_arena` but uses cached RowVec.
+    /// The returned `RowVec` auto-returns to cache on drop.
+    #[inline]
+    pub fn get_all_visible_rows_cached(&self, txn_id: i64) -> RowVec {
+        let mut result = RowVec::new();
+
+        if self.closed.load(Ordering::Acquire) {
+            return result;
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return result,
+        };
+
+        // Pre-acquire arena lock ONCE for the entire operation
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
+
+        // Helper closure to get row data from arena or version
+        let get_row_data = |e: &VersionChainEntry| -> Row {
+            if let Some(idx) = e.arena_idx {
+                if let Some(arc_row) = arena_data.get(idx) {
+                    return Row::from_arc_slice(Arc::clone(arc_row));
+                }
+            }
+            e.version.data.clone()
+        };
+
+        // Single-pass: read directly from arena during visibility check
+        let versions = self.versions.read();
+
+        // Ensure capacity
+        let current_capacity = result.capacity();
+        let needed = versions.len();
+        if current_capacity < needed {
+            result.reserve(needed - current_capacity);
+        }
+
+        for (&row_id, chain) in versions.iter() {
+            // FAST PATH: Check HEAD version first - O(1) for common case
+            let head_txn_id = chain.version.txn_id;
+            let head_deleted_at = chain.version.deleted_at_txn_id;
+
+            if checker.is_visible(head_txn_id, txn_id) {
+                // HEAD is visible - check if deleted
+                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+                    result.push((row_id, get_row_data(chain)));
+                }
+                continue;
+            }
+
+            // SLOW PATH: HEAD not visible - traverse chain for older versions
+            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                if checker.is_visible(version_txn_id, txn_id) {
+                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
+                        result.push((row_id, get_row_data(e)));
+                    }
+                    break;
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
+            }
+        }
+
         result
     }
 
@@ -1903,14 +2022,14 @@ impl VersionStore {
     /// Note: With BTreeMap, this is functionally identical to get_all_visible_rows_arena
     /// since BTreeMap iteration is inherently ordered.
     #[inline]
-    pub fn get_all_visible_rows_unsorted(&self, txn_id: i64) -> Vec<(i64, Row)> {
+    pub fn get_all_visible_rows_unsorted(&self, txn_id: i64) -> RowVec {
         if self.closed.load(Ordering::Acquire) {
-            return Vec::new();
+            return RowVec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return RowVec::new(),
         };
 
         // Pre-acquire arena lock ONCE for the entire operation
@@ -1929,7 +2048,7 @@ impl VersionStore {
 
         // Single-pass: read directly from arena during visibility check (BTreeMap is sorted)
         let versions = self.versions.read();
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(versions.len());
+        let mut result = RowVec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
             // FAST PATH: Check HEAD version first - O(1) for common case
@@ -1974,19 +2093,14 @@ impl VersionStore {
     /// * `txn_id` - Transaction ID for visibility check
     /// * `limit` - Maximum number of rows to return
     /// * `offset` - Number of rows to skip before collecting
-    pub fn get_visible_rows_with_limit(
-        &self,
-        txn_id: i64,
-        limit: usize,
-        offset: usize,
-    ) -> Vec<(i64, Row)> {
+    pub fn get_visible_rows_with_limit(&self, txn_id: i64, limit: usize, offset: usize) -> RowVec {
         if self.closed.load(Ordering::Acquire) || limit == 0 {
-            return Vec::new();
+            return RowVec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return RowVec::new(),
         };
 
         // Pre-acquire arena lock ONCE for the entire operation
@@ -2005,7 +2119,7 @@ impl VersionStore {
 
         // BTreeMap is sorted - collect with early termination
         let versions = self.versions.read();
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit);
+        let mut result = RowVec::with_capacity(limit);
         let mut skipped = 0usize;
 
         for (&row_id, chain) in versions.iter() {
@@ -2069,7 +2183,7 @@ impl VersionStore {
         txn_id: i64,
         limit: usize,
         offset: usize,
-    ) -> Vec<(i64, Row)> {
+    ) -> RowVec {
         // Delegate to the sorted version - BTreeMap is always sorted
         self.get_visible_rows_with_limit(txn_id, limit, offset)
     }
@@ -2091,14 +2205,14 @@ impl VersionStore {
         txn_id: i64,
         after_row_id: i64,
         batch_size: usize,
-    ) -> (Vec<(i64, Row)>, bool) {
+    ) -> (RowVec, bool) {
         if self.closed.load(Ordering::Acquire) || batch_size == 0 {
-            return (Vec::new(), false);
+            return (RowVec::new(), false);
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return (Vec::new(), false),
+            None => return (RowVec::new(), false),
         };
 
         // Pre-acquire arena lock ONCE for this batch
@@ -2117,7 +2231,7 @@ impl VersionStore {
 
         // BTreeMap is sorted - use range for efficient cursor-based iteration
         let versions = self.versions.read();
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(batch_size);
+        let mut result = RowVec::with_capacity(batch_size);
         let mut has_more = false;
 
         // Use range to start after the cursor row_id
@@ -2190,7 +2304,7 @@ impl VersionStore {
         txn_id: i64,
         after_row_id: i64,
         batch_size: usize,
-        buffer: &mut Vec<(i64, Row)>,
+        buffer: &mut RowVec,
     ) -> bool {
         buffer.clear();
 
@@ -2294,14 +2408,14 @@ impl VersionStore {
         ascending: bool,
         limit: usize,
         offset: usize,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<RowVec> {
         if self.closed.load(Ordering::Acquire) || limit == 0 {
-            return Some(Vec::new());
+            return Some(RowVec::new());
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Some(Vec::new()),
+            None => return Some(RowVec::new()),
         };
 
         // Pre-acquire arena lock ONCE for this entire operation
@@ -2322,12 +2436,12 @@ impl VersionStore {
         let versions = self.versions.read();
         // Cap capacity to avoid overflow when limit is usize::MAX
         let capacity = limit.min(versions.len()).min(10_000);
-        let mut result: Vec<Row> = Vec::with_capacity(capacity);
+        let mut result = RowVec::with_capacity(capacity);
         let mut skipped = 0usize;
 
         if ascending {
             // Forward iteration with early termination
-            for chain in versions.values() {
+            for (row_id, chain) in versions.iter() {
                 // Inline visibility check
                 let mut current: Option<&VersionChainEntry> = Some(chain);
                 while let Some(entry) = current {
@@ -2339,7 +2453,7 @@ impl VersionStore {
                             if skipped < offset {
                                 skipped += 1;
                             } else {
-                                result.push(get_row_from_entry(entry));
+                                result.push((*row_id, get_row_from_entry(entry)));
                                 if result.len() >= limit {
                                     return Some(result);
                                 }
@@ -2352,8 +2466,8 @@ impl VersionStore {
             }
         } else {
             // For descending order, we need to collect all, then reverse
-            let mut all_visible: Vec<Row> = Vec::with_capacity(versions.len());
-            for chain in versions.values() {
+            let mut all_visible = RowVec::with_capacity(versions.len());
+            for (row_id, chain) in versions.iter() {
                 // Inline visibility check
                 let mut current: Option<&VersionChainEntry> = Some(chain);
                 while let Some(entry) = current {
@@ -2361,7 +2475,7 @@ impl VersionStore {
                         if entry.version.deleted_at_txn_id == 0
                             || !checker.is_visible(entry.version.deleted_at_txn_id, txn_id)
                         {
-                            all_visible.push(get_row_from_entry(entry));
+                            all_visible.push((*row_id, get_row_from_entry(entry)));
                         }
                         break;
                     }
@@ -2369,12 +2483,9 @@ impl VersionStore {
                 }
             }
             // Reverse and apply offset/limit
-            result = all_visible
-                .into_iter()
-                .rev()
-                .skip(offset)
-                .take(limit)
-                .collect();
+            for item in all_visible.into_iter().rev().skip(offset).take(limit) {
+                result.push(item);
+            }
         }
 
         Some(result)
@@ -2393,7 +2504,7 @@ impl VersionStore {
     /// * `limit` - Maximum number of rows to return
     ///
     /// # Returns
-    /// Vector of (row_id, row) pairs in row_id order
+    /// RowVec of (row_id, row) pairs in row_id order
     pub fn collect_rows_keyset(
         &self,
         txn_id: i64,
@@ -2401,14 +2512,14 @@ impl VersionStore {
         start_from_row_id: Option<i64>,
         ascending: bool,
         limit: usize,
-    ) -> Vec<(i64, Row)> {
+    ) -> RowVec {
         if self.closed.load(Ordering::Acquire) || limit == 0 {
-            return Vec::new();
+            return RowVec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return RowVec::new(),
         };
 
         // Pre-acquire arena lock ONCE for this entire operation
@@ -2455,7 +2566,7 @@ impl VersionStore {
 
         // BTreeMap is already sorted - collect with early termination
         let versions = self.versions.read();
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit);
+        let mut result = RowVec::with_capacity(limit);
 
         if ascending {
             for (&row_id, chain) in versions.range((start_bound, std::ops::Bound::Unbounded::<i64>))
@@ -2469,14 +2580,17 @@ impl VersionStore {
             }
         } else {
             // For descending, we need to collect all in range then reverse
-            let mut all_visible: Vec<(i64, Row)> = Vec::new();
+            let mut all_visible = RowVec::new();
             for (&row_id, chain) in versions.range((start_bound, std::ops::Bound::Unbounded::<i64>))
             {
                 if let Some(row_data) = find_visible_row(chain) {
                     all_visible.push((row_id, row_data));
                 }
             }
-            result = all_visible.into_iter().rev().take(limit).collect();
+            // Reverse iteration with limit
+            for item in all_visible.into_iter().rev().take(limit) {
+                result.push(item);
+            }
         }
 
         result
@@ -2494,14 +2608,14 @@ impl VersionStore {
         &self,
         txn_id: i64,
         filter: &dyn crate::storage::expression::Expression,
-    ) -> Vec<(i64, Row)> {
+    ) -> RowVec {
         if self.closed.load(Ordering::Acquire) {
-            return Vec::new();
+            return RowVec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return RowVec::new(),
         };
 
         // Compile the filter once at the start for ~3-5x speedup in hot loop
@@ -2516,7 +2630,7 @@ impl VersionStore {
 
         // Single-pass: read, filter, and collect in one loop (BTreeMap is sorted)
         let versions = self.versions.read();
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(versions.len());
+        let mut result = RowVec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain);
@@ -2572,14 +2686,14 @@ impl VersionStore {
         filter: &dyn crate::storage::expression::Expression,
         limit: usize,
         offset: usize,
-    ) -> Vec<(i64, Row)> {
+    ) -> RowVec {
         if self.closed.load(Ordering::Acquire) || limit == 0 {
-            return Vec::new();
+            return RowVec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return RowVec::new(),
         };
 
         // Compile the filter once at the start
@@ -2593,7 +2707,7 @@ impl VersionStore {
 
         // BTreeMap is already sorted - collect with offset/limit and early termination
         let versions = self.versions.read();
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(limit);
+        let mut result = RowVec::with_capacity(limit);
         let mut skipped = 0usize;
 
         for (&row_id, chain) in versions.iter() {
@@ -2657,7 +2771,7 @@ impl VersionStore {
         filter: &dyn crate::storage::expression::Expression,
         limit: usize,
         offset: usize,
-    ) -> Vec<(i64, Row)> {
+    ) -> RowVec {
         // Delegate to the sorted version - BTreeMap is always sorted
         self.get_visible_rows_filtered_with_limit(txn_id, filter, limit, offset)
     }
@@ -2815,9 +2929,9 @@ impl VersionStore {
     /// # Performance
     /// - Only clones the rows you actually need
     /// - Falls back to version chain for non-arena rows
-    pub fn materialize_rows(&self, indices: &[RowIndex]) -> Vec<(i64, Row)> {
+    pub fn materialize_rows(&self, indices: &[RowIndex]) -> RowVec {
         if indices.is_empty() {
-            return Vec::new();
+            return RowVec::new();
         }
 
         let arena_guard = self.arena.read_guard();
@@ -2827,7 +2941,7 @@ impl VersionStore {
         // Pre-acquire versions lock ONCE for all slow path lookups
         let versions = self.versions.read();
 
-        let mut result: Vec<(i64, Row)> = Vec::with_capacity(indices.len());
+        let mut result = RowVec::with_capacity(indices.len());
 
         for idx in indices {
             if let Some(arena_idx) = idx.arena_idx {
@@ -2957,16 +3071,16 @@ impl VersionStore {
         ascending: bool,
         limit: usize,
         offset: usize,
-    ) -> Vec<(i64, Row)> {
+    ) -> RowVec {
         if limit == 0 {
-            return Vec::new();
+            return RowVec::new();
         }
 
         // Step 1: Get all visible row indices (no cloning!)
         let indices = self.get_visible_row_indices_unordered(txn_id);
 
         if indices.is_empty() {
-            return Vec::new();
+            return RowVec::new();
         }
 
         // Step 2: Load only the sort column values (partial materialization)
@@ -3353,7 +3467,7 @@ impl VersionStore {
             return aggregates
                 .iter()
                 .map(|(op, _)| match op {
-                    AggregateOp::Count => AggregateResult::Count(0),
+                    AggregateOp::Count | AggregateOp::CountStar => AggregateResult::Count(0),
                     AggregateOp::Sum => AggregateResult::Sum(0.0, 0),
                     AggregateOp::Min => AggregateResult::Min(None),
                     AggregateOp::Max => AggregateResult::Max(None),
@@ -3372,7 +3486,7 @@ impl VersionStore {
         let mut results: Vec<AggregateAccumulator> = aggregates
             .iter()
             .map(|(op, _)| match op {
-                AggregateOp::Count => AggregateAccumulator::Count(0),
+                AggregateOp::Count | AggregateOp::CountStar => AggregateAccumulator::Count(0),
                 AggregateOp::Sum => AggregateAccumulator::Sum(0.0, 0),
                 AggregateOp::Min => AggregateAccumulator::Min(None),
                 AggregateOp::Max => AggregateAccumulator::Max(None),
@@ -3387,6 +3501,10 @@ impl VersionStore {
                     if !val.is_null() {
                         *c += 1;
                     }
+                }
+                (AggregateAccumulator::Count(c), AggregateOp::CountStar) => {
+                    // COUNT(*) counts all rows including NULL
+                    *c += 1;
                 }
                 (AggregateAccumulator::Sum(sum, cnt), AggregateOp::Sum) => match val {
                     Value::Integer(i) => {
@@ -4467,6 +4585,211 @@ impl VersionStore {
 
         count
     }
+
+    /// Compute grouped aggregates directly from arena storage.
+    ///
+    /// This method performs GROUP BY aggregation at the storage level without
+    /// materializing Row objects. It uses Arc::clone for group keys (O(1))
+    /// instead of Value::clone (deep copy), significantly reducing allocations.
+    ///
+    /// # Arguments
+    /// * `txn_id` - Transaction ID for visibility checks
+    /// * `group_by_indices` - Column indices to group by
+    /// * `aggregates` - List of (operation, column_index) pairs
+    ///
+    /// # Returns
+    /// Vector of grouped aggregate results, or empty if optimization not possible
+    pub fn compute_grouped_aggregates(
+        &self,
+        txn_id: i64,
+        group_by_indices: &[usize],
+        aggregates: &[(AggregateOp, usize)],
+    ) -> Vec<GroupedAggregateResult> {
+        use ahash::AHashMap;
+
+        if self.closed.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+
+        // Accumulator for each group: (count, sum, min, max) per aggregate
+        #[derive(Clone)]
+        struct Accum {
+            count: i64,
+            sum: f64,
+            min: Option<Value>,
+            max: Option<Value>,
+        }
+
+        impl Default for Accum {
+            fn default() -> Self {
+                Self {
+                    count: 0,
+                    sum: 0.0,
+                    min: None,
+                    max: None,
+                }
+            }
+        }
+
+        let mut groups: AHashMap<GroupKey, Vec<Accum>> = AHashMap::new();
+
+        // Pre-acquire arena lock ONCE
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
+        let arena_meta = arena_guard.meta();
+
+        // Process arena rows directly (fast path - no Row allocation)
+        for (idx, meta) in arena_meta.iter().enumerate() {
+            // Visibility check
+            if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id) {
+                continue;
+            }
+            if !checker.is_visible(meta.txn_id, txn_id) {
+                continue;
+            }
+
+            // Get row data from arena
+            let row_data = match arena_data.get(idx) {
+                Some(data) => data,
+                None => continue,
+            };
+
+            // Build group key using Arc::clone (O(1)) instead of Value::clone
+            let group_key = if group_by_indices.len() == 1 {
+                let col_idx = group_by_indices[0];
+                if col_idx < row_data.len() {
+                    GroupKey::Single(Arc::clone(&row_data[col_idx]))
+                } else {
+                    GroupKey::Single(Arc::new(Value::Null(DataType::Null)))
+                }
+            } else {
+                let key_values: Vec<Arc<Value>> = group_by_indices
+                    .iter()
+                    .map(|&col_idx| {
+                        if col_idx < row_data.len() {
+                            Arc::clone(&row_data[col_idx])
+                        } else {
+                            Arc::new(Value::Null(DataType::Null))
+                        }
+                    })
+                    .collect();
+                GroupKey::Multi(key_values)
+            };
+
+            // Get or create accumulator for this group
+            let accums = groups
+                .entry(group_key)
+                .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
+
+            // Update each aggregate
+            for (agg_idx, (op, col_idx)) in aggregates.iter().enumerate() {
+                let accum = &mut accums[agg_idx];
+
+                match op {
+                    AggregateOp::CountStar => {
+                        accum.count += 1;
+                    }
+                    AggregateOp::Count => {
+                        if *col_idx < row_data.len() && !row_data[*col_idx].is_null() {
+                            accum.count += 1;
+                        }
+                    }
+                    AggregateOp::Sum | AggregateOp::Avg => {
+                        if *col_idx < row_data.len() {
+                            let val = &*row_data[*col_idx];
+                            let f_opt = match val {
+                                Value::Integer(i) => Some(*i as f64),
+                                Value::Float(f) => Some(*f),
+                                _ => None,
+                            };
+                            if let Some(v) = f_opt {
+                                accum.sum += v;
+                                accum.count += 1;
+                            }
+                        }
+                    }
+                    AggregateOp::Min => {
+                        if *col_idx < row_data.len() {
+                            let val = &row_data[*col_idx];
+                            if !val.is_null() {
+                                match &accum.min {
+                                    None => accum.min = Some((**val).clone()),
+                                    Some(current) => {
+                                        if **val < *current {
+                                            accum.min = Some((**val).clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    AggregateOp::Max => {
+                        if *col_idx < row_data.len() {
+                            let val = &row_data[*col_idx];
+                            if !val.is_null() {
+                                match &accum.max {
+                                    None => accum.max = Some((**val).clone()),
+                                    Some(current) => {
+                                        if **val > *current {
+                                            accum.max = Some((**val).clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Convert to results
+        let mut results: Vec<GroupedAggregateResult> = Vec::with_capacity(groups.len());
+
+        for (group_key, accums) in groups {
+            // Extract group values
+            let group_values = match group_key {
+                GroupKey::Single(v) => vec![(*v).clone()],
+                GroupKey::Multi(vs) => vs.iter().map(|v| (**v).clone()).collect(),
+            };
+
+            // Compute final aggregate values
+            let aggregate_values: Vec<Value> = aggregates
+                .iter()
+                .zip(accums.iter())
+                .map(|((op, _), accum)| match op {
+                    AggregateOp::Count | AggregateOp::CountStar => Value::Integer(accum.count),
+                    AggregateOp::Sum => {
+                        if accum.count > 0 {
+                            Value::Float(accum.sum)
+                        } else {
+                            Value::Null(DataType::Float)
+                        }
+                    }
+                    AggregateOp::Avg => {
+                        if accum.count > 0 {
+                            Value::Float(accum.sum / accum.count as f64)
+                        } else {
+                            Value::Null(DataType::Float)
+                        }
+                    }
+                    AggregateOp::Min => accum.min.clone().unwrap_or(Value::Null(DataType::Null)),
+                    AggregateOp::Max => accum.max.clone().unwrap_or(Value::Null(DataType::Null)),
+                })
+                .collect();
+
+            results.push(GroupedAggregateResult {
+                group_values,
+                aggregate_values,
+            });
+        }
+
+        results
+    }
 }
 
 impl Clone for VersionChainEntry {
@@ -4601,7 +4924,7 @@ impl TransactionVersionStore {
     ///
     /// This is used for rows that are already tracked in local_versions (updates within same txn)
     /// or when we don't have pre-fetched original versions.
-    pub fn put_batch_for_update(&mut self, rows: Vec<(i64, Row)>) -> Result<(), Error> {
+    pub fn put_batch_for_update(&mut self, rows: RowVec) -> Result<(), Error> {
         for (row_id, data) in rows {
             self.put(row_id, data, false)?;
         }
@@ -4736,8 +5059,8 @@ impl TransactionVersionStore {
     /// the overhead of individual put() calls with lock acquisitions per row.
     ///
     /// Parameters:
-    /// - rows: Vec of (row_id, row_data) to mark as deleted
-    pub fn put_batch_deleted(&mut self, rows: Vec<(i64, Row)>) -> Result<(), Error> {
+    /// - rows: RowVec of (row_id, row_data) to mark as deleted
+    pub fn put_batch_deleted(&mut self, rows: RowVec) -> Result<(), Error> {
         for (row_id, data) in rows {
             // Check if we already have a local version
             let has_local = self
@@ -6311,9 +6634,9 @@ mod tests {
 
         // First 3 rows in ascending PK order should be row_ids 1, 2, 3
         // With values 10, 20, 30
-        assert_eq!(rows[0].get(0), Some(&Value::from(10)));
-        assert_eq!(rows[1].get(0), Some(&Value::from(20)));
-        assert_eq!(rows[2].get(0), Some(&Value::from(30)));
+        assert_eq!(rows[0].1.get(0), Some(&Value::from(10)));
+        assert_eq!(rows[1].1.get(0), Some(&Value::from(20)));
+        assert_eq!(rows[2].1.get(0), Some(&Value::from(30)));
 
         // Test descending order
         let rows_desc = store.collect_rows_pk_ordered(2, false, 3, 0);
@@ -6323,9 +6646,9 @@ mod tests {
 
         // First 3 rows in descending PK order should be row_ids 5, 4, 3
         // With values 50, 40, 30
-        assert_eq!(rows_desc[0].get(0), Some(&Value::from(50)));
-        assert_eq!(rows_desc[1].get(0), Some(&Value::from(40)));
-        assert_eq!(rows_desc[2].get(0), Some(&Value::from(30)));
+        assert_eq!(rows_desc[0].1.get(0), Some(&Value::from(50)));
+        assert_eq!(rows_desc[1].1.get(0), Some(&Value::from(40)));
+        assert_eq!(rows_desc[2].1.get(0), Some(&Value::from(30)));
 
         // Test with offset
         let rows_offset = store.collect_rows_pk_ordered(2, true, 2, 2);
@@ -6333,8 +6656,8 @@ mod tests {
         let rows_offset = rows_offset.unwrap();
         assert_eq!(rows_offset.len(), 2);
         // Skip first 2 (values 10, 20), get next 2 (values 30, 40)
-        assert_eq!(rows_offset[0].get(0), Some(&Value::from(30)));
-        assert_eq!(rows_offset[1].get(0), Some(&Value::from(40)));
+        assert_eq!(rows_offset[0].1.get(0), Some(&Value::from(30)));
+        assert_eq!(rows_offset[1].1.get(0), Some(&Value::from(40)));
     }
 
     #[test]

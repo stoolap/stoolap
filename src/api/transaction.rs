@@ -32,10 +32,10 @@
 //! tx.commit()?;
 //! ```
 
-use crate::core::{Error, Result, Row, Value};
+use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::ExpressionEval;
-use crate::executor::result::ExecutorMemoryResult;
+use crate::executor::result::ExecutorResult;
 use crate::parser::ast::{Expression, Statement};
 use crate::parser::Parser;
 use crate::storage::traits::{QueryResult, Transaction as StorageTransaction};
@@ -352,8 +352,9 @@ impl Transaction {
                             values.push(eval.eval_slice(&Row::new())?);
                         }
 
-                        let rows = vec![Row::from_values(values)];
-                        return Ok(Box::new(ExecutorMemoryResult::new(columns, rows)));
+                        let mut rows = RowVec::with_capacity(1);
+                        rows.push((0, Row::from_values(values)));
+                        return Ok(Box::new(ExecutorResult::new(columns, rows)));
                     }
                 };
 
@@ -384,10 +385,12 @@ impl Transaction {
 
                 // Scan table
                 let mut scanner = table.scan(&column_indices, where_expr.as_deref())?;
-                let mut rows = Vec::new();
+                let mut rows = RowVec::new();
+                let mut idx = 0i64;
 
                 while scanner.next() {
-                    rows.push(scanner.take_row());
+                    rows.push((idx, scanner.take_row()));
+                    idx += 1;
                 }
 
                 // Check for scanner error
@@ -406,10 +409,7 @@ impl Transaction {
                     self.project_columns(stmt, &columns, rows, ctx)?
                 };
 
-                Ok(Box::new(ExecutorMemoryResult::new(
-                    result_columns,
-                    result_rows,
-                )))
+                Ok(Box::new(ExecutorResult::new(result_columns, result_rows)))
             }
             _ => Err(Error::NotSupportedMessage(
                 "Only DML statements are supported in transactions".to_string(),
@@ -488,13 +488,13 @@ impl Transaction {
         &self,
         stmt: &crate::parser::ast::SelectStatement,
         source_columns: &[String],
-        rows: Vec<Row>,
+        rows: RowVec,
         ctx: &ExecutionContext,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
+    ) -> Result<(Vec<String>, RowVec)> {
         use crate::executor::expression::compile_expression;
 
         let mut result_columns = Vec::new();
-        let mut result_rows = Vec::new();
+        let mut result_rows = RowVec::with_capacity(rows.len());
 
         // Pre-compile expressions and determine output columns
         // Store either None for Star or Some(program) for compiled expressions
@@ -536,7 +536,7 @@ impl Transaction {
         let num_cols = stmt.columns.len();
 
         // Project each row
-        for row in rows {
+        for (id, row) in rows {
             let mut exec_ctx = crate::executor::expression::ExecuteContext::new(&row);
             if !params.is_empty() {
                 exec_ctx = exec_ctx.with_params(params);
@@ -560,7 +560,7 @@ impl Transaction {
                 }
             }
 
-            result_rows.push(Row::from_values(values));
+            result_rows.push((id, Row::from_values(values)));
         }
 
         Ok((result_columns, result_rows))

@@ -18,24 +18,20 @@
 //!
 //! - [`version`] - Version information and constants
 //! - [`buffer_pool`] - Self-tuning buffer pool for efficient memory reuse
-//! - [`int64_map`] - Fast hash maps for integer keys
+//! - [`int_maps`] - Fast hash maps for integer keys
+//! - [`compact_vec`] - 16-byte vector optimized for Row storage
 
 pub mod buffer_pool;
-pub mod int64_map;
+pub mod compact_vec;
+pub mod int_maps;
 pub mod version;
 
 // Re-export main types for convenience
 pub use buffer_pool::{BufferPool, PoolStats};
-pub use int64_map::{
-    new_btree_int64_map, new_concurrent_int64_map, new_concurrent_int64_map_with_capacity,
-    new_concurrent_uint64_map, new_concurrent_uint64_map_with_capacity, new_concurrent_usize_map,
-    new_concurrent_usize_map_with_capacity, new_int64_map, new_int64_map_with_capacity,
-    new_int64_set, new_int64_set_with_capacity, new_segment_int64_map,
-    new_segment_int64_map_with_segments, new_uint64_map, new_uint64_map_with_capacity,
-    new_uint64_set, new_uint64_set_with_capacity, new_usize_map, new_usize_map_with_capacity,
-    new_usize_set, new_usize_set_with_capacity, BTreeInt64Map, ConcurrentInt64Map,
-    ConcurrentUInt64Map, ConcurrentUsizeMap, Int64Map, Int64Set, SegmentInt64Map, UInt64Map,
-    UInt64Set, UsizeMap, UsizeSet,
+pub use compact_vec::CompactVec;
+pub use int_maps::{
+    new_btree_int64_map, new_concurrent_int64_map, new_int64_map, new_int64_map_with_capacity,
+    BTreeInt64Map, ConcurrentInt64Map, Int64Map, Int64Set,
 };
 pub use version::{version, version_info, SemVer, BUILD_TIME, GIT_COMMIT, MAJOR, MINOR, PATCH};
 

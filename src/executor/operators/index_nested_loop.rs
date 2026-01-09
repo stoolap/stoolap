@@ -24,8 +24,9 @@
 
 use std::sync::Arc;
 
+use crate::common::CompactVec;
 use crate::core::value::NULL_VALUE;
-use crate::core::{Result, Row, Value};
+use crate::core::{Result, Row, RowVec, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::storage::expression::ConstBoolExpr;
@@ -80,8 +81,8 @@ pub struct IndexNestedLoopJoinOperator {
 
     // Current state
     current_outer_row: Option<Row>,
-    // Optimization: Store (id, row) to verify specific inner rows if needed, and match fetch_rows_by_ids_into signature
-    current_inner_rows: Vec<(i64, Row)>,
+    // Optimization: Store (id, row) to verify specific inner rows if needed
+    current_inner_rows: RowVec,
     current_inner_idx: usize,
     outer_had_match: bool,
 
@@ -141,7 +142,7 @@ impl IndexNestedLoopJoinOperator {
             inner_col_count,
             projection: None,
             current_outer_row: None,
-            current_inner_rows: Vec::new(),
+            current_inner_rows: RowVec::new(),
             current_inner_idx: 0,
             outer_had_match: false,
             // Pre-allocate buffer for typical number of matches (small)
@@ -239,8 +240,8 @@ impl IndexNestedLoopJoinOperator {
     fn take_from_buffer(&mut self) -> Row {
         let vec = self.row_buffer.as_mut_arc_vec_with_capacity(0);
         let capacity = vec.capacity();
-        let values = std::mem::replace(vec, Vec::with_capacity(capacity));
-        Row::from_arc_values(values)
+        let values = std::mem::replace(vec, CompactVec::with_capacity(capacity));
+        Row::from_arc_values(values.into_vec())
     }
 
     /// Create combined row directly (for cases where buffer can't be used).
