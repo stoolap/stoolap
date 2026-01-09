@@ -430,6 +430,23 @@ pub fn is_punctuator(c: char) -> bool {
     PUNCTUATORS.contains(&c)
 }
 
+/// Get a static string for a punctuator character (avoids allocation)
+/// Returns None if the character is not a punctuator
+#[inline]
+pub fn punctuator_str(c: char) -> Option<&'static str> {
+    match c {
+        ',' => Some(","),
+        ';' => Some(";"),
+        '(' => Some("("),
+        ')' => Some(")"),
+        '.' => Some("."),
+        ':' => Some(":"),
+        '[' => Some("["),
+        ']' => Some("]"),
+        _ => None,
+    }
+}
+
 /// Characters that can be part of an operator
 pub fn is_operator_char(c: char) -> bool {
     // Don't include # as an operator character since it's used for comments

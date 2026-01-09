@@ -25,12 +25,13 @@
 use compact_str::CompactString;
 use rustc_hash::FxHashSet;
 
+use crate::core::row_vec::RowVec;
 use crate::core::{Error, Result, Row, Value};
 use crate::parser::ast::*;
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
-use super::result::ExecutorMemoryResult;
+use super::result::ExecutorResult;
 use super::Executor;
 
 impl Executor {
@@ -44,12 +45,15 @@ impl Executor {
         let tables = tx.list_tables()?;
 
         let columns = vec!["table_name".to_string()];
-        let rows: Vec<Row> = tables
-            .into_iter()
-            .map(|name| Row::from_values(vec![Value::Text(CompactString::from(name.as_str()))]))
-            .collect();
+        let mut rows = RowVec::with_capacity(tables.len());
+        for (i, name) in tables.into_iter().enumerate() {
+            rows.push((
+                i as i64,
+                Row::from_values(vec![Value::Text(CompactString::from(name.as_str()))]),
+            ));
+        }
 
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+        Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
 
     /// Execute SHOW VIEWS statement
@@ -61,12 +65,15 @@ impl Executor {
         let views = self.engine.list_views()?;
 
         let columns = vec!["view_name".to_string()];
-        let rows: Vec<Row> = views
-            .into_iter()
-            .map(|name| Row::from_values(vec![Value::Text(CompactString::from(name.as_str()))]))
-            .collect();
+        let mut rows = RowVec::with_capacity(views.len());
+        for (i, name) in views.into_iter().enumerate() {
+            rows.push((
+                i as i64,
+                Row::from_values(vec![Value::Text(CompactString::from(name.as_str()))]),
+            ));
+        }
 
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+        Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
 
     /// Execute SHOW CREATE TABLE statement
@@ -130,12 +137,16 @@ impl Executor {
         create_sql.push(')');
 
         let columns = vec!["Table".to_string(), "Create Table".to_string()];
-        let rows = vec![Row::from_values(vec![
-            Value::Text(CompactString::from(table_name.as_str())),
-            Value::Text(CompactString::from(create_sql.as_str())),
-        ])];
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((
+            0,
+            Row::from_values(vec![
+                Value::Text(CompactString::from(table_name.as_str())),
+                Value::Text(CompactString::from(create_sql.as_str())),
+            ]),
+        ));
 
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+        Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
 
     /// Execute SHOW CREATE VIEW statement
@@ -159,12 +170,16 @@ impl Executor {
         );
 
         let columns = vec!["View".to_string(), "Create View".to_string()];
-        let rows = vec![Row::from_values(vec![
-            Value::Text(CompactString::from(view_def.original_name.as_str())),
-            Value::Text(CompactString::from(create_sql.as_str())),
-        ])];
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((
+            0,
+            Row::from_values(vec![
+                Value::Text(CompactString::from(view_def.original_name.as_str())),
+                Value::Text(CompactString::from(create_sql.as_str())),
+            ]),
+        ));
 
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+        Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
 
     /// Execute SHOW INDEXES statement
@@ -194,7 +209,8 @@ impl Executor {
             "is_unique".to_string(),
         ];
 
-        let mut rows: Vec<Row> = Vec::new();
+        let mut rows = RowVec::with_capacity(index_names.len());
+        let mut row_id = 0i64;
         for index_name in index_names {
             // Try to get index details from the table's underlying storage
             if let Some(index) = table.get_index(&index_name) {
@@ -211,17 +227,21 @@ impl Executor {
                 let is_unique = index.is_unique();
                 let index_type = index.index_type().as_str().to_uppercase();
 
-                rows.push(Row::from_values(vec![
-                    Value::Text(CompactString::from(table_name.as_str())),
-                    Value::Text(CompactString::from(index_name.as_str())),
-                    Value::Text(CompactString::from(column_name.as_str())),
-                    Value::Text(CompactString::from(index_type)),
-                    Value::Boolean(is_unique),
-                ]));
+                rows.push((
+                    row_id,
+                    Row::from_values(vec![
+                        Value::Text(CompactString::from(table_name.as_str())),
+                        Value::Text(CompactString::from(index_name.as_str())),
+                        Value::Text(CompactString::from(column_name.as_str())),
+                        Value::Text(CompactString::from(index_type)),
+                        Value::Boolean(is_unique),
+                    ]),
+                ));
+                row_id += 1;
             }
         }
 
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+        Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
 
     /// Execute DESCRIBE statement - shows table structure
@@ -245,8 +265,8 @@ impl Executor {
             "Extra".to_string(),
         ];
 
-        let mut rows: Vec<Row> = Vec::new();
-        for col in &schema.columns {
+        let mut rows = RowVec::with_capacity(schema.columns.len());
+        for (i, col) in schema.columns.iter().enumerate() {
             // Determine type string
             let type_str = format!("{:?}", col.data_type);
 
@@ -271,16 +291,19 @@ impl Executor {
                     ""
                 };
 
-            rows.push(Row::from_values(vec![
-                Value::Text(CompactString::from(col.name.as_str())),
-                Value::Text(CompactString::from(type_str.as_str())),
-                Value::Text(CompactString::from(null_str)),
-                Value::Text(CompactString::from(key_str)),
-                Value::Text(CompactString::from(default_str.as_str())),
-                Value::Text(CompactString::from(extra_str)),
-            ]));
+            rows.push((
+                i as i64,
+                Row::from_values(vec![
+                    Value::Text(CompactString::from(col.name.as_str())),
+                    Value::Text(CompactString::from(type_str.as_str())),
+                    Value::Text(CompactString::from(null_str)),
+                    Value::Text(CompactString::from(key_str)),
+                    Value::Text(CompactString::from(default_str.as_str())),
+                    Value::Text(CompactString::from(extra_str)),
+                ]),
+            ));
         }
 
-        Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+        Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
 }

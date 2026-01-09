@@ -1,0 +1,55 @@
+[package]
+name = "stoolap-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.stoolap]
+path = ".."
+
+# SQL Parser fuzzing - most critical target
+[[bin]]
+name = "fuzz_sql_parser"
+path = "fuzz_targets/fuzz_sql_parser.rs"
+test = false
+doc = false
+bench = false
+
+# Query execution fuzzing - tests full execution path
+[[bin]]
+name = "fuzz_query_execute"
+path = "fuzz_targets/fuzz_query_execute.rs"
+test = false
+doc = false
+bench = false
+
+# Structured SQL fuzzing - generates valid SQL to explore deeper code paths
+[[bin]]
+name = "fuzz_structured_sql"
+path = "fuzz_targets/fuzz_structured_sql.rs"
+test = false
+doc = false
+bench = false
+
+# Expression evaluation fuzzing - tests the expression VM
+[[bin]]
+name = "fuzz_expressions"
+path = "fuzz_targets/fuzz_expressions.rs"
+test = false
+doc = false
+bench = false
+
+# Transaction fuzzing - tests MVCC with interleaved operations
+[[bin]]
+name = "fuzz_transactions"
+path = "fuzz_targets/fuzz_transactions.rs"
+test = false
+doc = false
+bench = false

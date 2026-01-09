@@ -33,7 +33,7 @@ use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use crate::core::{Error, Result, Row, Value};
+use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
@@ -45,15 +45,16 @@ use super::operator::{ColumnInfo, Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{IndexLookupStrategy, IndexNestedLoopJoinOperator};
 use super::query_classification::get_classification;
-use super::result::ExecutorMemoryResult;
+use super::result::ExecutorResult;
 use super::utils::{build_column_index_map, extract_join_keys_and_residual, is_sorted_on_keys};
 use super::Executor;
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
-pub type CteData = (Arc<Vec<String>>, Arc<Vec<Row>>);
+/// Uses Vec<(i64, Row)> for rows - same structure as RowVec but Arc-shareable
+pub type CteData = (Arc<Vec<String>>, Arc<Vec<(i64, Row)>>);
 
 /// Type alias for CTE data map
-/// Uses Arc<Vec<String>> for columns and Arc<Vec<Row>> for rows
+/// Uses Arc<Vec<String>> for columns and Arc<Vec<(i64, Row)>> for rows
 /// to enable zero-copy sharing of CTE results with joins
 pub type CteDataMap = FxHashMap<String, CteData>;
 
@@ -61,9 +62,9 @@ pub type CteDataMap = FxHashMap<String, CteData>;
 /// Uses Arc for zero-copy sharing of CTE results with join operators
 type JoinDataResult = (
     Arc<Vec<String>>,
-    Arc<Vec<Row>>,
+    Arc<Vec<(i64, Row)>>,
     Arc<Vec<String>>,
-    Arc<Vec<Row>>,
+    Arc<Vec<(i64, Row)>>,
 );
 
 /// Convert an expression to a normalized lowercase string for ORDER BY matching.
@@ -151,16 +152,19 @@ impl CteRegistry {
     /// - If shared, clones first then mutates (preserves other references)
     ///
     /// Both columns and rows are wrapped in Arc to enable zero-copy sharing.
-    pub fn store(&mut self, name: &str, columns: Vec<String>, rows: Vec<Row>) {
+    /// Accepts RowVec and converts to Arc<Vec<(i64, Row)>> for sharing.
+    pub fn store(&mut self, name: &str, columns: Vec<String>, rows: RowVec) {
         let name_lower = name.to_lowercase();
-        Arc::make_mut(&mut self.data).insert(name_lower, (Arc::new(columns), Arc::new(rows)));
+        // Convert RowVec to Vec<(i64, Row)> for Arc sharing
+        let rows_vec: Vec<(i64, Row)> = rows.into_iter().collect();
+        Arc::make_mut(&mut self.data).insert(name_lower, (Arc::new(columns), Arc::new(rows_vec)));
     }
 
     /// Store a materialized CTE result with pre-wrapped Arcs
     ///
     /// Use this when you already have Arc-wrapped data to avoid cloning.
     /// This enables zero-copy sharing of CTE results between queries.
-    pub fn store_arc(&mut self, name: &str, columns: Arc<Vec<String>>, rows: Arc<Vec<Row>>) {
+    pub fn store_arc(&mut self, name: &str, columns: Arc<Vec<String>>, rows: Arc<Vec<(i64, Row)>>) {
         let name_lower = name.to_lowercase();
         Arc::make_mut(&mut self.data).insert(name_lower, (columns, rows));
     }
@@ -285,7 +289,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         cte_registry: &mut CteRegistry,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
+    ) -> Result<(Vec<String>, RowVec)> {
         // Check if the CTE references another CTE
         if let Some(ref table_expr) = stmt.table_expr {
             // First check for simple CTE reference
@@ -295,12 +299,12 @@ impl Executor {
                 if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
                     if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                         // Execute query against CTE result
-                        // Dereference Arc to get underlying data
+                        // Clone Arc data into RowVec for processing
                         return self.execute_query_on_cte_result(
                             stmt,
                             ctx,
                             columns.to_vec(),
-                            (**rows).clone(),
+                            RowVec::from_vec((**rows).clone()),
                         );
                     }
                 }
@@ -349,7 +353,7 @@ impl Executor {
         ctx: &ExecutionContext,
         cte_registry: &mut CteRegistry,
         column_aliases: Option<&[Identifier]>,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
+    ) -> Result<(Vec<String>, RowVec)> {
         use crate::parser::ast::SetOperationType;
 
         // Maximum iterations to prevent infinite loops
@@ -438,21 +442,28 @@ impl Executor {
             temp_registry.store(cte_name, columns.clone(), working_rows.clone());
 
             // Execute each recursive member
-            let mut new_rows: Vec<Row> = Vec::new();
+            let mut new_rows = RowVec::new();
             for set_op in &stmt.set_operations {
                 // The recursive member is in set_op.right
                 let recursive_result =
                     self.execute_cte_query(&set_op.right, ctx, &mut temp_registry)?;
 
-                new_rows.extend(recursive_result.1);
+                // Extend with rows from recursive result, renumbering row IDs
+                let base_id = new_rows.len() as i64;
+                for (i, (_, row)) in recursive_result.1.into_iter().enumerate() {
+                    new_rows.push((base_id + i as i64, row));
+                }
             }
 
             if new_rows.is_empty() {
                 break;
             }
 
-            // Add new rows to total result
-            all_rows.extend(new_rows.clone());
+            // Add new rows to total result, renumbering row IDs
+            let base_id = all_rows.len() as i64;
+            for (i, (_, row)) in new_rows.clone().into_iter().enumerate() {
+                all_rows.push((base_id + i as i64, row));
+            }
 
             // New rows become the working set for next iteration
             working_rows = new_rows;
@@ -483,17 +494,14 @@ impl Executor {
                 if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
                     if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                         // Execute query against CTE result
-                        // Dereference Arc to get underlying data
+                        // Clone Arc data into RowVec for processing
                         let (result_cols, result_rows) = self.execute_query_on_cte_result(
                             stmt,
                             &ctx_with_ctes,
                             columns.to_vec(),
-                            (**rows).clone(),
+                            RowVec::from_vec((**rows).clone()),
                         )?;
-                        return Ok(Box::new(ExecutorMemoryResult::new(
-                            result_cols,
-                            result_rows,
-                        )));
+                        return Ok(Box::new(ExecutorResult::new(result_cols, result_rows)));
                     }
                 }
             }
@@ -642,23 +650,25 @@ impl Executor {
             )?
         } else {
             // Both CTEs or both regular tables - use standard path
-            let (left_columns, left_rows): (Arc<Vec<String>>, Arc<Vec<Row>>) = match left_data {
+            let (left_columns, left_rows): CteData = match left_data {
                 Some(data) => data,
                 None => {
                     let (result, cols) = self.execute_table_expression(&join_source.left, ctx)?;
                     let rows = Self::materialize_result(result)?;
-                    // Wrap in Arc for consistency with CTE data
-                    (Arc::new(cols), Arc::new(rows))
+                    // Convert RowVec to Vec<(i64, Row)> for Arc sharing
+                    let rows_vec: Vec<(i64, Row)> = rows.into_iter().collect();
+                    (Arc::new(cols), Arc::new(rows_vec))
                 }
             };
 
-            let (right_columns, right_rows): (Arc<Vec<String>>, Arc<Vec<Row>>) = match right_data {
+            let (right_columns, right_rows): CteData = match right_data {
                 Some(data) => data,
                 None => {
                     let (result, cols) = self.execute_table_expression(&join_source.right, ctx)?;
                     let rows = Self::materialize_result(result)?;
-                    // Wrap in Arc for consistency with CTE data
-                    (Arc::new(cols), Arc::new(rows))
+                    // Convert RowVec to Vec<(i64, Row)> for Arc sharing
+                    let rows_vec: Vec<(i64, Row)> = rows.into_iter().collect();
+                    (Arc::new(cols), Arc::new(rows_vec))
                 }
             };
             (left_columns, left_rows, right_columns, right_rows)
@@ -736,26 +746,31 @@ impl Executor {
             };
         let has_equality_keys = !left_key_indices.is_empty();
 
+        // Extract just the Row part for sort checking (JoinExecutor works with Row, not (i64, Row))
+        let left_rows_only: Vec<Row> = left_rows.iter().map(|(_, row)| row.clone()).collect();
+        let right_rows_only: Vec<Row> = right_rows.iter().map(|(_, row)| row.clone()).collect();
+
         // Check if inputs are sorted on join keys
-        let left_sorted = has_equality_keys && is_sorted_on_keys(&left_rows, &left_key_indices);
-        let right_sorted = has_equality_keys && is_sorted_on_keys(&right_rows, &right_key_indices);
+        let left_sorted =
+            has_equality_keys && is_sorted_on_keys(&left_rows_only, &left_key_indices);
+        let right_sorted =
+            has_equality_keys && is_sorted_on_keys(&right_rows_only, &right_key_indices);
 
         // Get algorithm decision from QueryPlanner
         let algorithm_decision = self.get_query_planner().plan_runtime_join_with_sort_info(
-            left_rows.len(),
-            right_rows.len(),
+            left_rows_only.len(),
+            right_rows_only.len(),
             has_equality_keys,
             left_sorted,
             right_sorted,
         );
 
         // Use JoinExecutor for consistent join execution
-        // Passes Arc<Vec<Row>> directly for zero-copy sharing with CTE results.
-        // JoinExecutor will only clone if necessary (e.g., parallel path).
+        // Passes Arc<Vec<Row>> (without row IDs) to JoinExecutor
         let join_executor = JoinExecutor::new();
         let join_result = join_executor.execute(JoinRequest {
-            left_rows,
-            right_rows,
+            left_rows: Arc::new(left_rows_only),
+            right_rows: Arc::new(right_rows_only),
             left_columns: &left_qualified,
             right_columns: &right_qualified,
             condition: join_source.condition.as_deref(),
@@ -766,15 +781,15 @@ impl Executor {
         })?;
         let result_rows = join_result.rows;
 
-        // Apply WHERE clause if present
+        // Apply WHERE clause if present (result_rows is RowVec with (row_id, Row) tuples)
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
             let mut where_eval =
                 ExpressionEval::compile(where_clause, &all_columns)?.with_context(ctx);
 
-            let mut rows = Vec::new();
-            for row in result_rows {
+            let mut rows = RowVec::with_capacity(result_rows.len());
+            for (row_id, row) in result_rows {
                 if where_eval.eval_bool(&row) {
-                    rows.push(row);
+                    rows.push((row_id, row));
                 }
             }
             rows
@@ -785,7 +800,7 @@ impl Executor {
         // Check for window functions (must handle before projection)
         if classification.has_window_functions {
             let result =
-                self.execute_select_with_window_functions(stmt, ctx, filtered_rows, &all_columns)?;
+                self.execute_select_with_window_functions(stmt, ctx, &filtered_rows, &all_columns)?;
             return Ok(Some(result));
         }
 
@@ -800,7 +815,7 @@ impl Executor {
                 let rows = Self::materialize_result(result)?;
                 let sorted_rows =
                     self.apply_order_by_to_rows(rows, &stmt.order_by, &output_columns)?;
-                return Ok(Some(Box::new(ExecutorMemoryResult::new(
+                return Ok(Some(Box::new(ExecutorResult::new(
                     output_columns,
                     sorted_rows,
                 ))));
@@ -809,7 +824,14 @@ impl Executor {
         }
 
         // Project rows according to SELECT expressions
-        let projected_rows = self.project_rows(&stmt.columns, filtered_rows, &all_columns, ctx)?;
+        let projected_rows = self.project_rows_with_alias(
+            &stmt.columns,
+            filtered_rows,
+            &all_columns,
+            None,
+            ctx,
+            None,
+        )?;
 
         // Determine output column names
         // Note: For CTE JOINs, columns are already qualified (e.g., "cte1.id", "cte2.id"),
@@ -823,7 +845,7 @@ impl Executor {
             projected_rows
         };
 
-        Ok(Some(Box::new(ExecutorMemoryResult::new(
+        Ok(Some(Box::new(ExecutorResult::new(
             output_columns,
             final_rows,
         ))))
@@ -831,13 +853,12 @@ impl Executor {
 
     /// Resolve a table expression - returns Some if it's a CTE, None if it's a regular table
     /// Returns Arc-wrapped columns and rows to enable zero-copy sharing with join operators
-    #[allow(clippy::type_complexity)]
     fn resolve_table_or_cte(
         &self,
         expr: &Expression,
         _ctx: &ExecutionContext,
         cte_registry: &CteRegistry,
-    ) -> Result<Option<(Arc<Vec<String>>, Arc<Vec<Row>>)>> {
+    ) -> Result<Option<CteData>> {
         // Use the base CTE name (not alias) for registry lookup
         if let Some(cte_name) = self.extract_cte_name_for_lookup(expr) {
             if let Some((columns, rows)) = cte_registry.get(&cte_name) {
@@ -909,8 +930,8 @@ impl Executor {
                     // Extract distinct non-NULL values from CTE
                     let mut seen: AHashSet<Value> = AHashSet::with_capacity(cte_rows.len());
 
-                    // Iterate over Arc<Vec<Row>> by dereferencing
-                    for row in cte_rows.iter() {
+                    // Iterate over Arc<Vec<(i64, Row)>> by dereferencing
+                    for (_, row) in cte_rows.iter() {
                         if let Some(val) = row.get(idx) {
                             if !val.is_null() {
                                 seen.insert(val.clone());
@@ -943,7 +964,10 @@ impl Executor {
             self.execute_table_expression(table_expr, ctx)?
         };
         // Wrap materialized result in Arc for consistency with CTE data
-        let table_rows = Arc::new(Self::materialize_result(table_result)?);
+        let table_rows_vec: Vec<(i64, Row)> = Self::materialize_result(table_result)?
+            .into_iter()
+            .collect();
+        let table_rows = Arc::new(table_rows_vec);
 
         // Return in correct order (left, right)
         let table_cols = Arc::new(table_cols);
@@ -1050,8 +1074,8 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         cte_columns: Vec<String>,
-        cte_rows: Vec<Row>,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
+        cte_rows: RowVec,
+    ) -> Result<(Vec<String>, RowVec)> {
         // OPTIMIZATION: Get cached query classification to avoid repeated AST traversals
         let classification = get_classification(stmt);
 
@@ -1069,10 +1093,12 @@ impl Executor {
             let mut eval =
                 ExpressionEval::compile(&processed_where, &cte_columns)?.with_context(ctx);
 
-            let mut result = Vec::new();
-            for row in cte_rows {
+            let mut result = RowVec::new();
+            let mut row_id = 0i64;
+            for (_, row) in cte_rows {
                 if eval.eval_bool(&row) {
-                    result.push(row);
+                    result.push((row_id, row));
+                    row_id += 1;
                 }
             }
             result
@@ -1093,7 +1119,7 @@ impl Executor {
         // Check for window functions
         if classification.has_window_functions {
             let result =
-                self.execute_select_with_window_functions(stmt, ctx, filtered_rows, &cte_columns)?;
+                self.execute_select_with_window_functions(stmt, ctx, &filtered_rows, &cte_columns)?;
             let columns = result.columns().to_vec();
             let rows = Self::materialize_result(result)?;
 
@@ -1243,10 +1269,10 @@ impl Executor {
     fn project_cte_rows_from_columns(
         &self,
         columns: &[Expression],
-        rows: &[Row],
+        rows: &RowVec,
         cte_columns: &[String],
         ctx: &ExecutionContext,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
 
         let col_index_map = build_column_index_map(cte_columns);
@@ -1280,9 +1306,9 @@ impl Executor {
 
         // Create VM for expression execution (reused for all rows)
         let mut vm = ExprVM::new();
-        let mut result_rows = Vec::with_capacity(rows.len());
+        let mut result_rows = RowVec::with_capacity(rows.len());
 
-        for row in rows {
+        for (row_id, (_, row)) in rows.iter().enumerate() {
             // OPTIMIZATION: Pre-allocate Vec with estimated capacity
             let mut values = Vec::with_capacity(columns.len().max(row.len()));
             // CRITICAL: Include params from context for parameterized queries
@@ -1308,7 +1334,7 @@ impl Executor {
                 }
             }
 
-            result_rows.push(Row::from_values(values));
+            result_rows.push((row_id as i64, Row::from_values(values)));
         }
 
         Ok(result_rows)
@@ -1322,10 +1348,10 @@ impl Executor {
     /// Apply ORDER BY to rows
     fn apply_order_by_to_rows(
         &self,
-        mut rows: Vec<Row>,
+        mut rows: RowVec,
         order_by: &[crate::parser::ast::OrderByExpression],
         columns: &[String],
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         if order_by.is_empty() || rows.is_empty() {
             return Ok(rows);
         }
@@ -1366,7 +1392,8 @@ impl Executor {
             .collect();
 
         // Sort using the same comparison function as the main query executor
-        rows.sort_by(|a, b| {
+        // RowVec derefs to Vec<(i64, Row)>, so we sort by the Row part
+        rows.sort_by(|(_, a), (_, b)| {
             for (col_idx, ascending, nulls_first) in &order_specs {
                 if let Some(idx) = col_idx {
                     let a_val = a.get(*idx);
@@ -1958,10 +1985,11 @@ impl Executor {
         };
 
         // Execute Index Nested Loop Join using operator
-        // Wrap outer rows as a QueryResult/Operator using Arc for zero-copy sharing
-        let outer_result: Box<dyn QueryResult> = Box::new(ExecutorMemoryResult::with_shared_rows(
+        // Extract just the Row part from the (i64, Row) tuples for the operator
+        let rows_only: Vec<Row> = outer_rows.iter().map(|(_, row)| row.clone()).collect();
+        let outer_result: Box<dyn QueryResult> = Box::new(ExecutorResult::with_shared_rows(
             outer_cols.clone(),
-            Arc::clone(outer_rows),
+            Arc::new(rows_only),
         ));
         let outer_op: Box<dyn Operator> =
             Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
@@ -1983,11 +2011,13 @@ impl Executor {
             None, // No residual filter for now (handled later if needed)
         ));
 
-        // Execute and collect results
+        // Execute and collect results with synthetic row IDs
         join_op.open()?;
-        let mut result_rows = Vec::new();
+        let mut row_id = 0i64;
+        let mut result_rows = RowVec::with_capacity(effective_limit.unwrap_or(1000) as usize);
         while let Some(row_ref) = join_op.next()? {
-            result_rows.push(row_ref.into_owned());
+            result_rows.push((row_id, row_ref.into_owned()));
+            row_id += 1;
             if let Some(lim) = effective_limit {
                 if result_rows.len() >= lim as usize {
                     break;
@@ -2004,29 +2034,26 @@ impl Executor {
             cols
         };
 
-        // No rotation needed - all_columns matches physical order
-        let final_rows = result_rows;
-
-        // Apply WHERE clause if present
+        // Apply WHERE clause if present (result_rows is RowVec with (row_id, Row) tuples)
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
             let mut where_eval =
                 ExpressionEval::compile(where_clause, &all_columns)?.with_context(ctx);
 
-            let mut rows = Vec::new();
-            for row in final_rows {
+            let mut rows = RowVec::with_capacity(result_rows.len());
+            for (row_id, row) in result_rows {
                 if where_eval.eval_bool(&row) {
-                    rows.push(row);
+                    rows.push((row_id, row));
                 }
             }
             rows
         } else {
-            final_rows
+            result_rows
         };
 
         // Check for window functions
         if classification.has_window_functions {
             let result =
-                self.execute_select_with_window_functions(stmt, ctx, filtered_rows, &all_columns)?;
+                self.execute_select_with_window_functions(stmt, ctx, &filtered_rows, &all_columns)?;
             return Ok(Some(result));
         }
 
@@ -2041,7 +2068,7 @@ impl Executor {
                 let rows = Self::materialize_result(result)?;
                 let sorted_rows =
                     self.apply_order_by_to_rows(rows, &stmt.order_by, &output_columns)?;
-                return Ok(Some(Box::new(ExecutorMemoryResult::new(
+                return Ok(Some(Box::new(ExecutorResult::new(
                     output_columns,
                     sorted_rows,
                 ))));
@@ -2050,7 +2077,14 @@ impl Executor {
         }
 
         // Project rows according to SELECT expressions
-        let projected_rows = self.project_rows(&stmt.columns, filtered_rows, &all_columns, ctx)?;
+        let projected_rows = self.project_rows_with_alias(
+            &stmt.columns,
+            filtered_rows,
+            &all_columns,
+            None,
+            ctx,
+            None,
+        )?;
 
         // Determine output column names
         let output_columns = self.get_output_column_names(&stmt.columns, &all_columns, None);
@@ -2062,7 +2096,7 @@ impl Executor {
             projected_rows
         };
 
-        Ok(Some(Box::new(ExecutorMemoryResult::new(
+        Ok(Some(Box::new(ExecutorResult::new(
             output_columns,
             final_rows,
         ))))
@@ -2293,7 +2327,7 @@ impl Executor {
         ctx: &ExecutionContext,
         cte_registry: &mut CteRegistry,
         hint: &CtePushdownHint,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
+    ) -> Result<(Vec<String>, RowVec)> {
         // Create a modified statement with LIMIT and ORDER BY pushed down
         let mut modified_stmt = stmt.clone();
 
@@ -2322,8 +2356,17 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::row_vec::RowVec;
     use crate::storage::mvcc::engine::MVCCEngine;
     use std::sync::Arc;
+
+    fn make_rows(rows: Vec<Row>) -> RowVec {
+        let mut rv = RowVec::with_capacity(rows.len());
+        for (i, row) in rows.into_iter().enumerate() {
+            rv.push((i as i64, row));
+        }
+        rv
+    }
 
     fn create_test_executor() -> Executor {
         let engine = MVCCEngine::in_memory();
@@ -2351,12 +2394,12 @@ mod tests {
         let mut registry = CteRegistry::new();
 
         let columns = vec!["id".to_string(), "name".to_string()];
-        let rows = vec![Row::from_values(vec![
+        let rows = make_rows(vec![Row::from_values(vec![
             Value::Integer(1),
             Value::text("test"),
-        ])];
+        ])]);
 
-        registry.store("my_cte", columns.clone(), rows.clone());
+        registry.store("my_cte", columns.clone(), rows);
 
         assert!(registry.exists("my_cte"));
         assert!(registry.exists("MY_CTE")); // case-insensitive

@@ -287,14 +287,16 @@ impl QueryCache {
 
     /// Add a plan to the cache
     ///
-    /// Returns the cached plan for convenience.
+    /// Returns a lightweight reference to the cached plan (CachedPlanRef).
+    /// This avoids cloning CompactStrings since callers only need the statement
+    /// and compiled execution state.
     pub fn put(
         &self,
         query: &str,
         statement: Arc<Statement>,
         has_params: bool,
         param_count: usize,
-    ) -> CachedQueryPlan {
+    ) -> CachedPlanRef {
         let normalized = normalize_query(query);
         // Convert Cow to CompactString for storage
         let normalized_key: CompactString = match normalized {
@@ -302,13 +304,8 @@ impl QueryCache {
             Cow::Owned(s) => CompactString::new(&s),
         };
 
-        let plan = CachedQueryPlan::new(
-            statement,
-            CompactString::new(query),
-            has_params,
-            param_count,
-            normalized_key.clone(),
-        );
+        // Create the compiled state upfront - shared between stored plan and returned ref
+        let compiled = Arc::new(RwLock::new(CompiledExecution::Unknown));
 
         if let Ok(mut plans) = self.plans.write() {
             // Check if we need to prune the cache
@@ -316,10 +313,31 @@ impl QueryCache {
                 self.prune_cache(&mut plans);
             }
 
-            plans.insert(normalized_key, plan.clone());
+            // Insert plan into map - use normalized_key for both key and field
+            // Only clone normalized_key for the map key; move it into the plan struct
+            let key_for_insert = normalized_key.clone();
+            plans.insert(
+                key_for_insert,
+                CachedQueryPlan {
+                    statement: statement.clone(),
+                    query_text: CompactString::new(query),
+                    last_used: Instant::now(),
+                    usage_count: 1,
+                    has_params,
+                    param_count,
+                    normalized_query: normalized_key, // moved, not cloned
+                    compiled: compiled.clone(),       // Arc clone - cheap
+                },
+            );
         }
 
-        plan
+        // Return lightweight reference - only Arc clones, no CompactString clones
+        CachedPlanRef {
+            statement,
+            has_params,
+            param_count,
+            compiled,
+        }
     }
 
     /// Clear the cache

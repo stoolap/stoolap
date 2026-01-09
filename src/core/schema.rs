@@ -441,7 +441,7 @@ impl Schema {
 
     /// Get column names as Arc for zero-copy sharing with results
     ///
-    /// This is the most efficient way to pass column names to `ExecutorMemoryResult::with_arc_columns`
+    /// This is the most efficient way to pass column names to `ExecutorResult::with_arc_columns`
     /// as it avoids any string cloning after the first call.
     #[inline]
     pub fn column_names_arc(&self) -> Arc<Vec<String>> {

@@ -140,18 +140,48 @@ impl Parser {
         // Remove surrounding quotes
         let value = if literal.len() >= 2 {
             let inner = &literal[1..literal.len() - 1];
-            // Handle escape sequences
+            // Handle escape sequences - optimized to avoid allocations when no escapes present
             // Note: We don't convert \" to " because:
             // 1. In SQL, double quotes don't need escaping inside single-quoted strings
             // 2. Converting \" to " breaks JSON content like {"key":"value with \"quotes\""}
-            CompactString::from(
-                inner
-                    .replace("\\n", "\n")
-                    .replace("\\t", "\t")
-                    .replace("\\r", "\r")
-                    .replace("\\'", "'")
-                    .replace("\\\\", "\\"),
-            )
+            if inner.contains('\\') {
+                // Has escapes - do single-pass replacement
+                let mut result = String::with_capacity(inner.len());
+                let mut chars = inner.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        match chars.peek() {
+                            Some('n') => {
+                                result.push('\n');
+                                chars.next();
+                            }
+                            Some('t') => {
+                                result.push('\t');
+                                chars.next();
+                            }
+                            Some('r') => {
+                                result.push('\r');
+                                chars.next();
+                            }
+                            Some('\'') => {
+                                result.push('\'');
+                                chars.next();
+                            }
+                            Some('\\') => {
+                                result.push('\\');
+                                chars.next();
+                            }
+                            _ => result.push(c), // Keep backslash for unknown escapes
+                        }
+                    } else {
+                        result.push(c);
+                    }
+                }
+                CompactString::from(result)
+            } else {
+                // No escapes - zero allocation path
+                CompactString::from(inner)
+            }
         } else {
             literal.clone()
         };

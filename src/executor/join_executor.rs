@@ -95,7 +95,7 @@
 use std::sync::Arc;
 
 use crate::core::value::NULL_VALUE;
-use crate::core::{Result, Row, Value};
+use crate::core::{Result, Row, RowVec, Value};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::RowFilter;
 use crate::executor::hash_table::JoinHashTable;
@@ -125,8 +125,8 @@ const STREAMING_LIMIT_THRESHOLD: u64 = 1000;
 /// Result of a streaming join execution.
 #[derive(Debug)]
 pub struct JoinResult {
-    /// The joined rows.
-    pub rows: Vec<Row>,
+    /// The joined rows with synthetic row IDs.
+    pub rows: RowVec,
     /// Column names for the combined result.
     pub columns: Vec<String>,
 }
@@ -582,7 +582,7 @@ impl JoinExecutor {
         build_left: bool,
         limit: Option<u64>,
         ctx: &ExecutionContext,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         // Use schema for column counts (not row data - handles empty tables correctly)
         let left_col_count = left_columns.len();
         let right_col_count = right_columns.len();
@@ -650,7 +650,7 @@ impl JoinExecutor {
         build_left: bool,
         limit: Option<u64>,
         ctx: &ExecutionContext,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         let config = ParallelConfig::default();
 
         // Determine probe and build sides - use Arc slices directly (zero-copy)
@@ -694,7 +694,13 @@ impl JoinExecutor {
             &config,
         );
 
-        let mut rows = result.rows;
+        // Wrap with synthetic row IDs for join results
+        let mut rows: RowVec = result
+            .rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| (i as i64, row))
+            .collect();
 
         // Apply residual conditions FIRST (before LIMIT)
         // This ensures correct semantics: filter matching rows, then limit
@@ -707,7 +713,7 @@ impl JoinExecutor {
                 // For INNER joins, simply filter rows
                 for cond in &analysis.residual_conditions {
                     let filter = RowFilter::new(cond, all_columns)?.with_context(ctx);
-                    rows.retain(|row| filter.matches(row));
+                    rows.retain(|(_, row)| filter.matches(row));
                 }
             } else {
                 // For OUTER joins, need special NULL-padding handling
@@ -749,7 +755,7 @@ impl JoinExecutor {
         build_left: bool,
         limit: Option<u64>,
         ctx: &ExecutionContext,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         // Build schema for operators from column names
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
         let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
@@ -819,7 +825,7 @@ impl JoinExecutor {
         right_columns: &[String],
         analysis: &JoinAnalysis,
         limit: Option<u64>,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         // Build schema for operators
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
         let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
@@ -856,7 +862,7 @@ impl JoinExecutor {
         right_columns: &[String],
         join_type_str: &str,
         limit: Option<u64>,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         // Build schema for operators
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
         let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
@@ -896,11 +902,12 @@ impl JoinExecutor {
         op: &mut dyn Operator,
         limit: Option<u64>,
         residual_filters: &[RowFilter],
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         op.open()?;
 
         let max_rows = limit.map(|l| l as usize).unwrap_or(usize::MAX);
-        let mut rows = Vec::with_capacity(max_rows.min(1000));
+        let mut rows = RowVec::with_capacity(max_rows.min(1000));
+        let mut row_id = 0i64;
         let has_filters = !residual_filters.is_empty();
 
         while let Some(row_ref) = op.next()? {
@@ -929,7 +936,8 @@ impl JoinExecutor {
                 }
             }
 
-            rows.push(row);
+            rows.push((row_id, row));
+            row_id += 1;
 
             // Early termination
             if rows.len() >= max_rows {
@@ -948,14 +956,14 @@ impl JoinExecutor {
     #[allow(clippy::too_many_arguments)]
     fn apply_residual_post_join(
         &self,
-        mut rows: Vec<Row>,
+        mut rows: RowVec,
         residual: &[Expression],
         all_columns: &[String],
         join_type: &str,
         left_col_count: usize,
         right_col_count: usize,
         ctx: &ExecutionContext,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         let is_left_outer = join_type.contains("LEFT");
         let is_right_outer = join_type.contains("RIGHT");
         let is_full_outer = join_type.contains("FULL");
@@ -967,9 +975,9 @@ impl JoinExecutor {
                 // For OUTER joins, replace non-matching rows with NULL-padded versions
                 rows = rows
                     .into_iter()
-                    .map(|row| {
+                    .map(|(row_id, row)| {
                         if filter.matches(&row) {
-                            row
+                            (row_id, row)
                         } else {
                             // Convert to NULL-padded row
                             if is_left_outer {
@@ -977,23 +985,23 @@ impl JoinExecutor {
                                 let mut new_values: Vec<Value> =
                                     row.iter().take(left_col_count).cloned().collect();
                                 new_values.extend(std::iter::repeat_n(NULL_VALUE, right_col_count));
-                                Row::from_values(new_values)
+                                (row_id, Row::from_values(new_values))
                             } else if is_right_outer {
                                 // NULL left, keep right
                                 let mut new_values: Vec<Value> =
                                     std::iter::repeat_n(NULL_VALUE, left_col_count).collect();
                                 new_values.extend(row.iter().skip(left_col_count).cloned());
-                                Row::from_values(new_values)
+                                (row_id, Row::from_values(new_values))
                             } else {
                                 // FULL OUTER - keep original for now
-                                row
+                                (row_id, row)
                             }
                         }
                     })
                     .collect();
             } else {
                 // INNER join - just filter
-                rows.retain(|row| filter.matches(row));
+                rows.retain(|(_, row)| filter.matches(row));
             }
         }
 

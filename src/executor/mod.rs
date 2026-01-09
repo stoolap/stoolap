@@ -127,7 +127,7 @@ pub use planner::{
     ColumnStatsCache, QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision, StatsHealth,
 };
 pub use query_cache::{CacheStats, CachedQueryPlan, QueryCache, DEFAULT_CACHE_SIZE};
-pub use result::{ExecResult, ExecutorMemoryResult};
+pub use result::{ExecResult, ExecutorResult};
 pub use semantic_cache::{
     CacheLookupResult, CachedResult, QueryFingerprint, SemanticCache, SemanticCacheStats,
     SemanticCacheStatsSnapshot, SubsumptionResult, DEFAULT_CACHE_TTL_SECS, DEFAULT_MAX_CACHED_ROWS,

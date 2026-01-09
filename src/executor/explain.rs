@@ -19,7 +19,7 @@
 
 use compact_str::CompactString;
 
-use crate::core::{Result, Row, Value};
+use crate::core::{Result, Row, RowVec, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::parser::ast::*;
 use crate::storage::traits::{Engine, QueryResult, ScanPlan};
@@ -29,7 +29,7 @@ use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
 use super::planner::RuntimeJoinAlgorithm;
 use super::pushdown;
-use super::result::ExecutorMemoryResult;
+use super::result::ExecutorResult;
 use super::Executor;
 
 impl Executor {
@@ -127,24 +127,36 @@ impl Executor {
 
             // Return the plan as a result
             let columns = vec!["plan".to_string()];
-            let rows: Vec<Row> = plan_lines
+            let rows: RowVec = plan_lines
                 .into_iter()
-                .map(|line| Row::from_values(vec![Value::Text(CompactString::from(line.as_str()))]))
+                .enumerate()
+                .map(|(i, line)| {
+                    (
+                        i as i64,
+                        Row::from_values(vec![Value::Text(CompactString::from(line.as_str()))]),
+                    )
+                })
                 .collect();
 
-            Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+            Ok(Box::new(ExecutorResult::new(columns, rows)))
         } else {
             // Regular EXPLAIN: Just show the plan without executing (using inlined version if available)
             self.explain_statement(explain_stmt, &mut plan_lines, 0);
 
             // Return as a single-column result
             let columns = vec!["plan".to_string()];
-            let rows: Vec<Row> = plan_lines
+            let rows: RowVec = plan_lines
                 .into_iter()
-                .map(|line| Row::from_values(vec![Value::Text(CompactString::from(line.as_str()))]))
+                .enumerate()
+                .map(|(i, line)| {
+                    (
+                        i as i64,
+                        Row::from_values(vec![Value::Text(CompactString::from(line.as_str()))]),
+                    )
+                })
                 .collect();
 
-            Ok(Box::new(ExecutorMemoryResult::new(columns, rows)))
+            Ok(Box::new(ExecutorResult::new(columns, rows)))
         }
     }
 

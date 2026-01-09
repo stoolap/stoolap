@@ -1581,19 +1581,17 @@ impl Executor {
         }
 
         let row = result.take_row();
-        if row.is_empty() {
-            let null_value = crate::core::Value::null_unknown();
-            if let Some(key) = cache_key {
-                cache_scalar_subquery(key, null_value.clone());
+        // take_first_value() is more efficient than get(0).cloned()
+        let first_value = match row.take_first_value() {
+            Some(v) => v,
+            None => {
+                let null_value = crate::core::Value::null_unknown();
+                if let Some(key) = cache_key {
+                    cache_scalar_subquery(key, null_value.clone());
+                }
+                return Ok(null_value);
             }
-            return Ok(null_value);
-        }
-
-        // Get the first value
-        let first_value = row
-            .get(0)
-            .cloned()
-            .unwrap_or_else(crate::core::Value::null_unknown);
+        };
 
         // Check that there's only one row (scalar subquery should return single value)
         if result.next() {
@@ -1642,12 +1640,9 @@ impl Executor {
         let mut values = Vec::new();
         while result.next() {
             let row = result.take_row();
-            if !row.is_empty() {
-                // into_values() uses Arc::try_unwrap() to move without cloning when sole owner
-                let mut row_values = row.into_values();
-                if !row_values.is_empty() {
-                    values.push(row_values.swap_remove(0));
-                }
+            // take_first_value() is more efficient than into_values().swap_remove(0)
+            if let Some(value) = row.take_first_value() {
+                values.push(value);
             }
         }
 
@@ -2893,7 +2888,7 @@ impl Executor {
         outer_rows: Arc<Vec<crate::core::Row>>,
         outer_columns: &[String],
         _ctx: &ExecutionContext,
-    ) -> Result<Vec<crate::core::Row>> {
+    ) -> Result<crate::core::RowVec> {
         // Direct table access - much faster than going through execute_select
         let txn = self.engine.begin_transaction()?;
         let inner_table = txn.get_table(&info.inner_table)?;
@@ -2934,7 +2929,7 @@ impl Executor {
         let mut seen: AHashSet<crate::core::Value> = AHashSet::with_capacity(estimated_unique);
         let mut inner_rows: Vec<crate::core::Row> = Vec::with_capacity(estimated_unique);
 
-        for row in &inner_all_rows {
+        for (_, row) in &inner_all_rows {
             if let Some(value) = row.get(inner_key_source_idx) {
                 if !value.is_null() {
                     // Clone once and reuse for both HashSet and Row to avoid double allocation
@@ -2994,11 +2989,13 @@ impl Executor {
             JoinSide::Right, // Build on smaller (inner) side
         );
 
-        // Execute the join
+        // Execute the join with synthetic row IDs
         join_op.open()?;
-        let mut result_rows = Vec::new();
+        let mut result_rows = crate::core::RowVec::new();
+        let mut row_id = 0i64;
         while let Some(row_ref) = join_op.next()? {
-            result_rows.push(row_ref.into_owned());
+            result_rows.push((row_id, row_ref.into_owned()));
+            row_id += 1;
         }
         join_op.close()?;
 

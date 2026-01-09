@@ -30,13 +30,13 @@ use std::sync::{Arc, RwLock};
 
 use compact_str::CompactString;
 
-use crate::core::{Result, Row, Schema, Value};
+use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement};
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
 use super::query_cache::{CompiledExecution, CompiledPkLookup, PkValueSource};
-use super::result::ExecutorMemoryResult;
+use super::result::ExecutorResult;
 use super::Executor;
 
 /// Information extracted from a simple PK lookup query
@@ -280,12 +280,13 @@ impl Executor {
             .fetch_rows_by_ids(&info.table_name, &[info.pk_value])?;
 
         // Extract Row values and normalize to current schema (handles ADD/DROP COLUMN)
-        let result_rows: Vec<_> = rows
+        let result_rows: RowVec = rows
             .into_iter()
-            .map(|(_, row)| Self::normalize_row_to_schema(row, &info.schema))
+            .enumerate()
+            .map(|(i, (_, row))| (i as i64, Self::normalize_row_to_schema(row, &info.schema)))
             .collect();
 
-        Ok(Box::new(ExecutorMemoryResult::with_arc_columns(
+        Ok(Box::new(ExecutorResult::with_arc_columns(
             columns,
             result_rows,
         )))
@@ -409,12 +410,15 @@ impl Executor {
             .fetch_rows_by_ids(&lookup.table_name, &[pk_value])?;
         // Normalize rows to current schema (handles ADD/DROP COLUMN)
         // Pre-allocate with capacity 1 for single PK lookup (avoids realloc)
-        let mut result_rows = Vec::with_capacity(1);
-        for (_, row) in rows {
-            result_rows.push(Self::normalize_row_to_schema(row, &lookup.schema));
+        let mut result_rows = RowVec::with_capacity(1);
+        for (row_id, (_, row)) in rows.into_iter().enumerate() {
+            result_rows.push((
+                row_id as i64,
+                Self::normalize_row_to_schema(row, &lookup.schema),
+            ));
         }
         // Use Arc columns - O(1) clone since column_names is Arc<Vec<String>>
-        Ok(Box::new(ExecutorMemoryResult::with_arc_columns(
+        Ok(Box::new(ExecutorResult::with_arc_columns(
             lookup.column_names.clone(),
             result_rows,
         )))

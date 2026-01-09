@@ -19,7 +19,7 @@
 //! - UPDATE
 //! - DELETE
 
-use crate::core::{DataType, Error, Result, Row, Schema, Value};
+use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::traits::{Engine, QueryResult, Table};
@@ -427,7 +427,7 @@ impl Executor {
                     )));
                 }
 
-                // Build row values - initialize with DEFAULT values for missing columns
+                // Build row values - need Vec for error handling paths
                 let mut row_values = Vec::with_capacity(schema_column_count);
                 for i in 0..schema_column_count {
                     if let Some(ref default_expr) = default_exprs[i] {
@@ -462,7 +462,7 @@ impl Executor {
                     row_values[column_indices[i]] = coerced;
                 }
 
-                // Need to clone for potential update
+                // Create row from values (ON DUPLICATE KEY needs values for error handling)
                 let row = Row::from_values(row_values.clone());
                 match table.insert_discard(row) {
                     Ok(()) => {
@@ -815,6 +815,17 @@ impl Executor {
             None
         };
 
+        // Build lookup from schema column index to value position
+        // This allows building row_values directly without cloning entire template
+        let col_to_value_pos: Vec<Option<usize>> = {
+            let mut lookup = vec![None; default_row_template.len()];
+            for (value_pos, &col_idx) in column_indices.iter().enumerate() {
+                lookup[col_idx] = Some(value_pos);
+            }
+            lookup
+        };
+        let num_columns = default_row_template.len();
+
         // Check if this is INSERT ... SELECT
         if let Some(ref select_stmt) = stmt.select {
             // Execute the SELECT query
@@ -832,14 +843,25 @@ impl Executor {
                     )));
                 }
 
-                // Clone pre-evaluated defaults (avoids re-evaluation per row)
-                let mut row_values = (*default_row_template).clone();
-
-                // Fill in values from SELECT
-                for (i, value) in select_row.iter().enumerate() {
-                    let coerced = value.coerce_to_type(column_types[i]);
-                    validate_coercion(value, &coerced, &column_names[i], column_types[i])?;
-                    row_values[column_indices[i]] = coerced;
+                // OPTIMIZATION: Build row_values directly without cloning entire template
+                // Only clone defaults for columns NOT in the insert list
+                let mut row_values = Vec::with_capacity(num_columns);
+                for (col_idx, default_val) in default_row_template.iter().enumerate() {
+                    if let Some(value_pos) = col_to_value_pos[col_idx] {
+                        // Column in insert list - use value from SELECT row
+                        let value = &select_row[value_pos];
+                        let coerced = value.coerce_to_type(column_types[value_pos]);
+                        validate_coercion(
+                            value,
+                            &coerced,
+                            &column_names[value_pos],
+                            column_types[value_pos],
+                        )?;
+                        row_values.push(coerced);
+                    } else {
+                        // Column not in insert list - use default
+                        row_values.push(default_val.clone());
+                    }
                 }
 
                 // Validate CHECK constraints
@@ -874,28 +896,40 @@ impl Executor {
                     )));
                 }
 
-                // Clone pre-evaluated defaults (avoids re-evaluation per row)
-                let mut row_values = (*default_row_template).clone();
+                // OPTIMIZATION: Build row_values directly without cloning entire template
+                // Only clone defaults for columns NOT in the insert list
+                let mut row_values = Vec::with_capacity(num_columns);
+                for (col_idx, default_val) in default_row_template.iter().enumerate() {
+                    if let Some(value_pos) = col_to_value_pos[col_idx] {
+                        // Column in insert list - evaluate expression
+                        let expr = &value_list[value_pos];
+                        if matches!(expr, Expression::Default(_)) {
+                            // DEFAULT keyword - use pre-evaluated default
+                            row_values.push(default_val.clone());
+                        } else {
+                            // OPTIMIZATION: Try literal extraction first (avoids VM compilation)
+                            let value = if let Some(lit_val) = try_extract_literal(expr) {
+                                lit_val
+                            } else {
+                                // Fall back to VM evaluation for complex expressions
+                                let program = compile_expression(expr, &[])?;
+                                vm.execute_cow(&program, &base_exec_ctx)?
+                            };
 
-                // Fill in values from VALUES clause
-                for (i, expr) in value_list.iter().enumerate() {
-                    // Handle DEFAULT keyword - skip this column to use pre-initialized default
-                    if matches!(expr, Expression::Default(_)) {
-                        continue;
-                    }
-                    // OPTIMIZATION: Try literal extraction first (avoids VM compilation)
-                    let value = if let Some(lit_val) = try_extract_literal(expr) {
-                        lit_val
+                            let target_type = column_types[value_pos];
+                            let coerced = value.coerce_to_type(target_type);
+                            validate_coercion(
+                                &value,
+                                &coerced,
+                                &column_names[value_pos],
+                                target_type,
+                            )?;
+                            row_values.push(coerced);
+                        }
                     } else {
-                        // Fall back to VM evaluation for complex expressions
-                        let program = compile_expression(expr, &[])?;
-                        vm.execute_cow(&program, &base_exec_ctx)?
-                    };
-
-                    let target_type = column_types[i];
-                    let coerced = value.coerce_to_type(target_type);
-                    validate_coercion(&value, &coerced, &column_names[i], target_type)?;
-                    row_values[column_indices[i]] = coerced;
+                        // Column not in insert list - use default
+                        row_values.push(default_val.clone());
+                    }
                 }
 
                 // Validate CHECK constraints
@@ -2026,7 +2060,7 @@ impl Executor {
         column_names: &[String],
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        use super::result::ExecutorMemoryResult;
+        use super::result::ExecutorResult;
         use crate::parser::{Identifier, Position, Token, TokenType};
 
         // Expand Star expressions to all columns
@@ -2059,10 +2093,7 @@ impl Executor {
 
         // If no source rows, return empty result
         if source_rows.is_empty() {
-            return Ok(Box::new(ExecutorMemoryResult::new(
-                result_columns,
-                Vec::new(),
-            )));
+            return Ok(Box::new(ExecutorResult::new(result_columns, RowVec::new())));
         }
 
         use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
@@ -2077,8 +2108,8 @@ impl Executor {
         let mut vm = ExprVM::new();
 
         // Evaluate RETURNING expressions for each row
-        let mut result_rows = Vec::with_capacity(source_rows.len());
-        for row in source_rows {
+        let mut result_rows = RowVec::with_capacity(source_rows.len());
+        for (row_id, row) in source_rows.into_iter().enumerate() {
             // CRITICAL: Include params from context for parameterized queries
             let exec_ctx = ExecuteContext::new(&row)
                 .with_params(ctx.params())
@@ -2090,13 +2121,10 @@ impl Executor {
                 let value = vm.execute_cow(program, &exec_ctx)?;
                 row_values.push(value);
             }
-            result_rows.push(Row::from_values(row_values));
+            result_rows.push((row_id as i64, Row::from_values(row_values)));
         }
 
-        Ok(Box::new(ExecutorMemoryResult::new(
-            result_columns,
-            result_rows,
-        )))
+        Ok(Box::new(ExecutorResult::new(result_columns, result_rows)))
     }
 
     /// Get a column name for a RETURNING expression

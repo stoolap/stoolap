@@ -22,7 +22,7 @@ use smallvec::SmallVec;
 use std::sync::{Arc, RwLock};
 
 use crate::common::Int64Set;
-use crate::core::{DataType, Error, IndexType, Result, Row, Schema, SchemaColumn, Value};
+use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, SchemaColumn, Value};
 use crate::storage::expression::Expression;
 use crate::storage::mvcc::bitmap_index::BitmapIndex;
 use crate::storage::mvcc::btree_index::BTreeIndex;
@@ -776,14 +776,14 @@ impl MVCCTable {
         schema: &Schema,
         limit: usize,
         offset: usize,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<RowVec> {
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
             return None; // Fall through to full path
         }
 
         // No local changes - fetch directly from version store by row IDs
-        let mut result = Vec::with_capacity(limit.min(row_ids.len()));
+        let mut result = RowVec::with_capacity(limit.min(row_ids.len()));
         let mut skipped = 0usize;
 
         for row_id in row_ids {
@@ -795,7 +795,7 @@ impl MVCCTable {
                         if skipped < offset {
                             skipped += 1;
                         } else {
-                            result.push(row);
+                            result.push((row_id, row));
                             if result.len() >= limit {
                                 return Some(result);
                             }
@@ -1163,8 +1163,9 @@ impl MVCCTable {
     ///
     /// Optimized to use batch fetch even when there are local changes,
     /// then merge the results.
+    /// Returns RowVec for zero-allocation reuse across queries.
     #[inline]
-    fn collect_visible_rows(&self, filter: Option<&dyn Expression>) -> Vec<(i64, Row)> {
+    fn collect_visible_rows(&self, filter: Option<&dyn Expression>) -> RowVec {
         let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
 
@@ -1172,15 +1173,17 @@ impl MVCCTable {
         let has_local = txn_versions.has_local_changes();
 
         if !has_local {
-            // No local versions - use arena-based batch fetch for maximum performance
+            // No local versions - use thread-local cached Vec for zero-allocation reuse
             // Arena storage provides 50x+ faster scans via contiguous memory access
-            let raw_rows = if let Some(expr) = filter {
-                // Use filtered version to avoid allocating memory for non-matching rows
-                self.version_store
-                    .get_all_visible_rows_filtered(self.txn_id, expr)
-            } else {
-                self.version_store.get_all_visible_rows_arena(self.txn_id)
-            };
+            if let Some(expr) = filter {
+                // Use filtered version - returns RowVec directly
+                return self
+                    .version_store
+                    .get_all_visible_rows_filtered(self.txn_id, expr);
+            }
+
+            // Use cached version for unfiltered scans (main optimization)
+            let raw_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
 
             // OPTIMIZATION: Skip normalization if first row matches schema column count
             // This is the common case when no ALTER TABLE ADD/DROP COLUMN has occurred
@@ -1194,6 +1197,7 @@ impl MVCCTable {
             }
 
             // Slow path: need to normalize rows for schema evolution
+            // Iterate over cached vec (drains it), collect into RowVec
             return raw_rows
                 .into_iter()
                 .map(|(row_id, row)| (row_id, self.normalize_row_to_schema(row, schema)))
@@ -1202,7 +1206,8 @@ impl MVCCTable {
 
         // Has local versions - use batch fetch then merge
         // Step 1: Get all global rows in one batch (single lock acquisition)
-        let global_rows = self.version_store.get_all_visible_rows_arena(self.txn_id);
+        // Uses thread-local cached Vec for zero-allocation reuse
+        let global_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
 
         // Step 2: Build set of local row IDs for quick lookup (Int64Set for fast i64 lookups)
         let local_row_ids: Int64Set = txn_versions
@@ -1211,7 +1216,7 @@ impl MVCCTable {
             .collect();
 
         // Step 3: Pre-allocate result
-        let mut rows = Vec::with_capacity(global_rows.len() + local_row_ids.len());
+        let mut rows = RowVec::with_capacity(global_rows.len() + local_row_ids.len());
 
         // Step 4: Add global rows that don't have local overrides
         for (row_id, row) in global_rows {
@@ -1251,52 +1256,10 @@ impl MVCCTable {
     /// This skips the O(n log n) sort since GROUP BY doesn't care about row order.
     /// Returns rows in DashMap iteration order (non-deterministic).
     #[inline]
-    fn collect_visible_rows_unsorted(&self) -> Vec<Row> {
-        let txn_versions = self.txn_versions.read().unwrap();
-        let schema = &self.cached_schema;
-
-        // Check if we have local versions (uncommitted changes in this transaction)
-        let has_local = txn_versions.has_local_changes();
-
-        if !has_local {
-            // No local versions - use unsorted arena-based fetch
-            let raw_rows = self
-                .version_store
-                .get_all_visible_rows_unsorted(self.txn_id);
-            // Normalize rows and discard row_ids (not needed for GROUP BY)
-            return raw_rows
-                .into_iter()
-                .map(|(_, row)| self.normalize_row_to_schema(row, schema))
-                .collect();
-        }
-
-        // Has local versions - merge (order doesn't matter)
-        let global_rows = self
-            .version_store
-            .get_all_visible_rows_unsorted(self.txn_id);
-
-        let local_row_ids: Int64Set = txn_versions
-            .iter_local()
-            .map(|(row_id, _)| row_id)
-            .collect();
-
-        let mut rows = Vec::with_capacity(global_rows.len() + local_row_ids.len());
-
-        for (row_id, row) in global_rows {
-            if local_row_ids.contains(&row_id) {
-                continue;
-            }
-            rows.push(self.normalize_row_to_schema(row, schema));
-        }
-
-        for (_, version) in txn_versions.iter_local() {
-            if version.is_deleted() {
-                continue;
-            }
-            rows.push(self.normalize_row_to_schema(version.data.clone(), schema));
-        }
-
-        rows
+    fn collect_visible_rows_unsorted(&self) -> RowVec {
+        // For GROUP BY, order doesn't matter - use same cached path
+        // BTreeMap iteration is already sorted anyway
+        self.collect_visible_rows(None)
     }
 
     /// Collect visible rows with early termination when limit is reached
@@ -1306,7 +1269,7 @@ impl MVCCTable {
         filter: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
-    ) -> Vec<Row> {
+    ) -> RowVec {
         let schema = &self.cached_schema;
 
         // FAST PATH: Check if this is a primary key equality lookup (WHERE id = X)
@@ -1316,12 +1279,12 @@ impl MVCCTable {
                 // Direct O(1) lookup by primary key
                 let txn_versions = self.txn_versions.read().unwrap();
                 let row = if let Some(row) = txn_versions.get(pk_id) {
-                    Some(row)
+                    Some((pk_id, row))
                 } else if let Some(version) =
                     self.version_store.get_visible_version(pk_id, self.txn_id)
                 {
                     if !version.is_deleted() {
-                        Some(version.data.clone())
+                        Some((pk_id, version.data.clone()))
                     } else {
                         None
                     }
@@ -1330,10 +1293,12 @@ impl MVCCTable {
                 };
 
                 return match row {
-                    Some(r) if offset == 0 && limit >= 1 => {
-                        vec![self.normalize_row_to_schema(r, schema)]
+                    Some((row_id, r)) if offset == 0 && limit >= 1 => {
+                        let mut rv = RowVec::with_capacity(1);
+                        rv.push((row_id, self.normalize_row_to_schema(r, schema)));
+                        rv
                     }
-                    _ => Vec::new(),
+                    _ => RowVec::new(),
                 };
             }
 
@@ -1372,14 +1337,16 @@ impl MVCCTable {
                     .get_visible_rows_with_limit(self.txn_id, limit, offset)
             };
 
+            // Keep row IDs in RowVec
             return raw_rows
                 .into_iter()
-                .map(|(_, row)| self.normalize_row_to_schema(row, schema))
+                .map(|(row_id, row)| (row_id, self.normalize_row_to_schema(row, schema)))
                 .collect();
         }
 
         // Has local versions - use batch fetch then merge with early termination
-        let global_rows = self.version_store.get_all_visible_rows_arena(self.txn_id);
+        // Uses thread-local cached Vec for zero-allocation reuse
+        let global_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
 
         // Build set of local row IDs for quick lookup
         let local_row_ids: Int64Set = txn_versions
@@ -1387,7 +1354,7 @@ impl MVCCTable {
             .map(|(row_id, _)| row_id)
             .collect();
 
-        let mut result = Vec::with_capacity(limit);
+        let mut result = RowVec::with_capacity(limit);
         let mut count = 0;
 
         // Add global rows that don't have local overrides
@@ -1402,7 +1369,7 @@ impl MVCCTable {
                 }
             }
             if count >= offset {
-                result.push(row);
+                result.push((row_id, row));
                 if result.len() >= limit {
                     return result;
                 }
@@ -1411,7 +1378,7 @@ impl MVCCTable {
         }
 
         // Add local versions (both updates and inserts)
-        for (_, version) in txn_versions.iter_local() {
+        for (row_id, version) in txn_versions.iter_local() {
             if version.is_deleted() {
                 continue;
             }
@@ -1422,7 +1389,7 @@ impl MVCCTable {
                 }
             }
             if count >= offset {
-                result.push(row);
+                result.push((row_id, row));
                 if result.len() >= limit {
                     return result;
                 }
@@ -1442,7 +1409,7 @@ impl MVCCTable {
         filter: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
-    ) -> Vec<Row> {
+    ) -> RowVec {
         let schema = &self.cached_schema;
 
         // FAST PATH: Check if this is a primary key equality lookup (WHERE id = X)
@@ -1452,12 +1419,12 @@ impl MVCCTable {
                 // Direct O(1) lookup by primary key
                 let txn_versions = self.txn_versions.read().unwrap();
                 let row = if let Some(row) = txn_versions.get(pk_id) {
-                    Some(row)
+                    Some((pk_id, row))
                 } else if let Some(version) =
                     self.version_store.get_visible_version(pk_id, self.txn_id)
                 {
                     if !version.is_deleted() {
-                        Some(version.data.clone())
+                        Some((pk_id, version.data.clone()))
                     } else {
                         None
                     }
@@ -1466,10 +1433,12 @@ impl MVCCTable {
                 };
 
                 return match row {
-                    Some(r) if offset == 0 && limit >= 1 => {
-                        vec![self.normalize_row_to_schema(r, schema)]
+                    Some((row_id, r)) if offset == 0 && limit >= 1 => {
+                        let mut rv = RowVec::with_capacity(1);
+                        rv.push((row_id, self.normalize_row_to_schema(r, schema)));
+                        rv
                     }
-                    _ => Vec::new(),
+                    _ => RowVec::new(),
                 };
             }
 
@@ -1505,9 +1474,10 @@ impl MVCCTable {
                     .get_visible_rows_with_limit_unordered(self.txn_id, limit, offset)
             };
 
+            // Keep row IDs in RowVec
             return raw_rows
                 .into_iter()
-                .map(|(_, row)| self.normalize_row_to_schema(row, schema))
+                .map(|(row_id, row)| (row_id, self.normalize_row_to_schema(row, schema)))
                 .collect();
         }
 
@@ -1530,21 +1500,10 @@ impl Table for MVCCTable {
 
     /// Fetch rows by their IDs, applying filter
     ///
+    /// Fetch rows into a reusable RowVec buffer.
     /// Optimized to use batch fetch for global store rows,
     /// reducing lock contention from O(n) to O(1).
-    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Vec<(i64, Row)> {
-        let mut rows = Vec::with_capacity(row_ids.len());
-        self.fetch_rows_by_ids_into(row_ids, filter, &mut rows);
-        rows
-    }
-
-    /// Fetch rows into a reusable buffer
-    fn fetch_rows_by_ids_into(
-        &self,
-        row_ids: &[i64],
-        filter: &dyn Expression,
-        rows: &mut Vec<(i64, Row)>,
-    ) {
+    fn fetch_rows_by_ids_into(&self, row_ids: &[i64], filter: &dyn Expression, rows: &mut RowVec) {
         let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
 
@@ -1731,7 +1690,7 @@ impl Table for MVCCTable {
             // Fast path: PK range lookup (WHERE id >= X AND id < Y)
             if let Some(pk_range_ids) = self.try_pk_range_lookup(expr, schema) {
                 // OPTIMIZATION: Track original versions to avoid redundant lookups
-                let mut local_rows: Vec<(i64, Row)> = Vec::with_capacity(pk_range_ids.len() / 4);
+                let mut local_rows = RowVec::with_capacity(pk_range_ids.len() / 4);
                 let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
                     Vec::with_capacity(pk_range_ids.len());
 
@@ -1780,8 +1739,7 @@ impl Table for MVCCTable {
             if let Some(filtered_row_ids) = self.try_index_lookup(expr, schema) {
                 // Step 1: Check local versions first (these don't need write-set tracking)
                 // OPTIMIZATION: Pre-allocate with estimated capacity
-                let mut local_rows_to_update: Vec<(i64, Row)> =
-                    Vec::with_capacity(filtered_row_ids.len() / 4);
+                let mut local_rows_to_update = RowVec::with_capacity(filtered_row_ids.len() / 4);
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
 
                 {
@@ -1874,7 +1832,7 @@ impl Table for MVCCTable {
 
         // Also check local inserts that might not be in global store
         // OPTIMIZATION: Filter on reference BEFORE cloning to avoid wasted allocations
-        let local_rows_to_update: Vec<(i64, Row)> = {
+        let local_rows_to_update: RowVec = {
             let txn_versions = self.txn_versions.read().unwrap();
             txn_versions
                 .iter_local()
@@ -1906,7 +1864,7 @@ impl Table for MVCCTable {
         }
 
         // Apply setter to local rows
-        let local_updated: Vec<(i64, Row)> = local_rows_to_update
+        let local_updated: RowVec = local_rows_to_update
             .into_iter()
             .map(|(row_id, row)| {
                 let (updated_row, _) = setter(row);
@@ -1935,7 +1893,7 @@ impl Table for MVCCTable {
         let schema = &self.cached_schema;
 
         // Step 1: Check local versions first (single lock acquisition)
-        let mut local_rows: Vec<(i64, Row)> = Vec::with_capacity(row_ids.len() / 4);
+        let mut local_rows = RowVec::with_capacity(row_ids.len() / 4);
         let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
 
         {
@@ -1985,7 +1943,7 @@ impl Table for MVCCTable {
         let schema = &self.cached_schema;
 
         // Step 1: Check local versions first
-        let mut local_deletes: Vec<(i64, Row)> = Vec::with_capacity(row_ids.len() / 4);
+        let mut local_deletes = RowVec::with_capacity(row_ids.len() / 4);
         let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
 
         {
@@ -2083,7 +2041,7 @@ impl Table for MVCCTable {
             // PK IS the row_id, so we can generate the range directly
             if let Some(pk_range_ids) = self.try_pk_range_lookup(expr, schema) {
                 // OPTIMIZATION: Track original versions to avoid redundant lookups
-                let mut local_rows: Vec<(i64, Row)> = Vec::with_capacity(pk_range_ids.len() / 4);
+                let mut local_rows = RowVec::with_capacity(pk_range_ids.len() / 4);
                 let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
                     Vec::with_capacity(pk_range_ids.len());
 
@@ -2128,8 +2086,7 @@ impl Table for MVCCTable {
             if let Some(filtered_row_ids) = self.try_index_lookup(expr, schema) {
                 // OPTIMIZATION: Batch collect rows to delete, then batch put
                 // This reduces lock contention from 2N locks to 2 locks for N rows
-                let mut rows_to_delete: Vec<(i64, Row)> =
-                    Vec::with_capacity(filtered_row_ids.len());
+                let mut rows_to_delete = RowVec::with_capacity(filtered_row_ids.len());
 
                 // Step 1: Check local versions first (single lock acquisition)
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
@@ -2293,11 +2250,9 @@ impl Table for MVCCTable {
                 if let Some(row) = row {
                     // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
                     let row = self.normalize_row_to_schema(row, &schema);
-                    let scanner = MVCCScanner::from_rows(
-                        vec![(pk_lookup, row)],
-                        schema,
-                        column_indices.to_vec(),
-                    );
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((pk_lookup, row));
+                    let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
                     return Ok(Box::new(scanner));
                 } else {
                     // Row not found - return empty scanner
@@ -2315,43 +2270,20 @@ impl Table for MVCCTable {
             }
         }
 
-        // Fall back to full scan - collect all visible rows at once
-        // This is faster than lazy batching for most workloads due to reduced per-batch overhead
+        // Fall back to full scan - use MVCCScanner with RowVec for cache reuse
         let rows = self.collect_visible_rows(where_expr);
         let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
         Ok(Box::new(scanner))
     }
 
-    fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<Vec<Row>> {
-        // Collect visible rows and extract just the Row values (discard row IDs)
-        let rows = self.collect_visible_rows(where_expr);
-        Ok(rows.into_iter().map(|(_, row)| row).collect())
+    fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
+        // Return cached row vector directly - caller iterates (i64, Row) tuples
+        Ok(self.collect_visible_rows(where_expr))
     }
 
-    fn collect_all_rows_unsorted(&self) -> Result<Vec<Row>> {
-        // Use the unsorted collection for GROUP BY optimization
+    fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
+        // Use cached collection - BTreeMap is already sorted anyway
         Ok(self.collect_visible_rows_unsorted())
-    }
-
-    fn collect_projected_rows(&self, column_indices: &[usize]) -> Result<Vec<Row>> {
-        // Collect visible rows and project directly during collection
-        // This avoids the double-clone overhead of the scanner interface
-        let rows = self.collect_visible_rows(None);
-
-        Ok(rows
-            .into_iter()
-            .map(|(_, row)| {
-                // Use get_arc() for O(1) Arc clone on Shared/Owned storage
-                let arc_values: Vec<std::sync::Arc<Value>> = column_indices
-                    .iter()
-                    .map(|&idx| {
-                        row.get_arc(idx)
-                            .unwrap_or_else(|| std::sync::Arc::new(Value::null_unknown()))
-                    })
-                    .collect();
-                Row::from_arc_values(arc_values)
-            })
-            .collect())
     }
 
     fn collect_rows_with_limit(
@@ -2359,7 +2291,7 @@ impl Table for MVCCTable {
         where_expr: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         // Use the optimized version with limit/offset
         Ok(self.collect_visible_rows_with_limit(where_expr, limit, offset))
     }
@@ -2369,7 +2301,7 @@ impl Table for MVCCTable {
         where_expr: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<RowVec> {
         // Use the optimized unordered version with true early termination
         Ok(self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset))
     }
@@ -2934,7 +2866,7 @@ impl Table for MVCCTable {
         ascending: bool,
         limit: usize,
         offset: usize,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<RowVec> {
         // OPTIMIZATION: Handle PRIMARY KEY column specially
         // For INTEGER PRIMARY KEY, the row_id IS the value, so we can iterate
         // the BTreeMap directly in order without any sorting.
@@ -2963,7 +2895,7 @@ impl Table for MVCCTable {
 
         if let Some(ordered_row_ids) = index.get_row_ids_ordered(ascending, batch_size, 0) {
             // Fast path: B-tree index supports ordered iteration
-            let mut rows = Vec::with_capacity(limit.min(100));
+            let mut rows = RowVec::with_capacity(limit.min(100));
             let mut skipped = 0;
 
             for row_id in ordered_row_ids {
@@ -2979,7 +2911,7 @@ impl Table for MVCCTable {
                         continue;
                     }
 
-                    rows.push(version.data.clone());
+                    rows.push((row_id, version.data.clone()));
 
                     // Check if we've reached the limit
                     if rows.len() >= limit {
@@ -3009,7 +2941,7 @@ impl Table for MVCCTable {
         });
 
         // Collect rows by iterating through sorted values
-        let mut rows = Vec::with_capacity(limit.min(100));
+        let mut rows = RowVec::with_capacity(limit.min(100));
         let mut skipped = 0;
 
         for value in sorted_values {
@@ -3029,7 +2961,7 @@ impl Table for MVCCTable {
                         continue;
                     }
 
-                    rows.push(version.data.clone());
+                    rows.push((row_id, version.data.clone()));
 
                     // Check if we've reached the limit
                     if rows.len() >= limit {
@@ -3048,27 +2980,22 @@ impl Table for MVCCTable {
         start_from: Option<i64>,
         ascending: bool,
         limit: usize,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<RowVec> {
         // Only works if table has a single-column INTEGER PRIMARY KEY
         self.cached_schema.pk_column_index()?;
 
         // Use the efficient keyset iteration from version store
-        let rows = self.version_store.collect_rows_keyset(
+        // Returns RowVec with (row_id, Row) tuples
+        Some(self.version_store.collect_rows_keyset(
             self.txn_id,
             start_after,
             start_from,
             ascending,
             limit,
-        );
-
-        // Return rows only (discard row_ids)
-        Some(rows.into_iter().map(|(_, row)| row).collect())
+        ))
     }
 
-    fn collect_rows_grouped_by_partition(
-        &self,
-        column_name: &str,
-    ) -> Option<Vec<(Value, Vec<Row>)>> {
+    fn collect_rows_grouped_by_partition(&self, column_name: &str) -> Option<Vec<(Value, RowVec)>> {
         // Check if column has an index
         let index = self.version_store.get_index_by_column(column_name)?;
 
@@ -3079,18 +3006,18 @@ impl Table for MVCCTable {
         }
 
         // Collect rows grouped by partition value
-        let mut result: Vec<(Value, Vec<Row>)> = Vec::with_capacity(all_values.len());
+        let mut result: Vec<(Value, RowVec)> = Vec::with_capacity(all_values.len());
 
         for partition_value in all_values {
             // Get all row IDs for this partition value
             let row_ids = index.get_row_ids_equal(std::slice::from_ref(&partition_value));
 
             // Collect visible rows for this partition
-            let mut partition_rows = Vec::with_capacity(row_ids.len());
+            let mut partition_rows = RowVec::with_capacity(row_ids.len());
             for row_id in row_ids {
                 if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
                     if !version.is_deleted() {
-                        partition_rows.push(version.data.clone());
+                        partition_rows.push((row_id, version.data.clone()));
                     }
                 }
             }
@@ -3122,7 +3049,7 @@ impl Table for MVCCTable {
         &self,
         column_name: &str,
         partition_value: &Value,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<RowVec> {
         // Get index for the column
         let index = self.version_store.get_index_by_column(column_name)?;
 
@@ -3130,11 +3057,11 @@ impl Table for MVCCTable {
         let row_ids = index.get_row_ids_equal(std::slice::from_ref(partition_value));
 
         // Collect visible rows for this partition
-        let mut rows = Vec::with_capacity(row_ids.len());
+        let mut rows = RowVec::with_capacity(row_ids.len());
         for row_id in row_ids {
             if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
                 if !version.is_deleted() {
-                    rows.push(version.data.clone());
+                    rows.push((row_id, version.data.clone()));
                 }
             }
         }
@@ -3533,6 +3460,25 @@ impl Table for MVCCTable {
         drop(txn_versions);
 
         Some(self.version_store.max_column(self.txn_id, col_idx))
+    }
+
+    fn compute_grouped_aggregates(
+        &self,
+        group_by_indices: &[usize],
+        aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
+    ) -> Option<Vec<crate::storage::mvcc::version_store::GroupedAggregateResult>> {
+        // Only use storage-level aggregation if no uncommitted local changes
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        Some(self.version_store.compute_grouped_aggregates(
+            self.txn_id,
+            group_by_indices,
+            aggregates,
+        ))
     }
 }
 

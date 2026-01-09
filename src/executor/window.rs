@@ -34,6 +34,8 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
+use crate::common::CompactVec;
+use crate::core::row_vec::RowVec;
 use crate::core::value::NULL_VALUE;
 use crate::core::{Error, Result, Row, Value};
 
@@ -46,7 +48,7 @@ use crate::storage::traits::{QueryResult, Table};
 
 use super::context::ExecutionContext;
 use super::expression::{ExpressionEval, MultiExpressionEval};
-use super::result::ExecutorMemoryResult;
+use super::result::ExecutorResult;
 use super::utils::build_column_index_map;
 use super::Executor;
 
@@ -174,11 +176,12 @@ pub struct WindowPreGroupedState {
 
 impl Executor {
     /// Execute SELECT with window functions
+    /// Accepts &[(i64, Row)] to allow RowVec to be passed directly via deref
     pub(crate) fn execute_select_with_window_functions(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        base_rows: Vec<Row>,
+        base_rows: &[(i64, Row)],
         base_columns: &[String],
     ) -> Result<Box<dyn QueryResult>> {
         self.execute_select_with_window_functions_internal(
@@ -198,7 +201,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        base_rows: Vec<Row>,
+        base_rows: &[(i64, Row)],
         base_columns: &[String],
         pre_sorted: Option<WindowPreSortedState>,
     ) -> Result<Box<dyn QueryResult>> {
@@ -219,7 +222,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        base_rows: Vec<Row>,
+        base_rows: &[(i64, Row)],
         base_columns: &[String],
         pre_grouped: WindowPreGroupedState,
     ) -> Result<Box<dyn QueryResult>> {
@@ -238,7 +241,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        base_rows: Vec<Row>,
+        base_rows: &[(i64, Row)],
         base_columns: &[String],
         pre_sorted: Option<WindowPreSortedState>,
         pre_grouped: Option<WindowPreGroupedState>,
@@ -248,10 +251,11 @@ impl Executor {
 
         if window_functions.is_empty() {
             // No window functions found, return base result
-            return Ok(Box::new(ExecutorMemoryResult::new(
-                base_columns.to_vec(),
-                base_rows,
-            )));
+            let mut rows = RowVec::with_capacity(base_rows.len());
+            for (id, row) in base_rows.iter() {
+                rows.push((*id, row.clone()));
+            }
+            return Ok(Box::new(ExecutorResult::new(base_columns.to_vec(), rows)));
         }
 
         // OPTIMIZATION: LIMIT pushdown for PARTITION BY queries
@@ -308,7 +312,7 @@ impl Executor {
         for wf in &window_functions {
             let window_values = self.compute_window_function(
                 wf,
-                &base_rows,
+                base_rows,
                 base_columns,
                 &col_index_map,
                 ctx,
@@ -331,7 +335,8 @@ impl Executor {
 
         // Step 3: Build result rows based on SELECT list
         let num_rows = base_rows.len();
-        let mut result_rows: Vec<Row> = Vec::with_capacity(num_rows);
+        let mut result_rows = RowVec::with_capacity(num_rows);
+        let mut result_row_id = 0i64;
 
         // Build aliases from col_index_map for expression evaluation
         let agg_aliases: Vec<(String, usize)> =
@@ -413,7 +418,7 @@ impl Executor {
 
         // OPTIMIZATION: Pre-allocate ext_values buffer for extended expressions
         let ext_values_capacity = if !ext_expr_items.is_empty() {
-            base_rows.first().map_or(0, |r| r.len()) + added_wf_names.len()
+            base_rows.first().map_or(0, |r| r.1.len()) + added_wf_names.len()
         } else {
             0
         };
@@ -422,10 +427,9 @@ impl Executor {
         // Number of output columns
         let num_items = select_items.len();
 
-        for (row_idx, base_row) in base_rows.iter().enumerate() {
-            // OPTIMIZATION: Single Vec allocation per row (was 2 before: Option vec + collect)
-            // We build directly into the final values vec and move it into Row
-            let mut values: Vec<Value> = Vec::with_capacity(num_items);
+        for (row_idx, (_, base_row)) in base_rows.iter().enumerate() {
+            // Build values vec directly and move into Row
+            let mut values: CompactVec<Value> = CompactVec::with_capacity(num_items);
 
             // Fill values in order (push instead of index to avoid resize)
             for (item_idx, (item, _, _)) in transformed_items.iter().enumerate() {
@@ -487,13 +491,11 @@ impl Executor {
             }
 
             // Move values into Row (no clone needed)
-            result_rows.push(Row::from_values(values));
+            result_rows.push((result_row_id, Row::from_compact_vec(values)));
+            result_row_id += 1;
         }
 
-        Ok(Box::new(ExecutorMemoryResult::new(
-            result_columns,
-            result_rows,
-        )))
+        Ok(Box::new(ExecutorResult::new(result_columns, result_rows)))
     }
 
     /// Streaming execution for window functions with LIMIT pushdown
@@ -502,7 +504,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        base_rows: Vec<Row>,
+        base_rows: &[(i64, Row)],
         base_columns: &[String],
         window_functions: &[WindowFunctionInfo],
         limit: usize,
@@ -541,7 +543,7 @@ impl Executor {
             .collect();
 
         let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
-        for (i, row) in base_rows.iter().enumerate() {
+        for (i, (_, row)) in base_rows.iter().enumerate() {
             let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
             for idx_opt in &partition_indices {
                 let value = if let Some(&idx) = idx_opt.as_ref() {
@@ -563,7 +565,7 @@ impl Executor {
         let precomputed_order_by = if !wf_info.order_by.is_empty() {
             Some(self.precompute_order_by_values(
                 &wf_info.order_by,
-                &base_rows,
+                base_rows,
                 base_columns,
                 &col_index_map,
                 ctx,
@@ -573,7 +575,8 @@ impl Executor {
         };
 
         // Process partitions one at a time, stopping when we have enough rows
-        let mut result_rows: Vec<Row> = Vec::with_capacity(limit);
+        let mut result_rows = RowVec::with_capacity(limit);
+        let mut result_row_id = 0i64;
 
         // Convert to vec for sequential processing
         let partitions_vec: Vec<_> = partitions.into_iter().collect();
@@ -587,7 +590,7 @@ impl Executor {
             let (partition_results, sorted_indices) = self.compute_window_for_partition(
                 &*window_func,
                 wf_info,
-                &base_rows,
+                base_rows,
                 row_indices,
                 precomputed_order_by.as_ref(),
                 base_columns,
@@ -597,7 +600,7 @@ impl Executor {
             )?;
 
             // Pre-allocate ext_values buffer for extended expressions
-            let ext_capacity = base_rows.first().map_or(0, |r| r.len()) + 1;
+            let ext_capacity = base_rows.first().map_or(0, |r| r.1.len()) + 1;
             let mut ext_values: Vec<Value> = Vec::with_capacity(ext_capacity);
             let num_items = select_items.len();
 
@@ -607,11 +610,11 @@ impl Executor {
                     break; // Early exit within partition
                 }
 
-                let base_row = &base_rows[orig_idx];
+                let base_row = &base_rows[orig_idx].1;
                 let window_value = &partition_results[sorted_pos];
 
-                // OPTIMIZATION: Single Vec allocation per row, move into Row
-                let mut values: Vec<Value> = Vec::with_capacity(num_items);
+                // Build values vec for output row
+                let mut values: CompactVec<Value> = CompactVec::with_capacity(num_items);
 
                 // Build output row
                 for item in &select_items {
@@ -653,14 +656,12 @@ impl Executor {
                     };
                     values.push(value);
                 }
-                result_rows.push(Row::from_values(values));
+                result_rows.push((result_row_id, Row::from_compact_vec(values)));
+                result_row_id += 1;
             }
         }
 
-        Ok(Box::new(ExecutorMemoryResult::new(
-            result_columns,
-            result_rows,
-        )))
+        Ok(Box::new(ExecutorResult::new(result_columns, result_rows)))
     }
 
     /// Lazy partition fetching for window functions with LIMIT pushdown
@@ -712,7 +713,8 @@ impl Executor {
         };
 
         // Process partitions one at a time, stopping when we have enough rows
-        let mut result_rows: Vec<Row> = Vec::with_capacity(limit);
+        let mut result_rows = RowVec::with_capacity(limit);
+        let mut result_row_id = 0i64;
 
         for partition_value in partition_values {
             if result_rows.len() >= limit {
@@ -763,11 +765,11 @@ impl Executor {
                     break; // Early exit within partition
                 }
 
-                let base_row = &partition_rows[row_idx];
+                let (_, base_row) = &partition_rows[row_idx];
                 let window_value = &partition_results[sorted_pos];
 
                 // Build output row
-                let mut values: Vec<Value> = Vec::with_capacity(select_items.len());
+                let mut values: CompactVec<Value> = CompactVec::with_capacity(select_items.len());
                 for item in &select_items {
                     match &item.source {
                         SelectItemSource::BaseColumn(col_idx) => {
@@ -812,14 +814,12 @@ impl Executor {
                         }
                     }
                 }
-                result_rows.push(Row::from_values(values));
+                result_rows.push((result_row_id, Row::from_compact_vec(values)));
+                result_row_id += 1;
             }
         }
 
-        Ok(Box::new(ExecutorMemoryResult::new(
-            result_columns,
-            result_rows,
-        )))
+        Ok(Box::new(ExecutorResult::new(result_columns, result_rows)))
     }
 
     /// Parse SELECT list to determine output order and sources
@@ -1283,7 +1283,7 @@ impl Executor {
     fn compute_window_function(
         &self,
         wf_info: &WindowFunctionInfo,
-        rows: &[Row],
+        rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
         ctx: &ExecutionContext,
@@ -1412,7 +1412,7 @@ impl Executor {
                 })
                 .collect();
 
-            for (i, row) in rows.iter().enumerate() {
+            for (i, (_, row)) in rows.iter().enumerate() {
                 let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
                 for idx_opt in &partition_indices {
                     let value = if let Some(&idx) = idx_opt.as_ref() {
@@ -1513,7 +1513,7 @@ impl Executor {
         &self,
         window_func: &dyn WindowFunction,
         wf_info: &WindowFunctionInfo,
-        all_rows: &[Row],
+        all_rows: &[(i64, Row)],
         mut row_indices: Vec<usize>,
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
@@ -1563,6 +1563,7 @@ impl Executor {
                 .map(|&idx| {
                     if let Some(col_idx) = arg_col_idx {
                         return all_rows[idx]
+                            .1
                             .get(col_idx)
                             .cloned()
                             .unwrap_or_else(Value::null_unknown);
@@ -1610,7 +1611,7 @@ impl Executor {
                     wf_info,
                     &partition_values,
                     i,
-                    &all_rows[row_idx],
+                    &all_rows[row_idx].1,
                     columns,
                     ctx,
                 )?,
@@ -2076,7 +2077,7 @@ impl Executor {
     fn precompute_order_by_values(
         &self,
         order_by: &[OrderByExpression],
-        rows: &[Row],
+        rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
         ctx: &ExecutionContext,
@@ -2122,7 +2123,7 @@ impl Executor {
             match MultiExpressionEval::compile_with_aliases(&order_exprs, columns, &agg_aliases) {
                 Ok(eval) => {
                     let mut eval = eval.with_context(ctx);
-                    for row in rows {
+                    for (_, row) in rows {
                         match eval.eval_all(row) {
                             Ok(values) => {
                                 for (col_idx, value) in values.into_iter().enumerate() {
@@ -2173,7 +2174,7 @@ impl Executor {
                 let col = &mut result_columns[col_idx];
                 match idx_opt {
                     Some(src_idx) => {
-                        for row in rows {
+                        for (_, row) in rows {
                             col.push(
                                 row.get(*src_idx)
                                     .cloned()
@@ -2498,7 +2499,7 @@ impl Executor {
     fn compute_aggregate_window_function(
         &self,
         wf_info: &WindowFunctionInfo,
-        rows: &[Row],
+        rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &FxHashMap<String, usize>,
         ctx: &ExecutionContext,
@@ -2527,7 +2528,7 @@ impl Executor {
             let mut eval =
                 ExpressionEval::compile(&wf_info.arguments[0], columns)?.with_context(ctx);
             rows.iter()
-                .map(|row| eval.eval(row).unwrap_or_else(|_| Value::null_unknown()))
+                .map(|(_, row)| eval.eval(row).unwrap_or_else(|_| Value::null_unknown()))
                 .collect()
         } else {
             vec![]
@@ -2561,7 +2562,7 @@ impl Executor {
         // OPTIMIZATION: Use FxHashMap for fastest hash table operations with trusted keys
         let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
 
-        for (i, row) in rows.iter().enumerate() {
+        for (i, (_, row)) in rows.iter().enumerate() {
             let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
             for idx_opt in &partition_indices {
                 let value = if let Some(&idx) = idx_opt.as_ref() {
@@ -2849,6 +2850,7 @@ impl Executor {
                     for &idx in &row_indices[frame_start..frame_end] {
                         let value = if let Some(col_idx) = arg_col_idx {
                             rows[idx]
+                                .1
                                 .get(col_idx)
                                 .cloned()
                                 .unwrap_or_else(Value::null_unknown)
@@ -2879,6 +2881,7 @@ impl Executor {
                 for &row_idx in &row_indices {
                     let value = if let Some(col_idx) = arg_col_idx {
                         rows[row_idx]
+                            .1
                             .get(col_idx)
                             .cloned()
                             .unwrap_or_else(Value::null_unknown)
