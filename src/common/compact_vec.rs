@@ -300,17 +300,28 @@ impl<T> CompactVec<T> {
         let iter = iter.into_iter();
         let (lower, upper) = iter.size_hint();
 
-        // If exact size is known, write directly without per-element bounds checks
+        // If exact size is known, write directly with bounds protection
         if Some(lower) == upper && lower > 0 {
             self.reserve(lower);
             let mut len = self.len();
+            let cap = self.capacity();
             // SAFETY:
             // - reserve(lower) guarantees capacity for `lower` more elements
-            // - ExactSizeIterator (lower == upper) guarantees exactly `lower` items
-            // - We write each item and increment len, then set_len at the end
+            // - We add bounds check (len < cap) to protect against malicious iterators
+            //   that yield more elements than size_hint promised
+            // - If iterator yields fewer elements, we only set_len to actual count
             unsafe {
                 let ptr = self.ptr.as_ptr();
                 for item in iter {
+                    if len >= cap {
+                        // Iterator lied about size - fall back to safe push
+                        // First, set length to what we've written so far
+                        self.set_len(len);
+                        self.push(item);
+                        len = self.len();
+                        // Continue with remaining items using push
+                        continue;
+                    }
                     ptr::write(ptr.add(len), item);
                     len += 1;
                 }
@@ -529,17 +540,26 @@ impl<T> FromIterator<T> for CompactVec<T> {
         let iter = iter.into_iter();
         let (lower, upper) = iter.size_hint();
 
-        // If exact size is known, write directly without per-element bounds checks
+        // If exact size is known, write directly with bounds protection
         if Some(lower) == upper && lower > 0 {
             let mut vec = Self::with_capacity(lower);
+            let cap = vec.capacity();
             // SAFETY:
             // - with_capacity(lower) guarantees capacity >= lower
-            // - ExactSizeIterator guarantees exactly `lower` items
-            // - We write each item sequentially and set_len at the end
+            // - We add bounds check (len < cap) to protect against malicious iterators
+            //   that yield more elements than size_hint promised
+            // - If iterator yields fewer elements, we only set_len to actual count
             unsafe {
                 let ptr = vec.ptr.as_ptr();
                 let mut len = 0;
                 for item in iter {
+                    if len >= cap {
+                        // Iterator lied about size - fall back to safe push
+                        vec.set_len(len);
+                        vec.push(item);
+                        len = vec.len();
+                        continue;
+                    }
                     ptr::write(ptr.add(len), item);
                     len += 1;
                 }
