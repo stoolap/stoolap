@@ -688,4 +688,50 @@ mod tests {
 
         tx.rollback().unwrap();
     }
+
+    #[test]
+    fn test_transaction_lost_after_install_failure() {
+        // BUG TEST: Transaction is lost when install_external_transaction fails
+        //
+        // Scenario:
+        // 1. Start transaction via db.execute("BEGIN") - installs into executor
+        // 2. Create Transaction API transaction (db.begin())
+        // 3. Call tx.execute() which tries to install tx's transaction
+        // 4. install_external_transaction FAILS because executor already has one
+        // 5. BUG: Transaction is dropped, self.tx becomes None
+        // 6. Subsequent operations silently fail or misbehave
+
+        let db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE test_conflict (id INTEGER)", ()).unwrap();
+
+        // Step 1: Start transaction via executor directly
+        db.execute("BEGIN", ()).unwrap();
+
+        // Step 2: Create Transaction API transaction
+        let mut tx = db.begin().unwrap();
+        let tx_id_before = tx.id();
+        println!("Transaction ID before: {}", tx_id_before);
+        assert!(tx_id_before > 0, "Should have valid transaction ID");
+
+        // Step 3-4: This will fail because executor already has a transaction
+        let result = tx.execute("INSERT INTO test_conflict VALUES (1)", ());
+        assert!(result.is_err(), "Should fail - executor already has transaction");
+        println!("Execute error: {:?}", result.err());
+
+        // Step 5-6: BUG DETECTION - Transaction ID should still be valid
+        let tx_id_after = tx.id();
+        println!("Transaction ID after: {}", tx_id_after);
+
+        // If bug exists, tx_id_after will be -1 (because self.tx is None)
+        // If fixed, tx_id_after should equal tx_id_before
+        assert_eq!(
+            tx_id_before, tx_id_after,
+            "BUG: Transaction was lost! ID changed from {} to {}",
+            tx_id_before, tx_id_after
+        );
+
+        // Clean up
+        let _ = db.execute("ROLLBACK", ());
+        let _ = tx.rollback();
+    }
 }
