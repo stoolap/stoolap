@@ -68,8 +68,8 @@ static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<FxHashMap<String, Arc<Datab
 
 /// Inner database state (shared between Database instances with same DSN)
 pub(crate) struct DatabaseInner {
-    engine: Arc<MVCCEngine>,
-    executor: Mutex<Executor>,
+    pub(crate) engine: Arc<MVCCEngine>,
+    pub(crate) executor: Mutex<Executor>,
     dsn: String,
 }
 
@@ -804,7 +804,7 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let tx = executor.begin_transaction_with_isolation(isolation)?;
-        Ok(Transaction::new(tx))
+        Ok(Transaction::new(tx, Arc::clone(&self.inner)))
     }
 
     /// Get the underlying storage engine

@@ -646,6 +646,66 @@ impl Executor {
         let _ = tx.set_isolation_level(isolation);
         Ok(tx)
     }
+
+    /// Install an external transaction for use by subsequent execute calls.
+    ///
+    /// This is used by the Transaction API to route queries through the full
+    /// executor pipeline while using an externally-managed transaction.
+    ///
+    /// Returns an error if there is already an active transaction.
+    pub fn install_external_transaction(&self, tx: Box<dyn Transaction>) -> Result<()> {
+        let mut active_tx = self.active_transaction.lock().unwrap();
+        if active_tx.is_some() {
+            return Err(Error::internal(
+                "Cannot install external transaction: active transaction already exists",
+            ));
+        }
+        *active_tx = Some(ActiveTransaction {
+            transaction: tx,
+            tables: FxHashMap::default(),
+        });
+        Ok(())
+    }
+
+    /// Take the external transaction back after execution.
+    ///
+    /// Returns the transaction that was previously installed via `install_external_transaction`.
+    /// Returns None if no transaction is installed.
+    pub fn take_external_transaction(&self) -> Option<Box<dyn Transaction>> {
+        let mut active_tx = self.active_transaction.lock().unwrap();
+        active_tx.take().map(|tx_state| tx_state.transaction)
+    }
+}
+
+/// RAII guard that ensures the external transaction is restored even on panic.
+///
+/// When dropped, this guard takes the transaction back from the executor's
+/// `active_transaction` slot and stores it in the provided `Option`.
+pub struct ExternalTransactionGuard<'a> {
+    executor: &'a Executor,
+    tx_slot: &'a mut Option<Box<dyn Transaction>>,
+}
+
+impl<'a> ExternalTransactionGuard<'a> {
+    /// Create a new guard that will restore the transaction on drop.
+    ///
+    /// The transaction is taken from `tx_slot` and installed into the executor.
+    /// On drop (including panic), the transaction is taken back and stored in `tx_slot`.
+    pub fn new(
+        executor: &'a Executor,
+        tx_slot: &'a mut Option<Box<dyn Transaction>>,
+    ) -> Result<Self> {
+        let tx = tx_slot.take().ok_or(Error::TransactionNotStarted)?;
+        executor.install_external_transaction(tx)?;
+        Ok(Self { executor, tx_slot })
+    }
+}
+
+impl Drop for ExternalTransactionGuard<'_> {
+    fn drop(&mut self) {
+        // Always try to take the transaction back, even on panic
+        *self.tx_slot = self.executor.take_external_transaction();
+    }
 }
 
 /// Count the number of parameter placeholders in a statement
