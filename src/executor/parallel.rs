@@ -41,6 +41,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::common::CompactVec;
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::FunctionRegistry;
@@ -743,7 +744,7 @@ pub fn parallel_hash_join(
                                     build_col_count,
                                     swapped,
                                 );
-                                local_results.push(Row::from_values(combined));
+                                local_results.push(Row::from_compact_vec(combined));
                             }
                         }
                     }
@@ -789,7 +790,7 @@ pub fn parallel_hash_join(
                                     build_col_count,
                                     swapped,
                                 );
-                                matched_results.push(Row::from_values(combined));
+                                matched_results.push(Row::from_compact_vec(combined));
                             }
                         }
                     }
@@ -802,7 +803,7 @@ pub fn parallel_hash_join(
                             build_col_count,
                             swapped,
                         );
-                        unmatched_results.push(Row::from_values(values));
+                        unmatched_results.push(Row::from_compact_vec(values));
                     }
                 }
 
@@ -866,7 +867,7 @@ pub fn parallel_hash_join(
                             build_col_count,
                             swapped,
                         );
-                        matched_rows.push(Row::from_values(combined));
+                        matched_rows.push(Row::from_compact_vec(combined));
                     }
                 }
             }
@@ -875,7 +876,7 @@ pub fn parallel_hash_join(
             if !matched && needs_unmatched_probe {
                 let values =
                     combine_with_nulls(probe_row, probe_col_count, build_col_count, swapped);
-                matched_rows.push(Row::from_values(values));
+                matched_rows.push(Row::from_compact_vec(values));
             }
         }
 
@@ -892,7 +893,7 @@ pub fn parallel_hash_join(
             if !tracker.was_matched(build_idx) {
                 let values =
                     combine_build_with_nulls(build_row, build_col_count, probe_col_count, swapped);
-                result_rows.push(Row::from_values(values));
+                result_rows.push(Row::from_compact_vec(values));
             }
         }
     }
@@ -916,8 +917,10 @@ fn combine_join_rows(
     probe_col_count: usize,
     build_col_count: usize,
     swapped: bool,
-) -> Vec<Value> {
-    let mut combined = Vec::with_capacity(probe_col_count + build_col_count);
+) -> CompactVec<Value> {
+    // Use CompactVec directly to avoid Vec→CompactVec conversion in Row::from_values
+    let mut combined: CompactVec<Value> =
+        CompactVec::with_capacity(probe_col_count + build_col_count);
     if swapped {
         // Build was originally left, probe was originally right
         for i in 0..build_col_count {
@@ -945,8 +948,10 @@ fn combine_with_nulls(
     probe_col_count: usize,
     build_col_count: usize,
     swapped: bool,
-) -> Vec<Value> {
-    let mut combined = Vec::with_capacity(probe_col_count + build_col_count);
+) -> CompactVec<Value> {
+    // Use CompactVec directly to avoid Vec→CompactVec conversion in Row::from_values
+    let mut combined: CompactVec<Value> =
+        CompactVec::with_capacity(probe_col_count + build_col_count);
     if swapped {
         // Build (left) is NULL, probe (right) has values
         combined.extend(std::iter::repeat_n(NULL_VALUE, build_col_count));
@@ -970,8 +975,10 @@ fn combine_build_with_nulls(
     build_col_count: usize,
     probe_col_count: usize,
     swapped: bool,
-) -> Vec<Value> {
-    let mut combined = Vec::with_capacity(probe_col_count + build_col_count);
+) -> CompactVec<Value> {
+    // Use CompactVec directly to avoid Vec→CompactVec conversion in Row::from_values
+    let mut combined: CompactVec<Value> =
+        CompactVec::with_capacity(probe_col_count + build_col_count);
     if swapped {
         // Build (left) has values, probe (right) is NULL
         for i in 0..build_col_count {

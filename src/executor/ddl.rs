@@ -699,39 +699,6 @@ impl Executor {
         Ok(Box::new(ExecResult::empty()))
     }
 
-    /// Execute a CREATE COLUMNAR INDEX statement
-    ///
-    /// DEPRECATED: The COLUMNAR INDEX syntax is deprecated.
-    /// Use `CREATE INDEX` instead - the index type (BTree, Hash, Bitmap)
-    /// is automatically selected based on the column data type:
-    /// - INTEGER, FLOAT, TIMESTAMP -> BTree (range queries)
-    /// - TEXT, JSON -> Hash (O(1) equality lookups)
-    /// - BOOLEAN -> Bitmap (low cardinality)
-    /// - Multiple columns -> MultiColumn composite index
-    pub(crate) fn execute_create_columnar_index(
-        &self,
-        _stmt: &CreateColumnarIndexStatement,
-        _ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        Err(Error::internal(
-            "CREATE COLUMNAR INDEX syntax is deprecated. Use CREATE INDEX instead - the index type is auto-selected based on column type.",
-        ))
-    }
-
-    /// Execute a DROP COLUMNAR INDEX statement
-    ///
-    /// DEPRECATED: The COLUMNAR INDEX syntax is deprecated.
-    /// Use `DROP INDEX index_name ON table_name` instead.
-    pub(crate) fn execute_drop_columnar_index(
-        &self,
-        _stmt: &DropColumnarIndexStatement,
-        _ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        Err(Error::internal(
-            "DROP COLUMNAR INDEX syntax is deprecated. Use DROP INDEX index_name ON table_name instead.",
-        ))
-    }
-
     /// Parse a SQL data type string to DataType enum
     pub(crate) fn parse_data_type(&self, type_str: &str) -> Result<DataType> {
         let upper = type_str.to_uppercase();

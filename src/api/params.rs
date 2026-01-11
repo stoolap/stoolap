@@ -48,8 +48,8 @@ use smallvec::SmallVec;
 use crate::core::Value;
 
 /// Type alias for parameter vectors.
-/// Uses SmallVec to avoid heap allocation for queries with ≤4 parameters (the common case).
-pub type ParamVec = SmallVec<[Value; 4]>;
+/// Uses SmallVec to avoid heap allocation for queries with ≤8 parameters (the common case).
+pub type ParamVec = SmallVec<[Value; 8]>;
 
 /// Trait for types that can be converted to SQL parameters
 ///

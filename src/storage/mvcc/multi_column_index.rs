@@ -37,11 +37,12 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
+use crate::common::CompactArc;
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
@@ -124,9 +125,9 @@ pub struct MultiColumnIndex {
     prefix_indexes: Vec<RwLock<FxHashMap<CompositeKey, SmallVec<[i64; 4]>>>>,
     prefix_built: Vec<AtomicBool>,
 
-    /// Reverse mapping for removal - uses Vec<Arc<Value>> for memory efficiency
+    /// Reverse mapping for removal - uses Vec<CompactArc<Value>> for memory efficiency
     /// Arc references are shared with ValueArena (8 bytes per value)
-    row_to_key: RwLock<FxHashMap<i64, Vec<Arc<Value>>>>,
+    row_to_key: RwLock<FxHashMap<i64, Vec<CompactArc<Value>>>>,
 }
 
 impl std::fmt::Debug for MultiColumnIndex {
@@ -180,10 +181,10 @@ impl MultiColumnIndex {
         }
     }
 
-    /// Helper to compare stored Arc<Value> with input &[Value]
+    /// Helper to compare stored CompactArc<Value> with input &[Value]
     /// Specialized unrolling for common cases (1-4 columns): ~5% faster than zip().all()
     #[inline]
-    fn values_match(stored: &[Arc<Value>], input: &[Value]) -> bool {
+    fn values_match(stored: &[CompactArc<Value>], input: &[Value]) -> bool {
         if stored.len() != input.len() {
             return false;
         }
@@ -209,13 +210,13 @@ impl MultiColumnIndex {
         }
     }
 
-    /// Helper to compare stored Arc<Value> with input &[Arc<Value>]
+    /// Helper to compare stored CompactArc<Value> with input &[CompactArc<Value>]
     /// Specialized unrolling for common cases (1-4 columns): ~5% faster than zip().all()
     #[inline]
-    fn arc_values_match(stored: &[Arc<Value>], input: &[Arc<Value>]) -> bool {
+    fn arc_values_match(stored: &[CompactArc<Value>], input: &[CompactArc<Value>]) -> bool {
         #[inline]
-        fn eq(s: &Arc<Value>, i: &Arc<Value>) -> bool {
-            Arc::ptr_eq(s, i) || s.as_ref() == i.as_ref()
+        fn eq(s: &CompactArc<Value>, i: &CompactArc<Value>) -> bool {
+            CompactArc::ptr_eq(s, i) || s.as_ref() == i.as_ref()
         }
         if stored.len() != input.len() {
             return false;
@@ -236,7 +237,7 @@ impl MultiColumnIndex {
             _ => stored
                 .iter()
                 .zip(input.iter())
-                .all(|(s, i)| Arc::ptr_eq(s, i) || s.as_ref() == i.as_ref()),
+                .all(|(s, i)| CompactArc::ptr_eq(s, i) || s.as_ref() == i.as_ref()),
         }
     }
 
@@ -291,7 +292,7 @@ impl MultiColumnIndex {
         // Insert in sorted order for O(N+M) merge operations
         for (&row_id, arc_values) in row_to_key.iter() {
             if arc_values.len() >= prefix_len {
-                // Dereference Arc<Value> to create CompositeKey for prefix
+                // Dereference CompactArc<Value> to create CompositeKey for prefix
                 let prefix_key = CompositeKey(
                     arc_values[..prefix_len]
                         .iter()
@@ -371,7 +372,8 @@ impl Index for MultiColumnIndex {
         let key = CompositeKey(values.to_vec());
 
         // Wrap values in Arc for O(1) cloning in row_to_key
-        let arc_values: Vec<Arc<Value>> = values.iter().map(|v| Arc::new(v.clone())).collect();
+        let arc_values: Vec<CompactArc<Value>> =
+            values.iter().map(|v| CompactArc::new(v.clone())).collect();
 
         // Acquire BOTH write locks FIRST to prevent race conditions during updates
         // Lock order: value_to_rows → row_to_key (same as remove())
@@ -381,7 +383,7 @@ impl Index for MultiColumnIndex {
         // Check if row already exists with different key (for updates)
         // Now safe to do atomically since we hold both write locks
         if let Some(existing_arc_values) = row_to_key.get(&row_id) {
-            // Compare Arc<Value> contents with new values using optimized helper
+            // Compare CompactArc<Value> contents with new values using optimized helper
             if Self::values_match(existing_arc_values, values) {
                 // Same key, nothing to do
                 return Ok(());
@@ -447,7 +449,7 @@ impl Index for MultiColumnIndex {
             hash_rows.insert(pos, row_id);
         }
 
-        // Store Arc<Value> references in row_to_key (memory efficient)
+        // Store CompactArc<Value> references in row_to_key (memory efficient)
         row_to_key.insert(row_id, arc_values);
 
         // Update BTree only if it was already built
@@ -478,7 +480,7 @@ impl Index for MultiColumnIndex {
         Ok(())
     }
 
-    fn add_arc(&self, values: &[Arc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
+    fn add_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
         }
@@ -496,7 +498,7 @@ impl Index for MultiColumnIndex {
         let key = CompositeKey(values.iter().map(|a| (**a).clone()).collect());
 
         // Clone Arc references - O(1) per value, no value cloning!
-        let arc_values: Vec<Arc<Value>> = values.iter().map(Arc::clone).collect();
+        let arc_values: Vec<CompactArc<Value>> = values.iter().map(CompactArc::clone).collect();
 
         // Acquire BOTH write locks FIRST to prevent race conditions during updates
         // Lock order: value_to_rows → row_to_key (same as remove())
@@ -572,7 +574,7 @@ impl Index for MultiColumnIndex {
             hash_rows.insert(pos, row_id);
         }
 
-        // Store Arc<Value> references in row_to_key (memory efficient - O(1) clones)
+        // Store CompactArc<Value> references in row_to_key (memory efficient - O(1) clones)
         row_to_key.insert(row_id, arc_values);
 
         // Update BTree only if it was already built
@@ -670,7 +672,7 @@ impl Index for MultiColumnIndex {
         Ok(())
     }
 
-    fn remove_arc(&self, values: &[Arc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
+    fn remove_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
         }

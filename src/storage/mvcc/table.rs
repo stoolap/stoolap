@@ -21,7 +21,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::{Arc, RwLock};
 
-use crate::common::Int64Set;
+use crate::common::{CompactArc, Int64Set};
 use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, SchemaColumn, Value};
 use crate::storage::expression::Expression;
 use crate::storage::mvcc::bitmap_index::BitmapIndex;
@@ -1007,100 +1007,100 @@ impl MVCCTable {
     /// This method updates indexes before committing versions to the global store.
     pub fn commit(&mut self) -> Result<()> {
         // Update indexes using already-cached old versions (no extra lookups needed)
-        let index_names = self.version_store.list_indexes();
+        // OPTIMIZATION: get_all_indexes() returns Arc clones (cheap atomic increment)
+        // instead of String clones + HashMap lookups per index
+        let indexes = self.version_store.get_all_indexes();
 
-        if !index_names.is_empty() {
+        if !indexes.is_empty() {
             let txn_versions = self.txn_versions.read().unwrap();
             for (row_id, new_version, old_row) in txn_versions.iter_local_with_old() {
                 let is_deleted = new_version.is_deleted();
                 let new_row = &new_version.data;
 
-                for index_name in &index_names {
-                    if let Some(index) = self.version_store.get_index(index_name) {
-                        let column_ids = index.column_ids();
-                        if column_ids.is_empty() {
+                for index in &indexes {
+                    let column_ids = index.column_ids();
+                    if column_ids.is_empty() {
+                        continue;
+                    }
+
+                    // OPTIMIZATION: For UPDATEs, check if any indexed column changed
+                    // BEFORE allocating Vecs. This avoids allocation overhead when
+                    // updating columns that aren't indexed.
+                    if let Some(old_r) = old_row {
+                        if !is_deleted {
+                            // UPDATE case: check if indexed columns differ (no allocation)
+                            let any_changed = column_ids.iter().any(|&col_id| {
+                                let idx = col_id as usize;
+                                let old_val = old_r.get(idx);
+                                let new_val = new_row.get(idx);
+                                old_val != new_val
+                            });
+
+                            if !any_changed {
+                                // Indexed columns unchanged - skip this index entirely
+                                continue;
+                            }
+
+                            // Values differ - collect and update using Arc variants
+                            let old_values: SmallVec<[CompactArc<Value>; 2]> = column_ids
+                                .iter()
+                                .map(|&col_id| {
+                                    old_r.get_arc(col_id as usize).unwrap_or_else(|| {
+                                        CompactArc::new(Value::Null(DataType::Null))
+                                    })
+                                })
+                                .collect();
+
+                            let new_values: SmallVec<[CompactArc<Value>; 2]> = column_ids
+                                .iter()
+                                .map(|&col_id| {
+                                    new_row.get_arc(col_id as usize).unwrap_or_else(|| {
+                                        CompactArc::new(Value::Null(DataType::Null))
+                                    })
+                                })
+                                .collect();
+
+                            let _ = index.remove_arc(&old_values, row_id, row_id);
+                            index.add_arc(&new_values, row_id, row_id)?;
                             continue;
                         }
+                    }
 
-                        // OPTIMIZATION: For UPDATEs, check if any indexed column changed
-                        // BEFORE allocating Vecs. This avoids allocation overhead when
-                        // updating columns that aren't indexed.
-                        if let Some(old_r) = old_row {
-                            if !is_deleted {
-                                // UPDATE case: check if indexed columns differ (no allocation)
-                                let any_changed = column_ids.iter().any(|&col_id| {
-                                    let idx = col_id as usize;
-                                    let old_val = old_r.get(idx);
-                                    let new_val = new_row.get(idx);
-                                    old_val != new_val
-                                });
-
-                                if !any_changed {
-                                    // Indexed columns unchanged - skip this index entirely
-                                    continue;
-                                }
-
-                                // Values differ - collect and update using Arc variants
-                                let old_values: SmallVec<[Arc<Value>; 2]> = column_ids
+                    if is_deleted {
+                        // DELETE: remove from index using Arc values
+                        let values_to_remove: SmallVec<[CompactArc<Value>; 2]> =
+                            if let Some(old_r) = old_row {
+                                column_ids
                                     .iter()
                                     .map(|&col_id| {
                                         old_r.get_arc(col_id as usize).unwrap_or_else(|| {
-                                            Arc::new(Value::Null(DataType::Null))
+                                            CompactArc::new(Value::Null(DataType::Null))
                                         })
                                     })
-                                    .collect();
-
-                                let new_values: SmallVec<[Arc<Value>; 2]> = column_ids
+                                    .collect()
+                            } else {
+                                column_ids
                                     .iter()
                                     .map(|&col_id| {
                                         new_row.get_arc(col_id as usize).unwrap_or_else(|| {
-                                            Arc::new(Value::Null(DataType::Null))
+                                            CompactArc::new(Value::Null(DataType::Null))
                                         })
                                     })
-                                    .collect();
-
-                                let _ = index.remove_arc(&old_values, row_id, row_id);
-                                index.add_arc(&new_values, row_id, row_id)?;
-                                continue;
-                            }
-                        }
-
-                        if is_deleted {
-                            // DELETE: remove from index using Arc values
-                            let values_to_remove: SmallVec<[Arc<Value>; 2]> =
-                                if let Some(old_r) = old_row {
-                                    column_ids
-                                        .iter()
-                                        .map(|&col_id| {
-                                            old_r.get_arc(col_id as usize).unwrap_or_else(|| {
-                                                Arc::new(Value::Null(DataType::Null))
-                                            })
-                                        })
-                                        .collect()
-                                } else {
-                                    column_ids
-                                        .iter()
-                                        .map(|&col_id| {
-                                            new_row.get_arc(col_id as usize).unwrap_or_else(|| {
-                                                Arc::new(Value::Null(DataType::Null))
-                                            })
-                                        })
-                                        .collect()
-                                };
-                            let _ = index.remove_arc(&values_to_remove, row_id, row_id);
-                        } else {
-                            // INSERT: use add_arc to avoid Value cloning
-                            // SmallVec inlines 1-2 values (most indexes are single-column)
-                            let new_values: SmallVec<[Arc<Value>; 2]> = column_ids
-                                .iter()
-                                .map(|&col_id| {
-                                    new_row
-                                        .get_arc(col_id as usize)
-                                        .unwrap_or_else(|| Arc::new(Value::Null(DataType::Null)))
-                                })
-                                .collect();
-                            index.add_arc(&new_values, row_id, row_id)?;
-                        }
+                                    .collect()
+                            };
+                        let _ = index.remove_arc(&values_to_remove, row_id, row_id);
+                    } else {
+                        // INSERT: use add_arc to avoid Value cloning
+                        // SmallVec inlines 1-2 values (most indexes are single-column)
+                        let new_values: SmallVec<[CompactArc<Value>; 2]> = column_ids
+                            .iter()
+                            .map(|&col_id| {
+                                new_row
+                                    .get_arc(col_id as usize)
+                                    .unwrap_or_else(|| CompactArc::new(Value::Null(DataType::Null)))
+                            })
+                            .collect();
+                        index.add_arc(&new_values, row_id, row_id)?;
                     }
                 }
             }

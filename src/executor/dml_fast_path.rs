@@ -26,7 +26,7 @@ use std::sync::{Arc, RwLock};
 
 use compact_str::CompactString;
 
-use crate::core::{Result, Row, Value};
+use crate::core::{Result, Row, Schema, Value};
 use crate::parser::ast::{DeleteStatement, Expression, UpdateStatement};
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpression};
 use crate::storage::traits::{Engine, QueryResult};
@@ -277,10 +277,18 @@ impl Executor {
                         let value = Self::extract_update_value_from_slice(&u.value_source, params)?;
                         updates.push((u.column_idx, value.coerce_to_type(u.column_type)));
                     }
-                    // Clone what we need before dropping guard
-                    let update_clone = update.clone();
+                    // Clone only what we need (cheap: CompactString + Arc)
+                    let table_name = update.table_name.clone();
+                    let pk_column_name = update.pk_column_name.clone();
+                    let schema = Arc::clone(&update.schema);
                     drop(compiled_guard);
-                    return Some(self.execute_pk_update_direct(&update_clone, pk_value, updates));
+                    return Some(self.execute_pk_update_minimal(
+                        &table_name,
+                        &pk_column_name,
+                        &schema,
+                        pk_value,
+                        updates,
+                    ));
                 }
                 None // Epoch changed, use normal path
             }
@@ -305,10 +313,17 @@ impl Executor {
                 if self.engine.schema_epoch() == delete.cached_epoch {
                     let pk_value =
                         Self::extract_pk_value_from_params(&delete.pk_value_source, params)?;
-                    // Clone what we need before dropping guard
-                    let delete_clone = delete.clone();
+                    // Clone only what we need (cheap: CompactString + Arc)
+                    let table_name = delete.table_name.clone();
+                    let pk_column_name = delete.pk_column_name.clone();
+                    let schema = Arc::clone(&delete.schema);
                     drop(compiled_guard);
-                    return Some(self.execute_compiled_pk_delete(&delete_clone, pk_value));
+                    return Some(self.execute_pk_delete_minimal(
+                        &table_name,
+                        &pk_column_name,
+                        &schema,
+                        pk_value,
+                    ));
                 }
                 None // Epoch changed, use normal path
             }
@@ -317,24 +332,26 @@ impl Executor {
         }
     }
 
-    /// Execute PK update directly with pre-extracted values (no ExecutionContext needed)
-    fn execute_pk_update_direct(
+    /// Execute PK update with minimal data (avoids cloning CompiledPkUpdate)
+    fn execute_pk_update_minimal(
         &self,
-        compiled: &CompiledPkUpdate,
+        table_name: &str,
+        pk_column_name: &str,
+        schema: &Arc<Schema>,
         pk_value: i64,
         updates: Vec<(usize, Value)>,
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
         let tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(&compiled.table_name)?;
+        let mut table = tx.get_table(table_name)?;
 
         // Build WHERE expression for PK lookup
         let mut pk_expr = ComparisonExpr::new(
-            compiled.pk_column_name.as_str(),
+            pk_column_name,
             crate::core::Operator::Eq,
             Value::Integer(pk_value),
         );
-        pk_expr.prepare_for_schema(&compiled.schema);
+        pk_expr.prepare_for_schema(schema);
 
         // Execute update with simple setter
         let mut setter = |mut row: Row| -> (Row, bool) {
@@ -348,8 +365,47 @@ impl Executor {
 
         // Invalidate caches
         if rows_affected > 0 {
-            self.semantic_cache.invalidate_table(&compiled.table_name);
-            invalidate_semi_join_cache_for_table(&compiled.table_name);
+            self.semantic_cache.invalidate_table(table_name);
+            invalidate_semi_join_cache_for_table(table_name);
+        }
+
+        // Commit
+        drop(table);
+        let mut tx = tx;
+        tx.commit()?;
+
+        Ok(Box::new(ExecResult::with_rows_affected(
+            rows_affected as i64,
+        )))
+    }
+
+    /// Execute PK delete with minimal data (avoids cloning CompiledPkDelete)
+    fn execute_pk_delete_minimal(
+        &self,
+        table_name: &str,
+        pk_column_name: &str,
+        schema: &Arc<Schema>,
+        pk_value: i64,
+    ) -> Result<Box<dyn QueryResult>> {
+        // Create auto-commit transaction
+        let tx = self.engine.begin_transaction()?;
+        let mut table = tx.get_table(table_name)?;
+
+        // Build WHERE expression for PK lookup
+        let mut pk_expr = ComparisonExpr::new(
+            pk_column_name,
+            crate::core::Operator::Eq,
+            Value::Integer(pk_value),
+        );
+        pk_expr.prepare_for_schema(schema);
+
+        // Execute delete
+        let rows_affected = table.delete(Some(&pk_expr))?;
+
+        // Invalidate caches
+        if rows_affected > 0 {
+            self.semantic_cache.invalidate_table(table_name);
+            invalidate_semi_join_cache_for_table(table_name);
         }
 
         // Commit
@@ -366,26 +422,14 @@ impl Executor {
     // EXECUTION METHODS
     // ============================================================================
 
-    /// Execute a compiled PK update
+    /// Execute a compiled PK update (extracts values from ctx then delegates to core impl)
     fn execute_compiled_pk_update(
         &self,
         compiled: &CompiledPkUpdate,
         pk_value: i64,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        // Create auto-commit transaction
-        let tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(&compiled.table_name)?;
-
-        // Build WHERE expression for PK lookup using cached column name
-        let mut pk_expr = ComparisonExpr::new(
-            compiled.pk_column_name.as_str(),
-            crate::core::Operator::Eq,
-            Value::Integer(pk_value),
-        );
-        pk_expr.prepare_for_schema(&compiled.schema);
-
-        // Extract values from compiled sources (pre-allocate for typical 1-3 column updates)
+        // Extract values from compiled sources
         let mut updates = Vec::with_capacity(compiled.updates.len());
         for u in &compiled.updates {
             let value = match &u.value_source {
@@ -401,67 +445,27 @@ impl Executor {
             updates.push((u.column_idx, value.coerce_to_type(u.column_type)));
         }
 
-        // Execute update with simple setter
-        let mut setter = |mut row: Row| -> (Row, bool) {
-            for (idx, new_value) in &updates {
-                let _ = row.set(*idx, new_value.clone());
-            }
-            (row, true)
-        };
-
-        let rows_affected = table.update(Some(&pk_expr), &mut setter)?;
-
-        // Invalidate caches
-        if rows_affected > 0 {
-            self.semantic_cache.invalidate_table(&compiled.table_name);
-            invalidate_semi_join_cache_for_table(&compiled.table_name);
-        }
-
-        // Commit
-        drop(table);
-        let mut tx = tx;
-        tx.commit()?;
-
-        Ok(Box::new(ExecResult::with_rows_affected(
-            rows_affected as i64,
-        )))
+        self.execute_pk_update_minimal(
+            &compiled.table_name,
+            &compiled.pk_column_name,
+            &compiled.schema,
+            pk_value,
+            updates,
+        )
     }
 
-    /// Execute a compiled PK delete
+    /// Execute a compiled PK delete (delegates to core impl)
     fn execute_compiled_pk_delete(
         &self,
         compiled: &CompiledPkDelete,
         pk_value: i64,
     ) -> Result<Box<dyn QueryResult>> {
-        // Create auto-commit transaction
-        let tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(&compiled.table_name)?;
-
-        // Build WHERE expression for PK lookup using cached schema and column name
-        let mut pk_expr = ComparisonExpr::new(
-            compiled.pk_column_name.as_str(),
-            crate::core::Operator::Eq,
-            Value::Integer(pk_value),
-        );
-        pk_expr.prepare_for_schema(&compiled.schema);
-
-        // Execute delete
-        let rows_affected = table.delete(Some(&pk_expr))?;
-
-        // Invalidate caches
-        if rows_affected > 0 {
-            self.semantic_cache.invalidate_table(&compiled.table_name);
-            invalidate_semi_join_cache_for_table(&compiled.table_name);
-        }
-
-        // Commit
-        drop(table);
-        let mut tx = tx;
-        tx.commit()?;
-
-        Ok(Box::new(ExecResult::with_rows_affected(
-            rows_affected as i64,
-        )))
+        self.execute_pk_delete_minimal(
+            &compiled.table_name,
+            &compiled.pk_column_name,
+            &compiled.schema,
+            pk_value,
+        )
     }
 
     // ============================================================================

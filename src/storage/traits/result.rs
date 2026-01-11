@@ -16,8 +16,8 @@
 //!
 
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
 
+use crate::common::CompactArc;
 use crate::core::{Result, Row, Value};
 
 /// QueryResult represents the result of a SQL query
@@ -47,7 +47,7 @@ pub trait QueryResult: Send {
     /// This is an optimization for the API layer to avoid cloning column names.
     /// Default implementation returns None, meaning caller should fall back to
     /// cloning from columns().
-    fn columns_arc(&self) -> Option<Arc<Vec<String>>> {
+    fn columns_arc(&self) -> Option<CompactArc<Vec<String>>> {
         None
     }
 
@@ -98,12 +98,12 @@ pub trait QueryResult: Send {
         0
     }
 
-    /// Try to extract all rows as Arc<Vec<Row>> for zero-copy joins
+    /// Try to extract all rows as CompactArc<Vec<Row>> for zero-copy joins
     ///
     /// Returns None if the result cannot provide Arc-wrapped rows.
     /// This consumes the result - after calling, iteration will yield no more rows.
     /// Default implementation returns None.
-    fn try_into_arc_rows(&mut self) -> Option<Arc<Vec<Row>>> {
+    fn try_into_arc_rows(&mut self) -> Option<CompactArc<Vec<Row>>> {
         None
     }
 

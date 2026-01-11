@@ -19,6 +19,7 @@
 //! - UPDATE
 //! - DELETE
 
+use crate::common::CompactArc;
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
@@ -1023,7 +1024,7 @@ impl Executor {
 
         // Pre-compute column names and indices to avoid schema borrow conflicts
         let schema = table.schema();
-        // OPTIMIZATION: Use Arc<Vec<String>> to share column names without cloning
+        // OPTIMIZATION: Use CompactArc<Vec<String>> to share column names without cloning
         let column_names = schema.column_names_arc();
 
         // Check if any update expressions contain subqueries
@@ -1150,7 +1151,7 @@ impl Executor {
 
         // Create evaluator once and reuse for all rows (optimization)
         let mut evaluator = CompiledEvaluator::new(function_registry).with_context(ctx);
-        evaluator.init_columns_arc(Arc::clone(&column_names));
+        evaluator.init_columns_arc(CompactArc::clone(&column_names));
 
         // Use RefCell to collect updated rows for RETURNING clause
         use std::cell::RefCell;
@@ -1181,17 +1182,19 @@ impl Executor {
             let all_col_indices: Vec<usize> = (0..column_names.len()).collect();
 
             // OPTIMIZATION: Use schema's cached lowercase column names instead of computing
+            // Use Arc<str> for zero-cost cloning in the per-row loop
             let column_names_lower = schema.column_names_lower_arc();
-            let col_name_pairs: Vec<(String, String)> = column_names_lower
+            let col_name_pairs: Vec<(Arc<str>, Arc<str>)> = column_names_lower
                 .iter()
                 .map(|col_lower| {
-                    let qualified = format!("{}.{}", table_name, col_lower);
-                    (col_lower.clone(), qualified)
+                    let qualified = Arc::from(format!("{}.{}", table_name, col_lower).as_str());
+                    (Arc::from(col_lower.as_str()), qualified)
                 })
                 .collect();
 
             // Reusable outer_row_map - cleared and reused each iteration
-            let mut outer_row_map: FxHashMap<String, Value> =
+            // Uses Arc<str> keys for zero-cost cloning
+            let mut outer_row_map: FxHashMap<Arc<str>, Value> =
                 FxHashMap::with_capacity_and_hasher(col_name_pairs.len() * 2, Default::default());
 
             // Scan all rows (WHERE filtering happens in the setter)
@@ -1226,7 +1229,7 @@ impl Executor {
                 // Move map into context, we'll take it back after
                 let mut correlated_ctx = ctx.with_outer_row(
                     std::mem::take(&mut outer_row_map),
-                    Arc::clone(&column_names),
+                    CompactArc::clone(&column_names),
                 );
 
                 // Evaluate all update expressions
@@ -1239,7 +1242,7 @@ impl Executor {
                                 // Now evaluate the processed expression (subquery replaced with value)
                                 let mut eval = CompiledEvaluator::new(function_registry)
                                     .with_context(&correlated_ctx);
-                                eval.init_columns_arc(Arc::clone(&column_names));
+                                eval.init_columns_arc(CompactArc::clone(&column_names));
                                 eval.set_row_array(row);
                                 eval.evaluate(&processed_expr).ok()
                             }
@@ -1579,30 +1582,38 @@ impl Executor {
 
             // Pre-compute column name mappings for correlated subqueries
             let column_names_arc = if has_correlated {
-                Some(std::sync::Arc::new(column_names_owned.clone()))
+                Some(CompactArc::new(column_names_owned.clone()))
             } else {
                 None
             };
 
             // OPTIMIZATION: Use schema's cached lowercase column names instead of computing
             // Each entry: (col_lower, effective_qualified, optional_table_qualified)
+            // Uses Arc<str> for zero-cost cloning in the per-row loop
             let column_names_lower = schema.column_names_lower_arc();
-            let col_name_triples: Vec<(String, String, Option<String>)> = column_names_lower
+            #[allow(clippy::type_complexity)]
+            let col_name_triples: Vec<(Arc<str>, Arc<str>, Option<Arc<str>>)> = column_names_lower
                 .iter()
                 .map(|col_lower| {
-                    let effective_qualified = format!("{}.{}", effective_name, col_lower);
+                    let effective_qualified =
+                        Arc::from(format!("{}.{}", effective_name, col_lower).as_str());
                     let table_qualified = if effective_name != table_name {
-                        Some(format!("{}.{}", table_name, col_lower))
+                        Some(Arc::from(format!("{}.{}", table_name, col_lower).as_str()))
                     } else {
                         None
                     };
-                    (col_lower.clone(), effective_qualified, table_qualified)
+                    (
+                        Arc::from(col_lower.as_str()),
+                        effective_qualified,
+                        table_qualified,
+                    )
                 })
                 .collect();
 
             // Reusable outer_row_map for correlated subqueries
+            // Uses Arc<str> keys for zero-cost cloning
             let estimated_entries = col_name_triples.len() * 3; // up to 3 entries per column
-            let mut outer_row_map: FxHashMap<String, Value> =
+            let mut outer_row_map: FxHashMap<Arc<str>, Value> =
                 FxHashMap::with_capacity_and_hasher(estimated_entries, Default::default());
 
             while scanner.next() {

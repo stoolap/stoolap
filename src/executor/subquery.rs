@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use crate::common::CompactArc;
 use ahash::{AHashMap, AHashSet};
 use compact_str::CompactString;
 
@@ -228,7 +229,7 @@ impl Executor {
                         return Ok(Expression::InHashSet(InHashSetExpression {
                             token: in_expr.token.clone(),
                             column: Box::new(processed_left),
-                            values: Arc::new(hash_set),
+                            values: CompactArc::new(hash_set),
                             not: in_expr.not,
                         }));
                     }
@@ -442,12 +443,13 @@ impl Executor {
 
         // Get the outer value from the outer row hashmap using pre-computed lowercase keys
         // This avoids per-row to_lowercase() calls
+        // Use .as_str() for lookups since map now uses Arc<str> keys
         let outer_value = if let Some(ref qualified) = correlation.outer_qualified_lower {
             outer_row
-                .get(qualified)
-                .or_else(|| outer_row.get(&correlation.outer_column_lower))
+                .get(qualified.as_str())
+                .or_else(|| outer_row.get(correlation.outer_column_lower.as_str()))
         } else {
-            outer_row.get(&correlation.outer_column_lower)
+            outer_row.get(correlation.outer_column_lower.as_str())
         };
 
         let outer_value = match outer_value {
@@ -524,7 +526,7 @@ impl Executor {
                 };
                 // Use schema's cached column names - O(1) Arc clone
                 let cols = schema.column_names_arc();
-                cache_exists_schema(correlation.inner_table.clone(), Arc::clone(&cols));
+                cache_exists_schema(correlation.inner_table.clone(), CompactArc::clone(&cols));
                 cols
             }
         };
@@ -761,12 +763,13 @@ impl Executor {
 
         // Get the outer value from the outer row hashmap using pre-computed lowercase keys
         // This avoids per-probe to_lowercase() calls
+        // Use .as_str() for lookups since map now uses Arc<str> keys
         let outer_value = if let Some(ref qualified) = correlation.outer_qualified_lower {
             outer_row
-                .get(qualified)
-                .or_else(|| outer_row.get(&correlation.outer_column_lower))
+                .get(qualified.as_str())
+                .or_else(|| outer_row.get(correlation.outer_column_lower.as_str()))
         } else {
-            outer_row.get(&correlation.outer_column_lower)
+            outer_row.get(correlation.outer_column_lower.as_str())
         };
 
         let outer_value = match outer_value {
@@ -889,12 +892,13 @@ impl Executor {
         };
 
         // Get the outer value from the outer row hashmap (no allocation)
+        // Use .as_str() for lookups since map now uses Arc<str> keys
         let outer_value = if let Some(ref qualified) = lookup_info.outer_qualified_lower {
             outer_row
-                .get(qualified)
-                .or_else(|| outer_row.get(&lookup_info.outer_column_lower))
+                .get(qualified.as_str())
+                .or_else(|| outer_row.get(lookup_info.outer_column_lower.as_str()))
         } else {
-            outer_row.get(&lookup_info.outer_column_lower)
+            outer_row.get(lookup_info.outer_column_lower.as_str())
         };
 
         let outer_value = match outer_value {
@@ -983,7 +987,7 @@ impl Executor {
         &self,
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
-    ) -> Result<Option<Arc<AHashMap<Value, Value>>>> {
+    ) -> Result<Option<CompactArc<AHashMap<Value, Value>>>> {
         // Must have single aggregate column
         if subquery.columns.len() != 1 {
             return Ok(None);
@@ -2062,7 +2066,7 @@ impl Executor {
                     return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
                         column: Box::new(processed_left),
-                        values: Arc::new(hash_set),
+                        values: CompactArc::new(hash_set),
                         not: in_expr.not,
                     }));
                 }
@@ -2348,7 +2352,7 @@ impl Executor {
                     return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
                         column: Box::new(processed_left),
-                        values: Arc::new(hash_set),
+                        values: CompactArc::new(hash_set),
                         not: in_expr.not,
                     }));
                 }
@@ -2781,7 +2785,7 @@ impl Executor {
         &self,
         info: &SemiJoinInfo,
         ctx: &ExecutionContext,
-    ) -> Result<Arc<AHashSet<crate::core::Value>>> {
+    ) -> Result<CompactArc<AHashSet<crate::core::Value>>> {
         // Build cache key hash from inner table, column, and WHERE predicate hash
         // Uses u64 hash to avoid any string allocation
         let pred_hash = info
@@ -2857,11 +2861,15 @@ impl Executor {
         // Build AHashSet from Vec - this deduplicates automatically
         let hash_set: AHashSet<crate::core::Value> = values_vec.into_iter().collect();
 
-        // Wrap in Arc once - no cloning needed
-        let hash_set_arc = Arc::new(hash_set);
+        // Wrap in CompactArc once - no cloning needed
+        let hash_set_arc = CompactArc::new(hash_set);
 
-        // Cache for subsequent calls within this query (Arc clone is cheap)
-        cache_semi_join_arc(cache_key, &info.inner_table, Arc::clone(&hash_set_arc));
+        // Cache for subsequent calls within this query (CompactArc clone is cheap)
+        cache_semi_join_arc(
+            cache_key,
+            &info.inner_table,
+            CompactArc::clone(&hash_set_arc),
+        );
 
         Ok(hash_set_arc)
     }
@@ -2885,7 +2893,7 @@ impl Executor {
     pub fn execute_anti_join(
         &self,
         info: &SemiJoinInfo,
-        outer_rows: Arc<Vec<crate::core::Row>>,
+        outer_rows: CompactArc<Vec<crate::core::Row>>,
         outer_columns: &[String],
         _ctx: &ExecutionContext,
     ) -> Result<crate::core::RowVec> {
@@ -3023,7 +3031,7 @@ impl Executor {
     /// Replaces: EXISTS (SELECT ...) with: outer_col IN (hash_set_values)
     pub fn transform_exists_to_in_list(
         info: &SemiJoinInfo,
-        hash_set: Arc<AHashSet<crate::core::Value>>,
+        hash_set: CompactArc<AHashSet<crate::core::Value>>,
     ) -> Expression {
         // For empty hash set, return FALSE (no matches exist)
         // For NOT EXISTS with empty set, return TRUE (nothing exists to negate)

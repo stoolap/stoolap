@@ -32,8 +32,11 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use compact_str::CompactString;
+
 use crate::common::{
-    new_btree_int64_map, new_int64_map, new_int64_map_with_capacity, BTreeInt64Map, Int64Map,
+    new_btree_int64_map, new_int64_map, new_int64_map_with_capacity, BTreeInt64Map, CompactArc,
+    Int64Map,
 };
 use crate::core::types::DataType;
 use crate::core::{Error, Row, RowVec, Schema, Value};
@@ -53,12 +56,12 @@ use smallvec::{smallvec, SmallVec};
 /// for the common case of a single version per row within a transaction.
 type VersionList = SmallVec<[RowVersion; 1]>;
 
-/// Group key using Arc<Value> to avoid cloning during aggregation.
+/// Group key using CompactArc<Value> to avoid cloning during aggregation.
 /// Uses Arc::clone (O(1) atomic increment) instead of Value::clone (deep copy).
 #[derive(Clone, Debug)]
 pub enum GroupKey {
-    Single(Arc<Value>),
-    Multi(Vec<Arc<Value>>),
+    Single(CompactArc<Value>),
+    Multi(Vec<CompactArc<Value>>),
 }
 
 impl PartialEq for GroupKey {
@@ -379,8 +382,8 @@ pub trait VisibilityChecker: Send + Sync {
 pub struct VersionStore {
     /// Row versions indexed by row ID (BTreeMap for ordered iteration)
     versions: BTreeInt64Map<VersionChainEntry>,
-    /// The name of the table this store belongs to
-    table_name: String,
+    /// The name of the table this store belongs to (CompactString for inline storage ≤24 bytes)
+    table_name: CompactString,
     /// Table schema (Arc for zero-cost cloning on read)
     schema: RwLock<Arc<Schema>>,
     /// Indexes on this table (FxHashMap for fast string key lookups)
@@ -413,7 +416,7 @@ pub struct VersionStore {
 
 impl VersionStore {
     /// Creates a new version store
-    pub fn new(table_name: String, schema: Schema) -> Self {
+    pub fn new(table_name: impl Into<CompactString>, schema: Schema) -> Self {
         Self::with_capacity(table_name, schema, None, 0)
     }
 
@@ -423,7 +426,7 @@ impl VersionStore {
     /// Use this when the expected row count is known (e.g., during recovery).
     #[cfg(not(test))]
     pub fn with_capacity(
-        table_name: String,
+        table_name: impl Into<CompactString>,
         schema: Schema,
         checker: Option<Arc<TransactionRegistry>>,
         expected_rows: usize,
@@ -438,7 +441,7 @@ impl VersionStore {
 
         Self {
             versions,
-            table_name,
+            table_name: table_name.into(),
             schema: RwLock::new(Arc::new(schema)),
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
@@ -455,7 +458,7 @@ impl VersionStore {
     /// Creates a new version store with pre-allocated capacity (test version)
     #[cfg(test)]
     pub fn with_capacity(
-        table_name: String,
+        table_name: impl Into<CompactString>,
         schema: Schema,
         checker: Option<Arc<dyn VisibilityChecker>>,
         expected_rows: usize,
@@ -469,7 +472,7 @@ impl VersionStore {
 
         Self {
             versions,
-            table_name,
+            table_name: table_name.into(),
             schema: RwLock::new(Arc::new(schema)),
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
@@ -502,7 +505,7 @@ impl VersionStore {
     /// Creates a new version store with a visibility checker (production)
     #[cfg(not(test))]
     pub fn with_visibility_checker(
-        table_name: String,
+        table_name: impl Into<CompactString>,
         schema: Schema,
         checker: Arc<TransactionRegistry>,
     ) -> Self {
@@ -512,7 +515,7 @@ impl VersionStore {
     /// Creates a new version store with a visibility checker (test)
     #[cfg(test)]
     pub fn with_visibility_checker(
-        table_name: String,
+        table_name: impl Into<CompactString>,
         schema: Schema,
         checker: Arc<dyn VisibilityChecker>,
     ) -> Self {
@@ -3762,6 +3765,26 @@ impl VersionStore {
         indexes.keys().cloned().collect()
     }
 
+    /// Check if there are any indexes
+    #[inline]
+    pub fn has_indexes(&self) -> bool {
+        let indexes = self.indexes.read();
+        !indexes.is_empty()
+    }
+
+    /// Iterate over all indexes, calling the provided function for each
+    /// OPTIMIZATION: Avoids collecting index names and allows early exit on error
+    pub fn for_each_index<F>(&self, mut f: F) -> crate::core::Result<()>
+    where
+        F: FnMut(&Arc<dyn Index>) -> crate::core::Result<()>,
+    {
+        let indexes = self.indexes.read();
+        for index in indexes.values() {
+            f(index)?;
+        }
+        Ok(())
+    }
+
     /// Iterate over unique indexes only, calling the provided function for each
     /// OPTIMIZATION: Avoids collecting index names and allows early exit on error
     pub fn for_each_unique_index<F>(&self, mut f: F) -> crate::core::Result<()>
@@ -3856,8 +3879,10 @@ impl VersionStore {
         best_match
     }
 
-    /// Get all indexes (for optimizer to inspect)
-    pub fn get_all_indexes(&self) -> Vec<Arc<dyn Index>> {
+    /// Get all indexes as Arc clones - avoids String allocation and repeated lookups
+    /// OPTIMIZATION: Arc clones are cheap (atomic increment), uses SmallVec for ≤4 indexes
+    #[inline]
+    pub fn get_all_indexes(&self) -> SmallVec<[Arc<dyn Index>; 4]> {
         let indexes = self.indexes.read();
         indexes.values().cloned().collect()
     }
@@ -4166,11 +4191,11 @@ impl VersionStore {
                     let version = &version_chain.version;
                     if !version.is_deleted() {
                         // Use get_arc + add_arc for zero-copy Arc sharing
-                        let arc_values: Vec<std::sync::Arc<crate::core::Value>> = col_indices
+                        let arc_values: Vec<CompactArc<crate::core::Value>> = col_indices
                             .iter()
                             .map(|&idx| {
                                 version.data.get_arc(idx).unwrap_or_else(|| {
-                                    std::sync::Arc::new(crate::core::Value::Null(
+                                    CompactArc::new(crate::core::Value::Null(
                                         crate::core::DataType::Null,
                                     ))
                                 })
@@ -4238,11 +4263,11 @@ impl VersionStore {
                     }
                 } else {
                     // Multi-column index
-                    let arc_values: Vec<std::sync::Arc<crate::core::Value>> = col_indices
+                    let arc_values: Vec<CompactArc<crate::core::Value>> = col_indices
                         .iter()
                         .map(|&idx| {
                             version.data.get_arc(idx).unwrap_or_else(|| {
-                                std::sync::Arc::new(crate::core::Value::Null(
+                                CompactArc::new(crate::core::Value::Null(
                                     crate::core::DataType::Null,
                                 ))
                             })
@@ -4659,22 +4684,22 @@ impl VersionStore {
                 None => continue,
             };
 
-            // Build group key using Arc::clone (O(1)) instead of Value::clone
+            // Build group key using CompactArc::clone (O(1)) instead of Value::clone
             let group_key = if group_by_indices.len() == 1 {
                 let col_idx = group_by_indices[0];
                 if col_idx < row_data.len() {
-                    GroupKey::Single(Arc::clone(&row_data[col_idx]))
+                    GroupKey::Single(CompactArc::clone(&row_data[col_idx]))
                 } else {
-                    GroupKey::Single(Arc::new(Value::Null(DataType::Null)))
+                    GroupKey::Single(CompactArc::new(Value::Null(DataType::Null)))
                 }
             } else {
-                let key_values: Vec<Arc<Value>> = group_by_indices
+                let key_values: Vec<CompactArc<Value>> = group_by_indices
                     .iter()
                     .map(|&col_idx| {
                         if col_idx < row_data.len() {
-                            Arc::clone(&row_data[col_idx])
+                            CompactArc::clone(&row_data[col_idx])
                         } else {
-                            Arc::new(Value::Null(DataType::Null))
+                            CompactArc::new(Value::Null(DataType::Null))
                         }
                     })
                     .collect();

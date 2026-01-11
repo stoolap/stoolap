@@ -29,8 +29,8 @@ Stoolap is a **feature-rich embedded SQL database** with capabilities that rival
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│   STOOLAP vs SQLite:    44 wins / 9 losses    (83% win rate)  │
-│   STOOLAP vs DuckDB:    50 wins / 3 losses    (94% win rate)  │
+│   STOOLAP vs SQLite:    43 wins / 10 losses   (81% win rate)  │
+│   STOOLAP vs DuckDB:    49 wins / 4 losses    (92% win rate)  │
 └───────────────────────────────────────────────────────────────┘
 ```
 

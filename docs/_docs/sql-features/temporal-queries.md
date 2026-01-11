@@ -73,15 +73,57 @@ WHERE amount > 1000;
 
 ```sql
 -- With explicit alias
-SELECT u.id, u.name 
+SELECT u.id, u.name
 FROM users AS u AS OF TRANSACTION 75
 WHERE u.created_at < '2025-01-01';
 
 -- Without explicit alias (implicit alias)
-SELECT users.id, users.name 
+SELECT users.id, users.name
 FROM users AS OF TIMESTAMP '2025-06-10 12:00:00'
 WHERE users.status = 'active';
 ```
+
+### AS OF in JOIN Clauses
+
+You can use `AS OF TIMESTAMP` and `AS OF TRANSACTION` directly in JOIN clauses to compare current data with historical data in a single query:
+
+```sql
+-- Compare current prices with historical prices
+SELECT
+    c.id,
+    c.name,
+    c.price AS current_price,
+    h.price AS old_price,
+    c.price - h.price AS price_change
+FROM products c
+JOIN products AS OF TIMESTAMP '2024-01-01 00:00:00' h ON c.id = h.id
+WHERE c.price != h.price;
+
+-- Find users whose status changed since a specific transaction
+SELECT
+    current.id,
+    current.name,
+    current.status AS current_status,
+    old.status AS previous_status
+FROM users current
+JOIN users AS OF TRANSACTION 500 old ON current.id = old.id
+WHERE current.status != old.status;
+
+-- LEFT JOIN to include new records not in historical data
+SELECT
+    c.id,
+    c.name,
+    c.price AS current_price,
+    h.price AS historical_price
+FROM products c
+LEFT JOIN products AS OF TIMESTAMP '2024-06-01 00:00:00' h ON c.id = h.id;
+```
+
+This feature enables powerful use cases:
+- **Price change detection**: Compare current vs historical prices
+- **Audit trails**: Track what changed between two points in time
+- **Data reconciliation**: Verify data consistency across time periods
+- **Trend analysis**: Analyze how values evolved over time
 
 ## How It Works
 
@@ -112,7 +154,6 @@ WHERE users.status = 'active';
 
 ### Limitations
 
-- AS OF queries currently don't support JOIN operations (planned for future release)
 - Subqueries with AS OF are not yet supported
 - The timestamp resolution depends on the system clock precision
 
@@ -139,16 +180,13 @@ WHERE product_id IN (101, 102, 103);
 
 ```sql
 -- Compare current prices with last week's prices
-SELECT 
-    current.product_id,
-    current.price as current_price,
-    historical.price as last_week_price
-FROM products current
-CROSS JOIN (
-    SELECT product_id, price 
-    FROM products AS OF TIMESTAMP '2025-06-03 00:00:00'
-) historical
-WHERE current.product_id = historical.product_id;
+SELECT
+    c.product_id,
+    c.price AS current_price,
+    h.price AS last_week_price,
+    c.price - h.price AS price_difference
+FROM products c
+JOIN products AS OF TIMESTAMP '2025-06-03 00:00:00' h ON c.product_id = h.product_id;
 ```
 
 ## Future Enhancements

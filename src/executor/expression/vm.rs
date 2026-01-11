@@ -2193,6 +2193,39 @@ impl ExprVM {
                     pc = *target as usize;
                 }
 
+                Op::JumpIfTrue(target) => {
+                    if let Some(top) = stack.last() {
+                        if matches!(&**top, Value::Boolean(true)) {
+                            pc = *target as usize;
+                            continue;
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Op::JumpIfFalse(target) => {
+                    if let Some(top) = stack.last() {
+                        match &**top {
+                            Value::Boolean(false) | Value::Null(_) => {
+                                pc = *target as usize;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Op::JumpIfNull(target) => {
+                    if let Some(top) = stack.last() {
+                        if top.is_null() {
+                            pc = *target as usize;
+                            continue;
+                        }
+                    }
+                    pc += 1;
+                }
+
                 Op::PopJumpIfFalse(target) => {
                     let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     match &*v {
@@ -2294,6 +2327,49 @@ impl ExprVM {
                         }
                     }
                     stack.push(Cow::Owned(Value::Text(result)));
+                    pc += 1;
+                }
+
+                // CASE expression operations
+                Op::CaseStart => {
+                    // Marker only, no operation
+                    pc += 1;
+                }
+
+                Op::CaseWhen(next_branch) => {
+                    let cond = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    if !Self::to_bool(&cond) {
+                        pc = *next_branch as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                Op::CaseThen(end_pos) => {
+                    // Result is on stack, jump to end
+                    pc = *end_pos as usize;
+                }
+
+                Op::CaseElse => {
+                    // Marker only
+                    pc += 1;
+                }
+
+                Op::CaseEnd => {
+                    // Marker only
+                    pc += 1;
+                }
+
+                Op::CaseCompare => {
+                    let when_val = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    // Use reference to avoid clone - case_val stays on stack for next comparison
+                    let result = match stack.last() {
+                        Some(case_val) if !case_val.is_null() && !when_val.is_null() => {
+                            Value::Boolean(**case_val == *when_val)
+                        }
+                        _ => Value::Boolean(false),
+                    };
+                    stack.push(Cow::Owned(result));
                     pc += 1;
                 }
 
@@ -3089,6 +3165,7 @@ impl Default for ExprVM {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::CompactArc;
     use crate::Row;
     use ahash::AHashSet;
 
@@ -3147,7 +3224,7 @@ mod tests {
 
         let program = Program::new(vec![
             Op::LoadColumn(0),
-            Op::InSet(Arc::new(set), false),
+            Op::InSet(CompactArc::new(set), false),
             Op::Return,
         ]);
 
@@ -3999,7 +4076,7 @@ mod tests {
 
         let program = Program::new(vec![
             Op::LoadColumn(0),
-            Op::NotInSet(Arc::new(set), false),
+            Op::NotInSet(CompactArc::new(set), false),
             Op::Return,
         ]);
 
@@ -4020,7 +4097,7 @@ mod tests {
         // has_null = true means the set conceptually contains NULL
         let program = Program::new(vec![
             Op::LoadColumn(0),
-            Op::InSet(Arc::new(set), true),
+            Op::InSet(CompactArc::new(set), true),
             Op::Return,
         ]);
 
@@ -4042,7 +4119,10 @@ mod tests {
             .into_iter()
             .collect();
 
-        let program = Program::new(vec![Op::InSetColumn(0, Arc::new(set), false), Op::Return]);
+        let program = Program::new(vec![
+            Op::InSetColumn(0, CompactArc::new(set), false),
+            Op::Return,
+        ]);
 
         let row = Row::from_values(vec![Value::Integer(2)]);
         let ctx = ExecuteContext::new(&row);

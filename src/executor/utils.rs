@@ -23,7 +23,7 @@
 
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
@@ -117,7 +117,7 @@ pub fn value_to_expression(v: &Value) -> Expression {
 /// Uses copy-on-write semantics: only clones when substitution is actually needed.
 pub fn substitute_outer_references(
     expr: &Expression,
-    outer_row: &FxHashMap<String, Value>,
+    outer_row: &FxHashMap<Arc<str>, Value>,
 ) -> Expression {
     // Use the internal function that returns Option for copy-on-write semantics
     substitute_outer_references_inner(expr, outer_row).unwrap_or_else(|| expr.clone())
@@ -127,14 +127,15 @@ pub fn substitute_outer_references(
 /// Returns Some(new_expr) only when a substitution occurred.
 fn substitute_outer_references_inner(
     expr: &Expression,
-    outer_row: &FxHashMap<String, Value>,
+    outer_row: &FxHashMap<Arc<str>, Value>,
 ) -> Option<Expression> {
     match expr {
         // Check if this is an outer reference
         Expression::QualifiedIdentifier(qid) => {
             // Try qualified name: "alias.column"
+            // Use .as_str() for lookups since map now uses Arc<str> keys
             let qualified_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
-            if let Some(value) = outer_row.get(&qualified_name) {
+            if let Some(value) = outer_row.get(qualified_name.as_str()) {
                 return Some(value_to_expression(value));
             }
             // Try just the column name

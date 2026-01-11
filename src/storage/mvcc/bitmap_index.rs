@@ -43,12 +43,13 @@
 //! Automatic compression: array for sparse, bitmap for dense, RLE for runs.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 use ahash::AHashMap;
 use roaring::RoaringTreemap;
 use rustc_hash::FxHashMap;
 
+use crate::common::CompactArc;
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
@@ -86,13 +87,13 @@ pub struct BitmapIndex {
     closed: AtomicBool,
 
     /// One bitmap per distinct value
-    /// Maps Arc<Value> -> RoaringTreemap of row IDs (supports full u64 range)
-    /// Uses Arc<Value> keys for memory efficiency (8 bytes per key)
-    bitmaps: RwLock<AHashMap<Arc<Value>, RoaringTreemap>>,
+    /// Maps CompactArc<Value> -> RoaringTreemap of row IDs (supports full u64 range)
+    /// Uses CompactArc<Value> keys for memory efficiency (8 bytes per key)
+    bitmaps: RwLock<AHashMap<CompactArc<Value>, RoaringTreemap>>,
 
-    /// Reverse mapping: row_id -> Arc<Value> for efficient removal
-    /// Uses Arc<Value> to share references with bitmaps (8 bytes per entry)
-    row_to_value: RwLock<AHashMap<i64, Arc<Value>>>,
+    /// Reverse mapping: row_id -> CompactArc<Value> for efficient removal
+    /// Uses CompactArc<Value> to share references with bitmaps (8 bytes per entry)
+    row_to_value: RwLock<AHashMap<i64, CompactArc<Value>>>,
 
     /// Track cardinality for warnings
     distinct_count: AtomicUsize,
@@ -216,12 +217,12 @@ impl BitmapIndex {
         }
     }
 
-    /// Convert values to an Arc<Value> key
+    /// Convert values to an CompactArc<Value> key
     /// For single-column indexes, wraps the value in Arc
     /// For multi-column indexes, creates a composite key
-    fn value_to_arc_key(&self, values: &[Value]) -> Arc<Value> {
+    fn value_to_arc_key(&self, values: &[Value]) -> CompactArc<Value> {
         if values.len() == 1 {
-            Arc::new(values[0].clone())
+            CompactArc::new(values[0].clone())
         } else {
             // For multi-column bitmap index, create a composite key
             // This is less common but supported
@@ -233,17 +234,17 @@ impl BitmapIndex {
                     .join("||")
                     .into(),
             );
-            Arc::new(composite)
+            CompactArc::new(composite)
         }
     }
 
-    /// Convert Arc<Value> slice to an Arc<Value> key
+    /// Convert CompactArc<Value> slice to an CompactArc<Value> key
     /// For single-column indexes, clones the Arc (O(1))
     /// For multi-column indexes, creates a composite key
-    fn arc_values_to_arc_key(&self, values: &[Arc<Value>]) -> Arc<Value> {
+    fn arc_values_to_arc_key(&self, values: &[CompactArc<Value>]) -> CompactArc<Value> {
         if values.len() == 1 {
             // O(1) Arc clone - no value copying!
-            Arc::clone(&values[0])
+            CompactArc::clone(&values[0])
         } else {
             // For multi-column bitmap index, create a composite key
             // This is less common but supported
@@ -255,7 +256,7 @@ impl BitmapIndex {
                     .join("||")
                     .into(),
             );
-            Arc::new(composite)
+            CompactArc::new(composite)
         }
     }
 }
@@ -331,7 +332,7 @@ impl Index for BitmapIndex {
         // Check if row already exists with a different value (for updates)
         if let Some(old_arc_key) = row_to_value.get(&row_id).cloned() {
             // Compare Arc pointers - if same Arc, same value
-            if !Arc::ptr_eq(&old_arc_key, &arc_key) {
+            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
                 // Remove from old bitmap
                 if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
                     old_bitmap.remove(row_id_u64);
@@ -345,7 +346,7 @@ impl Index for BitmapIndex {
 
         // Add to bitmap
         let is_new_value = !bitmaps.contains_key(&arc_key);
-        let bitmap = bitmaps.entry(Arc::clone(&arc_key)).or_default();
+        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
         bitmap.insert(row_id_u64);
 
         // Update reverse mapping with Arc reference
@@ -359,7 +360,7 @@ impl Index for BitmapIndex {
         Ok(())
     }
 
-    fn add_arc(&self, values: &[Arc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
+    fn add_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
         }
@@ -417,7 +418,7 @@ impl Index for BitmapIndex {
         // Check if row already exists with a different value (for updates)
         if let Some(old_arc_key) = row_to_value.get(&row_id).cloned() {
             // Compare Arc pointers - if same Arc, same value
-            if !Arc::ptr_eq(&old_arc_key, &arc_key) {
+            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
                 // Remove from old bitmap
                 if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
                     old_bitmap.remove(row_id_u64);
@@ -431,7 +432,7 @@ impl Index for BitmapIndex {
 
         // Add to bitmap
         let is_new_value = !bitmaps.contains_key(&arc_key);
-        let bitmap = bitmaps.entry(Arc::clone(&arc_key)).or_default();
+        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
         bitmap.insert(row_id_u64);
 
         // Update reverse mapping with Arc reference - O(1) Arc clone
@@ -487,7 +488,7 @@ impl Index for BitmapIndex {
         Ok(())
     }
 
-    fn remove_arc(&self, values: &[Arc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
+    fn remove_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
         }
@@ -680,7 +681,7 @@ impl Index for BitmapIndex {
 
     fn get_all_values(&self) -> Vec<Value> {
         let bitmaps = self.bitmaps.read().unwrap();
-        // Dereference Arc<Value> to clone inner Value
+        // Dereference CompactArc<Value> to clone inner Value
         bitmaps.keys().map(|arc| (**arc).clone()).collect()
     }
 

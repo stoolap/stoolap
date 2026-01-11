@@ -17,7 +17,9 @@
 //! Provides the main MVCC storage engine implementation.
 //!
 
+use compact_str::CompactString;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -50,9 +52,13 @@ use crate::storage::mvcc::{
 };
 use crate::storage::traits::{Engine, Index, Table, Transaction};
 
+/// Type alias for a single table entry in the transaction version store
+type TxnTableEntry = (CompactString, Arc<RwLock<TransactionVersionStore>>);
+
 /// Type alias for the transaction version store map
-/// Structured as txn_id -> (table_name -> store) for O(1) lookup per transaction
-type TxnVersionStoreMap = FxHashMap<i64, FxHashMap<String, Arc<RwLock<TransactionVersionStore>>>>;
+/// Structured as txn_id -> [(table_name, store)] for efficient lookup per transaction
+/// Uses SmallVec<[T; 2]> since most transactions access 1-2 tables, avoiding heap allocation
+type TxnVersionStoreMap = FxHashMap<i64, SmallVec<[TxnTableEntry; 2]>>;
 
 /// Helper to get registry as the visibility checker type expected by VersionStore.
 /// In production: returns concrete Arc<TransactionRegistry> (zero-cost, inlined).
@@ -1875,8 +1881,8 @@ impl Engine for MVCCEngine {
 
         let store = self.get_version_store(table_name)?;
 
-        // Get all indexes from the version store
-        Ok(store.get_all_indexes())
+        // Get all indexes from the version store (convert SmallVec to Vec for trait compatibility)
+        Ok(store.get_all_indexes().into_vec())
     }
 
     fn get_isolation_level(&self) -> IsolationLevel {
@@ -2613,7 +2619,11 @@ impl TransactionEngineOperations for EngineOperations {
         let txn_versions = {
             let cache = self.txn_version_stores().read().unwrap();
             if let Some(txn_tables) = cache.get(&txn_id) {
-                if let Some(cached) = txn_tables.get(&*table_name_lower) {
+                // Linear search on SmallVec (fast for 1-2 tables)
+                if let Some((_, cached)) = txn_tables
+                    .iter()
+                    .find(|(name, _)| name == &*table_name_lower)
+                {
                     Arc::clone(cached)
                 } else {
                     drop(cache);
@@ -2626,7 +2636,7 @@ impl TransactionEngineOperations for EngineOperations {
                     cache
                         .entry(txn_id)
                         .or_default()
-                        .insert(table_name_lower.into_owned(), Arc::clone(&new_store));
+                        .push((table_name_lower.into_owned().into(), Arc::clone(&new_store)));
                     new_store
                 }
             } else {
@@ -2640,7 +2650,7 @@ impl TransactionEngineOperations for EngineOperations {
                 cache
                     .entry(txn_id)
                     .or_default()
-                    .insert(table_name_lower.into_owned(), Arc::clone(&new_store));
+                    .push((table_name_lower.into_owned().into(), Arc::clone(&new_store)));
                 new_store
             }
         };
@@ -2848,7 +2858,7 @@ impl TransactionEngineOperations for EngineOperations {
 
                     // Get the version store for this table
                     let stores = self.version_stores().read().unwrap();
-                    if let Some(version_store) = stores.get(table_name).cloned() {
+                    if let Some(version_store) = stores.get(table_name.as_str()).cloned() {
                         drop(stores);
 
                         // Create a table instance with shared transaction store
@@ -2868,7 +2878,7 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn commit_all_tables(&self, txn_id: i64) -> Result<()> {
-        // O(1) lookup for this transaction's tables
+        // O(1) lookup by txn_id using nested HashMap
         let cache = self.txn_version_stores().read().unwrap();
 
         if let Some(txn_tables) = cache.get(&txn_id) {
@@ -2882,7 +2892,7 @@ impl TransactionEngineOperations for EngineOperations {
                 if has_changes {
                     // Get the version store for this table
                     let stores = self.version_stores().read().unwrap();
-                    if let Some(version_store) = stores.get(table_name).cloned() {
+                    if let Some(version_store) = stores.get(table_name.as_str()).cloned() {
                         drop(stores);
 
                         // Create table and commit through it (updates indexes)

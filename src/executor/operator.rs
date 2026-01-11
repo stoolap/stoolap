@@ -44,8 +44,8 @@
 //! 4. **Zero-Copy**: RowRef allows referencing rows without cloning
 
 use std::fmt;
-use std::sync::Arc;
 
+use crate::common::{CompactArc, CompactVec};
 use crate::core::{Result, Row, Value};
 
 /// Column information for operator schema.
@@ -236,7 +236,7 @@ impl RowRef {
     #[inline]
     pub fn direct_build_composite(
         probe: Row,
-        build_rows: Arc<Vec<Row>>,
+        build_rows: CompactArc<Vec<Row>>,
         build_idx: usize,
         probe_is_left: bool,
     ) -> Self {
@@ -344,7 +344,7 @@ impl CompositeRow {
     /// Prefer `materialize_owned()` when you can consume the CompositeRow.
     pub fn materialize(&self) -> Row {
         let total = self.len();
-        let mut values: Vec<Value> = Vec::with_capacity(total);
+        let mut values: CompactVec<Value> = CompactVec::with_capacity(total);
 
         // Copy left values
         values.extend(self.left.iter().cloned());
@@ -352,7 +352,7 @@ impl CompositeRow {
         // Copy right values
         values.extend(self.right.iter().cloned());
 
-        Row::from_values(values)
+        Row::from_compact_vec(values)
     }
 
     /// Materialize into an owned Row by moving values (zero-copy).
@@ -398,7 +398,7 @@ pub struct DirectBuildCompositeRow {
     /// Probe row (owned directly, no Arc overhead)
     probe: Row,
     /// Shared reference to build rows
-    build_rows: Arc<Vec<Row>>,
+    build_rows: CompactArc<Vec<Row>>,
     /// Index into build_rows
     build_idx: usize,
     /// Number of columns from the probe side
@@ -412,7 +412,7 @@ impl DirectBuildCompositeRow {
     #[inline]
     pub fn new(
         probe: Row,
-        build_rows: Arc<Vec<Row>>,
+        build_rows: CompactArc<Vec<Row>>,
         build_idx: usize,
         probe_is_left: bool,
     ) -> Self {
@@ -470,7 +470,7 @@ impl DirectBuildCompositeRow {
     pub fn materialize(&self) -> Row {
         let build_row = &self.build_rows[self.build_idx];
         let total = self.probe_cols + build_row.len();
-        let mut values: Vec<Value> = Vec::with_capacity(total);
+        let mut values: CompactVec<Value> = CompactVec::with_capacity(total);
 
         if self.probe_is_left {
             values.extend(self.probe.iter().cloned());
@@ -480,7 +480,7 @@ impl DirectBuildCompositeRow {
             values.extend(self.probe.iter().cloned());
         }
 
-        Row::from_values(values)
+        Row::from_compact_vec(values)
     }
 
     /// Materialize into an owned Row by moving probe values.
@@ -496,7 +496,7 @@ impl DirectBuildCompositeRow {
         if let (Some(probe_arcs), Some(build_arcs)) =
             (self.probe.try_as_arc_slice(), build_row.try_as_arc_slice())
         {
-            let mut arc_values: Vec<Arc<Value>> = Vec::with_capacity(total);
+            let mut arc_values: Vec<CompactArc<Value>> = Vec::with_capacity(total);
             if self.probe_is_left {
                 arc_values.extend(probe_arcs.iter().cloned());
                 arc_values.extend(build_arcs.iter().cloned());
@@ -508,7 +508,7 @@ impl DirectBuildCompositeRow {
         }
 
         // Fallback: use Inline storage with Value clones
-        let mut values: Vec<Value> = Vec::with_capacity(total);
+        let mut values: CompactVec<Value> = CompactVec::with_capacity(total);
         if self.probe_is_left {
             values.extend(self.probe);
             values.extend(build_row.iter().cloned());
@@ -516,7 +516,7 @@ impl DirectBuildCompositeRow {
             values.extend(build_row.iter().cloned());
             values.extend(self.probe);
         }
-        Row::from_values(values)
+        Row::from_compact_vec(values)
     }
 }
 
@@ -524,7 +524,7 @@ impl Clone for DirectBuildCompositeRow {
     fn clone(&self) -> Self {
         Self {
             probe: self.probe.clone(),
-            build_rows: Arc::clone(&self.build_rows),
+            build_rows: CompactArc::clone(&self.build_rows),
             build_idx: self.build_idx,
             probe_cols: self.probe_cols,
             probe_is_left: self.probe_is_left,
@@ -651,10 +651,10 @@ impl MaterializedOperator {
         }
     }
 
-    /// Create from an Arc<Vec<Row>>, unwrapping if sole owner or cloning if shared.
+    /// Create from an CompactArc<Vec<Row>>, unwrapping if sole owner or cloning if shared.
     /// This is optimal for CTE results which may have multiple references.
-    pub fn from_arc(arc_rows: Arc<Vec<Row>>, schema: Vec<ColumnInfo>) -> Self {
-        let rows = Arc::try_unwrap(arc_rows).unwrap_or_else(|arc| (*arc).clone());
+    pub fn from_arc(arc_rows: CompactArc<Vec<Row>>, schema: Vec<ColumnInfo>) -> Self {
+        let rows = CompactArc::try_unwrap(arc_rows).unwrap_or_else(|arc| (*arc).clone());
         Self::new(rows, schema)
     }
 

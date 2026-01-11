@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use crate::common::CompactArc;
 use ahash::AHashSet;
 use compact_str::CompactString;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1100,9 +1101,9 @@ impl<'a> ExprCompiler<'a> {
                 // Optimized: use pre-built HashSet
                 self.compile_expr(&in_expr.left, builder)?;
                 if in_expr.not {
-                    builder.emit(Op::NotInSet(Arc::new(values), has_null));
+                    builder.emit(Op::NotInSet(CompactArc::new(values), has_null));
                 } else {
-                    builder.emit(Op::InSet(Arc::new(values), has_null));
+                    builder.emit(Op::InSet(CompactArc::new(values), has_null));
                 }
             }
         } else {

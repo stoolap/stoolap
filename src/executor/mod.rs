@@ -79,6 +79,7 @@ mod window;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::api::params::ParamVec;
 use crate::core::{Error, Result, Value};
 use crate::functions::FunctionRegistry;
 
@@ -127,7 +128,7 @@ pub use planner::{
     ColumnStatsCache, QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision, StatsHealth,
 };
 pub use query_cache::{CacheStats, CachedQueryPlan, QueryCache, DEFAULT_CACHE_SIZE};
-pub use result::{ExecResult, ExecutorResult};
+pub use result::{ColumnarResult, ExecResult, ExecutorResult};
 pub use semantic_cache::{
     CacheLookupResult, CachedResult, QueryFingerprint, SemanticCache, SemanticCacheStats,
     SemanticCacheStatsSnapshot, SubsumptionResult, DEFAULT_CACHE_TTL_SECS, DEFAULT_MAX_CACHED_ROWS,
@@ -319,19 +320,15 @@ impl Executor {
     ///
     /// Parameters are substituted for $1, $2, etc. placeholders in the query.
     /// Uses the query cache for efficient re-execution of parameterized queries.
-    pub fn execute_with_params(&self, sql: &str, params: &[Value]) -> Result<Box<dyn QueryResult>> {
-        // Try fast path first with borrowed params (avoids Arc allocation)
-        if let Some(result) = self.try_fast_path_with_params(sql, params) {
-            return result;
-        }
-        // Fall back to full execution with owned context
-        let ctx = ExecutionContext::with_params(params.to_vec());
+    /// Note: Callers should try try_fast_path_with_params() first before calling this.
+    pub fn execute_with_params(&self, sql: &str, params: ParamVec) -> Result<Box<dyn QueryResult>> {
+        let ctx = ExecutionContext::with_params(params);
         self.execute_cached(sql, &ctx)
     }
 
     /// Try fast path execution with borrowed params slice
     /// Returns None if fast path doesn't apply, Some(result) otherwise
-    fn try_fast_path_with_params(
+    pub fn try_fast_path_with_params(
         &self,
         sql: &str,
         params: &[Value],
@@ -592,8 +589,6 @@ impl Executor {
             Statement::AlterTable(stmt) => self.execute_alter_table(stmt, &ctx),
             Statement::CreateView(stmt) => self.execute_create_view(stmt, &ctx),
             Statement::DropView(stmt) => self.execute_drop_view(stmt, &ctx),
-            Statement::CreateColumnarIndex(stmt) => self.execute_create_columnar_index(stmt, &ctx),
-            Statement::DropColumnarIndex(stmt) => self.execute_drop_columnar_index(stmt, &ctx),
 
             // DML statements
             Statement::Insert(stmt) => self.execute_insert(stmt, &ctx),
@@ -878,7 +873,10 @@ mod tests {
             .unwrap();
 
         let mut result = executor
-            .execute_with_params("SELECT * FROM users WHERE id = $1", &[Value::Integer(1)])
+            .execute_with_params(
+                "SELECT * FROM users WHERE id = $1",
+                smallvec::smallvec![Value::Integer(1)],
+            )
             .unwrap();
 
         assert!(result.next());
@@ -927,14 +925,14 @@ mod tests {
 
         // First execution
         let mut result = executor
-            .execute_with_params(query, &[Value::Integer(1)])
+            .execute_with_params(query, smallvec::smallvec![Value::Integer(1)])
             .unwrap();
         assert!(result.next());
         assert_eq!(result.row().get(0), Some(&Value::Integer(1)));
 
         // Second execution with different param - should use cache
         let mut result = executor
-            .execute_with_params(query, &[Value::Integer(2)])
+            .execute_with_params(query, smallvec::smallvec![Value::Integer(2)])
             .unwrap();
         assert!(result.next());
         assert_eq!(result.row().get(0), Some(&Value::Integer(2)));

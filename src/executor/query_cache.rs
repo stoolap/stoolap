@@ -43,6 +43,7 @@ use std::time::Instant;
 use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 
+use crate::common::CompactArc;
 use crate::core::Schema;
 use crate::parser::ast::Statement;
 
@@ -72,8 +73,8 @@ pub struct CompiledPkLookup {
     pub table_name: CompactString,
     /// Cached schema
     pub schema: Arc<Schema>,
-    /// Pre-computed column names for result (Arc<Vec<String>> for zero-copy O(1) clone on execution)
-    pub column_names: Arc<Vec<String>>,
+    /// Pre-computed column names for result (CompactArc<Vec<String>> for zero-copy O(1) clone on execution)
+    pub column_names: CompactArc<Vec<String>>,
     /// How to extract the PK value
     pub pk_value_source: PkValueSource,
     /// Schema epoch at compilation time (for fast cache invalidation)

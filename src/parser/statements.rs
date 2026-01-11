@@ -1280,20 +1280,13 @@ impl Parser {
             self.next_token();
             self.parse_create_index_statement(false)
                 .map(Statement::CreateIndex)
-        } else if self.peek_token_is_keyword("COLUMNAR") {
-            self.next_token();
-            if !self.expect_keyword("INDEX") {
-                return None;
-            }
-            self.parse_create_columnar_index_statement()
-                .map(Statement::CreateColumnarIndex)
         } else if self.peek_token_is_keyword("VIEW") {
             self.next_token();
             self.parse_create_view_statement()
                 .map(Statement::CreateView)
         } else {
             self.add_error(format!(
-                "expected TABLE, INDEX, COLUMNAR INDEX, or VIEW after CREATE at {}",
+                "expected TABLE, INDEX, or VIEW after CREATE at {}",
                 self.cur_token.position
             ));
             None
@@ -1703,62 +1696,6 @@ impl Parser {
         })
     }
 
-    /// Parse a CREATE COLUMNAR INDEX statement
-    fn parse_create_columnar_index_statement(&mut self) -> Option<CreateColumnarIndexStatement> {
-        let token = self.cur_token.clone();
-
-        // Check for IF NOT EXISTS
-        let if_not_exists = if self.peek_token_is_keyword("IF") {
-            self.next_token();
-            if !self.expect_keyword("NOT") {
-                return None;
-            }
-            if !self.expect_keyword("EXISTS") {
-                return None;
-            }
-            true
-        } else {
-            false
-        };
-
-        // Expect ON
-        if !self.expect_keyword("ON") {
-            return None;
-        }
-
-        // Parse table name
-        if !self.expect_peek(TokenType::Identifier) {
-            return None;
-        }
-        let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
-
-        // Expect (
-        if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
-            self.add_error(format!("expected '(' at {}", self.cur_token.position));
-            return None;
-        }
-
-        // Parse column name
-        if !self.expect_peek(TokenType::Identifier) {
-            return None;
-        }
-        let column_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
-
-        // Expect )
-        if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
-            self.add_error(format!("expected ')' at {}", self.cur_token.position));
-            return None;
-        }
-
-        Some(CreateColumnarIndexStatement {
-            token,
-            table_name,
-            column_name,
-            if_not_exists,
-            is_unique: false,
-        })
-    }
-
     /// Parse a CREATE VIEW statement
     fn parse_create_view_statement(&mut self) -> Option<CreateViewStatement> {
         let token = self.cur_token.clone();
@@ -1830,19 +1767,12 @@ impl Parser {
         } else if self.peek_token_is_keyword("INDEX") {
             self.next_token();
             self.parse_drop_index_statement().map(Statement::DropIndex)
-        } else if self.peek_token_is_keyword("COLUMNAR") {
-            self.next_token();
-            if !self.expect_keyword("INDEX") {
-                return None;
-            }
-            self.parse_drop_columnar_index_statement()
-                .map(Statement::DropColumnarIndex)
         } else if self.peek_token_is_keyword("VIEW") {
             self.next_token();
             self.parse_drop_view_statement().map(Statement::DropView)
         } else {
             self.add_error(format!(
-                "expected TABLE, INDEX, COLUMNAR INDEX, or VIEW after DROP at {}",
+                "expected TABLE, INDEX, or VIEW after DROP at {}",
                 self.cur_token.position
             ));
             None
@@ -1916,58 +1846,6 @@ impl Parser {
             token,
             index_name,
             table_name,
-            if_exists,
-        })
-    }
-
-    /// Parse a DROP COLUMNAR INDEX statement
-    fn parse_drop_columnar_index_statement(&mut self) -> Option<DropColumnarIndexStatement> {
-        let token = self.cur_token.clone();
-
-        // Check for IF EXISTS
-        let if_exists = if self.peek_token_is_keyword("IF") {
-            self.next_token();
-            if !self.expect_keyword("EXISTS") {
-                return None;
-            }
-            true
-        } else {
-            false
-        };
-
-        // Expect ON
-        if !self.expect_keyword("ON") {
-            return None;
-        }
-
-        // Parse table name
-        if !self.expect_peek(TokenType::Identifier) {
-            return None;
-        }
-        let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
-
-        // Expect (
-        if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
-            self.add_error(format!("expected '(' at {}", self.cur_token.position));
-            return None;
-        }
-
-        // Parse column name
-        if !self.expect_peek(TokenType::Identifier) {
-            return None;
-        }
-        let column_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
-
-        // Expect )
-        if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
-            self.add_error(format!("expected ')' at {}", self.cur_token.position));
-            return None;
-        }
-
-        Some(DropColumnarIndexStatement {
-            token,
-            table_name,
-            column_name,
             if_exists,
         })
     }

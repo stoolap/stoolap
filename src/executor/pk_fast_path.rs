@@ -417,7 +417,7 @@ impl Executor {
                 Self::normalize_row_to_schema(row, &lookup.schema),
             ));
         }
-        // Use Arc columns - O(1) clone since column_names is Arc<Vec<String>>
+        // Use Arc columns - O(1) clone since column_names is CompactArc<Vec<String>>
         Ok(Box::new(ExecutorResult::with_arc_columns(
             lookup.column_names.clone(),
             result_rows,

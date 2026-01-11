@@ -16,8 +16,7 @@
 //!
 //! This module provides result types for SQL query execution.
 
-use std::sync::Arc;
-
+use crate::common::CompactArc;
 use crate::core::{Result, Row, RowVec, Value};
 use crate::parser::ast::Expression;
 use crate::storage::traits::QueryResult;
@@ -123,7 +122,7 @@ enum RowStorage {
     /// Owned rows - pooled, returns to thread-local cache on drop
     Owned(RowVec),
     /// Shared rows from cache - read-only, clone on take
-    Shared(Arc<Vec<Row>>),
+    Shared(CompactArc<Vec<Row>>),
 }
 
 impl RowStorage {
@@ -155,7 +154,7 @@ impl RowStorage {
 
 pub struct ExecutorResult {
     /// Column names (Arc for zero-copy sharing with API layer)
-    columns: Arc<Vec<String>>,
+    columns: CompactArc<Vec<String>>,
     /// Result rows - either owned or shared
     rows: RowStorage,
     /// Cached row count to avoid repeated match in next()
@@ -175,7 +174,7 @@ impl ExecutorResult {
     pub fn new(columns: Vec<String>, rows: RowVec) -> Self {
         let len = rows.len();
         Self {
-            columns: Arc::new(columns),
+            columns: CompactArc::new(columns),
             rows: RowStorage::Owned(rows),
             len,
             current_index: None,
@@ -186,7 +185,7 @@ impl ExecutorResult {
     }
 
     /// Create a new memory result with Arc columns (zero-copy)
-    pub fn with_arc_columns(columns: Arc<Vec<String>>, rows: RowVec) -> Self {
+    pub fn with_arc_columns(columns: CompactArc<Vec<String>>, rows: RowVec) -> Self {
         let len = rows.len();
         Self {
             columns,
@@ -201,10 +200,10 @@ impl ExecutorResult {
 
     /// Create a new memory result with shared rows from cache (zero-copy for rows)
     /// This avoids cloning the entire Vec<Row> when reading from semantic cache
-    pub fn with_shared_rows(columns: Vec<String>, rows: Arc<Vec<Row>>) -> Self {
+    pub fn with_shared_rows(columns: Vec<String>, rows: CompactArc<Vec<Row>>) -> Self {
         let len = rows.len();
         Self {
-            columns: Arc::new(columns),
+            columns: CompactArc::new(columns),
             rows: RowStorage::Shared(rows),
             len,
             current_index: None,
@@ -215,7 +214,10 @@ impl ExecutorResult {
     }
 
     /// Create a new memory result with Arc columns and shared rows (zero-copy for both)
-    pub fn with_arc_columns_shared_rows(columns: Arc<Vec<String>>, rows: Arc<Vec<Row>>) -> Self {
+    pub fn with_arc_columns_shared_rows(
+        columns: CompactArc<Vec<String>>,
+        rows: CompactArc<Vec<Row>>,
+    ) -> Self {
         let len = rows.len();
         Self {
             columns,
@@ -230,7 +232,7 @@ impl ExecutorResult {
 
     /// Create a new memory result with both Arc columns and Arc rows (fully zero-copy)
     /// This is the most efficient constructor for cached/shared results
-    pub fn with_arc_all(columns: Arc<Vec<String>>, rows: Arc<Vec<Row>>) -> Self {
+    pub fn with_arc_all(columns: CompactArc<Vec<String>>, rows: CompactArc<Vec<Row>>) -> Self {
         let len = rows.len();
         Self {
             columns,
@@ -292,16 +294,16 @@ impl ExecutorResult {
             RowStorage::Owned(mut rv) => rv.drain_rows().collect(),
             RowStorage::Shared(rows) => {
                 // Must clone if shared
-                Arc::try_unwrap(rows).unwrap_or_else(|arc| (*arc).clone())
+                CompactArc::try_unwrap(rows).unwrap_or_else(|arc| (*arc).clone())
             }
         }
     }
 
-    /// Take rows as Arc for zero-copy sharing with joins
-    /// Returns Arc<Vec<Row>> - wraps owned rows or clones Arc for shared
-    pub fn into_arc_rows(self) -> Arc<Vec<Row>> {
+    /// Take rows as CompactArc for zero-copy sharing with joins
+    /// Returns CompactArc<Vec<Row>> - wraps owned rows or clones CompactArc for shared
+    pub fn into_arc_rows(self) -> CompactArc<Vec<Row>> {
         match self.rows {
-            RowStorage::Owned(mut rv) => Arc::new(rv.drain_rows().collect()),
+            RowStorage::Owned(mut rv) => CompactArc::new(rv.drain_rows().collect()),
             RowStorage::Shared(rows) => rows,
         }
     }
@@ -327,8 +329,8 @@ impl QueryResult for ExecutorResult {
         &self.columns
     }
 
-    fn columns_arc(&self) -> Option<Arc<Vec<String>>> {
-        Some(Arc::clone(&self.columns))
+    fn columns_arc(&self) -> Option<CompactArc<Vec<String>>> {
+        Some(CompactArc::clone(&self.columns))
     }
 
     #[inline]
@@ -398,12 +400,12 @@ impl QueryResult for ExecutorResult {
         self.insert_id
     }
 
-    fn try_into_arc_rows(&mut self) -> Option<Arc<Vec<Row>>> {
+    fn try_into_arc_rows(&mut self) -> Option<CompactArc<Vec<Row>>> {
         // Take ownership of rows and return as Arc
         let rows = std::mem::replace(&mut self.rows, RowStorage::Owned(RowVec::new()));
         self.closed = true; // Mark as consumed
         match rows {
-            RowStorage::Owned(mut rv) => Some(Arc::new(rv.drain_rows().collect())),
+            RowStorage::Owned(mut rv) => Some(CompactArc::new(rv.drain_rows().collect())),
             RowStorage::Shared(arc) => Some(arc),
         }
     }
@@ -412,8 +414,8 @@ impl QueryResult for ExecutorResult {
         mut self: Box<Self>,
         aliases: FxHashMap<String, String>,
     ) -> Box<dyn QueryResult> {
-        // Apply aliases to column names (use Arc::make_mut for copy-on-write)
-        let columns = Arc::make_mut(&mut self.columns);
+        // Apply aliases to column names (use CompactArc::make_mut for copy-on-write)
+        let columns = CompactArc::make_mut(&mut self.columns);
         for col in columns {
             // Find if this column has an alias (reverse lookup)
             for (alias, original) in &aliases {
@@ -574,8 +576,8 @@ enum CompiledProjection {
     Star,
     /// Expand columns for specific table/alias (SELECT t.*)
     QualifiedStar {
-        /// Lowercase prefix for matching (e.g., "t.")
-        prefix_lower: String,
+        /// Lowercase qualifier for matching (e.g., "t") - no format! allocation
+        qualifier_lower: String,
     },
     /// A pre-compiled expression program
     Compiled(super::expression::SharedProgram),
@@ -630,12 +632,9 @@ impl ExprMappedResult {
         for expr in &expressions {
             let projection = match expr {
                 Expression::Star(_) => CompiledProjection::Star,
-                Expression::QualifiedStar(qs) => {
-                    let prefix = format!("{}.", qs.qualifier);
-                    CompiledProjection::QualifiedStar {
-                        prefix_lower: prefix.to_lowercase(),
-                    }
-                }
+                Expression::QualifiedStar(qs) => CompiledProjection::QualifiedStar {
+                    qualifier_lower: qs.qualifier.to_lowercase().to_string(),
+                },
                 _ => {
                     let program = compile_expression(expr, &source_columns)?;
                     CompiledProjection::Compiled(program)
@@ -648,11 +647,13 @@ impl ExprMappedResult {
         let source_columns_lower: Vec<String> =
             source_columns.iter().map(|c| c.to_lowercase()).collect();
 
+        // Pre-allocate buffer with capacity for reuse
+        let capacity = projections.len();
         Ok(Self {
             inner,
             projections,
             vm: super::expression::ExprVM::new(),
-            current_row: Row::new(),
+            current_row: Row::with_capacity(capacity),
             output_columns,
             source_columns_lower,
         })
@@ -683,21 +684,31 @@ impl QueryResult for ExprMappedResult {
         if self.inner.next() {
             let source_row = self.inner.row();
 
-            let mut result_row = Row::with_capacity(self.projections.len());
+            // OPTIMIZATION: Lazy capacity reservation - only allocate when Row was taken
+            // This avoids allocation in take_row() when caller drops the Row
+            self.current_row.reserve_inline(self.projections.len());
+            // Reuse buffer with inline storage - clear_inline preserves capacity
+            self.current_row.clear_inline();
             for projection in &self.projections {
                 match projection {
                     CompiledProjection::Star => {
                         // Expand all columns from source
                         for value in source_row.iter() {
-                            result_row.push(value.clone());
+                            self.current_row.push_inline(value.clone());
                         }
                     }
-                    CompiledProjection::QualifiedStar { prefix_lower, .. } => {
+                    CompiledProjection::QualifiedStar { qualifier_lower } => {
                         // Expand columns for specific table/alias
                         // Use pre-computed lowercase columns to avoid per-row to_lowercase()
+                        let qualifier_len = qualifier_lower.len();
                         for (idx, col_lower) in self.source_columns_lower.iter().enumerate() {
-                            if col_lower.starts_with(prefix_lower) && idx < source_row.len() {
-                                result_row.push(source_row[idx].clone());
+                            // Inline prefix check: "qualifier." without format! allocation
+                            if col_lower.len() > qualifier_len
+                                && col_lower.starts_with(qualifier_lower.as_str())
+                                && col_lower.as_bytes()[qualifier_len] == b'.'
+                                && idx < source_row.len()
+                            {
+                                self.current_row.push_inline(source_row[idx].clone());
                             }
                         }
                     }
@@ -707,11 +718,10 @@ impl QueryResult for ExprMappedResult {
                             .vm
                             .execute_cow(program, &ctx)
                             .unwrap_or(Value::null_unknown());
-                        result_row.push(value);
+                        self.current_row.push_inline(value);
                     }
                 }
             }
-            self.current_row = result_row;
             true
         } else {
             false
@@ -737,6 +747,8 @@ impl QueryResult for ExprMappedResult {
     }
 
     fn take_row(&mut self) -> Row {
+        // Don't pre-allocate here - let next() do lazy initialization
+        // This eliminates one allocation per row when the caller drops the row
         std::mem::take(&mut self.current_row)
     }
 
@@ -1458,11 +1470,12 @@ impl ProjectedResult {
         let projected_columns: Vec<String> =
             inner.columns().iter().take(keep_columns).cloned().collect();
 
+        // Pre-allocate Inline storage - no Arc overhead for intermediate results
         Self {
             inner,
             keep_columns,
             projected_columns,
-            current_row: Row::new(),
+            current_row: Row::with_capacity(keep_columns),
         }
     }
 }
@@ -1475,19 +1488,14 @@ impl QueryResult for ProjectedResult {
     fn next(&mut self) -> bool {
         if self.inner.next() {
             // Project the row to keep only the first N columns
-            // OPTIMIZATION: Build a fresh Vec<Arc<Value>> directly instead of
-            // clear()+reserve()+push(). Those methods call make_mut_arc()
-            // which converts Shared storage to Owned by cloning.
+            // OPTIMIZATION: Use Inline storage - no Arc overhead for intermediate results
+            self.current_row.reserve_inline(self.keep_columns);
+            self.current_row.clear_inline();
             let full_row = self.inner.row();
-            let mut values = Vec::with_capacity(self.keep_columns);
             for i in 0..self.keep_columns {
-                values.push(
-                    full_row
-                        .get_arc(i)
-                        .unwrap_or_else(|| Arc::new(Value::null_unknown())),
-                );
+                self.current_row
+                    .push_inline(full_row.get(i).cloned().unwrap_or(Value::null_unknown()));
             }
-            self.current_row = Row::from_arc_values(values);
             true
         } else {
             false
@@ -1661,11 +1669,13 @@ impl StreamingProjectionResult {
         column_indices: Vec<usize>,
         output_columns: Vec<String>,
     ) -> Self {
+        // Pre-allocate Inline storage - no Arc overhead for intermediate results
+        let capacity = column_indices.len();
         Self {
             inner,
             column_indices,
             output_columns,
-            current_row: Row::new(),
+            current_row: Row::with_capacity(capacity),
         }
     }
 }
@@ -1677,20 +1687,18 @@ impl QueryResult for StreamingProjectionResult {
 
     fn next(&mut self) -> bool {
         if self.inner.next() {
-            // OPTIMIZATION: Build a fresh Vec<Arc<Value>> directly instead of
-            // clear()+reserve()+push_arc(). Those methods call make_mut_arc()
-            // which converts Shared storage to Owned by cloning, even though
-            // we're about to clear it. Building fresh avoids that overhead.
+            // OPTIMIZATION: Use Inline storage - no Arc overhead for intermediate results
+            self.current_row.reserve_inline(self.column_indices.len());
+            self.current_row.clear_inline();
             let source_row = self.inner.row();
-            let mut values = Vec::with_capacity(self.column_indices.len());
             for &idx in &self.column_indices {
-                values.push(
+                self.current_row.push_inline(
                     source_row
-                        .get_arc(idx)
-                        .unwrap_or_else(|| Arc::new(Value::null_unknown())),
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or(Value::null_unknown()),
                 );
             }
-            self.current_row = Row::from_arc_values(values);
             true
         } else {
             false
@@ -1729,6 +1737,193 @@ impl QueryResult for StreamingProjectionResult {
 
     fn last_insert_id(&self) -> i64 {
         0
+    }
+
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
+        Box::new(AliasedResult::new(self, aliases))
+    }
+}
+
+/// Columnar result that stores data column-major and materializes rows lazily.
+///
+/// This is optimized for window functions and other operations that naturally
+/// produce column-major output. Instead of allocating millions of Row objects
+/// upfront, it stores data as Vec<Value> per column and materializes rows
+/// on-demand during iteration.
+///
+/// Key benefits:
+/// - Reduces allocations from O(num_rows) to O(num_columns)
+/// - Reuses a single Row buffer during iteration (zero per-row allocation)
+/// - Natural fit for window function results
+///
+/// The returned row from `row()` is valid only until the next `next()` call.
+pub struct ColumnarResult {
+    /// Column names
+    columns: CompactArc<Vec<String>>,
+    /// Column-major storage: data[col_idx][row_idx]
+    data: Vec<Vec<Value>>,
+    /// Number of rows (cached for fast access)
+    num_rows: usize,
+    /// Current row index (None before first next())
+    current_index: Option<usize>,
+    /// Reusable row buffer - avoids allocation per row
+    current_row: Row,
+    /// Whether the result is closed
+    closed: bool,
+}
+
+impl ColumnarResult {
+    /// Create a new columnar result from column-major data
+    ///
+    /// # Arguments
+    /// * `columns` - Column names (must match data.len())
+    /// * `data` - Column-major data where data[col_idx] contains all values for that column
+    ///
+    /// # Panics
+    /// Panics if columns.len() != data.len() or if columns have different lengths
+    pub fn new(columns: Vec<String>, data: Vec<Vec<Value>>) -> Self {
+        debug_assert!(
+            columns.len() == data.len(),
+            "columns.len() ({}) != data.len() ({})",
+            columns.len(),
+            data.len()
+        );
+
+        let num_rows = data.first().map(|c| c.len()).unwrap_or(0);
+
+        // Verify all columns have the same length
+        #[cfg(debug_assertions)]
+        for (i, col) in data.iter().enumerate() {
+            debug_assert!(
+                col.len() == num_rows,
+                "column {} has {} rows but expected {}",
+                i,
+                col.len(),
+                num_rows
+            );
+        }
+
+        // Pre-allocate the row buffer with capacity for all columns
+        let num_cols = columns.len();
+
+        Self {
+            columns: CompactArc::new(columns),
+            data,
+            num_rows,
+            current_index: None,
+            current_row: Row::with_capacity(num_cols),
+            closed: false,
+        }
+    }
+
+    /// Create with CompactArc columns (zero-copy)
+    pub fn with_arc_columns(columns: CompactArc<Vec<String>>, data: Vec<Vec<Value>>) -> Self {
+        let num_rows = data.first().map(|c| c.len()).unwrap_or(0);
+        let num_cols = columns.len();
+
+        Self {
+            columns,
+            data,
+            num_rows,
+            current_index: None,
+            current_row: Row::with_capacity(num_cols),
+            closed: false,
+        }
+    }
+
+    /// Get the number of rows
+    #[inline]
+    pub fn row_count(&self) -> usize {
+        self.num_rows
+    }
+
+    /// Get the number of columns
+    #[inline]
+    pub fn column_count(&self) -> usize {
+        self.data.len()
+    }
+}
+
+impl QueryResult for ColumnarResult {
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    fn columns_arc(&self) -> Option<CompactArc<Vec<String>>> {
+        Some(CompactArc::clone(&self.columns))
+    }
+
+    #[inline]
+    fn next(&mut self) -> bool {
+        if self.closed {
+            return false;
+        }
+
+        let next_idx = match self.current_index {
+            None => 0,
+            Some(i) => i + 1,
+        };
+
+        if next_idx >= self.num_rows {
+            return false;
+        }
+
+        self.current_index = Some(next_idx);
+
+        // OPTIMIZATION: Lazy capacity reservation - only allocate when Row was taken
+        self.current_row.reserve_inline(self.data.len());
+        // Materialize row from column data - clear_inline preserves capacity
+        self.current_row.clear_inline();
+        for col_data in &self.data {
+            // Safety: we verified all columns have num_rows elements
+            self.current_row.push_inline(col_data[next_idx].clone());
+        }
+
+        true
+    }
+
+    fn scan(&self, dest: &mut [Value]) -> Result<()> {
+        if dest.len() != self.current_row.len() {
+            return Err(crate::core::Error::internal(format!(
+                "scan destination has {} values but row has {} columns",
+                dest.len(),
+                self.current_row.len()
+            )));
+        }
+        for (i, value) in self.current_row.iter().enumerate() {
+            dest[i] = value.clone();
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn row(&self) -> &Row {
+        &self.current_row
+    }
+
+    fn take_row(&mut self) -> Row {
+        // Don't pre-allocate here - let next() do lazy initialization
+        // This eliminates one allocation per row when the caller drops the Row
+        std::mem::take(&mut self.current_row)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.closed = true;
+        // Clear data to free memory
+        self.data.clear();
+        Ok(())
+    }
+
+    fn rows_affected(&self) -> i64 {
+        0
+    }
+
+    fn last_insert_id(&self) -> i64 {
+        0
+    }
+
+    fn estimated_count(&self) -> Option<usize> {
+        Some(self.num_rows)
     }
 
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {

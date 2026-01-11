@@ -20,6 +20,8 @@ use std::fmt;
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
+
+use crate::common::CompactArc;
 use rustc_hash::FxHashMap;
 
 use super::error::{Error, Result};
@@ -191,7 +193,7 @@ pub struct Schema {
     pub updated_at: DateTime<Utc>,
 
     /// Cached column names (computed lazily on first access, Arc for zero-copy sharing)
-    column_names_cache: OnceLock<Arc<Vec<String>>>,
+    column_names_cache: OnceLock<CompactArc<Vec<String>>>,
 
     /// Cached primary key column index (computed lazily on first access)
     /// None means not computed yet, Some(None) means no PK, Some(Some(idx)) means PK at idx
@@ -204,7 +206,7 @@ pub struct Schema {
     pk_indices_cache: OnceLock<Arc<Vec<usize>>>,
 
     /// Cached lowercase column names (computed lazily on first access)
-    column_names_lower_cache: OnceLock<Arc<Vec<String>>>,
+    column_names_lower_cache: OnceLock<CompactArc<Vec<String>>>,
 }
 
 impl Clone for Schema {
@@ -212,8 +214,8 @@ impl Clone for Schema {
         // Clone caches if already computed to avoid recomputation
         let column_names_cache = OnceLock::new();
         if let Some(names) = self.column_names_cache.get() {
-            // Arc clone is O(1) - just increments ref count
-            let _ = column_names_cache.set(Arc::clone(names));
+            // CompactArc clone is O(1) - just increments ref count
+            let _ = column_names_cache.set(CompactArc::clone(names));
         }
 
         let pk_column_index_cache = OnceLock::new();
@@ -233,7 +235,7 @@ impl Clone for Schema {
 
         let column_names_lower_cache = OnceLock::new();
         if let Some(names) = self.column_names_lower_cache.get() {
-            let _ = column_names_lower_cache.set(Arc::clone(names));
+            let _ = column_names_lower_cache.set(CompactArc::clone(names));
         }
 
         Self {
@@ -271,7 +273,9 @@ impl Schema {
 
         // Eagerly compute caches to avoid recomputation on clone
         let column_names_cache = OnceLock::new();
-        let _ = column_names_cache.set(Arc::new(columns.iter().map(|c| c.name.clone()).collect()));
+        let _ = column_names_cache.set(CompactArc::new(
+            columns.iter().map(|c| c.name.clone()).collect(),
+        ));
 
         let pk_column_index_cache = OnceLock::new();
         let pk_idx = columns
@@ -301,7 +305,7 @@ impl Schema {
         ));
 
         let column_names_lower_cache = OnceLock::new();
-        let _ = column_names_lower_cache.set(Arc::new(
+        let _ = column_names_lower_cache.set(CompactArc::new(
             columns.iter().map(|c| c.name_lower.clone()).collect(),
         ));
 
@@ -331,7 +335,9 @@ impl Schema {
 
         // Eagerly compute caches to avoid recomputation on clone
         let column_names_cache = OnceLock::new();
-        let _ = column_names_cache.set(Arc::new(columns.iter().map(|c| c.name.clone()).collect()));
+        let _ = column_names_cache.set(CompactArc::new(
+            columns.iter().map(|c| c.name.clone()).collect(),
+        ));
 
         let pk_column_index_cache = OnceLock::new();
         let pk_idx = columns
@@ -361,7 +367,7 @@ impl Schema {
         ));
 
         let column_names_lower_cache = OnceLock::new();
-        let _ = column_names_lower_cache.set(Arc::new(
+        let _ = column_names_lower_cache.set(CompactArc::new(
             columns.iter().map(|c| c.name_lower.clone()).collect(),
         ));
 
@@ -436,7 +442,7 @@ impl Schema {
     #[inline]
     pub fn column_names_owned(&self) -> &[String] {
         self.column_names_cache
-            .get_or_init(|| Arc::new(self.columns.iter().map(|c| c.name.clone()).collect()))
+            .get_or_init(|| CompactArc::new(self.columns.iter().map(|c| c.name.clone()).collect()))
     }
 
     /// Get column names as Arc for zero-copy sharing with results
@@ -444,10 +450,11 @@ impl Schema {
     /// This is the most efficient way to pass column names to `ExecutorResult::with_arc_columns`
     /// as it avoids any string cloning after the first call.
     #[inline]
-    pub fn column_names_arc(&self) -> Arc<Vec<String>> {
-        Arc::clone(
-            self.column_names_cache
-                .get_or_init(|| Arc::new(self.columns.iter().map(|c| c.name.clone()).collect())),
+    pub fn column_names_arc(&self) -> CompactArc<Vec<String>> {
+        CompactArc::clone(
+            self.column_names_cache.get_or_init(|| {
+                CompactArc::new(self.columns.iter().map(|c| c.name.clone()).collect())
+            }),
         )
     }
 
@@ -456,12 +463,10 @@ impl Schema {
     /// Uses the pre-computed `name_lower` from each SchemaColumn, avoiding
     /// per-query `to_lowercase()` calls.
     #[inline]
-    pub fn column_names_lower_arc(&self) -> Arc<Vec<String>> {
-        Arc::clone(
-            self.column_names_lower_cache.get_or_init(|| {
-                Arc::new(self.columns.iter().map(|c| c.name_lower.clone()).collect())
-            }),
-        )
+    pub fn column_names_lower_arc(&self) -> CompactArc<Vec<String>> {
+        CompactArc::clone(self.column_names_lower_cache.get_or_init(|| {
+            CompactArc::new(self.columns.iter().map(|c| c.name_lower.clone()).collect())
+        }))
     }
 
     /// Get a cached map of lowercase column names to their indices
@@ -536,7 +541,7 @@ impl Schema {
     fn rebuild_caches(&mut self) {
         // Rebuild column names cache
         self.column_names_cache = OnceLock::new();
-        let _ = self.column_names_cache.set(Arc::new(
+        let _ = self.column_names_cache.set(CompactArc::new(
             self.columns.iter().map(|c| c.name.clone()).collect(),
         ));
 
@@ -573,7 +578,7 @@ impl Schema {
 
         // Rebuild lowercase column names cache
         self.column_names_lower_cache = OnceLock::new();
-        let _ = self.column_names_lower_cache.set(Arc::new(
+        let _ = self.column_names_lower_cache.set(CompactArc::new(
             self.columns.iter().map(|c| c.name_lower.clone()).collect(),
         ));
     }

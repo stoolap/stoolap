@@ -92,8 +92,7 @@
 //! The optimizer has bloom filter propagation logic, but runtime bloom filter
 //! checks are not yet integrated into the streaming operators.
 
-use std::sync::Arc;
-
+use crate::common::{CompactArc, CompactVec};
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, RowVec, Value};
 use crate::executor::context::ExecutionContext;
@@ -162,14 +161,14 @@ struct JoinConfig {
 
 /// Request to execute a join operation.
 ///
-/// Uses Arc<Vec<Row>> to enable zero-copy sharing with CTE results.
+/// Uses CompactArc<Vec<Row>> to enable zero-copy sharing with CTE results.
 /// When dropping, only decrements refcount (O(1)) instead of deallocating rows.
 /// The caller should pass Arc-wrapped data for CTE sources.
 pub struct JoinRequest<'a> {
     /// Left side rows (Arc for zero-copy sharing with CTE results).
-    pub left_rows: Arc<Vec<Row>>,
+    pub left_rows: CompactArc<Vec<Row>>,
     /// Right side rows (Arc for zero-copy sharing with CTE results).
-    pub right_rows: Arc<Vec<Row>>,
+    pub right_rows: CompactArc<Vec<Row>>,
     /// Left side column names.
     pub left_columns: &'a [String],
     /// Right side column names.
@@ -206,7 +205,7 @@ pub struct JoinRequest<'a> {
 /// - Join algorithm is Hash Join
 pub struct StreamingJoinRequest<'a> {
     /// Build side rows (Arc for zero-copy sharing with CTE results).
-    pub build_rows: Arc<Vec<Row>>,
+    pub build_rows: CompactArc<Vec<Row>>,
     /// Build side column names.
     pub build_columns: &'a [String],
     /// Probe side as streaming operator (NOT materialized).
@@ -374,9 +373,9 @@ impl JoinExecutor {
             // Standard path: build hash table during open()
             let build_schema: Vec<ColumnInfo> =
                 request.build_columns.iter().map(ColumnInfo::new).collect();
-            // Unwrap Arc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
+            // Unwrap CompactArc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
             let build_rows_vec =
-                Arc::try_unwrap(request.build_rows).unwrap_or_else(|arc| (*arc).clone());
+                CompactArc::try_unwrap(request.build_rows).unwrap_or_else(|arc| (*arc).clone());
             let build_op = Box::new(MaterializedOperator::new(build_rows_vec, build_schema));
 
             let (left_op, right_op): (Box<dyn Operator>, Box<dyn Operator>) =
@@ -574,8 +573,8 @@ impl JoinExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join(
         &self,
-        left_rows: Arc<Vec<Row>>,
-        right_rows: Arc<Vec<Row>>,
+        left_rows: CompactArc<Vec<Row>>,
+        right_rows: CompactArc<Vec<Row>>,
         analysis: &JoinAnalysis,
         left_columns: &[String],
         right_columns: &[String],
@@ -641,8 +640,8 @@ impl JoinExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_parallel(
         &self,
-        left_rows: Arc<Vec<Row>>,
-        right_rows: Arc<Vec<Row>>,
+        left_rows: CompactArc<Vec<Row>>,
+        right_rows: CompactArc<Vec<Row>>,
         analysis: &JoinAnalysis,
         left_col_count: usize,
         right_col_count: usize,
@@ -744,8 +743,8 @@ impl JoinExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_streaming(
         &self,
-        left_rows: Arc<Vec<Row>>,
-        right_rows: Arc<Vec<Row>>,
+        left_rows: CompactArc<Vec<Row>>,
+        right_rows: CompactArc<Vec<Row>>,
         analysis: &JoinAnalysis,
         left_columns: &[String],
         right_columns: &[String],
@@ -819,8 +818,8 @@ impl JoinExecutor {
     /// Execute merge join for pre-sorted inputs using MergeJoinOperator.
     fn execute_merge_join(
         &self,
-        left_rows: Arc<Vec<Row>>,
-        right_rows: Arc<Vec<Row>>,
+        left_rows: CompactArc<Vec<Row>>,
+        right_rows: CompactArc<Vec<Row>>,
         left_columns: &[String],
         right_columns: &[String],
         analysis: &JoinAnalysis,
@@ -830,9 +829,9 @@ impl JoinExecutor {
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
         let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
 
-        // Unwrap Arc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
-        let left_vec = Arc::try_unwrap(left_rows).unwrap_or_else(|arc| (*arc).clone());
-        let right_vec = Arc::try_unwrap(right_rows).unwrap_or_else(|arc| (*arc).clone());
+        // Unwrap CompactArc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
+        let left_vec = CompactArc::try_unwrap(left_rows).unwrap_or_else(|arc| (*arc).clone());
+        let right_vec = CompactArc::try_unwrap(right_rows).unwrap_or_else(|arc| (*arc).clone());
 
         // Create input operators - takes ownership, no clone
         let left_op = Box::new(MaterializedOperator::new(left_vec, left_schema));
@@ -855,8 +854,8 @@ impl JoinExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_nested_loop(
         &self,
-        left_rows: Arc<Vec<Row>>,
-        right_rows: Arc<Vec<Row>>,
+        left_rows: CompactArc<Vec<Row>>,
+        right_rows: CompactArc<Vec<Row>>,
         condition: Option<&Expression>,
         left_columns: &[String],
         right_columns: &[String],
@@ -867,9 +866,9 @@ impl JoinExecutor {
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
         let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
 
-        // Unwrap Arc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
-        let left_vec = Arc::try_unwrap(left_rows).unwrap_or_else(|arc| (*arc).clone());
-        let right_vec = Arc::try_unwrap(right_rows).unwrap_or_else(|arc| (*arc).clone());
+        // Unwrap CompactArc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
+        let left_vec = CompactArc::try_unwrap(left_rows).unwrap_or_else(|arc| (*arc).clone());
+        let right_vec = CompactArc::try_unwrap(right_rows).unwrap_or_else(|arc| (*arc).clone());
 
         // Create input operators - takes ownership, no clone
         let left_op = Box::new(MaterializedOperator::new(left_vec, left_schema));
@@ -982,16 +981,20 @@ impl JoinExecutor {
                             // Convert to NULL-padded row
                             if is_left_outer {
                                 // Keep left, NULL right
-                                let mut new_values: Vec<Value> =
-                                    row.iter().take(left_col_count).cloned().collect();
+                                // Use CompactVec directly to avoid Vec→CompactVec conversion
+                                let mut new_values: CompactVec<Value> =
+                                    CompactVec::with_capacity(left_col_count + right_col_count);
+                                new_values.extend(row.iter().take(left_col_count).cloned());
                                 new_values.extend(std::iter::repeat_n(NULL_VALUE, right_col_count));
-                                (row_id, Row::from_values(new_values))
+                                (row_id, Row::from_compact_vec(new_values))
                             } else if is_right_outer {
                                 // NULL left, keep right
-                                let mut new_values: Vec<Value> =
-                                    std::iter::repeat_n(NULL_VALUE, left_col_count).collect();
+                                // Use CompactVec directly to avoid Vec→CompactVec conversion
+                                let mut new_values: CompactVec<Value> =
+                                    CompactVec::with_capacity(left_col_count + right_col_count);
+                                new_values.extend(std::iter::repeat_n(NULL_VALUE, left_col_count));
                                 new_values.extend(row.iter().skip(left_col_count).cloned());
-                                (row_id, Row::from_values(new_values))
+                                (row_id, Row::from_compact_vec(new_values))
                             } else {
                                 // FULL OUTER - keep original for now
                                 (row_id, row)
@@ -1054,8 +1057,8 @@ mod tests {
         ));
 
         let request = JoinRequest {
-            left_rows: Arc::new(left),
-            right_rows: Arc::new(right),
+            left_rows: CompactArc::new(left),
+            right_rows: CompactArc::new(right),
             left_columns: &left_cols,
             right_columns: &right_cols,
             condition: Some(&cond),
@@ -1099,8 +1102,8 @@ mod tests {
         ));
 
         let request = JoinRequest {
-            left_rows: Arc::new(left),
-            right_rows: Arc::new(right),
+            left_rows: CompactArc::new(left),
+            right_rows: CompactArc::new(right),
             left_columns: &left_cols,
             right_columns: &right_cols,
             condition: Some(&cond),
@@ -1144,8 +1147,8 @@ mod tests {
         ));
 
         let request = JoinRequest {
-            left_rows: Arc::new(left),
-            right_rows: Arc::new(right),
+            left_rows: CompactArc::new(left),
+            right_rows: CompactArc::new(right),
             left_columns: &left_cols,
             right_columns: &right_cols,
             condition: Some(&cond),
@@ -1173,8 +1176,8 @@ mod tests {
         let right_cols = vec!["b.val".to_string()];
 
         let request = JoinRequest {
-            left_rows: Arc::new(left),
-            right_rows: Arc::new(right),
+            left_rows: CompactArc::new(left),
+            right_rows: CompactArc::new(right),
             left_columns: &left_cols,
             right_columns: &right_cols,
             condition: None,
