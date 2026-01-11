@@ -58,11 +58,12 @@
 
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
+use crate::common::CompactArc;
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
 use crate::storage::expression::{ComparisonExpr, Expression, InListExpr};
 use crate::storage::traits::Index;
@@ -87,10 +88,10 @@ fn hash_values(values: &[Value]) -> u64 {
     hasher.finish()
 }
 
-/// Compute hash for a slice of Arc<Value> using ahash
+/// Compute hash for a slice of CompactArc<Value> using ahash
 /// Uses same fixed seeds as hash_values for consistency
 #[inline]
-fn hash_arc_values(values: &[Arc<Value>]) -> u64 {
+fn hash_arc_values(values: &[CompactArc<Value>]) -> u64 {
     let hasher_builder =
         ahash::RandomState::with_seeds(HASH_SEEDS[0], HASH_SEEDS[1], HASH_SEEDS[2], HASH_SEEDS[3]);
     let mut hasher = hasher_builder.build_hasher();
@@ -110,7 +111,7 @@ fn hash_arc_values(values: &[Arc<Value>]) -> u64 {
 /// - Uses ahash - faster than SipHash
 /// - SmallVec optimization for single-match case (common for unique indexes)
 /// - Thread-safe with RwLock
-/// - Memory efficient with Arc<Value> for O(1) cloning
+/// - Memory efficient with CompactArc<Value> for O(1) cloning
 ///
 /// ## Limitations:
 /// - Does NOT support range queries (returns error)
@@ -135,10 +136,10 @@ pub struct HashIndex {
     row_to_hash: RwLock<FxHashMap<i64, u64>>,
 
     /// Full values storage for hash collision handling and unique constraint checking
-    /// Maps hash -> (values as Arc<Value>, row_ids) for collision resolution
-    /// Uses Arc<Value> to share references with ValueArena (8 bytes per value)
+    /// Maps hash -> (values as CompactArc<Value>, row_ids) for collision resolution
+    /// Uses CompactArc<Value> to share references with ValueArena (8 bytes per value)
     #[allow(clippy::type_complexity)]
-    hash_to_values: RwLock<FxHashMap<u64, Vec<(Vec<Arc<Value>>, SmallVec<[i64; 4]>)>>>,
+    hash_to_values: RwLock<FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, SmallVec<[i64; 4]>)>>>,
 }
 
 impl std::fmt::Debug for HashIndex {
@@ -185,7 +186,7 @@ impl HashIndex {
         values: &[Value],
         row_id: i64,
         hash: u64,
-        hash_to_values: &FxHashMap<u64, Vec<(Vec<Arc<Value>>, SmallVec<[i64; 4]>)>>,
+        hash_to_values: &FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, SmallVec<[i64; 4]>)>>,
     ) -> Result<()> {
         if !self.is_unique {
             return Ok(());
@@ -200,7 +201,7 @@ impl HashIndex {
 
         if let Some(entries) = hash_to_values.get(&hash) {
             for (stored_values, row_ids) in entries {
-                // Compare Arc<Value> contents with input values using optimized helper
+                // Compare CompactArc<Value> contents with input values using optimized helper
                 if Self::values_match(stored_values, values) && !row_ids.is_empty() {
                     // Check if any row_id is different (would be a duplicate)
                     if row_ids.iter().any(|&id| id != row_id) {
@@ -218,10 +219,10 @@ impl HashIndex {
         Ok(())
     }
 
-    /// Helper to compare stored Arc<Value> with input &[Value]
+    /// Helper to compare stored CompactArc<Value> with input &[Value]
     /// Specialized unrolling for common cases (1-4 columns): ~5% faster than zip().all()
     #[inline]
-    fn values_match(stored: &[Arc<Value>], input: &[Value]) -> bool {
+    fn values_match(stored: &[CompactArc<Value>], input: &[Value]) -> bool {
         if stored.len() != input.len() {
             return false;
         }
@@ -247,13 +248,13 @@ impl HashIndex {
         }
     }
 
-    /// Helper to compare stored Arc<Value> with input &[Arc<Value>]
+    /// Helper to compare stored CompactArc<Value> with input &[CompactArc<Value>]
     /// Specialized unrolling for common cases (1-4 columns): ~5% faster than zip().all()
     #[inline]
-    fn arc_values_match(stored: &[Arc<Value>], input: &[Arc<Value>]) -> bool {
+    fn arc_values_match(stored: &[CompactArc<Value>], input: &[CompactArc<Value>]) -> bool {
         #[inline]
-        fn eq(s: &Arc<Value>, i: &Arc<Value>) -> bool {
-            Arc::ptr_eq(s, i) || s.as_ref() == i.as_ref()
+        fn eq(s: &CompactArc<Value>, i: &CompactArc<Value>) -> bool {
+            CompactArc::ptr_eq(s, i) || s.as_ref() == i.as_ref()
         }
         if stored.len() != input.len() {
             return false;
@@ -274,7 +275,7 @@ impl HashIndex {
             _ => stored
                 .iter()
                 .zip(input.iter())
-                .all(|(s, i)| Arc::ptr_eq(s, i) || s.as_ref() == i.as_ref()),
+                .all(|(s, i)| CompactArc::ptr_eq(s, i) || s.as_ref() == i.as_ref()),
         }
     }
 
@@ -282,10 +283,10 @@ impl HashIndex {
     #[allow(clippy::type_complexity)]
     fn check_unique_constraint_arc(
         &self,
-        values: &[Arc<Value>],
+        values: &[CompactArc<Value>],
         row_id: i64,
         hash: u64,
-        hash_to_values: &FxHashMap<u64, Vec<(Vec<Arc<Value>>, SmallVec<[i64; 4]>)>>,
+        hash_to_values: &FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, SmallVec<[i64; 4]>)>>,
     ) -> Result<()> {
         if !self.is_unique {
             return Ok(());
@@ -300,7 +301,7 @@ impl HashIndex {
 
         if let Some(entries) = hash_to_values.get(&hash) {
             for (stored_values, row_ids) in entries {
-                // Compare Arc<Value> contents
+                // Compare CompactArc<Value> contents
                 if Self::arc_values_match(stored_values, values) && !row_ids.is_empty() {
                     // Check if any row_id is different (would be a duplicate)
                     if row_ids.iter().any(|&id| id != row_id) {
@@ -394,11 +395,11 @@ impl Index for HashIndex {
         row_to_hash.insert(row_id, hash);
 
         // Add to hash_to_values for collision handling
-        // Use Arc<Value> via arena for memory efficiency
+        // Use CompactArc<Value> via arena for memory efficiency
         let entries = hash_to_values.entry(hash).or_default();
         let mut found = false;
         for (stored_values, row_ids) in entries.iter_mut() {
-            // Compare Arc<Value> contents with input values
+            // Compare CompactArc<Value> contents with input values
             if Self::values_match(stored_values, values) {
                 // Insert sorted for O(N+M) merge operations
                 if let Err(pos) = row_ids.binary_search(&row_id) {
@@ -410,7 +411,8 @@ impl Index for HashIndex {
         }
         if !found {
             // Wrap values in Arc for O(1) cloning
-            let arc_values: Vec<Arc<Value>> = values.iter().map(|v| Arc::new(v.clone())).collect();
+            let arc_values: Vec<CompactArc<Value>> =
+                values.iter().map(|v| CompactArc::new(v.clone())).collect();
             let mut row_ids = SmallVec::new();
             row_ids.push(row_id); // First element, already sorted
             entries.push((arc_values, row_ids));
@@ -419,7 +421,7 @@ impl Index for HashIndex {
         Ok(())
     }
 
-    fn add_arc(&self, values: &[Arc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
+    fn add_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
         }
@@ -497,7 +499,7 @@ impl Index for HashIndex {
         }
         if !found {
             // Clone Arc references - O(1) per value, no value cloning!
-            let arc_values: Vec<Arc<Value>> = values.iter().map(Arc::clone).collect();
+            let arc_values: Vec<CompactArc<Value>> = values.iter().map(CompactArc::clone).collect();
             let mut row_ids = SmallVec::new();
             row_ids.push(row_id); // First element, already sorted
             entries.push((arc_values, row_ids));
@@ -540,7 +542,7 @@ impl Index for HashIndex {
         // Remove from hash_to_values (row_ids are sorted, use binary search)
         if let Some(entries) = hash_to_values.get_mut(&hash) {
             for (stored_values, row_ids) in entries.iter_mut() {
-                // Compare Arc<Value> contents with input values
+                // Compare CompactArc<Value> contents with input values
                 if Self::values_match(stored_values, values) {
                     if let Ok(pos) = row_ids.binary_search(&row_id) {
                         row_ids.remove(pos);
@@ -557,7 +559,7 @@ impl Index for HashIndex {
         Ok(())
     }
 
-    fn remove_arc(&self, values: &[Arc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
+    fn remove_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
         }
@@ -584,7 +586,7 @@ impl Index for HashIndex {
         // Remove from hash_to_values (row_ids are sorted, use binary search)
         if let Some(entries) = hash_to_values.get_mut(&hash) {
             for (stored_values, row_ids) in entries.iter_mut() {
-                // Compare Arc<Value> contents with input Arc values
+                // Compare CompactArc<Value> contents with input Arc values
                 if Self::arc_values_match(stored_values, values) {
                     if let Ok(pos) = row_ids.binary_search(&row_id) {
                         row_ids.remove(pos);
@@ -646,7 +648,7 @@ impl Index for HashIndex {
         let hash_to_values = self.hash_to_values.read().unwrap();
 
         if let Some(entries) = hash_to_values.get(&hash) {
-            // Handle hash collisions by checking actual values (Arc<Value>)
+            // Handle hash collisions by checking actual values (CompactArc<Value>)
             for (stored_values, row_ids) in entries {
                 if Self::values_match(stored_values, values) {
                     return Ok(row_ids
@@ -704,7 +706,7 @@ impl Index for HashIndex {
         let hash_to_values = self.hash_to_values.read().unwrap();
 
         if let Some(entries) = hash_to_values.get(&hash) {
-            // Handle hash collisions by checking actual values (Arc<Value>)
+            // Handle hash collisions by checking actual values (CompactArc<Value>)
             for (stored_values, row_ids) in entries {
                 if Self::values_match(stored_values, values) {
                     // SmallVec can be iterated efficiently
@@ -730,7 +732,7 @@ impl Index for HashIndex {
             let hash = hash_values(std::slice::from_ref(value));
             if let Some(entries) = hash_to_values.get(&hash) {
                 for (stored_values, row_ids) in entries {
-                    // Compare Arc<Value> with input value
+                    // Compare CompactArc<Value> with input value
                     if stored_values.len() == 1 && stored_values[0].as_ref() == value {
                         results.extend(row_ids.iter().copied());
                         break;

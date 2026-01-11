@@ -22,8 +22,8 @@ use ahash::AHashSet;
 use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 use std::fmt;
-use std::sync::Arc;
 
+use crate::common::CompactArc;
 use crate::core::Value;
 
 // ============================================================================
@@ -694,16 +694,16 @@ pub struct InHashSetExpression {
     /// The column/expression to check
     pub column: Box<Expression>,
     /// Pre-computed AHashSet for O(1) lookup - Arc for cheap parallel cloning
-    pub values: Arc<AHashSet<Value>>,
+    pub values: CompactArc<AHashSet<Value>>,
     /// Whether this is NOT IN
     pub not: bool,
 }
 
 impl PartialEq for InHashSetExpression {
     fn eq(&self, other: &Self) -> bool {
-        // Compare by Arc pointer for efficiency (same HashSet = same Arc)
+        // Compare by CompactArc pointer for efficiency (same HashSet = same CompactArc)
         self.not == other.not
-            && Arc::ptr_eq(&self.values, &other.values)
+            && CompactArc::ptr_eq(&self.values, &other.values)
             && self.column == other.column
     }
 }
@@ -1226,8 +1226,6 @@ pub enum Statement {
     AlterTable(Box<AlterTableStatement>),
     CreateIndex(CreateIndexStatement),
     DropIndex(DropIndexStatement),
-    CreateColumnarIndex(CreateColumnarIndexStatement),
-    DropColumnarIndex(DropColumnarIndexStatement),
     CreateView(CreateViewStatement),
     DropView(DropViewStatement),
     Begin(BeginStatement),
@@ -1261,8 +1259,6 @@ impl fmt::Display for Statement {
             Statement::AlterTable(s) => write!(f, "{}", s),
             Statement::CreateIndex(s) => write!(f, "{}", s),
             Statement::DropIndex(s) => write!(f, "{}", s),
-            Statement::CreateColumnarIndex(s) => write!(f, "{}", s),
-            Statement::DropColumnarIndex(s) => write!(f, "{}", s),
             Statement::CreateView(s) => write!(f, "{}", s),
             Statement::DropView(s) => write!(f, "{}", s),
             Statement::Begin(s) => write!(f, "{}", s),
@@ -1897,51 +1893,6 @@ impl fmt::Display for DropIndexStatement {
         if let Some(ref table) = self.table_name {
             result.push_str(&format!(" ON {}", table));
         }
-        write!(f, "{}", result)
-    }
-}
-
-/// CREATE COLUMNAR INDEX statement
-#[derive(Debug, Clone, PartialEq)]
-pub struct CreateColumnarIndexStatement {
-    pub token: Token,
-    pub table_name: Identifier,
-    pub column_name: Identifier,
-    pub if_not_exists: bool,
-    pub is_unique: bool,
-}
-
-impl fmt::Display for CreateColumnarIndexStatement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut result = String::from("CREATE ");
-        if self.is_unique {
-            result.push_str("UNIQUE ");
-        }
-        result.push_str("COLUMNAR INDEX ");
-        if self.if_not_exists {
-            result.push_str("IF NOT EXISTS ");
-        }
-        result.push_str(&format!("ON {} ({})", self.table_name, self.column_name));
-        write!(f, "{}", result)
-    }
-}
-
-/// DROP COLUMNAR INDEX statement
-#[derive(Debug, Clone, PartialEq)]
-pub struct DropColumnarIndexStatement {
-    pub token: Token,
-    pub table_name: Identifier,
-    pub column_name: Identifier,
-    pub if_exists: bool,
-}
-
-impl fmt::Display for DropColumnarIndexStatement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut result = String::from("DROP COLUMNAR INDEX ");
-        if self.if_exists {
-            result.push_str("IF EXISTS ");
-        }
-        result.push_str(&format!("ON {} ({})", self.table_name, self.column_name));
         write!(f, "{}", result)
     }
 }

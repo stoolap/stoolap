@@ -22,7 +22,7 @@ use super::error::{Error, Result};
 use super::schema::Schema;
 use super::types::DataType;
 use super::value::Value;
-use crate::common::CompactVec;
+use crate::common::{CompactArc, CompactVec};
 
 /// Internal storage for Row - hybrid approach for memory + performance
 ///
@@ -36,11 +36,11 @@ use crate::common::CompactVec;
 #[derive(Debug, Clone)]
 enum RowStorage {
     /// Shared storage - O(1) clone, copy-on-write for mutation (checked first)
-    Shared(Arc<[Arc<Value>]>),
+    Shared(Arc<[CompactArc<Value>]>),
     /// Inline storage - CompactVec<Value> for intermediate results (16 bytes, no Arc overhead)
     Inline(CompactVec<Value>),
-    /// Owned storage - CompactVec<Arc<Value>>, supports sharing with indexes (16 bytes)
-    Owned(CompactVec<Arc<Value>>),
+    /// Owned storage - CompactVec<CompactArc<Value>>, supports sharing with indexes (16 bytes)
+    Owned(CompactVec<CompactArc<Value>>),
 }
 
 impl Default for RowStorage {
@@ -127,11 +127,11 @@ impl RowStorage {
         match self {
             RowStorage::Inline(v) => v,
             RowStorage::Owned(arc_vec) => {
-                // Convert Arc<Value> to Value - use try_unwrap to avoid cloning when refcount is 1
+                // Convert CompactArc<Value> to Value - use try_unwrap to avoid cloning when refcount is 1
                 let vec = std::mem::take(arc_vec);
                 *self = RowStorage::Inline(
                     vec.into_iter()
-                        .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()))
+                        .map(|arc| CompactArc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()))
                         .collect(),
                 );
                 match self {
@@ -151,11 +151,12 @@ impl RowStorage {
 
     /// Get mutable access to Arc CompactVec, converting if necessary (copy-on-write)
     #[inline]
-    fn make_mut_arc(&mut self) -> &mut CompactVec<Arc<Value>> {
+    fn make_mut_arc(&mut self) -> &mut CompactVec<CompactArc<Value>> {
         match self {
             RowStorage::Inline(v) => {
-                // Convert Value to Arc<Value>
-                *self = RowStorage::Owned(std::mem::take(v).into_iter().map(Arc::new).collect());
+                // Convert Value to CompactArc<Value>
+                *self =
+                    RowStorage::Owned(std::mem::take(v).into_iter().map(CompactArc::new).collect());
                 match self {
                     RowStorage::Owned(v) => v,
                     _ => unreachable!(),
@@ -163,7 +164,7 @@ impl RowStorage {
             }
             RowStorage::Owned(v) => v,
             RowStorage::Shared(arc) => {
-                // Copy-on-write: convert shared to owned (Arc::clone is cheap)
+                // Copy-on-write: convert shared to owned (CompactArc::clone is cheap)
                 *self = RowStorage::Owned(arc.iter().cloned().collect());
                 match self {
                     RowStorage::Owned(v) => v,
@@ -181,18 +182,18 @@ impl RowStorage {
             RowStorage::Owned(v) => {
                 // Try to unwrap each Arc - if sole owner, move value; else clone
                 v.into_iter()
-                    .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()))
+                    .map(|arc| CompactArc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()))
                     .collect()
             }
             RowStorage::Shared(arc) => arc.iter().map(|a| (**a).clone()).collect(),
         }
     }
 
-    /// Convert to owned Vec<Arc<Value>>, consuming self
+    /// Convert to owned Vec<CompactArc<Value>>, consuming self
     #[inline]
-    fn into_arc_vec(self) -> Vec<Arc<Value>> {
+    fn into_arc_vec(self) -> Vec<CompactArc<Value>> {
         match self {
-            RowStorage::Inline(v) => v.into_iter().map(Arc::new).collect(),
+            RowStorage::Inline(v) => v.into_iter().map(CompactArc::new).collect(),
             RowStorage::Owned(v) => v.into_vec(),
             RowStorage::Shared(arc) => arc.to_vec(),
         }
@@ -200,7 +201,7 @@ impl RowStorage {
 
     /// Get mutable access to Arc CompactVec (alias for make_mut_arc for backwards compat)
     #[inline]
-    fn make_mut(&mut self) -> &mut CompactVec<Arc<Value>> {
+    fn make_mut(&mut self) -> &mut CompactVec<CompactArc<Value>> {
         self.make_mut_arc()
     }
 }
@@ -220,7 +221,7 @@ pub struct Row {
 /// Iterator over row values - handles all storage types transparently
 pub enum RowIter<'a> {
     Inline(std::slice::Iter<'a, Value>),
-    Arc(std::slice::Iter<'a, Arc<Value>>),
+    Arc(std::slice::Iter<'a, CompactArc<Value>>),
 }
 
 impl<'a> Iterator for RowIter<'a> {
@@ -263,7 +264,7 @@ impl<'a> DoubleEndedIterator for RowIter<'a> {
 
 /// Mutable iterator over row values - converts to Arc storage first
 pub struct RowIterMut<'a> {
-    inner: std::slice::IterMut<'a, Arc<Value>>,
+    inner: std::slice::IterMut<'a, CompactArc<Value>>,
 }
 
 impl<'a> Iterator for RowIterMut<'a> {
@@ -271,7 +272,7 @@ impl<'a> Iterator for RowIterMut<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(Arc::make_mut)
+        self.inner.next().map(CompactArc::make_mut)
     }
 
     #[inline]
@@ -321,11 +322,20 @@ impl Row {
         }
     }
 
-    /// Create a row from a vector of Arc<Value> (no wrapping needed)
+    /// Create a row from a vector of CompactArc<Value> (no wrapping needed)
     #[inline]
-    pub fn from_arc_values(values: Vec<Arc<Value>>) -> Self {
+    pub fn from_arc_values(values: Vec<CompactArc<Value>>) -> Self {
         Self {
             storage: RowStorage::Owned(CompactVec::from_vec(values)),
+        }
+    }
+
+    /// Create an empty row with Arc storage and pre-allocated capacity.
+    /// Use this when you'll be calling `clear()` + `push_arc()` repeatedly.
+    #[inline]
+    pub fn with_arc_capacity(capacity: usize) -> Self {
+        Self {
+            storage: RowStorage::Owned(CompactVec::with_capacity(capacity)),
         }
     }
 
@@ -374,7 +384,7 @@ impl Row {
             RowStorage::Owned(right_vec) => vec.extend(
                 right_vec
                     .into_iter()
-                    .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
+                    .map(|arc| CompactArc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
             ),
             RowStorage::Shared(arc) => vec.extend(arc.iter().map(|a| (**a).clone())),
         }
@@ -398,7 +408,7 @@ impl Row {
             RowStorage::Owned(left_vec) => vec.extend(
                 left_vec
                     .into_iter()
-                    .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
+                    .map(|arc| CompactArc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
             ),
             RowStorage::Shared(arc) => vec.extend(arc.iter().map(|a| (**a).clone())),
         }
@@ -407,7 +417,7 @@ impl Row {
             RowStorage::Owned(right_vec) => vec.extend(
                 right_vec
                     .into_iter()
-                    .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
+                    .map(|arc| CompactArc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
             ),
             RowStorage::Shared(arc) => vec.extend(arc.iter().map(|a| (**a).clone())),
         }
@@ -426,7 +436,7 @@ impl Row {
         // Extend with Arc values, moving when possible
         match left.storage {
             RowStorage::Inline(left_vec) => {
-                vec.extend(left_vec.into_iter().map(Arc::new));
+                vec.extend(left_vec.into_iter().map(CompactArc::new));
             }
             RowStorage::Owned(left_vec) => {
                 vec.extend(left_vec);
@@ -437,7 +447,7 @@ impl Row {
         }
         match right.storage {
             RowStorage::Inline(right_vec) => {
-                vec.extend(right_vec.into_iter().map(Arc::new));
+                vec.extend(right_vec.into_iter().map(CompactArc::new));
             }
             RowStorage::Owned(right_vec) => {
                 vec.extend(right_vec);
@@ -462,7 +472,7 @@ impl Row {
             RowStorage::Owned(right_vec) => values.extend(
                 right_vec
                     .into_iter()
-                    .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
+                    .map(|arc| CompactArc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
             ),
             RowStorage::Shared(arc) => values.extend(arc.iter().map(|a| (**a).clone())),
         }
@@ -490,18 +500,20 @@ impl Row {
                 let mut values: CompactVec<Value> = CompactVec::with_capacity(total_len);
                 match left_storage {
                     RowStorage::Inline(v) => values.extend(v),
-                    RowStorage::Owned(v) => values.extend(
-                        v.into_iter()
-                            .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
-                    ),
+                    RowStorage::Owned(v) => {
+                        values.extend(v.into_iter().map(|arc| {
+                            CompactArc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
+                        }))
+                    }
                     RowStorage::Shared(a) => values.extend(a.iter().map(|arc| (**arc).clone())),
                 }
                 match right_storage {
                     RowStorage::Inline(v) => values.extend(v),
-                    RowStorage::Owned(v) => values.extend(
-                        v.into_iter()
-                            .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
-                    ),
+                    RowStorage::Owned(v) => {
+                        values.extend(v.into_iter().map(|arc| {
+                            CompactArc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
+                        }))
+                    }
                     RowStorage::Shared(a) => values.extend(a.iter().map(|arc| (**arc).clone())),
                 }
                 Self {
@@ -515,13 +527,13 @@ impl Row {
     #[inline]
     pub fn from_arc(values: Arc<[Value]>) -> Self {
         Self {
-            storage: RowStorage::Owned(values.iter().map(|v| Arc::new(v.clone())).collect()),
+            storage: RowStorage::Owned(values.iter().map(|v| CompactArc::new(v.clone())).collect()),
         }
     }
 
-    /// Create a row from an Arc slice of Arc<Value> - O(1) clone
+    /// Create a row from an Arc slice of CompactArc<Value> - O(1) clone
     #[inline]
-    pub fn from_arc_slice(values: Arc<[Arc<Value>]>) -> Self {
+    pub fn from_arc_slice(values: Arc<[CompactArc<Value>]>) -> Self {
         Self {
             storage: RowStorage::Shared(values),
         }
@@ -536,7 +548,7 @@ impl Row {
     pub fn ensure_owned(&mut self) {
         match std::mem::take(&mut self.storage) {
             RowStorage::Inline(v) => {
-                self.storage = RowStorage::Owned(v.into_iter().map(Arc::new).collect());
+                self.storage = RowStorage::Owned(v.into_iter().map(CompactArc::new).collect());
             }
             RowStorage::Shared(arc) => {
                 self.storage = RowStorage::Owned(arc.iter().cloned().collect());
@@ -556,10 +568,10 @@ impl Row {
     /// Create a row with null values for a given schema
     #[inline]
     pub fn null_row(schema: &Schema) -> Self {
-        let values: CompactVec<Arc<Value>> = schema
+        let values: CompactVec<CompactArc<Value>> = schema
             .columns
             .iter()
-            .map(|col| Arc::new(Value::null(col.data_type)))
+            .map(|col| CompactArc::new(Value::null(col.data_type)))
             .collect();
         Self {
             storage: RowStorage::Owned(values),
@@ -584,12 +596,12 @@ impl Row {
         self.storage.get_value(index)
     }
 
-    /// Get an Arc<Value> by index - for indexes to share references
+    /// Get an CompactArc<Value> by index - for indexes to share references
     /// Note: For Inline storage, this creates a new Arc (clone required)
     #[inline]
-    pub fn get_arc(&self, index: usize) -> Option<Arc<Value>> {
+    pub fn get_arc(&self, index: usize) -> Option<CompactArc<Value>> {
         match &self.storage {
-            RowStorage::Inline(v) => v.get(index).map(|val| Arc::new(val.clone())),
+            RowStorage::Inline(v) => v.get(index).map(|val| CompactArc::new(val.clone())),
             RowStorage::Owned(v) => v.get(index).cloned(),
             RowStorage::Shared(a) => a.get(index).cloned(),
         }
@@ -599,7 +611,10 @@ impl Row {
     /// Note: This may clone the value if it has multiple Arc references
     #[inline]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
-        self.storage.make_mut().get_mut(index).map(Arc::make_mut)
+        self.storage
+            .make_mut()
+            .get_mut(index)
+            .map(CompactArc::make_mut)
     }
 
     /// Set a value at the given index (triggers copy-on-write if shared)
@@ -610,19 +625,19 @@ impl Row {
                 message: format!("row index {} out of bounds (len={})", index, vec.len()),
             });
         }
-        vec[index] = Arc::new(value);
+        vec[index] = CompactArc::new(value);
         Ok(())
     }
 
     /// Push a value to the end of the row (triggers copy-on-write if shared)
     #[inline]
     pub fn push(&mut self, value: Value) {
-        self.storage.make_mut().push(Arc::new(value));
+        self.storage.make_mut().push(CompactArc::new(value));
     }
 
-    /// Push an Arc<Value> to the end of the row (no wrapping needed)
+    /// Push an CompactArc<Value> to the end of the row (no wrapping needed)
     #[inline]
-    pub fn push_arc(&mut self, value: Arc<Value>) {
+    pub fn push_arc(&mut self, value: CompactArc<Value>) {
         self.storage.make_mut().push(value);
     }
 
@@ -632,7 +647,7 @@ impl Row {
         self.storage
             .make_mut()
             .pop()
-            .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
+            .map(|arc| CompactArc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
     }
 
     /// Truncate the row to a specific length (triggers copy-on-write if shared)
@@ -650,16 +665,50 @@ impl Row {
         self.storage.make_mut().clear();
     }
 
+    /// Clear the row's inline storage, keeping allocated capacity.
+    /// Uses Inline storage (CompactVec<Value>) without Arc overhead.
+    /// This is optimal for streaming operations where rows are reused.
+    #[inline]
+    pub fn clear_inline(&mut self) {
+        self.storage.make_mut_inline().clear();
+    }
+
+    /// Push a value to inline storage without Arc wrapping.
+    /// More efficient than push() when Arc sharing is not needed.
+    #[inline]
+    pub fn push_inline(&mut self, value: Value) {
+        self.storage.make_mut_inline().push(value);
+    }
+
+    /// Clear and refill the row with new values, reusing the buffer.
+    /// This is the most efficient way to reuse a Row for streaming results.
+    /// Zero allocations if the new data fits in existing capacity.
+    #[inline]
+    pub fn refill_inline<I: Iterator<Item = Value>>(&mut self, values: I) {
+        let vec = self.storage.make_mut_inline();
+        vec.clear();
+        vec.extend(values);
+    }
+
+    /// Reserve capacity in inline storage
+    #[inline]
+    pub fn reserve_inline(&mut self, capacity: usize) {
+        let vec = self.storage.make_mut_inline();
+        if vec.capacity() < capacity {
+            vec.reserve(capacity - vec.len());
+        }
+    }
+
     /// Extend the row with values from a slice (wraps each in Arc)
     #[inline]
     pub fn extend_from_slice(&mut self, other: &[Value]) {
         let vec = self.storage.make_mut();
-        vec.extend(other.iter().map(|v| Arc::new(v.clone())));
+        vec.extend(other.iter().map(|v| CompactArc::new(v.clone())));
     }
 
-    /// Extend the row with Arc<Value> references (no wrapping needed)
+    /// Extend the row with CompactArc<Value> references (no wrapping needed)
     #[inline]
-    pub fn extend_from_arc_slice(&mut self, other: &[Arc<Value>]) {
+    pub fn extend_from_arc_slice(&mut self, other: &[CompactArc<Value>]) {
         let vec = self.storage.make_mut();
         vec.extend(other.iter().cloned());
     }
@@ -681,10 +730,10 @@ impl Row {
         }
     }
 
-    /// Get an iterator over Arc<Value> references (for efficient cloning)
+    /// Get an iterator over CompactArc<Value> references (for efficient cloning)
     /// PANICS on Inline storage - use ensure_owned() first if Arc access is needed.
     #[inline]
-    pub fn iter_arc(&self) -> std::slice::Iter<'_, Arc<Value>> {
+    pub fn iter_arc(&self) -> std::slice::Iter<'_, CompactArc<Value>> {
         match &self.storage {
             RowStorage::Inline(_) => {
                 panic!("iter_arc() called on Inline storage - call ensure_owned() first")
@@ -726,16 +775,16 @@ impl Row {
                     None
                 } else {
                     let arc = v.swap_remove(0);
-                    Some(Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()))
+                    Some(CompactArc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()))
                 }
             }
             RowStorage::Shared(arc) => arc.first().map(|a| (**a).clone()),
         }
     }
 
-    /// Get the underlying vector of Arc<Value>
+    /// Get the underlying vector of CompactArc<Value>
     #[inline]
-    pub fn into_arc_values(self) -> Vec<Arc<Value>> {
+    pub fn into_arc_values(self) -> Vec<CompactArc<Value>> {
         self.storage.into_arc_vec()
     }
 
@@ -747,7 +796,7 @@ impl Row {
 
     /// Try to get Arc slice - returns None for Inline storage
     #[inline]
-    pub fn try_as_arc_slice(&self) -> Option<&[Arc<Value>]> {
+    pub fn try_as_arc_slice(&self) -> Option<&[CompactArc<Value>]> {
         match &self.storage {
             RowStorage::Inline(_) => None,
             RowStorage::Owned(v) => Some(v),
@@ -755,10 +804,13 @@ impl Row {
         }
     }
 
-    /// Get mutable CompactVec<Arc<Value>> with guaranteed capacity, for buffer reuse patterns.
+    /// Get mutable CompactVec<CompactArc<Value>> with guaranteed capacity, for buffer reuse patterns.
     /// OPTIMIZATION: Ensures capacity without reallocation if already sufficient.
     #[inline]
-    pub fn as_mut_arc_vec_with_capacity(&mut self, capacity: usize) -> &mut CompactVec<Arc<Value>> {
+    pub fn as_mut_arc_vec_with_capacity(
+        &mut self,
+        capacity: usize,
+    ) -> &mut CompactVec<CompactArc<Value>> {
         let vec = self.storage.make_mut();
         if vec.capacity() < capacity {
             vec.reserve(capacity - vec.len());
@@ -766,27 +818,28 @@ impl Row {
         vec
     }
 
-    /// Convert Row to Arc<[Arc<Value>]>, consuming self - efficient for arena storage
+    /// Convert Row to Arc<[CompactArc<Value>]>, consuming self - efficient for arena storage
     /// - Shared: returns the Arc directly (O(1))
     /// - Owned: converts to Arc (O(n) to create the Arc slice)
     /// - Inline: wraps each value in Arc then creates Arc slice
     ///
     /// OPTIMIZATION: Shared checked first (most common path)
     #[inline(always)]
-    pub fn into_arc(self) -> Arc<[Arc<Value>]> {
+    pub fn into_arc(self) -> Arc<[CompactArc<Value>]> {
         match self.storage {
             RowStorage::Shared(arc) => arc,
             RowStorage::Inline(vec) => {
-                let arc_vec: Vec<Arc<Value>> = vec.into_iter().map(Arc::new).collect();
+                let arc_vec: Vec<CompactArc<Value>> =
+                    vec.into_iter().map(CompactArc::new).collect();
                 Arc::from(arc_vec.into_boxed_slice())
             }
             RowStorage::Owned(vec) => Arc::from(vec.into_boxed_slice()),
         }
     }
 
-    /// Get a mutable reference to the underlying Arc<Value> CompactVec (triggers copy-on-write)
+    /// Get a mutable reference to the underlying CompactArc<Value> CompactVec (triggers copy-on-write)
     #[inline]
-    pub fn as_mut_arc_vec(&mut self) -> &mut CompactVec<Arc<Value>> {
+    pub fn as_mut_arc_vec(&mut self) -> &mut CompactVec<CompactArc<Value>> {
         self.storage.make_mut()
     }
 
@@ -817,7 +870,7 @@ impl Row {
                 let mut values = CompactVec::with_capacity(indices.len());
                 for &idx in indices {
                     match vec.get(idx) {
-                        Some(arc) => values.push(Arc::clone(arc)),
+                        Some(arc) => values.push(CompactArc::clone(arc)),
                         None => {
                             return Err(Error::Internal {
                                 message: format!(
@@ -836,7 +889,7 @@ impl Row {
                 let mut values = CompactVec::with_capacity(indices.len());
                 for &idx in indices {
                     match arc.get(idx) {
-                        Some(a) => values.push(Arc::clone(a)),
+                        Some(a) => values.push(CompactArc::clone(a)),
                         None => {
                             return Err(Error::Internal {
                                 message: format!(
@@ -884,7 +937,18 @@ impl Row {
                     // Selecting all columns from Shared - just return self
                     return self;
                 }
-                _ => { /* fall through to general case for Shared partial */ }
+                RowStorage::Shared(ref arc) => {
+                    // Prefix selection from Shared: clone Arc refs for prefix columns only
+                    // This is O(prefix_len) Arc clones (cheap atomic increments), no value cloning
+                    let prefix_len = indices.len();
+                    let mut values = CompactVec::with_capacity(prefix_len);
+                    for i in 0..prefix_len {
+                        values.push(CompactArc::clone(&arc[i]));
+                    }
+                    return Row {
+                        storage: RowStorage::Owned(values),
+                    };
+                }
             }
         }
 
@@ -907,14 +971,14 @@ impl Row {
             }
             RowStorage::Owned(vec) => {
                 // Owned: clone Arc refs we need (O(1) per Arc), drop rest naturally
-                // Arc::clone is just an atomic increment - much cheaper than allocation.
+                // CompactArc::clone is just an atomic increment - much cheaper than allocation.
                 let len = vec.len();
                 let mut values = CompactVec::with_capacity(indices.len());
                 for &idx in indices {
                     if idx < len {
-                        values.push(Arc::clone(&vec[idx]));
+                        values.push(CompactArc::clone(&vec[idx]));
                     } else {
-                        values.push(Arc::new(Value::null_unknown()));
+                        values.push(CompactArc::new(Value::null_unknown()));
                     }
                 }
                 // vec drops here - decrements refcounts for values we cloned,
@@ -928,9 +992,9 @@ impl Row {
                 let mut values = CompactVec::with_capacity(indices.len());
                 for &idx in indices {
                     if idx < arc.len() {
-                        values.push(Arc::clone(&arc[idx]));
+                        values.push(CompactArc::clone(&arc[idx]));
                     } else {
-                        values.push(Arc::new(Value::null_unknown()));
+                        values.push(CompactArc::new(Value::null_unknown()));
                     }
                 }
                 Row {
@@ -996,7 +1060,7 @@ impl Row {
                 let mut values = CompactVec::with_capacity(indices.len());
                 for &i in indices {
                     if let Some(arc) = vec.get(i) {
-                        values.push(Arc::clone(arc));
+                        values.push(CompactArc::clone(arc));
                     }
                 }
                 Row {
@@ -1007,7 +1071,7 @@ impl Row {
                 let mut values = CompactVec::with_capacity(indices.len());
                 for &i in indices {
                     if let Some(a) = arc.get(i) {
-                        values.push(Arc::clone(a));
+                        values.push(CompactArc::clone(a));
                     }
                 }
                 Row {
@@ -1038,7 +1102,7 @@ impl Row {
     }
 }
 
-// Note: Deref<Target=[Value]> removed - incompatible with Arc<Value> storage
+// Note: Deref<Target=[Value]> removed - incompatible with CompactArc<Value> storage
 // Use iter() for iteration, get() for indexed access, or as_arc_slice() for Arc references
 
 // Implement Index for convenient access

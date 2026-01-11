@@ -32,6 +32,7 @@
 //! tx.commit()?;
 //! ```
 
+use crate::api::params::ParamVec;
 use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::ExpressionEval;
@@ -104,7 +105,7 @@ impl Transaction {
         self.check_active()?;
 
         let param_values = params.into_params();
-        let result = self.execute_sql(sql, &param_values)?;
+        let result = self.execute_sql(sql, param_values)?;
         Ok(result.rows_affected())
     }
 
@@ -124,7 +125,7 @@ impl Transaction {
         self.check_active()?;
 
         let param_values = params.into_params();
-        let result = self.execute_sql(sql, &param_values)?;
+        let result = self.execute_sql(sql, param_values)?;
         Ok(Rows::new(result))
     }
 
@@ -166,7 +167,7 @@ impl Transaction {
     }
 
     /// Internal SQL execution
-    fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<Box<dyn QueryResult>> {
+    fn execute_sql(&mut self, sql: &str, params: ParamVec) -> Result<Box<dyn QueryResult>> {
         // Parse the SQL
         let mut parser = Parser::new(sql);
         let program = parser
@@ -177,7 +178,7 @@ impl Transaction {
         let ctx = if params.is_empty() {
             ExecutionContext::new()
         } else {
-            ExecutionContext::with_params(params.to_vec())
+            ExecutionContext::with_params(params)
         };
 
         // Execute each statement

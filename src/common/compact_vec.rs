@@ -685,6 +685,30 @@ impl<T> Drop for IntoIter<T> {
     }
 }
 
+/// Creates a [`CompactVec`] containing the arguments.
+///
+/// `compact_vec!` allows creating a `CompactVec` with the same syntax as `vec![]`:
+///
+/// ```ignore
+/// let v = compact_vec![1, 2, 3];
+/// assert_eq!(v.as_slice(), &[1, 2, 3]);
+/// ```
+#[macro_export]
+macro_rules! compact_vec {
+    () => {
+        $crate::common::CompactVec::new()
+    };
+    ($($elem:expr),+ $(,)?) => {{
+        // Use array to get count at compile time, then collect
+        let arr = [$($elem),+];
+        let mut vec = $crate::common::CompactVec::with_capacity(arr.len());
+        for elem in arr {
+            vec.push(elem);
+        }
+        vec
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

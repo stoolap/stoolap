@@ -20,14 +20,17 @@
 //! - [`buffer_pool`] - Self-tuning buffer pool for efficient memory reuse
 //! - [`int_maps`] - Fast hash maps for integer keys
 //! - [`compact_vec`] - 16-byte vector optimized for Row storage
+//! - [`compact_arc`] - Memory-efficient Arc without weak reference support
 
 pub mod buffer_pool;
+pub mod compact_arc;
 pub mod compact_vec;
 pub mod int_maps;
 pub mod version;
 
 // Re-export main types for convenience
 pub use buffer_pool::{BufferPool, PoolStats};
+pub use compact_arc::CompactArc;
 pub use compact_vec::CompactVec;
 pub use int_maps::{
     new_btree_int64_map, new_concurrent_int64_map, new_int64_map, new_int64_map_with_capacity,

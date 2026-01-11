@@ -78,9 +78,10 @@ use rustc_hash::{FxHashMap, FxHasher};
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use crate::common::CompactArc;
 use crate::core::{Result, Row};
 
 /// Convert to lowercase without allocation if already lowercase.
@@ -174,7 +175,7 @@ pub struct CachedResult {
     /// Column names in order
     pub column_names: Vec<String>,
     /// Cached rows (Arc for zero-copy sharing on cache hits)
-    pub rows: Arc<Vec<Row>>,
+    pub rows: CompactArc<Vec<Row>>,
     /// The original WHERE predicate (for subsumption checking)
     pub predicate: Option<Expression>,
     /// When this entry was cached
@@ -197,7 +198,7 @@ impl CachedResult {
         Self {
             fingerprint,
             column_names,
-            rows: Arc::new(rows), // Wrap in Arc for zero-copy sharing
+            rows: CompactArc::new(rows), // Wrap in CompactArc for zero-copy sharing
             predicate,
             cached_at: now,
             last_accessed: now,
@@ -207,12 +208,12 @@ impl CachedResult {
 
     /// Create a new cached result with pre-wrapped Arc (avoids clone)
     ///
-    /// Use this when the caller already has an Arc<Vec<Row>> to avoid
+    /// Use this when the caller already has an CompactArc<Vec<Row>> to avoid
     /// an extra allocation and copy.
     pub fn new_with_arc(
         fingerprint: QueryFingerprint,
         column_names: Vec<String>,
-        rows: Arc<Vec<Row>>,
+        rows: CompactArc<Vec<Row>>,
         predicate: Option<Expression>,
     ) -> Self {
         let now = Instant::now();
@@ -318,11 +319,11 @@ pub struct SemanticCacheStatsSnapshot {
 #[derive(Debug)]
 pub enum CacheLookupResult {
     /// Exact match found (Arc for zero-copy sharing)
-    ExactHit(Arc<Vec<Row>>),
+    ExactHit(CompactArc<Vec<Row>>),
     /// Subsumption match found - apply filter to get results
     SubsumptionHit {
         /// Rows to filter (Arc for zero-copy sharing)
-        rows: Arc<Vec<Row>>,
+        rows: CompactArc<Vec<Row>>,
         /// Filter predicate to apply
         filter: Box<Expression>,
         /// Column names for evaluation context
@@ -579,7 +580,7 @@ impl SemanticCache {
         &self,
         table_name: &str,
         columns: Vec<String>,
-        rows: Arc<Vec<Row>>,
+        rows: CompactArc<Vec<Row>>,
         predicate: Option<Expression>,
     ) {
         let new_row_count = rows.len();

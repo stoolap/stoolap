@@ -48,9 +48,51 @@ use crate::storage::traits::{QueryResult, Table};
 
 use super::context::ExecutionContext;
 use super::expression::{ExpressionEval, MultiExpressionEval};
-use super::result::ExecutorResult;
+use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::build_column_index_map;
 use super::Executor;
+
+/// Wrapper for parallel writes to disjoint indices in a Vec<Value>.
+///
+/// SAFETY INVARIANT: Each index must be written by at most one thread.
+/// In window function computation, each partition writes to its own row indices,
+/// which are guaranteed to be disjoint (each row belongs to exactly one partition).
+struct ParallelVec {
+    ptr: *mut Value,
+    len: usize,
+}
+
+// SAFETY: ParallelVec is Send because we only write to disjoint indices
+// and Value is Send. Each partition writes to its own indices.
+unsafe impl Send for ParallelVec {}
+
+// SAFETY: ParallelVec is Sync because parallel writes to disjoint indices
+// don't race with each other. Each row index belongs to exactly one partition.
+unsafe impl Sync for ParallelVec {}
+
+impl ParallelVec {
+    /// Create from a mutable Vec reference.
+    /// The Vec must not be accessed through other references while ParallelVec exists.
+    #[inline]
+    fn new(vec: &mut Vec<Value>) -> Self {
+        Self {
+            ptr: vec.as_mut_ptr(),
+            len: vec.len(),
+        }
+    }
+
+    /// Write a value at the given index.
+    /// SAFETY: No two threads may write to the same index concurrently.
+    #[inline]
+    fn write(&self, idx: usize, value: Value) {
+        debug_assert!(idx < self.len, "index out of bounds");
+        // SAFETY: Caller guarantees no concurrent writes to the same index.
+        // In window functions, each partition writes to disjoint row indices.
+        unsafe {
+            *self.ptr.add(idx) = value;
+        }
+    }
+}
 
 /// Information about a window function call in a SELECT list
 #[derive(Clone, Debug)]
@@ -333,10 +375,11 @@ impl Executor {
             result_columns.push(item.output_name.clone());
         }
 
-        // Step 3: Build result rows based on SELECT list
+        // Step 3: Build result using COLUMNAR storage
+        // OPTIMIZATION: Instead of allocating one Row per result row, we store data column-major
+        // and use ColumnarResult which materializes rows lazily with a single reused buffer.
+        // This reduces allocations from O(num_rows) to O(num_columns).
         let num_rows = base_rows.len();
-        let mut result_rows = RowVec::with_capacity(num_rows);
-        let mut result_row_id = 0i64;
 
         // Build aliases from col_index_map for expression evaluation
         let agg_aliases: Vec<(String, usize)> =
@@ -422,80 +465,105 @@ impl Executor {
         } else {
             0
         };
-        let mut ext_values: Vec<Value> = Vec::with_capacity(ext_values_capacity);
+        let mut ext_values: CompactVec<Value> = CompactVec::with_capacity(ext_values_capacity);
 
         // Number of output columns
         let num_items = select_items.len();
 
-        for (row_idx, (_, base_row)) in base_rows.iter().enumerate() {
-            // Build values vec directly and move into Row
-            let mut values: CompactVec<Value> = CompactVec::with_capacity(num_items);
+        // COLUMNAR STORAGE OPTIMIZATION: Build columns in column-major order
+        // This is more cache-efficient than row-by-row iteration and enables
+        // moving window function Vecs directly (zero-copy for window results).
+        //
+        // Phase 1: Build non-expression columns (WindowFunction, BaseColumn)
+        // Phase 2: Fill expression columns row-by-row (requires evaluation)
+        let mut column_data: Vec<Vec<Value>> = Vec::with_capacity(num_items);
 
-            // Fill values in order (push instead of index to avoid resize)
-            for (item_idx, (item, _, _)) in transformed_items.iter().enumerate() {
-                let value = match &item.source {
-                    SelectItemSource::BaseColumn(col_idx) => {
-                        base_row.get(*col_idx).cloned().unwrap_or(NULL_VALUE)
+        // Track which window functions are used in expressions (need to keep them)
+        let wf_names_in_exprs: std::collections::HashSet<&str> =
+            added_wf_names.iter().map(|s| s.as_str()).collect();
+
+        // Phase 1: Build columns for WindowFunction and BaseColumn items
+        // Expression columns get placeholder Vecs (filled in Phase 2)
+        for (item, _, _) in &transformed_items {
+            match &item.source {
+                SelectItemSource::WindowFunction(wf_name_lower) => {
+                    // OPTIMIZATION: Move or clone the entire Vec at once
+                    // If this window function is also used in an expression, we need to keep it
+                    if wf_names_in_exprs.contains(wf_name_lower.as_str()) {
+                        // Clone the entire Vec (more cache-efficient than element-by-element)
+                        let values = window_value_map
+                            .get(wf_name_lower)
+                            .cloned()
+                            .unwrap_or_else(|| vec![NULL_VALUE; num_rows]);
+                        column_data.push(values);
+                    } else {
+                        // Move the Vec directly (zero-copy)
+                        let values = window_value_map
+                            .remove(wf_name_lower)
+                            .unwrap_or_else(|| vec![NULL_VALUE; num_rows]);
+                        column_data.push(values);
                     }
-                    SelectItemSource::WindowFunction(wf_name_lower) => window_value_map
-                        .get(wf_name_lower)
-                        .and_then(|vals| vals.get(row_idx).cloned())
-                        .unwrap_or(NULL_VALUE),
-                    SelectItemSource::Expression(_) => {
-                        // Will be filled below
-                        NULL_VALUE
+                }
+                SelectItemSource::BaseColumn(base_col_idx) => {
+                    // OPTIMIZATION: Build base column in one pass (column-wise)
+                    let mut values = Vec::with_capacity(num_rows);
+                    for (_, base_row) in base_rows {
+                        values.push(base_row.get(*base_col_idx).cloned().unwrap_or(NULL_VALUE));
                     }
-                    SelectItemSource::ExpressionWithWindow(_, _) => {
-                        // Will be filled below
-                        NULL_VALUE
-                    }
-                };
-                values.push(value);
-                let _ = item_idx; // suppress warning
+                    column_data.push(values);
+                }
+                SelectItemSource::Expression(_) | SelectItemSource::ExpressionWithWindow(_, _) => {
+                    // Placeholder - will be filled in Phase 2
+                    column_data.push(vec![NULL_VALUE; num_rows]);
+                }
             }
+        }
 
-            // Evaluate base expressions and update their values
-            if let Some(ref mut eval) = base_eval {
-                if let Ok(base_results) = eval.eval_all(base_row) {
-                    for (eval_idx, (item_idx, _)) in base_expr_items.iter().enumerate() {
-                        if eval_idx < base_results.len() {
-                            values[*item_idx] = base_results[eval_idx].clone();
+        // Phase 2: Fill expression columns row-by-row (requires evaluation)
+        let has_expressions = !base_expr_items.is_empty() || !ext_expr_items.is_empty();
+        if has_expressions {
+            for (row_idx, (_, base_row)) in base_rows.iter().enumerate() {
+                // Evaluate base expressions and update their column values
+                if let Some(ref mut eval) = base_eval {
+                    if let Ok(base_results) = eval.eval_all(base_row) {
+                        for (eval_idx, (item_idx, _)) in base_expr_items.iter().enumerate() {
+                            if eval_idx < base_results.len() {
+                                column_data[*item_idx][row_idx] = base_results[eval_idx].clone();
+                            }
                         }
                     }
                 }
-            }
 
-            // Evaluate extended expressions (if any) and update their values
-            if !ext_expr_items.is_empty() {
-                if let Some(ref mut eval) = ext_eval {
-                    // Reuse ext_values buffer: clear and refill
-                    ext_values.clear();
-                    ext_values.extend(base_row.iter().cloned());
-                    for wf_name in &added_wf_names {
-                        let wf_value = window_value_map
-                            .get(wf_name)
-                            .and_then(|vals| vals.get(row_idx).cloned())
-                            .unwrap_or(NULL_VALUE);
-                        ext_values.push(wf_value);
-                    }
-                    let ext_row = Row::from_values(ext_values.clone());
+                // Evaluate extended expressions (if any) and update their column values
+                if !ext_expr_items.is_empty() {
+                    if let Some(ref mut eval) = ext_eval {
+                        // Reuse ext_values buffer: clear and refill
+                        ext_values.clear();
+                        ext_values.extend(base_row.iter().cloned());
+                        for wf_name in &added_wf_names {
+                            let wf_value = window_value_map
+                                .get(wf_name)
+                                .and_then(|vals| vals.get(row_idx).cloned())
+                                .unwrap_or(NULL_VALUE);
+                            ext_values.push(wf_value);
+                        }
+                        let ext_row = Row::from_compact_vec(ext_values.clone());
 
-                    if let Ok(ext_result_values) = eval.eval_all(&ext_row) {
-                        for (eval_idx, (item_idx, _)) in ext_expr_items.iter().enumerate() {
-                            if eval_idx < ext_result_values.len() {
-                                values[*item_idx] = ext_result_values[eval_idx].clone();
+                        if let Ok(ext_result_values) = eval.eval_all(&ext_row) {
+                            for (eval_idx, (item_idx, _)) in ext_expr_items.iter().enumerate() {
+                                if eval_idx < ext_result_values.len() {
+                                    column_data[*item_idx][row_idx] =
+                                        ext_result_values[eval_idx].clone();
+                                }
                             }
                         }
                     }
                 }
             }
-
-            // Move values into Row (no clone needed)
-            result_rows.push((result_row_id, Row::from_compact_vec(values)));
-            result_row_id += 1;
         }
 
-        Ok(Box::new(ExecutorResult::new(result_columns, result_rows)))
+        // Return ColumnarResult which materializes rows lazily with zero per-row allocation
+        Ok(Box::new(ColumnarResult::new(result_columns, column_data)))
     }
 
     /// Streaming execution for window functions with LIMIT pushdown
@@ -601,7 +669,7 @@ impl Executor {
 
             // Pre-allocate ext_values buffer for extended expressions
             let ext_capacity = base_rows.first().map_or(0, |r| r.1.len()) + 1;
-            let mut ext_values: Vec<Value> = Vec::with_capacity(ext_capacity);
+            let mut ext_values: CompactVec<Value> = CompactVec::with_capacity(ext_capacity);
             let num_items = select_items.len();
 
             // Build result rows in sorted order (within this partition)
@@ -643,7 +711,7 @@ impl Executor {
                             ext_values.clear();
                             ext_values.extend(base_row.iter().cloned());
                             ext_values.push(window_value.clone());
-                            let ext_row = Row::from_values(ext_values.clone());
+                            let ext_row = Row::from_compact_vec(ext_values.clone());
                             if let Ok(mut eval) =
                                 ExpressionEval::compile(&transformed, &ext_columns)
                             {
@@ -798,9 +866,10 @@ impl Executor {
                                 Self::replace_window_with_identifier(expr, &item.output_name);
                             let mut ext_columns = base_columns.to_vec();
                             ext_columns.push(item.output_name.clone());
-                            let mut ext_values: Vec<Value> = base_row.iter().cloned().collect();
+                            let mut ext_values: CompactVec<Value> =
+                                base_row.iter().cloned().collect();
                             ext_values.push(window_value.clone());
-                            let ext_row = Row::from_values(ext_values);
+                            let ext_row = Row::from_compact_vec(ext_values);
                             if let Ok(mut eval) =
                                 ExpressionEval::compile(&transformed, &ext_columns)
                             {
@@ -1315,11 +1384,11 @@ impl Executor {
 
         // If there's no partitioning, treat all rows as one partition
         if wf_info.partition_by.is_empty() {
-            // OPTIMIZATION: Check if rows are already sorted by the window ORDER BY column
-            // This allows us to skip sorting when we've pre-sorted using an index
-            let rows_already_sorted = self.check_rows_presorted(wf_info, pre_sorted);
+            // Pre-allocate results array and use direct-writing variant
+            let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
+            let row_indices: Vec<usize> = (0..rows.len()).collect();
 
-            // Precompute ORDER BY values once (needed for tie detection even if pre-sorted)
+            // Precompute ORDER BY values for efficient sorting and comparison
             let precomputed_order_by = if !wf_info.order_by.is_empty() {
                 Some(self.precompute_order_by_values(
                     &wf_info.order_by,
@@ -1331,9 +1400,7 @@ impl Executor {
             } else {
                 None
             };
-
-            let row_indices: Vec<usize> = (0..rows.len()).collect();
-            let (partition_results, sorted_indices) = self.compute_window_for_partition(
+            self.compute_window_for_partition_direct(
                 &*window_func,
                 wf_info,
                 rows,
@@ -1342,28 +1409,9 @@ impl Executor {
                 columns,
                 col_index_map,
                 ctx,
-                rows_already_sorted, // Skip sorting if rows are pre-sorted by index
+                &mut results,
             )?;
 
-            // Map results back to original row order
-            // partition_results are in ORDER BY sorted order, we need to map back
-            if wf_info.order_by.is_empty() {
-                // No ORDER BY means row_indices weren't sorted, results are in original order
-                return Ok(partition_results);
-            }
-
-            // Map partition_results (in sorted order) back to original row order
-            // OPTIMIZATION: Use inverse permutation with usize (Copy = fast memset) instead of
-            // vec![NULL_VALUE; n] which requires cloning Value n times (~32 bytes each)
-            let mut inv_perm: Vec<usize> = vec![0; rows.len()];
-            for (sorted_pos, &orig_idx) in sorted_indices.iter().enumerate() {
-                inv_perm[orig_idx] = sorted_pos;
-            }
-            let mut partition_results = partition_results;
-            let results: Vec<Value> = inv_perm
-                .into_iter()
-                .map(|sorted_pos| std::mem::take(&mut partition_results[sorted_pos]))
-                .collect();
             return Ok(results);
         }
 
@@ -1434,51 +1482,43 @@ impl Executor {
 
         if use_parallel {
             // Parallel execution: process partitions concurrently
-            // OPTIMIZATION: Use Option<Value> with vec![None; n] - None is just a discriminant
-            // (no data to clone), much faster than vec![NULL_VALUE; n] which clones ~32 byte Values
-            let results_values: std::sync::RwLock<Vec<Option<Value>>> =
-                std::sync::RwLock::new(vec![None; rows.len()]);
+            // MEMORY OPTIMIZATION: Use ParallelVec for direct writes to disjoint indices.
+            // This eliminates:
+            //   1. Per-partition Vec<Value> allocation from compute_window_for_partition
+            //   2. The final .collect() mapping step
+            // Each partition writes to its own row indices (guaranteed disjoint).
+            let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
+            let parallel_results = ParallelVec::new(&mut results);
 
             let partitions_vec: Vec<_> = partitions.into_iter().collect();
             partitions_vec
                 .par_iter()
                 .try_for_each(|(_key, row_indices)| -> Result<()> {
-                    let (mut partition_results, sorted_indices) = self
-                        .compute_window_for_partition(
-                            &*window_func,
-                            wf_info,
-                            rows,
-                            row_indices.clone(),
-                            precomputed_order_by.as_ref(),
-                            columns,
-                            col_index_map,
-                            ctx,
-                            false, // Partitioned case: sorting is needed per-partition
-                        )?;
-
-                    // Map results from sorted order back to original row indices
-                    let mut results_guard = results_values.write().unwrap();
-                    for (i, &orig_idx) in sorted_indices.iter().enumerate() {
-                        results_guard[orig_idx] = Some(std::mem::take(&mut partition_results[i]));
-                    }
-                    Ok(())
+                    // Direct writing: each partition writes to its own indices
+                    self.compute_window_for_partition_parallel(
+                        &*window_func,
+                        wf_info,
+                        rows,
+                        row_indices.clone(),
+                        precomputed_order_by.as_ref(),
+                        columns,
+                        col_index_map,
+                        ctx,
+                        &parallel_results,
+                    )
                 })?;
 
-            // Unwrap all values (all indices should have been written)
-            Ok(results_values
-                .into_inner()
-                .unwrap()
-                .into_iter()
-                .map(|opt| opt.unwrap_or(NULL_VALUE))
-                .collect())
+            // ParallelVec is done, results are written in place
+            Ok(results)
         } else {
             // Sequential execution for small partition counts
-            // OPTIMIZATION: Use Option<Value> with vec![None; n] - None is just a discriminant
-            // (no data to clone), much faster than vec![NULL_VALUE; n] which clones ~32 byte Values
-            let mut results: Vec<Option<Value>> = vec![None; rows.len()];
+            // MEMORY OPTIMIZATION: Write directly to final results array instead of
+            // creating per-partition Vec<Value> and then mapping back
+            let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
 
             for (_key, row_indices) in partitions {
-                let (mut partition_results, sorted_indices) = self.compute_window_for_partition(
+                // MEMORY OPTIMIZATION: Direct writing variant - writes to results in-place
+                self.compute_window_for_partition_direct(
                     &*window_func,
                     wf_info,
                     rows,
@@ -1487,20 +1527,11 @@ impl Executor {
                     columns,
                     col_index_map,
                     ctx,
-                    false, // Partitioned case: sorting is needed per-partition
+                    &mut results,
                 )?;
-
-                // Map results from sorted order back to original row indices
-                for (i, &orig_idx) in sorted_indices.iter().enumerate() {
-                    results[orig_idx] = Some(std::mem::take(&mut partition_results[i]));
-                }
             }
 
-            // Unwrap all values (all indices should have been written)
-            Ok(results
-                .into_iter()
-                .map(|opt| opt.unwrap_or(NULL_VALUE))
-                .collect())
+            Ok(results)
         }
     }
 
@@ -1508,6 +1539,11 @@ impl Executor {
     /// Returns (results in sorted order, sorted row indices) to avoid re-sorting in the caller
     /// precomputed_order_by: Optional precomputed ORDER BY values for ALL rows (avoids recomputation)
     /// skip_sorting: If true, skip sorting (rows are already pre-sorted by index)
+    ///
+    /// MEMORY OPTIMIZATION: This function uses index-based value access instead of cloning
+    /// values into intermediate Vec<Value> collections. For LEAD/LAG/FIRST_VALUE/LAST_VALUE,
+    /// values are accessed directly from all_rows via indices. For RANK/DENSE_RANK, we use
+    /// ColumnarOrderByValues::rows_equal() to compare ORDER BY values without cloning.
     #[allow(clippy::too_many_arguments)]
     fn compute_window_for_partition(
         &self,
@@ -1545,57 +1581,13 @@ impl Executor {
             None
         };
 
-        // OPTIMIZATION: Defer building partition_values and order_values until needed
-        // ROW_NUMBER, NTILE don't need these, so avoid O(n) cloning for them
-        let needs_partition_values = matches!(
-            wf_info.name.as_str(),
-            "LEAD" | "LAG" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
-        );
-        let needs_order_values = matches!(
-            wf_info.name.as_str(),
-            "RANK" | "DENSE_RANK" | "PERCENT_RANK" | "CUME_DIST"
-        );
-
-        // Build partition values only for functions that need them
-        let partition_values: Vec<Value> = if needs_partition_values {
-            row_indices
-                .iter()
-                .map(|&idx| {
-                    if let Some(col_idx) = arg_col_idx {
-                        return all_rows[idx]
-                            .1
-                            .get(col_idx)
-                            .cloned()
-                            .unwrap_or_else(Value::null_unknown);
-                    }
-                    Value::null_unknown()
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-
-        // Build order by values only for ranking functions
-        let order_values: Vec<Value> = if needs_order_values && !order_by_values.is_empty() {
-            row_indices
-                .iter()
-                .map(|&idx| {
-                    order_by_values
-                        .get_first(idx)
-                        .cloned()
-                        .unwrap_or_else(Value::null_unknown)
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-
-        // OPTIMIZATION: Precompute rank info once for RANK/DENSE_RANK
-        // This reduces O(n²) Value::eq comparisons to O(n) precomputation + O(1) lookups
+        // MEMORY OPTIMIZATION: Compute rank info directly from ColumnarOrderByValues
+        // instead of cloning ORDER BY values into a Vec<Value>
+        // This uses rows_equal() for O(n) comparison without allocating order_values
         let is_rank_function = matches!(wf_info.name.as_str(), "RANK" | "DENSE_RANK");
         let is_rank = wf_info.name == "RANK";
-        let rank_info = if is_rank_function && !order_values.is_empty() {
-            Self::precompute_rank_info(&order_values)
+        let rank_info = if is_rank_function && !order_by_values.is_empty() {
+            Self::precompute_rank_info_columnar(&row_indices, order_by_values)
         } else {
             vec![]
         };
@@ -1607,9 +1599,13 @@ impl Executor {
         for (i, &row_idx) in row_indices.iter().enumerate() {
             // Handle special functions
             let value = match wf_info.name.as_str() {
-                "LEAD" | "LAG" => self.compute_lead_lag(
+                // MEMORY OPTIMIZATION: Access values directly from all_rows via indices
+                // instead of cloning into partition_values Vec
+                "LEAD" | "LAG" => self.compute_lead_lag_indexed(
                     wf_info,
-                    &partition_values,
+                    all_rows,
+                    &row_indices,
+                    arg_col_idx,
                     i,
                     &all_rows[row_idx].1,
                     columns,
@@ -1622,26 +1618,41 @@ impl Executor {
                     let (frame_start, frame_end) =
                         self.compute_simple_frame_bounds(wf_info, i, partition_len);
 
-                    // OPTIMIZATION: Pass slice directly instead of allocating Vec per row
-                    let frame_slice: &[Value] =
-                        if frame_start < frame_end && frame_end <= partition_len {
-                            &partition_values[frame_start..frame_end]
-                        } else {
-                            &[]
-                        };
-
+                    // MEMORY OPTIMIZATION: Access values directly via indices
                     match wf_info.name.as_str() {
-                        "FIRST_VALUE" => self.compute_first_value(frame_slice)?,
-                        "LAST_VALUE" => self.compute_last_value(frame_slice)?,
-                        "NTH_VALUE" => self.compute_nth_value(wf_info, frame_slice, ctx)?,
+                        "FIRST_VALUE" => self.compute_first_value_indexed(
+                            all_rows,
+                            &row_indices,
+                            arg_col_idx,
+                            frame_start,
+                            frame_end,
+                        )?,
+                        "LAST_VALUE" => self.compute_last_value_indexed(
+                            all_rows,
+                            &row_indices,
+                            arg_col_idx,
+                            frame_start,
+                            frame_end,
+                        )?,
+                        "NTH_VALUE" => self.compute_nth_value_indexed(
+                            wf_info,
+                            all_rows,
+                            &row_indices,
+                            arg_col_idx,
+                            frame_start,
+                            frame_end,
+                            ctx,
+                        )?,
                         _ => unreachable!(),
                     }
                 }
-                "PERCENT_RANK" => self.compute_percent_rank(&order_values, i, row_indices.len())?,
-                "CUME_DIST" => self.compute_cume_dist(&order_values, i, row_indices.len())?,
+                "PERCENT_RANK" => {
+                    self.compute_percent_rank_columnar(order_by_values, &row_indices, i)?
+                }
+                "CUME_DIST" => self.compute_cume_dist_columnar(order_by_values, &row_indices, i)?,
                 _ => {
-                    // ROW_NUMBER and other simple functions
-                    window_func.process(&partition_values, &order_values, i)?
+                    // ROW_NUMBER and other simple functions - no values needed
+                    window_func.process(&[], &[], i)?
                 }
             };
             results.push(value);
@@ -1650,12 +1661,276 @@ impl Executor {
         Ok((results, row_indices))
     }
 
-    /// Compute LEAD or LAG function
-    fn compute_lead_lag(
+    /// Direct-writing variant of compute_window_for_partition
+    /// Writes results directly to the provided results array, avoiding per-partition Vec allocation
+    ///
+    /// MEMORY OPTIMIZATION: Instead of returning (Vec<Value>, Vec<usize>) and mapping back,
+    /// this writes directly to results[orig_idx] for each computed value.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_window_for_partition_direct(
+        &self,
+        window_func: &dyn WindowFunction,
+        wf_info: &WindowFunctionInfo,
+        all_rows: &[(i64, Row)],
+        mut row_indices: Vec<usize>,
+        precomputed_order_by: Option<&ColumnarOrderByValues>,
+        columns: &[String],
+        col_index_map: &FxHashMap<String, usize>,
+        ctx: &ExecutionContext,
+        results: &mut [Value],
+    ) -> Result<()> {
+        let _ = columns;
+
+        // Empty fallback for when no precomputed values are provided
+        let empty_order_by = ColumnarOrderByValues {
+            columns: vec![],
+            ascending: vec![],
+            num_rows: 0,
+        };
+        let order_by_values = precomputed_order_by.unwrap_or(&empty_order_by);
+
+        // Sort partition by ORDER BY if specified
+        if !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+            Self::sort_by_order_values(&mut row_indices, order_by_values);
+        }
+
+        // Pre-compute column index for function argument
+        let arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() {
+            self.extract_column_from_arg(&wf_info.arguments[0])
+                .and_then(|col_name| col_index_map.get(&col_name.to_lowercase()).copied())
+        } else {
+            None
+        };
+
+        // Compute rank info for RANK/DENSE_RANK
+        let is_rank_function = matches!(wf_info.name.as_str(), "RANK" | "DENSE_RANK");
+        let is_rank = wf_info.name == "RANK";
+        let rank_info = if is_rank_function && !order_by_values.is_empty() {
+            Self::precompute_rank_info_columnar(&row_indices, order_by_values)
+        } else {
+            vec![]
+        };
+
+        let partition_len = row_indices.len();
+
+        // Compute and write directly to results array
+        for (i, &row_idx) in row_indices.iter().enumerate() {
+            let value = match wf_info.name.as_str() {
+                "LEAD" | "LAG" => self.compute_lead_lag_indexed(
+                    wf_info,
+                    all_rows,
+                    &row_indices,
+                    arg_col_idx,
+                    i,
+                    &all_rows[row_idx].1,
+                    columns,
+                    ctx,
+                )?,
+                "NTILE" => self.compute_ntile(wf_info, partition_len, i, ctx)?,
+                "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
+                "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
+                    let (frame_start, frame_end) =
+                        self.compute_simple_frame_bounds(wf_info, i, partition_len);
+                    match wf_info.name.as_str() {
+                        "FIRST_VALUE" => self.compute_first_value_indexed(
+                            all_rows,
+                            &row_indices,
+                            arg_col_idx,
+                            frame_start,
+                            frame_end,
+                        )?,
+                        "LAST_VALUE" => self.compute_last_value_indexed(
+                            all_rows,
+                            &row_indices,
+                            arg_col_idx,
+                            frame_start,
+                            frame_end,
+                        )?,
+                        "NTH_VALUE" => self.compute_nth_value_indexed(
+                            wf_info,
+                            all_rows,
+                            &row_indices,
+                            arg_col_idx,
+                            frame_start,
+                            frame_end,
+                            ctx,
+                        )?,
+                        _ => unreachable!(),
+                    }
+                }
+                "PERCENT_RANK" => {
+                    self.compute_percent_rank_columnar(order_by_values, &row_indices, i)?
+                }
+                "CUME_DIST" => self.compute_cume_dist_columnar(order_by_values, &row_indices, i)?,
+                _ => {
+                    // ROW_NUMBER and other simple functions - no values needed
+                    window_func.process(&[], &[], i)?
+                }
+            };
+            // DIRECT WRITE: Write to original row position, avoiding the mapping step
+            results[row_idx] = value;
+        }
+
+        Ok(())
+    }
+
+    /// Parallel-safe variant of compute_window_for_partition_direct.
+    /// Uses ParallelVec for safe writes to disjoint indices from multiple threads.
+    ///
+    /// MEMORY OPTIMIZATION: Eliminates per-partition Vec<Value> allocation and the
+    /// final mapping/collect step in parallel execution path.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_window_for_partition_parallel(
+        &self,
+        window_func: &dyn WindowFunction,
+        wf_info: &WindowFunctionInfo,
+        all_rows: &[(i64, Row)],
+        mut row_indices: Vec<usize>,
+        precomputed_order_by: Option<&ColumnarOrderByValues>,
+        columns: &[String],
+        col_index_map: &FxHashMap<String, usize>,
+        ctx: &ExecutionContext,
+        results: &ParallelVec,
+    ) -> Result<()> {
+        let _ = columns;
+
+        // Empty fallback for when no precomputed values are provided
+        let empty_order_by = ColumnarOrderByValues {
+            columns: vec![],
+            ascending: vec![],
+            num_rows: 0,
+        };
+        let order_by_values = precomputed_order_by.unwrap_or(&empty_order_by);
+
+        // Sort partition by ORDER BY if specified
+        if !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+            Self::sort_by_order_values(&mut row_indices, order_by_values);
+        }
+
+        // Pre-compute column index for function argument
+        let arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() {
+            self.extract_column_from_arg(&wf_info.arguments[0])
+                .and_then(|col_name| col_index_map.get(&col_name.to_lowercase()).copied())
+        } else {
+            None
+        };
+
+        // Compute rank info for RANK/DENSE_RANK
+        let is_rank_function = matches!(wf_info.name.as_str(), "RANK" | "DENSE_RANK");
+        let is_rank = wf_info.name == "RANK";
+        let rank_info = if is_rank_function && !order_by_values.is_empty() {
+            Self::precompute_rank_info_columnar(&row_indices, order_by_values)
+        } else {
+            vec![]
+        };
+
+        let partition_len = row_indices.len();
+
+        // Compute and write directly using ParallelVec
+        for (i, &row_idx) in row_indices.iter().enumerate() {
+            let value = match wf_info.name.as_str() {
+                "LEAD" | "LAG" => self.compute_lead_lag_indexed(
+                    wf_info,
+                    all_rows,
+                    &row_indices,
+                    arg_col_idx,
+                    i,
+                    &all_rows[row_idx].1,
+                    columns,
+                    ctx,
+                )?,
+                "NTILE" => self.compute_ntile(wf_info, partition_len, i, ctx)?,
+                "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
+                "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
+                    let (frame_start, frame_end) =
+                        self.compute_simple_frame_bounds(wf_info, i, partition_len);
+                    match wf_info.name.as_str() {
+                        "FIRST_VALUE" => self.compute_first_value_indexed(
+                            all_rows,
+                            &row_indices,
+                            arg_col_idx,
+                            frame_start,
+                            frame_end,
+                        )?,
+                        "LAST_VALUE" => self.compute_last_value_indexed(
+                            all_rows,
+                            &row_indices,
+                            arg_col_idx,
+                            frame_start,
+                            frame_end,
+                        )?,
+                        "NTH_VALUE" => self.compute_nth_value_indexed(
+                            wf_info,
+                            all_rows,
+                            &row_indices,
+                            arg_col_idx,
+                            frame_start,
+                            frame_end,
+                            ctx,
+                        )?,
+                        _ => unreachable!(),
+                    }
+                }
+                "PERCENT_RANK" => {
+                    self.compute_percent_rank_columnar(order_by_values, &row_indices, i)?
+                }
+                "CUME_DIST" => self.compute_cume_dist_columnar(order_by_values, &row_indices, i)?,
+                _ => {
+                    // ROW_NUMBER and other simple functions - no values needed
+                    window_func.process(&[], &[], i)?
+                }
+            };
+            // DIRECT WRITE: Write to original row position using ParallelVec
+            results.write(row_idx, value);
+        }
+
+        Ok(())
+    }
+
+    /// Precompute rank information using ColumnarOrderByValues directly (no cloning)
+    ///
+    /// Returns a vector of (group_start, dense_rank) for each position in sorted_indices.
+    /// Uses rows_equal() for O(n) comparison without allocating intermediate Vec<Value>.
+    #[inline]
+    fn precompute_rank_info_columnar(
+        sorted_indices: &[usize],
+        order_by: &ColumnarOrderByValues,
+    ) -> Vec<(usize, i64)> {
+        let n = sorted_indices.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        let mut result = Vec::with_capacity(n);
+
+        // First row: group starts at 0, dense_rank = 1
+        result.push((0, 1));
+
+        let mut current_group_start = 0;
+        let mut current_dense_rank: i64 = 1;
+
+        for i in 1..n {
+            // Compare ORDER BY values of adjacent sorted rows without cloning
+            if !order_by.rows_equal(sorted_indices[i - 1], sorted_indices[i]) {
+                // New group starts
+                current_group_start = i;
+                current_dense_rank += 1;
+            }
+            result.push((current_group_start, current_dense_rank));
+        }
+
+        result
+    }
+
+    /// Compute LEAD or LAG using index-based access (no cloning)
+    #[allow(clippy::too_many_arguments)]
+    fn compute_lead_lag_indexed(
         &self,
         wf_info: &WindowFunctionInfo,
-        partition_values: &[Value],
-        current_row: usize,
+        all_rows: &[(i64, Row)],
+        sorted_indices: &[usize],
+        arg_col_idx: Option<usize>,
+        current_pos: usize,
         current_row_data: &Row,
         columns: &[String],
         ctx: &ExecutionContext,
@@ -1680,18 +1955,186 @@ impl Executor {
             Value::null_unknown()
         };
 
-        // Calculate target index
-        let target_idx = if wf_info.name == "LEAD" {
-            current_row.checked_add(offset)
+        // Calculate target position in sorted order
+        let target_pos = if wf_info.name == "LEAD" {
+            current_pos.checked_add(offset)
         } else {
             // LAG
-            current_row.checked_sub(offset)
+            current_pos.checked_sub(offset)
         };
 
-        match target_idx {
-            Some(idx) if idx < partition_values.len() => Ok(partition_values[idx].clone()),
+        match target_pos {
+            Some(pos) if pos < sorted_indices.len() => {
+                // Access value directly from all_rows via index
+                let target_row_idx = sorted_indices[pos];
+                if let Some(col_idx) = arg_col_idx {
+                    Ok(all_rows[target_row_idx]
+                        .1
+                        .get(col_idx)
+                        .cloned()
+                        .unwrap_or_else(Value::null_unknown))
+                } else {
+                    Ok(default_value)
+                }
+            }
             _ => Ok(default_value),
         }
+    }
+
+    /// Compute FIRST_VALUE using index-based access (no cloning)
+    fn compute_first_value_indexed(
+        &self,
+        all_rows: &[(i64, Row)],
+        sorted_indices: &[usize],
+        arg_col_idx: Option<usize>,
+        frame_start: usize,
+        frame_end: usize,
+    ) -> Result<Value> {
+        if frame_start >= frame_end || frame_start >= sorted_indices.len() {
+            return Ok(Value::null_unknown());
+        }
+        let row_idx = sorted_indices[frame_start];
+        if let Some(col_idx) = arg_col_idx {
+            Ok(all_rows[row_idx]
+                .1
+                .get(col_idx)
+                .cloned()
+                .unwrap_or_else(Value::null_unknown))
+        } else {
+            Ok(Value::null_unknown())
+        }
+    }
+
+    /// Compute LAST_VALUE using index-based access (no cloning)
+    fn compute_last_value_indexed(
+        &self,
+        all_rows: &[(i64, Row)],
+        sorted_indices: &[usize],
+        arg_col_idx: Option<usize>,
+        frame_start: usize,
+        frame_end: usize,
+    ) -> Result<Value> {
+        if frame_start >= frame_end || frame_end > sorted_indices.len() {
+            return Ok(Value::null_unknown());
+        }
+        let row_idx = sorted_indices[frame_end - 1];
+        if let Some(col_idx) = arg_col_idx {
+            Ok(all_rows[row_idx]
+                .1
+                .get(col_idx)
+                .cloned()
+                .unwrap_or_else(Value::null_unknown))
+        } else {
+            Ok(Value::null_unknown())
+        }
+    }
+
+    /// Compute NTH_VALUE using index-based access (no cloning)
+    #[allow(clippy::too_many_arguments)]
+    fn compute_nth_value_indexed(
+        &self,
+        wf_info: &WindowFunctionInfo,
+        all_rows: &[(i64, Row)],
+        sorted_indices: &[usize],
+        arg_col_idx: Option<usize>,
+        frame_start: usize,
+        frame_end: usize,
+        ctx: &ExecutionContext,
+    ) -> Result<Value> {
+        if frame_start >= frame_end {
+            return Ok(Value::null_unknown());
+        }
+
+        // Get n (1-indexed position) from second argument
+        let n = if wf_info.arguments.len() > 1 {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
+            match eval.eval_slice(&Row::new())? {
+                Value::Integer(n) if n > 0 => n as usize,
+                _ => return Ok(Value::null_unknown()),
+            }
+        } else {
+            return Ok(Value::null_unknown());
+        };
+
+        // n is 1-indexed within the frame
+        let frame_len = frame_end - frame_start;
+        if n > frame_len {
+            return Ok(Value::null_unknown());
+        }
+
+        let pos_in_frame = n - 1;
+        let row_idx = sorted_indices[frame_start + pos_in_frame];
+        if let Some(col_idx) = arg_col_idx {
+            Ok(all_rows[row_idx]
+                .1
+                .get(col_idx)
+                .cloned()
+                .unwrap_or_else(Value::null_unknown))
+        } else {
+            Ok(Value::null_unknown())
+        }
+    }
+
+    /// Compute PERCENT_RANK using ColumnarOrderByValues (no cloning)
+    /// PERCENT_RANK = (rank - 1) / (total_rows - 1)
+    fn compute_percent_rank_columnar(
+        &self,
+        order_by: &ColumnarOrderByValues,
+        sorted_indices: &[usize],
+        current_pos: usize,
+    ) -> Result<Value> {
+        let n = sorted_indices.len();
+        if n <= 1 {
+            return Ok(Value::Float(0.0));
+        }
+
+        // Find rank by counting how many preceding rows have different ORDER BY value
+        let mut rank = 1usize;
+        for i in 0..current_pos {
+            if i == 0 || !order_by.rows_equal(sorted_indices[i - 1], sorted_indices[i]) {
+                // New group - this row gets a new rank
+                if i < current_pos
+                    && !order_by.rows_equal(sorted_indices[i], sorted_indices[current_pos])
+                {
+                    rank = i + 1;
+                }
+            }
+        }
+        // Find actual rank of current row (position of first row with same ORDER BY value)
+        for i in 0..=current_pos {
+            if order_by.rows_equal(sorted_indices[i], sorted_indices[current_pos]) {
+                rank = i + 1;
+                break;
+            }
+        }
+
+        Ok(Value::Float((rank - 1) as f64 / (n - 1) as f64))
+    }
+
+    /// Compute CUME_DIST using ColumnarOrderByValues (no cloning)
+    /// CUME_DIST = (number of rows with value <= current) / total_rows
+    fn compute_cume_dist_columnar(
+        &self,
+        order_by: &ColumnarOrderByValues,
+        sorted_indices: &[usize],
+        current_pos: usize,
+    ) -> Result<Value> {
+        let n = sorted_indices.len();
+        if n == 0 {
+            return Ok(Value::Float(1.0));
+        }
+
+        // Find how many rows have ORDER BY value <= current (i.e., last row with same value)
+        let mut count = current_pos + 1;
+        for i in (current_pos + 1)..n {
+            if order_by.rows_equal(sorted_indices[current_pos], sorted_indices[i]) {
+                count = i + 1;
+            } else {
+                break;
+            }
+        }
+
+        Ok(Value::Float(count as f64 / n as f64))
     }
 
     /// Compute NTILE function
@@ -1748,40 +2191,6 @@ impl Executor {
         Ok(Value::Integer(bucket as i64))
     }
 
-    /// Precompute rank information for a partition in O(n) time.
-    ///
-    /// Returns a vector of (group_start, dense_rank) for each row:
-    /// - group_start: 0-indexed position where this row's group starts
-    /// - dense_rank: 1-indexed sequential group number
-    ///
-    /// This replaces O(n²) per-row computation with O(n) precomputation.
-    #[inline]
-    fn precompute_rank_info(order_values: &[Value]) -> Vec<(usize, i64)> {
-        let n = order_values.len();
-        if n == 0 {
-            return vec![];
-        }
-
-        let mut result = Vec::with_capacity(n);
-
-        // First row: group starts at 0, dense_rank = 1
-        result.push((0, 1));
-
-        let mut current_group_start = 0;
-        let mut current_dense_rank: i64 = 1;
-
-        for i in 1..n {
-            if order_values[i] != order_values[i - 1] {
-                // New group starts
-                current_group_start = i;
-                current_dense_rank += 1;
-            }
-            result.push((current_group_start, current_dense_rank));
-        }
-
-        result
-    }
-
     /// Compute RANK or DENSE_RANK function using precomputed rank info.
     ///
     /// This is an O(1) lookup using the precomputed (group_start, dense_rank) tuple.
@@ -1800,53 +2209,6 @@ impl Executor {
             // DENSE_RANK: sequential group number
             Value::Integer(dense_rank)
         }
-    }
-
-    /// Compute FIRST_VALUE function
-    fn compute_first_value(&self, partition_values: &[Value]) -> Result<Value> {
-        if partition_values.is_empty() {
-            return Ok(Value::null_unknown());
-        }
-        Ok(partition_values[0].clone())
-    }
-
-    /// Compute LAST_VALUE function
-    fn compute_last_value(&self, partition_values: &[Value]) -> Result<Value> {
-        if partition_values.is_empty() {
-            return Ok(Value::null_unknown());
-        }
-        Ok(partition_values[partition_values.len() - 1].clone())
-    }
-
-    /// Compute NTH_VALUE function
-    fn compute_nth_value(
-        &self,
-        wf_info: &WindowFunctionInfo,
-        partition_values: &[Value],
-        ctx: &ExecutionContext,
-    ) -> Result<Value> {
-        if partition_values.is_empty() {
-            return Ok(Value::null_unknown());
-        }
-
-        // Get n (1-indexed position) from second argument
-        let n = if wf_info.arguments.len() > 1 {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) if n > 0 => n as usize,
-                _ => return Ok(Value::null_unknown()),
-            }
-        } else {
-            return Ok(Value::null_unknown());
-        };
-
-        // n is 1-indexed, so subtract 1 for array access
-        let index = n - 1;
-        if index >= partition_values.len() {
-            return Ok(Value::null_unknown());
-        }
-
-        Ok(partition_values[index].clone())
     }
 
     /// Compute simple ROWS-based frame bounds for navigation functions
@@ -1923,83 +2285,6 @@ impl Executor {
                 (0, current_row + 1)
             }
         }
-    }
-
-    /// Compute PERCENT_RANK function
-    /// PERCENT_RANK = (rank - 1) / (total_rows - 1)
-    /// The partition is already sorted by ORDER BY, so we calculate rank based on position
-    fn compute_percent_rank(
-        &self,
-        order_values: &[Value],
-        current_row: usize,
-        partition_size: usize,
-    ) -> Result<Value> {
-        // Use partition_size for the denominator when order_values is empty
-        let n = if order_values.is_empty() {
-            partition_size
-        } else {
-            order_values.len()
-        };
-
-        if n <= 1 {
-            return Ok(Value::Float(0.0));
-        }
-
-        // Calculate rank for current row
-        // Since partition is already sorted, rank is position + 1, with ties handled
-        let rank = if order_values.is_empty() || current_row == 0 {
-            1
-        } else {
-            let current_value = &order_values[current_row];
-            // Find the first row with the same value (this determines the rank for ties)
-            let mut first_same = current_row;
-            while first_same > 0 && order_values[first_same - 1] == *current_value {
-                first_same -= 1;
-            }
-            first_same + 1
-        };
-
-        let percent_rank = (rank - 1) as f64 / (n - 1) as f64;
-        Ok(Value::Float(percent_rank))
-    }
-
-    /// Compute CUME_DIST function
-    /// CUME_DIST = number of rows with value <= current / total rows
-    /// The partition is already sorted by ORDER BY
-    fn compute_cume_dist(
-        &self,
-        order_values: &[Value],
-        current_row: usize,
-        partition_size: usize,
-    ) -> Result<Value> {
-        // Use partition_size for the denominator when order_values is empty
-        let n = if order_values.is_empty() {
-            partition_size
-        } else {
-            order_values.len()
-        };
-
-        if n == 0 {
-            return Ok(Value::Float(1.0));
-        }
-
-        if order_values.is_empty() {
-            // No ordering - all rows are equal, so CUME_DIST is 1.0 for all
-            return Ok(Value::Float(1.0));
-        }
-
-        let current_value = &order_values[current_row];
-
-        // Find the last row with value <= current value (including ties)
-        // Since sorted, find the last position with the same value
-        let mut last_same = current_row;
-        while last_same + 1 < order_values.len() && order_values[last_same + 1] == *current_value {
-            last_same += 1;
-        }
-
-        // CUME_DIST = (position of last row with same value + 1) / total rows
-        let cume_dist = (last_same + 1) as f64 / n as f64;
-        Ok(Value::Float(cume_dist))
     }
 
     /// Extract column name from expression
@@ -2553,7 +2838,7 @@ impl Executor {
             })
             .collect();
 
-        // Precompute ORDER BY values (supports complex expressions like -score)
+        // Precompute ORDER BY values for efficient sorting and comparison
         let order_by_values =
             self.precompute_order_by_values(&wf_info.order_by, rows, columns, col_index_map, ctx);
 
@@ -2607,7 +2892,6 @@ impl Executor {
                         groups
                     } else {
                         let mut group_start = 0;
-                        // Use precomputed ORDER BY values (supports complex expressions)
                         // Compare adjacent rows by reference to avoid O(n) cloning
                         let mut prev_row_idx = row_indices[0];
 

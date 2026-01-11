@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use crate::common::CompactArc;
 use crate::core::{Row, Value};
 use crate::storage::mvcc::arena::ArenaReadGuard;
 
@@ -51,7 +52,7 @@ pub struct StreamingResult<'a> {
     /// Temporary row buffer for the current row (to satisfy &Row interface)
     current_row: Row,
     /// Cached Arc for current row (for zero-copy access)
-    current_arc: Option<Arc<[Arc<Value>]>>,
+    current_arc: Option<Arc<[CompactArc<Value>]>>,
 }
 
 impl<'a> StreamingResult<'a> {
@@ -105,7 +106,7 @@ impl<'a> StreamingResult<'a> {
 
     /// Get current row as Arc slice (for efficient access)
     #[inline]
-    pub fn row_arc_slice(&self) -> Option<&Arc<[Arc<Value>]>> {
+    pub fn row_arc_slice(&self) -> Option<&Arc<[CompactArc<Value>]>> {
         self.current_arc.as_ref()
     }
 
@@ -161,12 +162,15 @@ impl<'a> StreamingResult<'a> {
 /// that can be computed in a single pass over contiguous memory with
 /// zero allocations during the scan.
 pub struct AggregationScanner<'a> {
-    arena_data: &'a [Arc<[Arc<Value>]>],
+    arena_data: &'a [Arc<[CompactArc<Value>]>],
     visible_indices: &'a [VisibleRowInfo],
 }
 
 impl<'a> AggregationScanner<'a> {
-    pub fn new(arena_data: &'a [Arc<[Arc<Value>]>], visible_indices: &'a [VisibleRowInfo]) -> Self {
+    pub fn new(
+        arena_data: &'a [Arc<[CompactArc<Value>]>],
+        visible_indices: &'a [VisibleRowInfo],
+    ) -> Self {
         Self {
             arena_data,
             visible_indices,

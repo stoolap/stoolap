@@ -24,12 +24,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::api::params::ParamVec;
+use crate::common::CompactArc;
 use crate::core::{Result, Row, Value};
 
 // Static defaults for ExecutionContext to avoid allocations for empty values.
 // These are shared across all contexts and only require Arc refcount bump on clone.
 // Note: cancelled is NOT shared - each context needs its own cancellation flag.
-static EMPTY_PARAMS: LazyLock<Arc<Vec<Value>>> = LazyLock::new(|| Arc::new(Vec::new()));
+static EMPTY_PARAMS: LazyLock<CompactArc<ParamVec>> =
+    LazyLock::new(|| CompactArc::new(ParamVec::new()));
 static EMPTY_NAMED_PARAMS: LazyLock<Arc<FxHashMap<String, Value>>> =
     LazyLock::new(|| Arc::new(FxHashMap::default()));
 static EMPTY_DATABASE: LazyLock<Arc<Option<String>>> = LazyLock::new(|| Arc::new(None));
@@ -99,7 +102,7 @@ use ahash::{AHashMap, AHashSet};
 use std::hash::{Hash, Hasher};
 
 /// Cached semi-join entry: (table_name for invalidation, hash_set values)
-type SemiJoinCacheEntry = (Arc<str>, Arc<AHashSet<Value>>);
+type SemiJoinCacheEntry = (Arc<str>, CompactArc<AHashSet<Value>>);
 
 /// Compute a cache key hash from table, column, and predicate hash without allocation.
 #[inline]
@@ -142,13 +145,18 @@ pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
 
 /// Get a cached semi-join hash set by key hash.
 #[inline]
-pub fn get_cached_semi_join(key_hash: u64) -> Option<Arc<AHashSet<Value>>> {
-    SEMI_JOIN_CACHE.with(|cache| cache.borrow().get(&key_hash).map(|(_, v)| Arc::clone(v)))
+pub fn get_cached_semi_join(key_hash: u64) -> Option<CompactArc<AHashSet<Value>>> {
+    SEMI_JOIN_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&key_hash)
+            .map(|(_, v)| CompactArc::clone(v))
+    })
 }
 
 /// Cache a semi-join hash set result (Arc version for zero-copy).
 #[inline]
-pub fn cache_semi_join_arc(key_hash: u64, table: &str, values: Arc<AHashSet<Value>>) {
+pub fn cache_semi_join_arc(key_hash: u64, table: &str, values: CompactArc<AHashSet<Value>>) {
     SEMI_JOIN_CACHE.with(|cache| {
         cache
             .borrow_mut()
@@ -269,7 +277,7 @@ pub fn cache_count_counter(key: String, counter: RowCounter) {
 // Cache for table schema column names to avoid repeated get_table_schema() calls.
 // The key is the table name, the value is the list of column names.
 thread_local! {
-    static EXISTS_SCHEMA_CACHE: RefCell<FxHashMap<String, std::sync::Arc<Vec<String>>>> = RefCell::new(FxHashMap::default());
+    static EXISTS_SCHEMA_CACHE: RefCell<FxHashMap<String, CompactArc<Vec<String>>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the EXISTS schema cache. Should be called at the start of each top-level query.
@@ -280,12 +288,12 @@ pub fn clear_exists_schema_cache() {
 }
 
 /// Get cached table column names by table name.
-pub fn get_cached_exists_schema(key: &str) -> Option<std::sync::Arc<Vec<String>>> {
+pub fn get_cached_exists_schema(key: &str) -> Option<CompactArc<Vec<String>>> {
     EXISTS_SCHEMA_CACHE.with(|cache| cache.borrow().get(key).cloned())
 }
 
 /// Cache table column names (takes Arc for zero-copy sharing).
-pub fn cache_exists_schema(key: String, columns: std::sync::Arc<Vec<String>>) {
+pub fn cache_exists_schema(key: String, columns: CompactArc<Vec<String>>) {
     EXISTS_SCHEMA_CACHE.with(|cache| {
         cache.borrow_mut().insert(key, columns);
     });
@@ -322,7 +330,7 @@ pub fn cache_exists_pred_key(subquery_ptr: usize, pred_key: String) {
 // Thread-local to avoid synchronization overhead.
 // The key is a stable identifier for the subquery, the value is a map from group key to aggregate value.
 thread_local! {
-    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, Arc<AHashMap<Value, Value>>>> = RefCell::new(FxHashMap::default());
+    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, CompactArc<AHashMap<Value, Value>>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the batch aggregate cache. Should be called at the start of each top-level query.
@@ -335,14 +343,14 @@ pub fn clear_batch_aggregate_cache() {
 }
 
 /// Get a cached batch aggregate result map by subquery identifier.
-pub fn get_cached_batch_aggregate(key: &str) -> Option<Arc<AHashMap<Value, Value>>> {
+pub fn get_cached_batch_aggregate(key: &str) -> Option<CompactArc<AHashMap<Value, Value>>> {
     BATCH_AGGREGATE_CACHE.with(|cache| cache.borrow().get(key).cloned())
 }
 
 /// Cache a batch aggregate result map.
 pub fn cache_batch_aggregate(key: String, values: AHashMap<Value, Value>) {
     BATCH_AGGREGATE_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, Arc::new(values));
+        cache.borrow_mut().insert(key, CompactArc::new(values));
     });
 }
 
@@ -506,6 +514,9 @@ pub fn clear_all_thread_local_caches() {
     // Clear storage expression caches (regex patterns)
     crate::storage::expression::clear_regex_cache();
     crate::storage::expression::clear_like_regex_cache();
+
+    // Clear RowVec thread-local pool
+    crate::core::row_vec::clear_row_vec_pool();
 }
 
 /// Get cached EXISTS correlation info by subquery pointer address.
@@ -542,7 +553,7 @@ pub fn cache_exists_correlation(
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
     /// Query parameters ($1, $2, etc.) - wrapped in Arc for cheap cloning
-    params: Arc<Vec<Value>>,
+    params: CompactArc<ParamVec>,
     /// Named parameters (:name) - wrapped in Arc for cheap cloning
     named_params: Arc<FxHashMap<String, Value>>,
     /// Whether to use auto-commit for DML statements
@@ -562,11 +573,11 @@ pub struct ExecutionContext {
     pub(crate) query_depth: usize,
     /// Outer row context for correlated subqueries
     /// Maps column name (lowercase) to value from the outer query
-    /// Uses FxHashMap for faster hashing
+    /// Uses FxHashMap<Arc<str>, Value> for zero-cost key cloning in hot loops
     /// pub(crate) to allow taking ownership back for reuse in optimized loops
-    pub(crate) outer_row: Option<FxHashMap<String, Value>>,
+    pub(crate) outer_row: Option<FxHashMap<Arc<str>, Value>>,
     /// Outer row column names (for qualified identifier resolution) - wrapped in Arc
-    outer_columns: Option<Arc<Vec<String>>>,
+    outer_columns: Option<CompactArc<Vec<String>>>,
     /// CTE data for subqueries to reference CTEs from outer query
     /// Maps CTE name (lowercase) to (columns, rows)
     cte_data: Option<Arc<CteDataMap>>,
@@ -576,10 +587,10 @@ pub struct ExecutionContext {
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
 /// Uses Vec<(i64, Row)> for rows - same structure as RowVec but Arc-shareable
-type CteData = (Arc<Vec<String>>, Arc<Vec<(i64, Row)>>);
+type CteData = (CompactArc<Vec<String>>, CompactArc<Vec<(i64, Row)>>);
 
 /// Type alias for CTE data map to reduce type complexity
-/// Uses Arc<Vec<String>> for columns and Arc<Vec<(i64, Row)>> for rows
+/// Uses CompactArc<Vec<String>> for columns and CompactArc<Vec<(i64, Row)>> for rows
 /// to enable zero-copy sharing of CTE results with joins
 type CteDataMap = FxHashMap<String, CteData>;
 
@@ -611,9 +622,9 @@ impl ExecutionContext {
     }
 
     /// Create an execution context with positional parameters
-    pub fn with_params(params: Vec<Value>) -> Self {
+    pub fn with_params(params: ParamVec) -> Self {
         Self {
-            params: Arc::new(params),
+            params: CompactArc::new(params),
             ..Self::new()
         }
     }
@@ -647,7 +658,7 @@ impl ExecutionContext {
 
     /// Get the params Arc for zero-copy sharing.
     /// Used by evaluator bridge to avoid cloning params.
-    pub fn params_arc(&self) -> &Arc<Vec<Value>> {
+    pub fn params_arc(&self) -> &CompactArc<ParamVec> {
         &self.params
     }
 
@@ -668,13 +679,13 @@ impl ExecutionContext {
     }
 
     /// Set positional parameters
-    pub fn set_params(&mut self, params: Vec<Value>) {
-        self.params = Arc::new(params);
+    pub fn set_params(&mut self, params: ParamVec) {
+        self.params = CompactArc::new(params);
     }
 
     /// Add a positional parameter
     pub fn add_param(&mut self, value: Value) {
-        Arc::make_mut(&mut self.params).push(value);
+        CompactArc::make_mut(&mut self.params).push(value);
     }
 
     /// Set a named parameter
@@ -791,7 +802,7 @@ impl ExecutionContext {
     }
 
     /// Get the outer row context for correlated subqueries
-    pub fn outer_row(&self) -> Option<&FxHashMap<String, Value>> {
+    pub fn outer_row(&self) -> Option<&FxHashMap<Arc<str>, Value>> {
         self.outer_row.as_ref()
     }
 
@@ -801,12 +812,12 @@ impl ExecutionContext {
     }
 
     /// Create a new context with outer row context for correlated subqueries.
-    /// The outer_row maps lowercase column names to their values.
+    /// The outer_row maps lowercase column names (as Arc<str>) to their values.
     /// NOTE: This is now cheap to clone due to Arc wrapping of immutable fields.
     pub fn with_outer_row(
         &self,
-        outer_row: FxHashMap<String, Value>,
-        outer_columns: Arc<Vec<String>>,
+        outer_row: FxHashMap<Arc<str>, Value>,
+        outer_columns: CompactArc<Vec<String>>,
     ) -> Self {
         Self {
             params: self.params.clone(),             // Arc clone = cheap
@@ -833,11 +844,28 @@ impl ExecutionContext {
             .and_then(|data| data.get(&name.to_lowercase()))
     }
 
+    /// Get CTE data by name that is already lowercase.
+    /// Use this when the name is known to be lowercase (e.g., from value_lower fields)
+    /// to avoid redundant to_lowercase() allocation.
+    #[inline]
+    pub fn get_cte_by_lower(&self, name_lower: &str) -> Option<&CteData> {
+        self.cte_data.as_ref().and_then(|data| data.get(name_lower))
+    }
+
     /// Check if context has CTE data
     pub fn has_cte(&self, name: &str) -> bool {
         self.cte_data
             .as_ref()
             .is_some_and(|data| data.contains_key(&name.to_lowercase()))
+    }
+
+    /// Check if context has CTE data by name that is already lowercase.
+    /// Use this when the name is known to be lowercase to avoid allocation.
+    #[inline]
+    pub fn has_cte_by_lower(&self, name_lower: &str) -> bool {
+        self.cte_data
+            .as_ref()
+            .is_some_and(|data| data.contains_key(name_lower))
     }
 
     /// Create a new context with CTE data for subqueries to reference
@@ -1132,8 +1160,8 @@ impl ExecutionContextBuilder {
     }
 
     /// Add positional parameters
-    pub fn params(mut self, params: Vec<Value>) -> Self {
-        self.ctx.params = Arc::new(params);
+    pub fn params(mut self, params: ParamVec) -> Self {
+        self.ctx.params = CompactArc::new(params);
         self
     }
 
@@ -1143,7 +1171,7 @@ impl ExecutionContextBuilder {
         v.push(value);
         Self {
             ctx: ExecutionContext {
-                params: Arc::new(v),
+                params: CompactArc::new(v),
                 ..self.ctx
             },
         }
@@ -1222,7 +1250,10 @@ mod tests {
 
     #[test]
     fn test_context_with_params() {
-        let ctx = ExecutionContext::with_params(vec![Value::Integer(1), Value::text("hello")]);
+        let ctx = ExecutionContext::with_params(smallvec::smallvec![
+            Value::Integer(1),
+            Value::text("hello")
+        ]);
         assert_eq!(ctx.param_count(), 2);
         assert_eq!(ctx.get_param(1), Some(&Value::Integer(1)));
         assert_eq!(ctx.get_param(2), Some(&Value::text("hello")));
@@ -1276,7 +1307,7 @@ mod tests {
     #[test]
     fn test_context_builder() {
         let ctx = ExecutionContextBuilder::new()
-            .params(vec![Value::Integer(1)])
+            .params(smallvec::smallvec![Value::Integer(1)])
             .param(Value::Integer(2))
             .named_param("name", Value::text("test"))
             .auto_commit(false)

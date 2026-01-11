@@ -41,6 +41,15 @@ thread_local! {
     static ROW_VEC_POOL: RefCell<Vec<Vec<(i64, Row)>>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Clear the thread-local RowVec pool, releasing all cached buffers.
+/// Call this when dropping a database to prevent memory retention.
+#[inline]
+pub fn clear_row_vec_pool() {
+    ROW_VEC_POOL.with(|pool| {
+        pool.borrow_mut().clear();
+    });
+}
+
 // ============================================================================
 // Pool Statistics (only when dhat-heap feature is enabled)
 // ============================================================================

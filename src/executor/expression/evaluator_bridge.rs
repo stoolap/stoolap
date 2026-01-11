@@ -31,6 +31,8 @@ use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::api::params::ParamVec;
+use crate::common::CompactArc;
 use lru::LruCache;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -393,8 +395,8 @@ pub fn compile_expression_with_context(
 pub struct RowFilter {
     /// Pre-compiled program (shared across clones)
     program: SharedProgram,
-    /// Query parameters (shared) - uses Arc<Vec<Value>> to match ExecutionContext
-    params: Arc<Vec<Value>>,
+    /// Query parameters (shared) - uses CompactArc<Vec<Value>> to match ExecutionContext
+    params: CompactArc<ParamVec>,
     /// Named parameters (shared)
     named_params: Arc<FxHashMap<String, Value>>,
 }
@@ -409,7 +411,7 @@ impl RowFilter {
         let program = compile_expression(expr, columns)?;
         Ok(Self {
             program,
-            params: Arc::new(Vec::new()),
+            params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
         })
     }
@@ -457,14 +459,14 @@ impl RowFilter {
 
         Ok(Self {
             program,
-            params: Arc::new(Vec::new()),
+            params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
         })
     }
 
     /// Create a filter with query parameters.
-    pub fn with_params(mut self, params: Vec<Value>) -> Self {
-        self.params = Arc::new(params);
+    pub fn with_params(mut self, params: ParamVec) -> Self {
+        self.params = CompactArc::new(params);
         self
     }
 
@@ -478,8 +480,8 @@ impl RowFilter {
     ///
     /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
-        // Share params Arc - no cloning needed (both use Arc<Vec<Value>>)
-        self.params = Arc::clone(ctx.params_arc());
+        // Share params Arc - no cloning needed (both use CompactArc<Vec<Value>>)
+        self.params = CompactArc::clone(ctx.params_arc());
         // Share named_params Arc - no cloning needed
         self.named_params = Arc::clone(ctx.named_params_arc());
         self
@@ -489,7 +491,7 @@ impl RowFilter {
     pub fn from_program(program: SharedProgram) -> Self {
         Self {
             program,
-            params: Arc::new(Vec::new()),
+            params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
         }
     }
@@ -584,7 +586,7 @@ pub struct JoinFilter {
     /// Pre-compiled program
     program: SharedProgram,
     /// Query parameters (shared Arc to avoid cloning)
-    params: Arc<Vec<Value>>,
+    params: CompactArc<ParamVec>,
     /// Named parameters (shared Arc to avoid cloning)
     named_params: Arc<FxHashMap<String, Value>>,
 }
@@ -610,7 +612,7 @@ impl JoinFilter {
             .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
         Ok(Self {
             program: Arc::new(program),
-            params: Arc::new(Vec::new()),
+            params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
         })
     }
@@ -619,7 +621,7 @@ impl JoinFilter {
     /// This is required when the join condition contains parameter placeholders ($1, $2, etc.).
     #[inline]
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
-        self.params = Arc::clone(ctx.params_arc());
+        self.params = CompactArc::clone(ctx.params_arc());
         self.named_params = Arc::clone(ctx.named_params_arc());
         self
     }
@@ -697,8 +699,8 @@ pub struct ExpressionEval {
     program: SharedProgram,
     /// VM instance (reusable, maintains stack)
     vm: ExprVM,
-    /// Query parameters (shared) - uses Arc<Vec<Value>> to match ExecutionContext
-    params: Arc<Vec<Value>>,
+    /// Query parameters (shared) - uses CompactArc<Vec<Value>> to match ExecutionContext
+    params: CompactArc<ParamVec>,
     /// Named parameters (shared) - uses Arc to match ExecutionContext
     named_params: Arc<FxHashMap<String, Value>>,
     /// Outer row context for correlated subqueries
@@ -714,7 +716,7 @@ impl ExpressionEval {
         Ok(Self {
             program,
             vm: ExprVM::new(),
-            params: Arc::new(Vec::new()),
+            params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
             outer_row: None,
             transaction_id: None,
@@ -785,7 +787,7 @@ impl ExpressionEval {
         Ok(Self {
             program,
             vm: ExprVM::new(),
-            params: Arc::new(Vec::new()),
+            params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
             outer_row: None,
             transaction_id: None,
@@ -797,7 +799,7 @@ impl ExpressionEval {
         Self {
             program,
             vm: ExprVM::new(),
-            params: Arc::new(Vec::new()),
+            params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
             outer_row: None,
             transaction_id: None,
@@ -805,8 +807,8 @@ impl ExpressionEval {
     }
 
     /// Set query parameters.
-    pub fn with_params(mut self, params: Vec<Value>) -> Self {
-        self.params = Arc::new(params);
+    pub fn with_params(mut self, params: ParamVec) -> Self {
+        self.params = CompactArc::new(params);
         self
     }
 
@@ -821,14 +823,12 @@ impl ExpressionEval {
     /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         // Share params Arc - no cloning needed
-        self.params = Arc::clone(ctx.params_arc());
+        self.params = CompactArc::clone(ctx.params_arc());
         // Share named_params Arc - no cloning needed
         self.named_params = Arc::clone(ctx.named_params_arc());
         if let Some(outer) = ctx.outer_row() {
-            let mut arc_map = FxHashMap::default();
-            for (k, v) in outer.iter() {
-                arc_map.insert(Arc::from(k.as_str()), v.clone());
-            }
+            // Clone the map directly (Arc<str> clones are cheap)
+            let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             self.outer_row = Some(arc_map);
         }
         self.transaction_id = ctx.transaction_id();
@@ -842,11 +842,10 @@ impl ExpressionEval {
     }
 
     /// Set outer row for correlated subqueries.
-    pub fn set_outer_row(&mut self, outer: &FxHashMap<String, Value>) {
-        let mut arc_map = FxHashMap::default();
-        for (k, v) in outer.iter() {
-            arc_map.insert(Arc::from(k.as_str()), v.clone());
-        }
+    /// Accepts Arc<str> keys directly to avoid conversion overhead.
+    pub fn set_outer_row(&mut self, outer: &FxHashMap<Arc<str>, Value>) {
+        // Clone the map (Arc clones are cheap, Value clones may be expensive but needed)
+        let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         self.outer_row = Some(arc_map);
     }
 
@@ -963,8 +962,8 @@ pub struct MultiExpressionEval {
     programs: Vec<SharedProgram>,
     /// Single VM instance (reused for all expressions)
     vm: ExprVM,
-    /// Query parameters (shared) - uses Arc<Vec<Value>> to match ExecutionContext
-    params: Arc<Vec<Value>>,
+    /// Query parameters (shared) - uses CompactArc<Vec<Value>> to match ExecutionContext
+    params: CompactArc<ParamVec>,
     /// Named parameters (shared) - uses Arc to match ExecutionContext
     named_params: Arc<FxHashMap<String, Value>>,
     /// Transaction ID
@@ -990,7 +989,7 @@ impl MultiExpressionEval {
         Ok(Self {
             programs,
             vm: ExprVM::new(),
-            params: Arc::new(Vec::new()),
+            params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
             transaction_id: None,
         })
@@ -1032,15 +1031,15 @@ impl MultiExpressionEval {
         Ok(Self {
             programs,
             vm: ExprVM::new(),
-            params: Arc::new(Vec::new()),
+            params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
             transaction_id: None,
         })
     }
 
     /// Set query parameters.
-    pub fn with_params(mut self, params: Vec<Value>) -> Self {
-        self.params = Arc::new(params);
+    pub fn with_params(mut self, params: ParamVec) -> Self {
+        self.params = CompactArc::new(params);
         self
     }
 
@@ -1049,7 +1048,7 @@ impl MultiExpressionEval {
     /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         // Share params Arc - no cloning needed
-        self.params = Arc::clone(ctx.params_arc());
+        self.params = CompactArc::clone(ctx.params_arc());
         // Share named_params Arc - no cloning needed
         self.named_params = Arc::clone(ctx.named_params_arc());
         self.transaction_id = ctx.transaction_id();
@@ -1163,7 +1162,7 @@ pub struct CompiledEvaluator<'a> {
     function_registry: &'a FunctionRegistry,
 
     /// Column names for compilation context (Arc for zero-copy sharing)
-    columns: Arc<Vec<String>>,
+    columns: CompactArc<Vec<String>>,
 
     /// Cached Arc pointer for fast equality check (avoids Arc comparison)
     columns_arc_id: usize,
@@ -1174,8 +1173,8 @@ pub struct CompiledEvaluator<'a> {
     /// Outer query columns (for correlated subqueries)
     outer_columns: Option<Vec<String>>,
 
-    /// Query parameters (positional) - uses Arc<Vec<Value>> to match ExecutionContext
-    params: Arc<Vec<Value>>,
+    /// Query parameters (positional) - uses CompactArc<Vec<Value>> to match ExecutionContext
+    params: CompactArc<ParamVec>,
 
     /// Query parameters (named) - uses Arc to match ExecutionContext
     named_params: Arc<FxHashMap<String, Value>>,
@@ -1214,11 +1213,11 @@ impl<'a> CompiledEvaluator<'a> {
     pub fn new(function_registry: &'a FunctionRegistry) -> Self {
         Self {
             function_registry,
-            columns: Arc::new(Vec::new()),
+            columns: CompactArc::new(Vec::new()),
             columns_arc_id: 0,
             columns2: None,
             outer_columns: None,
-            params: Arc::new(Vec::new()),
+            params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
             outer_row: None,
             transaction_id: None,
@@ -1238,11 +1237,11 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Clear all state for reuse.
     pub fn clear(&mut self) {
-        self.columns = Arc::new(Vec::new());
+        self.columns = CompactArc::new(Vec::new());
         self.columns_arc_id = 0;
         self.columns2 = None;
         self.outer_columns = None;
-        self.params = Arc::new(Vec::new());
+        self.params = CompactArc::new(ParamVec::new());
         self.named_params = Arc::new(FxHashMap::default());
         self.outer_row = None;
         self.transaction_id = None;
@@ -1259,8 +1258,8 @@ impl<'a> CompiledEvaluator<'a> {
     }
 
     /// Set query parameters (positional) - fluent API
-    pub fn with_params(mut self, params: Vec<Value>) -> Self {
-        self.params = Arc::new(params);
+    pub fn with_params(mut self, params: ParamVec) -> Self {
+        self.params = CompactArc::new(params);
         self
     }
 
@@ -1275,18 +1274,16 @@ impl<'a> CompiledEvaluator<'a> {
     /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         // Share params Arc - no cloning needed
-        self.params = Arc::clone(ctx.params_arc());
+        self.params = CompactArc::clone(ctx.params_arc());
         // Share named_params Arc - no cloning needed
         self.named_params = Arc::clone(ctx.named_params_arc());
 
         // Set outer row context for correlated subqueries
         if let Some(outer) = ctx.outer_row() {
-            let mut arc_map = FxHashMap::default();
-            let mut outer_cols = Vec::new();
-            for (k, v) in outer.iter() {
-                arc_map.insert(Arc::from(k.as_str()), v.clone());
-                outer_cols.push(k.clone());
-            }
+            // Clone the map directly (Arc<str> clones are cheap)
+            let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            // Convert Arc<str> keys to String for outer_columns (needed for compilation)
+            let outer_cols: Vec<String> = outer.keys().map(|k| k.to_string()).collect();
             self.outer_row = Some(arc_map);
             // Also set up outer_columns for compilation
             if !outer_cols.is_empty() {
@@ -1328,7 +1325,7 @@ impl<'a> CompiledEvaluator<'a> {
             return;
         }
 
-        self.columns = Arc::new(columns.to_vec());
+        self.columns = CompactArc::new(columns.to_vec());
         self.columns_arc_id = new_source_id;
         // Clear local cache since compilation context changed
         self.local_cache.clear();
@@ -1336,12 +1333,12 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Initialize columns from an Arc (zero-copy when schema already has Arc)
     ///
-    /// This is the preferred method when the caller already has an Arc<Vec<String>>,
+    /// This is the preferred method when the caller already has an CompactArc<Vec<String>>,
     /// such as from `Schema::column_names_arc()`. It avoids all string cloning.
     #[inline]
-    pub fn init_columns_arc(&mut self, columns: Arc<Vec<String>>) {
-        // Use Arc pointer for identity check
-        let new_arc_id = Arc::as_ptr(&columns) as usize;
+    pub fn init_columns_arc(&mut self, columns: CompactArc<Vec<String>>) {
+        // Use CompactArc pointer for identity check
+        let new_arc_id = CompactArc::as_ptr(&columns) as usize;
         if self.columns_arc_id == new_arc_id {
             return;
         }
@@ -1390,21 +1387,20 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Initialize join columns
     pub fn init_join_columns(&mut self, left_columns: &[String], right_columns: &[String]) {
-        self.columns = Arc::new(left_columns.to_vec());
-        self.columns_arc_id = 0; // Reset since we're creating a new Arc
+        self.columns = CompactArc::new(left_columns.to_vec());
+        self.columns_arc_id = 0; // Reset since we're creating a new CompactArc
         self.columns2 = Some(right_columns.to_vec());
         // Invalidate local cache since compilation context changed
         self.local_cache.clear();
     }
 
     /// Set the outer row context for correlated subqueries
+    /// Accepts Arc<str> keys directly to avoid conversion overhead.
     #[inline]
-    pub fn set_outer_row(&mut self, outer_row: Option<&FxHashMap<String, Value>>) {
+    pub fn set_outer_row(&mut self, outer_row: Option<&FxHashMap<Arc<str>, Value>>) {
         if let Some(outer) = outer_row {
-            let mut arc_map = FxHashMap::default();
-            for (k, v) in outer.iter() {
-                arc_map.insert(Arc::from(k.as_str()), v.clone());
-            }
+            // Clone the map (Arc clones are cheap)
+            let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             self.outer_row = Some(arc_map);
         } else {
             self.outer_row = None;
@@ -1412,20 +1408,18 @@ impl<'a> CompiledEvaluator<'a> {
     }
 
     /// Set the outer row context by taking ownership
+    /// Accepts Arc<str> keys directly to avoid conversion overhead.
     #[inline]
-    pub fn set_outer_row_owned(&mut self, outer_row: FxHashMap<String, Value>) {
-        let mut arc_map = FxHashMap::default();
-        let mut outer_cols = Vec::new();
-        for (k, v) in outer_row.into_iter() {
-            outer_cols.push(k.clone());
-            arc_map.insert(Arc::from(k.as_str()), v);
-        }
-        self.outer_row = Some(arc_map);
+    pub fn set_outer_row_owned(&mut self, outer_row: FxHashMap<Arc<str>, Value>) {
+        // Collect outer column names for compilation (convert Arc<str> to String for outer_columns)
+        let outer_cols: Vec<String> = outer_row.keys().map(|k| k.to_string()).collect();
+        self.outer_row = Some(outer_row);
         // Also set up outer_columns for compilation so LoadOuterColumn can be emitted
         if !outer_cols.is_empty() {
             // Sort for deterministic order
-            outer_cols.sort();
-            self.outer_columns = Some(outer_cols);
+            let mut sorted_cols = outer_cols;
+            sorted_cols.sort();
+            self.outer_columns = Some(sorted_cols);
             // Invalidate local cache since compilation context changed
             self.local_cache.clear();
         }
@@ -1438,16 +1432,10 @@ impl<'a> CompiledEvaluator<'a> {
     }
 
     /// Take ownership of the outer row back (for reuse)
+    /// Returns Arc<str> keys directly to avoid conversion overhead.
     #[inline]
-    pub fn take_outer_row(&mut self) -> FxHashMap<String, Value> {
-        if let Some(arc_map) = self.outer_row.take() {
-            arc_map
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect()
-        } else {
-            FxHashMap::default()
-        }
+    pub fn take_outer_row(&mut self) -> FxHashMap<Arc<str>, Value> {
+        self.outer_row.take().unwrap_or_default()
     }
 
     /// Clear the outer row context

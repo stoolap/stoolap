@@ -33,6 +33,7 @@ use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
+use crate::common::{CompactArc, CompactVec};
 use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
@@ -51,20 +52,20 @@ use super::Executor;
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
 /// Uses Vec<(i64, Row)> for rows - same structure as RowVec but Arc-shareable
-pub type CteData = (Arc<Vec<String>>, Arc<Vec<(i64, Row)>>);
+pub type CteData = (CompactArc<Vec<String>>, CompactArc<Vec<(i64, Row)>>);
 
 /// Type alias for CTE data map
-/// Uses Arc<Vec<String>> for columns and Arc<Vec<(i64, Row)>> for rows
+/// Uses CompactArc<Vec<String>> for columns and CompactArc<Vec<(i64, Row)>> for rows
 /// to enable zero-copy sharing of CTE results with joins
 pub type CteDataMap = FxHashMap<String, CteData>;
 
 /// Type alias for join data result (left_columns, left_rows, right_columns, right_rows)
 /// Uses Arc for zero-copy sharing of CTE results with join operators
 type JoinDataResult = (
-    Arc<Vec<String>>,
-    Arc<Vec<(i64, Row)>>,
-    Arc<Vec<String>>,
-    Arc<Vec<(i64, Row)>>,
+    CompactArc<Vec<String>>,
+    CompactArc<Vec<(i64, Row)>>,
+    CompactArc<Vec<String>>,
+    CompactArc<Vec<(i64, Row)>>,
 );
 
 /// Convert an expression to a normalized lowercase string for ORDER BY matching.
@@ -152,19 +153,27 @@ impl CteRegistry {
     /// - If shared, clones first then mutates (preserves other references)
     ///
     /// Both columns and rows are wrapped in Arc to enable zero-copy sharing.
-    /// Accepts RowVec and converts to Arc<Vec<(i64, Row)>> for sharing.
+    /// Accepts RowVec and converts to CompactArc<Vec<(i64, Row)>> for sharing.
     pub fn store(&mut self, name: &str, columns: Vec<String>, rows: RowVec) {
         let name_lower = name.to_lowercase();
         // Convert RowVec to Vec<(i64, Row)> for Arc sharing
         let rows_vec: Vec<(i64, Row)> = rows.into_iter().collect();
-        Arc::make_mut(&mut self.data).insert(name_lower, (Arc::new(columns), Arc::new(rows_vec)));
+        Arc::make_mut(&mut self.data).insert(
+            name_lower,
+            (CompactArc::new(columns), CompactArc::new(rows_vec)),
+        );
     }
 
     /// Store a materialized CTE result with pre-wrapped Arcs
     ///
     /// Use this when you already have Arc-wrapped data to avoid cloning.
     /// This enables zero-copy sharing of CTE results between queries.
-    pub fn store_arc(&mut self, name: &str, columns: Arc<Vec<String>>, rows: Arc<Vec<(i64, Row)>>) {
+    pub fn store_arc(
+        &mut self,
+        name: &str,
+        columns: CompactArc<Vec<String>>,
+        rows: CompactArc<Vec<(i64, Row)>>,
+    ) {
         let name_lower = name.to_lowercase();
         Arc::make_mut(&mut self.data).insert(name_lower, (columns, rows));
     }
@@ -436,7 +445,7 @@ impl Executor {
             let mut temp_registry = CteRegistry::new();
             // Copy existing CTEs - share Arc to avoid cloning row data
             for (name, (cols, rows)) in cte_registry.iter() {
-                temp_registry.store_arc(name, cols.clone(), Arc::clone(rows));
+                temp_registry.store_arc(name, cols.clone(), CompactArc::clone(rows));
             }
             // Add current CTE with working rows
             temp_registry.store(cte_name, columns.clone(), working_rows.clone());
@@ -657,7 +666,7 @@ impl Executor {
                     let rows = Self::materialize_result(result)?;
                     // Convert RowVec to Vec<(i64, Row)> for Arc sharing
                     let rows_vec: Vec<(i64, Row)> = rows.into_iter().collect();
-                    (Arc::new(cols), Arc::new(rows_vec))
+                    (CompactArc::new(cols), CompactArc::new(rows_vec))
                 }
             };
 
@@ -668,7 +677,7 @@ impl Executor {
                     let rows = Self::materialize_result(result)?;
                     // Convert RowVec to Vec<(i64, Row)> for Arc sharing
                     let rows_vec: Vec<(i64, Row)> = rows.into_iter().collect();
-                    (Arc::new(cols), Arc::new(rows_vec))
+                    (CompactArc::new(cols), CompactArc::new(rows_vec))
                 }
             };
             (left_columns, left_rows, right_columns, right_rows)
@@ -766,11 +775,11 @@ impl Executor {
         );
 
         // Use JoinExecutor for consistent join execution
-        // Passes Arc<Vec<Row>> (without row IDs) to JoinExecutor
+        // Passes CompactArc<Vec<Row>> (without row IDs) to JoinExecutor
         let join_executor = JoinExecutor::new();
         let join_result = join_executor.execute(JoinRequest {
-            left_rows: Arc::new(left_rows_only),
-            right_rows: Arc::new(right_rows_only),
+            left_rows: CompactArc::new(left_rows_only),
+            right_rows: CompactArc::new(right_rows_only),
             left_columns: &left_qualified,
             right_columns: &right_qualified,
             condition: join_source.condition.as_deref(),
@@ -862,8 +871,8 @@ impl Executor {
         // Use the base CTE name (not alias) for registry lookup
         if let Some(cte_name) = self.extract_cte_name_for_lookup(expr) {
             if let Some((columns, rows)) = cte_registry.get(&cte_name) {
-                // Return Arc::clone for zero-copy sharing
-                return Ok(Some((Arc::clone(columns), Arc::clone(rows))));
+                // Return CompactArc::clone/Arc::clone for zero-copy sharing
+                return Ok(Some((CompactArc::clone(columns), CompactArc::clone(rows))));
             }
         }
         Ok(None)
@@ -872,7 +881,7 @@ impl Executor {
     /// Execute CTE JOIN with semi-join reduction optimization.
     /// When one side is a CTE and the other is a regular table, extract join keys from the CTE
     /// and use them to filter the regular table scan via IN clause (which can use indexes).
-    /// Accepts Arc<Vec<Row>> to enable zero-copy sharing of CTE results.
+    /// Accepts CompactArc<Vec<Row>> to enable zero-copy sharing of CTE results.
     #[allow(clippy::too_many_arguments)]
     fn execute_cte_join_with_semijoin_reduction(
         &self,
@@ -930,7 +939,7 @@ impl Executor {
                     // Extract distinct non-NULL values from CTE
                     let mut seen: AHashSet<Value> = AHashSet::with_capacity(cte_rows.len());
 
-                    // Iterate over Arc<Vec<(i64, Row)>> by dereferencing
+                    // Iterate over CompactArc<Vec<(i64, Row)>> by dereferencing
                     for (_, row) in cte_rows.iter() {
                         if let Some(val) = row.get(idx) {
                             if !val.is_null() {
@@ -967,10 +976,10 @@ impl Executor {
         let table_rows_vec: Vec<(i64, Row)> = Self::materialize_result(table_result)?
             .into_iter()
             .collect();
-        let table_rows = Arc::new(table_rows_vec);
+        let table_rows = CompactArc::new(table_rows_vec);
 
         // Return in correct order (left, right)
-        let table_cols = Arc::new(table_cols);
+        let table_cols = CompactArc::new(table_cols);
         if cte_on_left {
             Ok((cte_columns, cte_rows, table_cols, table_rows))
         } else {
@@ -1309,8 +1318,9 @@ impl Executor {
         let mut result_rows = RowVec::with_capacity(rows.len());
 
         for (row_id, (_, row)) in rows.iter().enumerate() {
-            // OPTIMIZATION: Pre-allocate Vec with estimated capacity
-            let mut values = Vec::with_capacity(columns.len().max(row.len()));
+            // OPTIMIZATION: Pre-allocate CompactVec with estimated capacity
+            let mut values: CompactVec<Value> =
+                CompactVec::with_capacity(columns.len().max(row.len()));
             // CRITICAL: Include params from context for parameterized queries
             let exec_ctx = ExecuteContext::new(row)
                 .with_params(ctx.params())
@@ -1334,7 +1344,7 @@ impl Executor {
                 }
             }
 
-            result_rows.push((row_id as i64, Row::from_values(values)));
+            result_rows.push((row_id as i64, Row::from_compact_vec(values)));
         }
 
         Ok(result_rows)
@@ -1836,7 +1846,7 @@ impl Executor {
     /// because we can do direct lookups instead of building a hash table.
     ///
     /// Returns Some(result) if Index Nested Loop was used, None if not applicable.
-    /// Accepts Arc<Vec<Row>> to enable zero-copy sharing of CTE results.
+    /// Accepts CompactArc<Vec<Row>> to enable zero-copy sharing of CTE results.
     #[allow(clippy::too_many_arguments)]
     fn try_cte_index_nested_loop_join(
         &self,
@@ -1989,7 +1999,7 @@ impl Executor {
         let rows_only: Vec<Row> = outer_rows.iter().map(|(_, row)| row.clone()).collect();
         let outer_result: Box<dyn QueryResult> = Box::new(ExecutorResult::with_shared_rows(
             outer_cols.clone(),
-            Arc::new(rows_only),
+            CompactArc::new(rows_only),
         ));
         let outer_op: Box<dyn Operator> =
             Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));

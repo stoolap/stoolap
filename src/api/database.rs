@@ -429,8 +429,10 @@ impl Database {
         let param_values = params.into_params();
         let result = if param_values.is_empty() {
             executor.execute(sql)?
+        } else if let Some(fast_result) = executor.try_fast_path_with_params(sql, &param_values) {
+            fast_result?
         } else {
-            executor.execute_with_params(sql, &param_values)?
+            executor.execute_with_params(sql, param_values)?
         };
         Ok(result.rows_affected())
     }
@@ -474,8 +476,10 @@ impl Database {
         let param_values = params.into_params();
         let result = if param_values.is_empty() {
             executor.execute(sql)?
+        } else if let Some(fast_result) = executor.try_fast_path_with_params(sql, &param_values) {
+            fast_result?
         } else {
-            executor.execute_with_params(sql, &param_values)?
+            executor.execute_with_params(sql, param_values)?
         };
         Ok(Rows::new(result))
     }
@@ -541,7 +545,7 @@ impl Database {
 
         let param_values = params.into_params();
         let ctx = ExecutionContextBuilder::new()
-            .params(param_values.into_vec())
+            .params(param_values)
             .timeout_ms(timeout_ms)
             .build();
 
@@ -576,7 +580,7 @@ impl Database {
 
         let param_values = params.into_params();
         let ctx = ExecutionContextBuilder::new()
-            .params(param_values.into_vec())
+            .params(param_values)
             .timeout_ms(timeout_ms)
             .build();
 

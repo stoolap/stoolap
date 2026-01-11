@@ -30,6 +30,7 @@ use std::sync::Arc;
 use compact_str::CompactString;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::common::{CompactArc, CompactVec};
 use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
@@ -48,9 +49,19 @@ const MAX_VIEW_DEPTH: usize = 32;
 /// to benefit from early termination.
 const ANTI_JOIN_LIMIT_THRESHOLD: i64 = 10000;
 
-/// Type alias for select execution results: (result, column_names, is_empty)
-/// Using Arc<Vec<String>> for column names enables zero-copy sharing across query execution.
-type SelectResult = Result<(Box<dyn QueryResult>, Arc<Vec<String>>, bool)>;
+/// Deferred projection info: (column_indices, output_column_names)
+/// Used when projection can be deferred until after ORDER BY + LIMIT
+type DeferredProjection = (Vec<usize>, Vec<String>);
+
+/// Type alias for select execution results: (result, column_names, limit_offset_applied, deferred_projection)
+/// Using CompactArc<Vec<String>> for column names enables zero-copy sharing across query execution.
+/// The deferred_projection field is Some when projection should be applied after ORDER BY + LIMIT.
+type SelectResult = Result<(
+    Box<dyn QueryResult>,
+    CompactArc<Vec<String>>,
+    bool,
+    Option<DeferredProjection>,
+)>;
 
 use super::context::{
     clear_batch_aggregate_cache, clear_batch_aggregate_info_cache, clear_count_counter_cache,
@@ -91,16 +102,16 @@ use super::Executor;
 use crate::optimizer::bloom::BloomFilterBuilder;
 
 /// Pre-computed column name mappings for correlated subqueries.
-/// Avoids repeated string allocations per row in the inner loop.
+/// Uses Arc<str> for zero-cost cloning in the per-row inner loop.
 struct ColumnKeyMapping {
     /// Column index in the row
     index: usize,
     /// Lowercase column name (e.g., "id")
-    col_lower: String,
+    col_lower: Arc<str>,
     /// Qualified name with table alias (e.g., "c.id")
-    qualified_name: Option<String>,
+    qualified_name: Option<Arc<str>>,
     /// Unqualified part if original had a dot (e.g., "id" from "table.id")
-    unqualified_part: Option<String>,
+    unqualified_part: Option<Arc<str>>,
 }
 
 impl ColumnKeyMapping {
@@ -112,11 +123,12 @@ impl ColumnKeyMapping {
             .iter()
             .enumerate()
             .map(|(i, col_name)| {
-                let col_lower = col_name.to_lowercase();
-                let qualified_name = table_alias.map(|alias| format!("{}.{}", alias, col_lower));
+                let col_lower: Arc<str> = Arc::from(col_name.to_lowercase().as_str());
+                let qualified_name =
+                    table_alias.map(|alias| Arc::from(format!("{}.{}", alias, col_lower).as_str()));
                 let unqualified_part = col_name
                     .rfind('.')
-                    .map(|dot_idx| col_name[dot_idx + 1..].to_lowercase());
+                    .map(|dot_idx| Arc::from(col_name[dot_idx + 1..].to_lowercase().as_str()));
                 ColumnKeyMapping {
                     index: i,
                     col_lower,
@@ -304,7 +316,8 @@ impl Executor {
 
         // Execute the main query
         // The third return value indicates if LIMIT/OFFSET was already applied (by storage-level pushdown)
-        let (mut result, columns, limit_offset_applied) =
+        // The fourth return value contains deferred projection info if applicable
+        let (mut result, columns, limit_offset_applied, deferred_projection) =
             self.execute_select_internal(stmt, ctx, &classification)?;
 
         // Apply set operations (UNION, INTERSECT, EXCEPT)
@@ -517,7 +530,7 @@ impl Executor {
                 // Each inner Vec contains the evaluated ORDER BY expressions for that row
                 let sort_keys: Vec<Vec<Value>> = if has_correlated_order_by {
                     // For correlated subqueries, we need to process per-row with outer context
-                    let columns_arc = Arc::clone(&columns);
+                    let columns_arc = CompactArc::clone(&columns);
                     // Extract table alias for qualified column names
                     let order_table_alias: Option<CompactString> =
                         stmt.table_expr.as_ref().and_then(|te| match te.as_ref() {
@@ -533,25 +546,28 @@ impl Executor {
                         });
 
                     // OPTIMIZATION: Pre-compute lowercase column names once before row loop
-                    // This avoids per-row to_lowercase() calls
-                    let columns_lower: Vec<String> =
-                        columns.iter().map(|c| c.to_lowercase()).collect();
+                    // This avoids per-row to_lowercase() calls. Use Arc<str> for zero-cost clone.
+                    let columns_lower: Vec<Arc<str>> = columns
+                        .iter()
+                        .map(|c| Arc::from(c.to_lowercase().as_str()))
+                        .collect();
                     // Also pre-compute qualified names if alias is present
-                    let qualified_names: Option<Vec<String>> =
+                    let qualified_names: Option<Vec<Arc<str>>> =
                         order_table_alias.as_ref().map(|alias| {
                             columns_lower
                                 .iter()
-                                .map(|c| format!("{}.{}", alias, c))
+                                .map(|c| Arc::from(format!("{}.{}", alias, c).as_str()))
                                 .collect()
                         });
 
                     rows.iter()
                         .map(|(_, row)| {
                             // Build outer row context from current row
-                            let mut outer_row_map: FxHashMap<String, Value> = FxHashMap::default();
+                            let mut outer_row_map: FxHashMap<Arc<str>, Value> =
+                                FxHashMap::default();
                             for (idx, col_lower) in columns_lower.iter().enumerate() {
                                 let val = row.get(idx).cloned().unwrap_or(Value::null_unknown());
-                                // Use pre-computed lowercase and qualified names
+                                // Use pre-computed lowercase and qualified names (Arc clone is cheap)
                                 if let Some(ref qualified) = qualified_names {
                                     outer_row_map.insert(qualified[idx].clone(), val.clone());
                                     outer_row_map.insert(col_lower.clone(), val);
@@ -715,9 +731,9 @@ impl Executor {
 
                 // Use original column names if expected_columns matches
                 let output_columns = if expected_columns > 0 && expected_columns <= columns.len() {
-                    Arc::new(columns[..expected_columns].to_vec())
+                    CompactArc::new(columns[..expected_columns].to_vec())
                 } else {
-                    Arc::clone(&columns)
+                    CompactArc::clone(&columns)
                 };
                 return Ok(Box::new(ExecutorResult::with_arc_columns(
                     output_columns,
@@ -745,8 +761,16 @@ impl Executor {
                     offset,
                 ));
 
-                // Remove extra ORDER BY columns if needed
-                if columns.len() > expected_columns && expected_columns > 0 {
+                // Apply deferred projection if applicable
+                // This reduces allocations from O(matched_rows) to O(limit)
+                if let Some((col_indices, output_names)) = deferred_projection {
+                    result = Box::new(StreamingProjectionResult::new(
+                        result,
+                        col_indices,
+                        output_names,
+                    ));
+                } else if columns.len() > expected_columns && expected_columns > 0 {
+                    // Remove extra ORDER BY columns if needed (no deferred projection)
                     result = Box::new(ProjectedResult::new(result, expected_columns));
                 }
 
@@ -834,7 +858,7 @@ impl Executor {
             Expression::TableSource(table_source) => {
                 // Check if this is a CTE from context (for subqueries referencing outer CTEs)
                 let table_name = &table_source.name.value_lower;
-                if let Some((columns, rows)) = ctx.get_cte(table_name) {
+                if let Some((columns, rows)) = ctx.get_cte_by_lower(table_name) {
                     // Execute query against CTE data
                     // Dereference Arc to get &Vec<(i64, Row)>, then wrap in RowVec
                     return self.execute_query_on_memory_result(
@@ -899,9 +923,10 @@ impl Executor {
                     };
                     columns.push(col_name);
                 }
-                let columns = Arc::new(columns);
-                let result = ExecutorResult::with_arc_columns(Arc::clone(&columns), RowVec::new());
-                return Ok((Box::new(result), columns, false));
+                let columns = CompactArc::new(columns);
+                let result =
+                    ExecutorResult::with_arc_columns(CompactArc::clone(&columns), RowVec::new());
+                return Ok((Box::new(result), columns, false, None));
             }
         }
 
@@ -914,8 +939,8 @@ impl Executor {
             let empty_columns: Vec<String> = vec![];
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, dummy_rows, &empty_columns)?;
-            let columns = Arc::new(result.columns().to_vec());
-            return Ok((result, columns, false));
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
         // Process scalar subqueries in SELECT columns first (single-pass)
@@ -942,12 +967,12 @@ impl Executor {
         }
 
         let row = Row::from_values(values);
-        let columns = Arc::new(columns);
+        let columns = CompactArc::new(columns);
         let mut rows = RowVec::with_capacity(1);
         rows.push((0, row));
-        let result = ExecutorResult::with_arc_columns(Arc::clone(&columns), rows);
+        let result = ExecutorResult::with_arc_columns(CompactArc::clone(&columns), rows);
 
-        Ok((Box::new(result), columns, false))
+        Ok((Box::new(result), columns, false, None))
     }
 
     /// Execute a query against in-memory data (for CTEs referenced from context)
@@ -961,14 +986,15 @@ impl Executor {
         // Use the CTE execution logic from cte.rs
         let (result_cols, result_rows) =
             self.execute_query_on_cte_result(stmt, ctx, columns, rows)?;
-        let result_cols = Arc::new(result_cols);
+        let result_cols = CompactArc::new(result_cols);
         Ok((
             Box::new(ExecutorResult::with_arc_columns(
-                Arc::clone(&result_cols),
+                CompactArc::clone(&result_cols),
                 result_rows,
             )),
             result_cols,
             false,
+            None,
         ))
     }
 
@@ -1047,6 +1073,109 @@ impl Executor {
             Expression::Star(_) | Expression::QualifiedStar(_) => None, // SELECT * or t.* includes all columns
             _ => None,
         }
+    }
+
+    /// Check if deferred projection optimization is applicable.
+    ///
+    /// For ORDER BY + LIMIT queries where SELECT columns are simple column references,
+    /// we can defer projection until after sorting and limiting. This reduces allocations
+    /// from O(matched_rows) to O(limit).
+    ///
+    /// Returns (column_indices, output_column_names) if optimization applies, None otherwise.
+    fn get_deferred_projection_info(
+        &self,
+        stmt: &SelectStatement,
+        source_columns_lower: &[String],
+        source_columns: &[String],
+        classification: &std::sync::Arc<QueryClassification>,
+    ) -> Option<(Vec<usize>, Vec<String>)> {
+        // Must have ORDER BY + LIMIT
+        if stmt.order_by.is_empty() || stmt.limit.is_none() {
+            return None;
+        }
+
+        // No aggregation or window functions (these are handled separately)
+        if classification.has_aggregation || classification.has_window_functions {
+            return None;
+        }
+
+        // ORDER BY columns must exist in source columns (so sorting can happen before projection)
+        for ob in &stmt.order_by {
+            let col_exists = match &ob.expression {
+                Expression::Identifier(id) => source_columns_lower
+                    .iter()
+                    .any(|c| c == id.value_lower.as_str()),
+                Expression::QualifiedIdentifier(qid) => source_columns_lower
+                    .iter()
+                    .any(|c| c == qid.name.value_lower.as_str()),
+                _ => false, // Complex expression - can't evaluate on source columns
+            };
+            if !col_exists {
+                return None;
+            }
+        }
+
+        // Calculate projection indices - all SELECT columns must be simple column references
+        let mut indices = Vec::with_capacity(stmt.columns.len());
+        let mut output_names = Vec::with_capacity(stmt.columns.len());
+
+        for expr in &stmt.columns {
+            match expr {
+                Expression::Identifier(id) => {
+                    if let Some(idx) = source_columns_lower
+                        .iter()
+                        .position(|c| c == id.value_lower.as_str())
+                    {
+                        indices.push(idx);
+                        output_names.push(source_columns[idx].clone());
+                    } else {
+                        return None;
+                    }
+                }
+                Expression::QualifiedIdentifier(qid) => {
+                    if let Some(idx) = source_columns_lower
+                        .iter()
+                        .position(|c| c == qid.name.value_lower.as_str())
+                    {
+                        indices.push(idx);
+                        output_names.push(source_columns[idx].clone());
+                    } else {
+                        return None;
+                    }
+                }
+                Expression::Aliased(aliased) => match aliased.expression.as_ref() {
+                    Expression::Identifier(id) => {
+                        if let Some(idx) = source_columns_lower
+                            .iter()
+                            .position(|c| c == id.value_lower.as_str())
+                        {
+                            indices.push(idx);
+                            output_names.push(aliased.alias.value.to_string());
+                        } else {
+                            return None;
+                        }
+                    }
+                    Expression::QualifiedIdentifier(qid) => {
+                        if let Some(idx) = source_columns_lower
+                            .iter()
+                            .position(|c| c == qid.name.value_lower.as_str())
+                        {
+                            indices.push(idx);
+                            output_names.push(aliased.alias.value.to_string());
+                        } else {
+                            return None;
+                        }
+                    }
+                    _ => return None, // Complex expression
+                },
+                Expression::Star(_) | Expression::QualifiedStar(_) => {
+                    return None; // SELECT * doesn't benefit
+                }
+                _ => return None, // Function call, arithmetic, etc.
+            }
+        }
+
+        Some((indices, output_names))
     }
 
     /// Try to get distinct values directly from an index
@@ -1218,8 +1347,8 @@ impl Executor {
             if let Some(result) =
                 self.try_aggregation_pushdown(table.as_ref(), stmt, ctx, classification)?
             {
-                let columns = Arc::new(result.columns().to_vec());
-                return Ok((result, columns, false));
+                let columns = CompactArc::new(result.columns().to_vec());
+                return Ok((result, columns, false, None));
             }
 
             // Try storage-level GROUP BY aggregation (no WHERE clause)
@@ -1228,8 +1357,8 @@ impl Executor {
                 if let Some(result) =
                     self.try_storage_aggregation(table.as_ref(), stmt, &all_columns, classification)
                 {
-                    let columns = Arc::new(result.columns().to_vec());
-                    return Ok((result, columns, false));
+                    let columns = CompactArc::new(result.columns().to_vec());
+                    return Ok((result, columns, false, None));
                 }
             }
 
@@ -1238,8 +1367,8 @@ impl Executor {
             if let Some(result) =
                 self.try_streaming_global_aggregation(table.as_ref(), stmt, ctx, classification)?
             {
-                let columns = Arc::new(result.columns().to_vec());
-                return Ok((result, columns, false));
+                let columns = CompactArc::new(result.columns().to_vec());
+                return Ok((result, columns, false, None));
             }
         }
 
@@ -1251,8 +1380,8 @@ impl Executor {
             if let Some(result) =
                 self.try_distinct_pushdown(table.as_ref(), stmt, &all_columns, classification)?
             {
-                let columns = Arc::new(result.columns().to_vec());
-                return Ok((result, columns, false));
+                let columns = CompactArc::new(result.columns().to_vec());
+                return Ok((result, columns, false, None));
             }
         }
 
@@ -1362,16 +1491,16 @@ impl Executor {
                 {
                     CacheLookupResult::ExactHit(rows_arc) => {
                         // Exact cache hit - return cached rows with zero-copy sharing
-                        let output_columns = Arc::new(self.get_output_column_names(
+                        let output_columns = CompactArc::new(self.get_output_column_names(
                             &stmt.columns,
                             &all_columns,
                             table_alias.as_deref(),
                         ));
                         let result = ExecutorResult::with_arc_columns_shared_rows(
-                            Arc::clone(&output_columns),
+                            CompactArc::clone(&output_columns),
                             rows_arc,
                         );
-                        return Ok((Box::new(result), output_columns, false));
+                        return Ok((Box::new(result), output_columns, false, None));
                     }
                     CacheLookupResult::SubsumptionHit {
                         rows: rows_arc,
@@ -1393,16 +1522,16 @@ impl Executor {
                             .enumerate()
                             .map(|(i, row)| (i as i64, row))
                             .collect();
-                        let output_columns = Arc::new(self.get_output_column_names(
+                        let output_columns = CompactArc::new(self.get_output_column_names(
                             &stmt.columns,
                             &all_columns,
                             table_alias.as_deref(),
                         ));
                         let result = ExecutorResult::with_arc_columns(
-                            Arc::clone(&output_columns),
+                            CompactArc::clone(&output_columns),
                             filtered_rows,
                         );
-                        return Ok((Box::new(result), output_columns, false));
+                        return Ok((Box::new(result), output_columns, false, None));
                     }
                     CacheLookupResult::Miss => {
                         // Cache miss - continue with normal execution
@@ -1468,16 +1597,16 @@ impl Executor {
                     .can_prune_entire_scan(&*table, expr.as_ref())
                 {
                     // Zone maps indicate no segments can match - return empty result
-                    let output_columns = Arc::new(self.get_output_column_names(
+                    let output_columns = CompactArc::new(self.get_output_column_names(
                         &stmt.columns,
                         &all_columns,
                         table_alias.as_deref(),
                     ));
                     let result = ExecutorResult::with_arc_columns(
-                        Arc::clone(&output_columns),
+                        CompactArc::clone(&output_columns),
                         RowVec::new(),
                     );
-                    return Ok((Box::new(result), output_columns, true));
+                    return Ok((Box::new(result), output_columns, true, None));
                 }
             }
         }
@@ -1489,7 +1618,7 @@ impl Executor {
             if let Some((result, columns)) =
                 self.try_min_max_index_optimization(stmt, &*table, &all_columns)?
             {
-                return Ok((result, columns, false));
+                return Ok((result, columns, false, None));
             }
         }
 
@@ -1498,7 +1627,7 @@ impl Executor {
         // use the table's row_count() method instead of scanning all rows
         if storage_expr.is_none() && !needs_memory_filter && !classification.has_group_by {
             if let Some((result, columns)) = self.try_count_star_optimization(stmt, &*table)? {
-                return Ok((result, columns, false));
+                return Ok((result, columns, false, None));
             }
         }
 
@@ -1517,7 +1646,7 @@ impl Executor {
             if let Some((result, columns)) =
                 self.try_streaming_group_by(stmt, &*table, &all_columns, ctx)?
             {
-                return Ok((result, columns, false));
+                return Ok((result, columns, false, None));
             }
         }
 
@@ -1537,7 +1666,7 @@ impl Executor {
                 self.try_order_by_index_optimization(stmt, &*table, &all_columns, ctx)?
             {
                 // Note: ORDER BY + LIMIT already handles LIMIT at storage level
-                return Ok((result, columns, true));
+                return Ok((result, columns, true, None));
             }
         }
 
@@ -1563,7 +1692,7 @@ impl Executor {
                 table_alias.as_deref(),
                 ctx,
             )? {
-                return Ok((result, columns, true));
+                return Ok((result, columns, true, None));
             }
         }
 
@@ -1581,7 +1710,7 @@ impl Executor {
                     ctx,
                     classification,
                 )? {
-                    return Ok((result, columns, false));
+                    return Ok((result, columns, false, None));
                 }
             }
         }
@@ -1600,7 +1729,7 @@ impl Executor {
                     ctx,
                     classification,
                 )? {
-                    return Ok((result, columns, false));
+                    return Ok((result, columns, false, None));
                 }
             }
         }
@@ -1686,16 +1815,18 @@ impl Executor {
                 ctx,
                 table_alias.as_deref(),
             )?;
-            let output_columns = Arc::new(self.get_output_column_names(
+            let output_columns = CompactArc::new(self.get_output_column_names(
                 &stmt.columns,
                 &all_columns,
                 table_alias.as_deref(),
             ));
 
-            let result =
-                ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
+            let result = ExecutorResult::with_arc_columns(
+                CompactArc::clone(&output_columns),
+                projected_rows,
+            );
             // LIMIT/OFFSET already applied at storage level
-            return Ok((Box::new(result), output_columns, true));
+            return Ok((Box::new(result), output_columns, true, None));
         }
 
         // STREAMING PATH: For simple queries without aggregation/window/ORDER BY
@@ -1721,8 +1852,10 @@ impl Executor {
             && !has_outer_context // Can't stream with outer context (correlated subqueries)
             && !should_disable_streaming_for_cache; // Only disable streaming for small cacheable queries
 
-        // Check for subqueries in WHERE - use the actual where clause (resolved or original)
-        let has_where_subqueries = where_to_use.is_some_and(Self::has_subqueries);
+        // Check for CORRELATED subqueries in WHERE - these require per-row evaluation
+        // Non-correlated scalar subqueries (like SELECT AVG(...)) are OK - they're evaluated once
+        // and the result is used as a literal value for all rows
+        let has_correlated_where_subqueries = classification.where_has_correlated_subqueries;
 
         // CRITICAL OPTIMIZATION: When needs_memory_filter is true AND we have LIMIT,
         // skip the streaming path. The streaming path pre-materializes ALL rows from
@@ -1733,7 +1866,7 @@ impl Executor {
             needs_memory_filter && stmt.limit.is_some() && stmt.order_by.is_empty();
 
         if can_use_streaming
-            && !has_where_subqueries
+            && !has_correlated_where_subqueries
             && !skip_streaming_for_memory_filter_with_limit
         {
             // Check if we have simple column projection (no complex expressions)
@@ -1751,8 +1884,19 @@ impl Executor {
                 // If we need memory filtering (complex WHERE that couldn't be pushed down)
                 if needs_memory_filter {
                     if let Some(where_expr) = where_to_use {
-                        // Create a pre-compiled filter with context (for correlated subqueries)
-                        let filter = RowFilter::new(where_expr, &all_columns)?.with_context(ctx);
+                        // Check if there are non-correlated scalar subqueries to process
+                        // These need to be evaluated once before streaming
+                        let has_scalar_subqueries = classification.where_has_subqueries
+                            && !classification.where_has_correlated_subqueries;
+
+                        let filter = if has_scalar_subqueries {
+                            // Process scalar subqueries to resolve them to literal values
+                            let processed = self.process_where_subqueries(where_expr, ctx)?;
+                            RowFilter::new(&processed, &all_columns)?.with_context(ctx)
+                        } else {
+                            // No scalar subqueries - use expression directly
+                            RowFilter::new(where_expr, &all_columns)?.with_context(ctx)
+                        };
                         result = Box::new(FilteredResult::from_filter(result, filter));
                     }
                 }
@@ -1771,19 +1915,60 @@ impl Executor {
                 // 1. Non-identity projection (different columns or reordered)
                 // 2. Column names differ (aliases like "SELECT id AS a")
                 if !column_indices.is_empty() && (!is_identity_projection || names_differ) {
-                    let output_columns = Arc::new(output_columns);
+                    let output_columns = CompactArc::new(output_columns);
                     result = Box::new(StreamingProjectionResult::new(
                         result,
                         column_indices,
                         (*output_columns).clone(),
                     ));
                     // LIMIT/OFFSET NOT applied yet - streaming path
-                    return Ok((result, output_columns, false));
+                    return Ok((result, output_columns, false, None));
                 } else {
                     // SELECT * - no projection needed
                     // LIMIT/OFFSET NOT applied yet - streaming path
-                    return Ok((result, Arc::new(output_columns), false));
+                    return Ok((result, CompactArc::new(output_columns), false, None));
                 }
+            } else if !classification.select_has_scalar_subqueries {
+                // STREAMING WITH EXPRESSIONS: Use ExprMappedResult for complex projections
+                // This avoids batch allocation when SELECT contains expressions like CASE
+                // NOTE: Only use this path when SELECT doesn't have subqueries (which need special processing)
+                let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
+                let scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
+
+                let mut result: Box<dyn QueryResult> =
+                    Box::new(ScannerResult::new(scanner, all_columns.clone()));
+
+                // If we need memory filtering
+                if needs_memory_filter {
+                    if let Some(where_expr) = where_to_use {
+                        let has_scalar_subqueries = classification.where_has_subqueries
+                            && !classification.where_has_correlated_subqueries;
+
+                        let filter = if has_scalar_subqueries {
+                            let processed = self.process_where_subqueries(where_expr, ctx)?;
+                            RowFilter::new(&processed, &all_columns)?.with_context(ctx)
+                        } else {
+                            RowFilter::new(where_expr, &all_columns)?.with_context(ctx)
+                        };
+                        result = Box::new(FilteredResult::from_filter(result, filter));
+                    }
+                }
+
+                // Use ExprMappedResult for expression-based projection with buffer reuse
+                let output_columns = self.get_output_column_names(
+                    &stmt.columns,
+                    &all_columns,
+                    table_alias.as_deref(),
+                );
+                let output_columns = CompactArc::new(output_columns);
+
+                result = Box::new(ExprMappedResult::new(
+                    result,
+                    stmt.columns.clone(),
+                    (*output_columns).clone(),
+                )?);
+
+                return Ok((result, output_columns, false, None));
             }
         }
 
@@ -1859,7 +2044,7 @@ impl Executor {
                             // Execute anti-join
                             let anti_join_result = self.execute_anti_join(
                                 &not_exists_info,
-                                Arc::new(outer_rows.drain_rows().collect()),
+                                CompactArc::new(outer_rows.drain_rows().collect()),
                                 &all_columns,
                                 ctx,
                             )?;
@@ -1873,7 +2058,7 @@ impl Executor {
                                 ctx,
                                 table_alias.as_deref(),
                             )?;
-                            let output_columns = Arc::new(self.get_output_column_names(
+                            let output_columns = CompactArc::new(self.get_output_column_names(
                                 &stmt.columns,
                                 &all_columns,
                                 table_alias.as_deref(),
@@ -1907,10 +2092,10 @@ impl Executor {
                             };
 
                             let result = ExecutorResult::with_arc_columns(
-                                Arc::clone(&output_columns),
+                                CompactArc::clone(&output_columns),
                                 final_rows,
                             );
-                            return Ok((Box::new(result), output_columns, true));
+                            return Ok((Box::new(result), output_columns, true, None));
                         }
                     }
 
@@ -1988,7 +2173,7 @@ impl Executor {
                         table_alias.as_deref(),
                         ctx,
                     )? {
-                        return Ok((result, columns, false));
+                        return Ok((result, columns, false, None));
                     }
                 }
             }
@@ -2111,16 +2296,16 @@ impl Executor {
                         ctx,
                         table_alias.as_deref(),
                     )?;
-                    let output_columns = Arc::new(self.get_output_column_names(
+                    let output_columns = CompactArc::new(self.get_output_column_names(
                         &stmt.columns,
                         &all_columns,
                         table_alias.as_deref(),
                     ));
                     let result = ExecutorResult::with_arc_columns(
-                        Arc::clone(&output_columns),
+                        CompactArc::clone(&output_columns),
                         projected_rows,
                     );
-                    return Ok((Box::new(result), output_columns, true)); // true = LIMIT applied
+                    return Ok((Box::new(result), output_columns, true, None)); // true = LIMIT applied
                 }
 
                 // Normal path: collect all rows first (for ORDER BY, aggregation, etc.)
@@ -2166,12 +2351,12 @@ impl Executor {
 
                 // OPTIMIZATION: Pre-allocate outer_row_map with capacity and reuse
                 let base_capacity = all_columns.len() * 2 + ctx.outer_row().map_or(0, |m| m.len());
-                let mut outer_row_map: FxHashMap<String, Value> = FxHashMap::default();
+                let mut outer_row_map: FxHashMap<Arc<str>, Value> = FxHashMap::default();
                 outer_row_map.reserve(base_capacity);
 
                 // OPTIMIZATION: Wrap all_columns in Arc once, reuse for all rows (only if needed)
-                let all_columns_arc: Option<Arc<Vec<String>>> = if has_correlated {
-                    Some(Arc::new(all_columns.clone()))
+                let all_columns_arc: Option<CompactArc<Vec<String>>> = if has_correlated {
+                    Some(CompactArc::new(all_columns.clone()))
                 } else {
                     None
                 };
@@ -2435,8 +2620,9 @@ impl Executor {
                                                 limit_val,
                                             );
                                         if let Ok(query_result) = result {
-                                            let columns = Arc::new(query_result.columns().to_vec());
-                                            return Ok((query_result, columns, false));
+                                            let columns =
+                                                CompactArc::new(query_result.columns().to_vec());
+                                            return Ok((query_result, columns, false, None));
                                         }
                                         // Fall through to regular path if optimization fails
                                     }
@@ -2590,8 +2776,8 @@ impl Executor {
             // Apply window functions on aggregated rows
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, &agg_rows, &agg_columns)?;
-            let columns = Arc::new(result.columns().to_vec());
-            return Ok((result, columns, false));
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
         // Check if we need window functions only (no aggregation)
@@ -2619,19 +2805,28 @@ impl Executor {
                 // Default path: no optimization
                 self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns)?
             };
-            let columns = Arc::new(result.columns().to_vec());
-            return Ok((result, columns, false));
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
         // Check if we need aggregation only (no window functions)
         if has_agg {
             let result = self.execute_select_with_aggregation(stmt, ctx, rows, &all_columns)?;
-            let columns = Arc::new(result.columns().to_vec());
-            return Ok((result, columns, false));
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
         // Project rows according to SELECT expressions
-        let (projected_rows, output_columns) = if order_by_needs_extra_columns {
+        // Check if deferred projection is applicable (ORDER BY + LIMIT with simple columns)
+        // This reduces allocations from O(matched_rows) to O(limit)
+        let deferred_projection_info = self.get_deferred_projection_info(
+            stmt,
+            &all_columns_lower,
+            &all_columns,
+            classification,
+        );
+
+        let (projected_rows, output_columns, deferred_proj) = if order_by_needs_extra_columns {
             // When ORDER BY references columns not in SELECT, we need to:
             // 1. Include those columns in the output (appended at end)
             // 2. Sort will happen in execute_select
@@ -2658,7 +2853,15 @@ impl Executor {
                     }
                 }
             }
-            (projected_rows, output_columns)
+            (projected_rows, output_columns, None)
+        } else if let Some((col_indices, output_names)) = deferred_projection_info {
+            // DEFERRED PROJECTION: Skip projection now, do it after ORDER BY + LIMIT
+            // Return all source columns; projection will be applied after TopNResult
+            (
+                rows,
+                all_columns.to_vec(),
+                Some((col_indices, output_names)),
+            )
         } else {
             // Standard projection
             let projected_rows = self.project_rows_with_alias(
@@ -2671,7 +2874,7 @@ impl Executor {
             )?;
             let output_columns =
                 self.get_output_column_names(&stmt.columns, &all_columns, table_alias.as_deref());
-            (projected_rows, output_columns)
+            (projected_rows, output_columns, None)
         };
 
         // SEMANTIC CACHE: Insert result for eligible queries
@@ -2679,7 +2882,8 @@ impl Executor {
         //
         // Note: The cache stores Vec<Row>, so we extract rows from RowVec for caching.
         // The result keeps the original RowVec.
-        if cache_eligible {
+        // Skip caching when deferred projection is used (rows are not projected yet)
+        if cache_eligible && deferred_proj.is_none() {
             if let Some(where_expr) = where_to_use {
                 // Clone rows for cache (cache needs Vec<Row>)
                 let rows_for_cache: Vec<Row> = projected_rows.rows().cloned().collect();
@@ -2692,9 +2896,10 @@ impl Executor {
             }
         }
 
-        let output_columns = Arc::new(output_columns);
-        let result = ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
-        Ok((Box::new(result), output_columns, false))
+        let output_columns = CompactArc::new(output_columns);
+        let result =
+            ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
+        Ok((Box::new(result), output_columns, false, deferred_proj))
     }
 
     /// Execute a JOIN source
@@ -3365,12 +3570,12 @@ impl Executor {
                         // Don't return early - let the standard path handle these
                     } else if let Some(proj) = projection_pushdown {
                         // Projection was pushed down - rows are already projected
-                        let output_columns = Arc::new(proj.output_columns);
+                        let output_columns = CompactArc::new(proj.output_columns);
                         let result = ExecutorResult::with_arc_columns(
-                            Arc::clone(&output_columns),
+                            CompactArc::clone(&output_columns),
                             final_rows,
                         );
-                        return Ok((Box::new(result), output_columns, false));
+                        return Ok((Box::new(result), output_columns, false, None));
                     } else {
                         // Project rows according to SELECT expressions
                         let projected_rows = self.project_rows_with_alias(
@@ -3381,7 +3586,7 @@ impl Executor {
                             ctx,
                             None,
                         )?;
-                        let output_columns = Arc::new(self.get_output_column_names(
+                        let output_columns = CompactArc::new(self.get_output_column_names(
                             &stmt.columns,
                             &all_columns,
                             None,
@@ -3389,10 +3594,10 @@ impl Executor {
 
                         // Return with projected results
                         let result = ExecutorResult::with_arc_columns(
-                            Arc::clone(&output_columns),
+                            CompactArc::clone(&output_columns),
                             projected_rows,
                         );
-                        return Ok((Box::new(result), output_columns, false));
+                        return Ok((Box::new(result), output_columns, false, None));
                     }
                 }
             }
@@ -3571,14 +3776,17 @@ impl Executor {
                         ctx,
                         None,
                     )?;
-                    let output_columns =
-                        Arc::new(self.get_output_column_names(&stmt.columns, &all_cols, None));
+                    let output_columns = CompactArc::new(self.get_output_column_names(
+                        &stmt.columns,
+                        &all_cols,
+                        None,
+                    ));
 
                     let result = ExecutorResult::with_arc_columns(
-                        Arc::clone(&output_columns),
+                        CompactArc::clone(&output_columns),
                         projected_rows,
                     );
-                    return Ok((Box::new(result), output_columns, false));
+                    return Ok((Box::new(result), output_columns, false, None));
                 }
             }
 
@@ -3901,24 +4109,24 @@ impl Executor {
             // Apply window functions on aggregated rows (agg_rows is already RowVec with IDs)
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, &agg_rows, &agg_columns)?;
-            let columns = Arc::new(result.columns().to_vec());
-            return Ok((result, columns, false));
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
         // Check if we need window functions only (no aggregation)
         if has_window {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, &final_rows, &final_columns)?;
-            let columns = Arc::new(result.columns().to_vec());
-            return Ok((result, columns, false));
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
         // Check if we need aggregation only
         if has_agg {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, final_rows, &final_columns)?;
-            let columns = Arc::new(result.columns().to_vec());
-            return Ok((result, columns, false));
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
         // Project rows according to SELECT expressions
@@ -3935,10 +4143,11 @@ impl Executor {
         // Note: For JOIN results, columns are already qualified (e.g., "a.id", "b.id"),
         // so we pass None for table_alias - the prefix matching will work
         let output_columns =
-            Arc::new(self.get_output_column_names(&stmt.columns, &final_columns, None));
+            CompactArc::new(self.get_output_column_names(&stmt.columns, &final_columns, None));
 
-        let result = ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
-        Ok((Box::new(result), output_columns, false))
+        let result =
+            ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
+        Ok((Box::new(result), output_columns, false, None))
     }
 
     /// Execute a subquery source
@@ -3956,6 +4165,37 @@ impl Executor {
         let subquery_ctx = ctx.with_incremented_query_depth();
         let result = self.execute_select(&subquery_source.subquery, &subquery_ctx)?;
         let columns = result.columns().to_vec();
+
+        // OPTIMIZATION: For simple GROUP BY aggregation without WHERE clause, try streaming
+        // directly to aggregation HashMap without materializing all rows first.
+        // This reduces memory allocations from O(N) to O(groups).
+        if stmt.where_clause.is_none()
+            && classification.has_aggregation
+            && !classification.has_window_functions
+        {
+            if let Some(agg_result) =
+                self.try_streaming_derived_table_aggregation(result, stmt, classification)?
+            {
+                let out_columns = CompactArc::new(agg_result.columns().to_vec());
+                return Ok((agg_result, out_columns, false, None));
+            }
+            // Streaming not applicable - need to re-execute the subquery
+            // (the streaming function consumed the result iterator)
+            let result = self.execute_select(&subquery_source.subquery, &subquery_ctx)?;
+
+            // Fall through to materialization path
+            let mut rows = RowVec::new();
+            let mut result = result;
+            let mut row_id = 0i64;
+            while result.next() {
+                rows.push((row_id, result.take_row()));
+                row_id += 1;
+            }
+
+            let agg_result = self.execute_select_with_aggregation(stmt, ctx, rows, &columns)?;
+            let out_columns = CompactArc::new(agg_result.columns().to_vec());
+            return Ok((agg_result, out_columns, false, None));
+        }
 
         // Materialize the subquery result directly with synthetic row IDs
         let mut rows = RowVec::new();
@@ -3981,16 +4221,16 @@ impl Executor {
         if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, &filtered_rows, &columns)?;
-            let out_columns = Arc::new(result.columns().to_vec());
-            return Ok((result, out_columns, false));
+            let out_columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, out_columns, false, None));
         }
 
         // Check if we need aggregation
         if classification.has_aggregation {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &columns)?;
-            let out_columns = Arc::new(result.columns().to_vec());
-            return Ok((result, out_columns, false));
+            let out_columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, out_columns, false, None));
         }
 
         // Project rows according to SELECT expressions
@@ -4003,10 +4243,11 @@ impl Executor {
             .as_ref()
             .map(|a| a.value_lower.as_str());
         let output_columns =
-            Arc::new(self.get_output_column_names(&stmt.columns, &columns, subquery_alias));
+            CompactArc::new(self.get_output_column_names(&stmt.columns, &columns, subquery_alias));
 
-        let result = ExecutorResult::with_arc_columns(Arc::clone(&output_columns), projected_rows);
-        Ok((Box::new(result), output_columns, false))
+        let result =
+            ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
+        Ok((Box::new(result), output_columns, false, None))
     }
 
     /// Parse a view's SQL query and return the cached Statement.
@@ -4106,8 +4347,8 @@ impl Executor {
             // Execute aggregation on the view's rows
             let agg_result =
                 self.execute_select_with_aggregation(stmt, ctx, rows, &view_columns)?;
-            let columns = Arc::new(agg_result.columns().to_vec());
-            return Ok((agg_result, columns, false));
+            let columns = CompactArc::new(agg_result.columns().to_vec());
+            return Ok((agg_result, columns, false, None));
         }
 
         // Handle projection: apply outer query's column selection
@@ -4121,7 +4362,7 @@ impl Executor {
         if is_select_star {
             // For SELECT *, just return the view result with WHERE applied
             // DISTINCT, ORDER BY, LIMIT/OFFSET are handled by execute_select
-            return Ok((result, Arc::new(view_columns), false));
+            return Ok((result, CompactArc::new(view_columns), false, None));
         }
 
         // Determine if we have any complex expressions (not just column references)
@@ -4147,13 +4388,17 @@ impl Executor {
                 }
                 Expression::QualifiedStar(qs) => {
                     // Expand columns for specific table/alias
-                    let prefix = format!("{}.", qs.qualifier);
-                    let prefix_lower = prefix.to_lowercase();
+                    let qualifier_lower = qs.qualifier.to_lowercase();
+                    let qualifier_len = qualifier_lower.len();
                     for (idx, col_lower) in view_columns_lower.iter().enumerate() {
-                        if col_lower.starts_with(&prefix_lower) {
+                        // Inline prefix check: "qualifier." without format! allocation
+                        if col_lower.len() > qualifier_len
+                            && col_lower.starts_with(qualifier_lower.as_str())
+                            && col_lower.as_bytes()[qualifier_len] == b'.'
+                        {
                             column_indices.push(idx);
-                            // Strip the prefix from the column name for the output
-                            output_columns.push(view_columns[idx][prefix.len()..].to_string());
+                            // Strip "qualifier." from the column name for the output
+                            output_columns.push(view_columns[idx][qualifier_len + 1..].to_string());
                         }
                     }
                 }
@@ -4212,14 +4457,18 @@ impl Executor {
                         }
                     }
                     Expression::QualifiedStar(qs) => {
-                        let prefix = format!("{}.", qs.qualifier);
-                        let prefix_lower = prefix.to_lowercase();
+                        let qualifier_lower = qs.qualifier.to_lowercase();
+                        let qualifier_len = qualifier_lower.len();
                         // Use pre-computed lowercase columns from earlier
                         for (idx, col_lower) in view_columns_lower.iter().enumerate() {
-                            if col_lower.starts_with(&prefix_lower) {
-                                // Strip the prefix from the column name for the output
+                            // Inline prefix check: "qualifier." without format! allocation
+                            if col_lower.len() > qualifier_len
+                                && col_lower.starts_with(qualifier_lower.as_str())
+                                && col_lower.as_bytes()[qualifier_len] == b'.'
+                            {
+                                // Strip "qualifier." from the column name for the output
                                 final_output_columns
-                                    .push(view_columns[idx][prefix.len()..].to_string());
+                                    .push(view_columns[idx][qualifier_len + 1..].to_string());
                             }
                         }
                     }
@@ -4269,7 +4518,7 @@ impl Executor {
             output_columns
         };
 
-        Ok((result, Arc::new(final_columns), false))
+        Ok((result, CompactArc::new(final_columns), false, None))
     }
 
     /// Execute a VALUES source (e.g., (VALUES (1, 'a'), (2, 'b')) AS t(col1, col2))
@@ -4372,22 +4621,22 @@ impl Executor {
         if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, &result_rows, &column_names)?;
-            let columns = Arc::new(result.columns().to_vec());
-            return Ok((result, columns, false));
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
         // Check if we need aggregation
         if classification.has_aggregation {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, result_rows, &column_names)?;
-            let columns = Arc::new(result.columns().to_vec());
-            return Ok((result, columns, false));
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
-        // Create the result - use Arc for column names
-        let column_names_arc = Arc::new(column_names);
+        // Create the result - use CompactArc for column names
+        let column_names_arc = CompactArc::new(column_names);
         let values_result =
-            ExecutorResult::with_arc_columns(Arc::clone(&column_names_arc), result_rows);
+            ExecutorResult::with_arc_columns(CompactArc::clone(&column_names_arc), result_rows);
 
         // If the SELECT has projections, apply them
         if stmt.columns.len() == 1
@@ -4397,7 +4646,7 @@ impl Executor {
             )
         {
             // SELECT * or t.* - return all columns
-            return Ok((Box::new(values_result), column_names_arc, false));
+            return Ok((Box::new(values_result), column_names_arc, false, None));
         }
 
         // Apply column projection
@@ -4525,17 +4774,19 @@ impl Executor {
                             // Check if it's correlated (references outer columns)
                             if Self::has_correlated_subqueries(&a.expression) {
                                 // Build outer row context for correlated subquery
-                                let mut outer_row_map: FxHashMap<String, Value> =
+                                let mut outer_row_map: FxHashMap<Arc<str>, Value> =
                                     FxHashMap::default();
                                 for (i, col_name) in extended_columns.iter().enumerate() {
                                     if let Some(value) = row.get(i) {
-                                        outer_row_map
-                                            .insert(col_name.to_lowercase(), value.clone());
+                                        outer_row_map.insert(
+                                            Arc::from(col_name.to_lowercase().as_str()),
+                                            value.clone(),
+                                        );
                                     }
                                 }
                                 let correlated_ctx = ctx.with_outer_row(
                                     outer_row_map,
-                                    std::sync::Arc::new(extended_columns.clone()),
+                                    CompactArc::new(extended_columns.clone()),
                                 );
                                 self.process_correlated_where(&a.expression, &correlated_ctx)?
                             } else {
@@ -4558,17 +4809,19 @@ impl Executor {
                             // Check if it's correlated (references outer columns)
                             if Self::has_correlated_subqueries(other) {
                                 // Build outer row context for correlated subquery
-                                let mut outer_row_map: FxHashMap<String, Value> =
+                                let mut outer_row_map: FxHashMap<Arc<str>, Value> =
                                     FxHashMap::default();
                                 for (i, col_name) in extended_columns.iter().enumerate() {
                                     if let Some(value) = row.get(i) {
-                                        outer_row_map
-                                            .insert(col_name.to_lowercase(), value.clone());
+                                        outer_row_map.insert(
+                                            Arc::from(col_name.to_lowercase().as_str()),
+                                            value.clone(),
+                                        );
                                     }
                                 }
                                 let correlated_ctx = ctx.with_outer_row(
                                     outer_row_map,
-                                    std::sync::Arc::new(extended_columns.clone()),
+                                    CompactArc::new(extended_columns.clone()),
                                 );
                                 self.process_correlated_where(other, &correlated_ctx)?
                             } else {
@@ -4588,10 +4841,12 @@ impl Executor {
             proj_row_id += 1;
         }
 
-        let projected_columns_arc = Arc::new(projected_columns);
-        let final_result =
-            ExecutorResult::with_arc_columns(Arc::clone(&projected_columns_arc), projected_rows);
-        Ok((Box::new(final_result), projected_columns_arc, false))
+        let projected_columns_arc = CompactArc::new(projected_columns);
+        let final_result = ExecutorResult::with_arc_columns(
+            CompactArc::clone(&projected_columns_arc),
+            projected_rows,
+        );
+        Ok((Box::new(final_result), projected_columns_arc, false, None))
     }
 
     /// Execute a table expression (for JOIN left/right sides)
@@ -4622,7 +4877,7 @@ impl Executor {
             Expression::TableSource(ts) => {
                 // Check if this is a CTE from context (for subqueries referencing outer CTEs)
                 let table_name = &ts.name.value_lower;
-                if let Some((columns, rows)) = ctx.get_cte(table_name) {
+                if let Some((columns, rows)) = ctx.get_cte_by_lower(table_name) {
                     // Get the alias for column prefixing
                     let table_alias = ts
                         .alias
@@ -4647,7 +4902,7 @@ impl Executor {
                         );
                         let row_filter =
                             RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
-                        // CTE stores Arc<Vec<(i64, Row)>>, filter on the Row part
+                        // CTE stores CompactArc<Vec<(i64, Row)>>, filter on the Row part
                         let filtered_rows: RowVec = rows
                             .iter()
                             .filter(|(_, row)| row_filter.matches(row))
@@ -4660,7 +4915,7 @@ impl Executor {
                             filtered_rows,
                         ))
                     } else {
-                        // Convert CTE Arc<Vec<(i64, Row)>> to RowVec
+                        // Convert CTE CompactArc<Vec<(i64, Row)>> to RowVec
                         let rows_vec = RowVec::from_vec((**rows).clone());
                         Box::new(super::result::ExecutorResult::new(
                             columns.to_vec(),
@@ -4727,7 +4982,7 @@ impl Executor {
                 };
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
-                let (result, columns, _) =
+                let (result, columns, _, _) =
                     self.execute_simple_table_scan(ts, &select_all, ctx, &classification)?;
 
                 // Prefix column names with table alias (or table name if no alias)
@@ -4765,7 +5020,7 @@ impl Executor {
                 };
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
-                let (result, columns, _) =
+                let (result, columns, _, _) =
                     self.execute_join_source(js, &select_all, ctx, &classification)?;
                 Ok((result, columns.to_vec()))
             }
@@ -4833,7 +5088,7 @@ impl Executor {
                 };
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
-                let (result, columns, _) =
+                let (result, columns, _, _) =
                     self.execute_values_source(vs, &select_all, ctx, &classification)?;
                 Ok((result, columns.to_vec()))
             }
@@ -4876,7 +5131,7 @@ impl Executor {
             let table_name = ts.name.value_lower.as_str();
 
             // Skip if this is a CTE reference - CTEs are already materialized
-            if ctx.get_cte(table_name).is_some() {
+            if ctx.get_cte_by_lower(table_name).is_some() {
                 return self.execute_table_expression_with_filter(expr, ctx, filter);
             }
 
@@ -4911,7 +5166,7 @@ impl Executor {
             };
             // Get classification for the synthetic SELECT statement
             let classification = get_classification(&select_all);
-            let (result, columns, _) =
+            let (result, columns, _, _) =
                 self.execute_simple_table_scan(ts, &select_all, ctx, &classification)?;
 
             // Prefix column names with table alias (or table name if no alias)
@@ -4956,13 +5211,13 @@ impl Executor {
         Ok(rows)
     }
 
-    /// Materialize a result into an Arc<Vec<Row>> for zero-copy sharing with joins
+    /// Materialize a result into an CompactArc<Vec<Row>> for zero-copy sharing with joins
     ///
     /// This method first tries to extract an Arc directly from the result (e.g., from CTE cache),
     /// falling back to iterating and collecting rows if not possible.
     pub(crate) fn materialize_result_arc(
         mut result: Box<dyn QueryResult>,
-    ) -> Result<Arc<Vec<Row>>> {
+    ) -> Result<CompactArc<Vec<Row>>> {
         // Try to extract Arc directly (zero-copy path for CTEs)
         if let Some(arc_rows) = result.try_into_arc_rows() {
             return Ok(arc_rows);
@@ -4977,7 +5232,7 @@ impl Executor {
         while result.next() {
             rows.push(result.take_row());
         }
-        Ok(Arc::new(rows))
+        Ok(CompactArc::new(rows))
     }
 
     /// Project rows by evaluating SELECT expressions
@@ -5060,6 +5315,14 @@ impl Executor {
                 } else {
                     matching_indices
                 };
+
+                // OPTIMIZATION: If selecting all columns in order (identity), pass through directly
+                let is_identity = indices_to_use.len() == all_columns.len()
+                    && indices_to_use.iter().enumerate().all(|(i, &idx)| i == idx);
+
+                if is_identity {
+                    return Ok(rows); // Pass through directly - no allocation needed
+                }
 
                 // Project rows to only include matching columns
                 let mut projected = RowVec::with_capacity(rows.len());
@@ -5287,15 +5550,33 @@ impl Executor {
         let column_keys = ColumnKeyMapping::build_mappings(all_columns, table_alias);
 
         // OPTIMIZATION: Pre-allocate outer_row_map with capacity and reuse
+        // Uses Arc<str> keys for zero-cost cloning in the per-row loop
         let base_capacity = all_columns.len() * 2;
-        let mut outer_row_map: FxHashMap<String, Value> = FxHashMap::default();
+        let mut outer_row_map: FxHashMap<Arc<str>, Value> = FxHashMap::default();
         outer_row_map.reserve(base_capacity);
 
-        // OPTIMIZATION: Wrap all_columns in Arc once, reuse for all rows
-        let all_columns_arc: Arc<Vec<String>> = Arc::new(all_columns.to_vec());
+        // OPTIMIZATION: Wrap all_columns in CompactArc once, reuse for all rows
+        let all_columns_arc: CompactArc<Vec<String>> = CompactArc::new(all_columns.to_vec());
+
+        // OPTIMIZATION: Pre-compute QualifiedStar lowercase qualifiers to avoid per-row to_lowercase()
+        // Key: original qualifier string, Value: qualifier_lower (no format! allocation needed)
+        let qualified_star_cache: FxHashMap<String, String> = select_exprs
+            .iter()
+            .filter_map(|expr| {
+                if let Expression::QualifiedStar(qs) = expr {
+                    Some((
+                        qs.qualifier.to_string(),
+                        qs.qualifier.to_lowercase().to_string(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         for (id, row) in rows.into_iter() {
-            let mut values = Vec::with_capacity(select_exprs.len());
+            // Use CompactVec directly instead of Vec to avoid Vec->CompactVec conversion
+            let mut values: CompactVec<Value> = CompactVec::with_capacity(select_exprs.len());
 
             evaluator.set_row_array(&row);
 
@@ -5350,11 +5631,19 @@ impl Executor {
                     }
                     Expression::QualifiedStar(qs) => {
                         // Expand columns for specific table/alias
-                        let prefix_lower = format!("{}.", qs.qualifier.to_lowercase());
-                        let qualifier_lower = qs.qualifier.to_lowercase();
+                        // Use pre-computed cache to avoid per-row to_lowercase()
+                        let qualifier_lower = qualified_star_cache
+                            .get(qs.qualifier.as_str())
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        let qualifier_len = qualifier_lower.len();
                         let mut found_any = false;
                         for (idx, col_lower) in columns_lower.iter().enumerate() {
-                            if col_lower.starts_with(&prefix_lower) {
+                            // Inline prefix check: "qualifier." without format! allocation
+                            if col_lower.len() > qualifier_len
+                                && col_lower.starts_with(qualifier_lower)
+                                && col_lower.as_bytes()[qualifier_len] == b'.'
+                            {
                                 if let Some(val) = row.get(idx) {
                                     values.push(val.clone());
                                     found_any = true;
@@ -5363,7 +5652,7 @@ impl Executor {
                         }
                         if !found_any {
                             if let Some(ref alias_lower) = table_alias_lower {
-                                if *alias_lower == qualifier_lower {
+                                if alias_lower.as_str() == qualifier_lower {
                                     for val in row.iter() {
                                         values.push(val.clone());
                                     }
@@ -5383,7 +5672,7 @@ impl Executor {
                 }
             }
 
-            projected.push((id, Row::from_values(values)));
+            projected.push((id, Row::from_compact_vec(values)));
         }
 
         Ok(projected)
@@ -5437,7 +5726,6 @@ impl Executor {
             SimpleColumn(usize),
             StarExpand,
             QualifiedStarExpand {
-                prefix_lower: String,
                 qualifier_lower: String,
             },
             /// Inline COALESCE - bypasses VM for 7x speedup
@@ -5705,8 +5993,7 @@ impl Executor {
             let action = match expr {
                 Expression::Star(_) => ExprAction::StarExpand,
                 Expression::QualifiedStar(qs) => ExprAction::QualifiedStarExpand {
-                    prefix_lower: format!("{}.", qs.qualifier.to_lowercase()),
-                    qualifier_lower: qs.qualifier.to_lowercase().into(),
+                    qualifier_lower: qs.qualifier.to_lowercase().to_string(),
                 },
                 Expression::Identifier(id) => {
                     if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
@@ -5875,7 +6162,8 @@ impl Executor {
             let values_capacity = actions.len();
 
             for (id, row) in rows.into_iter() {
-                let mut values = Vec::with_capacity(values_capacity);
+                // Use CompactVec directly instead of Vec to avoid Vec->CompactVec conversion
+                let mut values: CompactVec<Value> = CompactVec::with_capacity(values_capacity);
 
                 // Build VM context with all params in one call (faster than builder chain)
                 let vm_ctx = ExecuteContext::with_common_params(
@@ -5900,13 +6188,15 @@ impl Executor {
                                 values.push(val.clone());
                             }
                         }
-                        ExprAction::QualifiedStarExpand {
-                            prefix_lower,
-                            qualifier_lower,
-                        } => {
+                        ExprAction::QualifiedStarExpand { qualifier_lower } => {
+                            let qualifier_len = qualifier_lower.len();
                             let mut found_any = false;
                             for (idx, col_lower) in all_columns_lower.iter().enumerate() {
-                                if col_lower.starts_with(prefix_lower) {
+                                // Inline prefix check: "qualifier." without format! allocation
+                                if col_lower.len() > qualifier_len
+                                    && col_lower.starts_with(qualifier_lower)
+                                    && col_lower.as_bytes()[qualifier_len] == b'.'
+                                {
                                     if let Some(val) = row.get(idx) {
                                         values.push(val.clone());
                                         found_any = true;
@@ -6050,7 +6340,7 @@ impl Executor {
                     }
                 }
 
-                projected.push((id, Row::from_values(values)));
+                projected.push((id, Row::from_compact_vec(values)));
             }
         }
 
@@ -6276,17 +6566,20 @@ impl Executor {
                 }
                 Expression::QualifiedStar(qs) => {
                     // SELECT t.* - add columns matching the qualifier
-                    let prefix = format!("{}.", qs.qualifier);
-                    let prefix_lower = prefix.to_lowercase();
                     let qualifier_lower = qs.qualifier.to_lowercase();
+                    let qualifier_len = qualifier_lower.len();
                     let mut found_any = false;
                     // Use pre-computed lowercase columns
                     if let Some(ref cols_lower) = all_columns_lower {
                         for (idx, col_lower) in cols_lower.iter().enumerate() {
-                            if col_lower.starts_with(&prefix_lower) {
-                                // Strip the prefix from the column name for the output
+                            // Inline prefix check: "qualifier." without format! allocation
+                            if col_lower.len() > qualifier_len
+                                && col_lower.starts_with(qualifier_lower.as_str())
+                                && col_lower.as_bytes()[qualifier_len] == b'.'
+                            {
+                                // Strip "qualifier." from the column name for the output
                                 // e.g., "e.name" becomes "name"
-                                names.push(all_columns[idx][prefix.len()..].to_string());
+                                names.push(all_columns[idx][qualifier_len + 1..].to_string());
                                 found_any = true;
                             }
                         }
@@ -6838,29 +7131,30 @@ impl Executor {
         if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns)?;
-            let columns = Arc::new(result.columns().to_vec());
-            return Ok((result, columns, false));
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
         // Check for aggregation
         if classification.has_aggregation {
             let result = self.execute_select_with_aggregation(stmt, ctx, rows, &all_columns)?;
-            let columns = Arc::new(result.columns().to_vec());
-            return Ok((result, columns, false));
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
         // Project rows
         let (projected_rows, final_columns) =
             self.project_rows_for_select(stmt, rows, &all_columns, ctx)?;
 
-        let final_columns_arc = Arc::new(final_columns);
+        let final_columns_arc = CompactArc::new(final_columns);
         Ok((
             Box::new(ExecutorResult::with_arc_columns(
-                Arc::clone(&final_columns_arc),
+                CompactArc::clone(&final_columns_arc),
                 projected_rows,
             )),
             final_columns_arc,
             false,
+            None,
         ))
     }
 
@@ -7198,10 +7492,19 @@ impl Executor {
 
         // Verify left key references the left table
         let left_key_lower = left_key_col.to_lowercase();
-        if !left_key_lower.starts_with(&format!("{}.", left_alias.to_lowercase())) {
+        let left_alias_lower = left_alias.to_lowercase();
+        let left_alias_len = left_alias_lower.len();
+        // Inline prefix check: "alias." without format! allocation
+        let left_matches = left_key_lower.len() > left_alias_len
+            && left_key_lower.starts_with(&left_alias_lower)
+            && left_key_lower.as_bytes()[left_alias_len] == b'.';
+        if !left_matches {
             // Maybe it's right.col = left.col (swapped)
             let right_key_lower = right_key_col.to_lowercase();
-            if !right_key_lower.starts_with(&format!("{}.", left_alias.to_lowercase())) {
+            let right_matches = right_key_lower.len() > left_alias_len
+                && right_key_lower.starts_with(&left_alias_lower)
+                && right_key_lower.as_bytes()[left_alias_len] == b'.';
+            if !right_matches {
                 return None;
             }
             // Swap the keys
@@ -7387,23 +7690,31 @@ impl Executor {
             .unwrap_or(table_name_ref);
 
         // Check if left_col is from right table and right_col is from left table (swapped)
-        let (inner_col, outer_col) = if left_col_lower
-            .starts_with(&format!("{}.", right_table_alias.to_lowercase()))
-        {
-            // left_col is actually from right (inner) table
-            (left_col.clone(), right_col.clone())
-        } else if right_col_lower.starts_with(&format!("{}.", right_table_alias.to_lowercase())) {
-            // right_col is from right (inner) table - normal case
-            (right_col.clone(), left_col.clone())
-        } else {
-            // Can't determine which column is from which table
-            return None;
+        // Pre-compute lowercase alias to avoid repeated format! allocations
+        let right_alias_lower = right_table_alias.to_lowercase();
+        let right_alias_len = right_alias_lower.len();
+        // Inline prefix check helper
+        let starts_with_alias = |col: &str, alias: &str, alias_len: usize| -> bool {
+            col.len() > alias_len && col.starts_with(alias) && col.as_bytes()[alias_len] == b'.'
         };
+        let (inner_col, outer_col) =
+            if starts_with_alias(&left_col_lower, &right_alias_lower, right_alias_len) {
+                // left_col is actually from right (inner) table
+                (left_col.clone(), right_col.clone())
+            } else if starts_with_alias(&right_col_lower, &right_alias_lower, right_alias_len) {
+                // right_col is from right (inner) table - normal case
+                (right_col.clone(), left_col.clone())
+            } else {
+                // Can't determine which column is from which table
+                return None;
+            };
 
         // Verify outer column is from left table (if we have left alias)
         if let Some(left_a) = left_alias {
             let outer_col_lower = outer_col.to_lowercase();
-            if !outer_col_lower.starts_with(&format!("{}.", left_a.to_lowercase())) {
+            let left_alias_lower = left_a.to_lowercase();
+            let left_alias_len = left_alias_lower.len();
+            if !starts_with_alias(&outer_col_lower, &left_alias_lower, left_alias_len) {
                 // Outer column doesn't reference left table
                 return None;
             }
@@ -7696,7 +8007,7 @@ impl Executor {
         table: &dyn crate::storage::traits::Table,
         all_columns: &[String],
         ctx: &ExecutionContext,
-    ) -> Result<Option<(Box<dyn QueryResult>, Arc<Vec<String>>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
         use crate::core::IndexType;
 
         // Only single-column GROUP BY is supported for now
@@ -8038,8 +8349,9 @@ impl Executor {
             }
         }
 
-        let result_columns = Arc::new(result_columns);
-        let result = ExecutorResult::with_arc_columns(Arc::clone(&result_columns), result_rows);
+        let result_columns = CompactArc::new(result_columns);
+        let result =
+            ExecutorResult::with_arc_columns(CompactArc::clone(&result_columns), result_rows);
         Ok(Some((Box::new(result), result_columns)))
     }
 }

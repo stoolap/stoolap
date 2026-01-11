@@ -32,8 +32,7 @@
 //! - RIGHT OUTER: All right rows, matched left or NULLs
 //! - FULL OUTER: All rows from both sides
 
-use std::sync::Arc;
-
+use crate::common::CompactArc;
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row};
 use crate::executor::hash_table::{hash_row_keys, verify_key_equality, JoinHashTable};
@@ -174,9 +173,9 @@ pub struct HashJoinOperator {
     right_key_indices: Vec<usize>,
 
     // Build phase state (populated in open())
-    // Uses Arc<Vec<Row>> to enable zero-copy sharing with CTE results.
+    // Uses CompactArc<Vec<Row>> to enable zero-copy sharing with CTE results.
     // When dropped, only decrements refcount (O(1)) instead of deallocating rows.
-    build_rows: Arc<Vec<Row>>,
+    build_rows: CompactArc<Vec<Row>>,
     hash_table: Option<JoinHashTable>,
 
     // Output schema
@@ -248,7 +247,7 @@ impl HashJoinOperator {
             build_side,
             left_key_indices,
             right_key_indices,
-            build_rows: Arc::new(Vec::new()),
+            build_rows: CompactArc::new(Vec::new()),
             hash_table: None,
             schema,
             left_col_count,
@@ -286,7 +285,7 @@ impl HashJoinOperator {
     /// * `build_is_left` - Whether build side is left (for schema ordering)
     pub fn with_prebuilt(
         probe: Box<dyn Operator>,
-        build_rows: Arc<Vec<Row>>,
+        build_rows: CompactArc<Vec<Row>>,
         hash_table: crate::executor::hash_table::JoinHashTable,
         join_type: JoinType,
         probe_key_indices: Vec<usize>,
@@ -405,7 +404,7 @@ impl HashJoinOperator {
             build_side: JoinSide::Left, // Build from the single input
             left_key_indices,
             right_key_indices,
-            build_rows: Arc::new(Vec::new()),
+            build_rows: CompactArc::new(Vec::new()),
             hash_table: None,
             schema,
             left_col_count: col_count,
@@ -485,7 +484,7 @@ impl HashJoinOperator {
         let probe_is_left = matches!(self.build_side, JoinSide::Right);
         RowRef::direct_build_composite(
             probe_row,
-            Arc::clone(&self.build_rows),
+            CompactArc::clone(&self.build_rows),
             build_idx,
             probe_is_left,
         )
@@ -588,8 +587,8 @@ impl Operator for HashJoinOperator {
             self.build_matched = vec![false; build_rows.len()];
         }
 
-        // Wrap in Arc for zero-copy drop (only refcount decrement, not deallocation)
-        self.build_rows = Arc::new(build_rows);
+        // Wrap in CompactArc for zero-copy drop (only refcount decrement, not deallocation)
+        self.build_rows = CompactArc::new(build_rows);
         self.hash_table = Some(hash_table);
         self.opened = true;
 

@@ -17,7 +17,7 @@
 //! This module provides Arc-based storage for row data,
 //! enabling O(1) row cloning on read (just Arc::clone).
 //!
-//! Key insight: Store row data as Arc<[Arc<Value>]> for O(1) clone on read.
+//! Key insight: Store row data as Arc<[CompactArc<Value>]> for O(1) clone on read.
 //! Single clone on insert, zero clone on read.
 //!
 //! # Lock Design
@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::common::CompactArc;
 use crate::core::{Row, Value};
 
 /// Metadata for a row stored in the arena
@@ -57,8 +58,8 @@ impl ArenaRowMeta {
 /// Inner arena data protected by single lock
 pub struct ArenaInner {
     /// Arc storage per row (for O(1) clone on read)
-    /// Stores Arc<[Arc<Value>]> matching the new Row storage format
-    pub data: Vec<Arc<[Arc<Value>]>>,
+    /// Stores Arc<[CompactArc<Value>]> matching the new Row storage format
+    pub data: Vec<Arc<[CompactArc<Value>]>>,
     /// Row metadata
     pub meta: Vec<ArenaRowMeta>,
 }
@@ -102,8 +103,9 @@ impl RowArena {
     pub fn insert(&self, row_id: i64, txn_id: i64, create_time: i64, values: &[Value]) -> usize {
         let mut inner = self.inner.write();
 
-        // Convert values to Arc<Value> and store
-        let arc_values: Vec<Arc<Value>> = values.iter().map(|v| Arc::new(v.clone())).collect();
+        // Convert values to CompactArc<Value> and store
+        let arc_values: Vec<CompactArc<Value>> =
+            values.iter().map(|v| CompactArc::new(v.clone())).collect();
         inner.data.push(Arc::from(arc_values));
 
         let meta = ArenaRowMeta {
@@ -129,7 +131,8 @@ impl RowArena {
             Some(slice) => Arc::from(slice),
             None => {
                 // Inline storage: wrap values in Arc
-                let arc_vec: Vec<Arc<Value>> = row.iter().map(|v| Arc::new(v.clone())).collect();
+                let arc_vec: Vec<CompactArc<Value>> =
+                    row.iter().map(|v| CompactArc::new(v.clone())).collect();
                 Arc::from(arc_vec.into_boxed_slice())
             }
         };
@@ -157,7 +160,7 @@ impl RowArena {
         txn_id: i64,
         create_time: i64,
         row: &Row,
-    ) -> (usize, Arc<[Arc<Value>]>) {
+    ) -> (usize, Arc<[CompactArc<Value>]>) {
         let mut inner = self.inner.write();
 
         // Create Arc once, clone for storage and return - handle all storage types
@@ -165,7 +168,8 @@ impl RowArena {
             Some(slice) => Arc::from(slice),
             None => {
                 // Inline storage: wrap values in Arc
-                let arc_vec: Vec<Arc<Value>> = row.iter().map(|v| Arc::new(v.clone())).collect();
+                let arc_vec: Vec<CompactArc<Value>> =
+                    row.iter().map(|v| CompactArc::new(v.clone())).collect();
                 Arc::from(arc_vec.into_boxed_slice())
             }
         };
@@ -191,7 +195,7 @@ impl RowArena {
         row_id: i64,
         txn_id: i64,
         create_time: i64,
-        arc_data: Arc<[Arc<Value>]>,
+        arc_data: Arc<[CompactArc<Value>]>,
     ) -> usize {
         let mut inner = self.inner.write();
 
@@ -230,7 +234,7 @@ impl RowArena {
         row_id: i64,
         txn_id: i64,
         create_time: i64,
-        arc_data: Arc<[Arc<Value>]>,
+        arc_data: Arc<[CompactArc<Value>]>,
     ) -> bool {
         let mut inner = self.inner.write();
         if arena_idx < inner.meta.len() {
@@ -272,7 +276,7 @@ impl RowArena {
 
     /// Get Arc for a row by arena index - O(1) clone
     #[inline]
-    pub fn get_arc(&self, arena_idx: usize) -> Option<Arc<[Arc<Value>]>> {
+    pub fn get_arc(&self, arena_idx: usize) -> Option<Arc<[CompactArc<Value>]>> {
         let inner = self.inner.read();
         inner.data.get(arena_idx).cloned()
     }
@@ -282,7 +286,10 @@ impl RowArena {
     /// This is optimized for the visibility fast path where we need to check
     /// txn_id and deleted_at_txn_id before returning the data.
     #[inline]
-    pub fn get_meta_and_arc(&self, arena_idx: usize) -> Option<(ArenaRowMeta, Arc<[Arc<Value>]>)> {
+    pub fn get_meta_and_arc(
+        &self,
+        arena_idx: usize,
+    ) -> Option<(ArenaRowMeta, Arc<[CompactArc<Value>]>)> {
         let inner = self.inner.read();
         if arena_idx < inner.meta.len() {
             let meta = inner.meta[arena_idx];
@@ -308,7 +315,7 @@ pub struct ArenaReadGuard<'a> {
 impl<'a> ArenaReadGuard<'a> {
     /// Get data slice
     #[inline]
-    pub fn data(&self) -> &[Arc<[Arc<Value>]>] {
+    pub fn data(&self) -> &[Arc<[CompactArc<Value>]>] {
         &self.inner.data
     }
 

@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use compact_str::CompactString;
 
+use crate::common::CompactArc;
+
 use super::compiler::{CompileContext, ExprCompiler};
 use super::ops::{CompiledPattern, Op};
 use super::program::Program;
@@ -178,7 +180,7 @@ fn test_in_set() {
 
     let program = Program::new(vec![
         Op::LoadColumn(0),
-        Op::InSet(Arc::new(set), false),
+        Op::InSet(CompactArc::new(set), false),
         Op::Return,
     ]);
 

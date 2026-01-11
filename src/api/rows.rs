@@ -45,6 +45,7 @@
 //! let users: Vec<User> = db.query_as("SELECT id, name FROM users", ())?;
 //! ```
 
+use crate::common::CompactArc;
 use crate::core::{Error, Result, Row, Value};
 use crate::storage::traits::QueryResult;
 
@@ -106,12 +107,12 @@ pub trait FromRow: Sized {
 pub struct ResultRow {
     row: Row,
     /// Shared column names (Arc avoids per-row allocation)
-    columns: std::sync::Arc<Vec<String>>,
+    columns: CompactArc<Vec<String>>,
 }
 
 impl ResultRow {
     /// Create a new ResultRow
-    pub(crate) fn new(row: Row, columns: std::sync::Arc<Vec<String>>) -> Self {
+    pub(crate) fn new(row: Row, columns: CompactArc<Vec<String>>) -> Self {
         Self { row, columns }
     }
 
@@ -225,7 +226,7 @@ impl ResultRow {
 pub struct Rows {
     result: Box<dyn QueryResult>,
     /// Shared column names (Arc to avoid cloning per row)
-    columns: std::sync::Arc<Vec<String>>,
+    columns: CompactArc<Vec<String>>,
     closed: bool,
 }
 
@@ -235,7 +236,7 @@ impl Rows {
         // Use columns_arc() if available (zero-copy), otherwise clone
         let columns = result
             .columns_arc()
-            .unwrap_or_else(|| std::sync::Arc::new(result.columns().to_vec()));
+            .unwrap_or_else(|| CompactArc::new(result.columns().to_vec()));
         Self {
             result,
             columns,
@@ -295,10 +296,7 @@ impl Iterator for Rows {
             // Use take_row() to avoid cloning - moves the row out of the result
             let row = self.result.take_row();
             // Arc clone is O(1) - just increments reference count
-            Some(Ok(ResultRow::new(
-                row,
-                std::sync::Arc::clone(&self.columns),
-            )))
+            Some(Ok(ResultRow::new(row, CompactArc::clone(&self.columns))))
         } else {
             None
         }

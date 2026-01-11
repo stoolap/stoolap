@@ -48,6 +48,7 @@ use rustc_hash::FxHashMap;
 
 use chrono::{DateTime, Utc};
 
+use crate::common::CompactArc;
 use crate::core::{Operator, Row, Schema, Value};
 
 use super::between::BetweenExpr;
@@ -198,29 +199,74 @@ impl CompiledPattern {
     /// Check if a string matches this pattern
     #[inline(always)]
     pub fn matches(&self, s: &str, case_insensitive: bool) -> bool {
-        // Avoid allocation for case-sensitive matching by using Cow
-        use std::borrow::Cow;
-        let s: Cow<'_, str> = if case_insensitive {
-            Cow::Owned(s.to_lowercase())
-        } else {
-            Cow::Borrowed(s)
-        };
-
+        // OPTIMIZATION: Avoid per-row allocation where possible
+        // - Regex patterns already use (?i) flag, no lowercasing needed
+        // - Simple patterns use allocation-free ASCII case-insensitive comparison
+        // - Fall back to to_lowercase() only for non-ASCII case-insensitive patterns
         match self {
-            CompiledPattern::Exact(pattern) => s.as_ref() == pattern.as_ref(),
-            CompiledPattern::Prefix(prefix) => s.starts_with(prefix.as_ref()),
-            CompiledPattern::Suffix(suffix) => s.ends_with(suffix.as_ref()),
-            CompiledPattern::Contains(substr) => s.contains(substr.as_ref()),
+            CompiledPattern::Exact(pattern) => {
+                if case_insensitive {
+                    s.eq_ignore_ascii_case(pattern.as_ref())
+                } else {
+                    s == pattern.as_ref()
+                }
+            }
+            CompiledPattern::Prefix(prefix) => {
+                let prefix_ref = prefix.as_ref();
+                if case_insensitive {
+                    s.len() >= prefix_ref.len()
+                        && s[..prefix_ref.len()].eq_ignore_ascii_case(prefix_ref)
+                } else {
+                    s.starts_with(prefix_ref)
+                }
+            }
+            CompiledPattern::Suffix(suffix) => {
+                let suffix_ref = suffix.as_ref();
+                if case_insensitive {
+                    s.len() >= suffix_ref.len()
+                        && s[s.len() - suffix_ref.len()..].eq_ignore_ascii_case(suffix_ref)
+                } else {
+                    s.ends_with(suffix_ref)
+                }
+            }
+            CompiledPattern::Contains(substr) => {
+                let substr_ref = substr.as_ref();
+                if case_insensitive {
+                    // For case-insensitive contains, we need to scan through the string
+                    // Use allocation-free approach by checking each position
+                    if substr_ref.is_empty() {
+                        return true;
+                    }
+                    let substr_len = substr_ref.len();
+                    if s.len() < substr_len {
+                        return false;
+                    }
+                    // Check each starting position
+                    for i in 0..=(s.len() - substr_len) {
+                        if s[i..i + substr_len].eq_ignore_ascii_case(substr_ref) {
+                            return true;
+                        }
+                    }
+                    false
+                } else {
+                    s.contains(substr_ref)
+                }
+            }
             CompiledPattern::PrefixWithPattern {
                 prefix,
                 prefix_len,
                 rest_regex,
             } => {
-                // Fast path: check prefix first
-                if !s.starts_with(prefix.as_ref()) {
+                // Fast path: check prefix first (case-insensitive via ASCII)
+                let prefix_ref = prefix.as_ref();
+                if case_insensitive {
+                    if s.len() < *prefix_len || !s[..*prefix_len].eq_ignore_ascii_case(prefix_ref) {
+                        return false;
+                    }
+                } else if !s.starts_with(prefix_ref) {
                     return false;
                 }
-                // Slow path: check the rest with regex
+                // Slow path: check the rest with regex (regex already has (?i) flag)
                 if s.len() < *prefix_len {
                     return false;
                 }
@@ -230,6 +276,7 @@ impl CompiledPattern {
                 template,
                 has_trailing_percent,
             } => {
+                // SimpleUnderscorePrefix is only used for case-sensitive patterns (see compile())
                 // Use character iteration for proper UTF-8 handling
                 let mut chars = s.chars();
 
@@ -261,7 +308,9 @@ impl CompiledPattern {
                     chars.next().is_none()
                 }
             }
-            CompiledPattern::Regex(re) => re.is_match(&s),
+            // Regex patterns already use (?i) flag for case-insensitivity
+            // No need to lowercase the input - just match directly
+            CompiledPattern::Regex(re) => re.is_match(s),
         }
     }
 }
@@ -1252,7 +1301,7 @@ impl CompiledFilter {
     /// Evaluate the filter against an Arc value slice (avoids Row allocation)
     ///
     /// This is the zero-copy hot path for storage layer filtering.
-    /// By operating directly on &[Arc<Value>], we avoid creating Row objects
+    /// By operating directly on &[CompactArc<Value>], we avoid creating Row objects
     /// for rows that don't match the filter.
     ///
     /// # Schema Evolution Safety
@@ -1264,7 +1313,7 @@ impl CompiledFilter {
     /// - IsNotNull → false
     /// - All other comparisons → false (can't match a missing value)
     #[inline]
-    pub fn matches_arc_slice(&self, values: &[Arc<Value>]) -> bool {
+    pub fn matches_arc_slice(&self, values: &[CompactArc<Value>]) -> bool {
         // Helper macro: get value or return false for missing columns
         macro_rules! get_val {
             ($col_idx:expr) => {
@@ -1780,7 +1829,7 @@ impl CompiledFilter {
     /// Check if the filter result would be UNKNOWN (NULL) due to NULL column values
     /// This is the Arc slice-based version for zero-copy filtering.
     #[inline(always)]
-    pub fn is_unknown_due_to_null_arc_slice(&self, values: &[Arc<Value>]) -> bool {
+    pub fn is_unknown_due_to_null_arc_slice(&self, values: &[CompactArc<Value>]) -> bool {
         match self {
             // Comparison with NULL column produces UNKNOWN
             CompiledFilter::IntegerEq { col_idx, .. }
