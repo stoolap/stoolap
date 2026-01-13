@@ -4287,6 +4287,7 @@ impl VersionStore {
     ///
     /// This removes soft-deleted rows that are no longer visible to any active
     /// transaction and are older than the specified retention period.
+    /// Also clears the arena slots and row_arena_index entries to release memory.
     pub fn cleanup_deleted_rows(&self, retention_period: std::time::Duration) -> i32 {
         if self.closed.load(Ordering::Acquire) {
             return 0;
@@ -4312,14 +4313,26 @@ impl VersionStore {
             }
         }
 
-        // Second pass: remove the identified rows
-        for row_id in &rows_to_delete {
-            // Remove from indexes first
-            {
-                let versions = self.versions.read();
+        if rows_to_delete.is_empty() {
+            return 0;
+        }
+
+        // Collect arena indices before removing from row_arena_index
+        let arena_indices: Vec<usize> = {
+            let row_index = self.row_arena_index.read();
+            rows_to_delete
+                .iter()
+                .filter_map(|row_id| row_index.get(row_id).copied())
+                .collect()
+        };
+
+        // Second pass: remove from indexes (single lock acquisition for all rows)
+        {
+            let versions = self.versions.read();
+            let indexes = self.indexes.read();
+            for row_id in &rows_to_delete {
                 if let Some(entry) = versions.get(row_id) {
                     let version = &entry.version;
-                    let indexes = self.indexes.read();
                     for index in indexes.values() {
                         let column_ids = index.column_ids();
                         if !column_ids.is_empty() {
@@ -4346,10 +4359,26 @@ impl VersionStore {
                     }
                 }
             }
-
-            // Now remove from version store
-            self.versions.write().remove(row_id);
         }
+
+        // Third pass: remove from version store (single write lock for all rows)
+        {
+            let mut versions = self.versions.write();
+            for row_id in &rows_to_delete {
+                versions.remove(row_id);
+            }
+        }
+
+        // Remove from row_arena_index
+        {
+            let mut row_index = self.row_arena_index.write();
+            for row_id in &rows_to_delete {
+                row_index.remove(row_id);
+            }
+        }
+
+        // Clear arena slots to release memory (batch operation for efficiency)
+        self.arena.clear_batch(&arena_indices);
 
         rows_to_delete.len() as i32
     }
@@ -4891,6 +4920,11 @@ impl TransactionVersionStore {
 
     /// Put adds or updates a row in the transaction's local store
     pub fn put(&mut self, row_id: i64, data: Row, is_delete: bool) -> Result<(), Error> {
+        // Convert to Shared (Arc) storage immediately for efficient Arc sharing:
+        // - get_arc() will return cheap Arc clones (no value cloning)
+        // - into_arc() at commit time returns the existing Arc (no clone)
+        let data = Row::from_arc_slice(data.into_arc());
+
         // Create the row version
         let mut rv = RowVersion::new(self.txn_id, row_id, data);
         if is_delete {
@@ -4969,6 +5003,9 @@ impl TransactionVersionStore {
         original_version: RowVersion,
         is_delete: bool,
     ) -> Result<(), Error> {
+        // Convert to Shared (Arc) storage immediately for efficient Arc sharing
+        let data = Row::from_arc_slice(data.into_arc());
+
         // Create the new row version
         let mut rv = RowVersion::new(self.txn_id, row_id, data);
         if is_delete {
@@ -5033,6 +5070,9 @@ impl TransactionVersionStore {
         let now = get_fast_timestamp();
 
         for (row_id, data, original_version) in rows {
+            // Convert to Shared (Arc) storage immediately for efficient Arc sharing
+            let data = Row::from_arc_slice(data.into_arc());
+
             // Create the new row version
             let mut rv = RowVersion::new(self.txn_id, row_id, data);
             rv.create_time = now;
@@ -6731,5 +6771,154 @@ mod tests {
         };
         let result = store.materialize_row(&invalid_idx);
         assert!(result.is_none());
+    }
+
+    // =========================================================================
+    // Cleanup Tests
+    // =========================================================================
+
+    #[test]
+    fn test_cleanup_deleted_rows_basic() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add 10 rows from transaction 1
+        for i in 1..=10 {
+            let row = Row::from(vec![Value::from(i)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        // Delete all rows in transaction 2
+        for i in 1..=10 {
+            let row = Row::from(vec![Value::from(i)]);
+            let mut version = RowVersion::new(1, i, row);
+            version.deleted_at_txn_id = 2;
+            store.add_version(i, version);
+        }
+
+        // Cleanup with 0 retention (immediate)
+        let cleaned = store.cleanup_deleted_rows(std::time::Duration::from_secs(0));
+
+        // All 10 rows should be cleaned
+        assert_eq!(cleaned, 10, "Expected 10 rows to be cleaned");
+
+        // Verify versions map is empty
+        assert_eq!(
+            store.versions.read().len(),
+            0,
+            "Versions map should be empty"
+        );
+
+        // Verify row_arena_index is empty
+        assert_eq!(
+            store.row_arena_index.read().len(),
+            0,
+            "Row arena index should be empty"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_respects_retention_period() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add and delete a row
+        let row = Row::from(vec![Value::from(1)]);
+        let version = RowVersion::new(1, 1, row.clone());
+        store.add_version(1, version);
+
+        let mut deleted_version = RowVersion::new(1, 1, row);
+        deleted_version.deleted_at_txn_id = 2;
+        store.add_version(1, deleted_version);
+
+        // Cleanup with very long retention - should not clean
+        let cleaned = store.cleanup_deleted_rows(std::time::Duration::from_secs(3600));
+        assert_eq!(cleaned, 0, "Should not clean rows within retention period");
+
+        // Verify row still exists
+        assert_eq!(
+            store.versions.read().len(),
+            1,
+            "Row should still exist in versions"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_only_deleted_rows() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add 5 rows, delete only 3
+        for i in 1..=5 {
+            let row = Row::from(vec![Value::from(i)]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        // Delete rows 1, 3, 5
+        for i in [1, 3, 5] {
+            let row = Row::from(vec![Value::from(i)]);
+            let mut version = RowVersion::new(1, i, row);
+            version.deleted_at_txn_id = 2;
+            store.add_version(i, version);
+        }
+
+        // Cleanup
+        let cleaned = store.cleanup_deleted_rows(std::time::Duration::from_secs(0));
+
+        assert_eq!(cleaned, 3, "Should clean only 3 deleted rows");
+        assert_eq!(
+            store.versions.read().len(),
+            2,
+            "2 non-deleted rows should remain"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_arena_memory_released() {
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store =
+            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
+
+        // Add rows with data
+        for i in 1..=5 {
+            let row = Row::from(vec![Value::from(i), Value::text(format!("data_{}", i))]);
+            let version = RowVersion::new(1, i, row);
+            store.add_version(i, version);
+        }
+
+        // Record initial arena length
+        let initial_arena_len = store.arena.len();
+        assert_eq!(initial_arena_len, 5);
+
+        // Delete all rows
+        for i in 1..=5 {
+            let row = Row::from(vec![Value::from(i), Value::text(format!("data_{}", i))]);
+            let mut version = RowVersion::new(1, i, row);
+            version.deleted_at_txn_id = 2;
+            store.add_version(i, version);
+        }
+
+        // Cleanup
+        let cleaned = store.cleanup_deleted_rows(std::time::Duration::from_secs(0));
+        assert_eq!(cleaned, 5);
+
+        // Arena slots should be cleared (data replaced with empty)
+        // The slots remain but data is released
+        let guard = store.arena.read_guard();
+        for i in 0..5 {
+            // Cleared slots have row_id = 0
+            assert_eq!(guard.meta()[i].row_id, 0, "Slot {} should be cleared", i);
+            // Data should be empty
+            assert!(
+                guard.data()[i].is_empty(),
+                "Slot {} data should be empty",
+                i
+            );
+        }
     }
 }

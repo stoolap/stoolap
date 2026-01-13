@@ -29,7 +29,7 @@
 
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::common::CompactArc;
 use crate::core::{Row, Value};
@@ -56,6 +56,9 @@ impl ArenaRowMeta {
 }
 
 /// Inner arena data protected by single lock
+///
+/// NOTE: This struct is on the hot read path. Keep it minimal.
+/// The free_list is stored separately in RowArena to avoid bloating this struct.
 pub struct ArenaInner {
     /// Arc storage per row (for O(1) clone on read)
     /// Stores Arc<[CompactArc<Value>]> matching the new Row storage format
@@ -70,9 +73,13 @@ pub struct ArenaInner {
 /// Single clone on insert, zero clone on read.
 ///
 /// Uses single RwLock for atomicity and deadlock prevention.
+/// Free list is stored separately to avoid bloating the hot read path.
 pub struct RowArena {
     /// Combined data and metadata under single lock
     inner: RwLock<ArenaInner>,
+    /// Free list of cleared slot indices for reuse (separate lock, write-path only)
+    /// This prevents unbounded arena growth during insert/delete cycles
+    free_list: Mutex<Vec<usize>>,
 }
 
 impl RowArena {
@@ -83,6 +90,7 @@ impl RowArena {
                 data: Vec::with_capacity(10_000),
                 meta: Vec::with_capacity(10_000),
             }),
+            free_list: Mutex::new(Vec::new()),
         }
     }
 
@@ -93,20 +101,25 @@ impl RowArena {
                 data: Vec::with_capacity(row_capacity),
                 meta: Vec::with_capacity(row_capacity),
             }),
+            free_list: Mutex::new(Vec::new()),
         }
     }
 
     /// Insert a row into the arena
     ///
-    /// Returns the index of the row metadata
+    /// Returns the index of the row metadata.
+    /// Reuses cleared slots from the free list to prevent unbounded growth.
     #[inline]
     pub fn insert(&self, row_id: i64, txn_id: i64, create_time: i64, values: &[Value]) -> usize {
+        // Check free list first (separate lock, doesn't affect read path)
+        let reuse_idx = self.free_list.lock().pop();
+
         let mut inner = self.inner.write();
 
         // Convert values to CompactArc<Value> and store
         let arc_values: Vec<CompactArc<Value>> =
             values.iter().map(|v| CompactArc::new(v.clone())).collect();
-        inner.data.push(Arc::from(arc_values));
+        let arc_data = Arc::from(arc_values);
 
         let meta = ArenaRowMeta {
             row_id,
@@ -115,15 +128,27 @@ impl RowArena {
             create_time,
         };
 
-        let idx = inner.meta.len();
-        inner.meta.push(meta);
-        idx
+        // Reuse a slot from the free list if available
+        if let Some(idx) = reuse_idx {
+            inner.data[idx] = arc_data;
+            inner.meta[idx] = meta;
+            idx
+        } else {
+            inner.data.push(arc_data);
+            let idx = inner.meta.len();
+            inner.meta.push(meta);
+            idx
+        }
     }
 
     /// Insert a row from a Row struct
     /// Handles all storage types: Inline values are wrapped in Arc, Owned/Shared are cloned.
+    /// Reuses cleared slots from the free list to prevent unbounded growth.
     #[inline]
     pub fn insert_row(&self, row_id: i64, txn_id: i64, create_time: i64, row: &Row) -> usize {
+        // Check free list first (separate lock, doesn't affect read path)
+        let reuse_idx = self.free_list.lock().pop();
+
         let mut inner = self.inner.write();
 
         // Store Arc for O(1) clone on read - handle all storage types
@@ -136,7 +161,6 @@ impl RowArena {
                 Arc::from(arc_vec.into_boxed_slice())
             }
         };
-        inner.data.push(arc_data);
 
         let meta = ArenaRowMeta {
             row_id,
@@ -145,14 +169,23 @@ impl RowArena {
             create_time,
         };
 
-        let idx = inner.meta.len();
-        inner.meta.push(meta);
-        idx
+        // Reuse a slot from the free list if available
+        if let Some(idx) = reuse_idx {
+            inner.data[idx] = arc_data;
+            inner.meta[idx] = meta;
+            idx
+        } else {
+            inner.data.push(arc_data);
+            let idx = inner.meta.len();
+            inner.meta.push(meta);
+            idx
+        }
     }
 
     /// Insert a row and return both the index AND the Arc
     /// This allows the caller to reuse the Arc for O(1) clones
     /// Handles all storage types: Inline values are wrapped in Arc, Owned/Shared are cloned.
+    /// Reuses cleared slots from the free list to prevent unbounded growth.
     #[inline]
     pub fn insert_row_get_arc(
         &self,
@@ -161,6 +194,9 @@ impl RowArena {
         create_time: i64,
         row: &Row,
     ) -> (usize, Arc<[CompactArc<Value>]>) {
+        // Check free list first (separate lock, doesn't affect read path)
+        let reuse_idx = self.free_list.lock().pop();
+
         let mut inner = self.inner.write();
 
         // Create Arc once, clone for storage and return - handle all storage types
@@ -173,7 +209,6 @@ impl RowArena {
                 Arc::from(arc_vec.into_boxed_slice())
             }
         };
-        inner.data.push(Arc::clone(&arc_data));
 
         let meta = ArenaRowMeta {
             row_id,
@@ -182,13 +217,23 @@ impl RowArena {
             create_time,
         };
 
-        let idx = inner.meta.len();
-        inner.meta.push(meta);
+        // Reuse a slot from the free list if available
+        let idx = if let Some(idx) = reuse_idx {
+            inner.data[idx] = Arc::clone(&arc_data);
+            inner.meta[idx] = meta;
+            idx
+        } else {
+            inner.data.push(Arc::clone(&arc_data));
+            let idx = inner.meta.len();
+            inner.meta.push(meta);
+            idx
+        };
         (idx, arc_data)
     }
 
     /// Insert an already-created Arc directly - avoids copy when caller has Arc
     /// Returns the index where it was stored
+    /// Reuses cleared slots from the free list to prevent unbounded growth.
     #[inline]
     pub fn insert_arc(
         &self,
@@ -197,9 +242,10 @@ impl RowArena {
         create_time: i64,
         arc_data: Arc<[CompactArc<Value>]>,
     ) -> usize {
-        let mut inner = self.inner.write();
+        // Check free list first (separate lock, doesn't affect read path)
+        let reuse_idx = self.free_list.lock().pop();
 
-        inner.data.push(arc_data);
+        let mut inner = self.inner.write();
 
         let meta = ArenaRowMeta {
             row_id,
@@ -208,9 +254,17 @@ impl RowArena {
             create_time,
         };
 
-        let idx = inner.meta.len();
-        inner.meta.push(meta);
-        idx
+        // Reuse a slot from the free list if available
+        if let Some(idx) = reuse_idx {
+            inner.data[idx] = arc_data;
+            inner.meta[idx] = meta;
+            idx
+        } else {
+            inner.data.push(arc_data);
+            let idx = inner.meta.len();
+            inner.meta.push(meta);
+            idx
+        }
     }
 
     /// Mark a row as deleted
@@ -220,6 +274,76 @@ impl RowArena {
         if row_idx < inner.meta.len() {
             inner.meta[row_idx].deleted_at_txn_id = deleted_at_txn_id;
         }
+    }
+
+    /// Clear a slot in the arena to release memory
+    ///
+    /// This replaces the data with an empty Arc and marks the metadata as cleared
+    /// (row_id = 0). The slot index is added to the free list for reuse.
+    /// This is used during cleanup of deleted rows.
+    #[inline]
+    pub fn clear_at(&self, arena_idx: usize) -> bool {
+        let cleared = {
+            let mut inner = self.inner.write();
+            if arena_idx < inner.meta.len() {
+                // Replace data with empty Arc to release memory
+                inner.data[arena_idx] =
+                    Arc::from(Vec::<CompactArc<Value>>::new().into_boxed_slice());
+                // Mark metadata as cleared (row_id = 0 indicates cleared slot)
+                inner.meta[arena_idx] = ArenaRowMeta {
+                    row_id: 0,
+                    txn_id: 0,
+                    deleted_at_txn_id: 0,
+                    create_time: 0,
+                };
+                true
+            } else {
+                false
+            }
+        };
+
+        if cleared {
+            // Add to free list for reuse (separate lock)
+            self.free_list.lock().push(arena_idx);
+        }
+        cleared
+    }
+
+    /// Clear multiple slots in the arena efficiently (single lock acquisition)
+    ///
+    /// Returns the number of slots actually cleared.
+    /// Cleared indices are added to the free list for reuse.
+    #[inline]
+    pub fn clear_batch(&self, arena_indices: &[usize]) -> usize {
+        let mut cleared_indices = Vec::with_capacity(arena_indices.len());
+
+        {
+            let mut inner = self.inner.write();
+            let empty_data = Arc::from(Vec::<CompactArc<Value>>::new().into_boxed_slice());
+            let cleared_meta = ArenaRowMeta {
+                row_id: 0,
+                txn_id: 0,
+                deleted_at_txn_id: 0,
+                create_time: 0,
+            };
+
+            for &arena_idx in arena_indices {
+                if arena_idx < inner.meta.len() {
+                    inner.data[arena_idx] = Arc::clone(&empty_data);
+                    inner.meta[arena_idx] = cleared_meta;
+                    cleared_indices.push(arena_idx);
+                }
+            }
+        }
+
+        // Add to free list for reuse (separate lock, after releasing inner lock)
+        let count = cleared_indices.len();
+        if count > 0 {
+            let mut free_list = self.free_list.lock();
+            free_list.reserve(count);
+            free_list.extend(cleared_indices);
+        }
+        count
     }
 
     /// Update data at an existing arena index (for slot reuse during UPDATEs)
@@ -462,5 +586,86 @@ mod tests {
         assert_eq!(guard.len(), 2);
         assert_eq!(guard.meta()[0].row_id, 1);
         assert_eq!(guard.meta()[1].row_id, 2);
+    }
+
+    #[test]
+    fn test_arena_free_list_reuse() {
+        let arena = RowArena::new();
+
+        // Insert 5 rows
+        for i in 1..=5 {
+            arena.insert(
+                i,
+                100,
+                1000 + i,
+                &[Value::Integer(i), Value::text(format!("row{}", i))],
+            );
+        }
+        assert_eq!(arena.len(), 5);
+
+        // Clear slots 1 and 3 (0-indexed)
+        arena.clear_at(1);
+        arena.clear_at(3);
+
+        // Arena len is still 5 (slots are cleared but not removed)
+        assert_eq!(arena.len(), 5);
+
+        // Verify cleared slots have row_id = 0
+        {
+            let guard = arena.read_guard();
+            assert_eq!(guard.meta()[1].row_id, 0);
+            assert_eq!(guard.meta()[3].row_id, 0);
+        }
+
+        // Insert new rows - should reuse cleared slots (3 then 1, LIFO order)
+        let idx1 = arena.insert(10, 200, 2000, &[Value::Integer(10), Value::text("new1")]);
+        let idx2 = arena.insert(11, 200, 2001, &[Value::Integer(11), Value::text("new2")]);
+
+        // Slots should be reused, not appended
+        assert_eq!(arena.len(), 5); // Still 5, slots were reused
+
+        // Verify indices are the cleared slots (LIFO: 3 was pushed last, so popped first)
+        assert_eq!(idx1, 3);
+        assert_eq!(idx2, 1);
+
+        // Verify the new data is in the reused slots
+        {
+            let guard = arena.read_guard();
+            assert_eq!(guard.meta()[3].row_id, 10);
+            assert_eq!(guard.meta()[1].row_id, 11);
+        }
+
+        // Insert one more - should append since free list is empty
+        let idx3 = arena.insert(12, 200, 2002, &[Value::Integer(12), Value::text("new3")]);
+        assert_eq!(idx3, 5); // New slot at end
+        assert_eq!(arena.len(), 6);
+    }
+
+    #[test]
+    fn test_arena_clear_batch_free_list() {
+        let arena = RowArena::new();
+
+        // Insert 10 rows
+        for i in 0..10 {
+            arena.insert(i, 100, 1000 + i, &[Value::Integer(i)]);
+        }
+        assert_eq!(arena.len(), 10);
+
+        // Clear slots 2, 4, 6, 8 in batch
+        let cleared = arena.clear_batch(&[2, 4, 6, 8]);
+        assert_eq!(cleared, 4);
+        assert_eq!(arena.len(), 10); // Still 10, slots cleared but not removed
+
+        // Insert 4 new rows - should reuse all 4 cleared slots
+        let mut new_indices = Vec::new();
+        for i in 100..104 {
+            new_indices.push(arena.insert(i, 200, 2000 + i, &[Value::Integer(i)]));
+        }
+
+        // Should still be 10 (all slots reused)
+        assert_eq!(arena.len(), 10);
+
+        // Verify all new indices are from cleared slots (8, 6, 4, 2 in LIFO order)
+        assert!(new_indices.iter().all(|&idx| [2, 4, 6, 8].contains(&idx)));
     }
 }

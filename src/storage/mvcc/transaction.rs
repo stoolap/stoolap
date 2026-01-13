@@ -102,6 +102,10 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// Commit all tables for a transaction at once
     fn commit_all_tables(&self, txn_id: i64) -> Result<()>;
 
+    /// Rollback all tables for a transaction at once
+    /// This cleans up the transaction's entries in txn_version_stores
+    fn rollback_all_tables(&self, txn_id: i64);
+
     /// Defer table cleanup to background thread (avoids synchronous deallocation)
     /// Default implementation drops synchronously
     fn defer_table_cleanup(&self, _tables: Vec<Box<dyn Table>>) {
@@ -397,11 +401,13 @@ impl Transaction for MvccTransaction {
             table.rollback();
         }
 
-        // Notify engine of rollback
+        // Notify engine of rollback (per-table callbacks)
         if let Some(ops) = &self.engine_operations {
             for (_, table) in self.tables.iter() {
                 ops.rollback_table(self.id, table.as_ref());
             }
+            // Clean up txn_version_stores entry to prevent memory leak
+            ops.rollback_all_tables(self.id);
         }
 
         // Record in WAL if not read-only

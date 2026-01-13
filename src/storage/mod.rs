@@ -38,7 +38,7 @@ pub use expression::{
 pub use index::{BTree, Int64BTree};
 
 // Re-export config types
-pub use config::{Config, PersistenceConfig, SyncMode};
+pub use config::{CleanupConfig, Config, PersistenceConfig, SyncMode};
 
 // Re-export trait types
 pub use traits::{

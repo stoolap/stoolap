@@ -931,17 +931,7 @@ impl Index for MultiColumnIndex {
         }
     }
 
-    fn get_row_ids_in_range(
-        &self,
-        min_value: &[Value],
-        max_value: &[Value],
-        include_min: bool,
-        include_max: bool,
-    ) -> Vec<i64> {
-        self.find_range(min_value, max_value, include_min, include_max)
-            .map(|entries| entries.into_iter().map(|e| e.row_id).collect())
-            .unwrap_or_default()
-    }
+    // Uses default trait implementation: get_row_ids_in_range delegates to get_row_ids_in_range_into
 
     fn get_filtered_row_ids(&self, _expr: &dyn Expression) -> Vec<i64> {
         Vec::new()

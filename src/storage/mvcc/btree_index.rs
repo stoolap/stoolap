@@ -712,20 +712,21 @@ impl Index for BTreeIndex {
         }
     }
 
-    fn get_row_ids_in_range(
+    fn get_row_ids_in_range_into(
         &self,
         min_value: &[Value],
         max_value: &[Value],
         include_min: bool,
         include_max: bool,
-    ) -> Vec<i64> {
+        buffer: &mut Vec<i64>,
+    ) {
         if min_value.is_empty() || max_value.is_empty() {
-            return Vec::new();
+            return;
         }
 
         // OPTIMIZATION: Collect row_ids directly without intermediate IndexEntry allocation
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Vec::new();
+            return;
         }
 
         let min_val = &min_value[0];
@@ -749,15 +750,9 @@ impl Index for BTreeIndex {
             Bound::Excluded(max_arc)
         };
 
-        // Estimate capacity based on range - collect directly into Vec<i64>
-        let capacity = sorted_values.len() / 4;
-        let mut row_ids = Vec::with_capacity(capacity);
-
         for (_, rows) in sorted_values.range((min_bound, max_bound)) {
-            row_ids.extend(rows.iter().copied());
+            buffer.extend(rows.iter().copied());
         }
-
-        row_ids
     }
 
     fn get_filtered_row_ids(&self, expr: &dyn Expression) -> Vec<i64> {

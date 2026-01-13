@@ -200,6 +200,67 @@ impl PersistenceConfig {
     }
 }
 
+/// Configuration for background cleanup operations
+#[derive(Debug, Clone)]
+pub struct CleanupConfig {
+    /// Whether automatic cleanup is enabled
+    /// Default: true
+    pub enabled: bool,
+
+    /// Interval between cleanup runs in seconds
+    /// Default: 60 (1 minute)
+    pub interval_secs: u64,
+
+    /// Retention period for deleted rows in seconds
+    /// Rows deleted longer than this will be permanently removed
+    /// Default: 300 (5 minutes)
+    pub deleted_row_retention_secs: u64,
+
+    /// Retention period for old transaction metadata in seconds
+    /// Only applies in Snapshot Isolation mode (READ COMMITTED requires keeping all)
+    /// Default: 3600 (1 hour)
+    pub transaction_retention_secs: u64,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 60,
+            deleted_row_retention_secs: 300,
+            transaction_retention_secs: 3600,
+        }
+    }
+}
+
+impl CleanupConfig {
+    /// Creates a cleanup config with cleanup disabled
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Default::default()
+        }
+    }
+
+    /// Builder method to set cleanup interval
+    pub fn with_interval_secs(mut self, secs: u64) -> Self {
+        self.interval_secs = secs;
+        self
+    }
+
+    /// Builder method to set deleted row retention
+    pub fn with_deleted_row_retention_secs(mut self, secs: u64) -> Self {
+        self.deleted_row_retention_secs = secs;
+        self
+    }
+
+    /// Builder method to set transaction retention
+    pub fn with_transaction_retention_secs(mut self, secs: u64) -> Self {
+        self.transaction_retention_secs = secs;
+        self
+    }
+}
+
 /// Configuration for the storage engine
 #[derive(Debug, Clone, Default)]
 pub struct Config {
@@ -210,6 +271,9 @@ pub struct Config {
     /// Configuration options for disk persistence
     /// Only used if path is Some
     pub persistence: PersistenceConfig,
+
+    /// Configuration for background cleanup operations
+    pub cleanup: CleanupConfig,
 }
 
 impl Config {
@@ -221,6 +285,7 @@ impl Config {
                 enabled: false,
                 ..Default::default()
             },
+            cleanup: CleanupConfig::default(),
         }
     }
 
@@ -229,6 +294,7 @@ impl Config {
         Self {
             path: Some(path.into()),
             persistence: PersistenceConfig::default(),
+            cleanup: CleanupConfig::default(),
         }
     }
 
@@ -240,6 +306,12 @@ impl Config {
     /// Builder method to set persistence config
     pub fn with_persistence(mut self, config: PersistenceConfig) -> Self {
         self.persistence = config;
+        self
+    }
+
+    /// Builder method to set cleanup config
+    pub fn with_cleanup(mut self, config: CleanupConfig) -> Self {
+        self.cleanup = config;
         self
     }
 }

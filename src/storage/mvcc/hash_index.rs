@@ -718,15 +718,14 @@ impl Index for HashIndex {
     }
 
     /// Optimized IN list lookup - acquires lock once for all values
-    fn get_row_ids_in(&self, value_list: &[Value]) -> Vec<i64> {
+    fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Vec::new();
+            return;
         }
 
         // Single lock acquisition for all lookups
         let hash_to_values = self.hash_to_values.read().unwrap();
 
-        let mut results = Vec::new();
         for value in value_list {
             // Hash without cloning - pass reference to slice
             let hash = hash_values(std::slice::from_ref(value));
@@ -734,25 +733,23 @@ impl Index for HashIndex {
                 for (stored_values, row_ids) in entries {
                     // Compare CompactArc<Value> with input value
                     if stored_values.len() == 1 && stored_values[0].as_ref() == value {
-                        results.extend(row_ids.iter().copied());
+                        buffer.extend(row_ids.iter().copied());
                         break;
                     }
                 }
             }
         }
-
-        results
     }
 
-    fn get_row_ids_in_range(
+    fn get_row_ids_in_range_into(
         &self,
         _min_value: &[Value],
         _max_value: &[Value],
         _include_min: bool,
         _include_max: bool,
-    ) -> Vec<i64> {
-        // Hash index does not support range queries
-        vec![]
+        _buffer: &mut Vec<i64>,
+    ) {
+        // Hash index does not support range queries - do nothing
     }
 
     fn get_filtered_row_ids(&self, expr: &dyn Expression) -> Vec<i64> {

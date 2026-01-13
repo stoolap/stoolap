@@ -2943,12 +2943,15 @@ impl Table for MVCCTable {
         // Collect rows by iterating through sorted values
         let mut rows = RowVec::with_capacity(limit.min(100));
         let mut skipped = 0;
+        let mut row_ids = Vec::new();
 
         for value in sorted_values {
-            // Get all row IDs for this value
-            let row_ids = index.get_row_ids_equal(&[value]);
+            // Get all row IDs for this value - reuse buffer to avoid allocation per iteration
+            row_ids.clear();
+            index.get_row_ids_equal_into(&[value], &mut row_ids);
 
-            for row_id in row_ids {
+            for row_id in &row_ids {
+                let row_id = *row_id;
                 // Check visibility and get row
                 if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
                     if version.is_deleted() {
@@ -3007,14 +3010,16 @@ impl Table for MVCCTable {
 
         // Collect rows grouped by partition value
         let mut result: Vec<(Value, RowVec)> = Vec::with_capacity(all_values.len());
+        let mut row_ids = Vec::new();
 
         for partition_value in all_values {
-            // Get all row IDs for this partition value
-            let row_ids = index.get_row_ids_equal(std::slice::from_ref(&partition_value));
+            // Get all row IDs for this partition value - reuse buffer to avoid allocation per iteration
+            row_ids.clear();
+            index.get_row_ids_equal_into(std::slice::from_ref(&partition_value), &mut row_ids);
 
             // Collect visible rows for this partition
             let mut partition_rows = RowVec::with_capacity(row_ids.len());
-            for row_id in row_ids {
+            for &row_id in &row_ids {
                 if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
                     if !version.is_deleted() {
                         partition_rows.push((row_id, version.data.clone()));

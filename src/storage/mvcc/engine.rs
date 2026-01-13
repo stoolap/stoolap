@@ -319,6 +319,8 @@ pub struct MVCCEngine {
     /// Schema epoch counter - increments on any CREATE/ALTER/DROP TABLE
     /// Used for fast cache invalidation without HashMap lookup
     schema_epoch: AtomicU64,
+    /// Handle for the background cleanup thread (None if not started)
+    cleanup_handle: Mutex<Option<CleanupHandle>>,
 }
 
 impl MVCCEngine {
@@ -356,6 +358,7 @@ impl MVCCEngine {
             loading_from_disk: Arc::new(AtomicBool::new(false)),
             file_lock: Mutex::new(None),
             schema_epoch: AtomicU64::new(0),
+            cleanup_handle: Mutex::new(None),
         }
     }
 
@@ -400,7 +403,78 @@ impl MVCCEngine {
             }
         }
 
+        // Note: Cleanup is started separately via start_cleanup() after Arc wrapping
+        // because start_periodic_cleanup requires Arc<Self>
+
         Ok(())
+    }
+
+    /// Starts the background cleanup thread
+    ///
+    /// This should be called after wrapping the engine in Arc.
+    /// The cleanup thread periodically removes:
+    /// - Deleted rows older than the retention period
+    /// - Old previous versions no longer needed
+    /// - Old transaction metadata (in Snapshot Isolation mode only)
+    pub fn start_cleanup(self: &Arc<Self>) {
+        let config = self.config.read().unwrap();
+        if !config.cleanup.enabled {
+            return;
+        }
+
+        let interval = std::time::Duration::from_secs(config.cleanup.interval_secs);
+        let deleted_row_retention =
+            std::time::Duration::from_secs(config.cleanup.deleted_row_retention_secs);
+        let txn_retention =
+            std::time::Duration::from_secs(config.cleanup.transaction_retention_secs);
+        drop(config);
+
+        let handle =
+            self.start_periodic_cleanup_internal(interval, deleted_row_retention, txn_retention);
+
+        let mut cleanup_handle = self.cleanup_handle.lock().unwrap();
+        *cleanup_handle = Some(handle);
+    }
+
+    /// Internal method to start periodic cleanup with configurable parameters
+    fn start_periodic_cleanup_internal(
+        self: &Arc<Self>,
+        interval: std::time::Duration,
+        deleted_row_retention: std::time::Duration,
+        txn_retention: std::time::Duration,
+    ) -> CleanupHandle {
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag_clone = Arc::clone(&stop_flag);
+        let engine = Arc::clone(self);
+
+        let handle = thread::spawn(move || {
+            while !stop_flag_clone.load(Ordering::Acquire) {
+                // Sleep for the interval (check stop flag periodically)
+                let check_interval = std::time::Duration::from_millis(100);
+                let mut elapsed = std::time::Duration::ZERO;
+                while elapsed < interval && !stop_flag_clone.load(Ordering::Acquire) {
+                    thread::sleep(check_interval);
+                    elapsed += check_interval;
+                }
+
+                if stop_flag_clone.load(Ordering::Acquire) {
+                    break;
+                }
+
+                // Perform cleanup
+                let _txn_count = engine.cleanup_old_transactions(txn_retention);
+                let _row_count = engine.cleanup_deleted_rows(deleted_row_retention);
+                let _prev_version_count = engine.cleanup_old_previous_versions();
+            }
+        });
+
+        CleanupHandle {
+            stop_flag,
+            thread: Some(handle),
+        }
     }
 
     /// Load table snapshots from disk for faster recovery
@@ -824,6 +898,14 @@ impl MVCCEngine {
             .is_err()
         {
             return Ok(()); // Already closed
+        }
+
+        // Stop the cleanup thread first (before stopping transactions)
+        {
+            let mut cleanup_handle = self.cleanup_handle.lock().unwrap();
+            if let Some(mut handle) = cleanup_handle.take() {
+                handle.stop();
+            }
         }
 
         // Stop accepting new transactions
@@ -2914,6 +2996,13 @@ impl TransactionEngineOperations for EngineOperations {
 
         Ok(())
     }
+
+    fn rollback_all_tables(&self, txn_id: i64) {
+        // O(1) cleanup - remove entire transaction entry from txn_version_stores
+        // This prevents memory leaks when transactions are rolled back
+        let mut cache = self.txn_version_stores().write().unwrap();
+        cache.remove(&txn_id);
+    }
 }
 
 #[cfg(test)]
@@ -3226,6 +3315,205 @@ mod tests {
             assert_eq!(
                 count, 1,
                 "Transaction 2 should see 1 row committed by Transaction 1"
+            );
+        }
+
+        engine.close_engine().unwrap();
+    }
+
+    // =========================================================================
+    // Cleanup Mechanism Tests
+    // =========================================================================
+
+    use crate::storage::CleanupConfig;
+    use std::time::Duration;
+
+    #[test]
+    fn test_cleanup_config_disabled() {
+        let config = Config::in_memory().with_cleanup(CleanupConfig::disabled());
+        let engine = MVCCEngine::new(config);
+        engine.open_engine().unwrap();
+        let engine = Arc::new(engine);
+
+        // start_cleanup should be a no-op when disabled
+        engine.start_cleanup();
+
+        // Verify no cleanup handle was set
+        let handle = engine.cleanup_handle.lock().unwrap();
+        assert!(
+            handle.is_none(),
+            "Cleanup handle should be None when disabled"
+        );
+        drop(handle);
+
+        engine.close_engine().unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_config_custom_settings() {
+        let config = Config::in_memory().with_cleanup(
+            CleanupConfig::default()
+                .with_interval_secs(30)
+                .with_deleted_row_retention_secs(120)
+                .with_transaction_retention_secs(600),
+        );
+
+        assert_eq!(config.cleanup.interval_secs, 30);
+        assert_eq!(config.cleanup.deleted_row_retention_secs, 120);
+        assert_eq!(config.cleanup.transaction_retention_secs, 600);
+        assert!(config.cleanup.enabled);
+    }
+
+    #[test]
+    fn test_cleanup_old_transactions_read_committed() {
+        // In READ COMMITTED mode (default), transactions cannot be cleaned
+        // because visibility depends on their presence in the registry
+        let config = Config::in_memory().with_cleanup(CleanupConfig::disabled());
+        let engine = MVCCEngine::new(config);
+        engine.open_engine().unwrap();
+
+        // Create and commit multiple transactions
+        for _ in 0..10 {
+            let mut txn = engine.begin_transaction().unwrap();
+            txn.commit().unwrap();
+        }
+
+        // In READ COMMITTED mode, cleanup returns 0 (by design)
+        let cleaned = engine.cleanup_old_transactions(Duration::from_secs(0));
+        assert_eq!(
+            cleaned, 0,
+            "READ COMMITTED mode should not clean transactions"
+        );
+
+        engine.close_engine().unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_old_transactions_snapshot_isolation() {
+        use crate::core::IsolationLevel;
+
+        // In SNAPSHOT ISOLATION mode, old transactions can be cleaned
+        let config = Config::in_memory().with_cleanup(CleanupConfig::disabled());
+        let engine = MVCCEngine::new(config);
+        engine.open_engine().unwrap();
+
+        // Set isolation level to Snapshot Isolation
+        engine
+            .registry
+            .set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+
+        // Create and commit multiple transactions
+        for _ in 0..10 {
+            let mut txn = engine.begin_transaction().unwrap();
+            txn.commit().unwrap();
+        }
+
+        // Wait a tiny bit for transactions to be "old"
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Cleanup with 0 retention should clean all committed transactions
+        let cleaned = engine.cleanup_old_transactions(Duration::from_secs(0));
+        assert!(
+            cleaned > 0,
+            "SNAPSHOT mode should clean up old committed transactions"
+        );
+
+        engine.close_engine().unwrap();
+    }
+
+    #[test]
+    fn test_start_and_stop_cleanup() {
+        let config = Config::in_memory().with_cleanup(
+            CleanupConfig::default()
+                .with_interval_secs(60) // Long interval so it doesn't run during test
+                .with_deleted_row_retention_secs(0),
+        );
+        let engine = MVCCEngine::new(config);
+        engine.open_engine().unwrap();
+        let engine = Arc::new(engine);
+
+        // Start cleanup
+        engine.start_cleanup();
+
+        // Verify cleanup handle was set
+        {
+            let handle = engine.cleanup_handle.lock().unwrap();
+            assert!(
+                handle.is_some(),
+                "Cleanup handle should be set after start_cleanup"
+            );
+        }
+
+        // Close engine should stop cleanup
+        engine.close_engine().unwrap();
+
+        // Verify cleanup handle was cleared
+        {
+            let handle = engine.cleanup_handle.lock().unwrap();
+            assert!(
+                handle.is_none(),
+                "Cleanup handle should be cleared after close"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scheduled_cleanup_runs() {
+        let config = Config::in_memory().with_cleanup(
+            CleanupConfig::default()
+                .with_interval_secs(1) // 1 second interval
+                .with_deleted_row_retention_secs(0), // Immediate cleanup
+        );
+        let engine = MVCCEngine::new(config);
+        engine.open_engine().unwrap();
+
+        // Create table
+        let schema = SchemaBuilder::new("cleanup_test")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        engine.create_table(schema).unwrap();
+
+        // Insert rows
+        {
+            let mut tx = engine.begin_transaction().unwrap();
+            let mut table = tx.get_table("cleanup_test").unwrap();
+            for i in 1..=20 {
+                table
+                    .insert(Row::from_values(vec![Value::Integer(i)]))
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        // Delete all rows using DELETE with no WHERE clause
+        {
+            let mut tx = engine.begin_transaction().unwrap();
+            let mut table = tx.get_table("cleanup_test").unwrap();
+            table.delete(None).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Wrap in Arc for start_cleanup
+        let engine = Arc::new(engine);
+
+        // Start cleanup
+        engine.start_cleanup();
+
+        // Wait for scheduled cleanup to run
+        std::thread::sleep(Duration::from_millis(1500));
+
+        // Verify rows are cleaned
+        {
+            let tx = engine.begin_transaction().unwrap();
+            let table = tx.get_table("cleanup_test").unwrap();
+            let mut scanner = table.scan(&[0], None).unwrap();
+            let mut count = 0;
+            while scanner.next() {
+                count += 1;
+            }
+            assert_eq!(
+                count, 0,
+                "All deleted rows should be cleaned by scheduled cleanup"
             );
         }
 

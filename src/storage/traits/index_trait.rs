@@ -179,7 +179,38 @@ pub trait Index: Send + Sync {
         max_value: &[Value],
         include_min: bool,
         include_max: bool,
-    ) -> Vec<i64>;
+    ) -> Vec<i64> {
+        let mut row_ids = Vec::new();
+        self.get_row_ids_in_range_into(
+            min_value,
+            max_value,
+            include_min,
+            include_max,
+            &mut row_ids,
+        );
+        row_ids
+    }
+
+    /// Appends row IDs with values in the given range to the provided buffer
+    ///
+    /// This enables callers to reuse the vector allocation across multiple calls.
+    fn get_row_ids_in_range_into(
+        &self,
+        min_value: &[Value],
+        max_value: &[Value],
+        include_min: bool,
+        include_max: bool,
+        buffer: &mut Vec<i64>,
+    ) {
+        // Default implementation: delegate to find_range (allocates)
+        // Override in concrete indexes for zero-allocation
+        if let Ok(entries) = self.find_range(min_value, max_value, include_min, include_max) {
+            buffer.reserve(entries.len());
+            for entry in entries {
+                buffer.push(entry.row_id);
+            }
+        }
+    }
 
     /// Returns row IDs for values in the given list (IN clause optimization)
     ///
@@ -193,12 +224,19 @@ pub trait Index: Send + Sync {
     /// # Returns
     /// Vector of row IDs matching any value in the list
     fn get_row_ids_in(&self, value_list: &[Value]) -> Vec<i64> {
-        // Default implementation: do multiple equality lookups
         let mut results = Vec::new();
-        for value in value_list {
-            results.extend(self.get_row_ids_equal(std::slice::from_ref(value)));
-        }
+        self.get_row_ids_in_into(value_list, &mut results);
         results
+    }
+
+    /// Appends row IDs for values in the given list to the provided buffer
+    ///
+    /// This enables callers to reuse the vector allocation across multiple calls.
+    fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
+        // Default implementation: do multiple equality lookups
+        for value in value_list {
+            self.get_row_ids_equal_into(std::slice::from_ref(value), buffer);
+        }
     }
 
     /// Returns row IDs that match the given expression

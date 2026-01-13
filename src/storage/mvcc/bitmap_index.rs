@@ -657,15 +657,15 @@ impl Index for BitmapIndex {
         }
     }
 
-    fn get_row_ids_in_range(
+    fn get_row_ids_in_range_into(
         &self,
         _min_value: &[Value],
         _max_value: &[Value],
         _include_min: bool,
         _include_max: bool,
-    ) -> Vec<i64> {
-        // Bitmap index doesn't support range queries efficiently
-        vec![]
+        _buffer: &mut Vec<i64>,
+    ) {
+        // Bitmap index doesn't support range queries efficiently - do nothing
     }
 
     fn get_filtered_row_ids(&self, expr: &dyn Expression) -> Vec<i64> {

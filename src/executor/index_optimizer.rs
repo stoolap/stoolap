@@ -945,10 +945,9 @@ impl Executor {
             // NOT IN with non-PK index: fall back to normal scan
             return Ok(None);
         } else if let Some(ref idx) = index {
-            // Index probe for each value
+            // Index probe for each value - use _into to avoid intermediate allocations
             for value in &values {
-                let row_ids = idx.get_row_ids_equal(std::slice::from_ref(value));
-                all_row_ids.extend(row_ids);
+                idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
             }
         }
 
@@ -1170,10 +1169,9 @@ impl Executor {
                 }
             }
         } else if let Some(ref idx) = index {
-            // Index probe for each value
+            // Index probe for each value - use _into to avoid intermediate allocations
             for value in &values {
-                let row_ids = idx.get_row_ids_equal(std::slice::from_ref(value));
-                all_row_ids.extend(row_ids);
+                idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
             }
         }
 
@@ -1557,7 +1555,7 @@ impl Executor {
                 }
             }
         } else if let Some(ref idx) = index {
-            // Index probe for each value
+            // Index probe for each value - use _into to avoid intermediate allocations
             for value in values.iter() {
                 // Early termination check
                 if let Some(target) = early_termination_target {
@@ -1565,8 +1563,7 @@ impl Executor {
                         break;
                     }
                 }
-                let row_ids = idx.get_row_ids_equal(std::slice::from_ref(value));
-                all_row_ids.extend(row_ids);
+                idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
             }
         }
 

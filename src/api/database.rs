@@ -131,6 +131,18 @@ impl Clone for Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        // Only remove from registry if:
+        // 1. The registry entry is OUR Arc (ptr_eq check) - prevents open_in_memory()
+        //    from accidentally removing a different DatabaseInner with same DSN
+        // 2. We're the last non-registry holder (strong_count == 2)
+        if let Ok(mut registry) = DATABASE_REGISTRY.write() {
+            if let Some(entry) = registry.get(&self.inner.dsn) {
+                if Arc::ptr_eq(entry, &self.inner) && Arc::strong_count(&self.inner) == 2 {
+                    registry.remove(&self.inner.dsn);
+                }
+            }
+        }
+
         // If this is the last reference, clear thread-local caches BEFORE
         // the Arc is dropped. This breaks circular references where caches
         // hold Arc<dyn Index> or closures that capture engine internals.
@@ -194,7 +206,10 @@ impl Database {
             MEMORY_SCHEME => {
                 let engine = MVCCEngine::in_memory();
                 engine.open_engine()?;
-                Arc::new(engine)
+                let engine = Arc::new(engine);
+                // Start background cleanup (uses config from engine)
+                engine.start_cleanup();
+                engine
             }
             FILE_SCHEME => {
                 // Parse optional query parameters
@@ -202,7 +217,10 @@ impl Database {
 
                 let engine = MVCCEngine::new(config);
                 engine.open_engine()?;
-                Arc::new(engine)
+                let engine = Arc::new(engine);
+                // Start background cleanup (uses config from engine)
+                engine.start_cleanup();
+                engine
             }
             _ => {
                 return Err(Error::parse(format!(
@@ -237,6 +255,8 @@ impl Database {
         let engine = MVCCEngine::in_memory();
         engine.open_engine()?;
         let engine = Arc::new(engine);
+        // Start background cleanup (uses config from engine)
+        engine.start_cleanup();
 
         // Create executor (uses shared default function registry)
         let executor = Executor::new(Arc::clone(&engine));
