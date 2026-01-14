@@ -128,6 +128,7 @@ pub use planner::{
     ColumnStatsCache, QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision, StatsHealth,
 };
 pub use query_cache::{CacheStats, CachedQueryPlan, QueryCache, DEFAULT_CACHE_SIZE};
+pub use query_classification::clear_classification_cache;
 pub use result::{ColumnarResult, ExecResult, ExecutorResult};
 pub use semantic_cache::{
     CacheLookupResult, CachedResult, QueryFingerprint, SemanticCache, SemanticCacheStats,

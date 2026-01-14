@@ -57,6 +57,12 @@ const PROGRAM_CACHE_SIZE: usize = 256;
 /// Uses parking_lot::Mutex for efficient locking.
 static PROGRAM_CACHE: Mutex<Option<LruCache<u64, SharedProgram>>> = Mutex::new(None);
 
+/// Clear the program cache. Call on database drop to release memory.
+pub fn clear_program_cache() {
+    let mut guard = PROGRAM_CACHE.lock();
+    *guard = None;
+}
+
 /// Compute cache key from expression and columns using efficient recursive hashing.
 /// This avoids the overhead of Debug formatting by directly hashing expression structure.
 /// Uses FxHasher which is 2-5x faster than SipHash for small keys.

@@ -518,6 +518,13 @@ pub fn clear_all_thread_local_caches() {
     // Clear RowVec and RowIdVec thread-local pools
     crate::core::row_vec::clear_row_vec_pool();
     crate::core::row_vec::clear_row_id_vec_pool();
+
+    // Clear global transaction version map pools
+    crate::storage::mvcc::clear_version_map_pools();
+
+    // Clear global LRU caches
+    super::expression::clear_program_cache();
+    super::query_classification::clear_classification_cache();
 }
 
 /// Get cached EXISTS correlation info by subquery pointer address.

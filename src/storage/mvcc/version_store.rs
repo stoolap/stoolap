@@ -285,6 +285,13 @@ fn return_write_set_map(mut map: Int64Map<WriteSetEntry>) {
     // If pool is full, map is dropped (deallocated)
 }
 
+/// Clear the transaction version map pools.
+/// Call this when dropping the database to release pooled memory.
+pub fn clear_version_map_pools() {
+    VERSION_LIST_MAP_POOL.lock().clear();
+    WRITE_SET_MAP_POOL.lock().clear();
+}
+
 /// Capacity hint for transaction version maps - used by pool functions
 const TX_VERSION_MAP_INITIAL_CAPACITY: usize = 16;
 

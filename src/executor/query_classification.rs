@@ -40,6 +40,12 @@ const CLASSIFICATION_CACHE_SIZE: usize = 512;
 static CLASSIFICATION_CACHE: Mutex<Option<LruCache<u64, Arc<QueryClassification>>>> =
     Mutex::new(None);
 
+/// Clear the classification cache. Call on database drop to release memory.
+pub fn clear_classification_cache() {
+    let mut guard = CLASSIFICATION_CACHE.lock();
+    *guard = None;
+}
+
 /// Pre-computed characteristics of a SELECT statement
 /// Some fields are computed for future optimizations but not yet used.
 #[derive(Debug, Clone)]
