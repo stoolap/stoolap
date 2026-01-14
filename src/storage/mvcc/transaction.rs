@@ -685,6 +685,14 @@ impl Drop for MvccTransaction {
         if self.state == TransactionState::Active {
             // Silent rollback on drop
             self.registry.abort_transaction(self.id);
+
+            // Clean up txn_version_stores to prevent memory leak
+            // This is critical for read-only transactions that call get_table()
+            // but are dropped without explicit commit/rollback
+            if let Some(ops) = &self.engine_operations {
+                ops.rollback_all_tables(self.id);
+            }
+
             self.cleanup();
         }
     }

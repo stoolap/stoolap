@@ -50,7 +50,7 @@ use roaring::RoaringTreemap;
 use rustc_hash::FxHashMap;
 
 use crate::common::CompactArc;
-use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
+use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
 
@@ -632,12 +632,6 @@ impl Index for BitmapIndex {
         }
     }
 
-    fn get_row_ids_equal(&self, values: &[Value]) -> Vec<i64> {
-        let mut row_ids = Vec::new();
-        self.get_row_ids_equal_into(values, &mut row_ids);
-        row_ids
-    }
-
     fn get_row_ids_equal_into(&self, values: &[Value], buffer: &mut Vec<i64>) {
         if self.closed.load(AtomicOrdering::Acquire) {
             return;
@@ -668,7 +662,7 @@ impl Index for BitmapIndex {
         // Bitmap index doesn't support range queries efficiently - do nothing
     }
 
-    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> Vec<i64> {
+    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {
         // For complex expressions, return all row IDs and let caller filter
         let bitmaps = self.bitmaps.read().unwrap();
         let mut all_rows = RoaringTreemap::new();
@@ -676,7 +670,8 @@ impl Index for BitmapIndex {
             all_rows |= bitmap;
         }
         let _ = expr;
-        all_rows.iter().map(|id| id as i64).collect()
+        let collected: Vec<i64> = all_rows.iter().map(|id| id as i64).collect();
+        RowIdVec::from_vec(collected)
     }
 
     fn get_all_values(&self) -> Vec<Value> {

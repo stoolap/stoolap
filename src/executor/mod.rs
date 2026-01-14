@@ -412,8 +412,20 @@ impl Executor {
             // Try compiled fast paths based on statement type
             match cached.statement.as_ref() {
                 Statement::Select(stmt) => {
+                    // Try PK lookup fast path first
                     if let Some(result) =
                         self.try_fast_pk_lookup_compiled(stmt, ctx, &cached.compiled)
+                    {
+                        return result;
+                    }
+                    // Try COUNT(DISTINCT col) fast path
+                    if let Some(result) =
+                        self.try_fast_count_distinct_compiled(stmt, &cached.compiled)
+                    {
+                        return result;
+                    }
+                    // Try COUNT(*) fast path
+                    if let Some(result) = self.try_fast_count_star_compiled(stmt, &cached.compiled)
                     {
                         return result;
                     }
@@ -462,8 +474,21 @@ impl Executor {
             // Try compiled fast paths based on statement type
             match stmt_arc.as_ref() {
                 Statement::Select(select) => {
+                    // Try PK lookup fast path first
                     if let Some(result) =
                         self.try_fast_pk_lookup_compiled(select, ctx, &cached_plan.compiled)
+                    {
+                        return result;
+                    }
+                    // Try COUNT(DISTINCT col) fast path
+                    if let Some(result) =
+                        self.try_fast_count_distinct_compiled(select, &cached_plan.compiled)
+                    {
+                        return result;
+                    }
+                    // Try COUNT(*) fast path
+                    if let Some(result) =
+                        self.try_fast_count_star_compiled(select, &cached_plan.compiled)
                     {
                         return result;
                     }

@@ -156,6 +156,32 @@ pub struct CompiledInsert {
     pub cached_epoch: u64,
 }
 
+/// Pre-compiled state for COUNT(DISTINCT col) queries
+/// Caches table/column info to avoid re-parsing aggregation on every execution
+#[derive(Debug, Clone)]
+pub struct CompiledCountDistinct {
+    /// Table name (already lowercased)
+    pub table_name: CompactString,
+    /// Column name to count distinct values from (lowercased)
+    pub column_name: CompactString,
+    /// Result column name (e.g., "COUNT(DISTINCT age)")
+    pub result_column_name: String,
+    /// Schema epoch at compilation time (for fast cache invalidation)
+    pub cached_epoch: u64,
+}
+
+/// Pre-compiled state for COUNT(*) queries
+/// Caches table info to avoid re-parsing on every execution
+#[derive(Debug, Clone)]
+pub struct CompiledCountStar {
+    /// Table name (already lowercased)
+    pub table_name: CompactString,
+    /// Result column name (e.g., "COUNT(*)")
+    pub result_column_name: String,
+    /// Schema epoch at compilation time (for fast cache invalidation)
+    pub cached_epoch: u64,
+}
+
 /// Pre-compiled execution state for fast paths
 #[derive(Debug, Clone, Default)]
 pub enum CompiledExecution {
@@ -172,6 +198,10 @@ pub enum CompiledExecution {
     PkDelete(CompiledPkDelete),
     /// Cached INSERT compilation (schema-derived info)
     Insert(CompiledInsert),
+    /// COUNT(DISTINCT col) fast path
+    CountDistinct(CompiledCountDistinct),
+    /// COUNT(*) fast path
+    CountStar(CompiledCountStar),
 }
 
 /// Default cache size (number of cached plans)
@@ -354,14 +384,27 @@ impl QueryCache {
         let table_lower = to_lowercase_cow(table_name);
         if let Ok(mut plans) = self.plans.write() {
             // Remove plans that reference this table
-            // Check both the compiled PK lookup table name and query text
+            // Check both the compiled lookup table name and query text
             plans.retain(|_key, plan| {
                 // Check if compiled lookup references this table
                 if let Ok(compiled) = plan.compiled.read() {
-                    if let CompiledExecution::PkLookup(lookup) = &*compiled {
-                        if lookup.table_name == *table_lower {
-                            return false; // Remove this plan
+                    match &*compiled {
+                        CompiledExecution::PkLookup(lookup) => {
+                            if lookup.table_name == *table_lower {
+                                return false; // Remove this plan
+                            }
                         }
+                        CompiledExecution::CountDistinct(cd) => {
+                            if cd.table_name == *table_lower {
+                                return false; // Remove this plan
+                            }
+                        }
+                        CompiledExecution::CountStar(cs) => {
+                            if cs.table_name == *table_lower {
+                                return false; // Remove this plan
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 // Also check query text for table reference (simple heuristic)

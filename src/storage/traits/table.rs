@@ -655,6 +655,17 @@ pub trait Table: Send + Sync {
         self.row_count() // Default falls back to row_count
     }
 
+    /// Fast O(1) exact row count for COUNT(*) queries
+    ///
+    /// Returns Some(count) if the fast path can be used (no local changes, sees all committed data),
+    /// Returns None if the caller should fall back to the full row_count() method.
+    ///
+    /// This is different from row_count_hint() because it returns the EXACT count,
+    /// not an estimate. It's designed for COUNT(*) without WHERE clause.
+    fn fast_row_count(&self) -> Option<usize> {
+        None // Default: no fast path available
+    }
+
     /// Collects rows sorted by an indexed column with limit (ORDER BY + LIMIT pushdown)
     ///
     /// For queries like `SELECT * FROM table ORDER BY col LIMIT 10`, this uses the
@@ -731,6 +742,19 @@ pub trait Table: Send + Sync {
     /// # Returns
     /// Some(Vec<Value>) with distinct values, or None if column has no index
     fn get_partition_values(&self, column_name: &str) -> Option<Vec<Value>> {
+        let _ = column_name;
+        None // Default implementation - override in concrete tables
+    }
+
+    /// Get the count of distinct non-null values from an indexed column.
+    /// Used for COUNT(DISTINCT col) optimization without cloning all values.
+    ///
+    /// # Arguments
+    /// * `column_name` - The indexed column to count distinct values from
+    ///
+    /// # Returns
+    /// Some(count) excluding NULL values, or None if column has no index
+    fn get_partition_count(&self, column_name: &str) -> Option<usize> {
         let _ = column_name;
         None // Default implementation - override in concrete tables
     }

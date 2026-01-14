@@ -515,8 +515,9 @@ pub fn clear_all_thread_local_caches() {
     crate::storage::expression::clear_regex_cache();
     crate::storage::expression::clear_like_regex_cache();
 
-    // Clear RowVec thread-local pool
+    // Clear RowVec and RowIdVec thread-local pools
     crate::core::row_vec::clear_row_vec_pool();
+    crate::core::row_vec::clear_row_id_vec_pool();
 }
 
 /// Get cached EXISTS correlation info by subquery pointer address.

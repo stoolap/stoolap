@@ -350,6 +350,33 @@ impl Executor {
 
         // Step 1: Compute all window function values upfront
         // OPTIMIZATION: Use FxHashMap for fastest lookups with trusted keys
+
+        // OPTIMIZATION: Precompute ORDER BY values ONCE for each unique ORDER BY clause
+        // This avoids redundant computation when multiple window functions share the same ORDER BY
+        // We use a Vec for the cache since the number of unique ORDER BY clauses is typically small
+        // NOTE: We use string representation for semantic comparison because PartialEq on expressions
+        // compares token positions, making structurally identical expressions from different window
+        // functions appear different.
+        let mut order_by_cache: Vec<(String, ColumnarOrderByValues)> = Vec::new();
+        for wf in &window_functions {
+            if !wf.order_by.is_empty() {
+                // Create a semantic key from the ORDER BY expressions (ignores token positions)
+                let cache_key = Self::order_by_cache_key(&wf.order_by);
+                // Check if this ORDER BY clause is already in the cache
+                let already_cached = order_by_cache.iter().any(|(key, _)| key == &cache_key);
+                if !already_cached {
+                    let precomputed = self.precompute_order_by_values(
+                        &wf.order_by,
+                        base_rows,
+                        base_columns,
+                        &col_index_map,
+                        ctx,
+                    );
+                    order_by_cache.push((cache_key, precomputed));
+                }
+            }
+        }
+
         let mut window_value_map: FxHashMap<String, Vec<Value>> = FxHashMap::default();
         for wf in &window_functions {
             let window_values = self.compute_window_function(
@@ -360,6 +387,7 @@ impl Executor {
                 ctx,
                 pre_sorted.as_ref(),
                 pre_grouped.as_ref(),
+                &order_by_cache,
             )?;
             window_value_map.insert(wf.column_name.to_lowercase(), window_values);
         }
@@ -1345,9 +1373,26 @@ impl Executor {
         })
     }
 
+    /// Create a cache key for ORDER BY expressions using their string representation.
+    /// This enables semantic comparison (ignoring token positions) for ORDER BY clause deduplication.
+    #[inline]
+    fn order_by_cache_key(order_by: &[OrderByExpression]) -> String {
+        use std::fmt::Write;
+        let mut key = String::with_capacity(64);
+        for (i, ob) in order_by.iter().enumerate() {
+            if i > 0 {
+                key.push(',');
+            }
+            // Use Display trait to get semantic string representation
+            let _ = write!(key, "{}", ob);
+        }
+        key
+    }
+
     /// Compute window function values for all rows
     /// pre_sorted: Optional info about whether rows are already sorted by an indexed column
     /// pre_grouped: Optional pre-grouped partitions from index (avoids hash-based grouping)
+    /// order_by_cache: Precomputed ORDER BY values cache (keyed by semantic string representation)
     #[allow(clippy::too_many_arguments)]
     fn compute_window_function(
         &self,
@@ -1358,12 +1403,19 @@ impl Executor {
         ctx: &ExecutionContext,
         pre_sorted: Option<&WindowPreSortedState>,
         pre_grouped: Option<&WindowPreGroupedState>,
+        order_by_cache: &[(String, ColumnarOrderByValues)],
     ) -> Result<Vec<Value>> {
         // Check if this is an aggregate function used as window function
         let is_aggregate = self.function_registry.is_aggregate(&wf_info.name);
 
         if is_aggregate {
             // Handle aggregate functions as window functions (SUM, COUNT, AVG, etc.)
+            // Look up precomputed ORDER BY values from cache using semantic key
+            let cache_key = Self::order_by_cache_key(&wf_info.order_by);
+            let cached_order_by = order_by_cache
+                .iter()
+                .find(|(key, _)| key == &cache_key)
+                .map(|(_, v)| v);
             return self.compute_aggregate_window_function(
                 wf_info,
                 rows,
@@ -1371,6 +1423,7 @@ impl Executor {
                 col_index_map,
                 ctx,
                 pre_sorted,
+                cached_order_by,
             );
         }
 
@@ -1382,30 +1435,29 @@ impl Executor {
                 Error::NotSupportedMessage(format!("Unknown window function: {}", wf_info.name))
             })?;
 
+        // Look up precomputed ORDER BY values from cache using semantic key
+        let precomputed_order_by: Option<&ColumnarOrderByValues> = if !wf_info.order_by.is_empty() {
+            let cache_key = Self::order_by_cache_key(&wf_info.order_by);
+            order_by_cache
+                .iter()
+                .find(|(key, _)| key == &cache_key)
+                .map(|(_, v)| v)
+        } else {
+            None
+        };
+
         // If there's no partitioning, treat all rows as one partition
         if wf_info.partition_by.is_empty() {
             // Pre-allocate results array and use direct-writing variant
             let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
             let row_indices: Vec<usize> = (0..rows.len()).collect();
 
-            // Precompute ORDER BY values for efficient sorting and comparison
-            let precomputed_order_by = if !wf_info.order_by.is_empty() {
-                Some(self.precompute_order_by_values(
-                    &wf_info.order_by,
-                    rows,
-                    columns,
-                    col_index_map,
-                    ctx,
-                ))
-            } else {
-                None
-            };
             self.compute_window_for_partition_direct(
                 &*window_func,
                 wf_info,
                 rows,
                 row_indices,
-                precomputed_order_by.as_ref(),
+                precomputed_order_by,
                 columns,
                 col_index_map,
                 ctx,
@@ -1415,20 +1467,10 @@ impl Executor {
             return Ok(results);
         }
 
-        // OPTIMIZATION: Precompute ORDER BY values ONCE for all rows (not per-partition!)
+        // OPTIMIZATION: ORDER BY values are now precomputed in the cache
         // This is critical - precompute_order_by_values was being called for ALL rows
         // inside each partition, causing O(n × p) work instead of O(n).
-        let precomputed_order_by = if !wf_info.order_by.is_empty() {
-            Some(self.precompute_order_by_values(
-                &wf_info.order_by,
-                rows,
-                columns,
-                col_index_map,
-                ctx,
-            ))
-        } else {
-            None
-        };
+        // The precomputed_order_by is already retrieved from the cache above
 
         // Group rows by partition key
         // OPTIMIZATION: Use pre-grouped partitions from index if available (avoids O(n) hashing)
@@ -1500,7 +1542,7 @@ impl Executor {
                         wf_info,
                         rows,
                         row_indices.clone(),
-                        precomputed_order_by.as_ref(),
+                        precomputed_order_by,
                         columns,
                         col_index_map,
                         ctx,
@@ -1523,7 +1565,7 @@ impl Executor {
                     wf_info,
                     rows,
                     row_indices,
-                    precomputed_order_by.as_ref(),
+                    precomputed_order_by,
                     columns,
                     col_index_map,
                     ctx,
@@ -2781,6 +2823,8 @@ impl Executor {
     }
 
     /// Compute aggregate function as window function (SUM, COUNT, AVG, MIN, MAX)
+    /// cached_order_by: Optional precomputed ORDER BY values from cache to avoid redundant computation
+    #[allow(clippy::too_many_arguments)]
     fn compute_aggregate_window_function(
         &self,
         wf_info: &WindowFunctionInfo,
@@ -2789,6 +2833,7 @@ impl Executor {
         col_index_map: &FxHashMap<String, usize>,
         ctx: &ExecutionContext,
         pre_sorted: Option<&WindowPreSortedState>,
+        cached_order_by: Option<&ColumnarOrderByValues>,
     ) -> Result<Vec<Value>> {
         // Check if this is COUNT(*) - Star expression means count all rows
         let is_count_star =
@@ -2838,9 +2883,14 @@ impl Executor {
             })
             .collect();
 
-        // Precompute ORDER BY values for efficient sorting and comparison
-        let order_by_values =
-            self.precompute_order_by_values(&wf_info.order_by, rows, columns, col_index_map, ctx);
+        // Use precomputed ORDER BY values from cache if available
+        // OPTIMIZATION: This avoids redundant computation when multiple window functions share ORDER BY
+        let empty_order_by = ColumnarOrderByValues {
+            columns: vec![],
+            ascending: vec![],
+            num_rows: 0,
+        };
+        let order_by_values: &ColumnarOrderByValues = cached_order_by.unwrap_or(&empty_order_by);
 
         // Group rows by partition key
         // OPTIMIZATION: Use SmallVec for partition keys to avoid heap allocation
@@ -2875,7 +2925,7 @@ impl Executor {
             if !wf_info.order_by.is_empty() {
                 // Only sort if not already pre-sorted by index
                 if !skip_sorting {
-                    Self::sort_by_order_values(&mut row_indices, &order_by_values);
+                    Self::sort_by_order_values(&mut row_indices, order_by_values);
                 }
 
                 // With ORDER BY, compute aggregate with frame specification

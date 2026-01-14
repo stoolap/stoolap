@@ -34,7 +34,7 @@ pub mod value;
 // Re-export main types for convenience
 pub use error::{Error, Result};
 pub use row::Row;
-pub use row_vec::RowVec;
+pub use row_vec::{RowIdVec, RowVec};
 pub use schema::{Schema, SchemaBuilder, SchemaColumn};
 pub use types::{DataType, IndexEntry, IndexType, IsolationLevel, Operator};
 pub use value::{parse_timestamp, Value, NULL_VALUE};

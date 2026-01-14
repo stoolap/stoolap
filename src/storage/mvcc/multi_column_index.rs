@@ -43,7 +43,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::common::CompactArc;
-use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
+use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
 
@@ -895,12 +895,6 @@ impl Index for MultiColumnIndex {
         }
     }
 
-    fn get_row_ids_equal(&self, values: &[Value]) -> Vec<i64> {
-        let mut row_ids = Vec::new();
-        self.get_row_ids_equal_into(values, &mut row_ids);
-        row_ids
-    }
-
     fn get_row_ids_equal_into(&self, values: &[Value], buffer: &mut Vec<i64>) {
         if self.closed.load(AtomicOrdering::Acquire) {
             return;
@@ -933,8 +927,8 @@ impl Index for MultiColumnIndex {
 
     // Uses default trait implementation: get_row_ids_in_range delegates to get_row_ids_in_range_into
 
-    fn get_filtered_row_ids(&self, _expr: &dyn Expression) -> Vec<i64> {
-        Vec::new()
+    fn get_filtered_row_ids(&self, _expr: &dyn Expression) -> RowIdVec {
+        RowIdVec::new()
     }
 
     fn close(&mut self) -> Result<()> {

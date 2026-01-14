@@ -337,10 +337,12 @@ impl Executor {
                     // Fall through to recompile path
                 }
                 CompiledExecution::Unknown => {} // Fall through to compile
-                // These variants are for UPDATE/DELETE/INSERT - not PK lookups
+                // These variants are for UPDATE/DELETE/INSERT/COUNT DISTINCT/COUNT(*) - not PK lookups
                 CompiledExecution::PkUpdate(_)
                 | CompiledExecution::PkDelete(_)
-                | CompiledExecution::Insert(_) => return None,
+                | CompiledExecution::Insert(_)
+                | CompiledExecution::CountDistinct(_)
+                | CompiledExecution::CountStar(_) => return None,
             }
         }
 
@@ -446,10 +448,12 @@ impl Executor {
                 return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
             }
             CompiledExecution::Unknown => {} // Continue with compilation
-            // These variants are for UPDATE/DELETE/INSERT - not PK lookups
+            // These variants are for UPDATE/DELETE/INSERT/COUNT DISTINCT/COUNT(*) - not PK lookups
             CompiledExecution::PkUpdate(_)
             | CompiledExecution::PkDelete(_)
-            | CompiledExecution::Insert(_) => return None,
+            | CompiledExecution::Insert(_)
+            | CompiledExecution::CountDistinct(_)
+            | CompiledExecution::CountStar(_) => return None,
         }
 
         // Do full pattern detection (same as try_fast_pk_lookup)
@@ -474,8 +478,8 @@ impl Executor {
         }
 
         // Must be SELECT *
+        // Don't set NotOptimizable here - other fast paths (like COUNT DISTINCT) may handle this
         if stmt.columns.len() != 1 || !matches!(&stmt.columns[0], Expression::Star(_)) {
-            *compiled_guard = CompiledExecution::NotOptimizable;
             return None;
         }
 

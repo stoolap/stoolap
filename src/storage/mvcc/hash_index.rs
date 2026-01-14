@@ -64,7 +64,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::common::CompactArc;
-use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
+use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::{ComparisonExpr, Expression, InListExpr};
 use crate::storage::traits::Index;
 
@@ -686,12 +686,6 @@ impl Index for HashIndex {
         }
     }
 
-    fn get_row_ids_equal(&self, values: &[Value]) -> Vec<i64> {
-        let mut row_ids = Vec::new();
-        self.get_row_ids_equal_into(values, &mut row_ids);
-        row_ids
-    }
-
     fn get_row_ids_equal_into(&self, values: &[Value], buffer: &mut Vec<i64>) {
         if self.closed.load(AtomicOrdering::Acquire) {
             return;
@@ -752,7 +746,7 @@ impl Index for HashIndex {
         // Hash index does not support range queries - do nothing
     }
 
-    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> Vec<i64> {
+    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {
         // Try to optimize for IN list expressions
         if let Some(in_list) = expr.as_any().downcast_ref::<InListExpr>() {
             // Check if this IN list is on our indexed column
@@ -780,7 +774,7 @@ impl Index for HashIndex {
         // Fallback: return all row IDs and let caller filter
         // This is inefficient but necessary for correctness for complex expressions
         let hash_to_values = self.hash_to_values.read().unwrap();
-        let mut results = Vec::new();
+        let mut results = RowIdVec::new();
 
         for entries in hash_to_values.values() {
             for (_values, row_ids) in entries {
@@ -789,6 +783,31 @@ impl Index for HashIndex {
         }
 
         results
+    }
+
+    fn get_distinct_count_excluding_null(&self) -> Option<usize> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return None;
+        }
+        let hash_to_values = self.hash_to_values.read().unwrap();
+        // Count unique value combinations excluding null
+        let mut count = 0;
+        for entries in hash_to_values.values() {
+            for (values, _row_ids) in entries {
+                // For single-column index, check if value is null
+                if values.len() == 1 {
+                    if !values[0].is_null() {
+                        count += 1;
+                    }
+                } else {
+                    // For multi-column index, count if not all values are null
+                    if !values.iter().all(|v| v.is_null()) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Some(count)
     }
 
     fn close(&mut self) -> Result<()> {

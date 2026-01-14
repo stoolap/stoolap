@@ -21,7 +21,7 @@
 //! - HAVING clause: `SELECT category, SUM(amount) FROM sales GROUP BY category HAVING SUM(amount) > 100`
 
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use ahash::AHasher;
 use hashbrown::hash_map::RawEntryMut;
@@ -34,12 +34,13 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::aggregate::CompiledAggregate;
 use crate::functions::AggregateFunction;
 use crate::parser::ast::*;
-use crate::storage::traits::QueryResult;
+use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
 #[allow(deprecated)]
 use super::expression::CompiledEvaluator;
 use super::expression::{ExpressionEval, RowFilter};
+use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::utils::{build_column_index_map, hash_value_into};
@@ -4935,13 +4936,10 @@ impl Executor {
             match agg.name.as_str() {
                 "COUNT" => {
                     if agg.distinct {
-                        // COUNT(DISTINCT col) - try to get count from index
-                        if let Some(distinct_values) = table.get_partition_values(&agg.column_lower)
-                        {
-                            // Per SQL standard, COUNT(DISTINCT col) excludes NULL values
-                            let non_null_count =
-                                distinct_values.iter().filter(|v| !v.is_null()).count();
-                            result_values.push(Value::Integer(non_null_count as i64));
+                        // COUNT(DISTINCT col) - try to get count from index without cloning values
+                        if let Some(count) = table.get_partition_count(&agg.column_lower) {
+                            // get_partition_count already excludes NULL values per SQL standard
+                            result_values.push(Value::Integer(count as i64));
                         } else {
                             // No index on this column, can't pushdown
                             return Ok(None);
@@ -6046,6 +6044,552 @@ impl Executor {
         }
 
         Some(Box::new(ExecutorResult::new(result_columns, rows)))
+    }
+
+    /// Try fast COUNT(DISTINCT col) using compiled cache
+    ///
+    /// This is a compiled fast path for simple `SELECT COUNT(DISTINCT col) FROM table` queries.
+    /// On first execution, it analyzes and compiles the query pattern.
+    /// On subsequent executions, it skips parsing and directly fetches the distinct count.
+    ///
+    /// # Arguments
+    /// * `stmt` - The SELECT statement
+    /// * `compiled` - The compiled execution state (shared via RwLock)
+    ///
+    /// # Returns
+    /// * `Some(Ok(result))` - Query succeeded via fast path
+    /// * `Some(Err(e))` - Query failed
+    /// * `None` - Query doesn't qualify for this fast path (use normal path)
+    pub(crate) fn try_fast_count_distinct_compiled(
+        &self,
+        stmt: &SelectStatement,
+        compiled: &RwLock<CompiledExecution>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        // Quick reject: must not be in an explicit transaction (for simplicity)
+        {
+            let active_tx = match self.active_transaction.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return None,
+            };
+            if active_tx.is_some() {
+                return None;
+            }
+        }
+
+        // Try read lock first - check if already compiled
+        {
+            let compiled_guard = match compiled.read() {
+                Ok(guard) => guard,
+                Err(_) => return None,
+            };
+            match &*compiled_guard {
+                CompiledExecution::NotOptimizable => return None,
+                CompiledExecution::CountDistinct(cd) => {
+                    // Fast path: validate epoch and execute directly
+                    if self.engine.schema_epoch() == cd.cached_epoch {
+                        return Some(self.execute_compiled_count_distinct(cd));
+                    }
+                    // Schema changed - fall through to recompile
+                }
+                CompiledExecution::Unknown => {} // Fall through to compile
+                // Other variants - not a COUNT DISTINCT query
+                _ => return None,
+            }
+        }
+
+        // First execution or schema changed - compile and cache (write lock)
+        self.compile_and_execute_count_distinct(stmt, compiled)
+    }
+
+    /// Execute using pre-compiled COUNT(DISTINCT col) info
+    fn execute_compiled_count_distinct(
+        &self,
+        cd: &CompiledCountDistinct,
+    ) -> Result<Box<dyn QueryResult>> {
+        // Get table and count distinct values directly
+        let tx = self.engine.begin_transaction()?;
+        let table = tx.get_table(&cd.table_name)?;
+
+        let count = table
+            .get_partition_count(&cd.column_name)
+            .ok_or_else(|| crate::core::Error::internal("Index no longer available for column"))?;
+
+        // Build result
+        let mut result_values = CompactVec::with_capacity(1);
+        result_values.push(Value::Integer(count as i64));
+        let row = Row::from_compact_vec(result_values);
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((0, row));
+
+        Ok(Box::new(ExecutorResult::new(
+            vec![cd.result_column_name.clone()],
+            rows,
+        )))
+    }
+
+    /// Compile and execute COUNT(DISTINCT col), caching the compiled state
+    fn compile_and_execute_count_distinct(
+        &self,
+        stmt: &SelectStatement,
+        compiled: &RwLock<CompiledExecution>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        use compact_str::CompactString;
+
+        // Acquire write lock
+        let mut compiled_guard = match compiled.write() {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        };
+
+        // Double-check (another thread may have compiled while we waited)
+        match &*compiled_guard {
+            CompiledExecution::NotOptimizable => return None,
+            CompiledExecution::CountDistinct(cd) => {
+                if self.engine.schema_epoch() == cd.cached_epoch {
+                    return Some(self.execute_compiled_count_distinct(cd));
+                }
+                // Schema changed, continue to recompile
+            }
+            CompiledExecution::Unknown => {} // Continue with compilation
+            _ => return None,
+        }
+
+        // Pattern detection: SELECT COUNT(DISTINCT col) FROM table
+        // Must have:
+        // - Exactly one column expression
+        // - That column is COUNT(DISTINCT col) function call
+        // - No WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, CTEs, set operations
+        // - Single table source (no joins)
+
+        if stmt.columns.len() != 1 {
+            *compiled_guard = CompiledExecution::NotOptimizable;
+            return None;
+        }
+
+        // Check for disqualifying clauses
+        if stmt.where_clause.is_some()
+            || !stmt.group_by.columns.is_empty()
+            || stmt.having.is_some()
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.with.is_some()
+            || !stmt.set_operations.is_empty()
+        {
+            *compiled_guard = CompiledExecution::NotOptimizable;
+            return None;
+        }
+
+        // Extract COUNT(DISTINCT col) pattern
+        let (column_name, result_column_name) = match &stmt.columns[0] {
+            Expression::FunctionCall(func) => {
+                // Must be COUNT function
+                if func.function.to_uppercase() != "COUNT" {
+                    *compiled_guard = CompiledExecution::NotOptimizable;
+                    return None;
+                }
+                // Must be DISTINCT - if not, don't mark as NotOptimizable
+                // because COUNT(*) fast path might handle it
+                if !func.is_distinct {
+                    return None;
+                }
+                if func.arguments.len() != 1 {
+                    *compiled_guard = CompiledExecution::NotOptimizable;
+                    return None;
+                }
+                // Get column name from argument
+                let col = match &func.arguments[0] {
+                    Expression::Identifier(ident) => ident.value.to_lowercase(),
+                    _ => {
+                        *compiled_guard = CompiledExecution::NotOptimizable;
+                        return None;
+                    }
+                };
+                let result_name = format!("COUNT(DISTINCT {})", col);
+                (col, result_name)
+            }
+            Expression::Aliased(aliased) => {
+                // Handle COUNT(DISTINCT col) AS alias
+                match aliased.expression.as_ref() {
+                    Expression::FunctionCall(func) => {
+                        // Must be COUNT function
+                        if func.function.to_uppercase() != "COUNT" {
+                            *compiled_guard = CompiledExecution::NotOptimizable;
+                            return None;
+                        }
+                        // Must be DISTINCT - if not, don't mark as NotOptimizable
+                        // because COUNT(*) fast path might handle it
+                        if !func.is_distinct {
+                            return None;
+                        }
+                        if func.arguments.len() != 1 {
+                            *compiled_guard = CompiledExecution::NotOptimizable;
+                            return None;
+                        }
+                        let col = match &func.arguments[0] {
+                            Expression::Identifier(ident) => ident.value.to_lowercase(),
+                            _ => {
+                                *compiled_guard = CompiledExecution::NotOptimizable;
+                                return None;
+                            }
+                        };
+                        (col, aliased.alias.value.to_string())
+                    }
+                    _ => {
+                        *compiled_guard = CompiledExecution::NotOptimizable;
+                        return None;
+                    }
+                }
+            }
+            _ => {
+                *compiled_guard = CompiledExecution::NotOptimizable;
+                return None;
+            }
+        };
+
+        // Extract table name
+        let table_name = match stmt.table_expr.as_deref() {
+            Some(Expression::TableSource(ts)) => ts.name.value_lower.clone(),
+            _ => {
+                *compiled_guard = CompiledExecution::NotOptimizable;
+                return None;
+            }
+        };
+
+        // Try to get table and verify index exists
+        let tx = match self.engine.begin_transaction() {
+            Ok(tx) => tx,
+            Err(_) => {
+                *compiled_guard = CompiledExecution::NotOptimizable;
+                return None;
+            }
+        };
+
+        let table = match tx.get_table(&table_name) {
+            Ok(t) => t,
+            Err(_) => {
+                *compiled_guard = CompiledExecution::NotOptimizable;
+                return None;
+            }
+        };
+
+        // Check if column has an index (required for fast path)
+        if table.get_partition_count(&column_name).is_none() {
+            *compiled_guard = CompiledExecution::NotOptimizable;
+            return None;
+        }
+
+        // Get the count
+        let count = table.get_partition_count(&column_name).unwrap();
+
+        // Cache the compiled state
+        let compiled_cd = CompiledCountDistinct {
+            table_name: CompactString::new(&table_name),
+            column_name: CompactString::new(&column_name),
+            result_column_name: result_column_name.clone(),
+            cached_epoch: self.engine.schema_epoch(),
+        };
+        *compiled_guard = CompiledExecution::CountDistinct(compiled_cd);
+        drop(compiled_guard);
+
+        // Build result
+        let mut result_values = CompactVec::with_capacity(1);
+        result_values.push(Value::Integer(count as i64));
+        let row = Row::from_compact_vec(result_values);
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((0, row));
+
+        Some(Ok(Box::new(ExecutorResult::new(
+            vec![result_column_name],
+            rows,
+        ))))
+    }
+
+    /// COUNT(*) fast path for simple queries
+    ///
+    /// This is a compiled fast path for simple `SELECT COUNT(*) FROM table` queries.
+    /// On first execution, it analyzes and compiles the query pattern.
+    /// On subsequent executions, it skips parsing and directly fetches the row count.
+    ///
+    /// # Arguments
+    /// * `stmt` - The SELECT statement
+    /// * `compiled` - The compiled execution state (shared via RwLock)
+    ///
+    /// # Returns
+    /// * `Some(Ok(result))` - Query succeeded via fast path
+    /// * `Some(Err(e))` - Query failed
+    /// * `None` - Query doesn't qualify for this fast path (use normal path)
+    pub(crate) fn try_fast_count_star_compiled(
+        &self,
+        stmt: &SelectStatement,
+        compiled: &RwLock<CompiledExecution>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        // Quick reject: must not be in an explicit transaction (for simplicity)
+        {
+            let active_tx = match self.active_transaction.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return None,
+            };
+            if active_tx.is_some() {
+                return None;
+            }
+        }
+
+        // Try read lock first - check if already compiled
+        {
+            let compiled_guard = match compiled.read() {
+                Ok(guard) => guard,
+                Err(_) => return None,
+            };
+            match &*compiled_guard {
+                CompiledExecution::NotOptimizable => return None,
+                CompiledExecution::CountStar(cs) => {
+                    // Fast path: validate epoch and execute directly
+                    if self.engine.schema_epoch() == cs.cached_epoch {
+                        return Some(self.execute_compiled_count_star(cs));
+                    }
+                    // Schema changed - fall through to recompile
+                }
+                CompiledExecution::Unknown => {} // Fall through to compile
+                // Other variants - not a COUNT(*) query
+                _ => return None,
+            }
+        }
+
+        // First execution or schema changed - compile and cache (write lock)
+        self.compile_and_execute_count_star(stmt, compiled)
+    }
+
+    /// Execute using pre-compiled COUNT(*) info
+    fn execute_compiled_count_star(
+        &self,
+        cs: &crate::executor::query_cache::CompiledCountStar,
+    ) -> Result<Box<dyn QueryResult>> {
+        // Get table and count rows directly
+        let tx = self.engine.begin_transaction()?;
+        let table = tx.get_table(&cs.table_name)?;
+
+        let count = table.row_count();
+
+        // Build result
+        let mut result_values = CompactVec::with_capacity(1);
+        result_values.push(Value::Integer(count as i64));
+        let row = Row::from_compact_vec(result_values);
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((0, row));
+
+        Ok(Box::new(ExecutorResult::new(
+            vec![cs.result_column_name.clone()],
+            rows,
+        )))
+    }
+
+    /// Compile and execute COUNT(*), caching the compiled state
+    fn compile_and_execute_count_star(
+        &self,
+        stmt: &SelectStatement,
+        compiled: &RwLock<CompiledExecution>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        use crate::executor::query_cache::CompiledCountStar;
+        use compact_str::CompactString;
+
+        // Acquire write lock
+        let mut compiled_guard = match compiled.write() {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        };
+
+        // Double-check (another thread may have compiled while we waited)
+        match &*compiled_guard {
+            CompiledExecution::NotOptimizable => return None,
+            CompiledExecution::CountStar(cs) => {
+                if self.engine.schema_epoch() == cs.cached_epoch {
+                    return Some(self.execute_compiled_count_star(cs));
+                }
+                // Schema changed, continue to recompile
+            }
+            CompiledExecution::Unknown => {} // Continue with compilation
+            _ => return None,
+        }
+
+        // Pattern detection: SELECT COUNT(*) FROM table
+        // Must have:
+        // - Exactly one column expression
+        // - That column is COUNT(*) or COUNT(1) function call (not DISTINCT)
+        // - No WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, CTEs, set operations
+        // - Single table source (no joins)
+
+        if stmt.columns.len() != 1 {
+            *compiled_guard = CompiledExecution::NotOptimizable;
+            return None;
+        }
+
+        // Check for disqualifying clauses
+        if stmt.where_clause.is_some()
+            || !stmt.group_by.columns.is_empty()
+            || stmt.having.is_some()
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.with.is_some()
+            || !stmt.set_operations.is_empty()
+        {
+            *compiled_guard = CompiledExecution::NotOptimizable;
+            return None;
+        }
+
+        // Extract COUNT(*) pattern
+        let result_column_name = match &stmt.columns[0] {
+            Expression::FunctionCall(func) => {
+                // Must be COUNT function
+                if func.function.to_uppercase() != "COUNT" {
+                    *compiled_guard = CompiledExecution::NotOptimizable;
+                    return None;
+                }
+                // Must NOT be DISTINCT - if DISTINCT, don't mark as NotOptimizable
+                // because COUNT DISTINCT fast path might handle it
+                if func.is_distinct {
+                    return None;
+                }
+                // Must not have FILTER clause
+                if func.filter.is_some() {
+                    *compiled_guard = CompiledExecution::NotOptimizable;
+                    return None;
+                }
+                // Must be COUNT(*) or COUNT(1)
+                match func.arguments.len() {
+                    0 => {
+                        // COUNT(*) without explicit star is rare but handle it
+                        "COUNT(*)".to_string()
+                    }
+                    1 => {
+                        match &func.arguments[0] {
+                            Expression::Star(_) => "COUNT(*)".to_string(),
+                            Expression::IntegerLiteral(lit) => {
+                                // COUNT(1) is equivalent to COUNT(*)
+                                if lit.value == 1 {
+                                    "COUNT(1)".to_string()
+                                } else {
+                                    *compiled_guard = CompiledExecution::NotOptimizable;
+                                    return None;
+                                }
+                            }
+                            _ => {
+                                // COUNT(col) without DISTINCT - not our fast path
+                                *compiled_guard = CompiledExecution::NotOptimizable;
+                                return None;
+                            }
+                        }
+                    }
+                    _ => {
+                        *compiled_guard = CompiledExecution::NotOptimizable;
+                        return None;
+                    }
+                }
+            }
+            Expression::Aliased(aliased) => {
+                // Handle COUNT(*) AS alias
+                match aliased.expression.as_ref() {
+                    Expression::FunctionCall(func) => {
+                        // Must be COUNT function
+                        if func.function.to_uppercase() != "COUNT" {
+                            *compiled_guard = CompiledExecution::NotOptimizable;
+                            return None;
+                        }
+                        // Must NOT be DISTINCT - if DISTINCT, don't mark as NotOptimizable
+                        // because COUNT DISTINCT fast path might handle it
+                        if func.is_distinct {
+                            return None;
+                        }
+                        // Must not have FILTER clause
+                        if func.filter.is_some() {
+                            *compiled_guard = CompiledExecution::NotOptimizable;
+                            return None;
+                        }
+                        match func.arguments.len() {
+                            0 => aliased.alias.value.to_string(),
+                            1 => match &func.arguments[0] {
+                                Expression::Star(_) => aliased.alias.value.to_string(),
+                                Expression::IntegerLiteral(lit) => {
+                                    if lit.value == 1 {
+                                        aliased.alias.value.to_string()
+                                    } else {
+                                        *compiled_guard = CompiledExecution::NotOptimizable;
+                                        return None;
+                                    }
+                                }
+                                _ => {
+                                    *compiled_guard = CompiledExecution::NotOptimizable;
+                                    return None;
+                                }
+                            },
+                            _ => {
+                                *compiled_guard = CompiledExecution::NotOptimizable;
+                                return None;
+                            }
+                        }
+                    }
+                    _ => {
+                        *compiled_guard = CompiledExecution::NotOptimizable;
+                        return None;
+                    }
+                }
+            }
+            _ => {
+                *compiled_guard = CompiledExecution::NotOptimizable;
+                return None;
+            }
+        };
+
+        // Extract table name
+        let table_name = match stmt.table_expr.as_deref() {
+            Some(Expression::TableSource(ts)) => ts.name.value_lower.clone(),
+            _ => {
+                *compiled_guard = CompiledExecution::NotOptimizable;
+                return None;
+            }
+        };
+
+        // Try to get table and get count
+        let tx = match self.engine.begin_transaction() {
+            Ok(tx) => tx,
+            Err(_) => {
+                *compiled_guard = CompiledExecution::NotOptimizable;
+                return None;
+            }
+        };
+
+        let table = match tx.get_table(&table_name) {
+            Ok(t) => t,
+            Err(_) => {
+                *compiled_guard = CompiledExecution::NotOptimizable;
+                return None;
+            }
+        };
+
+        // Get the count
+        let count = table.row_count();
+
+        // Cache the compiled state
+        let compiled_cs = CompiledCountStar {
+            table_name: CompactString::new(&table_name),
+            result_column_name: result_column_name.clone(),
+            cached_epoch: self.engine.schema_epoch(),
+        };
+        *compiled_guard = CompiledExecution::CountStar(compiled_cs);
+        drop(compiled_guard);
+
+        // Build result
+        let mut result_values = CompactVec::with_capacity(1);
+        result_values.push(Value::Integer(count as i64));
+        let row = Row::from_compact_vec(result_values);
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((0, row));
+
+        Some(Ok(Box::new(ExecutorResult::new(
+            vec![result_column_name],
+            rows,
+        ))))
     }
 }
 

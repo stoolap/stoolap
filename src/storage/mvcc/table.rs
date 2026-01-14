@@ -22,7 +22,9 @@ use smallvec::SmallVec;
 use std::sync::{Arc, RwLock};
 
 use crate::common::{CompactArc, Int64Set};
-use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, SchemaColumn, Value};
+use crate::core::{
+    DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
+};
 use crate::storage::expression::Expression;
 use crate::storage::mvcc::bitmap_index::BitmapIndex;
 use crate::storage::mvcc::btree_index::BTreeIndex;
@@ -195,8 +197,8 @@ impl MVCCTable {
     }
 
     /// Try to identify a PK range lookup (WHERE id >= X AND id < Y)
-    /// Returns Some(Vec<row_id>) if this is a PK range query
-    fn try_pk_range_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<Vec<i64>> {
+    /// Returns Some(RowIdVec) if this is a PK range query (pooled for efficient memory reuse)
+    fn try_pk_range_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<RowIdVec> {
         use crate::core::Operator;
 
         // Get PK column info
@@ -261,7 +263,7 @@ impl MVCCTable {
 
         // Check for invalid range (start > end means empty result)
         if start > end {
-            return Some(Vec::new());
+            return Some(RowIdVec::new());
         }
 
         // SAFETY: Limit range size to prevent memory explosion
@@ -273,14 +275,19 @@ impl MVCCTable {
         }
 
         // Generate row_ids directly (no index needed - PK IS the row_id)
-        Some((start..=end).collect())
+        let mut row_ids = RowIdVec::with_capacity(range_size as usize);
+        for id in start..=end {
+            row_ids.push(id);
+        }
+        Some(row_ids)
     }
 
     /// Try to use an index to filter row IDs
     ///
     /// Returns Some(row_ids) if an index can be used, None otherwise
+    /// Returns a pooled RowIdVec for efficient memory reuse.
     #[allow(clippy::only_used_in_recursion)]
-    fn try_index_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<Vec<i64>> {
+    fn try_index_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<RowIdVec> {
         use crate::core::Operator;
         use crate::storage::mvcc::{intersect_sorted_ids, union_sorted_ids};
 
@@ -305,9 +312,8 @@ impl MVCCTable {
         // - If at least one operand uses index but others don't, we still return
         //   the indexed row_ids (the executor will handle memory filtering for others)
         if let Some(or_operands) = expr.get_or_operands() {
-            let mut indexed_row_ids: Vec<Vec<i64>> = Vec::with_capacity(or_operands.len());
+            let mut indexed_row_ids: Vec<RowIdVec> = Vec::with_capacity(or_operands.len());
             let mut has_unindexed_operand = false;
-            let mut all_operands_indexed = true;
 
             for operand in or_operands {
                 // Recursively try index lookup for each OR operand
@@ -317,40 +323,24 @@ impl MVCCTable {
                 } else {
                     // This operand can't use an index
                     has_unindexed_operand = true;
-                    all_operands_indexed = false;
                 }
-            }
-
-            // If ALL operands can use indexes, return the union
-            if all_operands_indexed && !indexed_row_ids.is_empty() {
-                if indexed_row_ids.len() == 1 {
-                    return Some(indexed_row_ids.into_iter().next().unwrap());
-                }
-
-                let mut result = indexed_row_ids[0].clone();
-                for other in &indexed_row_ids[1..] {
-                    result = union_sorted_ids(&result, other);
-                }
-                return Some(result);
             }
 
             // HYBRID OPTIMIZATION: If some operands use indexes but not all,
             // we can't use pure index lookup (would miss rows from unindexed operands).
-            // However, if there are many indexed operands and few unindexed ones,
-            // the executor can still benefit from partial index usage.
             // For now, fall back to full scan - the memory filter will handle it.
             // Future: Could return indexed row_ids + flag for partial optimization
-            if has_unindexed_operand {
+            if has_unindexed_operand || indexed_row_ids.is_empty() {
                 return None;
             }
 
-            // All indexed - union results
-            if indexed_row_ids.is_empty() {
-                return None;
+            // All operands indexed - return the union of all row IDs
+            if indexed_row_ids.len() == 1 {
+                return Some(indexed_row_ids.into_iter().next().unwrap());
             }
 
-            let mut result = indexed_row_ids[0].clone();
-            for other in &indexed_row_ids[1..] {
+            let mut result = union_sorted_ids(&indexed_row_ids[0], &indexed_row_ids[1]);
+            for other in &indexed_row_ids[2..] {
                 result = union_sorted_ids(&result, other);
             }
             return Some(result);
@@ -412,7 +402,7 @@ impl MVCCTable {
         // For '(col1 IN (...)) AND (col2 IN (...))', process each operand and intersect results
         // This is critical for semi-join optimization where we combine right_filter with IN clause
         if let Some(and_operands) = expr.get_and_operands() {
-            let mut indexed_row_ids: Vec<Vec<i64>> = Vec::with_capacity(and_operands.len());
+            let mut indexed_row_ids: Vec<RowIdVec> = Vec::with_capacity(and_operands.len());
 
             for operand in and_operands {
                 // Recursively try index lookup for each AND operand
@@ -440,7 +430,7 @@ impl MVCCTable {
                     result = intersect_sorted_ids(&result, other);
                     // Early termination if intersection is empty
                     if result.is_empty() {
-                        return Some(Vec::new());
+                        return Some(RowIdVec::new());
                     }
                 }
                 return Some(result);
@@ -493,7 +483,10 @@ impl MVCCTable {
                     true,  // include min
                     false, // exclude max
                 ) {
-                    let row_ids: Vec<i64> = entries.into_iter().map(|e| e.row_id).collect();
+                    let mut row_ids = RowIdVec::with_capacity(entries.len());
+                    for entry in entries {
+                        row_ids.push(entry.row_id);
+                    }
                     return Some(row_ids);
                 }
             }
@@ -580,7 +573,7 @@ impl MVCCTable {
                         }
                         // There are uncovered columns - continue to check single-column indexes
                         // and intersect with multi-column index results
-                        let mut all_row_ids = vec![row_ids];
+                        let mut all_row_ids: Vec<RowIdVec> = vec![row_ids];
 
                         // Check single-column indexes for uncovered columns
                         for col_name in uncovered_columns {
@@ -595,7 +588,7 @@ impl MVCCTable {
                                         let ids =
                                             single_idx.get_row_ids_equal(std::slice::from_ref(val));
                                         if ids.is_empty() {
-                                            return Some(Vec::new());
+                                            return Some(RowIdVec::new());
                                         }
                                         // Don't sort yet - only sort when intersection is needed
                                         all_row_ids.push(ids);
@@ -609,11 +602,11 @@ impl MVCCTable {
                             return Some(all_row_ids.into_iter().next().unwrap());
                         }
                         // Row IDs are already sorted by index (sorted insertion)
-                        let mut result = all_row_ids[0].clone();
-                        for other in &all_row_ids[1..] {
+                        let mut result = all_row_ids.swap_remove(0);
+                        for other in &all_row_ids {
                             result = intersect_sorted_ids(&result, other);
                             if result.is_empty() {
-                                return Some(Vec::new());
+                                return Some(RowIdVec::new());
                             }
                         }
                         return Some(result);
@@ -624,7 +617,7 @@ impl MVCCTable {
 
         // Fall back to single-column index strategy
         // Collect row IDs from all indexed columns
-        let mut all_row_ids: Vec<Vec<i64>> = Vec::new();
+        let mut all_row_ids: Vec<RowIdVec> = Vec::new();
 
         for (col_name, ops) in &column_comparisons {
             if let Some(index) = self.version_store.get_index_by_column(col_name) {
@@ -654,7 +647,7 @@ impl MVCCTable {
                     let row_ids = index.get_row_ids_equal(std::slice::from_ref(val));
                     if row_ids.is_empty() {
                         // If any index returns empty, the AND result is empty
-                        return Some(Vec::new());
+                        return Some(RowIdVec::new());
                     }
                     // Don't sort yet - only sort when intersection is needed
                     all_row_ids.push(row_ids);
@@ -695,12 +688,12 @@ impl MVCCTable {
                             self.query_index_with_operator(&*index, op, val)
                                 .unwrap_or_default()
                         } else {
-                            Vec::new()
+                            RowIdVec::new()
                         };
 
                     if row_ids.is_empty() {
                         // If any index returns empty, the AND result is empty
-                        return Some(Vec::new());
+                        return Some(RowIdVec::new());
                     }
                     // Don't sort yet - only sort when intersection is needed
                     all_row_ids.push(row_ids);
@@ -721,11 +714,11 @@ impl MVCCTable {
         // Row IDs are already sorted by index (sorted insertion)
         // Intersect all row ID sets for multi-column filtering
         // This is the key optimization - we filter rows using multiple indexes
-        let mut result = all_row_ids[0].clone();
-        for other in &all_row_ids[1..] {
+        let mut result = all_row_ids.swap_remove(0);
+        for other in &all_row_ids {
             result = intersect_sorted_ids(&result, other);
             if result.is_empty() {
-                return Some(Vec::new());
+                return Some(RowIdVec::new());
             }
         }
 
@@ -733,12 +726,13 @@ impl MVCCTable {
     }
 
     /// Query an index with a specific operator
+    /// Returns a pooled RowIdVec for efficient memory reuse.
     fn query_index_with_operator(
         &self,
         index: &dyn crate::storage::traits::Index,
         operator: crate::core::Operator,
         value: &Value,
-    ) -> Option<Vec<i64>> {
+    ) -> Option<RowIdVec> {
         use crate::core::Operator;
 
         match operator {
@@ -755,7 +749,10 @@ impl MVCCTable {
                 let entries = index
                     .find_with_operator(operator, std::slice::from_ref(value))
                     .ok()?;
-                let row_ids: Vec<i64> = entries.into_iter().map(|e| e.row_id).collect();
+                let mut row_ids = RowIdVec::with_capacity(entries.len());
+                for entry in entries {
+                    row_ids.push(entry.row_id);
+                }
                 if row_ids.is_empty() {
                     None
                 } else {
@@ -768,10 +765,11 @@ impl MVCCTable {
 
     /// Fast path for index-based row fetching when there are no local transaction changes.
     /// Returns Some(rows) if we can serve from index, None if we should fall through to full path.
+    /// Takes RowIdVec for efficient pooled memory reuse.
     #[inline]
     fn try_fetch_from_index(
         &self,
-        row_ids: Vec<i64>,
+        row_ids: RowIdVec,
         expr: &dyn Expression,
         schema: &Schema,
         limit: usize,
@@ -1157,6 +1155,24 @@ impl MVCCTable {
         }
 
         count
+    }
+
+    /// Fast O(1) row count for COUNT(*) queries without local changes
+    ///
+    /// Returns Some(count) if the fast path can be used (no local changes),
+    /// Returns None if the caller should fall back to the full row_count() method.
+    ///
+    /// OPTIMIZATION: This uses the pre-computed committed_row_count which is O(1)
+    /// instead of iterating all rows with visibility checks.
+    #[inline]
+    pub fn fast_row_count(&self) -> Option<usize> {
+        // Check if there are any local changes
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        // No local changes - use the O(1) committed row count
+        Some(self.version_store.committed_row_count())
     }
 
     /// Collect all visible rows, optionally filtered
@@ -2851,13 +2867,21 @@ impl Table for MVCCTable {
     }
 
     fn row_count(&self) -> usize {
-        // Use the optimized row_count method that uses single-pass counting
+        // Try O(1) fast path first
+        if let Some(count) = MVCCTable::fast_row_count(self) {
+            return count;
+        }
+        // Fall back to optimized single-pass counting
         MVCCTable::row_count(self)
     }
 
     fn row_count_hint(&self) -> usize {
-        // O(1) upper bound: just return versions.len() without visibility checks
-        self.version_store.row_count()
+        // O(1) - just return the committed row count without any lock checks
+        self.version_store.committed_row_count()
+    }
+
+    fn fast_row_count(&self) -> Option<usize> {
+        MVCCTable::fast_row_count(self)
     }
 
     fn collect_rows_ordered_by_index(
@@ -3050,6 +3074,20 @@ impl Table for MVCCTable {
         Some(index.get_all_values())
     }
 
+    fn get_partition_count(&self, column_name: &str) -> Option<usize> {
+        // Only use index-based count if no uncommitted local changes
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        // Get index for the column
+        let index = self.version_store.get_index_by_column(column_name)?;
+        // Return count of distinct non-null values without cloning
+        index.get_distinct_count_excluding_null()
+    }
+
     fn get_rows_for_partition_value(
         &self,
         column_name: &str,
@@ -3063,7 +3101,7 @@ impl Table for MVCCTable {
 
         // Collect visible rows for this partition
         let mut rows = RowVec::with_capacity(row_ids.len());
-        for row_id in row_ids {
+        for &row_id in row_ids.iter() {
             if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
                 if !version.is_deleted() {
                     rows.push((row_id, version.data.clone()));

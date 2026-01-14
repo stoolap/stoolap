@@ -27,7 +27,7 @@
 //!
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -412,6 +412,10 @@ pub struct VersionStore {
     /// This limits memory growth during write-heavy operations.
     /// Default is 10 - enough for most concurrent transaction scenarios.
     max_version_history: usize,
+    /// Count of committed non-deleted rows for O(1) COUNT(*) queries.
+    /// Updated on commit: +1 for INSERT, -1 for DELETE.
+    /// This is an optimization for the common case of autocommit queries.
+    committed_row_count: AtomicUsize,
 }
 
 impl VersionStore {
@@ -452,6 +456,7 @@ impl VersionStore {
             row_arena_index,
             zone_maps: RwLock::new(None),
             max_version_history: 10, // Default: keep up to 10 previous versions
+            committed_row_count: AtomicUsize::new(0),
         }
     }
 
@@ -483,6 +488,7 @@ impl VersionStore {
             row_arena_index,
             zone_maps: RwLock::new(None),
             max_version_history: 10,
+            committed_row_count: AtomicUsize::new(0),
         }
     }
 
@@ -591,6 +597,8 @@ impl VersionStore {
             return;
         }
 
+        let is_new_version_deleted = version.deleted_at_txn_id != 0;
+
         // Use write lock for the entire operation (MVCC single-writer semantics)
         let mut versions = self.versions.write();
 
@@ -601,6 +609,16 @@ impl VersionStore {
                 let existing = occupied.get();
                 let existing_arena_idx = existing.arena_idx;
                 let existing_depth = existing.chain_depth;
+                let was_deleted = existing.version.deleted_at_txn_id != 0;
+
+                // Update committed row count based on delete state transitions
+                if was_deleted && !is_new_version_deleted {
+                    // Row was deleted, now being re-inserted -> increment
+                    self.committed_row_count.fetch_add(1, Ordering::Relaxed);
+                } else if !was_deleted && is_new_version_deleted {
+                    // Row was visible, now being deleted -> decrement
+                    self.committed_row_count.fetch_sub(1, Ordering::Relaxed);
+                }
 
                 // O(1) chain management with depth tracking
                 // When limit exceeded: drop old chain AND reuse arena slot
@@ -692,6 +710,9 @@ impl VersionStore {
                 // First version for this row - store in arena
                 // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
                 let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
+                    // New non-deleted row -> increment counter
+                    self.committed_row_count.fetch_add(1, Ordering::Relaxed);
+
                     let mut v = version;
                     // Convert Row to Arc once (takes ownership, no copy if already Arc)
                     let arc_data = std::mem::take(&mut v.data).into_arc();
@@ -742,7 +763,12 @@ impl VersionStore {
         // Collect arena index updates to batch them under a single lock
         let mut arena_index_updates: Vec<(i64, usize)> = Vec::with_capacity(batch.len());
 
+        // Track row count delta: positive for inserts, negative for deletes
+        let mut count_delta: isize = 0;
+
         for (row_id, version) in batch {
+            let is_new_version_deleted = version.deleted_at_txn_id != 0;
+
             // Use entry API to avoid double BTreeMap traversal (get + insert -> single entry)
             match versions.entry(row_id) {
                 std::collections::btree_map::Entry::Occupied(mut occupied) => {
@@ -750,6 +776,14 @@ impl VersionStore {
                     let existing = occupied.get();
                     let existing_arena_idx = existing.arena_idx;
                     let existing_depth = existing.chain_depth;
+                    let was_deleted = existing.version.deleted_at_txn_id != 0;
+
+                    // Track row count changes based on delete state transitions
+                    if was_deleted && !is_new_version_deleted {
+                        count_delta += 1; // Row re-inserted
+                    } else if !was_deleted && is_new_version_deleted {
+                        count_delta -= 1; // Row deleted
+                    }
 
                     // O(1) chain management with depth tracking
                     // When limit exceeded: drop old chain AND reuse arena slot
@@ -840,6 +874,9 @@ impl VersionStore {
                     // First version for this row - store in arena with Arc reuse
                     // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
                     let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
+                        // New non-deleted row -> will increment counter
+                        count_delta += 1;
+
                         let mut v = version;
                         // Convert Row to Arc once (takes ownership, no copy if already Arc)
                         let arc_data = std::mem::take(&mut v.data).into_arc();
@@ -878,6 +915,15 @@ impl VersionStore {
                 index.insert(row_id, idx);
             }
         }
+
+        // Apply count delta in a single atomic operation
+        if count_delta > 0 {
+            self.committed_row_count
+                .fetch_add(count_delta as usize, Ordering::Relaxed);
+        } else if count_delta < 0 {
+            self.committed_row_count
+                .fetch_sub((-count_delta) as usize, Ordering::Relaxed);
+        }
     }
 
     /// Add a single version to the store (optimized for auto-commit single-row inserts)
@@ -889,6 +935,7 @@ impl VersionStore {
             return;
         }
 
+        let is_new_version_deleted = version.deleted_at_txn_id != 0;
         let mut versions = self.versions.write();
 
         match versions.entry(row_id) {
@@ -897,6 +944,16 @@ impl VersionStore {
                 let existing = occupied.get();
                 let existing_arena_idx = existing.arena_idx;
                 let existing_depth = existing.chain_depth;
+                let was_deleted = existing.version.deleted_at_txn_id != 0;
+
+                // Update committed row count based on delete state transitions
+                if was_deleted && !is_new_version_deleted {
+                    // Row was deleted, now being re-inserted -> increment
+                    self.committed_row_count.fetch_add(1, Ordering::Relaxed);
+                } else if !was_deleted && is_new_version_deleted {
+                    // Row was visible, now being deleted -> decrement
+                    self.committed_row_count.fetch_sub(1, Ordering::Relaxed);
+                }
 
                 // O(1) chain management with depth tracking
                 // When limit exceeded: drop old chain AND reuse arena slot
@@ -982,6 +1039,9 @@ impl VersionStore {
             }
             std::collections::btree_map::Entry::Vacant(vacant) => {
                 let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
+                    // New non-deleted row -> increment counter
+                    self.committed_row_count.fetch_add(1, Ordering::Relaxed);
+
                     let mut v = version;
                     let arc_data = std::mem::take(&mut v.data).into_arc();
                     let idx = self.arena.insert_arc(
@@ -1616,6 +1676,20 @@ impl VersionStore {
         }
 
         count
+    }
+
+    /// Returns the count of committed non-deleted rows (O(1) operation)
+    ///
+    /// This is the fast path for COUNT(*) queries without WHERE clause.
+    /// The counter is updated atomically on INSERT commit (+1) and DELETE commit (-1).
+    ///
+    /// # Important
+    ///
+    /// This count does NOT include uncommitted changes from the current transaction.
+    /// Use this only for queries that see committed data (e.g., autocommit queries).
+    #[inline]
+    pub fn committed_row_count(&self) -> usize {
+        self.committed_row_count.load(Ordering::Relaxed)
     }
 
     /// Returns all visible rows for a transaction (optimized batch operation)

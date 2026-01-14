@@ -623,6 +623,297 @@ impl FromIterator<(i64, Row)> for RowVec {
     }
 }
 
+// ============================================================================
+// RowIdVec - Cached Vec<i64> for zero-allocation index lookups
+// ============================================================================
+
+/// Maximum capacity to cache for RowIdVec (prevents unbounded memory retention)
+/// 256K elements = ~2MB at 8 bytes per i64
+const ROW_ID_MAX_CACHED_CAPACITY: usize = 256_000;
+
+/// Pool size for RowIdVec - same as RowVec
+const ROW_ID_POOL_SIZE: usize = 16;
+
+// Thread-local pool for row ID vectors - kept sorted by capacity (ascending)
+thread_local! {
+    static ROW_ID_VEC_POOL: RefCell<Vec<Vec<i64>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Clear the thread-local RowIdVec pool, releasing all cached buffers.
+/// Call this when dropping a database to prevent memory retention.
+#[inline]
+pub fn clear_row_id_vec_pool() {
+    ROW_ID_VEC_POOL.with(|pool| {
+        pool.borrow_mut().clear();
+    });
+}
+
+/// Cached row ID vector that returns to thread-local cache on drop.
+///
+/// Use this for index lookups to reuse Vec<i64> allocations across queries.
+/// Derefs to `Vec<i64>` for transparent access.
+#[derive(Debug)]
+pub struct RowIdVec {
+    inner: Option<Vec<i64>>,
+}
+
+impl RowIdVec {
+    /// Create from thread-local pool or allocate new.
+    /// Takes the largest available buffer (end of sorted list).
+    #[inline]
+    pub fn new() -> Self {
+        let v = ROW_ID_VEC_POOL.with(|pool| pool.borrow_mut().pop());
+        match v {
+            Some(buf) => Self { inner: Some(buf) },
+            None => Self {
+                inner: Some(Vec::with_capacity(16)),
+            },
+        }
+    }
+
+    /// Create with specific capacity using best-fit allocation.
+    /// Uses binary search to find smallest buffer >= requested capacity.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        let v = ROW_ID_VEC_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.is_empty() {
+                return None;
+            }
+            // Binary search for smallest buffer >= capacity
+            let idx = pool.partition_point(|b| b.capacity() < capacity);
+            if idx < pool.len() {
+                // Found a buffer with sufficient capacity
+                Some(pool.remove(idx))
+            } else {
+                // No buffer large enough - take largest and let it grow
+                pool.pop()
+            }
+        });
+
+        match v {
+            Some(mut buf) => {
+                let buf_cap = buf.capacity();
+                if buf_cap < capacity {
+                    // Need to grow buffer
+                    buf.reserve(capacity - buf_cap);
+                }
+                Self { inner: Some(buf) }
+            }
+            None => Self {
+                inner: Some(Vec::with_capacity(capacity)),
+            },
+        }
+    }
+
+    /// Create from an existing Vec<i64>.
+    /// NOTE: This bypasses the cache - use when you already have allocated data.
+    #[inline]
+    pub fn from_vec(v: Vec<i64>) -> Self {
+        Self { inner: Some(v) }
+    }
+
+    /// Extract the inner Vec directly, bypassing cache return.
+    /// Use this when you need to pass the Vec to APIs that require Vec<i64>.
+    /// The allocation is NOT returned to the cache.
+    #[inline]
+    pub fn into_vec(mut self) -> Vec<i64> {
+        self.inner.take().unwrap_or_default()
+    }
+
+    /// Get length
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.as_ref().map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Check if empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Push a row ID
+    #[inline]
+    pub fn push(&mut self, item: i64) {
+        if let Some(v) = self.inner.as_mut() {
+            v.push(item);
+        }
+    }
+
+    /// Extend from iterator
+    #[inline]
+    pub fn extend<I: IntoIterator<Item = i64>>(&mut self, iter: I) {
+        if let Some(v) = self.inner.as_mut() {
+            v.extend(iter);
+        }
+    }
+
+    /// Clear the vector (keeps allocation)
+    #[inline]
+    pub fn clear(&mut self) {
+        if let Some(v) = self.inner.as_mut() {
+            v.clear();
+        }
+    }
+
+    /// Get iterator over row IDs
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &i64> {
+        self.inner.as_ref().unwrap().iter()
+    }
+
+    /// Reserve capacity
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        if let Some(v) = self.inner.as_mut() {
+            v.reserve(additional);
+        }
+    }
+
+    /// Sort the row IDs
+    #[inline]
+    pub fn sort(&mut self) {
+        if let Some(v) = self.inner.as_mut() {
+            v.sort_unstable();
+        }
+    }
+
+    /// Dedup the row IDs (requires sorted)
+    #[inline]
+    pub fn dedup(&mut self) {
+        if let Some(v) = self.inner.as_mut() {
+            v.dedup();
+        }
+    }
+}
+
+impl Default for RowIdVec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for RowIdVec {
+    fn clone(&self) -> Self {
+        let mut cloned = RowIdVec::with_capacity(self.len());
+        if let Some(v) = self.inner.as_ref() {
+            cloned.extend(v.iter().copied());
+        }
+        cloned
+    }
+}
+
+impl std::ops::Deref for RowIdVec {
+    type Target = Vec<i64>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for RowIdVec {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.as_mut().unwrap()
+    }
+}
+
+impl Drop for RowIdVec {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(mut v) = self.inner.take() {
+            let cap = v.capacity();
+            // Don't cache very large buffers to prevent unbounded memory retention
+            if cap > ROW_ID_MAX_CACHED_CAPACITY {
+                return; // Let it deallocate
+            }
+            v.clear();
+            ROW_ID_VEC_POOL.with(|pool| {
+                let mut pool = pool.borrow_mut();
+                if pool.len() < ROW_ID_POOL_SIZE {
+                    // Pool has room - insert in sorted position (by capacity, ascending)
+                    let insert_idx = pool.partition_point(|b| b.capacity() < cap);
+                    pool.insert(insert_idx, v);
+                } else {
+                    // Pool full - smart eviction: keep larger buffers (more versatile)
+                    // Replace smallest if this buffer is larger
+                    if !pool.is_empty() && pool[0].capacity() < cap {
+                        // Remove smallest (index 0), insert this one in sorted position
+                        pool.remove(0);
+                        let insert_idx = pool.partition_point(|b| b.capacity() < cap);
+                        pool.insert(insert_idx, v);
+                    }
+                    // Otherwise let v deallocate - it's smaller than everything in pool
+                }
+            });
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a RowIdVec {
+    type Item = &'a i64;
+    type IntoIter = std::slice::Iter<'a, i64>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.as_ref().unwrap().iter()
+    }
+}
+
+/// Owning iterator for RowIdVec.
+///
+/// Note: The buffer is NOT returned to pool when using into_iter().
+/// This is because std::vec::IntoIter consumes the buffer and it cannot
+/// be recovered in stable Rust. For buffer reuse, prefer iter() + collect().
+pub struct RowIdVecIntoIter {
+    inner: std::vec::IntoIter<i64>,
+}
+
+impl Iterator for RowIdVecIntoIter {
+    type Item = i64;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ExactSizeIterator for RowIdVecIntoIter {}
+
+impl IntoIterator for RowIdVec {
+    type Item = i64;
+    type IntoIter = RowIdVecIntoIter;
+
+    #[inline]
+    fn into_iter(mut self) -> Self::IntoIter {
+        let v = self.inner.take().unwrap_or_default();
+        RowIdVecIntoIter {
+            inner: v.into_iter(),
+        }
+    }
+}
+
+// Allow collecting into RowIdVec
+impl FromIterator<i64> for RowIdVec {
+    fn from_iter<I: IntoIterator<Item = i64>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        let capacity = upper.unwrap_or(lower).max(16);
+        let mut rv = RowIdVec::with_capacity(capacity);
+        for item in iter {
+            rv.push(item);
+        }
+        rv
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

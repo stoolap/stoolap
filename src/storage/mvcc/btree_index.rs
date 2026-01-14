@@ -40,7 +40,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::common::CompactArc;
-use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
+use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
 
@@ -196,10 +196,9 @@ impl BTreeIndex {
     /// Uses the BTreeMap for O(log n) lookup
     pub fn get_row_ids_for_value(&self, value: &Value) -> Vec<i64> {
         let sorted_values = self.sorted_values.read().unwrap();
-        // Create a temporary Arc for lookup (BTreeMap compares by value, not pointer)
-        let lookup_key = CompactArc::new(value.clone());
+        // Use Borrow trait - BTreeMap accepts &Value since CompactArc<Value>: Borrow<Value>
         sorted_values
-            .get(&lookup_key)
+            .get(value)
             .map(|set| set.iter().copied().collect())
             .unwrap_or_default()
     }
@@ -208,8 +207,8 @@ impl BTreeIndex {
     /// Uses BTreeMap for O(log n) lookup
     pub fn contains_value(&self, value: &Value) -> bool {
         let sorted_values = self.sorted_values.read().unwrap();
-        let lookup_key = CompactArc::new(value.clone());
-        sorted_values.contains_key(&lookup_key)
+        // Use Borrow trait - no allocation needed
+        sorted_values.contains_key(value)
     }
 
     /// Checks if a row ID exists in the index
@@ -274,19 +273,19 @@ impl BTreeIndex {
     /// Uses BTreeMap for O(log n + k) range queries instead of O(n) full scans
     fn find_with_op(&self, op: Operator, value: &Value) -> Vec<i64> {
         let sorted_values = self.sorted_values.read().unwrap();
-        // Create lookup key for BTreeMap operations
-        let lookup_key = CompactArc::new(value.clone());
 
         match op {
-            // Equality uses BTreeMap for O(log n) lookup
+            // Equality uses BTreeMap for O(log n) lookup via Borrow trait
             Operator::Eq | Operator::In => sorted_values
-                .get(&lookup_key)
+                .get(value)
                 .map(|rows| rows.iter().copied().collect())
                 .unwrap_or_default(),
 
-            // Range queries use BTreeMap for O(log n + k) performance
+            // Range queries need owned keys for bounds (BTreeMap limitation)
+            // We create CompactArc only when needed for range operations
             Operator::Lt => {
                 // range(..value) gives us all values < value
+                let lookup_key = CompactArc::new(value.clone());
                 let capacity = sorted_values.len() / 4; // Estimate
                 let mut results = Vec::with_capacity(capacity);
                 for (_, rows) in sorted_values.range(..lookup_key) {
@@ -297,6 +296,7 @@ impl BTreeIndex {
 
             Operator::Lte => {
                 // range(..=value) gives us all values <= value
+                let lookup_key = CompactArc::new(value.clone());
                 let capacity = sorted_values.len() / 4;
                 let mut results = Vec::with_capacity(capacity);
                 for (_, rows) in sorted_values.range(..=lookup_key) {
@@ -307,6 +307,7 @@ impl BTreeIndex {
 
             Operator::Gt => {
                 // range((Excluded(value), Unbounded)) gives us all values > value
+                let lookup_key = CompactArc::new(value.clone());
                 let capacity = sorted_values.len() / 4;
                 let mut results = Vec::with_capacity(capacity);
                 for (_, rows) in
@@ -319,6 +320,7 @@ impl BTreeIndex {
 
             Operator::Gte => {
                 // range(value..) gives us all values >= value
+                let lookup_key = CompactArc::new(value.clone());
                 let capacity = sorted_values.len() / 4;
                 let mut results = Vec::with_capacity(capacity);
                 for (_, rows) in sorted_values.range(lookup_key..) {
@@ -604,10 +606,9 @@ impl Index for BTreeIndex {
 
         let value = &values[0];
         let sorted_values = self.sorted_values.read().unwrap();
-        let lookup_key = CompactArc::new(value.clone());
-
+        // Use Borrow trait - no allocation needed for equality lookup
         let entries = sorted_values
-            .get(&lookup_key)
+            .get(value)
             .map(|rows| {
                 rows.iter()
                     .map(|&row_id| IndexEntry {
@@ -691,12 +692,6 @@ impl Index for BTreeIndex {
             .collect())
     }
 
-    fn get_row_ids_equal(&self, values: &[Value]) -> Vec<i64> {
-        let mut ids = Vec::new();
-        self.get_row_ids_equal_into(values, &mut ids);
-        ids
-    }
-
     fn get_row_ids_equal_into(&self, values: &[Value], buffer: &mut Vec<i64>) {
         if values.is_empty() {
             return;
@@ -704,9 +699,8 @@ impl Index for BTreeIndex {
 
         let value = &values[0];
         let sorted_values = self.sorted_values.read().unwrap();
-        let lookup_key = CompactArc::new(value.clone());
-
-        if let Some(rows) = sorted_values.get(&lookup_key) {
+        // Use Borrow trait - no allocation needed for equality lookup
+        if let Some(rows) = sorted_values.get(value) {
             // Optimization: SmallVec can be iterated quickly
             buffer.extend(rows.iter().copied());
         }
@@ -755,9 +749,9 @@ impl Index for BTreeIndex {
         }
     }
 
-    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> Vec<i64> {
+    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Vec::new();
+            return RowIdVec::new();
         }
 
         // Try to get comparison info from expression
@@ -778,7 +772,7 @@ impl Index for BTreeIndex {
                             Operator::Gte => (value_slice, empty_slice, true, false),
                             Operator::Lt => (empty_slice, value_slice, false, false),
                             Operator::Lte => (empty_slice, value_slice, false, true),
-                            _ => return Vec::new(),
+                            _ => return RowIdVec::new(),
                         };
 
                         return self.get_row_ids_in_range(
@@ -850,7 +844,7 @@ impl Index for BTreeIndex {
         if row_to_value.len() >= PARALLEL_FILTER_THRESHOLD {
             // Parallel filtering with Rayon
             let pairs: Vec<_> = row_to_value.iter().collect();
-            pairs
+            let collected: Vec<i64> = pairs
                 .par_iter()
                 .filter_map(|&(&row_id, arc_value)| {
                     // Dereference Arc to get the Value
@@ -861,10 +855,11 @@ impl Index for BTreeIndex {
                         None
                     }
                 })
-                .collect()
+                .collect();
+            RowIdVec::from_vec(collected)
         } else {
             // Sequential for small datasets
-            let mut results = Vec::with_capacity(row_to_value.len() / 4);
+            let mut results = RowIdVec::with_capacity(row_to_value.len() / 4);
             for (&row_id, arc_value) in row_to_value.iter() {
                 // Dereference Arc to get the Value
                 let row = crate::core::Row::from_values(vec![(**arc_value).clone()]);
@@ -917,6 +912,16 @@ impl Index for BTreeIndex {
         // Use sorted_values for deterministic ordering
         let sorted_values = self.sorted_values.read().unwrap();
         sorted_values.keys().map(|arc| (**arc).clone()).collect()
+    }
+
+    fn get_distinct_count_excluding_null(&self) -> Option<usize> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return None;
+        }
+        let sorted_values = self.sorted_values.read().unwrap();
+        // Count non-null values without cloning
+        let count = sorted_values.keys().filter(|v| !v.is_null()).count();
+        Some(count)
     }
 
     fn get_row_ids_ordered(
@@ -1044,22 +1049,23 @@ impl Index for BTreeIndex {
 /// Intersects two sorted slices of i64 and returns the common elements
 ///
 /// This is an O(n) algorithm when both slices are sorted.
-pub fn intersect_sorted_ids(a: &[i64], b: &[i64]) -> Vec<i64> {
+/// Returns a pooled RowIdVec for efficient memory reuse.
+pub fn intersect_sorted_ids(a: &[i64], b: &[i64]) -> RowIdVec {
     if a.is_empty() || b.is_empty() {
-        return Vec::new();
+        return RowIdVec::new();
     }
 
     // Fast path: check if ranges don't overlap at all
     let (a_min, a_max) = (a[0], a[a.len() - 1]);
     let (b_min, b_max) = (b[0], b[b.len() - 1]);
     if a_max < b_min || b_max < a_min {
-        return Vec::new();
+        return RowIdVec::new();
     }
 
     // Use the smaller slice for the outer loop (binary search approach)
     let (smaller, larger) = if a.len() <= b.len() { (a, b) } else { (b, a) };
 
-    let mut result = Vec::with_capacity(smaller.len());
+    let mut result = RowIdVec::with_capacity(smaller.len());
 
     for &val in smaller {
         if larger.binary_search(&val).is_ok() {
@@ -1071,20 +1077,23 @@ pub fn intersect_sorted_ids(a: &[i64], b: &[i64]) -> Vec<i64> {
 }
 
 /// Intersects multiple sorted slices and returns common elements
-pub fn intersect_multiple_sorted_ids(slices: &[Vec<i64>]) -> Vec<i64> {
+/// Returns a pooled RowIdVec for efficient memory reuse.
+pub fn intersect_multiple_sorted_ids(slices: &[&[i64]]) -> RowIdVec {
     if slices.is_empty() {
-        return Vec::new();
+        return RowIdVec::new();
     }
     if slices.len() == 1 {
-        return slices[0].clone();
+        let mut result = RowIdVec::with_capacity(slices[0].len());
+        result.extend(slices[0].iter().copied());
+        return result;
     }
 
-    let mut result = slices[0].clone();
-    for slice in &slices[1..] {
-        result = intersect_sorted_ids(&result, slice);
+    let mut result = intersect_sorted_ids(slices[0], slices[1]);
+    for slice in &slices[2..] {
         if result.is_empty() {
             break;
         }
+        result = intersect_sorted_ids(&result, slice);
     }
     result
 }
@@ -1094,15 +1103,20 @@ pub fn intersect_multiple_sorted_ids(slices: &[Vec<i64>]) -> Vec<i64> {
 /// Returns a sorted slice containing all unique elements from both input slices.
 /// This is an O(n+m) algorithm when both slices are sorted.
 /// Used for OR expression index optimization.
-pub fn union_sorted_ids(a: &[i64], b: &[i64]) -> Vec<i64> {
+/// Returns a pooled RowIdVec for efficient memory reuse.
+pub fn union_sorted_ids(a: &[i64], b: &[i64]) -> RowIdVec {
     if a.is_empty() {
-        return b.to_vec();
+        let mut result = RowIdVec::with_capacity(b.len());
+        result.extend(b.iter().copied());
+        return result;
     }
     if b.is_empty() {
-        return a.to_vec();
+        let mut result = RowIdVec::with_capacity(a.len());
+        result.extend(a.iter().copied());
+        return result;
     }
 
-    let mut result = Vec::with_capacity(a.len() + b.len());
+    let mut result = RowIdVec::with_capacity(a.len() + b.len());
     let mut i = 0;
     let mut j = 0;
 
@@ -1125,23 +1139,26 @@ pub fn union_sorted_ids(a: &[i64], b: &[i64]) -> Vec<i64> {
     }
 
     // Append remaining elements
-    result.extend_from_slice(&a[i..]);
-    result.extend_from_slice(&b[j..]);
+    result.extend(a[i..].iter().copied());
+    result.extend(b[j..].iter().copied());
 
     result
 }
 
 /// Union multiple sorted slices and returns all unique elements
-pub fn union_multiple_sorted_ids(slices: &[Vec<i64>]) -> Vec<i64> {
+/// Returns a pooled RowIdVec for efficient memory reuse.
+pub fn union_multiple_sorted_ids(slices: &[&[i64]]) -> RowIdVec {
     if slices.is_empty() {
-        return Vec::new();
+        return RowIdVec::new();
     }
     if slices.len() == 1 {
-        return slices[0].clone();
+        let mut result = RowIdVec::with_capacity(slices[0].len());
+        result.extend(slices[0].iter().copied());
+        return result;
     }
 
-    let mut result = slices[0].clone();
-    for slice in &slices[1..] {
+    let mut result = union_sorted_ids(slices[0], slices[1]);
+    for slice in &slices[2..] {
         result = union_sorted_ids(&result, slice);
     }
     result

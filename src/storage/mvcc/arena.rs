@@ -84,6 +84,8 @@ pub struct RowArena {
 
 impl RowArena {
     /// Create a new arena
+    /// Note: Pre-allocate 10,000 slots to avoid reallocation during bulk inserts.
+    /// Vec doubling during growth can cause peak memory spikes.
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(ArenaInner {

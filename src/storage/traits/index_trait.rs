@@ -18,7 +18,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::common::CompactArc;
-use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, Value};
+use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 
 /// Index represents an abstract index for a column or set of columns
@@ -150,8 +150,9 @@ pub trait Index: Send + Sync {
     /// Returns row IDs with the given values (convenience method)
     ///
     /// This is a simplified version of `find` that returns only row IDs.
-    fn get_row_ids_equal(&self, values: &[Value]) -> Vec<i64> {
-        let mut row_ids = Vec::new();
+    /// Returns a pooled RowIdVec that is automatically recycled on drop.
+    fn get_row_ids_equal(&self, values: &[Value]) -> RowIdVec {
+        let mut row_ids = RowIdVec::new();
         self.get_row_ids_equal_into(values, &mut row_ids);
         row_ids
     }
@@ -173,14 +174,15 @@ pub trait Index: Send + Sync {
     /// Returns row IDs with values in the given range (convenience method)
     ///
     /// This is a simplified version of `find_range` that returns only row IDs.
+    /// Returns a pooled RowIdVec that is automatically recycled on drop.
     fn get_row_ids_in_range(
         &self,
         min_value: &[Value],
         max_value: &[Value],
         include_min: bool,
         include_max: bool,
-    ) -> Vec<i64> {
-        let mut row_ids = Vec::new();
+    ) -> RowIdVec {
+        let mut row_ids = RowIdVec::new();
         self.get_row_ids_in_range_into(
             min_value,
             max_value,
@@ -222,9 +224,9 @@ pub trait Index: Send + Sync {
     /// * `value_list` - List of values to match (each is a single column value)
     ///
     /// # Returns
-    /// Vector of row IDs matching any value in the list
-    fn get_row_ids_in(&self, value_list: &[Value]) -> Vec<i64> {
-        let mut results = Vec::new();
+    /// Pooled RowIdVec of row IDs matching any value in the list
+    fn get_row_ids_in(&self, value_list: &[Value]) -> RowIdVec {
+        let mut results = RowIdVec::new();
         self.get_row_ids_in_into(value_list, &mut results);
         results
     }
@@ -245,8 +247,8 @@ pub trait Index: Send + Sync {
     /// * `expr` - The expression to evaluate
     ///
     /// # Returns
-    /// Vector of row IDs matching the expression
-    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> Vec<i64>;
+    /// Pooled RowIdVec of row IDs matching the expression
+    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec;
 
     /// Returns the minimum value in the index (for MIN aggregate optimization)
     ///
@@ -269,6 +271,16 @@ pub trait Index: Send + Sync {
     /// This enables sorted iteration through unique values for TOP-N queries.
     fn get_all_values(&self) -> Vec<Value> {
         Vec::new() // Default implementation - override in concrete indexes
+    }
+
+    /// Returns the count of distinct non-null values in the index
+    ///
+    /// This enables O(1) COUNT(DISTINCT col) queries on indexed columns
+    /// without cloning all values. Per SQL standard, NULL values are excluded.
+    ///
+    /// Returns None if the index doesn't support this optimization.
+    fn get_distinct_count_excluding_null(&self) -> Option<usize> {
+        None // Default implementation - override in concrete indexes
     }
 
     /// Returns row IDs in sorted order by index value (for ORDER BY optimization)
