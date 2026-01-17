@@ -20,7 +20,7 @@ use super::token::{
     is_keyword, is_operator, is_operator_char, is_punctuator, punctuator_str, Position, Token,
     TokenType,
 };
-use compact_str::CompactString;
+use crate::common::SmartString;
 
 /// SQL Lexer for tokenizing input
 ///
@@ -288,8 +288,8 @@ impl Lexer {
     }
 
     /// Read an identifier
-    fn read_identifier(&mut self) -> CompactString {
-        let mut result = CompactString::new("");
+    fn read_identifier(&mut self) -> SmartString {
+        let mut result = SmartString::new("");
         result.push(self.ch);
         self.read_char();
 
@@ -302,8 +302,8 @@ impl Lexer {
     }
 
     /// Read a number (integer or float)
-    fn read_number(&mut self) -> CompactString {
-        let mut result = CompactString::new("");
+    fn read_number(&mut self) -> SmartString {
+        let mut result = SmartString::new("");
         result.push(self.ch);
         self.read_char();
 
@@ -353,8 +353,8 @@ impl Lexer {
     }
 
     /// Read a string literal (single-quoted)
-    fn read_string_literal(&mut self) -> CompactString {
-        let mut result = CompactString::new("");
+    fn read_string_literal(&mut self) -> SmartString {
+        let mut result = SmartString::new("");
         let quote = self.ch;
         result.push(quote);
         self.read_char(); // consume opening quote
@@ -395,8 +395,8 @@ impl Lexer {
     }
 
     /// Read a quoted identifier (double quotes or backticks)
-    fn read_quoted_identifier(&mut self, quote: char) -> CompactString {
-        let mut result = CompactString::new("");
+    fn read_quoted_identifier(&mut self, quote: char) -> SmartString {
+        let mut result = SmartString::new("");
         self.read_char(); // consume opening quote
 
         while self.ch != '\0' {
@@ -428,8 +428,8 @@ impl Lexer {
     }
 
     /// Read a single-line comment (-- or #)
-    fn read_line_comment(&mut self) -> CompactString {
-        let mut result = CompactString::new("");
+    fn read_line_comment(&mut self) -> SmartString {
+        let mut result = SmartString::new("");
         result.push(self.ch);
 
         // Skip the start of comment (-- or #)
@@ -451,8 +451,8 @@ impl Lexer {
     }
 
     /// Read a block comment (/* ... */)
-    fn read_block_comment(&mut self) -> CompactString {
-        let mut result = CompactString::new("");
+    fn read_block_comment(&mut self) -> SmartString {
+        let mut result = SmartString::new("");
 
         // Start with the opening /* sequence
         result.push(self.ch); // /
@@ -480,16 +480,16 @@ impl Lexer {
     }
 
     /// Read an operator
-    fn read_operator(&mut self) -> CompactString {
-        let mut result = CompactString::new("");
+    fn read_operator(&mut self) -> SmartString {
+        let mut result = SmartString::new("");
         let first_char = self.ch;
         result.push(first_char);
         self.read_char();
 
         // Check for multi-character operators
         if self.ch != '\0' {
-            let two_chars: CompactString =
-                CompactString::from_iter([first_char, self.ch].iter().copied());
+            let two_chars: SmartString =
+                SmartString::from_iter([first_char, self.ch].iter().copied());
             if is_operator(&two_chars) {
                 result.push(self.ch);
                 self.read_char();
@@ -510,8 +510,8 @@ impl Lexer {
     }
 
     /// Read a parameter ($1, $2, etc.)
-    fn read_parameter(&mut self) -> CompactString {
-        let mut result = CompactString::new("");
+    fn read_parameter(&mut self) -> SmartString {
+        let mut result = SmartString::new("");
         result.push(self.ch); // $
         self.read_char();
 
@@ -530,8 +530,8 @@ impl Lexer {
     }
 
     /// Read a named parameter (:name)
-    fn read_named_parameter(&mut self) -> CompactString {
-        let mut result = CompactString::new("");
+    fn read_named_parameter(&mut self) -> SmartString {
+        let mut result = SmartString::new("");
         result.push(self.ch); // :
         self.read_char();
 

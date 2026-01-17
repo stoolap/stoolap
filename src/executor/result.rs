@@ -444,7 +444,7 @@ pub struct FilteredResult {
     columns: Vec<String>,
 }
 
-// FilteredResult is Send because all fields are Send:
+// SAFETY: FilteredResult is Send because all fields are Send:
 // - Box<dyn QueryResult> is Send (trait bound)
 // - RowFilter is Send+Sync (uses Arc internally)
 // - Option<Row> and Vec<String> are Send
@@ -602,7 +602,7 @@ pub struct ExprMappedResult {
     source_columns_lower: Vec<String>,
 }
 
-// ExprMappedResult is Send because all fields are Send:
+// SAFETY: ExprMappedResult is Send because all fields are Send:
 // - Box<dyn QueryResult> is Send (trait bound)
 // - CompiledProjection is Send (SharedProgram uses Arc)
 // - ExprVM is Send

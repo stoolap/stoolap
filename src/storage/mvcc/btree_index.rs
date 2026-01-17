@@ -36,10 +36,8 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 
-use crate::common::CompactArc;
+use crate::common::{CompactArc, CompactVec, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
@@ -47,9 +45,8 @@ use crate::storage::traits::Index;
 /// Threshold for parallel filtering (number of unique values)
 const PARALLEL_FILTER_THRESHOLD: usize = 10_000;
 
-/// SmallVec inline capacity for row IDs per value
-/// Most values have few rows, so 4 inline slots avoids heap allocation
-type RowIdSet = SmallVec<[i64; 4]>;
+/// CompactVec for row IDs per value (16 bytes vs SmallVec's 48 bytes)
+type RowIdSet = CompactVec<i64>;
 
 /// B-tree index for efficient range queries and ordered access
 ///
@@ -100,8 +97,8 @@ pub struct BTreeIndex {
     sorted_values: RwLock<BTreeMap<CompactArc<Value>, RowIdSet>>,
 
     /// Row ID to value mapping (for removal operations)
-    /// Uses FxHashMap for O(1) lookups with CompactArc<Value> (8 bytes per entry)
-    row_to_value: RwLock<FxHashMap<i64, CompactArc<Value>>>,
+    /// Uses I64Map for fast O(1) lookups with CompactArc<Value> (8 bytes per entry)
+    row_to_value: RwLock<I64Map<CompactArc<Value>>>,
 
     /// Cached minimum value (excluding NULLs)
     cached_min: RwLock<Option<CompactArc<Value>>>,
@@ -135,7 +132,7 @@ impl BTreeIndex {
             unique,
             closed: AtomicBool::new(false),
             sorted_values: RwLock::new(BTreeMap::new()),
-            row_to_value: RwLock::new(FxHashMap::default()),
+            row_to_value: RwLock::new(I64Map::new()),
             cached_min: RwLock::new(None),
             cached_max: RwLock::new(None),
             cache_valid: AtomicBool::new(true),
@@ -214,7 +211,7 @@ impl BTreeIndex {
     /// Checks if a row ID exists in the index
     pub fn contains_row(&self, row_id: i64) -> bool {
         let row_to_value = self.row_to_value.read().unwrap();
-        row_to_value.contains_key(&row_id)
+        row_to_value.contains_key(row_id)
     }
 
     /// Invalidate the min/max cache (called on mutations)
@@ -404,7 +401,7 @@ impl Index for BTreeIndex {
 
         // Check if this row_id already exists with the same value (no-op)
         // or different value (need to remove old entry first)
-        if let Some(old_arc) = row_to_value.get(&row_id) {
+        if let Some(old_arc) = row_to_value.get(row_id) {
             if old_arc.as_ref() == value {
                 // Same value, nothing to do
                 return Ok(());
@@ -475,7 +472,7 @@ impl Index for BTreeIndex {
 
         // Check if this row_id already exists with the same value (no-op)
         // or different value (need to remove old entry first)
-        if let Some(old_arc) = row_to_value.get(&row_id) {
+        if let Some(old_arc) = row_to_value.get(row_id) {
             if old_arc == arc_value {
                 // Same value, nothing to do
                 return Ok(());
@@ -524,11 +521,11 @@ impl Index for BTreeIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
+    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
         self.check_closed()?;
 
-        for (row_id, values) in entries {
-            self.add(values, *row_id, self.next_ref())?;
+        for (row_id, values) in entries.iter() {
+            self.add(values, row_id, self.next_ref())?;
         }
         Ok(())
     }
@@ -541,7 +538,7 @@ impl Index for BTreeIndex {
         let mut row_to_value = self.row_to_value.write().unwrap();
 
         // Check if the row exists and remove atomically
-        if let Some(arc_value) = row_to_value.remove(&row_id) {
+        if let Some(arc_value) = row_to_value.remove(row_id) {
             // Remove from sorted index (row_ids are sorted, use binary search)
             if let Some(rows) = sorted_values.get_mut(&arc_value) {
                 if let Ok(pos) = rows.binary_search(&row_id) {
@@ -568,11 +565,11 @@ impl Index for BTreeIndex {
         self.remove(&[], row_id, ref_id)
     }
 
-    fn remove_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
+    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
         self.check_closed()?;
 
-        for (row_id, values) in entries {
-            self.remove(values, *row_id, 0)?;
+        for (row_id, values) in entries.iter() {
+            self.remove(values, row_id, 0)?;
         }
         Ok(())
     }
@@ -846,7 +843,7 @@ impl Index for BTreeIndex {
             let pairs: Vec<_> = row_to_value.iter().collect();
             let collected: Vec<i64> = pairs
                 .par_iter()
-                .filter_map(|&(&row_id, arc_value)| {
+                .filter_map(|&(row_id, arc_value)| {
                     // Dereference Arc to get the Value
                     let row = crate::core::Row::from_values(vec![(**arc_value).clone()]);
                     if expr.evaluate(&row).unwrap_or(false) {
@@ -860,7 +857,7 @@ impl Index for BTreeIndex {
         } else {
             // Sequential for small datasets
             let mut results = RowIdVec::with_capacity(row_to_value.len() / 4);
-            for (&row_id, arc_value) in row_to_value.iter() {
+            for (row_id, arc_value) in row_to_value.iter() {
                 // Dereference Arc to get the Value
                 let row = crate::core::Row::from_values(vec![(**arc_value).clone()]);
                 if expr.evaluate(&row).unwrap_or(false) {
@@ -1323,7 +1320,7 @@ mod tests {
     fn test_btree_index_batch_operations() {
         let index = create_test_index();
 
-        let mut entries = FxHashMap::default();
+        let mut entries = I64Map::new();
         entries.insert(1, vec![Value::Integer(100)]);
         entries.insert(2, vec![Value::Integer(200)]);
         entries.insert(3, vec![Value::Integer(100)]);
@@ -1332,7 +1329,7 @@ mod tests {
         assert_eq!(index.entry_count(), 3);
 
         // Remove batch
-        let mut to_remove = FxHashMap::default();
+        let mut to_remove = I64Map::new();
         to_remove.insert(1, vec![Value::Integer(100)]);
         to_remove.insert(2, vec![Value::Integer(200)]);
 

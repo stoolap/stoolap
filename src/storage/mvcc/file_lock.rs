@@ -119,6 +119,8 @@ fn acquire_lock(file: &File) -> Result<()> {
 
     let fd = file.as_raw_fd();
 
+    // SAFETY: fd is a valid file descriptor from AsRawFd on an open File.
+    // libc::flock is safe to call with valid fd and standard flock flags.
     // LOCK_EX = exclusive lock, LOCK_NB = non-blocking
     let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
 

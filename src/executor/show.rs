@@ -22,9 +22,9 @@
 //! - SHOW INDEXES
 //! - DESCRIBE
 
-use compact_str::CompactString;
 use rustc_hash::FxHashSet;
 
+use crate::common::SmartString;
 use crate::core::row_vec::RowVec;
 use crate::core::{Error, Result, Row, Value};
 use crate::parser::ast::*;
@@ -49,7 +49,7 @@ impl Executor {
         for (i, name) in tables.into_iter().enumerate() {
             rows.push((
                 i as i64,
-                Row::from_values(vec![Value::Text(CompactString::from(name.as_str()))]),
+                Row::from_values(vec![Value::Text(SmartString::from_string(name))]),
             ));
         }
 
@@ -69,7 +69,7 @@ impl Executor {
         for (i, name) in views.into_iter().enumerate() {
             rows.push((
                 i as i64,
-                Row::from_values(vec![Value::Text(CompactString::from(name.as_str()))]),
+                Row::from_values(vec![Value::Text(SmartString::from_string(name))]),
             ));
         }
 
@@ -141,8 +141,8 @@ impl Executor {
         rows.push((
             0,
             Row::from_values(vec![
-                Value::Text(CompactString::from(table_name.as_str())),
-                Value::Text(CompactString::from(create_sql.as_str())),
+                Value::Text(SmartString::new(table_name)),
+                Value::Text(SmartString::from_string(create_sql)),
             ]),
         ));
 
@@ -174,8 +174,8 @@ impl Executor {
         rows.push((
             0,
             Row::from_values(vec![
-                Value::Text(CompactString::from(view_def.original_name.as_str())),
-                Value::Text(CompactString::from(create_sql.as_str())),
+                Value::Text(SmartString::new(&view_def.original_name)),
+                Value::Text(SmartString::from_string(create_sql)),
             ]),
         ));
 
@@ -230,10 +230,10 @@ impl Executor {
                 rows.push((
                     row_id,
                     Row::from_values(vec![
-                        Value::Text(CompactString::from(table_name.as_str())),
-                        Value::Text(CompactString::from(index_name.as_str())),
-                        Value::Text(CompactString::from(column_name.as_str())),
-                        Value::Text(CompactString::from(index_type)),
+                        Value::Text(SmartString::new(table_name)),
+                        Value::Text(SmartString::new(&index_name)),
+                        Value::Text(SmartString::from_string(column_name)),
+                        Value::Text(SmartString::from_string(index_type)),
                         Value::Boolean(is_unique),
                     ]),
                 ));
@@ -294,12 +294,12 @@ impl Executor {
             rows.push((
                 i as i64,
                 Row::from_values(vec![
-                    Value::Text(CompactString::from(col.name.as_str())),
-                    Value::Text(CompactString::from(type_str.as_str())),
-                    Value::Text(CompactString::from(null_str)),
-                    Value::Text(CompactString::from(key_str)),
-                    Value::Text(CompactString::from(default_str.as_str())),
-                    Value::Text(CompactString::from(extra_str)),
+                    Value::Text(SmartString::new(&col.name)),
+                    Value::Text(SmartString::from_string(type_str)),
+                    Value::Text(SmartString::new(null_str)),
+                    Value::Text(SmartString::new(key_str)),
+                    Value::Text(SmartString::from_string(default_str)),
+                    Value::Text(SmartString::new(extra_str)),
                 ]),
             ));
         }

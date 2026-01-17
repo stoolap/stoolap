@@ -21,8 +21,7 @@
 
 use std::sync::Arc;
 
-use compact_str::CompactString;
-
+use crate::common::SmartString;
 use crate::core::{Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
@@ -75,7 +74,7 @@ impl ScalarFunction for CastFunction {
         // Handle NULL values
         if value.is_null() {
             return match target_type.as_str() {
-                "STRING" | "TEXT" | "VARCHAR" | "CHAR" => Ok(Value::Text(CompactString::from(""))),
+                "STRING" | "TEXT" | "VARCHAR" | "CHAR" => Ok(Value::Text(SmartString::from(""))),
                 "INT" | "INTEGER" => Ok(Value::Integer(0)),
                 "FLOAT" | "REAL" | "DOUBLE" => Ok(Value::Float(0.0)),
                 "BOOLEAN" | "BOOL" => Ok(Value::Boolean(false)),
@@ -158,17 +157,15 @@ fn cast_to_float(value: &Value) -> Result<Value> {
 fn cast_to_string(value: &Value) -> Result<Value> {
     match value {
         Value::Text(s) => Ok(Value::Text(s.clone())),
-        Value::Integer(i) => Ok(Value::Text(CompactString::from(i.to_string().as_str()))),
+        Value::Integer(i) => Ok(Value::Text(SmartString::from_string(i.to_string()))),
         Value::Float(f) => {
             // Format with up to 6 decimal places
-            Ok(Value::Text(CompactString::from(
-                format!("{:.6}", f).as_str(),
-            )))
+            Ok(Value::Text(SmartString::from_string(format!("{:.6}", f))))
         }
-        Value::Boolean(b) => Ok(Value::Text(CompactString::from(b.to_string().as_str()))),
-        Value::Timestamp(t) => Ok(Value::Text(CompactString::from(t.to_rfc3339().as_str()))),
-        Value::Json(j) => Ok(Value::Text(CompactString::from(j.as_ref()))),
-        Value::Null(_) => Ok(Value::Text(CompactString::from(""))),
+        Value::Boolean(b) => Ok(Value::Text(SmartString::from_string(b.to_string()))),
+        Value::Timestamp(t) => Ok(Value::Text(SmartString::from_string(t.to_rfc3339()))),
+        Value::Json(j) => Ok(Value::Text(SmartString::from(j.as_ref()))),
+        Value::Null(_) => Ok(Value::Text(SmartString::from(""))),
     }
 }
 
@@ -303,7 +300,7 @@ impl ScalarFunction for CollateFunction {
 
         // Apply collation
         let result = apply_collation(&s, &collation)?;
-        Ok(Value::Text(CompactString::from(result.as_str())))
+        Ok(Value::Text(SmartString::from_string(result)))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {

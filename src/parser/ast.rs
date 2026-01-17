@@ -18,8 +18,8 @@
 //! and expressions.
 
 use super::token::{Position, Token};
+use crate::common::SmartString;
 use ahash::AHashSet;
-use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 use std::fmt;
 
@@ -207,15 +207,15 @@ impl Expression {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Identifier {
     pub token: Token,
-    pub value: CompactString,
+    pub value: SmartString,
     /// Pre-computed lowercase value for fast case-insensitive lookups
-    pub value_lower: CompactString,
+    pub value_lower: SmartString,
 }
 
 impl Identifier {
     /// Create a new identifier with pre-computed lowercase value
     #[inline]
-    pub fn new(token: Token, value: impl Into<CompactString>) -> Self {
+    pub fn new(token: Token, value: impl Into<SmartString>) -> Self {
         let value = value.into();
         let value_lower = value.to_lowercase();
         Self {
@@ -276,9 +276,9 @@ impl fmt::Display for FloatLiteral {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StringLiteral {
     pub token: Token,
-    pub value: CompactString,
+    pub value: SmartString,
     /// Optional type hint (DATE, TIME, JSON, etc.)
-    pub type_hint: Option<CompactString>,
+    pub type_hint: Option<SmartString>,
 }
 
 impl fmt::Display for StringLiteral {
@@ -316,9 +316,9 @@ impl fmt::Display for NullLiteral {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntervalLiteral {
     pub token: Token,
-    pub value: CompactString,
+    pub value: SmartString,
     pub quantity: i64,
-    pub unit: CompactString,
+    pub unit: SmartString,
 }
 
 impl fmt::Display for IntervalLiteral {
@@ -331,7 +331,7 @@ impl fmt::Display for IntervalLiteral {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Parameter {
     pub token: Token,
-    pub name: CompactString,
+    pub name: SmartString,
     pub index: usize,
 }
 
@@ -494,7 +494,7 @@ impl fmt::Display for StarExpression {
 #[derive(Debug, Clone, PartialEq)]
 pub struct QualifiedStarExpression {
     pub token: Token,
-    pub qualifier: CompactString,
+    pub qualifier: SmartString,
 }
 
 impl fmt::Display for QualifiedStarExpression {
@@ -519,7 +519,7 @@ impl fmt::Display for DefaultExpression {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrefixExpression {
     pub token: Token,
-    pub operator: CompactString,
+    pub operator: SmartString,
     /// Pre-computed operator type for fast evaluation (no string comparison)
     pub op_type: PrefixOperator,
     pub right: Box<Expression>,
@@ -528,7 +528,7 @@ pub struct PrefixExpression {
 impl PrefixExpression {
     /// Create a new prefix expression with auto-computed op_type
     #[inline]
-    pub fn new(token: Token, operator: impl Into<CompactString>, right: Box<Expression>) -> Self {
+    pub fn new(token: Token, operator: impl Into<SmartString>, right: Box<Expression>) -> Self {
         let operator = operator.into();
         let op_type = PrefixOperator::from_str(&operator);
         Self {
@@ -555,7 +555,7 @@ impl fmt::Display for PrefixExpression {
 pub struct InfixExpression {
     pub token: Token,
     pub left: Box<Expression>,
-    pub operator: CompactString,
+    pub operator: SmartString,
     /// Pre-computed operator type for fast evaluation (no string comparison)
     pub op_type: InfixOperator,
     pub right: Box<Expression>,
@@ -567,7 +567,7 @@ impl InfixExpression {
     pub fn new(
         token: Token,
         left: Box<Expression>,
-        operator: impl Into<CompactString>,
+        operator: impl Into<SmartString>,
         right: Box<Expression>,
     ) -> Self {
         let operator = operator.into();
@@ -649,7 +649,7 @@ impl fmt::Display for AllAnyType {
 pub struct AllAnyExpression {
     pub token: Token,
     pub left: Box<Expression>,
-    pub operator: CompactString,
+    pub operator: SmartString,
     pub all_any_type: AllAnyType,
     pub subquery: Box<SelectStatement>,
 }
@@ -749,7 +749,7 @@ pub struct LikeExpression {
     pub left: Box<Expression>,
     pub pattern: Box<Expression>,
     /// The operator: LIKE, ILIKE, NOT LIKE, NOT ILIKE, GLOB, NOT GLOB, REGEXP, RLIKE, NOT REGEXP, NOT RLIKE
-    pub operator: CompactString,
+    pub operator: SmartString,
     /// Optional escape character
     pub escape: Option<Box<Expression>>,
 }
@@ -836,7 +836,7 @@ impl fmt::Display for WhenClause {
 pub struct CastExpression {
     pub token: Token,
     pub expr: Box<Expression>,
-    pub type_name: CompactString,
+    pub type_name: SmartString,
 }
 
 impl fmt::Display for CastExpression {
@@ -849,7 +849,7 @@ impl fmt::Display for CastExpression {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionCall {
     pub token: Token,
-    pub function: CompactString,
+    pub function: SmartString,
     pub arguments: Vec<Expression>,
     pub is_distinct: bool,
     pub order_by: Vec<OrderByExpression>,
@@ -914,7 +914,7 @@ pub struct WindowExpression {
     pub token: Token,
     pub function: Box<FunctionCall>,
     /// Named window reference (e.g., OVER w)
-    pub window_ref: Option<CompactString>,
+    pub window_ref: Option<SmartString>,
     pub partition_by: Vec<Expression>,
     pub order_by: Vec<OrderByExpression>,
     pub frame: Option<WindowFrame>,
@@ -1005,7 +1005,7 @@ impl fmt::Display for WindowFrameBound {
 /// Named window definition (WINDOW w AS (...))
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowDefinition {
-    pub name: CompactString,
+    pub name: SmartString,
     pub partition_by: Vec<Expression>,
     pub order_by: Vec<OrderByExpression>,
     pub frame: Option<WindowFrame>,
@@ -1066,7 +1066,7 @@ impl fmt::Display for SimpleTableSource {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AsOfClause {
     pub token: Token,
-    pub as_of_type: CompactString, // "TRANSACTION" or "TIMESTAMP"
+    pub as_of_type: SmartString, // "TRANSACTION" or "TIMESTAMP"
     pub value: Box<Expression>,
 }
 
@@ -1081,7 +1081,7 @@ impl fmt::Display for AsOfClause {
 pub struct JoinTableSource {
     pub token: Token,
     pub left: Box<Expression>,
-    pub join_type: CompactString,
+    pub join_type: SmartString,
     pub right: Box<Expression>,
     pub condition: Option<Box<Expression>>,
     /// USING clause columns (e.g., USING(id, name))
@@ -1552,7 +1552,7 @@ impl fmt::Display for InsertStatement {
 pub struct UpdateStatement {
     pub token: Token,
     pub table_name: Identifier,
-    pub updates: FxHashMap<CompactString, Expression>,
+    pub updates: FxHashMap<SmartString, Expression>,
     pub where_clause: Option<Box<Expression>>,
     /// RETURNING clause expressions
     pub returning: Vec<Expression>,
@@ -1651,7 +1651,7 @@ impl fmt::Display for CreateTableStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDefinition {
     pub name: Identifier,
-    pub data_type: CompactString,
+    pub data_type: SmartString,
     pub constraints: Vec<ColumnConstraint>,
 }
 
@@ -1940,7 +1940,7 @@ impl fmt::Display for DropViewStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BeginStatement {
     pub token: Token,
-    pub isolation_level: Option<CompactString>,
+    pub isolation_level: Option<SmartString>,
 }
 
 impl fmt::Display for BeginStatement {
@@ -2139,7 +2139,7 @@ impl fmt::Display for ExplainStatement {
 pub struct AnalyzeStatement {
     pub token: Token,
     /// Table name to analyze (None = analyze all tables)
-    pub table_name: Option<CompactString>,
+    pub table_name: Option<SmartString>,
 }
 
 impl fmt::Display for AnalyzeStatement {

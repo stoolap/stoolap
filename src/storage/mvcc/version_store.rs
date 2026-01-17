@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
-use compact_str::CompactString;
+use crate::common::SmartString;
 
 use crate::common::{
     new_btree_int64_map, new_int64_map, new_int64_map_with_capacity, BTreeInt64Map, CompactArc,
@@ -389,8 +389,8 @@ pub trait VisibilityChecker: Send + Sync {
 pub struct VersionStore {
     /// Row versions indexed by row ID (BTreeMap for ordered iteration)
     versions: BTreeInt64Map<VersionChainEntry>,
-    /// The name of the table this store belongs to (CompactString for inline storage ≤24 bytes)
-    table_name: CompactString,
+    /// The name of the table this store belongs to (SmartString for inline storage ≤24 bytes)
+    table_name: SmartString,
     /// Table schema (Arc for zero-cost cloning on read)
     schema: RwLock<Arc<Schema>>,
     /// Indexes on this table (FxHashMap for fast string key lookups)
@@ -427,7 +427,7 @@ pub struct VersionStore {
 
 impl VersionStore {
     /// Creates a new version store
-    pub fn new(table_name: impl Into<CompactString>, schema: Schema) -> Self {
+    pub fn new(table_name: impl Into<SmartString>, schema: Schema) -> Self {
         Self::with_capacity(table_name, schema, None, 0)
     }
 
@@ -437,7 +437,7 @@ impl VersionStore {
     /// Use this when the expected row count is known (e.g., during recovery).
     #[cfg(not(test))]
     pub fn with_capacity(
-        table_name: impl Into<CompactString>,
+        table_name: impl Into<SmartString>,
         schema: Schema,
         checker: Option<Arc<TransactionRegistry>>,
         expected_rows: usize,
@@ -470,7 +470,7 @@ impl VersionStore {
     /// Creates a new version store with pre-allocated capacity (test version)
     #[cfg(test)]
     pub fn with_capacity(
-        table_name: impl Into<CompactString>,
+        table_name: impl Into<SmartString>,
         schema: Schema,
         checker: Option<Arc<dyn VisibilityChecker>>,
         expected_rows: usize,
@@ -518,7 +518,7 @@ impl VersionStore {
     /// Creates a new version store with a visibility checker (production)
     #[cfg(not(test))]
     pub fn with_visibility_checker(
-        table_name: impl Into<CompactString>,
+        table_name: impl Into<SmartString>,
         schema: Schema,
         checker: Arc<TransactionRegistry>,
     ) -> Self {
@@ -528,7 +528,7 @@ impl VersionStore {
     /// Creates a new version store with a visibility checker (test)
     #[cfg(test)]
     pub fn with_visibility_checker(
-        table_name: impl Into<CompactString>,
+        table_name: impl Into<SmartString>,
         schema: Schema,
         checker: Arc<dyn VisibilityChecker>,
     ) -> Self {
@@ -1097,7 +1097,7 @@ impl VersionStore {
         // ARENA FAST PATH: O(1) HashMap lookup instead of O(log n) BTreeMap
         // This bypasses BTreeMap entirely when HEAD is visible (common case).
         // row_arena_index maps row_id → arena_idx for O(1) access.
-        if let Some(&arena_idx) = self.row_arena_index.read().get(&row_id) {
+        if let Some(&arena_idx) = self.row_arena_index.read().get(row_id) {
             if let Some((meta, arc_data)) = self.arena.get_meta_and_arc(arena_idx) {
                 // Check HEAD visibility using arena metadata
                 if checker.is_visible(meta.txn_id, txn_id) {
@@ -1234,7 +1234,7 @@ impl VersionStore {
 
         for &row_id in row_ids {
             // ARENA FAST PATH: O(1) HashMap + direct array access
-            if let Some(&arena_idx) = row_index.get(&row_id) {
+            if let Some(&arena_idx) = row_index.get(row_id) {
                 if arena_idx < arena_len {
                     // SAFETY: bounds checked above, unchecked access for speed
                     let meta = &arena_meta[arena_idx];
@@ -3788,7 +3788,7 @@ impl VersionStore {
     }
     /// Tries to claim a row for update (dirty write prevention)
     pub fn try_claim_row(&self, row_id: i64, txn_id: i64) -> Result<(), Error> {
-        use std::collections::hash_map::Entry;
+        use crate::common::i64_map::Entry;
 
         let mut map = self.uncommitted_writes.write();
         match map.entry(row_id) {
@@ -3813,9 +3813,9 @@ impl VersionStore {
     /// Releases a row claim
     pub fn release_row_claim(&self, row_id: i64, txn_id: i64) {
         let mut map = self.uncommitted_writes.write();
-        if let Some(&v) = map.get(&row_id) {
+        if let Some(&v) = map.get(row_id) {
             if v == txn_id {
-                map.remove(&row_id);
+                map.remove(row_id);
             }
         }
     }
@@ -3826,9 +3826,9 @@ impl VersionStore {
     pub fn release_row_claims_batch(&self, row_ids: &[i64], txn_id: i64) {
         let mut map = self.uncommitted_writes.write();
         for &row_id in row_ids {
-            if let Some(&v) = map.get(&row_id) {
+            if let Some(&v) = map.get(row_id) {
                 if v == txn_id {
-                    map.remove(&row_id);
+                    map.remove(row_id);
                 }
             }
         }
@@ -4403,7 +4403,7 @@ impl VersionStore {
             let row_index = self.row_arena_index.read();
             rows_to_delete
                 .iter()
-                .filter_map(|row_id| row_index.get(row_id).copied())
+                .filter_map(|row_id| row_index.get(*row_id).copied())
                 .collect()
         };
 
@@ -4454,7 +4454,7 @@ impl VersionStore {
         {
             let mut row_index = self.row_arena_index.write();
             for row_id in &rows_to_delete {
-                row_index.remove(row_id);
+                row_index.remove(*row_id);
             }
         }
 
@@ -4771,57 +4771,18 @@ impl VersionStore {
             }
         }
 
-        let mut groups: AHashMap<GroupKey, Vec<Accum>> = AHashMap::new();
-
         // Pre-acquire arena lock ONCE
         let arena_guard = self.arena.read_guard();
         let arena_data = arena_guard.data();
         let arena_meta = arena_guard.meta();
 
-        // Process arena rows directly (fast path - no Row allocation)
-        for (idx, meta) in arena_meta.iter().enumerate() {
-            // Visibility check
-            if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id) {
-                continue;
-            }
-            if !checker.is_visible(meta.txn_id, txn_id) {
-                continue;
-            }
-
-            // Get row data from arena
-            let row_data = match arena_data.get(idx) {
-                Some(data) => data,
-                None => continue,
-            };
-
-            // Build group key using CompactArc::clone (O(1)) instead of Value::clone
-            let group_key = if group_by_indices.len() == 1 {
-                let col_idx = group_by_indices[0];
-                if col_idx < row_data.len() {
-                    GroupKey::Single(CompactArc::clone(&row_data[col_idx]))
-                } else {
-                    GroupKey::Single(CompactArc::new(Value::Null(DataType::Null)))
-                }
-            } else {
-                let key_values: Vec<CompactArc<Value>> = group_by_indices
-                    .iter()
-                    .map(|&col_idx| {
-                        if col_idx < row_data.len() {
-                            CompactArc::clone(&row_data[col_idx])
-                        } else {
-                            CompactArc::new(Value::Null(DataType::Null))
-                        }
-                    })
-                    .collect();
-                GroupKey::Multi(key_values)
-            };
-
-            // Get or create accumulator for this group
-            let accums = groups
-                .entry(group_key)
-                .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-
-            // Update each aggregate
+        // Helper to update accumulators
+        #[inline(always)]
+        fn update_accums(
+            accums: &mut [Accum],
+            aggregates: &[(AggregateOp, usize)],
+            row_data: &[CompactArc<Value>],
+        ) {
             for (agg_idx, (op, col_idx)) in aggregates.iter().enumerate() {
                 let accum = &mut accums[agg_idx];
 
@@ -4882,18 +4843,12 @@ impl VersionStore {
             }
         }
 
-        // Convert to results
-        let mut results: Vec<GroupedAggregateResult> = Vec::with_capacity(groups.len());
-
-        for (group_key, accums) in groups {
-            // Extract group values
-            let group_values = match group_key {
-                GroupKey::Single(v) => vec![(*v).clone()],
-                GroupKey::Multi(vs) => vs.iter().map(|v| (**v).clone()).collect(),
-            };
-
-            // Compute final aggregate values
-            let aggregate_values: Vec<Value> = aggregates
+        // Helper to compute final aggregate values
+        fn compute_aggregate_values(
+            aggregates: &[(AggregateOp, usize)],
+            accums: &[Accum],
+        ) -> Vec<Value> {
+            aggregates
                 .iter()
                 .zip(accums.iter())
                 .map(|((op, _), accum)| match op {
@@ -4915,11 +4870,183 @@ impl VersionStore {
                     AggregateOp::Min => accum.min.clone().unwrap_or(Value::Null(DataType::Null)),
                     AggregateOp::Max => accum.max.clone().unwrap_or(Value::Null(DataType::Null)),
                 })
-                .collect();
+                .collect()
+        }
 
+        // FAST PATH: Single-column GROUP BY with primitive types (Integer, Float, Boolean)
+        // Uses I64Map directly for ~3x faster hashing and comparison
+        // Avoids GroupKey allocation entirely for primitive types and NULL
+        if group_by_indices.len() == 1 {
+            let col_idx = group_by_indices[0];
+
+            // Track key type: 0=Integer, 1=Float, 2=Boolean, 3=Mixed/Other
+            let mut key_type: u8 = 255; // uninitialized
+            let mut int_groups: Int64Map<Vec<Accum>> = Int64Map::new();
+            // Separate NULL accumulator - avoids creating GroupKey for NULL
+            let mut null_accums: Option<Vec<Accum>> = None;
+            // Only used for String/other types that can't be mapped to i64
+            let mut other_groups: AHashMap<GroupKey, Vec<Accum>> = AHashMap::new();
+
+            for (idx, meta) in arena_meta.iter().enumerate() {
+                // Visibility check
+                if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                {
+                    continue;
+                }
+                if !checker.is_visible(meta.txn_id, txn_id) {
+                    continue;
+                }
+
+                let row_data = match arena_data.get(idx) {
+                    Some(data) => data,
+                    None => continue,
+                };
+
+                let val = if col_idx < row_data.len() {
+                    &row_data[col_idx]
+                } else {
+                    // NULL - track separately without GroupKey allocation
+                    let accums =
+                        null_accums.get_or_insert_with(|| vec![Accum::default(); aggregates.len()]);
+                    update_accums(accums, aggregates, row_data);
+                    continue;
+                };
+
+                // Try to extract i64 key for primitive types
+                let i64_key = match &**val {
+                    Value::Integer(i) => {
+                        if key_type == 255 {
+                            key_type = 0;
+                        }
+                        Some(*i)
+                    }
+                    Value::Float(f) => {
+                        if key_type == 255 {
+                            key_type = 1;
+                        }
+                        Some(f.to_bits() as i64)
+                    }
+                    Value::Boolean(b) => {
+                        if key_type == 255 {
+                            key_type = 2;
+                        }
+                        Some(if *b { 1 } else { 0 })
+                    }
+                    Value::Null(_) => {
+                        // NULL value in the column - track separately
+                        let accums = null_accums
+                            .get_or_insert_with(|| vec![Accum::default(); aggregates.len()]);
+                        update_accums(accums, aggregates, row_data);
+                        continue;
+                    }
+                    _ => {
+                        key_type = 3; // Mixed/other
+                        None
+                    }
+                };
+
+                if let Some(key) = i64_key {
+                    let accums = int_groups
+                        .entry(key)
+                        .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
+                    update_accums(accums, aggregates, row_data);
+                } else {
+                    let accums = other_groups
+                        .entry(GroupKey::Single(CompactArc::clone(val)))
+                        .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
+                    update_accums(accums, aggregates, row_data);
+                }
+            }
+
+            // Convert to results
+            let has_null = null_accums.is_some();
+            let mut results: Vec<GroupedAggregateResult> = Vec::with_capacity(
+                int_groups.len() + other_groups.len() + if has_null { 1 } else { 0 },
+            );
+
+            // Convert int_groups based on key_type
+            for (key, accums) in int_groups.iter() {
+                let group_value = match key_type {
+                    0 => Value::Integer(key),                      // Integer
+                    1 => Value::Float(f64::from_bits(key as u64)), // Float
+                    2 => Value::Boolean(key != 0),                 // Boolean
+                    _ => Value::Integer(key),                      // Fallback
+                };
+                results.push(GroupedAggregateResult {
+                    group_values: vec![group_value],
+                    aggregate_values: compute_aggregate_values(aggregates, accums),
+                });
+            }
+
+            // Add NULL group if present
+            if let Some(accums) = null_accums {
+                results.push(GroupedAggregateResult {
+                    group_values: vec![Value::Null(DataType::Null)],
+                    aggregate_values: compute_aggregate_values(aggregates, &accums),
+                });
+            }
+
+            // Convert other_groups (strings, etc.)
+            for (group_key, accums) in other_groups {
+                let group_values = match group_key {
+                    GroupKey::Single(v) => vec![(*v).clone()],
+                    GroupKey::Multi(vs) => vs.iter().map(|v| (**v).clone()).collect(),
+                };
+                results.push(GroupedAggregateResult {
+                    group_values,
+                    aggregate_values: compute_aggregate_values(aggregates, &accums),
+                });
+            }
+
+            return results;
+        }
+
+        // SLOW PATH: Multi-column GROUP BY (currently not used from try_storage_aggregation)
+        let mut groups: AHashMap<GroupKey, Vec<Accum>> = AHashMap::new();
+
+        for (idx, meta) in arena_meta.iter().enumerate() {
+            // Visibility check
+            if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id) {
+                continue;
+            }
+            if !checker.is_visible(meta.txn_id, txn_id) {
+                continue;
+            }
+
+            let row_data = match arena_data.get(idx) {
+                Some(data) => data,
+                None => continue,
+            };
+
+            let key_values: Vec<CompactArc<Value>> = group_by_indices
+                .iter()
+                .map(|&col_idx| {
+                    if col_idx < row_data.len() {
+                        CompactArc::clone(&row_data[col_idx])
+                    } else {
+                        CompactArc::new(Value::Null(DataType::Null))
+                    }
+                })
+                .collect();
+            let group_key = GroupKey::Multi(key_values);
+
+            let accums = groups
+                .entry(group_key)
+                .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
+            update_accums(accums, aggregates, row_data);
+        }
+
+        // Convert to results
+        let mut results: Vec<GroupedAggregateResult> = Vec::with_capacity(groups.len());
+
+        for (group_key, accums) in groups {
+            let group_values = match group_key {
+                GroupKey::Single(v) => vec![(*v).clone()],
+                GroupKey::Multi(vs) => vs.iter().map(|v| (**v).clone()).collect(),
+            };
             results.push(GroupedAggregateResult {
                 group_values,
-                aggregate_values,
+                aggregate_values: compute_aggregate_values(aggregates, &accums),
             });
         }
 
@@ -5016,12 +5143,12 @@ impl TransactionVersionStore {
         let has_local = self
             .local_versions
             .as_ref()
-            .is_some_and(|lv| lv.contains_key(&row_id));
+            .is_some_and(|lv| lv.contains_key(row_id));
 
         if has_local {
             // Already have local version - just append
             self.ensure_local_versions()
-                .get_mut(&row_id)
+                .get_mut(row_id)
                 .unwrap()
                 .push(rv);
         } else {
@@ -5029,7 +5156,7 @@ impl TransactionVersionStore {
             let needs_write_set_entry = self
                 .write_set
                 .as_ref()
-                .is_none_or(|ws| !ws.contains_key(&row_id));
+                .is_none_or(|ws| !ws.contains_key(row_id));
 
             if needs_write_set_entry {
                 let read_version = self.parent_store.get_visible_version(row_id, self.txn_id);
@@ -5097,12 +5224,12 @@ impl TransactionVersionStore {
         let has_local = self
             .local_versions
             .as_ref()
-            .is_some_and(|lv| lv.contains_key(&row_id));
+            .is_some_and(|lv| lv.contains_key(row_id));
 
         if has_local {
             // Already have local version - just append
             self.ensure_local_versions()
-                .get_mut(&row_id)
+                .get_mut(row_id)
                 .unwrap()
                 .push(rv);
         } else {
@@ -5110,7 +5237,7 @@ impl TransactionVersionStore {
             let needs_write_set_entry = self
                 .write_set
                 .as_ref()
-                .is_none_or(|ws| !ws.contains_key(&row_id));
+                .is_none_or(|ws| !ws.contains_key(row_id));
 
             if needs_write_set_entry {
                 let read_version_seq = self
@@ -5159,7 +5286,7 @@ impl TransactionVersionStore {
             rv.create_time = now;
 
             // Check if already in local versions (already processed in this transaction)
-            if let Some(versions) = self.ensure_local_versions().get_mut(&row_id) {
+            if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
                 // Append new version to history
                 versions.push(rv);
                 continue;
@@ -5169,7 +5296,7 @@ impl TransactionVersionStore {
             let needs_write_set_entry = self
                 .write_set
                 .as_ref()
-                .is_none_or(|ws| !ws.contains_key(&row_id));
+                .is_none_or(|ws| !ws.contains_key(row_id));
 
             if needs_write_set_entry {
                 // Get current sequence for conflict detection
@@ -5212,14 +5339,14 @@ impl TransactionVersionStore {
             let has_local = self
                 .local_versions
                 .as_ref()
-                .is_some_and(|lv| lv.contains_key(&row_id));
+                .is_some_and(|lv| lv.contains_key(row_id));
 
             if !has_local {
                 // Check if this row exists in parent store and track in write-set
                 let needs_write_set_entry = self
                     .write_set
                     .as_ref()
-                    .is_none_or(|ws| !ws.contains_key(&row_id));
+                    .is_none_or(|ws| !ws.contains_key(row_id));
 
                 if needs_write_set_entry {
                     let read_version = self.parent_store.get_visible_version(row_id, self.txn_id);
@@ -5253,7 +5380,7 @@ impl TransactionVersionStore {
 
             // Append to version history for this row
             let local_versions = self.ensure_local_versions();
-            if let Some(versions) = local_versions.get_mut(&row_id) {
+            if let Some(versions) = local_versions.get_mut(row_id) {
                 versions.push(rv);
             } else {
                 local_versions.insert(row_id, smallvec![rv]);
@@ -5277,7 +5404,7 @@ impl TransactionVersionStore {
             rv.deleted_at_txn_id = self.txn_id;
 
             // Check if already in local versions (already processed in this transaction)
-            if let Some(versions) = self.ensure_local_versions().get_mut(&row_id) {
+            if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
                 versions.push(rv);
                 continue;
             }
@@ -5286,7 +5413,7 @@ impl TransactionVersionStore {
             let needs_write_set_entry = self
                 .write_set
                 .as_ref()
-                .is_none_or(|ws| !ws.contains_key(&row_id));
+                .is_none_or(|ws| !ws.contains_key(row_id));
 
             if needs_write_set_entry {
                 let read_version_seq = self
@@ -5318,7 +5445,7 @@ impl TransactionVersionStore {
     pub fn has_locally_seen(&self, row_id: i64) -> bool {
         self.local_versions
             .as_ref()
-            .is_some_and(|lv| lv.contains_key(&row_id))
+            .is_some_and(|lv| lv.contains_key(row_id))
     }
 
     /// Returns true if this transaction has any uncommitted local changes
@@ -5333,7 +5460,7 @@ impl TransactionVersionStore {
         self.local_versions
             .iter()
             .flat_map(|lv| lv.iter())
-            .filter_map(|(k, versions)| versions.last().map(|v| (*k, v)))
+            .filter_map(|(k, versions)| versions.last().map(|v| (k, v)))
     }
 
     /// Iterate over local versions with their original (old) versions for index updates
@@ -5350,7 +5477,7 @@ impl TransactionVersionStore {
                         .and_then(|entry| entry.read_version.as_ref())
                         .filter(|v| !v.is_deleted())
                         .map(|v| &v.data);
-                    (*row_id, version, old_row)
+                    (row_id, version, old_row)
                 })
             })
     }
@@ -5360,7 +5487,7 @@ impl TransactionVersionStore {
     pub fn get_local_version(&self, row_id: i64) -> Option<&RowVersion> {
         self.local_versions
             .as_ref()
-            .and_then(|lv| lv.get(&row_id))
+            .and_then(|lv| lv.get(row_id))
             .and_then(|versions| versions.last())
     }
 
@@ -5368,7 +5495,7 @@ impl TransactionVersionStore {
     pub fn get(&self, row_id: i64) -> Option<Row> {
         // Check local versions first (get most recent)
         if let Some(lv) = self.local_versions.as_ref() {
-            if let Some(versions) = lv.get(&row_id) {
+            if let Some(versions) = lv.get(row_id) {
                 if let Some(local_version) = versions.last() {
                     if local_version.is_deleted() {
                         return None;
@@ -5406,7 +5533,7 @@ impl TransactionVersionStore {
                     // Single insert - check conflict directly without Vec
                     if self
                         .parent_store
-                        .has_any_visible_version(&[*row_id], self.txn_id)
+                        .has_any_visible_version(&[row_id], self.txn_id)
                         .is_some()
                     {
                         return Err(Error::internal(format!(
@@ -5424,7 +5551,7 @@ impl TransactionVersionStore {
             .iter()
             .filter_map(|(row_id, write_entry)| {
                 if write_entry.read_version.is_none() {
-                    Some(*row_id)
+                    Some(row_id)
                 } else {
                     None
                 }
@@ -5461,7 +5588,7 @@ impl TransactionVersionStore {
         for (row_id, version_history) in local_versions.iter() {
             // Only commit the most recent version per row
             if let Some(version) = version_history.last() {
-                versions.push((*row_id, version.clone()));
+                versions.push((row_id, version.clone()));
             }
         }
         versions
@@ -5538,16 +5665,16 @@ impl TransactionVersionStore {
 
             // If all versions are removed, mark for complete removal
             if versions.is_empty() {
-                rows_to_remove_completely.push(*row_id);
+                rows_to_remove_completely.push(row_id);
             }
         }
 
         // Remove rows with no remaining versions and release their claims
         for row_id in &rows_to_remove_completely {
-            local_versions.remove(row_id);
+            local_versions.remove(*row_id);
             self.parent_store.release_row_claim(*row_id, self.txn_id);
             if let Some(write_set) = self.write_set.as_mut() {
-                write_set.remove(row_id);
+                write_set.remove(*row_id);
             }
         }
     }
@@ -5559,7 +5686,7 @@ impl TransactionVersionStore {
         };
         // OPTIMIZATION: Collect row_ids first, then batch release
         // Avoids holding write_set iterator while accessing parent_store
-        let row_ids: Vec<i64> = write_set.keys().copied().collect();
+        let row_ids: Vec<i64> = write_set.keys().collect();
         self.parent_store
             .release_row_claims_batch(&row_ids, self.txn_id);
     }

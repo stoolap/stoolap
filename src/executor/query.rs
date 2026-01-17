@@ -27,7 +27,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use compact_str::CompactString;
+use crate::common::SmartString;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec};
@@ -532,7 +532,7 @@ impl Executor {
                     // For correlated subqueries, we need to process per-row with outer context
                     let columns_arc = CompactArc::clone(&columns);
                     // Extract table alias for qualified column names
-                    let order_table_alias: Option<CompactString> =
+                    let order_table_alias: Option<SmartString> =
                         stmt.table_expr.as_ref().and_then(|te| match te.as_ref() {
                             crate::parser::ast::Expression::TableSource(source) => source
                                 .alias
@@ -6296,41 +6296,71 @@ impl Executor {
                             }
                         }
                         ExprAction::Concat(parts) => {
-                            // Inline string concatenation - optimized to avoid to_string()
-                            let mut result = String::with_capacity(64); // Pre-allocate
+                            // First pass: calculate exact length for text-only (common case)
+                            // and check for nulls/non-text values
+                            let mut total_len = 0usize;
                             let mut any_null = false;
+                            let mut all_text = true;
                             for part in parts.iter() {
                                 let val: Option<&Value> = match part {
                                     ArgSource::Column(idx) => row.get(*idx),
                                     ArgSource::Const(v) => Some(v),
                                 };
                                 match val {
-                                    Some(Value::Text(s)) => result.push_str(s.as_str()),
-                                    Some(Value::Integer(i)) => {
-                                        use std::fmt::Write;
-                                        let _ = write!(result, "{}", i);
-                                    }
-                                    Some(Value::Float(f)) => {
-                                        use std::fmt::Write;
-                                        let _ = write!(result, "{}", f);
-                                    }
-                                    Some(Value::Boolean(b)) => {
-                                        result.push_str(if *b { "true" } else { "false" });
-                                    }
+                                    Some(Value::Text(s)) => total_len += s.len(),
                                     Some(Value::Null(_)) | None => {
                                         any_null = true;
                                         break;
                                     }
-                                    Some(v) => {
-                                        // Fallback for other types (timestamp, json)
-                                        result.push_str(&v.to_string());
+                                    Some(_) => {
+                                        all_text = false;
+                                        break;
                                     }
                                 }
                             }
+
                             if any_null {
                                 values.push(Value::null_unknown());
-                            } else {
+                            } else if all_text {
+                                // Fast path: all text, exact capacity, no shrink_to_fit realloc
+                                let mut result = String::with_capacity(total_len);
+                                for part in parts.iter() {
+                                    let val: Option<&Value> = match part {
+                                        ArgSource::Column(idx) => row.get(*idx),
+                                        ArgSource::Const(v) => Some(v),
+                                    };
+                                    if let Some(Value::Text(s)) = val {
+                                        result.push_str(s.as_str());
+                                    }
+                                }
+                                // len == capacity, so into_boxed_str is O(1)
                                 values.push(Value::Text(result.into()));
+                            } else {
+                                // Slow path: mixed types, use Arc to avoid shrink_to_fit
+                                let mut result = String::with_capacity(64);
+                                for part in parts.iter() {
+                                    let val: Option<&Value> = match part {
+                                        ArgSource::Column(idx) => row.get(*idx),
+                                        ArgSource::Const(v) => Some(v),
+                                    };
+                                    match val {
+                                        Some(Value::Text(s)) => result.push_str(s.as_str()),
+                                        Some(Value::Integer(i)) => {
+                                            use std::fmt::Write;
+                                            let _ = write!(result, "{}", i);
+                                        }
+                                        Some(Value::Float(f)) => {
+                                            use std::fmt::Write;
+                                            let _ = write!(result, "{}", f);
+                                        }
+                                        Some(Value::Boolean(b)) => {
+                                            result.push_str(if *b { "true" } else { "false" });
+                                        }
+                                        Some(v) => result.push_str(&v.to_string()),
+                                        None => {}
+                                    }
+                                }
+                                values.push(Value::Text(SmartString::from_string_shared(result)));
                             }
                         }
                         ExprAction::Compiled(program) => {

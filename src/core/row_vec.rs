@@ -555,12 +555,13 @@ impl Drop for RowVecIter {
         if let Some(vec) = self.inner.inner.as_mut() {
             for i in self.front..self.back {
                 // SAFETY: Items in range [front, back) haven't been read yet
+                // and are valid initialized elements.
                 unsafe {
                     std::ptr::drop_in_place(vec.as_mut_ptr().add(i));
                 }
             }
-            // Set len to 0 so Vec's drop doesn't double-free already-read elements.
-            // Capacity is preserved for cache reuse.
+            // SAFETY: We've dropped all elements above. Set len to 0 so Vec's
+            // drop doesn't double-free. Capacity is preserved for cache reuse.
             unsafe {
                 vec.set_len(0);
             }

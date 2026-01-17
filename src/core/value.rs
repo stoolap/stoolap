@@ -23,10 +23,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-use compact_str::CompactString;
 
 use super::error::{Error, Result};
 use super::types::DataType;
+use crate::common::SmartString;
 
 /// Timestamp formats supported for parsing
 /// Order matters - more specific formats first
@@ -55,9 +55,9 @@ const TIME_FORMATS: &[&str] = &[
 /// Each variant carries its data directly, avoiding the need for interface
 /// indirection or separate value references.
 ///
-/// Note: Text uses CompactString for inline storage of strings up to 24 bytes.
-/// This avoids heap allocation for most typical database column values.
-/// Json still uses Arc<str> for potentially large documents.
+/// Note: Text uses SmartString for inline storage of strings up to 22 bytes.
+/// Longer strings use Arc<str> for O(1) clone and sharing.
+/// Json also uses Arc<str> for potentially large documents.
 #[derive(Debug, Clone)]
 pub enum Value {
     /// NULL value with optional type hint
@@ -69,8 +69,8 @@ pub enum Value {
     /// 64-bit floating point
     Float(f64),
 
-    /// UTF-8 text string (CompactString for inline small strings)
-    Text(CompactString),
+    /// UTF-8 text string (SmartString: inline ≤22 bytes, Arc for larger)
+    Text(SmartString),
 
     /// Boolean value
     Boolean(bool),
@@ -114,12 +114,12 @@ impl Value {
 
     /// Create a text value
     pub fn text(value: impl Into<String>) -> Self {
-        Value::Text(CompactString::from(value.into().as_str()))
+        Value::Text(SmartString::from_string(value.into()))
     }
 
     /// Create a text value from Arc<str>
     pub fn text_arc(value: Arc<str>) -> Self {
-        Value::Text(CompactString::from(value.as_ref()))
+        Value::Text(SmartString::from(value.as_ref()))
     }
 
     /// Create a boolean value
@@ -387,9 +387,9 @@ impl Value {
                     }
                     DataType::Text => {
                         if let Some(s) = v.downcast_ref::<String>() {
-                            Value::Text(CompactString::from(s.as_str()))
+                            Value::Text(SmartString::new(s))
                         } else if let Some(&s) = v.downcast_ref::<&str>() {
-                            Value::Text(CompactString::from(s))
+                            Value::Text(SmartString::from(s))
                         } else {
                             Value::Null(data_type)
                         }
@@ -489,13 +489,13 @@ impl Value {
                 // Convert to TEXT - everything can become text
                 match self {
                     Value::Text(s) => Value::Text(s.clone()),
-                    Value::Integer(v) => Value::Text(CompactString::from(v.to_string())),
-                    Value::Float(v) => Value::Text(CompactString::from(format_float(*v))),
+                    Value::Integer(v) => Value::Text(SmartString::from_string(v.to_string())),
+                    Value::Float(v) => Value::Text(SmartString::from_string(format_float(*v))),
                     Value::Boolean(b) => {
-                        Value::Text(CompactString::from(if *b { "true" } else { "false" }))
+                        Value::Text(SmartString::new(if *b { "true" } else { "false" }))
                     }
-                    Value::Timestamp(t) => Value::Text(CompactString::from(t.to_rfc3339())),
-                    Value::Json(s) => Value::Text(CompactString::from(s.as_ref())),
+                    Value::Timestamp(t) => Value::Text(SmartString::from_string(t.to_rfc3339())),
+                    Value::Json(s) => Value::Text(SmartString::new(s.as_ref())),
                     Value::Null(_) => Value::Null(target_type),
                 }
             }
@@ -608,13 +608,13 @@ impl Value {
             },
             DataType::Text => match self {
                 Value::Text(s) => Value::Text(s),
-                Value::Integer(v) => Value::Text(CompactString::from(v.to_string())),
-                Value::Float(v) => Value::Text(CompactString::from(format_float(v))),
+                Value::Integer(v) => Value::Text(SmartString::from_string(v.to_string())),
+                Value::Float(v) => Value::Text(SmartString::from_string(format_float(v))),
                 Value::Boolean(b) => {
-                    Value::Text(CompactString::from(if b { "true" } else { "false" }))
+                    Value::Text(SmartString::new(if b { "true" } else { "false" }))
                 }
-                Value::Timestamp(t) => Value::Text(CompactString::from(t.to_rfc3339())),
-                Value::Json(s) => Value::Text(CompactString::from(s.as_ref())),
+                Value::Timestamp(t) => Value::Text(SmartString::from_string(t.to_rfc3339())),
+                Value::Json(s) => Value::Text(SmartString::new(s.as_ref())),
                 Value::Null(_) => Value::Null(target_type),
             },
             DataType::Boolean => match &self {
@@ -734,40 +734,70 @@ impl PartialEq for Value {
 
 impl Eq for Value {}
 
+/// Maximum i64 value that can be safely hashed as i64 without f64 conversion.
+/// Integers in the range [I64_SAFE_MIN, I64_SAFE_MAX] have unique f64 representations,
+/// while integers outside this range may round to the same f64 value.
+/// This is 2^53 - 1 = 9007199254740991.
+const I64_SAFE_MAX: i64 = (1_i64 << 53) - 1;
+const I64_SAFE_MIN: i64 = -I64_SAFE_MAX;
+
 impl Hash for Value {
+    #[inline(always)]
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Note: We must ensure that values that are equal have the same hash.
         // Since Integer(5) == Float(5.0), they must hash the same.
-        // We achieve this by hashing numeric types as their f64 bit representation.
+        //
+        // Optimization: For integers in the safe range [-2^53+1, 2^53-1], we hash
+        // directly as i64 without the expensive i64→f64 conversion. Floats with
+        // fractional parts can never equal any integer, so they use a different
+        // discriminant entirely.
         match self {
             Value::Null(_) => {
-                0u8.hash(state); // discriminant for Null
-                                 // Don't hash DataType: all NULLs must hash the same since PartialEq treats them as equal
+                // All NULLs hash the same (discriminant 0, no value)
+                state.write_u8(0);
             }
             Value::Integer(v) => {
-                // Hash as f64 bits so Integer(5) and Float(5.0) hash the same
-                1u8.hash(state); // discriminant for numeric types
-                (*v as f64).to_bits().hash(state);
+                state.write_u8(1);
+                match *v {
+                    I64_SAFE_MIN..=I64_SAFE_MAX => state.write_i64(*v),
+                    _ => state.write_u64((*v as f64).to_bits()),
+                }
             }
             Value::Float(v) => {
-                // Hash as f64 bits so Integer(5) and Float(5.0) hash the same
-                1u8.hash(state); // discriminant for numeric types
-                v.to_bits().hash(state);
+                if v.is_nan() {
+                    // All NaNs are equal in PartialEq, so they must hash the same
+                    state.write_u8(6);
+                    state.write_u64(f64::NAN.to_bits());
+                } else if v.fract() == 0.0 {
+                    // Whole number float - must hash same as equivalent Integer
+                    state.write_u8(1);
+                    match *v as i64 {
+                        i @ I64_SAFE_MIN..=I64_SAFE_MAX => state.write_i64(i),
+                        _ => state.write_u64(v.to_bits()),
+                    }
+                } else {
+                    // Fractional - can't equal any Integer, use different discriminant
+                    state.write_u8(6);
+                    state.write_u64(v.to_bits());
+                }
             }
             Value::Text(s) => {
-                2u8.hash(state);
+                state.write_u8(2);
+                // For strings, we still need to use .hash() to properly hash the bytes
                 s.hash(state);
             }
             Value::Boolean(b) => {
-                3u8.hash(state);
-                b.hash(state);
+                // Combine discriminant and value in single write
+                // 3 for false, 259 (3 + 256) for true
+                state.write_u16(if *b { 259 } else { 3 });
             }
             Value::Timestamp(t) => {
-                4u8.hash(state);
-                t.timestamp_nanos_opt().hash(state);
+                state.write_u8(4);
+                // timestamp_nanos_opt returns Option<i64>, unwrap_or for overflow case
+                state.write_i64(t.timestamp_nanos_opt().unwrap_or(i64::MAX));
             }
             Value::Json(s) => {
-                5u8.hash(state);
+                state.write_u8(5);
                 s.hash(state);
             }
         }
@@ -937,19 +967,19 @@ impl From<f32> for Value {
 
 impl From<String> for Value {
     fn from(v: String) -> Self {
-        Value::Text(CompactString::from(v))
+        Value::Text(SmartString::from_string(v))
     }
 }
 
 impl From<&str> for Value {
     fn from(v: &str) -> Self {
-        Value::Text(CompactString::from(v))
+        Value::Text(SmartString::from(v))
     }
 }
 
 impl From<Arc<str>> for Value {
     fn from(v: Arc<str>) -> Self {
-        Value::Text(CompactString::from(v.as_ref()))
+        Value::Text(SmartString::from(v.as_ref()))
     }
 }
 
@@ -1399,5 +1429,108 @@ mod tests {
         assert_eq!(set.len(), 2);
         assert!(set.contains(&Value::integer(42)));
         assert!(set.contains(&Value::integer(43)));
+    }
+
+    #[test]
+    fn test_hash_integer_float_consistency() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        fn hash_value(v: &Value) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            v.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        // Basic case: Integer(5) and Float(5.0) must hash the same
+        assert_eq!(
+            hash_value(&Value::integer(5)),
+            hash_value(&Value::float(5.0))
+        );
+        assert_eq!(
+            hash_value(&Value::integer(-100)),
+            hash_value(&Value::float(-100.0))
+        );
+        assert_eq!(
+            hash_value(&Value::integer(0)),
+            hash_value(&Value::float(0.0))
+        );
+
+        // Fractional floats should NOT hash the same as any integer
+        assert_ne!(
+            hash_value(&Value::float(5.5)),
+            hash_value(&Value::integer(5))
+        );
+        assert_ne!(
+            hash_value(&Value::float(5.5)),
+            hash_value(&Value::integer(6))
+        );
+
+        // Large integers within safe range
+        let safe_max = (1_i64 << 53) - 1; // 9007199254740991
+        assert_eq!(
+            hash_value(&Value::integer(safe_max)),
+            hash_value(&Value::float(safe_max as f64))
+        );
+        assert_eq!(
+            hash_value(&Value::integer(-safe_max)),
+            hash_value(&Value::float(-safe_max as f64))
+        );
+
+        // Boundary case: 2^53 (outside safe range, uses f64.to_bits())
+        let boundary = 1_i64 << 53; // 9007199254740992
+        assert_eq!(
+            hash_value(&Value::integer(boundary)),
+            hash_value(&Value::float(boundary as f64))
+        );
+
+        // Large integers that round to same f64 should hash same as that f64
+        // 2^53 + 1 rounds to 2^53 in f64
+        let large = boundary + 1; // 9007199254740993
+        let large_as_f64 = large as f64; // rounds to 9007199254740992.0
+        assert_eq!(
+            hash_value(&Value::integer(large)),
+            hash_value(&Value::float(large_as_f64))
+        );
+    }
+
+    #[test]
+    fn test_hash_in_hashmap() {
+        use ahash::AHashMap;
+
+        // Test that Integer and Float can be used as equivalent keys
+        let mut map = AHashMap::new();
+        map.insert(Value::integer(42), "int");
+
+        // Looking up with Float(42.0) should find the Integer(42) entry
+        assert_eq!(map.get(&Value::float(42.0)), Some(&"int"));
+
+        // Inserting Float(42.0) should overwrite Integer(42)
+        map.insert(Value::float(42.0), "float");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&Value::integer(42)), Some(&"float"));
+    }
+
+    #[test]
+    fn test_hash_nan_consistency() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        fn hash_value(v: &Value) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            v.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        // All NaN values must hash the same (they're equal in PartialEq)
+        let nan1 = Value::float(f64::NAN);
+        // Use a different NaN representation (quiet vs signaling doesn't matter for hash equality)
+        let nan2 = Value::float(f64::from_bits(0x7ff8000000000001)); // Another NaN bit pattern
+        let nan3 = Value::float(f64::INFINITY - f64::INFINITY);
+
+        assert_eq!(hash_value(&nan1), hash_value(&nan2));
+        assert_eq!(hash_value(&nan2), hash_value(&nan3));
+
+        // Verify they're equal in PartialEq
+        assert_eq!(nan1, nan2);
+        assert_eq!(nan2, nan3);
     }
 }

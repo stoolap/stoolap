@@ -24,7 +24,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use compact_str::CompactString;
+use crate::common::SmartString;
 
 use crate::core::{Result, Row, Schema, Value};
 use crate::parser::ast::{DeleteStatement, Expression, UpdateStatement};
@@ -277,7 +277,7 @@ impl Executor {
                         let value = Self::extract_update_value_from_slice(&u.value_source, params)?;
                         updates.push((u.column_idx, value.coerce_to_type(u.column_type)));
                     }
-                    // Clone only what we need (cheap: CompactString + Arc)
+                    // Clone only what we need (cheap: SmartString + Arc)
                     let table_name = update.table_name.clone();
                     let pk_column_name = update.pk_column_name.clone();
                     let schema = Arc::clone(&update.schema);
@@ -313,7 +313,7 @@ impl Executor {
                 if self.engine.schema_epoch() == delete.cached_epoch {
                     let pk_value =
                         Self::extract_pk_value_from_params(&delete.pk_value_source, params)?;
-                    // Clone only what we need (cheap: CompactString + Arc)
+                    // Clone only what we need (cheap: SmartString + Arc)
                     let table_name = delete.table_name.clone();
                     let pk_column_name = delete.pk_column_name.clone();
                     let schema = Arc::clone(&delete.schema);
@@ -561,9 +561,9 @@ impl Executor {
 
         // Build compiled state
         let compiled_update = CompiledPkUpdate {
-            table_name: CompactString::new(table_name),
+            table_name: SmartString::new(table_name),
             schema: Arc::new((*schema).clone()),
-            pk_column_name: CompactString::new(pk_column),
+            pk_column_name: SmartString::new(pk_column),
             pk_value_source: pk_source,
             updates: compiled_updates,
             cached_epoch: self.engine.schema_epoch(),
@@ -636,9 +636,9 @@ impl Executor {
 
         // Build compiled state
         let compiled_delete = CompiledPkDelete {
-            table_name: CompactString::new(table_name),
+            table_name: SmartString::new(table_name),
             schema: Arc::new((*schema).clone()),
-            pk_column_name: CompactString::new(pk_column),
+            pk_column_name: SmartString::new(pk_column),
             pk_value_source: pk_source,
             cached_epoch: self.engine.schema_epoch(),
         };

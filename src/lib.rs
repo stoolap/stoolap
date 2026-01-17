@@ -85,7 +85,9 @@ pub use core::{
 };
 
 // Re-export common utilities
-pub use common::{BufferPool, ConcurrentInt64Map, Int64Map, Int64Set, PoolStats, SemVer};
+pub use common::{
+    BufferPool, ConcurrentInt64Map, Int64Map, Int64Set, PoolStats, SemVer, SmartString,
+};
 
 // Re-export storage/expression types
 pub use storage::{

@@ -23,7 +23,8 @@ use std::sync::{Arc, RwLock};
 
 use crate::common::{CompactArc, Int64Set};
 use crate::core::{
-    DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
+    interned_null, DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn,
+    Value,
 };
 use crate::storage::expression::Expression;
 use crate::storage::mvcc::bitmap_index::BitmapIndex;
@@ -1043,18 +1044,18 @@ impl MVCCTable {
                             let old_values: SmallVec<[CompactArc<Value>; 2]> = column_ids
                                 .iter()
                                 .map(|&col_id| {
-                                    old_r.get_arc(col_id as usize).unwrap_or_else(|| {
-                                        CompactArc::new(Value::Null(DataType::Null))
-                                    })
+                                    old_r
+                                        .get_arc(col_id as usize)
+                                        .unwrap_or_else(|| interned_null(DataType::Null))
                                 })
                                 .collect();
 
                             let new_values: SmallVec<[CompactArc<Value>; 2]> = column_ids
                                 .iter()
                                 .map(|&col_id| {
-                                    new_row.get_arc(col_id as usize).unwrap_or_else(|| {
-                                        CompactArc::new(Value::Null(DataType::Null))
-                                    })
+                                    new_row
+                                        .get_arc(col_id as usize)
+                                        .unwrap_or_else(|| interned_null(DataType::Null))
                                 })
                                 .collect();
 
@@ -1071,18 +1072,18 @@ impl MVCCTable {
                                 column_ids
                                     .iter()
                                     .map(|&col_id| {
-                                        old_r.get_arc(col_id as usize).unwrap_or_else(|| {
-                                            CompactArc::new(Value::Null(DataType::Null))
-                                        })
+                                        old_r
+                                            .get_arc(col_id as usize)
+                                            .unwrap_or_else(|| interned_null(DataType::Null))
                                     })
                                     .collect()
                             } else {
                                 column_ids
                                     .iter()
                                     .map(|&col_id| {
-                                        new_row.get_arc(col_id as usize).unwrap_or_else(|| {
-                                            CompactArc::new(Value::Null(DataType::Null))
-                                        })
+                                        new_row
+                                            .get_arc(col_id as usize)
+                                            .unwrap_or_else(|| interned_null(DataType::Null))
                                     })
                                     .collect()
                             };
@@ -1095,7 +1096,7 @@ impl MVCCTable {
                             .map(|&col_id| {
                                 new_row
                                     .get_arc(col_id as usize)
-                                    .unwrap_or_else(|| CompactArc::new(Value::Null(DataType::Null)))
+                                    .unwrap_or_else(|| interned_null(DataType::Null))
                             })
                             .collect();
                         index.add_arc(&new_values, row_id, row_id)?;

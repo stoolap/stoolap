@@ -22,6 +22,7 @@ use super::error::{Error, Result};
 use super::schema::Schema;
 use super::types::DataType;
 use super::value::Value;
+use super::value_interner::{intern_value, interned_null};
 use crate::common::{CompactArc, CompactVec};
 
 /// Internal storage for Row - hybrid approach for memory + performance
@@ -154,9 +155,9 @@ impl RowStorage {
     fn make_mut_arc(&mut self) -> &mut CompactVec<CompactArc<Value>> {
         match self {
             RowStorage::Inline(v) => {
-                // Convert Value to CompactArc<Value>
+                // Convert Value to CompactArc<Value> with interning
                 *self =
-                    RowStorage::Owned(std::mem::take(v).into_iter().map(CompactArc::new).collect());
+                    RowStorage::Owned(std::mem::take(v).into_iter().map(intern_value).collect());
                 match self {
                     RowStorage::Owned(v) => v,
                     _ => unreachable!(),
@@ -193,7 +194,7 @@ impl RowStorage {
     #[inline]
     fn into_arc_vec(self) -> Vec<CompactArc<Value>> {
         match self {
-            RowStorage::Inline(v) => v.into_iter().map(CompactArc::new).collect(),
+            RowStorage::Inline(v) => v.into_iter().map(intern_value).collect(),
             RowStorage::Owned(v) => v.into_vec(),
             RowStorage::Shared(arc) => arc.to_vec(),
         }
@@ -436,7 +437,7 @@ impl Row {
         // Extend with Arc values, moving when possible
         match left.storage {
             RowStorage::Inline(left_vec) => {
-                vec.extend(left_vec.into_iter().map(CompactArc::new));
+                vec.extend(left_vec.into_iter().map(intern_value));
             }
             RowStorage::Owned(left_vec) => {
                 vec.extend(left_vec);
@@ -447,7 +448,7 @@ impl Row {
         }
         match right.storage {
             RowStorage::Inline(right_vec) => {
-                vec.extend(right_vec.into_iter().map(CompactArc::new));
+                vec.extend(right_vec.into_iter().map(intern_value));
             }
             RowStorage::Owned(right_vec) => {
                 vec.extend(right_vec);
@@ -527,7 +528,7 @@ impl Row {
     #[inline]
     pub fn from_arc(values: Arc<[Value]>) -> Self {
         Self {
-            storage: RowStorage::Owned(values.iter().map(|v| CompactArc::new(v.clone())).collect()),
+            storage: RowStorage::Owned(values.iter().map(|v| intern_value(v.clone())).collect()),
         }
     }
 
@@ -541,14 +542,14 @@ impl Row {
 
     /// Convert Inline/Shared storage to Owned in place.
     /// Call this before operations that need Arc access (like as_arc_slice).
-    /// - Inline: wraps each value in Arc
+    /// - Inline: wraps each value in Arc (with interning for common values)
     /// - Shared: clones Arc references to owned Vec
     /// - No-op if already Owned.
     #[inline]
     pub fn ensure_owned(&mut self) {
         match std::mem::take(&mut self.storage) {
             RowStorage::Inline(v) => {
-                self.storage = RowStorage::Owned(v.into_iter().map(CompactArc::new).collect());
+                self.storage = RowStorage::Owned(v.into_iter().map(intern_value).collect());
             }
             RowStorage::Shared(arc) => {
                 self.storage = RowStorage::Owned(arc.iter().cloned().collect());
@@ -571,7 +572,7 @@ impl Row {
         let values: CompactVec<CompactArc<Value>> = schema
             .columns
             .iter()
-            .map(|col| CompactArc::new(Value::null(col.data_type)))
+            .map(|col| interned_null(col.data_type))
             .collect();
         Self {
             storage: RowStorage::Owned(values),
@@ -597,11 +598,11 @@ impl Row {
     }
 
     /// Get an CompactArc<Value> by index - for indexes to share references
-    /// Note: For Inline storage, this creates a new Arc (clone required)
+    /// Note: For Inline storage, this uses value interning for common values
     #[inline]
     pub fn get_arc(&self, index: usize) -> Option<CompactArc<Value>> {
         match &self.storage {
-            RowStorage::Inline(v) => v.get(index).map(|val| CompactArc::new(val.clone())),
+            RowStorage::Inline(v) => v.get(index).map(|val| intern_value(val.clone())),
             RowStorage::Owned(v) => v.get(index).cloned(),
             RowStorage::Shared(a) => a.get(index).cloned(),
         }
@@ -625,14 +626,14 @@ impl Row {
                 message: format!("row index {} out of bounds (len={})", index, vec.len()),
             });
         }
-        vec[index] = CompactArc::new(value);
+        vec[index] = intern_value(value);
         Ok(())
     }
 
     /// Push a value to the end of the row (triggers copy-on-write if shared)
     #[inline]
     pub fn push(&mut self, value: Value) {
-        self.storage.make_mut().push(CompactArc::new(value));
+        self.storage.make_mut().push(intern_value(value));
     }
 
     /// Push an CompactArc<Value> to the end of the row (no wrapping needed)
@@ -703,7 +704,7 @@ impl Row {
     #[inline]
     pub fn extend_from_slice(&mut self, other: &[Value]) {
         let vec = self.storage.make_mut();
-        vec.extend(other.iter().map(|v| CompactArc::new(v.clone())));
+        vec.extend(other.iter().map(|v| intern_value(v.clone())));
     }
 
     /// Extend the row with CompactArc<Value> references (no wrapping needed)
@@ -829,8 +830,7 @@ impl Row {
         match self.storage {
             RowStorage::Shared(arc) => arc,
             RowStorage::Inline(vec) => {
-                let arc_vec: Vec<CompactArc<Value>> =
-                    vec.into_iter().map(CompactArc::new).collect();
+                let arc_vec: Vec<CompactArc<Value>> = vec.into_iter().map(intern_value).collect();
                 Arc::from(arc_vec.into_boxed_slice())
             }
             RowStorage::Owned(vec) => Arc::from(vec.into_boxed_slice()),
@@ -978,7 +978,7 @@ impl Row {
                     if idx < len {
                         values.push(CompactArc::clone(&vec[idx]));
                     } else {
-                        values.push(CompactArc::new(Value::null_unknown()));
+                        values.push(interned_null(DataType::Null));
                     }
                 }
                 // vec drops here - decrements refcounts for values we cloned,
@@ -994,7 +994,7 @@ impl Row {
                     if idx < arc.len() {
                         values.push(CompactArc::clone(&arc[idx]));
                     } else {
-                        values.push(CompactArc::new(Value::null_unknown()));
+                        values.push(interned_null(DataType::Null));
                     }
                 }
                 Row {

@@ -83,8 +83,14 @@ pub struct CompactArc<T> {
     _marker: PhantomData<CompactArcInner<T>>,
 }
 
-// Safety: CompactArc can be sent between threads if T can be
+// SAFETY: CompactArc can be sent between threads if T can be sent and shared.
+// The reference count is managed with atomic operations, ensuring thread-safe
+// access to the count. The data T is only accessed through shared references
+// (via Deref) unless we have exclusive access (count == 1).
 unsafe impl<T: Send + Sync> Send for CompactArc<T> {}
+// SAFETY: CompactArc can be shared between threads if T can be shared.
+// All accesses to the reference count use atomic operations, and the data
+// is accessed through an immutable reference, which is safe when T: Sync.
 unsafe impl<T: Send + Sync> Sync for CompactArc<T> {}
 
 impl<T> CompactArc<T> {
@@ -137,7 +143,9 @@ impl<T> CompactArc<T> {
     /// ```
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
-        // Relaxed is fine for just reading the count
+        // SAFETY: The pointer is valid because CompactArc maintains the invariant that
+        // ptr always points to a valid, aligned CompactArcInner allocation as long as
+        // the CompactArc exists. Relaxed ordering is sufficient for a non-synchronized read.
         unsafe { this.ptr.as_ref().count.load(AtomicOrdering::Relaxed) }
     }
 
@@ -166,6 +174,8 @@ impl<T> CompactArc<T> {
     #[inline]
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
         // Try to set count from 1 to 0
+        // SAFETY: The pointer is valid because CompactArc maintains the invariant that
+        // ptr always points to a valid, aligned CompactArcInner allocation.
         if unsafe {
             this.ptr
                 .as_ref()
@@ -289,6 +299,8 @@ impl<T> Clone for CompactArc<T> {
         // Increment the reference count
         // Using Relaxed is fine here because we're not synchronizing with anything
         // The synchronization happens in Drop when we decrement
+        // SAFETY: The pointer is valid because CompactArc maintains the invariant that
+        // ptr always points to a valid, aligned CompactArcInner allocation.
         let old_count = unsafe {
             self.ptr
                 .as_ref()
@@ -314,6 +326,8 @@ impl<T> Drop for CompactArc<T> {
         // Decrement the reference count
         // We need Release ordering to ensure all writes before drop are visible
         // to the thread that will deallocate
+        // SAFETY: The pointer is valid because CompactArc maintains the invariant that
+        // ptr always points to a valid, aligned CompactArcInner allocation.
         let old_count = unsafe {
             self.ptr
                 .as_ref()

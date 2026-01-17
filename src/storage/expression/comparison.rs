@@ -21,10 +21,10 @@
 use std::any::Any;
 
 use chrono::{DateTime, Utc};
-use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 
 use super::{find_column_index, resolve_alias, Expression};
+use crate::common::SmartString;
 use crate::core::{DataType, Error, Operator, Result, Row, Schema, Value};
 
 /// Pre-computed typed value for fast comparison
@@ -78,7 +78,7 @@ impl ComparisonValue {
             ComparisonValue::Null => Value::Null(DataType::Text),
             ComparisonValue::Integer(i) => Value::Integer(*i),
             ComparisonValue::Float(f) => Value::Float(*f),
-            ComparisonValue::Text(s) => Value::Text(CompactString::from(s.as_str())),
+            ComparisonValue::Text(s) => Value::Text(SmartString::new(s)),
             ComparisonValue::Boolean(b) => Value::Boolean(*b),
             ComparisonValue::Timestamp(t) => Value::Timestamp(*t),
         }

@@ -44,6 +44,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
+use memchr::memmem;
 use rustc_hash::FxHashMap;
 
 use chrono::{DateTime, Utc};
@@ -96,8 +97,13 @@ pub enum CompiledPattern {
     Prefix(Arc<str>),
     /// Suffix match (%pattern)
     Suffix(Arc<str>),
-    /// Contains match (%pattern%)
-    Contains(Arc<str>),
+    /// Contains match (%pattern%) - uses SIMD-accelerated substring search
+    Contains {
+        /// The substring to search for
+        substring: Arc<str>,
+        /// Pre-compiled SIMD finder for case-sensitive O(n) search (boxed to reduce enum size)
+        finder: Box<memmem::Finder<'static>>,
+    },
     /// Prefix with pattern (literal_prefix + wildcard_pattern%)
     /// First check starts_with(prefix), then regex for the rest
     PrefixWithPattern {
@@ -139,7 +145,12 @@ impl CompiledPattern {
                 (false, false) => CompiledPattern::Exact(Arc::from(inner)),
                 (false, true) => CompiledPattern::Prefix(Arc::from(inner)),
                 (true, false) => CompiledPattern::Suffix(Arc::from(inner)),
-                (true, true) => CompiledPattern::Contains(Arc::from(inner)),
+                (true, true) => {
+                    // Pre-compile SIMD finder for O(n) substring search
+                    let substring: Arc<str> = Arc::from(inner);
+                    let finder = Box::new(memmem::Finder::new(substring.as_bytes()).into_owned());
+                    CompiledPattern::Contains { substring, finder }
+                }
             }
         } else {
             // Check for simple underscore patterns without middle % (e.g., "User_1%", "User_1")
@@ -229,8 +240,8 @@ impl CompiledPattern {
                     s.ends_with(suffix_ref)
                 }
             }
-            CompiledPattern::Contains(substr) => {
-                let substr_ref = substr.as_ref();
+            CompiledPattern::Contains { substring, finder } => {
+                let substr_ref = substring.as_ref();
                 if case_insensitive {
                     // For case-insensitive contains, we need to scan through the string
                     // Use allocation-free approach by checking each position
@@ -249,7 +260,9 @@ impl CompiledPattern {
                     }
                     false
                 } else {
-                    s.contains(substr_ref)
+                    // OPTIMIZATION: Use pre-compiled SIMD finder for O(n) search
+                    // This is ~3-10x faster than str::contains which recreates TwoWaySearcher each call
+                    finder.find(s.as_bytes()).is_some()
                 }
             }
             CompiledPattern::PrefixWithPattern {

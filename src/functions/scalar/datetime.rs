@@ -15,8 +15,8 @@
 //! Date/Time scalar functions
 
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
-use compact_str::CompactString;
 
+use crate::common::SmartString;
 use crate::core::{parse_timestamp, Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
@@ -360,8 +360,8 @@ impl ScalarFunction for VersionFunction {
         }
 
         // Use the version info from common module
-        Ok(Value::Text(CompactString::from(
-            crate::common::version::version_info().as_str(),
+        Ok(Value::Text(SmartString::from_string(
+            crate::common::version::version_info(),
         )))
     }
 

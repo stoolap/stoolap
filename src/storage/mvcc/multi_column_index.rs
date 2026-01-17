@@ -40,9 +40,8 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 
-use crate::common::CompactArc;
+use crate::common::{CompactArc, CompactVec, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
@@ -100,7 +99,7 @@ impl std::hash::Hash for CompositeKey {
 /// - Fast INSERT/DELETE (only updates hash index until queries trigger builds)
 ///
 /// ## Implementation:
-/// - `value_to_rows`: FxHashMap<CompositeKey, SmallVec> for exact lookups (always maintained)
+/// - `value_to_rows`: FxHashMap<CompositeKey, CompactVec> for exact lookups (always maintained)
 /// - `row_to_key`: FxHashMap for reverse mapping (always maintained)
 /// - `sorted_values`: BTreeMap for RANGE queries (lazy built)
 /// - `prefix_indexes`: Vec of FxHashMaps for partial queries (lazy built)
@@ -114,20 +113,20 @@ pub struct MultiColumnIndex {
     closed: AtomicBool,
 
     /// Main BTree index for range queries - LAZY built on first range query
-    sorted_values: RwLock<BTreeMap<CompositeKey, SmallVec<[i64; 4]>>>,
+    sorted_values: RwLock<BTreeMap<CompositeKey, CompactVec<i64>>>,
     btree_built: AtomicBool,
 
     /// Hash index for exact lookups (full key) - always maintained
-    value_to_rows: RwLock<FxHashMap<CompositeKey, SmallVec<[i64; 4]>>>,
+    value_to_rows: RwLock<FxHashMap<CompositeKey, CompactVec<i64>>>,
 
     /// Prefix indexes: LAZY built on first partial query
     /// Index 0 = first column, Index 1 = first two columns, etc.
-    prefix_indexes: Vec<RwLock<FxHashMap<CompositeKey, SmallVec<[i64; 4]>>>>,
+    prefix_indexes: Vec<RwLock<FxHashMap<CompositeKey, CompactVec<i64>>>>,
     prefix_built: Vec<AtomicBool>,
 
     /// Reverse mapping for removal - uses Vec<CompactArc<Value>> for memory efficiency
     /// Arc references are shared with ValueArena (8 bytes per value)
-    row_to_key: RwLock<FxHashMap<i64, Vec<CompactArc<Value>>>>,
+    row_to_key: RwLock<I64Map<Vec<CompactArc<Value>>>>,
 }
 
 impl std::fmt::Debug for MultiColumnIndex {
@@ -177,7 +176,7 @@ impl MultiColumnIndex {
             value_to_rows: RwLock::new(FxHashMap::default()),
             prefix_indexes,
             prefix_built,
-            row_to_key: RwLock::new(FxHashMap::default()),
+            row_to_key: RwLock::new(I64Map::new()),
         }
     }
 
@@ -290,7 +289,7 @@ impl MultiColumnIndex {
 
         // Build prefix index from row_to_key (read lock prevents concurrent inserts)
         // Insert in sorted order for O(N+M) merge operations
-        for (&row_id, arc_values) in row_to_key.iter() {
+        for (row_id, arc_values) in row_to_key.iter() {
             if arc_values.len() >= prefix_len {
                 // Dereference CompactArc<Value> to create CompositeKey for prefix
                 let prefix_key = CompositeKey(
@@ -315,7 +314,7 @@ impl MultiColumnIndex {
         &self,
         key: &CompositeKey,
         row_id: i64,
-        value_to_rows: &FxHashMap<CompositeKey, SmallVec<[i64; 4]>>,
+        value_to_rows: &FxHashMap<CompositeKey, CompactVec<i64>>,
     ) -> Result<()> {
         if !self.is_unique {
             return Ok(());
@@ -382,7 +381,7 @@ impl Index for MultiColumnIndex {
 
         // Check if row already exists with different key (for updates)
         // Now safe to do atomically since we hold both write locks
-        if let Some(existing_arc_values) = row_to_key.get(&row_id) {
+        if let Some(existing_arc_values) = row_to_key.get(row_id) {
             // Compare CompactArc<Value> contents with new values using optimized helper
             if Self::values_match(existing_arc_values, values) {
                 // Same key, nothing to do
@@ -507,7 +506,7 @@ impl Index for MultiColumnIndex {
 
         // Check if row already exists with different key (for updates)
         // Now safe to do atomically since we hold both write locks
-        if let Some(existing_arc_values) = row_to_key.get(&row_id) {
+        if let Some(existing_arc_values) = row_to_key.get(row_id) {
             // Compare Arc pointers first (fast path), then values using optimized helper
             if Self::arc_values_match(existing_arc_values, values) {
                 // Same key, nothing to do
@@ -606,8 +605,8 @@ impl Index for MultiColumnIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
-        for (&row_id, values) in entries {
+    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
+        for (row_id, values) in entries.iter() {
             self.add(values, row_id, 0)?;
         }
         Ok(())
@@ -636,7 +635,7 @@ impl Index for MultiColumnIndex {
             }
 
             // Remove reverse mapping - ALWAYS maintained
-            row_to_key.remove(&row_id);
+            row_to_key.remove(row_id);
         }
 
         // Only update BTree if it was built (row_ids are sorted, use binary search)
@@ -696,7 +695,7 @@ impl Index for MultiColumnIndex {
             }
 
             // Remove reverse mapping - ALWAYS maintained
-            row_to_key.remove(&row_id);
+            row_to_key.remove(row_id);
         }
 
         // Only update BTree if it was built (row_ids are sorted, use binary search)
@@ -733,8 +732,8 @@ impl Index for MultiColumnIndex {
         Ok(())
     }
 
-    fn remove_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
-        for (&row_id, values) in entries {
+    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
+        for (row_id, values) in entries.iter() {
             self.remove(values, row_id, 0)?;
         }
         Ok(())

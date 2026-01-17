@@ -30,6 +30,7 @@ pub mod row_vec;
 pub mod schema;
 pub mod types;
 pub mod value;
+pub mod value_interner;
 
 // Re-export main types for convenience
 pub use error::{Error, Result};
@@ -38,6 +39,7 @@ pub use row_vec::{RowIdVec, RowVec};
 pub use schema::{Schema, SchemaBuilder, SchemaColumn};
 pub use types::{DataType, IndexEntry, IndexType, IsolationLevel, Operator};
 pub use value::{parse_timestamp, Value, NULL_VALUE};
+pub use value_interner::{intern_value, interned_bool, interned_int, interned_null};
 
 #[cfg(test)]
 mod integration_tests {

@@ -17,7 +17,7 @@
 //! Provides the main MVCC storage engine implementation.
 //!
 
-use compact_str::CompactString;
+use crate::common::{I64Map, SmartString};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -53,12 +53,12 @@ use crate::storage::mvcc::{
 use crate::storage::traits::{Engine, Index, Table, Transaction};
 
 /// Type alias for a single table entry in the transaction version store
-type TxnTableEntry = (CompactString, Arc<RwLock<TransactionVersionStore>>);
+type TxnTableEntry = (SmartString, Arc<RwLock<TransactionVersionStore>>);
 
 /// Type alias for the transaction version store map
 /// Structured as txn_id -> [(table_name, store)] for efficient lookup per transaction
 /// Uses SmallVec<[T; 2]> since most transactions access 1-2 tables, avoiding heap allocation
-type TxnVersionStoreMap = FxHashMap<i64, SmallVec<[TxnTableEntry; 2]>>;
+type TxnVersionStoreMap = I64Map<SmallVec<[TxnTableEntry; 2]>>;
 
 /// Helper to get registry as the visibility checker type expected by VersionStore.
 /// In production: returns concrete Arc<TransactionRegistry> (zero-cost, inlined).
@@ -352,7 +352,7 @@ impl MVCCEngine {
             version_stores: Arc::new(RwLock::new(FxHashMap::default())),
             registry: Arc::new(TransactionRegistry::new()),
             open: AtomicBool::new(false),
-            txn_version_stores: Arc::new(RwLock::new(FxHashMap::default())),
+            txn_version_stores: Arc::new(RwLock::new(I64Map::new())),
             views: RwLock::new(FxHashMap::default()),
             persistence: Arc::new(persistence),
             loading_from_disk: Arc::new(AtomicBool::new(false)),
@@ -2700,7 +2700,7 @@ impl TransactionEngineOperations for EngineOperations {
         // Check if we have a cached transaction version store for this (txn_id, table_name)
         let txn_versions = {
             let cache = self.txn_version_stores().read().unwrap();
-            if let Some(txn_tables) = cache.get(&txn_id) {
+            if let Some(txn_tables) = cache.get(txn_id) {
                 // Linear search on SmallVec (fast for 1-2 tables)
                 if let Some((_, cached)) = txn_tables
                     .iter()
@@ -2931,7 +2931,7 @@ impl TransactionEngineOperations for EngineOperations {
         // O(1) lookup for this transaction's tables
         let cache = self.txn_version_stores().read().unwrap();
 
-        if let Some(txn_tables) = cache.get(&txn_id) {
+        if let Some(txn_tables) = cache.get(txn_id) {
             for (table_name, txn_store) in txn_tables.iter() {
                 // Check if this store has pending changes
                 let store = txn_store.read().unwrap();
@@ -2963,7 +2963,7 @@ impl TransactionEngineOperations for EngineOperations {
         // O(1) lookup by txn_id using nested HashMap
         let cache = self.txn_version_stores().read().unwrap();
 
-        if let Some(txn_tables) = cache.get(&txn_id) {
+        if let Some(txn_tables) = cache.get(txn_id) {
             for (table_name, txn_store) in txn_tables.iter() {
                 // Check if there are local changes before committing
                 let has_changes = {
@@ -2992,7 +2992,7 @@ impl TransactionEngineOperations for EngineOperations {
         // O(1) cleanup - remove entire transaction entry
         drop(cache);
         let mut cache = self.txn_version_stores().write().unwrap();
-        cache.remove(&txn_id);
+        cache.remove(txn_id);
 
         Ok(())
     }
@@ -3001,7 +3001,7 @@ impl TransactionEngineOperations for EngineOperations {
         // O(1) cleanup - remove entire transaction entry from txn_version_stores
         // This prevents memory leaks when transactions are rolled back
         let mut cache = self.txn_version_stores().write().unwrap();
-        cache.remove(&txn_id);
+        cache.remove(txn_id);
     }
 }
 
