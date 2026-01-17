@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use crate::common::CompactArc;
 use ahash::AHashSet;
+use memchr::memmem;
 
 use crate::core::{DataType, Value};
 use crate::functions::{NativeFn1, ScalarFunction};
@@ -250,7 +251,10 @@ impl CompiledPattern {
                 CompiledPattern::Exact(p) => text == p,
                 CompiledPattern::Prefix(p) => text.starts_with(p),
                 CompiledPattern::Suffix(p) => text.ends_with(p),
-                CompiledPattern::Contains(p) => text.contains(p),
+                // Use memmem::find for SIMD-accelerated substring search
+                CompiledPattern::Contains(p) => {
+                    memmem::find(text.as_bytes(), p.as_bytes()).is_some()
+                }
                 CompiledPattern::PrefixSuffix(prefix, suffix) => {
                     text.starts_with(prefix)
                         && text.ends_with(suffix)
@@ -263,12 +267,15 @@ impl CompiledPattern {
         }
 
         // Case-insensitive: use ASCII fast path when possible, fall back to Unicode
+        // NOTE: Pattern is already lowercased at compile time (see compile() method),
+        // so we only need to lowercase the input text, not the pattern again.
         match self {
             CompiledPattern::Exact(p) => {
                 if text.is_ascii() && p.is_ascii() {
                     text.eq_ignore_ascii_case(p)
                 } else {
-                    text.to_lowercase() == p.to_lowercase()
+                    // Pattern already lowercased at compile time
+                    text.to_lowercase() == *p
                 }
             }
             CompiledPattern::Prefix(p) => {
@@ -278,7 +285,8 @@ impl CompiledPattern {
                 if text.is_ascii() && p.is_ascii() {
                     text[..p.len()].eq_ignore_ascii_case(p)
                 } else {
-                    text.to_lowercase().starts_with(&p.to_lowercase())
+                    // Pattern already lowercased at compile time
+                    text.to_lowercase().starts_with(p)
                 }
             }
             CompiledPattern::Suffix(p) => {
@@ -288,7 +296,8 @@ impl CompiledPattern {
                 if text.is_ascii() && p.is_ascii() {
                     text[text.len() - p.len()..].eq_ignore_ascii_case(p)
                 } else {
-                    text.to_lowercase().ends_with(&p.to_lowercase())
+                    // Pattern already lowercased at compile time
+                    text.to_lowercase().ends_with(p)
                 }
             }
             CompiledPattern::Contains(p) => {
@@ -301,8 +310,8 @@ impl CompiledPattern {
                         .windows(p.len())
                         .any(|window| window.eq_ignore_ascii_case(p.as_bytes()))
                 } else {
-                    // Unicode path: need proper case folding
-                    text.to_lowercase().contains(&p.to_lowercase())
+                    // Unicode path: lowercase text only (pattern already lowercased)
+                    text.to_lowercase().contains(p)
                 }
             }
             CompiledPattern::PrefixSuffix(prefix, suffix) => {
@@ -313,9 +322,9 @@ impl CompiledPattern {
                     text[..prefix.len()].eq_ignore_ascii_case(prefix)
                         && text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
                 } else {
+                    // Patterns already lowercased at compile time
                     let text_lower = text.to_lowercase();
-                    text_lower.starts_with(&prefix.to_lowercase())
-                        && text_lower.ends_with(&suffix.to_lowercase())
+                    text_lower.starts_with(prefix) && text_lower.ends_with(suffix)
                 }
             }
             // Regex already has case-insensitivity compiled in

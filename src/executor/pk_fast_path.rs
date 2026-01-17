@@ -28,7 +28,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use compact_str::CompactString;
+use crate::common::SmartString;
 
 use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement};
@@ -500,7 +500,7 @@ impl Executor {
                 let column_names = info.schema.column_names_arc();
                 let cached_epoch = self.engine.schema_epoch();
                 let compiled_lookup = CompiledPkLookup {
-                    table_name: CompactString::new(&info.table_name),
+                    table_name: SmartString::new(&info.table_name),
                     schema: info.schema.clone(),
                     column_names,
                     pk_value_source: info.pk_value_source.clone(),

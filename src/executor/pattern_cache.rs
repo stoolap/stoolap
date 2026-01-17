@@ -31,6 +31,7 @@
 //! - **Contains**: `'%hello%'` - contains check
 //! - **Complex**: `'h_llo%'` - Compiled regex (cached)
 
+use memchr::memmem;
 use regex::Regex;
 use rustc_hash::FxHashMap;
 use std::sync::RwLock;
@@ -95,7 +96,8 @@ impl CompiledPattern {
             CompiledPattern::Exact(s) => text == s,
             CompiledPattern::Prefix(p) => text.starts_with(p),
             CompiledPattern::Suffix(s) => text.ends_with(s),
-            CompiledPattern::Contains(c) => text.contains(c),
+            // Use SIMD-accelerated substring search
+            CompiledPattern::Contains(c) => memmem::find(text.as_bytes(), c.as_bytes()).is_some(),
             CompiledPattern::PrefixSuffix(p, s) => {
                 text.starts_with(p) && text.ends_with(s) && text.len() >= p.len() + s.len()
             }

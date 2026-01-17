@@ -14,7 +14,7 @@
 
 //! Statement parsing methods for the SQL Parser
 
-use compact_str::CompactString;
+use crate::common::SmartString;
 use rustc_hash::FxHashMap;
 
 use super::ast::*;
@@ -586,13 +586,13 @@ impl Parser {
             // Check for JOIN keywords
             let join_type = if self.peek_token_is_keyword("JOIN") {
                 self.next_token();
-                CompactString::const_new("INNER")
+                SmartString::const_new("INNER")
             } else if self.peek_token_is_keyword("INNER") {
                 self.next_token();
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                CompactString::const_new("INNER")
+                SmartString::const_new("INNER")
             } else if self.peek_token_is_keyword("LEFT") {
                 self.next_token();
                 if self.peek_token_is_keyword("OUTER") {
@@ -601,7 +601,7 @@ impl Parser {
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                CompactString::const_new("LEFT")
+                SmartString::const_new("LEFT")
             } else if self.peek_token_is_keyword("RIGHT") {
                 self.next_token();
                 if self.peek_token_is_keyword("OUTER") {
@@ -610,7 +610,7 @@ impl Parser {
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                CompactString::const_new("RIGHT")
+                SmartString::const_new("RIGHT")
             } else if self.peek_token_is_keyword("FULL") {
                 self.next_token();
                 if self.peek_token_is_keyword("OUTER") {
@@ -619,13 +619,13 @@ impl Parser {
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                CompactString::const_new("FULL")
+                SmartString::const_new("FULL")
             } else if self.peek_token_is_keyword("CROSS") {
                 self.next_token();
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                CompactString::const_new("CROSS")
+                SmartString::const_new("CROSS")
             } else if self.peek_token_is_keyword("NATURAL") {
                 self.next_token();
                 let natural_type = if self.peek_token_is_keyword("LEFT") {
@@ -646,11 +646,11 @@ impl Parser {
                 if !self.expect_keyword("JOIN") {
                     return None;
                 }
-                CompactString::const_new(natural_type)
+                SmartString::const_new(natural_type)
             } else if self.peek_token_is_punctuator(",") {
                 // Implicit CROSS JOIN with comma syntax: FROM t1, t2
                 self.next_token(); // consume comma
-                CompactString::const_new("CROSS")
+                SmartString::const_new("CROSS")
             } else {
                 // No more joins
                 break;
@@ -2040,15 +2040,15 @@ impl Parser {
                     if self.peek_token_is_keyword("READ") {
                         self.next_token();
                     }
-                    CompactString::const_new("REPEATABLE READ")
+                    SmartString::const_new("REPEATABLE READ")
                 }
                 "READ" => {
                     if self.peek_token_is_keyword("UNCOMMITTED") {
                         self.next_token();
-                        CompactString::const_new("READ UNCOMMITTED")
+                        SmartString::const_new("READ UNCOMMITTED")
                     } else if self.peek_token_is_keyword("COMMITTED") {
                         self.next_token();
-                        CompactString::const_new("READ COMMITTED")
+                        SmartString::const_new("READ COMMITTED")
                     } else {
                         self.add_error(format!(
                             "expected UNCOMMITTED or COMMITTED after READ at {}",

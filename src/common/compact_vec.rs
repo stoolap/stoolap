@@ -39,8 +39,11 @@ pub struct CompactVec<T> {
     len_cap: u64,
 }
 
-// Safety: CompactVec has the same thread-safety as Vec
+// SAFETY: CompactVec has the same thread-safety as Vec - it can be sent
+// between threads if T can be sent, as it owns its data exclusively.
 unsafe impl<T: Send> Send for CompactVec<T> {}
+// SAFETY: CompactVec can be shared between threads if T can be shared,
+// as it only provides shared access to its elements through &self methods.
 unsafe impl<T: Sync> Sync for CompactVec<T> {}
 
 impl<T> CompactVec<T> {
@@ -82,6 +85,7 @@ impl<T> CompactVec<T> {
 
         // Allocate memory
         let layout = Layout::array::<T>(cap as usize).unwrap();
+        // SAFETY: Layout is valid (non-zero size, proper alignment for T).
         let ptr = unsafe { alloc(layout) as *mut T };
 
         if ptr.is_null() {
@@ -89,6 +93,7 @@ impl<T> CompactVec<T> {
         }
 
         Self {
+            // SAFETY: We just checked that ptr is not null above.
             ptr: unsafe { NonNull::new_unchecked(ptr) },
             len_cap: Self::pack(0, cap),
         }
@@ -142,6 +147,8 @@ impl<T> CompactVec<T> {
             self.grow();
         }
 
+        // SAFETY: After grow(), we have capacity > len, so ptr.add(len) is valid.
+        // The memory at that location is uninitialized but allocated for T.
         unsafe {
             ptr::write(self.ptr.as_ptr().add(len), value);
             self.set_len(len + 1);
@@ -156,6 +163,9 @@ impl<T> CompactVec<T> {
             return None;
         }
 
+        // SAFETY: len > 0, so len - 1 is a valid index. The element at that
+        // position is initialized. After read, we decrement len so the moved
+        // element won't be dropped again.
         unsafe {
             self.set_len(len - 1);
             Some(ptr::read(self.ptr.as_ptr().add(len - 1)))
@@ -170,7 +180,8 @@ impl<T> CompactVec<T> {
             return;
         }
 
-        // Drop all elements
+        // SAFETY: All elements [0..len] are initialized. After dropping them,
+        // we set len to 0 so they won't be dropped again.
         unsafe {
             ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), len));
             self.set_len(0);
@@ -220,10 +231,13 @@ impl<T> CompactVec<T> {
 
         let new_ptr = if old_cap == 0 {
             // Fresh allocation
+            // SAFETY: new_layout is valid (non-zero size, proper alignment).
             unsafe { alloc(new_layout) as *mut T }
         } else {
             // Realloc existing
             let old_layout = Layout::array::<T>(old_cap).unwrap();
+            // SAFETY: self.ptr was allocated with old_layout, and new_layout.size()
+            // is valid. The allocator will copy existing data to new location.
             unsafe {
                 realloc(self.ptr.as_ptr() as *mut u8, old_layout, new_layout.size()) as *mut T
             }
@@ -233,6 +247,7 @@ impl<T> CompactVec<T> {
             std::alloc::handle_alloc_error(new_layout);
         }
 
+        // SAFETY: We just checked that new_ptr is not null above.
         self.ptr = unsafe { NonNull::new_unchecked(new_ptr) };
         self.len_cap = Self::pack(len as u32, new_cap);
     }
@@ -245,7 +260,8 @@ impl<T> CompactVec<T> {
             return;
         }
 
-        // Drop elements beyond new length
+        // SAFETY: Elements [len..current_len] are initialized. After dropping,
+        // we set length to `len` so they won't be dropped again.
         unsafe {
             let remaining = current_len - len;
             ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
@@ -262,6 +278,8 @@ impl<T> CompactVec<T> {
         let len = self.len();
         assert!(index < len, "removal index out of bounds");
 
+        // SAFETY: index < len is asserted above, so the element is valid.
+        // After reading, we shift remaining elements and decrement length.
         unsafe {
             let ptr = self.ptr.as_ptr().add(index);
             let value = ptr::read(ptr);
@@ -280,6 +298,8 @@ impl<T> CompactVec<T> {
         let len = self.len();
         assert!(index < len, "swap_remove index out of bounds");
 
+        // SAFETY: index < len is asserted above. We read the element at index,
+        // then copy the last element to fill the gap, and decrement length.
         unsafe {
             let ptr = self.ptr.as_ptr();
             let value = ptr::read(ptr.add(index));
@@ -291,6 +311,75 @@ impl<T> CompactVec<T> {
 
             self.set_len(len - 1);
             value
+        }
+    }
+
+    /// Inserts an element at position `index`, shifting all elements after it to the right.
+    ///
+    /// # Panics
+    /// Panics if `index > len`.
+    #[inline]
+    pub fn insert(&mut self, index: usize, element: T) {
+        let len = self.len();
+        assert!(index <= len, "insertion index out of bounds");
+
+        // Ensure we have capacity for one more element
+        if len == self.capacity() {
+            self.grow();
+        }
+
+        // SAFETY: index <= len is asserted above. After grow(), capacity > len.
+        // We shift elements right to make room, then write the new element.
+        unsafe {
+            let ptr = self.ptr.as_ptr().add(index);
+
+            // Shift elements to the right
+            if index < len {
+                ptr::copy(ptr, ptr.add(1), len - index);
+            }
+
+            // Write the new element
+            ptr::write(ptr, element);
+            self.set_len(len + 1);
+        }
+    }
+
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// Removes all elements `e` such that `f(&e)` returns `false`.
+    /// This method operates in place, visiting each element exactly once in the
+    /// original order, and preserves the order of the retained elements.
+    #[inline]
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let len = self.len();
+        let ptr = self.ptr.as_ptr();
+        let mut write_idx = 0;
+
+        for read_idx in 0..len {
+            // SAFETY: read_idx < len, so the element is valid and initialized.
+            // We either keep it (move to write_idx) or drop it.
+            unsafe {
+                let elem = &*ptr.add(read_idx);
+                if f(elem) {
+                    // Keep this element
+                    if write_idx != read_idx {
+                        // Move element from read_idx to write_idx
+                        ptr::copy_nonoverlapping(ptr.add(read_idx), ptr.add(write_idx), 1);
+                    }
+                    write_idx += 1;
+                } else {
+                    // Drop this element
+                    ptr::drop_in_place(ptr.add(read_idx));
+                }
+            }
+        }
+
+        // SAFETY: write_idx <= len, and exactly write_idx elements are initialized.
+        unsafe {
+            self.set_len(write_idx);
         }
     }
 
@@ -339,6 +428,7 @@ impl<T> CompactVec<T> {
     /// Returns a slice containing all elements.
     #[inline(always)]
     pub fn as_slice(&self) -> &[T] {
+        // SAFETY: ptr is valid and aligned, and len() elements are initialized.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len()) }
     }
 
@@ -361,10 +451,27 @@ impl<T> CompactVec<T> {
         self.as_mut_slice().iter_mut()
     }
 
+    /// Drains elements from `start` to end, returning an iterator.
+    /// Elements are removed from the vector.
+    #[inline]
+    pub fn drain(&mut self, range: std::ops::RangeFrom<usize>) -> Drain<'_, T> {
+        let start = range.start;
+        let len = self.len();
+        assert!(start <= len, "drain start index out of bounds");
+
+        Drain {
+            vec: self,
+            start,
+            current: start,
+            end: len,
+        }
+    }
+
     /// Gets a reference to an element.
     #[inline(always)]
     pub fn get(&self, index: usize) -> Option<&T> {
         if index < self.len() {
+            // SAFETY: index < len is checked above, so the element is valid.
             unsafe { Some(&*self.ptr.as_ptr().add(index)) }
         } else {
             None
@@ -375,6 +482,7 @@ impl<T> CompactVec<T> {
     #[inline(always)]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         if index < self.len() {
+            // SAFETY: index < len is checked above, so the element is valid.
             unsafe { Some(&mut *self.ptr.as_ptr().add(index)) }
         } else {
             None
@@ -395,6 +503,8 @@ impl<T> CompactVec<T> {
         let ptr = self.ptr.as_ptr();
         mem::forget(self);
 
+        // SAFETY: ptr was allocated by the global allocator with the given capacity,
+        // len elements are initialized, and we've forgotten self to prevent double-free.
         unsafe { Vec::from_raw_parts(ptr, len, cap) }
     }
 
@@ -419,6 +529,7 @@ impl<T> CompactVec<T> {
         let ptr = vec.as_mut_ptr();
 
         Self {
+            // SAFETY: Vec always has a non-null pointer when capacity > 0.
             ptr: unsafe { NonNull::new_unchecked(ptr) },
             len_cap: Self::pack(len, cap),
         }
@@ -450,6 +561,7 @@ impl<T> Drop for CompactVec<T> {
         // Drop all elements
         let len = self.len();
         if len > 0 {
+            // SAFETY: All len elements are initialized and valid for dropping.
             unsafe {
                 ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), len));
             }
@@ -458,6 +570,7 @@ impl<T> Drop for CompactVec<T> {
         // Deallocate memory
         if mem::size_of::<T>() > 0 {
             let layout = Layout::array::<T>(self.capacity()).unwrap();
+            // SAFETY: ptr was allocated with this layout and capacity > 0.
             unsafe {
                 dealloc(self.ptr.as_ptr() as *mut u8, layout);
             }
@@ -532,6 +645,42 @@ impl<T> IndexMut<usize> for CompactVec<T> {
     #[inline(always)]
     fn index_mut(&mut self, index: usize) -> &mut T {
         &mut self.as_mut_slice()[index]
+    }
+}
+
+impl<T> Index<std::ops::Range<usize>> for CompactVec<T> {
+    type Output = [T];
+
+    #[inline(always)]
+    fn index(&self, range: std::ops::Range<usize>) -> &[T] {
+        &self.as_slice()[range]
+    }
+}
+
+impl<T> Index<std::ops::RangeFrom<usize>> for CompactVec<T> {
+    type Output = [T];
+
+    #[inline(always)]
+    fn index(&self, range: std::ops::RangeFrom<usize>) -> &[T] {
+        &self.as_slice()[range]
+    }
+}
+
+impl<T> Index<std::ops::RangeTo<usize>> for CompactVec<T> {
+    type Output = [T];
+
+    #[inline(always)]
+    fn index(&self, range: std::ops::RangeTo<usize>) -> &[T] {
+        &self.as_slice()[range]
+    }
+}
+
+impl<T> Index<std::ops::RangeFull> for CompactVec<T> {
+    type Output = [T];
+
+    #[inline(always)]
+    fn index(&self, _range: std::ops::RangeFull) -> &[T] {
+        self.as_slice()
     }
 }
 
@@ -624,6 +773,62 @@ impl<T> From<CompactVec<T>> for Vec<T> {
     }
 }
 
+/// Drain iterator for CompactVec.
+/// Removes elements from the vector as they are iterated.
+pub struct Drain<'a, T> {
+    vec: &'a mut CompactVec<T>,
+    start: usize,
+    current: usize,
+    end: usize,
+}
+
+impl<'a, T> Iterator for Drain<'a, T> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        if self.current < self.end {
+            // SAFETY: current < end <= original len, so the element is valid.
+            // After reading, we increment current so it won't be read again.
+            let item = unsafe { ptr::read(self.vec.ptr.as_ptr().add(self.current)) };
+            self.current += 1;
+            Some(item)
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.end - self.current;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, T> ExactSizeIterator for Drain<'a, T> {
+    fn len(&self) -> usize {
+        self.end - self.current
+    }
+}
+
+impl<'a, T> Drop for Drain<'a, T> {
+    fn drop(&mut self) {
+        // Drop any remaining elements not yet consumed
+        while self.current < self.end {
+            // SAFETY: Elements [current..end] are initialized but not yet consumed.
+            unsafe {
+                ptr::drop_in_place(self.vec.ptr.as_ptr().add(self.current));
+            }
+            self.current += 1;
+        }
+
+        // SAFETY: Elements [0..start] are still valid, elements [start..end] have
+        // been consumed or dropped, so we set len to start.
+        unsafe {
+            self.vec.set_len(self.start);
+        }
+    }
+}
+
 /// Owning iterator for CompactVec.
 pub struct IntoIter<T> {
     vec: CompactVec<T>,
@@ -641,6 +846,8 @@ impl<T> Iterator for IntoIter<T> {
 
     fn next(&mut self) -> Option<T> {
         if self.index < self.vec.len() {
+            // SAFETY: index < len, so the element is valid. After reading,
+            // we increment index so it won't be read again.
             let item = unsafe { ptr::read(self.vec.ptr.as_ptr().add(self.index)) };
             self.index += 1;
             Some(item)

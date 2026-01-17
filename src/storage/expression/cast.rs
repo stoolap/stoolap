@@ -20,9 +20,9 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use chrono::{DateTime, TimeZone, Utc};
-use compact_str::CompactString;
 
 use super::{find_column_index, resolve_alias, Expression};
+use crate::common::SmartString;
 use crate::core::{DataType, Operator, Result, Row, Schema, Value};
 
 /// CAST expression (CAST(column AS type))
@@ -438,16 +438,16 @@ fn cast_to_float(value: &Value) -> Result<Value> {
 
 fn cast_to_string(value: &Value) -> Result<Value> {
     match value {
-        Value::Integer(v) => Ok(Value::Text(CompactString::from(v.to_string().as_str()))),
-        Value::Float(v) => Ok(Value::Text(CompactString::from(v.to_string().as_str()))),
+        Value::Integer(v) => Ok(Value::Text(SmartString::from_string(v.to_string()))),
+        Value::Float(v) => Ok(Value::Text(SmartString::from_string(v.to_string()))),
         Value::Text(s) => Ok(Value::Text(s.clone())),
-        Value::Boolean(b) => Ok(Value::Text(CompactString::from(if *b {
+        Value::Boolean(b) => Ok(Value::Text(SmartString::from(if *b {
             "true"
         } else {
             "false"
         }))),
-        Value::Timestamp(t) => Ok(Value::Text(CompactString::from(t.to_rfc3339().as_str()))),
-        Value::Json(j) => Ok(Value::Text(CompactString::from(j.as_ref()))),
+        Value::Timestamp(t) => Ok(Value::Text(SmartString::from_string(t.to_rfc3339()))),
+        Value::Json(j) => Ok(Value::Text(SmartString::from(j.as_ref()))),
         Value::Null(_) => Ok(Value::null(DataType::Text)),
     }
 }

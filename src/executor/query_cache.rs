@@ -40,7 +40,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use compact_str::CompactString;
+use crate::common::SmartString;
 use rustc_hash::FxHashMap;
 
 use crate::common::CompactArc;
@@ -70,7 +70,7 @@ pub enum PkValueSource {
 #[derive(Debug, Clone)]
 pub struct CompiledPkLookup {
     /// Table name (already lowercased)
-    pub table_name: CompactString,
+    pub table_name: SmartString,
     /// Cached schema
     pub schema: Arc<Schema>,
     /// Pre-computed column names for result (CompactArc<Vec<String>> for zero-copy O(1) clone on execution)
@@ -105,11 +105,11 @@ pub enum UpdateValueSource {
 #[derive(Debug, Clone)]
 pub struct CompiledPkUpdate {
     /// Table name (already lowercased)
-    pub table_name: CompactString,
+    pub table_name: SmartString,
     /// Cached schema
     pub schema: Arc<Schema>,
     /// Cached PK column name
-    pub pk_column_name: CompactString,
+    pub pk_column_name: SmartString,
     /// How to extract the PK value
     pub pk_value_source: PkValueSource,
     /// Pre-compiled column assignments
@@ -122,11 +122,11 @@ pub struct CompiledPkUpdate {
 #[derive(Debug, Clone)]
 pub struct CompiledPkDelete {
     /// Table name (already lowercased)
-    pub table_name: CompactString,
+    pub table_name: SmartString,
     /// Cached schema
     pub schema: Arc<Schema>,
     /// Cached PK column name
-    pub pk_column_name: CompactString,
+    pub pk_column_name: SmartString,
     /// How to extract the PK value
     pub pk_value_source: PkValueSource,
     /// Schema epoch at compilation time (for fast cache invalidation)
@@ -137,21 +137,21 @@ pub struct CompiledPkDelete {
 /// Caches schema-derived information to avoid recomputation on every INSERT execution
 #[derive(Debug, Clone)]
 pub struct CompiledInsert {
-    /// Table name (already lowercased, CompactString for inline storage)
-    pub table_name: CompactString,
+    /// Table name (already lowercased, SmartString for inline storage)
+    pub table_name: SmartString,
     /// Column indices for INSERT (which schema columns to populate)
     pub column_indices: Arc<Vec<usize>>,
     /// Column types for the INSERT columns (for type coercion)
     pub column_types: Arc<Vec<crate::core::DataType>>,
     /// Column names for error messages (Arc for zero-copy sharing)
-    pub column_names: Arc<Vec<CompactString>>,
+    pub column_names: Arc<Vec<SmartString>>,
     /// All column types in the schema (for default value evaluation)
     pub all_column_types: Arc<Vec<crate::core::DataType>>,
     /// Pre-evaluated default values for all columns (avoids re-evaluation per row)
     /// Each element is either the default Value or null_unknown if no default.
     pub default_row_template: Arc<Vec<crate::core::Value>>,
     /// CHECK constraint expressions: (column_idx, column_name, check_expr)
-    pub check_exprs: Arc<Vec<(usize, CompactString, CompactString)>>,
+    pub check_exprs: Arc<Vec<(usize, SmartString, SmartString)>>,
     /// Schema epoch at compilation time (for fast cache invalidation)
     pub cached_epoch: u64,
 }
@@ -161,9 +161,9 @@ pub struct CompiledInsert {
 #[derive(Debug, Clone)]
 pub struct CompiledCountDistinct {
     /// Table name (already lowercased)
-    pub table_name: CompactString,
+    pub table_name: SmartString,
     /// Column name to count distinct values from (lowercased)
-    pub column_name: CompactString,
+    pub column_name: SmartString,
     /// Result column name (e.g., "COUNT(DISTINCT age)")
     pub result_column_name: String,
     /// Schema epoch at compilation time (for fast cache invalidation)
@@ -175,7 +175,7 @@ pub struct CompiledCountDistinct {
 #[derive(Debug, Clone)]
 pub struct CompiledCountStar {
     /// Table name (already lowercased)
-    pub table_name: CompactString,
+    pub table_name: SmartString,
     /// Result column name (e.g., "COUNT(*)")
     pub result_column_name: String,
     /// Schema epoch at compilation time (for fast cache invalidation)
@@ -227,7 +227,7 @@ pub struct CachedQueryPlan {
     /// The parsed AST (wrapped in Arc for cheap cloning - statements are immutable)
     pub statement: Arc<Statement>,
     /// Original query text
-    pub query_text: CompactString,
+    pub query_text: SmartString,
     /// Last time this plan was used (monotonic)
     pub last_used: Instant,
     /// Number of times this plan has been used
@@ -237,7 +237,7 @@ pub struct CachedQueryPlan {
     /// Number of parameters required
     pub param_count: usize,
     /// Normalized query text (cache key)
-    pub normalized_query: CompactString,
+    pub normalized_query: SmartString,
     /// Compiled execution state (lazily populated on first execution)
     pub compiled: Arc<RwLock<CompiledExecution>>,
 }
@@ -246,10 +246,10 @@ impl CachedQueryPlan {
     /// Create a new cached query plan
     pub fn new(
         statement: Arc<Statement>,
-        query_text: CompactString,
+        query_text: SmartString,
         has_params: bool,
         param_count: usize,
-        normalized_query: CompactString,
+        normalized_query: SmartString,
     ) -> Self {
         Self {
             statement,
@@ -270,7 +270,7 @@ impl CachedQueryPlan {
 /// the overhead of parsing the same query multiple times.
 pub struct QueryCache {
     /// Cached plans indexed by normalized query text (FxHash for fast string hashing)
-    plans: RwLock<FxHashMap<CompactString, CachedQueryPlan>>,
+    plans: RwLock<FxHashMap<SmartString, CachedQueryPlan>>,
     /// Maximum number of cached plans
     max_size: usize,
     /// Factor to determine how many plans to prune when cache is full (0.0-1.0)
@@ -304,7 +304,7 @@ impl QueryCache {
 
         // Only use read lock - skip stats update for performance
         let plans = self.plans.read().ok()?;
-        // Use the Cow<str> as a key lookup without allocating CompactString
+        // Use the Cow<str> as a key lookup without allocating SmartString
         let plan = plans.get(normalized.as_ref())?;
 
         // Only clone the Arc (cheap) and copy the small fields
@@ -319,7 +319,7 @@ impl QueryCache {
     /// Add a plan to the cache
     ///
     /// Returns a lightweight reference to the cached plan (CachedPlanRef).
-    /// This avoids cloning CompactStrings since callers only need the statement
+    /// This avoids cloning SmartStrings since callers only need the statement
     /// and compiled execution state.
     pub fn put(
         &self,
@@ -329,10 +329,10 @@ impl QueryCache {
         param_count: usize,
     ) -> CachedPlanRef {
         let normalized = normalize_query(query);
-        // Convert Cow to CompactString for storage
-        let normalized_key: CompactString = match normalized {
-            Cow::Borrowed(s) => CompactString::new(s),
-            Cow::Owned(s) => CompactString::new(&s),
+        // Convert Cow to SmartString for storage
+        let normalized_key: SmartString = match normalized {
+            Cow::Borrowed(s) => SmartString::new(s),
+            Cow::Owned(s) => SmartString::new(&s),
         };
 
         // Create the compiled state upfront - shared between stored plan and returned ref
@@ -351,7 +351,7 @@ impl QueryCache {
                 key_for_insert,
                 CachedQueryPlan {
                     statement: statement.clone(),
-                    query_text: CompactString::new(query),
+                    query_text: SmartString::new(query),
                     last_used: Instant::now(),
                     usage_count: 1,
                     has_params,
@@ -362,7 +362,7 @@ impl QueryCache {
             );
         }
 
-        // Return lightweight reference - only Arc clones, no CompactString clones
+        // Return lightweight reference - only Arc clones, no SmartString clones
         CachedPlanRef {
             statement,
             has_params,
@@ -456,7 +456,7 @@ impl QueryCache {
     }
 
     /// Prune the least recently used entries when the cache is full
-    fn prune_cache(&self, plans: &mut FxHashMap<CompactString, CachedQueryPlan>) {
+    fn prune_cache(&self, plans: &mut FxHashMap<SmartString, CachedQueryPlan>) {
         // Calculate how many entries to remove
         let num_to_remove = ((self.max_size as f64) * self.prune_factor).ceil() as usize;
         let num_to_remove = num_to_remove.max(1);
@@ -467,7 +467,7 @@ impl QueryCache {
 
         // Build a list of references sorted by last used time and usage count
         // Use references to avoid cloning all keys
-        let mut entries: Vec<(&CompactString, Instant, u64)> = plans
+        let mut entries: Vec<(&SmartString, Instant, u64)> = plans
             .iter()
             .map(|(k, p)| (k, p.last_used, p.usage_count))
             .collect();
@@ -476,7 +476,7 @@ impl QueryCache {
         entries.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
 
         // Collect only the keys to remove (clone only what we need)
-        let keys_to_remove: Vec<CompactString> = entries
+        let keys_to_remove: Vec<SmartString> = entries
             .into_iter()
             .take(num_to_remove)
             .map(|(k, _, _)| k.clone())

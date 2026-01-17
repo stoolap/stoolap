@@ -42,9 +42,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use compact_str::CompactString;
 use smallvec::SmallVec;
 
+use crate::common::SmartString;
 use crate::core::Value;
 
 /// Type alias for parameter vectors.
@@ -130,19 +130,19 @@ impl ToParam for bool {
 
 impl ToParam for String {
     fn to_param(&self) -> Value {
-        Value::Text(CompactString::from(self.as_str()))
+        Value::Text(SmartString::new(self))
     }
 }
 
 impl ToParam for &str {
     fn to_param(&self) -> Value {
-        Value::Text(CompactString::from(*self))
+        Value::Text(SmartString::from(*self))
     }
 }
 
 impl ToParam for Arc<str> {
     fn to_param(&self) -> Value {
-        Value::Text(CompactString::from(self.as_ref()))
+        Value::Text(SmartString::from(self.as_ref()))
     }
 }
 

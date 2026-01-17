@@ -17,8 +17,7 @@
 //! This module handles EXPLAIN and EXPLAIN ANALYZE query plan output,
 //! showing the execution strategy and cost estimates for SQL statements.
 
-use compact_str::CompactString;
-
+use crate::common::SmartString;
 use crate::core::{Result, Row, RowVec, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::parser::ast::*;
@@ -133,7 +132,7 @@ impl Executor {
                 .map(|(i, line)| {
                     (
                         i as i64,
-                        Row::from_values(vec![Value::Text(CompactString::from(line.as_str()))]),
+                        Row::from_values(vec![Value::Text(SmartString::from_string(line))]),
                     )
                 })
                 .collect();
@@ -151,7 +150,7 @@ impl Executor {
                 .map(|(i, line)| {
                     (
                         i as i64,
-                        Row::from_values(vec![Value::Text(CompactString::from(line.as_str()))]),
+                        Row::from_values(vec![Value::Text(SmartString::from_string(line))]),
                     )
                 })
                 .collect();

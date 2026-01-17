@@ -26,8 +26,8 @@
 use std::sync::Arc;
 
 use crate::common::CompactArc;
+use crate::common::SmartString;
 use ahash::AHashSet;
-use compact_str::CompactString;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::ops::{CompareOp, CompiledPattern, Op};
@@ -362,18 +362,14 @@ impl<'a> ExprCompiler<'a> {
                     match hint.to_uppercase().as_str() {
                         "TIMESTAMP" | "DATETIME" => crate::core::value::parse_timestamp(&lit.value)
                             .map(Value::Timestamp)
-                            .unwrap_or_else(|_| {
-                                Value::Text(CompactString::from(lit.value.as_str()))
-                            }),
+                            .unwrap_or_else(|_| Value::Text(lit.value.clone())),
                         "DATE" => crate::core::value::parse_timestamp(&lit.value)
                             .map(Value::Timestamp)
-                            .unwrap_or_else(|_| {
-                                Value::Text(CompactString::from(lit.value.as_str()))
-                            }),
-                        _ => Value::Text(CompactString::from(lit.value.as_str())),
+                            .unwrap_or_else(|_| Value::Text(lit.value.clone())),
+                        _ => Value::Text(lit.value.clone()),
                     }
                 } else {
-                    Value::Text(CompactString::from(lit.value.as_str()))
+                    Value::Text(lit.value.clone())
                 };
                 builder.emit(Op::LoadConst(value));
             }
@@ -414,8 +410,8 @@ impl<'a> ExprCompiler<'a> {
                         // Return current time as text "HH:MM:SS"
                         let now = chrono::Utc::now();
                         let time_str = now.format("%H:%M:%S").to_string();
-                        builder.emit(Op::LoadConst(Value::Text(CompactString::from(
-                            time_str.as_str(),
+                        builder.emit(Op::LoadConst(Value::Text(SmartString::from_string(
+                            time_str,
                         ))));
                         return Ok(());
                     }
@@ -586,7 +582,7 @@ impl<'a> ExprCompiler<'a> {
             // === INTERVAL ===
             Expression::IntervalLiteral(interval) => {
                 let s = format!("{} {}", interval.quantity, interval.unit);
-                builder.emit(Op::LoadConst(Value::Text(CompactString::from(s.as_str()))));
+                builder.emit(Op::LoadConst(Value::Text(SmartString::from_string(s))));
             }
 
             // === SUBQUERIES ===
@@ -1481,9 +1477,7 @@ fn try_eval_constant(expr: &Expression) -> Option<Value> {
     match expr {
         Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
         Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-        Expression::StringLiteral(lit) => {
-            Some(Value::Text(CompactString::from(lit.value.as_str())))
-        }
+        Expression::StringLiteral(lit) => Some(Value::Text(lit.value.clone())),
         Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
         Expression::NullLiteral(_) => Some(Value::null_unknown()),
         _ => None,

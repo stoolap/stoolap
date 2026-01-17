@@ -16,7 +16,7 @@
 //!
 //! This module defines the token types used by the SQL lexer and parser.
 
-use compact_str::CompactString;
+use crate::common::SmartString;
 use rustc_hash::FxHashSet;
 use std::fmt;
 use std::sync::LazyLock;
@@ -105,16 +105,16 @@ impl fmt::Display for TokenType {
 
 /// Token represents a lexical token
 ///
-/// Uses CompactString for literal to avoid heap allocation for tokens up to 24 bytes
+/// Uses SmartString for literal to avoid heap allocation for tokens up to 24 bytes
 /// (covers most SQL tokens: keywords, operators, short identifiers, numbers).
 /// For error tokens, the literal field contains the error message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     /// The type of the token
     pub token_type: TokenType,
-    /// The literal string value (CompactString inlines strings up to 24 bytes)
+    /// The literal string value (SmartString inlines strings up to 24 bytes)
     /// For error tokens, this contains the error message instead.
-    pub literal: CompactString,
+    pub literal: SmartString,
     /// The position in the source
     pub position: Position,
 }
@@ -125,7 +125,7 @@ impl Token {
     pub fn new(token_type: TokenType, literal: impl AsRef<str>, position: Position) -> Self {
         Self {
             token_type,
-            literal: CompactString::from(literal.as_ref()),
+            literal: SmartString::from(literal.as_ref()),
             position,
         }
     }
@@ -134,7 +134,7 @@ impl Token {
     pub fn error(message: impl AsRef<str>, _literal: impl AsRef<str>, position: Position) -> Self {
         Self {
             token_type: TokenType::Error,
-            literal: CompactString::from(message.as_ref()),
+            literal: SmartString::from(message.as_ref()),
             position,
         }
     }
@@ -144,7 +144,7 @@ impl Token {
     pub fn eof(position: Position) -> Self {
         Self {
             token_type: TokenType::Eof,
-            literal: CompactString::const_new(""),
+            literal: SmartString::const_new(""),
             position,
         }
     }

@@ -18,7 +18,7 @@ use ahash::AHashSet;
 
 use std::sync::Arc;
 
-use compact_str::CompactString;
+use crate::common::SmartString;
 
 use crate::common::CompactArc;
 
@@ -242,13 +242,13 @@ fn test_like_pattern() {
     ]);
 
     // Match
-    let row = Row::from_values(vec![Value::Text(CompactString::from("testing"))]);
+    let row = Row::from_values(vec![Value::Text(SmartString::from("testing"))]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
     // No match
-    let row = Row::from_values(vec![Value::Text(CompactString::from("other"))]);
+    let row = Row::from_values(vec![Value::Text(SmartString::from("other"))]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
@@ -282,28 +282,28 @@ fn test_coalesce() {
     let program = Program::new(vec![
         Op::LoadColumn(0),
         Op::LoadColumn(1),
-        Op::LoadConst(Value::Text(CompactString::from("default"))),
+        Op::LoadConst(Value::Text(SmartString::from("default"))),
         Op::Coalesce(3),
         Op::Return,
     ]);
 
     // First non-null
     let row = Row::from_values(vec![
-        Value::Text(CompactString::from("first")),
-        Value::Text(CompactString::from("second")),
+        Value::Text(SmartString::from("first")),
+        Value::Text(SmartString::from("second")),
     ]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
-    assert_eq!(result, Value::Text(CompactString::from("first")));
+    assert_eq!(result, Value::Text(SmartString::from("first")));
 
     // Second non-null
     let row = Row::from_values(vec![
         Value::Null(crate::core::DataType::Text),
-        Value::Text(CompactString::from("second")),
+        Value::Text(SmartString::from("second")),
     ]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
-    assert_eq!(result, Value::Text(CompactString::from("second")));
+    assert_eq!(result, Value::Text(SmartString::from("second")));
 
     // Default
     let row = Row::from_values(vec![
@@ -312,7 +312,7 @@ fn test_coalesce() {
     ]);
     let ctx = ExecuteContext::new(&row);
     let result = vm.execute(&program, &ctx).unwrap();
-    assert_eq!(result, Value::Text(CompactString::from("default")));
+    assert_eq!(result, Value::Text(SmartString::from("default")));
 }
 
 #[test]

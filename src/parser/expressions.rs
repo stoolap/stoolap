@@ -14,7 +14,7 @@
 
 //! Expression parsing methods for the SQL Parser
 
-use compact_str::CompactString;
+use crate::common::SmartString;
 
 use super::ast::*;
 use super::parser::Parser;
@@ -177,10 +177,10 @@ impl Parser {
                         result.push(c);
                     }
                 }
-                CompactString::from(result)
+                SmartString::from_string(result)
             } else {
                 // No escapes - zero allocation path
-                CompactString::from(inner)
+                SmartString::new(inner)
             }
         } else {
             literal.clone()
@@ -188,7 +188,7 @@ impl Parser {
 
         // Check for JSON type hint
         let type_hint = if value.starts_with('{') && value.ends_with('}') {
-            Some(CompactString::const_new("JSON"))
+            Some(SmartString::const_new("JSON"))
         } else {
             None
         };
@@ -410,7 +410,7 @@ impl Parser {
         if self.cur_token_is_punctuator(")") {
             return Some(Expression::Identifier(Identifier::new(
                 self.cur_token.clone(),
-                compact_str::CompactString::const_new("()"),
+                crate::common::SmartString::const_new("()"),
             )));
         }
 
@@ -496,7 +496,7 @@ impl Parser {
         &mut self,
         left: Expression,
         token: Token,
-        operator: compact_str::CompactString,
+        operator: crate::common::SmartString,
     ) -> Option<Expression> {
         use super::ast::{AllAnyExpression, AllAnyType};
 
@@ -588,35 +588,35 @@ impl Parser {
                     self.next_token(); // consume LIKE
                     self.parse_like_expression(
                         left,
-                        compact_str::CompactString::const_new("LIKE"),
+                        crate::common::SmartString::const_new("LIKE"),
                         true,
                     )
                 } else if self.peek_token_is_keyword("ILIKE") {
                     self.next_token(); // consume ILIKE
                     self.parse_like_expression(
                         left,
-                        compact_str::CompactString::const_new("ILIKE"),
+                        crate::common::SmartString::const_new("ILIKE"),
                         true,
                     )
                 } else if self.peek_token_is_keyword("GLOB") {
                     self.next_token(); // consume GLOB
                     self.parse_like_expression(
                         left,
-                        compact_str::CompactString::const_new("GLOB"),
+                        crate::common::SmartString::const_new("GLOB"),
                         true,
                     )
                 } else if self.peek_token_is_keyword("REGEXP") {
                     self.next_token(); // consume REGEXP
                     self.parse_like_expression(
                         left,
-                        compact_str::CompactString::const_new("REGEXP"),
+                        crate::common::SmartString::const_new("REGEXP"),
                         true,
                     )
                 } else if self.peek_token_is_keyword("RLIKE") {
                     self.next_token(); // consume RLIKE
                     self.parse_like_expression(
                         left,
-                        compact_str::CompactString::const_new("RLIKE"),
+                        crate::common::SmartString::const_new("RLIKE"),
                         true,
                     )
                 } else {
@@ -626,7 +626,7 @@ impl Parser {
                     Some(Expression::Infix(InfixExpression::new(
                         token,
                         Box::new(left),
-                        compact_str::CompactString::const_new("NOT"),
+                        crate::common::SmartString::const_new("NOT"),
                         Box::new(right),
                     )))
                 }
@@ -658,7 +658,7 @@ impl Parser {
                 Some(Expression::Infix(InfixExpression::new(
                     token,
                     Box::new(left),
-                    compact_str::CompactString::const_new("*"),
+                    crate::common::SmartString::const_new("*"),
                     Box::new(right),
                 )))
             }
@@ -1297,12 +1297,12 @@ impl Parser {
     fn parse_like_expression(
         &mut self,
         left: Expression,
-        op: compact_str::CompactString,
+        op: crate::common::SmartString,
         not: bool,
     ) -> Option<Expression> {
         let token = self.cur_token.clone();
         let operator = if not {
-            compact_str::CompactString::from(format!("NOT {}", op))
+            crate::common::SmartString::from_string(format!("NOT {}", op))
         } else {
             op
         };
@@ -1551,7 +1551,7 @@ impl Parser {
             });
             Some(Expression::FunctionCall(Box::new(FunctionCall {
                 token,
-                function: CompactString::const_new("EXTRACT"),
+                function: SmartString::const_new("EXTRACT"),
                 arguments: vec![field_literal, source],
                 is_distinct: false,
                 order_by: Vec::new(),
@@ -1666,12 +1666,12 @@ impl Parser {
                 }
             };
 
-            let value = CompactString::from(format!("{} {}", quantity, unit));
+            let value = SmartString::from_string(format!("{} {}", quantity, unit));
             Some(Expression::IntervalLiteral(IntervalLiteral {
                 token,
                 value,
                 quantity,
-                unit: CompactString::from(unit),
+                unit: SmartString::new(unit),
             }))
         } else if self.expect_peek(TokenType::String) {
             // INTERVAL '1 month' syntax (original)
@@ -1703,11 +1703,11 @@ impl Parser {
                 }
             };
 
-            let unit = CompactString::from(parts[1].to_lowercase().trim_end_matches('s'));
+            let unit = SmartString::from(parts[1].to_lowercase().trim_end_matches('s'));
 
             Some(Expression::IntervalLiteral(IntervalLiteral {
                 token,
-                value: CompactString::from(value_str),
+                value: SmartString::from(value_str),
                 quantity,
                 unit,
             }))
@@ -1732,7 +1732,7 @@ impl Parser {
 
         let literal = &self.cur_token.literal;
         let value = if literal.len() >= 2 && literal.starts_with('\'') && literal.ends_with('\'') {
-            CompactString::from(&literal[1..literal.len() - 1])
+            SmartString::from(&literal[1..literal.len() - 1])
         } else {
             literal.clone()
         };

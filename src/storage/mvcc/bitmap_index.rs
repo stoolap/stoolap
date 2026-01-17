@@ -47,9 +47,8 @@ use std::sync::RwLock;
 
 use ahash::AHashMap;
 use roaring::RoaringTreemap;
-use rustc_hash::FxHashMap;
 
-use crate::common::CompactArc;
+use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
@@ -92,8 +91,8 @@ pub struct BitmapIndex {
     bitmaps: RwLock<AHashMap<CompactArc<Value>, RoaringTreemap>>,
 
     /// Reverse mapping: row_id -> CompactArc<Value> for efficient removal
-    /// Uses CompactArc<Value> to share references with bitmaps (8 bytes per entry)
-    row_to_value: RwLock<AHashMap<i64, CompactArc<Value>>>,
+    /// Uses I64Map for fast O(1) lookups and CompactArc<Value> (8 bytes per entry)
+    row_to_value: RwLock<I64Map<CompactArc<Value>>>,
 
     /// Track cardinality for warnings
     distinct_count: AtomicUsize,
@@ -135,7 +134,7 @@ impl BitmapIndex {
             is_unique,
             closed: AtomicBool::new(false),
             bitmaps: RwLock::new(AHashMap::new()),
-            row_to_value: RwLock::new(AHashMap::new()),
+            row_to_value: RwLock::new(I64Map::new()),
             distinct_count: AtomicUsize::new(0),
         }
     }
@@ -330,7 +329,7 @@ impl Index for BitmapIndex {
         }
 
         // Check if row already exists with a different value (for updates)
-        if let Some(old_arc_key) = row_to_value.get(&row_id).cloned() {
+        if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
             // Compare Arc pointers - if same Arc, same value
             if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
                 // Remove from old bitmap
@@ -416,7 +415,7 @@ impl Index for BitmapIndex {
         }
 
         // Check if row already exists with a different value (for updates)
-        if let Some(old_arc_key) = row_to_value.get(&row_id).cloned() {
+        if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
             // Compare Arc pointers - if same Arc, same value
             if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
                 // Remove from old bitmap
@@ -446,8 +445,8 @@ impl Index for BitmapIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
-        for (&row_id, values) in entries {
+    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
+        for (row_id, values) in entries.iter() {
             self.add(values, row_id, 0)?;
         }
         Ok(())
@@ -483,7 +482,7 @@ impl Index for BitmapIndex {
         }
 
         // Remove from reverse mapping
-        row_to_value.remove(&row_id);
+        row_to_value.remove(row_id);
 
         Ok(())
     }
@@ -518,13 +517,13 @@ impl Index for BitmapIndex {
         }
 
         // Remove from reverse mapping
-        row_to_value.remove(&row_id);
+        row_to_value.remove(row_id);
 
         Ok(())
     }
 
-    fn remove_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
-        for (&row_id, values) in entries {
+    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
+        for (row_id, values) in entries.iter() {
             self.remove(values, row_id, 0)?;
         }
         Ok(())

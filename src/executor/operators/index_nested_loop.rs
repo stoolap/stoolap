@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use crate::common::{CompactArc, CompactVec};
+use crate::common::{CompactArc, CompactVec, I64Map};
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, RowVec, Value};
 use crate::executor::expression::JoinFilter;
@@ -209,8 +209,9 @@ impl IndexNestedLoopJoinOperator {
 
                 // OPTIMIZATION: Move outer CompactArc<Value> instead of cloning (we own outer)
                 let mut outer_values = outer.into_arc_values();
-                // SAFETY: outer_indices validated at planning time against outer table schema
                 for &idx in &proj.outer_indices {
+                    // SAFETY: outer_indices validated at planning time against outer table schema.
+                    // The planner ensures all indices are within bounds of the outer row's columns.
                     vec.push(std::mem::take(unsafe {
                         outer_values.get_unchecked_mut(idx)
                     }));
@@ -218,8 +219,9 @@ impl IndexNestedLoopJoinOperator {
 
                 // OPTIMIZATION: Move inner CompactArc<Value> instead of cloning (we own inner)
                 let mut inner_values = inner.into_arc_values();
-                // SAFETY: inner_indices validated at planning time against inner table schema
                 for &idx in &proj.inner_indices {
+                    // SAFETY: inner_indices validated at planning time against inner table schema.
+                    // The planner ensures all indices are within bounds of the inner row's columns.
                     vec.push(std::mem::take(unsafe {
                         inner_values.get_unchecked_mut(idx)
                     }));
@@ -259,9 +261,10 @@ impl IndexNestedLoopJoinOperator {
                 let mut values = Vec::with_capacity(total);
 
                 // Handle both Arc and Inline storage for outer row
-                // SAFETY: outer_indices validated at planning time against outer table schema
                 if let Some(outer_slice) = outer.try_as_arc_slice() {
                     for &idx in &proj.outer_indices {
+                        // SAFETY: outer_indices validated at planning time against outer table schema.
+                        // The planner ensures all indices are within bounds of the outer row's columns.
                         values.push(CompactArc::clone(unsafe { outer_slice.get_unchecked(idx) }));
                     }
                 } else {
@@ -275,8 +278,9 @@ impl IndexNestedLoopJoinOperator {
 
                 // OPTIMIZATION: Move inner CompactArc<Value> instead of cloning (we own inner)
                 let mut inner_values = inner.into_arc_values();
-                // SAFETY: inner_indices validated at planning time against inner table schema
                 for &idx in &proj.inner_indices {
+                    // SAFETY: inner_indices validated at planning time against inner table schema.
+                    // The planner ensures all indices are within bounds of the inner row's columns.
                     values.push(std::mem::take(unsafe {
                         inner_values.get_unchecked_mut(idx)
                     }));
@@ -592,9 +596,10 @@ impl BatchIndexNestedLoopJoinOperator {
                 let mut values: Vec<CompactArc<Value>> = Vec::with_capacity(total);
 
                 // Handle both Arc and Inline storage for outer row
-                // SAFETY: outer_indices validated at planning time against outer table schema
                 if let Some(outer_slice) = outer.try_as_arc_slice() {
                     for &idx in &proj.outer_indices {
+                        // SAFETY: outer_indices validated at planning time against outer table schema.
+                        // The planner ensures all indices are within bounds of the outer row's columns.
                         values.push(CompactArc::clone(unsafe { outer_slice.get_unchecked(idx) }));
                     }
                 } else {
@@ -607,10 +612,11 @@ impl BatchIndexNestedLoopJoinOperator {
                 }
 
                 // Handle both Arc and Inline storage for inner row
-                // SAFETY: inner_indices validated at planning time against inner table schema
                 // null_inner_row() creates full-width rows for consistent indexing
                 if let Some(inner_slice) = inner.try_as_arc_slice() {
                     for &idx in &proj.inner_indices {
+                        // SAFETY: inner_indices validated at planning time against inner table schema.
+                        // The planner ensures all indices are within bounds of the inner row's columns.
                         values.push(CompactArc::clone(unsafe { inner_slice.get_unchecked(idx) }));
                     }
                 } else {
@@ -642,7 +648,7 @@ impl BatchIndexNestedLoopJoinOperator {
 
 impl Operator for BatchIndexNestedLoopJoinOperator {
     fn open(&mut self) -> Result<()> {
-        use rustc_hash::{FxHashMap, FxHashSet};
+        use rustc_hash::FxHashSet;
 
         self.outer.open()?;
 
@@ -652,7 +658,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
         // Step 1: Collect all outer rows and their join keys
         let mut outer_rows: Vec<Row> = Vec::new();
         let mut row_id_set: FxHashSet<i64> = FxHashSet::default();
-        let mut key_to_outer_indices: FxHashMap<i64, Vec<usize>> = FxHashMap::default();
+        let mut key_to_outer_indices: I64Map<Vec<usize>> = I64Map::new();
 
         while let Some(row_ref) = self.outer.next()? {
             let outer_row = row_ref.into_owned();
@@ -706,7 +712,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
         let inner_rows_batch = self.inner_table.fetch_rows_by_ids(&all_row_ids, &true_expr);
 
         // Build inner row map by row_id
-        let mut inner_by_id: FxHashMap<i64, Row> = FxHashMap::default();
+        let mut inner_by_id: I64Map<Row> = I64Map::with_capacity(inner_rows_batch.len());
         for (row_id, row) in inner_rows_batch {
             inner_by_id.insert(row_id, row);
         }
@@ -714,7 +720,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
         // Step 3: Build results by matching outer rows with inner rows
         let mut matched_outers: Vec<bool> = vec![false; outer_rows.len()];
 
-        for (row_id, inner_row) in &inner_by_id {
+        for (row_id, inner_row) in inner_by_id.iter() {
             if let Some(outer_indices) = key_to_outer_indices.get(row_id) {
                 for &outer_idx in outer_indices {
                     let outer_row = &outer_rows[outer_idx];

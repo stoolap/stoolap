@@ -25,17 +25,21 @@
 pub mod buffer_pool;
 pub mod compact_arc;
 pub mod compact_vec;
+pub mod i64_map;
 pub mod int_maps;
+pub mod smart_string;
 pub mod version;
 
 // Re-export main types for convenience
 pub use buffer_pool::{BufferPool, PoolStats};
 pub use compact_arc::CompactArc;
 pub use compact_vec::CompactVec;
+pub use i64_map::I64Map;
 pub use int_maps::{
     new_btree_int64_map, new_concurrent_int64_map, new_int64_map, new_int64_map_with_capacity,
     BTreeInt64Map, ConcurrentInt64Map, Int64Map, Int64Set,
 };
+pub use smart_string::SmartString;
 pub use version::{version, version_info, SemVer, BUILD_TIME, GIT_COMMIT, MAJOR, MINOR, PATCH};
 
 #[cfg(test)]
@@ -55,8 +59,8 @@ mod integration_tests {
         let mut map = map;
         map.insert(1, buf);
 
-        assert!(map.contains_key(&1));
-        assert_eq!(map.get(&1).unwrap(), b"test data");
+        assert!(map.contains_key(1));
+        assert_eq!(map.get(1).unwrap(), b"test data");
     }
 
     #[test]

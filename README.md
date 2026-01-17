@@ -27,14 +27,9 @@ Stoolap is a **feature-rich embedded SQL database** with capabilities that rival
 
 ### Performance
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│   STOOLAP vs SQLite:    43 wins / 10 losses   (81% win rate)  │
-│   STOOLAP vs DuckDB:    49 wins / 4 losses    (92% win rate)  │
-└───────────────────────────────────────────────────────────────┘
-```
+Stoolap is optimized for OLTP workloads: point queries, transactional updates, and real-time analytics. It uses parallel execution via Rayon for large scans and a cost-based optimizer for query planning.
 
-See [BENCHMARKS.md](BENCHMARKS.md) for detailed comparisons.
+See [BENCHMARKS.md](BENCHMARKS.md) for detailed comparisons against SQLite and DuckDB.
 
 ### Unique Features
 

@@ -29,7 +29,7 @@ required-features = ["cli"]
 
 [dependencies]
 # Error handling
-thiserror = "1.0"
+thiserror = "2.0"
 anyhow = "1.0"
 
 # Concurrency
@@ -51,21 +51,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI (optional)
 clap = { version = "4.4", features = ["derive"], optional = true }
-rustyline = { version = "14.0", optional = true }
-comfy-table = { version = "7.1", optional = true }
-dirs = { version = "5.0", optional = true }
+rustyline = { version = "17.0", optional = true }
+comfy-table = { version = "7.2", optional = true }
+dirs = { version = "6.0", optional = true }
 
 # Checksums for data integrity
 crc32fast = "1.4"
 
 # Compression
-lz4_flex = "0.11"
+lz4_flex = "0.12"
 
 # Utilities
 bytes = "1.5"
 smallvec = "1.11"
-compact_str = "0.9"  # Inline strings up to 24 bytes - avoids heap allocation
-ordered-float = "4.2"
+ordered-float = "5.1"
 indexmap = "2.1"
 rustc-hash = "1.1"
 memchr = "2.6"
@@ -73,9 +72,9 @@ regex = "1.10"
 radsort = "0.1"  # Radix sort - O(n) for integer keys
 rand = "0.9"  # Random number generation for RANDOM() function
 ahash = "0.8"  # Fast hash for hash indexes (DOS-resistant)
-hashbrown = "0.15"  # HashMap with raw_entry API for efficient group-by
-roaring = "0.10"  # Compressed bitmap indexes (used by Lucene, Druid, Spark)
-lru = "0.12"  # O(1) LRU cache for compiled expression programs
+hashbrown = "0.16"  # HashMap with raw_entry API for efficient group-by
+roaring = "0.11"  # Compressed bitmap indexes (used by Lucene, Druid, Spark)
+lru = "0.16"  # O(1) LRU cache for compiled expression programs
 
 # Optional benchmark dependencies (for comparison benchmarks)
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
@@ -89,10 +88,10 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.4"
 tempfile = "3.9"
 dhat = "0.3"

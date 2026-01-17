@@ -22,8 +22,8 @@
 use std::sync::Arc;
 
 use crate::common::CompactArc;
+use crate::common::SmartString;
 use ahash::{AHashMap, AHashSet};
-use compact_str::CompactString;
 
 use crate::core::{Error, Result, Value};
 use crate::parser::ast::*;
@@ -1027,7 +1027,7 @@ impl Executor {
 
         // Build the batch aggregate query:
         // SELECT correlation_column, AGG(...) FROM table GROUP BY correlation_column
-        let inner_col_val: CompactString = correlation.inner_column.clone().into();
+        let inner_col_val: SmartString = correlation.inner_column.clone().into();
         let inner_col_expr = Expression::Identifier(Identifier {
             token: dummy_token(&correlation.inner_column, TokenType::Identifier),
             value: inner_col_val.clone(),

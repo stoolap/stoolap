@@ -20,12 +20,12 @@
 //! - DELETE
 
 use crate::common::CompactArc;
+use crate::common::SmartString;
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::traits::{Engine, QueryResult, Table};
 use ahash::AHashMap;
-use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -662,7 +662,7 @@ impl Executor {
         let cached_insert = {
             let cache_read = compiled_cache.read().unwrap();
             if let CompiledExecution::Insert(ref cached) = *cache_read {
-                if cached.cached_epoch == current_epoch && *cached.table_name == table_name {
+                if cached.cached_epoch == current_epoch && *cached.table_name == *table_name {
                     Some(cached.clone())
                 } else {
                     None // Stale cache
@@ -696,14 +696,14 @@ impl Executor {
             let schema_column_count = schema.columns.len();
 
             // Only collect columns that actually have CHECK constraints
-            let check_exprs: Vec<(usize, CompactString, CompactString)> = schema
+            let check_exprs: Vec<(usize, SmartString, SmartString)> = schema
                 .columns
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, c)| {
                     c.check_expr
                         .as_ref()
-                        .map(|expr| (idx, CompactString::new(&c.name), CompactString::new(expr)))
+                        .map(|expr| (idx, SmartString::new(&c.name), SmartString::new(expr)))
                 })
                 .collect();
 
@@ -732,10 +732,10 @@ impl Executor {
                 // No columns specified - insert into all columns in order
                 let indices: Vec<usize> = (0..schema_column_count).collect();
                 let types = all_column_types.clone();
-                let names: Vec<CompactString> = schema
+                let names: Vec<SmartString> = schema
                     .columns
                     .iter()
-                    .map(|c| CompactString::new(&c.name))
+                    .map(|c| SmartString::new(&c.name))
                     .collect();
                 (indices, types, names)
             } else {
@@ -755,16 +755,16 @@ impl Executor {
                     .iter()
                     .map(|&idx| schema.columns[idx].data_type)
                     .collect();
-                let names: Vec<CompactString> = indices
+                let names: Vec<SmartString> = indices
                     .iter()
-                    .map(|&idx| CompactString::new(&schema.columns[idx].name))
+                    .map(|&idx| SmartString::new(&schema.columns[idx].name))
                     .collect();
                 (indices, types, names)
             };
 
             // Store in cache for next execution
             let compiled = CompiledInsert {
-                table_name: CompactString::new(table_name),
+                table_name: SmartString::new(table_name),
                 column_indices: Arc::new(column_indices.clone()),
                 column_types: Arc::new(column_types.clone()),
                 column_names: Arc::new(column_names.clone()),

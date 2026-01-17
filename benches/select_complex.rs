@@ -25,9 +25,10 @@
 //! - Window functions
 //! - CTEs
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(feature = "sqlite")]
 use rusqlite::Connection;
+use std::hint::black_box;
 use stoolap::Database;
 
 const ROW_COUNT: usize = 10_000;

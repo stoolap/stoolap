@@ -24,9 +24,10 @@
 //! 4. Proper warmup via criterion
 //! 5. Statistical analysis of results
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(feature = "sqlite")]
 use rusqlite::Connection;
+use std::hint::black_box;
 use stoolap::Database;
 
 const ROW_COUNT: usize = 10_000;

@@ -28,8 +28,8 @@
 //!
 //! Note: Recursive CTEs are parsed but not yet executed.
 
+use crate::common::SmartString;
 use ahash::AHashSet;
-use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -2302,7 +2302,7 @@ impl Executor {
                 // Check if column exists in CTE (exact match only)
                 if cte_columns.iter().any(|c| c == &col) {
                     // Create ORDER BY item without table qualifier
-                    let col_compact: CompactString = col.clone().into();
+                    let col_compact: SmartString = col.clone().into();
                     let new_expr = Expression::Identifier(Identifier {
                         token: Token::new(
                             TokenType::Identifier,

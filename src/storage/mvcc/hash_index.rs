@@ -61,9 +61,8 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 
-use crate::common::CompactArc;
+use crate::common::{CompactArc, CompactVec, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::{ComparisonExpr, Expression, InListExpr};
 use crate::storage::traits::Index;
@@ -128,18 +127,18 @@ pub struct HashIndex {
 
     /// Hash -> row IDs mapping
     /// Uses u64 hash key to avoid storing full values (memory efficient)
-    /// SmallVec<[i64; 4]> avoids heap allocation for 1-4 matches (common case)
-    hash_to_rows: RwLock<FxHashMap<u64, SmallVec<[i64; 4]>>>,
+    /// CompactVec<i64> provides 16-byte storage (vs 48 bytes for SmallVec)
+    hash_to_rows: RwLock<FxHashMap<u64, CompactVec<i64>>>,
 
     /// Row ID -> hash mapping for efficient removal
-    /// Uses FxHashMap for O(1) lookups (optimized for integer keys)
-    row_to_hash: RwLock<FxHashMap<i64, u64>>,
+    /// Uses I64Map for fast O(1) lookups (optimized for i64 keys)
+    row_to_hash: RwLock<I64Map<u64>>,
 
     /// Full values storage for hash collision handling and unique constraint checking
     /// Maps hash -> (values as CompactArc<Value>, row_ids) for collision resolution
     /// Uses CompactArc<Value> to share references with ValueArena (8 bytes per value)
     #[allow(clippy::type_complexity)]
-    hash_to_values: RwLock<FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, SmallVec<[i64; 4]>)>>>,
+    hash_to_values: RwLock<FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, CompactVec<i64>)>>>,
 }
 
 impl std::fmt::Debug for HashIndex {
@@ -174,7 +173,7 @@ impl HashIndex {
             is_unique,
             closed: AtomicBool::new(false),
             hash_to_rows: RwLock::new(FxHashMap::default()),
-            row_to_hash: RwLock::new(FxHashMap::default()),
+            row_to_hash: RwLock::new(I64Map::new()),
             hash_to_values: RwLock::new(FxHashMap::default()),
         }
     }
@@ -186,7 +185,7 @@ impl HashIndex {
         values: &[Value],
         row_id: i64,
         hash: u64,
-        hash_to_values: &FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, SmallVec<[i64; 4]>)>>,
+        hash_to_values: &FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, CompactVec<i64>)>>,
     ) -> Result<()> {
         if !self.is_unique {
             return Ok(());
@@ -286,7 +285,7 @@ impl HashIndex {
         values: &[CompactArc<Value>],
         row_id: i64,
         hash: u64,
-        hash_to_values: &FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, SmallVec<[i64; 4]>)>>,
+        hash_to_values: &FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, CompactVec<i64>)>>,
     ) -> Result<()> {
         if !self.is_unique {
             return Ok(());
@@ -355,7 +354,7 @@ impl Index for HashIndex {
         let mut hash_to_values = self.hash_to_values.write().unwrap();
 
         // Check if row already exists (for updates)
-        if let Some(&old_hash) = row_to_hash.get(&row_id) {
+        if let Some(&old_hash) = row_to_hash.get(row_id) {
             if old_hash == hash {
                 // Same hash - might be same values, check if we need to update
                 // (could be hash collision with different values)
@@ -413,7 +412,7 @@ impl Index for HashIndex {
             // Wrap values in Arc for O(1) cloning
             let arc_values: Vec<CompactArc<Value>> =
                 values.iter().map(|v| CompactArc::new(v.clone())).collect();
-            let mut row_ids = SmallVec::new();
+            let mut row_ids = CompactVec::new();
             row_ids.push(row_id); // First element, already sorted
             entries.push((arc_values, row_ids));
         }
@@ -443,7 +442,7 @@ impl Index for HashIndex {
         let mut hash_to_values = self.hash_to_values.write().unwrap();
 
         // Check if row already exists (for updates)
-        if let Some(&old_hash) = row_to_hash.get(&row_id) {
+        if let Some(&old_hash) = row_to_hash.get(row_id) {
             if old_hash == hash {
                 // Same hash - might be same values, check if we need to update
                 // (could be hash collision with different values)
@@ -500,7 +499,7 @@ impl Index for HashIndex {
         if !found {
             // Clone Arc references - O(1) per value, no value cloning!
             let arc_values: Vec<CompactArc<Value>> = values.iter().map(CompactArc::clone).collect();
-            let mut row_ids = SmallVec::new();
+            let mut row_ids = CompactVec::new();
             row_ids.push(row_id); // First element, already sorted
             entries.push((arc_values, row_ids));
         }
@@ -508,8 +507,8 @@ impl Index for HashIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
-        for (&row_id, values) in entries {
+    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
+        for (row_id, values) in entries.iter() {
             self.add(values, row_id, 0)?;
         }
         Ok(())
@@ -537,7 +536,7 @@ impl Index for HashIndex {
         }
 
         // Remove from row_to_hash
-        row_to_hash.remove(&row_id);
+        row_to_hash.remove(row_id);
 
         // Remove from hash_to_values (row_ids are sorted, use binary search)
         if let Some(entries) = hash_to_values.get_mut(&hash) {
@@ -581,7 +580,7 @@ impl Index for HashIndex {
         }
 
         // Remove from row_to_hash
-        row_to_hash.remove(&row_id);
+        row_to_hash.remove(row_id);
 
         // Remove from hash_to_values (row_ids are sorted, use binary search)
         if let Some(entries) = hash_to_values.get_mut(&hash) {
@@ -603,8 +602,8 @@ impl Index for HashIndex {
         Ok(())
     }
 
-    fn remove_batch(&self, entries: &FxHashMap<i64, Vec<Value>>) -> Result<()> {
-        for (&row_id, values) in entries {
+    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
+        for (row_id, values) in entries.iter() {
             self.remove(values, row_id, 0)?;
         }
         Ok(())

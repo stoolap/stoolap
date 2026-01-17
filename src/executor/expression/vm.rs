@@ -24,12 +24,12 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use compact_str::CompactString;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use super::ops::{CompareOp, Op};
 use super::program::Program;
+use crate::common::SmartString;
 use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
 
 /// Stack value that can be borrowed (from row/constants) or owned (from operations)
@@ -212,7 +212,7 @@ const ARGS_BUFFER_CAPACITY: usize = 8;
 
 pub struct ExprVM {
     /// Evaluation stack (reused between executions)
-    /// Uses SmallVec to avoid heap allocation for simple expressions (stack depth <= 8)
+    /// Uses SmallVec to avoid heap allocation for simple expressions (stack depth <= 16)
     stack: SmallVec<[Value; STACK_INLINE_CAPACITY]>,
 
     /// Reusable buffer for function arguments (avoids allocation per call)
@@ -783,13 +783,9 @@ impl ExprVM {
                         (Value::Integer(days), Value::Timestamp(t)) => {
                             Value::Timestamp(*t + chrono::Duration::days(*days))
                         }
-                        (Value::Timestamp(t), Value::Text(interval)) => {
-                            // Parse interval string
-                            self.timestamp_add_interval(
-                                &Value::Timestamp(*t),
-                                &Value::Text(interval.clone()),
-                                true,
-                            )
+                        (Value::Timestamp(_), Value::Text(_)) => {
+                            // Parse interval string - pass references directly to avoid clone
+                            self.timestamp_add_interval(&a, &b, true)
                         }
                         _ => Self::arithmetic_op(&a, &b, ArithmeticOp::Add, |x, y| x + y)?,
                     };
@@ -805,20 +801,16 @@ impl ExprVM {
                         (Value::Timestamp(t1), Value::Timestamp(t2)) => {
                             // Return interval text
                             let duration = t1.signed_duration_since(*t2);
-                            Value::Text(CompactString::from(
-                                self.format_duration_as_interval(duration).as_str(),
+                            Value::Text(SmartString::from_string(
+                                self.format_duration_as_interval(duration),
                             ))
                         }
                         (Value::Timestamp(t), Value::Integer(days)) => {
                             Value::Timestamp(*t - chrono::Duration::days(*days))
                         }
-                        (Value::Timestamp(t), Value::Text(interval)) => {
-                            // Parse interval string
-                            self.timestamp_add_interval(
-                                &Value::Timestamp(*t),
-                                &Value::Text(interval.clone()),
-                                false,
-                            )
+                        (Value::Timestamp(_), Value::Text(_)) => {
+                            // Parse interval string - pass references directly to avoid clone
+                            self.timestamp_add_interval(&a, &b, false)
                         }
                         _ => Self::arithmetic_op(&a, &b, ArithmeticOp::Sub, |x, y| x - y)?,
                     };
@@ -949,37 +941,34 @@ impl ExprVM {
                     let result = if a.is_null() || b.is_null() {
                         Value::Null(DataType::Text)
                     } else {
-                        // Fast path: both are Text - use CompactString directly (no intermediate String)
+                        // Fast path: both are Text
                         match (&a, &b) {
                             (Value::Text(a_str), Value::Text(b_str)) => {
-                                // Build CompactString directly - single allocation
-                                let mut s = CompactString::with_capacity(a_str.len() + b_str.len());
-                                s.push_str(a_str);
-                                s.push_str(b_str);
-                                Value::Text(s)
+                                // Use optimized concat - handles inline and heap efficiently
+                                Value::Text(SmartString::concat(a_str, b_str))
                             }
                             (Value::Text(a_str), _) => {
-                                // a is Text, b needs conversion
+                                // a is Text, b needs conversion - use Arc to avoid shrink_to_fit
                                 use std::fmt::Write;
-                                let mut s = CompactString::with_capacity(a_str.len() + 32);
+                                let mut s = String::with_capacity(a_str.len() + 32);
                                 s.push_str(a_str);
                                 let _ = write!(s, "{}", b);
-                                Value::Text(s)
+                                Value::Text(SmartString::from_string_shared(s))
                             }
                             (_, Value::Text(b_str)) => {
-                                // a needs conversion, b is Text
+                                // a needs conversion, b is Text - use Arc to avoid shrink_to_fit
                                 use std::fmt::Write;
-                                let mut s = CompactString::with_capacity(32 + b_str.len());
+                                let mut s = String::with_capacity(32 + b_str.len());
                                 let _ = write!(s, "{}", a);
                                 s.push_str(b_str);
-                                Value::Text(s)
+                                Value::Text(SmartString::from_string_shared(s))
                             }
                             _ => {
-                                // Both need conversion - rare case
+                                // Both need conversion - use Arc to avoid shrink_to_fit
                                 use std::fmt::Write;
-                                let mut s = CompactString::with_capacity(64);
+                                let mut s = String::with_capacity(64);
                                 let _ = write!(s, "{}{}", a, b);
-                                Value::Text(s)
+                                Value::Text(SmartString::from_string_shared(s))
                             }
                         }
                     };
@@ -991,8 +980,25 @@ impl ExprVM {
                     let n = *n as usize;
                     let start = self.stack.len().saturating_sub(n);
 
-                    // Check for any NULL - if so, result is NULL
-                    let has_null = self.stack[start..].iter().any(|v| v.is_null());
+                    // Single pass: check for NULL and calculate total length
+                    let mut total_len = 0usize;
+                    let mut has_null = false;
+                    let mut all_text = true;
+
+                    for v in &self.stack[start..] {
+                        match v {
+                            Value::Null(_) => {
+                                has_null = true;
+                                break;
+                            }
+                            Value::Text(s) => total_len += s.len(),
+                            _ => {
+                                all_text = false;
+                                total_len += 32;
+                            }
+                        }
+                    }
+
                     if has_null {
                         self.stack.truncate(start);
                         self.stack.push(Value::Null(DataType::Text));
@@ -1000,28 +1006,47 @@ impl ExprVM {
                         continue;
                     }
 
-                    // Calculate total length for single allocation
-                    let mut total_len = 0usize;
-                    for v in &self.stack[start..] {
-                        if let Value::Text(s) = v {
-                            total_len += s.len();
-                        } else {
-                            // Non-text needs conversion - estimate 32 chars
-                            total_len += 32;
-                        }
-                    }
-
-                    // Build result with single allocation
-                    let mut result = CompactString::with_capacity(total_len);
-                    for v in self.stack.drain(start..) {
-                        match v {
-                            Value::Text(s) => result.push_str(&s),
-                            _ => {
-                                use std::fmt::Write;
-                                let _ = write!(result, "{}", v);
+                    // Build result - optimize for inline vs heap
+                    let result = if all_text && total_len <= 22 {
+                        // Fast path: build directly into inline SmartString (no heap allocation)
+                        let mut data = [0u8; 22];
+                        let mut pos = 0;
+                        for v in self.stack.drain(start..) {
+                            if let Value::Text(text) = v {
+                                let bytes = text.as_bytes();
+                                data[pos..pos + bytes.len()].copy_from_slice(bytes);
+                                pos += bytes.len();
                             }
                         }
-                    }
+                        // SAFETY: SmartString only stores valid UTF-8
+                        SmartString::Inline {
+                            len: total_len as u8,
+                            data,
+                        }
+                    } else if all_text {
+                        // Heap path: exact capacity, into_boxed_str is O(1) when len == capacity
+                        let mut s = String::with_capacity(total_len);
+                        for v in self.stack.drain(start..) {
+                            if let Value::Text(text) = v {
+                                s.push_str(&text);
+                            }
+                        }
+                        // len == capacity, so into_boxed_str is O(1)
+                        SmartString::from_string(s)
+                    } else {
+                        // Mixed types: capacity is estimate, use Arc to avoid shrink_to_fit
+                        let mut s = String::with_capacity(total_len);
+                        for v in self.stack.drain(start..) {
+                            match v {
+                                Value::Text(text) => s.push_str(&text),
+                                _ => {
+                                    use std::fmt::Write;
+                                    let _ = write!(s, "{}", v);
+                                }
+                            }
+                        }
+                        SmartString::from_string_shared(s)
+                    };
                     self.stack.push(Value::Text(result));
                     pc += 1;
                 }
@@ -1115,8 +1140,8 @@ impl ExprVM {
                     let result = match (&ts1, &ts2) {
                         (Value::Timestamp(t1), Value::Timestamp(t2)) => {
                             let duration = t1.signed_duration_since(*t2);
-                            Value::Text(CompactString::from(
-                                self.format_duration_as_interval(duration).as_str(),
+                            Value::Text(SmartString::from_string(
+                                self.format_duration_as_interval(duration),
                             ))
                         }
                         _ if ts1.is_null() || ts2.is_null() => Value::Null(DataType::Text),
@@ -1851,8 +1876,8 @@ impl ExprVM {
 
                 // COMPARISON OPERATIONS - work with references
                 Op::Eq => {
-                    let b = stack.pop().unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let result = if a.is_null() || b.is_null() {
                         Value::Null(DataType::Boolean)
                     } else {
@@ -1863,8 +1888,8 @@ impl ExprVM {
                 }
 
                 Op::Ne => {
-                    let b = stack.pop().unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let result = if a.is_null() || b.is_null() {
                         Value::Null(DataType::Boolean)
                     } else {
@@ -2257,33 +2282,34 @@ impl ExprVM {
                     let result = if a.is_null() || b.is_null() {
                         Value::Null(DataType::Text)
                     } else {
-                        // Fast path: both are Text - use CompactString directly
+                        // Fast path: both are Text
                         match (&*a, &*b) {
                             (Value::Text(a_str), Value::Text(b_str)) => {
-                                let mut s = CompactString::with_capacity(a_str.len() + b_str.len());
-                                s.push_str(a_str);
-                                s.push_str(b_str);
-                                Value::Text(s)
+                                // Use optimized concat - handles inline and heap efficiently
+                                Value::Text(SmartString::concat(a_str, b_str))
                             }
                             (Value::Text(a_str), _) => {
+                                // Use Arc to avoid shrink_to_fit
                                 use std::fmt::Write;
-                                let mut s = CompactString::with_capacity(a_str.len() + 32);
+                                let mut s = String::with_capacity(a_str.len() + 32);
                                 s.push_str(a_str);
                                 let _ = write!(s, "{}", *b);
-                                Value::Text(s)
+                                Value::Text(SmartString::from_string_shared(s))
                             }
                             (_, Value::Text(b_str)) => {
+                                // Use Arc to avoid shrink_to_fit
                                 use std::fmt::Write;
-                                let mut s = CompactString::with_capacity(32 + b_str.len());
+                                let mut s = String::with_capacity(32 + b_str.len());
                                 let _ = write!(s, "{}", *a);
                                 s.push_str(b_str);
-                                Value::Text(s)
+                                Value::Text(SmartString::from_string_shared(s))
                             }
                             _ => {
+                                // Use Arc to avoid shrink_to_fit
                                 use std::fmt::Write;
-                                let mut s = CompactString::with_capacity(64);
+                                let mut s = String::with_capacity(64);
                                 let _ = write!(s, "{}{}", *a, *b);
-                                Value::Text(s)
+                                Value::Text(SmartString::from_string_shared(s))
                             }
                         }
                     };
@@ -2296,8 +2322,25 @@ impl ExprVM {
                     let n = *n as usize;
                     let start = stack.len().saturating_sub(n);
 
-                    // Check for any NULL - if so, result is NULL
-                    let has_null = stack[start..].iter().any(|v| v.is_null());
+                    // Single pass: check for NULL and calculate total length
+                    let mut total_len = 0usize;
+                    let mut has_null = false;
+                    let mut all_text = true;
+
+                    for v in &stack[start..] {
+                        match &**v {
+                            Value::Null(_) => {
+                                has_null = true;
+                                break;
+                            }
+                            Value::Text(s) => total_len += s.len(),
+                            _ => {
+                                all_text = false;
+                                total_len += 32;
+                            }
+                        }
+                    }
+
                     if has_null {
                         stack.truncate(start);
                         stack.push(Cow::Owned(Value::Null(DataType::Text)));
@@ -2305,27 +2348,47 @@ impl ExprVM {
                         continue;
                     }
 
-                    // Calculate total length for single allocation
-                    let mut total_len = 0usize;
-                    for v in &stack[start..] {
-                        if let Value::Text(s) = &**v {
-                            total_len += s.len();
-                        } else {
-                            total_len += 32; // estimate for non-text
-                        }
-                    }
-
-                    // Build result with single allocation
-                    let mut result = CompactString::with_capacity(total_len);
-                    for v in stack.drain(start..) {
-                        match &*v {
-                            Value::Text(s) => result.push_str(s),
-                            other => {
-                                use std::fmt::Write;
-                                let _ = write!(result, "{}", other);
+                    // Build result - optimize for inline vs heap
+                    let result = if all_text && total_len <= 22 {
+                        // Fast path: build directly into inline SmartString (no heap allocation)
+                        let mut data = [0u8; 22];
+                        let mut pos = 0;
+                        for v in stack.drain(start..) {
+                            if let Value::Text(text) = &*v {
+                                let bytes = text.as_bytes();
+                                data[pos..pos + bytes.len()].copy_from_slice(bytes);
+                                pos += bytes.len();
                             }
                         }
-                    }
+                        // SAFETY: SmartString only stores valid UTF-8
+                        SmartString::Inline {
+                            len: total_len as u8,
+                            data,
+                        }
+                    } else if all_text {
+                        // Heap path: exact capacity, into_boxed_str is O(1) when len == capacity
+                        let mut s = String::with_capacity(total_len);
+                        for v in stack.drain(start..) {
+                            if let Value::Text(text) = &*v {
+                                s.push_str(text);
+                            }
+                        }
+                        // len == capacity, so into_boxed_str is O(1)
+                        SmartString::from_string(s)
+                    } else {
+                        // Mixed types: capacity is estimate, use Arc to avoid shrink_to_fit
+                        let mut s = String::with_capacity(total_len);
+                        for v in stack.drain(start..) {
+                            match &*v {
+                                Value::Text(text) => s.push_str(text),
+                                other => {
+                                    use std::fmt::Write;
+                                    let _ = write!(s, "{}", other);
+                                }
+                            }
+                        }
+                        SmartString::from_string_shared(s)
+                    };
                     stack.push(Cow::Owned(Value::Text(result)));
                     pc += 1;
                 }
@@ -3031,11 +3094,9 @@ impl ExprVM {
                 if as_text {
                     // ->> returns text
                     match v {
-                        serde_json::Value::String(s) => {
-                            Value::Text(CompactString::from(s.as_str()))
-                        }
+                        serde_json::Value::String(s) => Value::Text(SmartString::new(s)),
                         serde_json::Value::Null => Value::Null(DataType::Text),
-                        other => Value::Text(CompactString::from(other.to_string().as_str())),
+                        other => Value::Text(SmartString::from_string(other.to_string())),
                     }
                 } else {
                     // -> returns JSON

@@ -29,7 +29,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 // SmallVec removed - Vec is faster due to spilled() check overhead in hot loops
 
-use crate::common::{CompactArc, CompactVec};
+use crate::common::{CompactArc, CompactVec, I64Map};
 use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::aggregate::CompiledAggregate;
 use crate::functions::AggregateFunction;
@@ -2696,8 +2696,7 @@ impl Executor {
                 max_values: AggVec<Option<Value>>,
             }
 
-            let mut groups: FxHashMap<i64, IntGroupState> =
-                FxHashMap::with_capacity_and_hasher(estimated_groups, Default::default());
+            let mut groups: I64Map<IntGroupState> = I64Map::with_capacity(estimated_groups);
             // Separate tracking for NULL group (SQL: all NULLs group together)
             let mut null_group: Option<IntGroupState> = None;
             let mut current_group_count: usize = 0;
@@ -2724,7 +2723,7 @@ impl Executor {
                 let state = if let Some(key) = key_opt {
                     // OPTIMIZATION: Single hash lookup using entry API instead of
                     // contains_key + entry (was doing 2 hash lookups)
-                    use std::collections::hash_map::Entry;
+                    use crate::common::i64_map::Entry;
                     match groups.entry(key) {
                         Entry::Occupied(e) => e.into_mut(),
                         Entry::Vacant(e) => {
@@ -2915,7 +2914,7 @@ impl Executor {
             return Ok(Some((result_columns, result_rows)));
         }
 
-        // String fast path for Text GROUP BY: direct CompactString key, no Value::eq overhead
+        // String fast path for Text GROUP BY: direct SmartString key, no Value::eq overhead
         // SmallVec for inline storage when ≤4 aggregations (common case)
         if use_string_fast_path {
             use smallvec::SmallVec;
@@ -2930,7 +2929,7 @@ impl Executor {
                 max_values: AggVec<Option<Value>>,
             }
 
-            let mut groups: FxHashMap<compact_str::CompactString, StringGroupState> =
+            let mut groups: FxHashMap<crate::common::SmartString, StringGroupState> =
                 FxHashMap::with_capacity_and_hasher(estimated_groups, Default::default());
             // Separate tracking for NULL group (SQL: all NULLs group together)
             let mut null_group: Option<StringGroupState> = None;
@@ -3512,31 +3511,26 @@ impl Executor {
             // OPTIMIZATION: Single-column GROUP BY uses direct hash map (no Vec<Value> overhead)
             if column_indices.len() == 1 {
                 let col_idx = column_indices[0];
-                // Use value hash directly as key, store (key_value, row_indices)
-                let mut single_col_groups: FxHashMap<u64, (Value, Vec<usize>)> =
-                    FxHashMap::default();
+                // Use AHashMap for Value keys - 50x faster than FxHash per CLAUDE.md
+                // Properly handles hash collisions via Value equality
+                let mut single_col_groups: ahash::AHashMap<Value, Vec<usize>> =
+                    ahash::AHashMap::new();
 
                 for (row_idx, (_, row)) in rows.iter().enumerate() {
                     let key_value = row
                         .get(col_idx)
                         .cloned()
                         .unwrap_or_else(Value::null_unknown);
-                    let hash = {
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = rustc_hash::FxHasher::default();
-                        key_value.hash(&mut hasher);
-                        hasher.finish()
-                    };
 
-                    // For single column, hash collisions are rare - use simple entry API
+                    // Use entry API with proper Value equality
                     single_col_groups
-                        .entry(hash)
-                        .and_modify(|e| e.1.push(row_idx))
-                        .or_insert_with(|| (key_value, vec![row_idx]));
+                        .entry(key_value)
+                        .or_default()
+                        .push(row_idx);
                 }
 
                 // Convert to GroupEntry format for downstream processing
-                for (_hash, (key_value, row_indices)) in single_col_groups {
+                for (key_value, row_indices) in single_col_groups {
                     groups
                         .entry(0) // Use dummy hash, we'll flatten anyway
                         .or_default()
@@ -3545,7 +3539,40 @@ impl Executor {
                             row_indices,
                         });
                 }
+            } else if column_indices.len() == 2 {
+                // OPTIMIZATION: 2-column GROUP BY uses tuple keys instead of Vec<Value>
+                // Tuples are 30% faster than Vec per CLAUDE.md (no heap allocation)
+                let col_idx0 = column_indices[0];
+                let col_idx1 = column_indices[1];
+                // AHashMap for tuple keys containing Value elements
+                let mut two_col_groups: ahash::AHashMap<(Value, Value), Vec<usize>> =
+                    ahash::AHashMap::new();
+
+                for (row_idx, (_, row)) in rows.iter().enumerate() {
+                    let key = (
+                        row.get(col_idx0)
+                            .cloned()
+                            .unwrap_or_else(Value::null_unknown),
+                        row.get(col_idx1)
+                            .cloned()
+                            .unwrap_or_else(Value::null_unknown),
+                    );
+
+                    two_col_groups.entry(key).or_default().push(row_idx);
+                }
+
+                // Convert to GroupEntry format for downstream processing
+                for ((v0, v1), row_indices) in two_col_groups {
+                    groups
+                        .entry(0) // Use dummy hash, we'll flatten anyway
+                        .or_default()
+                        .push(GroupEntry {
+                            key_values: vec![v0, v1],
+                            row_indices,
+                        });
+                }
             } else {
+                // 3+ columns: use Vec<Value> with hash-based collision handling
                 for (row_idx, (_, row)) in rows.iter().enumerate() {
                     // Build key values for this row
                     key_buffer.clear();
@@ -5415,7 +5442,7 @@ impl Executor {
         stmt: &SelectStatement,
         classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<Box<dyn QueryResult>>> {
-        use compact_str::CompactString;
+        use crate::common::SmartString;
         use smallvec::SmallVec;
 
         // Quick eligibility checks
@@ -5582,85 +5609,104 @@ impl Executor {
 
         if use_string_path {
             // String GROUP BY streaming path
-            let mut groups: FxHashMap<CompactString, StreamGroupState> =
-                FxHashMap::with_capacity_and_hasher(64, Default::default());
+            // OPTIMIZATION: Use hashbrown::HashMap with raw_entry_mut to avoid SmartString allocation on lookup
+            type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
+            let mut groups: hashbrown::HashMap<SmartString, StreamGroupState, FxBuildHasher> =
+                hashbrown::HashMap::with_capacity_and_hasher(64, FxBuildHasher::default());
             let mut null_group: Option<StreamGroupState> = None;
 
             // Process first row
-            let process_row = |row: &Row,
-                               groups: &mut FxHashMap<CompactString, StreamGroupState>,
-                               null_group: &mut Option<StreamGroupState>,
-                               template: &StreamGroupState| {
-                let key_opt = match row.get(group_col_idx) {
-                    Some(Value::Text(s)) => Some(s),
-                    Some(Value::Null(_)) | None => None,
-                    _ => return, // Skip non-text, non-NULL
-                };
+            let process_row =
+                |row: &Row,
+                 groups: &mut hashbrown::HashMap<SmartString, StreamGroupState, FxBuildHasher>,
+                 null_group: &mut Option<StreamGroupState>,
+                 template: &StreamGroupState| {
+                    let key_opt = match row.get(group_col_idx) {
+                        Some(Value::Text(s)) => Some(s),
+                        Some(Value::Null(_)) | None => None,
+                        _ => return, // Skip non-text, non-NULL
+                    };
 
-                let state = if let Some(key_str) = key_opt {
-                    // OPTIMIZATION: Use entry API for single hash lookup instead of get_mut + insert + get_mut
-                    groups
-                        .entry(CompactString::new(key_str))
-                        .or_insert_with(|| template.clone())
-                } else {
-                    if null_group.is_none() {
-                        *null_group = Some(template.clone());
-                    }
-                    null_group.as_mut().unwrap()
-                };
+                    let state = if let Some(key_str) = key_opt {
+                        // OPTIMIZATION: Use raw_entry_mut to avoid SmartString allocation on lookup
+                        // Only create SmartString when inserting a new group
+                        let mut hasher = FxHasher::default();
+                        std::hash::Hash::hash(key_str, &mut hasher);
+                        let hash = hasher.finish();
 
-                // Accumulate aggregates
-                for (i, agg) in simple_aggs.iter().enumerate() {
-                    match agg {
-                        SimpleAgg::Count => {
-                            state.counts[i] += 1;
-                        }
-                        SimpleAgg::Sum(col_idx) | SimpleAgg::Avg(col_idx) => {
-                            if let Some(value) = row.get(*col_idx) {
-                                match value {
-                                    Value::Integer(v) => {
-                                        state.agg_values[i] += *v as f64;
-                                        state.agg_has_value[i] = true;
-                                        state.counts[i] += 1;
-                                    }
-                                    Value::Float(v) => {
-                                        state.agg_values[i] += v;
-                                        state.agg_has_value[i] = true;
-                                        state.counts[i] += 1;
-                                    }
-                                    _ => {}
-                                }
+                        let entry = groups
+                            .raw_entry_mut()
+                            .from_hash(hash, |k| k.as_str() == key_str);
+                        match entry {
+                            RawEntryMut::Occupied(o) => o.into_mut(),
+                            RawEntryMut::Vacant(v) => {
+                                v.insert_hashed_nocheck(
+                                    hash,
+                                    SmartString::new(key_str),
+                                    template.clone(),
+                                )
+                                .1
                             }
                         }
-                        SimpleAgg::Min(col_idx) => {
-                            if let Some(value) = row.get(*col_idx) {
-                                if !value.is_null() {
-                                    match &state.min_values[i] {
-                                        None => state.min_values[i] = Some(value.clone()),
-                                        Some(current) if value < current => {
-                                            state.min_values[i] = Some(value.clone())
+                    } else {
+                        if null_group.is_none() {
+                            *null_group = Some(template.clone());
+                        }
+                        null_group.as_mut().unwrap()
+                    };
+
+                    // Accumulate aggregates
+                    for (i, agg) in simple_aggs.iter().enumerate() {
+                        match agg {
+                            SimpleAgg::Count => {
+                                state.counts[i] += 1;
+                            }
+                            SimpleAgg::Sum(col_idx) | SimpleAgg::Avg(col_idx) => {
+                                if let Some(value) = row.get(*col_idx) {
+                                    match value {
+                                        Value::Integer(v) => {
+                                            state.agg_values[i] += *v as f64;
+                                            state.agg_has_value[i] = true;
+                                            state.counts[i] += 1;
+                                        }
+                                        Value::Float(v) => {
+                                            state.agg_values[i] += v;
+                                            state.agg_has_value[i] = true;
+                                            state.counts[i] += 1;
                                         }
                                         _ => {}
                                     }
                                 }
                             }
-                        }
-                        SimpleAgg::Max(col_idx) => {
-                            if let Some(value) = row.get(*col_idx) {
-                                if !value.is_null() {
-                                    match &state.max_values[i] {
-                                        None => state.max_values[i] = Some(value.clone()),
-                                        Some(current) if value > current => {
-                                            state.max_values[i] = Some(value.clone())
+                            SimpleAgg::Min(col_idx) => {
+                                if let Some(value) = row.get(*col_idx) {
+                                    if !value.is_null() {
+                                        match &state.min_values[i] {
+                                            None => state.min_values[i] = Some(value.clone()),
+                                            Some(current) if value < current => {
+                                                state.min_values[i] = Some(value.clone())
+                                            }
+                                            _ => {}
                                         }
-                                        _ => {}
+                                    }
+                                }
+                            }
+                            SimpleAgg::Max(col_idx) => {
+                                if let Some(value) = row.get(*col_idx) {
+                                    if !value.is_null() {
+                                        match &state.max_values[i] {
+                                            None => state.max_values[i] = Some(value.clone()),
+                                            Some(current) if value > current => {
+                                                state.max_values[i] = Some(value.clone())
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-            };
+                };
 
             // Process first row (already fetched)
             process_row(first_row, &mut groups, &mut null_group, &state_template);
@@ -6133,7 +6179,7 @@ impl Executor {
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        use compact_str::CompactString;
+        use crate::common::SmartString;
 
         // Acquire write lock
         let mut compiled_guard = match compiled.write() {
@@ -6284,8 +6330,8 @@ impl Executor {
 
         // Cache the compiled state
         let compiled_cd = CompiledCountDistinct {
-            table_name: CompactString::new(&table_name),
-            column_name: CompactString::new(&column_name),
+            table_name: SmartString::new(&table_name),
+            column_name: SmartString::new(&column_name),
             result_column_name: result_column_name.clone(),
             cached_epoch: self.engine.schema_epoch(),
         };
@@ -6390,8 +6436,8 @@ impl Executor {
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
+        use crate::common::SmartString;
         use crate::executor::query_cache::CompiledCountStar;
-        use compact_str::CompactString;
 
         // Acquire write lock
         let mut compiled_guard = match compiled.write() {
@@ -6572,7 +6618,7 @@ impl Executor {
 
         // Cache the compiled state
         let compiled_cs = CompiledCountStar {
-            table_name: CompactString::new(&table_name),
+            table_name: SmartString::new(&table_name),
             result_column_name: result_column_name.clone(),
             cached_epoch: self.engine.schema_epoch(),
         };
