@@ -31,7 +31,9 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
-use super::context::{cache_in_subquery, get_cached_in_subquery, ExecutionContext};
+use super::context::{
+    cache_in_subquery, extract_table_names_for_cache, get_cached_in_subquery, ExecutionContext,
+};
 use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
@@ -825,7 +827,11 @@ impl Executor {
                 }
             }
             // Cache for future use
-            cache_in_subquery(cache_key, values.clone());
+            cache_in_subquery(
+                cache_key,
+                extract_table_names_for_cache(&subquery.subquery),
+                values.clone(),
+            );
             values
         };
 

@@ -702,8 +702,8 @@ impl Index for HashIndex {
             // Handle hash collisions by checking actual values (CompactArc<Value>)
             for (stored_values, row_ids) in entries {
                 if Self::values_match(stored_values, values) {
-                    // SmallVec can be iterated efficiently
-                    buffer.extend(row_ids.iter().copied());
+                    // Use extend_from_slice for memcpy instead of iterator
+                    buffer.extend_from_slice(row_ids.as_slice());
                     return;
                 }
             }
@@ -726,7 +726,7 @@ impl Index for HashIndex {
                 for (stored_values, row_ids) in entries {
                     // Compare CompactArc<Value> with input value
                     if stored_values.len() == 1 && stored_values[0].as_ref() == value {
-                        buffer.extend(row_ids.iter().copied());
+                        buffer.extend_from_slice(row_ids.as_slice());
                         break;
                     }
                 }
@@ -777,7 +777,7 @@ impl Index for HashIndex {
 
         for entries in hash_to_values.values() {
             for (_values, row_ids) in entries {
-                results.extend(row_ids.iter().copied());
+                results.extend_from_slice(row_ids.as_slice());
             }
         }
 

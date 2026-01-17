@@ -67,7 +67,7 @@ use super::context::{
     clear_batch_aggregate_cache, clear_batch_aggregate_info_cache, clear_count_counter_cache,
     clear_exists_correlation_cache, clear_exists_fetcher_cache, clear_exists_index_cache,
     clear_exists_pred_key_cache, clear_exists_predicate_cache, clear_exists_schema_cache,
-    clear_in_subquery_cache, clear_scalar_subquery_cache, ExecutionContext, TimeoutGuard,
+    ExecutionContext, TimeoutGuard,
 };
 use super::expression::{
     compile_expression, CompiledEvaluator, ExecuteContext, ExprVM, ExpressionEval, JoinFilter,
@@ -199,13 +199,10 @@ impl Executor {
         // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
         // This ensures the timeout applies to the entire query, not each nested call.
         let _timeout_guard = if ctx.query_depth == 0 {
-            // Clear subquery caches at top-level to avoid stale results between queries
-            // NOTE: semi-join cache is NOT cleared here - it's invalidated per-table
-            // when data changes (INSERT, UPDATE, DELETE, TRUNCATE) to enable caching
-            // across multiple read queries.
-            clear_scalar_subquery_cache();
-            clear_in_subquery_cache();
-            // clear_semi_join_cache(); - now table-specific invalidation
+            // Clear query-local caches at top-level.
+            // NOTE: scalar, IN, and semi-join caches are NOT cleared here - they're
+            // invalidated per-table when data changes (INSERT, UPDATE, DELETE, TRUNCATE)
+            // to enable cross-query caching for repeated subqueries.
             clear_exists_predicate_cache();
             clear_exists_index_cache();
             clear_exists_fetcher_cache();

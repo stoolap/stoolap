@@ -87,23 +87,79 @@ pub enum JoinType {
 
 impl JoinType {
     /// Parse join type from string (as used in parser AST).
+    /// Optimized to avoid allocation - uses byte-level case-insensitive matching.
     pub fn parse(s: &str) -> Self {
-        let s_lower = s.to_lowercase();
-        if s_lower.contains("left") {
-            JoinType::Left
-        } else if s_lower.contains("right") {
-            JoinType::Right
-        } else if s_lower.contains("full") {
-            JoinType::Full
-        } else if s_lower.contains("cross") {
-            JoinType::Cross
-        } else if s_lower.contains("semi") {
-            JoinType::Semi
-        } else if s_lower.contains("anti") {
-            JoinType::Anti
-        } else {
-            JoinType::Inner
+        // Fast path: check first byte to avoid scanning entire string
+        let bytes = s.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            match b | 32 {
+                // Case-insensitive: 'L' | 32 = 'l'
+                b'l' => {
+                    // Check for "left" (4 chars)
+                    if i + 4 <= bytes.len()
+                        && (bytes[i + 1] | 32) == b'e'
+                        && (bytes[i + 2] | 32) == b'f'
+                        && (bytes[i + 3] | 32) == b't'
+                    {
+                        return JoinType::Left;
+                    }
+                }
+                b'r' => {
+                    // Check for "right" (5 chars)
+                    if i + 5 <= bytes.len()
+                        && (bytes[i + 1] | 32) == b'i'
+                        && (bytes[i + 2] | 32) == b'g'
+                        && (bytes[i + 3] | 32) == b'h'
+                        && (bytes[i + 4] | 32) == b't'
+                    {
+                        return JoinType::Right;
+                    }
+                }
+                b'f' => {
+                    // Check for "full" (4 chars)
+                    if i + 4 <= bytes.len()
+                        && (bytes[i + 1] | 32) == b'u'
+                        && (bytes[i + 2] | 32) == b'l'
+                        && (bytes[i + 3] | 32) == b'l'
+                    {
+                        return JoinType::Full;
+                    }
+                }
+                b'c' => {
+                    // Check for "cross" (5 chars)
+                    if i + 5 <= bytes.len()
+                        && (bytes[i + 1] | 32) == b'r'
+                        && (bytes[i + 2] | 32) == b'o'
+                        && (bytes[i + 3] | 32) == b's'
+                        && (bytes[i + 4] | 32) == b's'
+                    {
+                        return JoinType::Cross;
+                    }
+                }
+                b's' => {
+                    // Check for "semi" (4 chars)
+                    if i + 4 <= bytes.len()
+                        && (bytes[i + 1] | 32) == b'e'
+                        && (bytes[i + 2] | 32) == b'm'
+                        && (bytes[i + 3] | 32) == b'i'
+                    {
+                        return JoinType::Semi;
+                    }
+                }
+                b'a' => {
+                    // Check for "anti" (4 chars)
+                    if i + 4 <= bytes.len()
+                        && (bytes[i + 1] | 32) == b'n'
+                        && (bytes[i + 2] | 32) == b't'
+                        && (bytes[i + 3] | 32) == b'i'
+                    {
+                        return JoinType::Anti;
+                    }
+                }
+                _ => {}
+            }
         }
+        JoinType::Inner
     }
 
     /// Alias for parse() - used by parallel.rs for compatibility.

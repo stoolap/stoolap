@@ -909,8 +909,8 @@ impl Index for MultiColumnIndex {
             // Exact match - use full key hash index (O(1))
             let value_to_rows = self.value_to_rows.read().unwrap();
             if let Some(row_ids) = value_to_rows.get(&key) {
-                // SmallVec can be iterated efficiently
-                buffer.extend(row_ids.iter().copied());
+                // extend_from_slice uses memcpy for efficient bulk copy
+                buffer.extend_from_slice(row_ids.as_slice());
             }
             return;
         }
@@ -920,7 +920,7 @@ impl Index for MultiColumnIndex {
 
         let prefix_index = self.prefix_indexes[values.len() - 1].read().unwrap();
         if let Some(row_ids) = prefix_index.get(&key) {
-            buffer.extend(row_ids.iter().copied());
+            buffer.extend_from_slice(row_ids.as_slice());
         }
     }
 

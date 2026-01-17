@@ -34,12 +34,12 @@ use super::context::{
     cache_batch_aggregate, cache_batch_aggregate_info, cache_count_counter,
     cache_exists_correlation, cache_exists_fetcher, cache_exists_index, cache_exists_pred_key,
     cache_exists_predicate, cache_exists_schema, cache_in_subquery, cache_scalar_subquery,
-    cache_semi_join_arc, compute_semi_join_cache_key, get_cached_batch_aggregate,
-    get_cached_batch_aggregate_info, get_cached_count_counter, get_cached_exists_correlation,
-    get_cached_exists_fetcher, get_cached_exists_index, get_cached_exists_pred_key,
-    get_cached_exists_predicate, get_cached_exists_schema, get_cached_in_subquery,
-    get_cached_scalar_subquery, get_cached_semi_join, BatchAggregateLookupInfo, ExecutionContext,
-    ExistsCorrelationInfo,
+    cache_semi_join_arc, compute_semi_join_cache_key, extract_table_names_for_cache,
+    get_cached_batch_aggregate, get_cached_batch_aggregate_info, get_cached_count_counter,
+    get_cached_exists_correlation, get_cached_exists_fetcher, get_cached_exists_index,
+    get_cached_exists_pred_key, get_cached_exists_predicate, get_cached_exists_schema,
+    get_cached_in_subquery, get_cached_scalar_subquery, get_cached_semi_join,
+    BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
 };
 use super::expr_converter::convert_ast_to_storage_expr;
 use super::expression::compute_expression_hash;
@@ -1579,7 +1579,11 @@ impl Executor {
             let null_value = crate::core::Value::null_unknown();
             // Cache the result for non-correlated subqueries
             if let Some(key) = cache_key {
-                cache_scalar_subquery(key, null_value.clone());
+                cache_scalar_subquery(
+                    key,
+                    extract_table_names_for_cache(subquery),
+                    null_value.clone(),
+                );
             }
             return Ok(null_value);
         }
@@ -1591,7 +1595,11 @@ impl Executor {
             None => {
                 let null_value = crate::core::Value::null_unknown();
                 if let Some(key) = cache_key {
-                    cache_scalar_subquery(key, null_value.clone());
+                    cache_scalar_subquery(
+                        key,
+                        extract_table_names_for_cache(subquery),
+                        null_value.clone(),
+                    );
                 }
                 return Ok(null_value);
             }
@@ -1606,7 +1614,11 @@ impl Executor {
 
         // Cache the result for non-correlated subqueries
         if let Some(key) = cache_key {
-            cache_scalar_subquery(key, first_value.clone());
+            cache_scalar_subquery(
+                key,
+                extract_table_names_for_cache(subquery),
+                first_value.clone(),
+            );
         }
 
         Ok(first_value)
@@ -1652,7 +1664,7 @@ impl Executor {
 
         // Cache the result for non-correlated subqueries
         if let Some(key) = cache_key {
-            cache_in_subquery(key, values.clone());
+            cache_in_subquery(key, extract_table_names_for_cache(subquery), values.clone());
         }
 
         Ok(values)

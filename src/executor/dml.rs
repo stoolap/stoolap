@@ -29,7 +29,10 @@ use ahash::AHashMap;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use super::context::{invalidate_semi_join_cache_for_table, ExecutionContext};
+use super::context::{
+    invalidate_in_subquery_cache_for_table, invalidate_scalar_subquery_cache_for_table,
+    invalidate_semi_join_cache_for_table, ExecutionContext,
+};
 use super::expression::CompiledEvaluator;
 use super::pushdown;
 use super::query_cache::{CompiledExecution, CompiledInsert};
@@ -391,6 +394,8 @@ impl Executor {
             if rows_affected > 0 {
                 self.semantic_cache.invalidate_table(table_name);
                 invalidate_semi_join_cache_for_table(table_name);
+                invalidate_scalar_subquery_cache_for_table(table_name);
+                invalidate_in_subquery_cache_for_table(table_name);
             }
 
             // Commit if this is a standalone (auto-commit) transaction
@@ -590,6 +595,8 @@ impl Executor {
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
             invalidate_semi_join_cache_for_table(table_name);
+            invalidate_scalar_subquery_cache_for_table(table_name);
+            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         // Commit if this is a standalone (auto-commit) transaction
@@ -960,6 +967,8 @@ impl Executor {
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
             invalidate_semi_join_cache_for_table(table_name);
+            invalidate_scalar_subquery_cache_for_table(table_name);
+            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         // Commit if this is a standalone (auto-commit) transaction
@@ -1394,6 +1403,8 @@ impl Executor {
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
             invalidate_semi_join_cache_for_table(table_name);
+            invalidate_scalar_subquery_cache_for_table(table_name);
+            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         // Commit if this is a standalone (auto-commit) transaction
@@ -1736,6 +1747,8 @@ impl Executor {
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
             invalidate_semi_join_cache_for_table(table_name);
+            invalidate_scalar_subquery_cache_for_table(table_name);
+            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         // Commit if this is a standalone (auto-commit) transaction
@@ -1806,6 +1819,8 @@ impl Executor {
         // (TRUNCATE always invalidates, regardless of rows_affected, for safety)
         self.semantic_cache.invalidate_table(table_name);
         invalidate_semi_join_cache_for_table(table_name);
+        invalidate_scalar_subquery_cache_for_table(table_name);
+        invalidate_in_subquery_cache_for_table(table_name);
 
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {

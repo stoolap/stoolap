@@ -42,11 +42,19 @@ static EMPTY_SESSION_VARS: LazyLock<Arc<AHashMap<String, Value>>> =
 // Cache for scalar subquery results to avoid re-execution.
 // Thread-local to avoid synchronization overhead.
 // Uses SQL string as key (not hash) to avoid collision risk.
+// Stores (tables_referenced, result) for table-based invalidation.
+use smallvec::SmallVec;
+
+/// Cached scalar subquery entry: (tables_referenced for invalidation, result value)
+type ScalarSubqueryCacheEntry = (SmallVec<[Arc<str>; 2]>, Value);
+
 thread_local! {
-    static SCALAR_SUBQUERY_CACHE: RefCell<FxHashMap<String, Value>> = RefCell::new(FxHashMap::default());
+    static SCALAR_SUBQUERY_CACHE: RefCell<FxHashMap<String, ScalarSubqueryCacheEntry>> = RefCell::new(FxHashMap::default());
 }
 
-/// Clear the scalar subquery cache. Should be called at the start of each top-level query.
+/// Clear the scalar subquery cache completely.
+/// NOTE: For normal operation, use `invalidate_scalar_subquery_cache_for_table` instead.
+/// This is only used for explicit cache clearing (e.g., after DDL operations).
 pub fn clear_scalar_subquery_cache() {
     SCALAR_SUBQUERY_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
@@ -55,26 +63,47 @@ pub fn clear_scalar_subquery_cache() {
     });
 }
 
-/// Get a cached scalar subquery result by SQL string key.
-pub fn get_cached_scalar_subquery(key: &str) -> Option<Value> {
-    SCALAR_SUBQUERY_CACHE.with(|cache| cache.borrow().get(key).cloned())
+/// Invalidate scalar subquery cache entries for a specific table.
+/// Should be called after INSERT, UPDATE, DELETE, or TRUNCATE on a table.
+#[inline]
+pub fn invalidate_scalar_subquery_cache_for_table(table_name: &str) {
+    SCALAR_SUBQUERY_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        if c.is_empty() {
+            return;
+        }
+        // Keep entries where no referenced table matches (case-insensitive)
+        c.retain(|_, (tables, _)| !tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)));
+    });
 }
 
-/// Cache a scalar subquery result.
-pub fn cache_scalar_subquery(key: String, value: Value) {
+/// Get a cached scalar subquery result by SQL string key.
+pub fn get_cached_scalar_subquery(key: &str) -> Option<Value> {
+    SCALAR_SUBQUERY_CACHE.with(|cache| cache.borrow().get(key).map(|(_, v)| v.clone()))
+}
+
+/// Cache a scalar subquery result with the tables it references.
+pub fn cache_scalar_subquery(key: String, tables: SmallVec<[Arc<str>; 2]>, value: Value) {
     SCALAR_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, value);
+        cache.borrow_mut().insert(key, (tables, value));
     });
 }
 
 // Cache for IN subquery results to avoid re-execution.
 // Thread-local to avoid synchronization overhead.
 // Uses SQL string as key (not hash) to avoid collision risk.
+// Stores (tables_referenced, result) for table-based invalidation.
+
+/// Cached IN subquery entry: (tables_referenced for invalidation, result values)
+type InSubqueryCacheEntry = (SmallVec<[Arc<str>; 2]>, Vec<Value>);
+
 thread_local! {
-    static IN_SUBQUERY_CACHE: RefCell<FxHashMap<String, Vec<Value>>> = RefCell::new(FxHashMap::default());
+    static IN_SUBQUERY_CACHE: RefCell<FxHashMap<String, InSubqueryCacheEntry>> = RefCell::new(FxHashMap::default());
 }
 
-/// Clear the IN subquery cache. Should be called at the start of each top-level query.
+/// Clear the IN subquery cache completely.
+/// NOTE: For normal operation, use `invalidate_in_subquery_cache_for_table` instead.
+/// This is only used for explicit cache clearing (e.g., after DDL operations).
 pub fn clear_in_subquery_cache() {
     IN_SUBQUERY_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
@@ -83,16 +112,64 @@ pub fn clear_in_subquery_cache() {
     });
 }
 
-/// Get a cached IN subquery result by SQL string key.
-pub fn get_cached_in_subquery(key: &str) -> Option<Vec<Value>> {
-    IN_SUBQUERY_CACHE.with(|cache| cache.borrow().get(key).cloned())
+/// Invalidate IN subquery cache entries for a specific table.
+/// Should be called after INSERT, UPDATE, DELETE, or TRUNCATE on a table.
+#[inline]
+pub fn invalidate_in_subquery_cache_for_table(table_name: &str) {
+    IN_SUBQUERY_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        if c.is_empty() {
+            return;
+        }
+        // Keep entries where no referenced table matches (case-insensitive)
+        c.retain(|_, (tables, _)| !tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)));
+    });
 }
 
-/// Cache an IN subquery result.
-pub fn cache_in_subquery(key: String, values: Vec<Value>) {
+/// Get a cached IN subquery result by SQL string key.
+pub fn get_cached_in_subquery(key: &str) -> Option<Vec<Value>> {
+    IN_SUBQUERY_CACHE.with(|cache| cache.borrow().get(key).map(|(_, v)| v.clone()))
+}
+
+/// Cache an IN subquery result with the tables it references.
+pub fn cache_in_subquery(key: String, tables: SmallVec<[Arc<str>; 2]>, values: Vec<Value>) {
     IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, values);
+        cache.borrow_mut().insert(key, (tables, values));
     });
+}
+
+use crate::parser::ast::{Expression, SelectStatement};
+
+/// Extract actual table names from a SelectStatement for cache invalidation.
+/// This returns the real table names (not aliases) because DML operations
+/// reference tables by their actual names, not aliases.
+pub fn extract_table_names_for_cache(stmt: &SelectStatement) -> SmallVec<[Arc<str>; 2]> {
+    let mut tables = SmallVec::new();
+    if let Some(ref table_expr) = stmt.table_expr {
+        collect_real_table_names(table_expr, &mut tables);
+    }
+    tables
+}
+
+/// Recursively collect actual table names (not aliases) from a table source expression.
+fn collect_real_table_names(source: &Expression, tables: &mut SmallVec<[Arc<str>; 2]>) {
+    match source {
+        Expression::TableSource(ts) => {
+            // Always use the actual table name for cache invalidation
+            tables.push(Arc::from(ts.name.value_lower.as_str()));
+        }
+        Expression::JoinSource(js) => {
+            collect_real_table_names(&js.left, tables);
+            collect_real_table_names(&js.right, tables);
+        }
+        Expression::SubquerySource(ss) => {
+            // Recursively extract tables from nested subquery
+            if let Some(ref table_expr) = ss.subquery.table_expr {
+                collect_real_table_names(table_expr, tables);
+            }
+        }
+        _ => {}
+    }
 }
 
 // Cache for semi-join (EXISTS) hash sets to avoid re-execution.
@@ -406,8 +483,6 @@ pub fn cache_batch_aggregate_info(
     });
     result
 }
-
-use crate::parser::ast::Expression;
 
 /// Pre-computed info for index nested loop EXISTS lookups to avoid per-row string operations.
 /// This caches the pre-computed lowercase column names for O(1) outer row lookups.

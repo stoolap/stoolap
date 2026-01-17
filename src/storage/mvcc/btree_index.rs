@@ -286,7 +286,7 @@ impl BTreeIndex {
                 let capacity = sorted_values.len() / 4; // Estimate
                 let mut results = Vec::with_capacity(capacity);
                 for (_, rows) in sorted_values.range(..lookup_key) {
-                    results.extend(rows.iter().copied());
+                    results.extend_from_slice(rows.as_slice());
                 }
                 results
             }
@@ -297,7 +297,7 @@ impl BTreeIndex {
                 let capacity = sorted_values.len() / 4;
                 let mut results = Vec::with_capacity(capacity);
                 for (_, rows) in sorted_values.range(..=lookup_key) {
-                    results.extend(rows.iter().copied());
+                    results.extend_from_slice(rows.as_slice());
                 }
                 results
             }
@@ -310,7 +310,7 @@ impl BTreeIndex {
                 for (_, rows) in
                     sorted_values.range((Bound::Excluded(lookup_key), Bound::Unbounded))
                 {
-                    results.extend(rows.iter().copied());
+                    results.extend_from_slice(rows.as_slice());
                 }
                 results
             }
@@ -321,7 +321,7 @@ impl BTreeIndex {
                 let capacity = sorted_values.len() / 4;
                 let mut results = Vec::with_capacity(capacity);
                 for (_, rows) in sorted_values.range(lookup_key..) {
-                    results.extend(rows.iter().copied());
+                    results.extend_from_slice(rows.as_slice());
                 }
                 results
             }
@@ -332,7 +332,7 @@ impl BTreeIndex {
                 let mut results = Vec::with_capacity(capacity);
                 for (v, rows) in sorted_values.iter() {
                     if v.as_ref() != value {
-                        results.extend(rows.iter().copied());
+                        results.extend_from_slice(rows.as_slice());
                     }
                 }
                 results
@@ -346,7 +346,7 @@ impl BTreeIndex {
                 let mut results = Vec::new();
                 for (v, rows) in sorted_values.iter() {
                     if v.is_null() {
-                        results.extend(rows.iter().copied());
+                        results.extend_from_slice(rows.as_slice());
                     }
                 }
                 results
@@ -357,7 +357,7 @@ impl BTreeIndex {
                 let mut results = Vec::with_capacity(capacity);
                 for (v, rows) in sorted_values.iter() {
                     if !v.is_null() {
-                        results.extend(rows.iter().copied());
+                        results.extend_from_slice(rows.as_slice());
                     }
                 }
                 results
@@ -698,8 +698,8 @@ impl Index for BTreeIndex {
         let sorted_values = self.sorted_values.read().unwrap();
         // Use Borrow trait - no allocation needed for equality lookup
         if let Some(rows) = sorted_values.get(value) {
-            // Optimization: SmallVec can be iterated quickly
-            buffer.extend(rows.iter().copied());
+            // Optimization: extend_from_slice uses memcpy for efficient bulk copy
+            buffer.extend_from_slice(rows.as_slice());
         }
     }
 
@@ -742,7 +742,7 @@ impl Index for BTreeIndex {
         };
 
         for (_, rows) in sorted_values.range((min_bound, max_bound)) {
-            buffer.extend(rows.iter().copied());
+            buffer.extend_from_slice(rows.as_slice());
         }
     }
 
@@ -1081,7 +1081,7 @@ pub fn intersect_multiple_sorted_ids(slices: &[&[i64]]) -> RowIdVec {
     }
     if slices.len() == 1 {
         let mut result = RowIdVec::with_capacity(slices[0].len());
-        result.extend(slices[0].iter().copied());
+        result.extend_from_slice(slices[0]);
         return result;
     }
 
@@ -1104,12 +1104,12 @@ pub fn intersect_multiple_sorted_ids(slices: &[&[i64]]) -> RowIdVec {
 pub fn union_sorted_ids(a: &[i64], b: &[i64]) -> RowIdVec {
     if a.is_empty() {
         let mut result = RowIdVec::with_capacity(b.len());
-        result.extend(b.iter().copied());
+        result.extend_from_slice(b);
         return result;
     }
     if b.is_empty() {
         let mut result = RowIdVec::with_capacity(a.len());
-        result.extend(a.iter().copied());
+        result.extend_from_slice(a);
         return result;
     }
 
@@ -1136,8 +1136,8 @@ pub fn union_sorted_ids(a: &[i64], b: &[i64]) -> RowIdVec {
     }
 
     // Append remaining elements
-    result.extend(a[i..].iter().copied());
-    result.extend(b[j..].iter().copied());
+    result.extend_from_slice(&a[i..]);
+    result.extend_from_slice(&b[j..]);
 
     result
 }
@@ -1150,7 +1150,7 @@ pub fn union_multiple_sorted_ids(slices: &[&[i64]]) -> RowIdVec {
     }
     if slices.len() == 1 {
         let mut result = RowIdVec::with_capacity(slices[0].len());
-        result.extend(slices[0].iter().copied());
+        result.extend_from_slice(slices[0]);
         return result;
     }
 

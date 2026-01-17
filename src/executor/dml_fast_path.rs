@@ -31,7 +31,10 @@ use crate::parser::ast::{DeleteStatement, Expression, UpdateStatement};
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpression};
 use crate::storage::traits::{Engine, QueryResult};
 
-use super::context::{invalidate_semi_join_cache_for_table, ExecutionContext};
+use super::context::{
+    invalidate_in_subquery_cache_for_table, invalidate_scalar_subquery_cache_for_table,
+    invalidate_semi_join_cache_for_table, ExecutionContext,
+};
 use super::query_cache::{
     CompiledExecution, CompiledPkDelete, CompiledPkUpdate, CompiledUpdateColumn, PkValueSource,
     UpdateValueSource,
@@ -367,6 +370,8 @@ impl Executor {
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
             invalidate_semi_join_cache_for_table(table_name);
+            invalidate_scalar_subquery_cache_for_table(table_name);
+            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         // Commit
@@ -406,6 +411,8 @@ impl Executor {
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
             invalidate_semi_join_cache_for_table(table_name);
+            invalidate_scalar_subquery_cache_for_table(table_name);
+            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         // Commit

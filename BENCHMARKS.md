@@ -19,7 +19,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 +---------------------------------------------------------------+
 |                                                               |
 |   STOOLAP vs SQLite:    45 wins / 8 losses    (85% win rate)  |
-|   STOOLAP vs DuckDB:    51 wins / 2 losses    (96% win rate)  |
+|   STOOLAP vs DuckDB:    52 wins / 1 loss     (98% win rate)  |
 |                                                               |
 +---------------------------------------------------------------+
 ```
@@ -85,7 +85,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | Multi-col ORDER BY (3) | **175.57** | 416.71 | 361.35 | Stoolap |
 | Self JOIN (same age) | 16.26 | **10.71** | 396.87 | SQLite |
 | Multi window funcs (3) | **628.97** | 1803.93 | 760.23 | Stoolap |
-| Nested subquery (3 lvl) | 2390.73 | 6397.42 | **850.91** | DuckDB |
+| Nested subquery (3 lvl) | **447.45** | 6397.42 | 850.91 | Stoolap |
 | Multi aggregates (6) | **126.64** | 842.98 | 306.48 | Stoolap |
 | COALESCE + IS NOT NULL | 5.10 | **2.84** | 90.97 | SQLite |
 | Expr in WHERE (funcs) | **6.44** | 15.05 | 236.50 | Stoolap |
@@ -102,7 +102,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | HAVING complex | **113.76** | 1420.61 | 114.47 | Stoolap |
 | Compare with subquery | **184.04** | 1424.07 | 293.51 | Stoolap |
 
-**Bottleneck Hunters Score: Stoolap 23, SQLite 4, DuckDB 2**
+**Bottleneck Hunters Score: Stoolap 24, SQLite 4, DuckDB 1**
 
 ---
 
@@ -112,8 +112,8 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 |----------|-------------|-------------|-------------|
 | Basic Operations | 11 | 0 | 0 |
 | Advanced Operations | 9 | 4 | 0 |
-| Bottleneck Hunters | 23 | 4 | 2 |
-| **Total** | **43** | **8** | **2** |
+| Bottleneck Hunters | 24 | 4 | 1 |
+| **Total** | **44** | **8** | **1** |
 
 ---
 
@@ -126,6 +126,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | NOT EXISTS subquery | 49.30 us | 1729.58 us | **35x** |
 | DISTINCT + ORDER BY | 6.20 us | 139.58 us | **23x** |
 | DISTINCT (no ORDER) | 5.81 us | 104.38 us | **18x** |
+| Nested subquery (3 lvl) | 447.45 us | 6397.42 us | **14x** |
 | GROUP BY (2 columns) | 179.74 us | 2259.41 us | **13x** |
 | Scalar subquery | 34.72 us | 399.10 us | **11x** |
 | HAVING complex | 113.76 us | 1420.61 us | **12x** |
@@ -157,6 +158,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | CASE expression | 5.97 us | 247.54 us | **41x** |
 | Complex JOIN+GROUP+HAVING | 59.92 us | 2233.32 us | **37x** |
 | UNION ALL | 6.18 us | 173.19 us | **28x** |
+| Nested subquery (3 lvl) | 447.45 us | 850.91 us | **1.9x** |
 | SELECT complex | 138.41 us | 184.68 us | **1.3x** |
 
 ---
@@ -176,7 +178,6 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 | Operation | DuckDB | Stoolap | Factor |
 |-----------|--------|---------|--------|
-| Nested subquery (3 lvl) | 850.91 us | 2390.73 us | 2.8x |
 | Derived table | 255.77 us | 491.58 us | 1.9x |
 
 ---
