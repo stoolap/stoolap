@@ -737,3 +737,289 @@ fn test_json_valid_in_where() {
         .expect("Failed to count invalid JSON");
     assert_eq!(count, 2, "Expected 2 invalid JSON rows");
 }
+
+/// Test JSON_TYPE with two arguments (path extraction)
+#[test]
+fn test_json_type_with_path() {
+    let db = Database::open("memory://json_type_path").expect("Failed to create database");
+
+    // Test extracting type at path - number
+    let result: String = db
+        .query_one(
+            "SELECT JSON_TYPE('{\"name\":\"John\",\"age\":30}', '$.age')",
+            (),
+        )
+        .expect("Failed to get JSON_TYPE with path for number");
+    assert_eq!(result, "number");
+
+    // Test extracting type at path - string
+    let result: String = db
+        .query_one(
+            "SELECT JSON_TYPE('{\"name\":\"John\",\"age\":30}', '$.name')",
+            (),
+        )
+        .expect("Failed to get JSON_TYPE with path for string");
+    assert_eq!(result, "string");
+
+    // Test extracting type at path - object
+    let result: String = db
+        .query_one("SELECT JSON_TYPE('{\"user\":{\"id\":1}}', '$.user')", ())
+        .expect("Failed to get JSON_TYPE with path for object");
+    assert_eq!(result, "object");
+
+    // Test extracting type at path - array
+    let result: String = db
+        .query_one("SELECT JSON_TYPE('{\"tags\":[\"a\",\"b\"]}', '$.tags')", ())
+        .expect("Failed to get JSON_TYPE with path for array");
+    assert_eq!(result, "array");
+
+    // Test extracting type at path - boolean
+    let result: String = db
+        .query_one("SELECT JSON_TYPE('{\"active\":true}', '$.active')", ())
+        .expect("Failed to get JSON_TYPE with path for boolean");
+    assert_eq!(result, "boolean");
+
+    // Test extracting type at path - null value in JSON
+    let result: String = db
+        .query_one("SELECT JSON_TYPE('{\"value\":null}', '$.value')", ())
+        .expect("Failed to get JSON_TYPE with path for null");
+    assert_eq!(result, "null");
+
+    // Test non-existent path returns NULL
+    let result = db
+        .query("SELECT JSON_TYPE('{\"a\":1}', '$.nonexistent')", ())
+        .expect("Failed to query JSON_TYPE with non-existent path");
+    let rows: Vec<_> = result.collect();
+    assert_eq!(rows.len(), 1);
+    let row = rows[0].as_ref().expect("Failed to get row");
+    assert!(
+        row.is_null(0),
+        "JSON_TYPE with non-existent path should return NULL"
+    );
+
+    // Test nested path
+    let result: String = db
+        .query_one(
+            "SELECT JSON_TYPE('{\"user\":{\"profile\":{\"age\":25}}}', '$.user.profile.age')",
+            (),
+        )
+        .expect("Failed to get JSON_TYPE with nested path");
+    assert_eq!(result, "number");
+}
+
+/// Test JSON_TYPE with path on table data
+#[test]
+fn test_json_type_path_with_table() {
+    let db = Database::open("memory://json_type_path_table").expect("Failed to create database");
+
+    db.execute(
+        "CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            metadata JSON
+        )",
+        (),
+    )
+    .expect("Failed to create table");
+
+    db.execute(
+        "INSERT INTO products (id, name, metadata) VALUES (1, 'Laptop', '{\"price\":999.99,\"specs\":{\"cpu\":\"i7\",\"ram\":16},\"tags\":[\"electronics\"]}')",
+        (),
+    )
+    .expect("Failed to insert product");
+
+    // Test JSON_TYPE with path on column
+    let result: String = db
+        .query_one(
+            "SELECT JSON_TYPE(metadata, '$.price') FROM products WHERE id = 1",
+            (),
+        )
+        .expect("Failed to get JSON_TYPE with path on column");
+    assert_eq!(result, "number");
+
+    let result: String = db
+        .query_one(
+            "SELECT JSON_TYPE(metadata, '$.specs') FROM products WHERE id = 1",
+            (),
+        )
+        .expect("Failed to get JSON_TYPE with path on column for object");
+    assert_eq!(result, "object");
+
+    let result: String = db
+        .query_one(
+            "SELECT JSON_TYPE(metadata, '$.tags') FROM products WHERE id = 1",
+            (),
+        )
+        .expect("Failed to get JSON_TYPE with path on column for array");
+    assert_eq!(result, "array");
+
+    let result: String = db
+        .query_one(
+            "SELECT JSON_TYPE(metadata, '$.specs.cpu') FROM products WHERE id = 1",
+            (),
+        )
+        .expect("Failed to get JSON_TYPE with nested path on column");
+    assert_eq!(result, "string");
+}
+
+/// Test JSON_TYPEOF with two arguments (should behave same as JSON_TYPE)
+#[test]
+fn test_json_typeof_with_path() {
+    let db = Database::open("memory://json_typeof_path").expect("Failed to create database");
+
+    let result: String = db
+        .query_one("SELECT JSON_TYPEOF('{\"count\":42}', '$.count')", ())
+        .expect("Failed to get JSON_TYPEOF with path");
+    assert_eq!(result, "number");
+
+    let result: String = db
+        .query_one("SELECT JSON_TYPEOF('{\"items\":[1,2,3]}', '$.items')", ())
+        .expect("Failed to get JSON_TYPEOF with path for array");
+    assert_eq!(result, "array");
+}
+
+/// Test JSON_TYPE with NULL path argument
+#[test]
+fn test_json_type_null_path() {
+    let db = Database::open("memory://json_type_null_path").expect("Failed to create database");
+
+    // NULL path should return NULL
+    let result = db
+        .query("SELECT JSON_TYPE('{\"a\":1}', NULL)", ())
+        .expect("Failed to query JSON_TYPE with NULL path");
+    let rows: Vec<_> = result.collect();
+    assert_eq!(rows.len(), 1);
+    let row = rows[0].as_ref().expect("Failed to get row");
+    assert!(
+        row.is_null(0),
+        "JSON_TYPE with NULL path should return NULL"
+    );
+}
+
+/// Test JSON_OBJECT function
+#[test]
+fn test_json_object_function() {
+    let db = Database::open("memory://json_object").expect("Failed to create database");
+
+    // Simple key-value pairs
+    let result: String = db
+        .query_one("SELECT JSON_OBJECT('name', 'Alice', 'age', 30)", ())
+        .expect("Failed to create JSON object");
+    assert!(result.contains("\"name\""));
+    assert!(result.contains("\"Alice\""));
+    assert!(result.contains("\"age\""));
+    assert!(result.contains("30"));
+
+    // Empty object
+    let result: String = db
+        .query_one("SELECT JSON_OBJECT()", ())
+        .expect("Failed to create empty JSON object");
+    assert_eq!(result, "{}");
+
+    // Single key-value pair
+    let result: String = db
+        .query_one("SELECT JSON_OBJECT('key', 'value')", ())
+        .expect("Failed to create single-pair JSON object");
+    assert!(result.contains("\"key\""));
+    assert!(result.contains("\"value\""));
+
+    // Mixed types
+    let result: String = db
+        .query_one(
+            "SELECT JSON_OBJECT('str', 'text', 'num', 42, 'bool', true)",
+            (),
+        )
+        .expect("Failed to create mixed-type JSON object");
+    assert!(result.contains("\"text\""));
+    assert!(result.contains("42"));
+    assert!(result.contains("true"));
+}
+
+/// Test JSON_ARRAY function
+#[test]
+fn test_json_array_function() {
+    let db = Database::open("memory://json_array").expect("Failed to create database");
+
+    // Number array
+    let result: String = db
+        .query_one("SELECT JSON_ARRAY(1, 2, 3)", ())
+        .expect("Failed to create number array");
+    assert_eq!(result, "[1,2,3]");
+
+    // String array
+    let result: String = db
+        .query_one("SELECT JSON_ARRAY('a', 'b', 'c')", ())
+        .expect("Failed to create string array");
+    assert!(result.contains("\"a\""));
+    assert!(result.contains("\"b\""));
+    assert!(result.contains("\"c\""));
+
+    // Empty array
+    let result: String = db
+        .query_one("SELECT JSON_ARRAY()", ())
+        .expect("Failed to create empty array");
+    assert_eq!(result, "[]");
+
+    // Mixed types
+    let result: String = db
+        .query_one("SELECT JSON_ARRAY(1, 'two', true, null)", ())
+        .expect("Failed to create mixed array");
+    assert!(result.contains("1"));
+    assert!(result.contains("\"two\""));
+    assert!(result.contains("true"));
+    assert!(result.contains("null"));
+}
+
+/// Test JSON_ARRAY_LENGTH function
+#[test]
+fn test_json_array_length_function() {
+    let db = Database::open("memory://json_array_length").expect("Failed to create database");
+
+    // Simple array
+    let result: i64 = db
+        .query_one("SELECT JSON_ARRAY_LENGTH('[1,2,3,4,5]')", ())
+        .expect("Failed to get array length");
+    assert_eq!(result, 5);
+
+    // Empty array
+    let result: i64 = db
+        .query_one("SELECT JSON_ARRAY_LENGTH('[]')", ())
+        .expect("Failed to get empty array length");
+    assert_eq!(result, 0);
+
+    // Single element
+    let result: i64 = db
+        .query_one("SELECT JSON_ARRAY_LENGTH('[42]')", ())
+        .expect("Failed to get single element array length");
+    assert_eq!(result, 1);
+}
+
+/// Test JSON_ARRAY_LENGTH with path (two arguments)
+#[test]
+fn test_json_array_length_with_path() {
+    let db = Database::open("memory://json_array_length_path").expect("Failed to create database");
+
+    // Array at path
+    let result: i64 = db
+        .query_one(
+            "SELECT JSON_ARRAY_LENGTH('{\"items\":[1,2,3]}', '$.items')",
+            (),
+        )
+        .expect("Failed to get array length at path");
+    assert_eq!(result, 3);
+
+    // Nested array
+    let result: i64 = db
+        .query_one(
+            "SELECT JSON_ARRAY_LENGTH('{\"data\":{\"values\":[1,2,3,4]}}', '$.data.values')",
+            (),
+        )
+        .expect("Failed to get nested array length");
+    assert_eq!(result, 4);
+
+    // Empty array at path
+    let result: i64 = db
+        .query_one("SELECT JSON_ARRAY_LENGTH('{\"empty\":[]}', '$.empty')", ())
+        .expect("Failed to get empty array length at path");
+    assert_eq!(result, 0);
+}
