@@ -11,10 +11,12 @@ This document details Stoolap's current JSON data type support, capabilities, an
 
 ## Introduction to JSON in Stoolap
 
-Stoolap provides native support for JSON (JavaScript Object Notation) data, allowing you to store structured data alongside your conventional relational data. The current implementation focuses on:
+Stoolap provides native support for JSON (JavaScript Object Notation) data, allowing you to store structured data alongside your conventional relational data. The current implementation includes:
 
-- Basic JSON storage and validation
-- Support for JSON data types in tables
+- JSON storage and validation
+- JSON extraction and path queries
+- JSON construction functions (JSON_OBJECT, JSON_ARRAY)
+- JSON type inspection (JSON_TYPE, JSON_TYPEOF)
 - Equality comparison for JSON values
 
 ## JSON Data Type
@@ -131,15 +133,29 @@ SELECT JSON_EXTRACT('[1, 2, 3]', '$[0]');
 
 ### JSON_TYPE / JSON_TYPEOF
 
-Returns the type of a JSON value:
+Returns the type of a JSON value. Supports both single-argument and two-argument forms:
 
 ```sql
+-- Single argument: type of the root value
 SELECT JSON_TYPE('{"name": "John"}');  -- Returns: object
 SELECT JSON_TYPE('[1, 2, 3]');         -- Returns: array
 SELECT JSON_TYPE('"hello"');           -- Returns: string
 SELECT JSON_TYPE('123');               -- Returns: number
 SELECT JSON_TYPE('true');              -- Returns: boolean
 SELECT JSON_TYPE('null');              -- Returns: null
+
+-- Two arguments: type of value at path
+SELECT JSON_TYPE('{"name": "John", "age": 30}', '$.name');  -- Returns: string
+SELECT JSON_TYPE('{"name": "John", "age": 30}', '$.age');   -- Returns: number
+SELECT JSON_TYPE('{"user": {"active": true}}', '$.user');   -- Returns: object
+SELECT JSON_TYPE('{"tags": ["a", "b"]}', '$.tags');         -- Returns: array
+```
+
+Using with table columns:
+
+```sql
+SELECT name, JSON_TYPE(metadata, '$.price') AS price_type
+FROM products;
 ```
 
 ### JSON_VALID
@@ -158,6 +174,61 @@ Returns the keys of a JSON object as an array:
 ```sql
 SELECT JSON_KEYS('{"a": 1, "b": 2, "c": 3}');
 -- Returns: ["a", "b", "c"]
+```
+
+### JSON_OBJECT
+
+Creates a JSON object from key-value pairs:
+
+```sql
+SELECT JSON_OBJECT('name', 'Alice', 'age', 30);
+-- Returns: {"name":"Alice","age":30}
+
+SELECT JSON_OBJECT('id', 1, 'active', true, 'score', 95.5);
+-- Returns: {"id":1,"active":true,"score":95.5}
+
+-- Empty object
+SELECT JSON_OBJECT();
+-- Returns: {}
+```
+
+### JSON_ARRAY
+
+Creates a JSON array from the provided values:
+
+```sql
+SELECT JSON_ARRAY(1, 2, 3);
+-- Returns: [1,2,3]
+
+SELECT JSON_ARRAY('a', 'b', 'c');
+-- Returns: ["a","b","c"]
+
+SELECT JSON_ARRAY(1, 'mixed', true, null);
+-- Returns: [1,"mixed",true,null]
+
+-- Empty array
+SELECT JSON_ARRAY();
+-- Returns: []
+```
+
+### JSON_ARRAY_LENGTH
+
+Returns the length of a JSON array. Supports both single-argument and two-argument forms:
+
+```sql
+-- Single argument: length of root array
+SELECT JSON_ARRAY_LENGTH('[1, 2, 3, 4, 5]');
+-- Returns: 5
+
+SELECT JSON_ARRAY_LENGTH('[]');
+-- Returns: 0
+
+-- Two arguments: length of array at path
+SELECT JSON_ARRAY_LENGTH('{"tags": ["a", "b", "c"]}', '$.tags');
+-- Returns: 3
+
+SELECT JSON_ARRAY_LENGTH('{"users": [{"name": "John"}, {"name": "Jane"}]}', '$.users');
+-- Returns: 2
 ```
 
 ## Application Integration
@@ -200,11 +271,9 @@ for row in db.query("SELECT attributes FROM products WHERE id = $1", (6,))? {
 
 The current JSON implementation has some limitations:
 
-- No JSON modification functions (JSON_SET, JSON_INSERT, etc.)
-- No JSON construction functions (JSON_OBJECT, JSON_ARRAY, etc.)
+- No JSON modification functions (JSON_SET, JSON_INSERT, JSON_REPLACE, JSON_REMOVE)
+- No JSON path query functions (JSON_CONTAINS, JSON_CONTAINS_PATH)
 - No indexing of JSON properties
-
-These features may be implemented in future releases.
 
 ## Example
 
@@ -237,7 +306,7 @@ Based on the current implementation:
 
 - **Hybrid approach**: Store frequently queried fields in regular columns, use JSON for flexible/nested data
 - **Don't overuse**: Don't use JSON to avoid proper data modeling
-- **Keep it simple**: Since advanced JSON operations aren't yet supported, use simple JSON structures
+- **Use extraction**: Use JSON_EXTRACT to query nested values efficiently
 
 ### Implementation Tips
 
@@ -249,7 +318,7 @@ Based on the current implementation:
 
 The following features may be implemented in future releases:
 
-- JSON modification functions (JSON_SET, JSON_INSERT, etc.)
-- JSON construction functions (JSON_OBJECT, JSON_ARRAY, etc.)
-- JSON comparison functions (JSON_CONTAINS, etc.)
+- JSON modification functions (JSON_SET, JSON_INSERT, JSON_REPLACE, JSON_REMOVE)
+- JSON path query functions (JSON_CONTAINS, JSON_CONTAINS_PATH)
+- JSON aggregation functions (JSON_ARRAYAGG, JSON_OBJECTAGG)
 - Indexing on JSON paths

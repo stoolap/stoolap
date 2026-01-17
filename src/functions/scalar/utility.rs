@@ -710,6 +710,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 // ============================================================================
 
 /// JSON_TYPE function - returns the type of a JSON value
+/// Supports both JSON_TYPE(json) and JSON_TYPE(json, path) forms
 #[derive(Default)]
 pub struct JsonTypeFunction;
 
@@ -722,13 +723,17 @@ impl ScalarFunction for JsonTypeFunction {
         FunctionInfo::new(
             "JSON_TYPE",
             FunctionType::Scalar,
-            "Returns the type of a JSON value (object, array, string, number, boolean, null)",
-            FunctionSignature::new(FunctionDataType::String, vec![FunctionDataType::Any], 1, 1),
+            "Returns the type of a JSON value (object, array, string, number, boolean, null). Optional second argument specifies a path.",
+            FunctionSignature::new(FunctionDataType::String, vec![FunctionDataType::Any, FunctionDataType::String], 1, 2),
         )
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        validate_arg_count!(args, "JSON_TYPE", 1);
+        if args.is_empty() || args.len() > 2 {
+            return Err(Error::invalid_argument(
+                "JSON_TYPE requires 1 or 2 arguments",
+            ));
+        }
 
         if args[0].is_null() {
             return Ok(Value::null_unknown());
@@ -740,18 +745,39 @@ impl ScalarFunction for JsonTypeFunction {
             Value::Text(s) => s.to_string(),
             _ => {
                 return Err(Error::invalid_argument(
-                    "JSON_TYPE argument must be JSON or TEXT",
+                    "JSON_TYPE first argument must be JSON or TEXT",
                 ))
             }
         };
 
-        // Parse JSON and determine type
+        // Parse JSON
         let json_value: serde_json::Value = match serde_json::from_str(&json_str) {
             Ok(v) => v,
             Err(_) => return Ok(Value::null_unknown()),
         };
 
-        let type_name = match json_value {
+        // If path is provided, extract the value at that path first
+        let target_value = if args.len() == 2 {
+            if args[1].is_null() {
+                return Ok(Value::null_unknown());
+            }
+            let path = match &args[1] {
+                Value::Text(s) => s.to_string(),
+                _ => {
+                    return Err(Error::invalid_argument(
+                        "JSON_TYPE second argument must be a path string",
+                    ))
+                }
+            };
+            match extract_json_path(&json_value, &path) {
+                Some(v) => v.clone(),
+                None => return Ok(Value::null_unknown()),
+            }
+        } else {
+            json_value
+        };
+
+        let type_name = match target_value {
             serde_json::Value::Null => "null",
             serde_json::Value::Bool(_) => "boolean",
             serde_json::Value::Number(_) => "number",
@@ -785,8 +811,8 @@ impl ScalarFunction for JsonTypeOfFunction {
         FunctionInfo::new(
             "JSON_TYPEOF",
             FunctionType::Scalar,
-            "Returns the type of a JSON value (PostgreSQL-style alias for JSON_TYPE)",
-            FunctionSignature::new(FunctionDataType::String, vec![FunctionDataType::Any], 1, 1),
+            "Returns the type of a JSON value (PostgreSQL-style alias for JSON_TYPE). Optional second argument specifies a path.",
+            FunctionSignature::new(FunctionDataType::String, vec![FunctionDataType::Any, FunctionDataType::String], 1, 2),
         )
     }
 
