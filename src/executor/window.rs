@@ -34,7 +34,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
-use crate::common::CompactVec;
+use crate::common::{CompactVec, StringMap};
 use crate::core::row_vec::RowVec;
 use crate::core::value::NULL_VALUE;
 use crate::core::{Error, Result, Row, Value};
@@ -377,7 +377,7 @@ impl Executor {
             }
         }
 
-        let mut window_value_map: FxHashMap<String, Vec<Value>> = FxHashMap::default();
+        let mut window_value_map: StringMap<Vec<Value>> = StringMap::new();
         for wf in &window_functions {
             let window_values = self.compute_window_function(
                 wf,
@@ -1399,7 +1399,7 @@ impl Executor {
         wf_info: &WindowFunctionInfo,
         rows: &[(i64, Row)],
         columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
         pre_sorted: Option<&WindowPreSortedState>,
         pre_grouped: Option<&WindowPreGroupedState>,
@@ -1595,7 +1595,7 @@ impl Executor {
         mut row_indices: Vec<usize>,
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
         skip_sorting: bool,
     ) -> Result<(Vec<Value>, Vec<usize>)> {
@@ -1717,7 +1717,7 @@ impl Executor {
         mut row_indices: Vec<usize>,
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
         results: &mut [Value],
     ) -> Result<()> {
@@ -1830,7 +1830,7 @@ impl Executor {
         mut row_indices: Vec<usize>,
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
         results: &ParallelVec,
     ) -> Result<()> {
@@ -2350,7 +2350,7 @@ impl Executor {
     fn resolve_column_index(
         &self,
         expr: &Expression,
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
     ) -> Option<usize> {
         match expr {
             Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
@@ -2406,7 +2406,7 @@ impl Executor {
         order_by: &[OrderByExpression],
         rows: &[(i64, Row)],
         columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
     ) -> ColumnarOrderByValues {
         let num_rows = rows.len();
@@ -2830,7 +2830,7 @@ impl Executor {
         wf_info: &WindowFunctionInfo,
         rows: &[(i64, Row)],
         columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
         pre_sorted: Option<&WindowPreSortedState>,
         cached_order_by: Option<&ColumnarOrderByValues>,

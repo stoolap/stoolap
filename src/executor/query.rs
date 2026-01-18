@@ -30,7 +30,7 @@ use std::sync::Arc;
 use crate::common::SmartString;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::common::{CompactArc, CompactVec};
+use crate::common::{CompactArc, CompactVec, StringMap};
 use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
@@ -5509,8 +5509,8 @@ impl Executor {
 
         // Pre-size HashMap to avoid rehashing (estimate 1.5x for qualified names)
         // Use columns_lower which was computed early in the function
-        let mut col_index_map_lower: FxHashMap<String, usize> =
-            FxHashMap::with_capacity_and_hasher(all_columns.len() * 3 / 2, Default::default());
+        let mut col_index_map_lower: StringMap<usize> =
+            StringMap::with_capacity(all_columns.len() * 3 / 2);
         for (i, lower) in columns_lower.iter().enumerate() {
             col_index_map_lower.insert(lower.clone(), i);
             // Also add unqualified column names for qualified columns
@@ -5684,7 +5684,7 @@ impl Executor {
         rows: RowVec,
         all_columns: &[String],
         all_columns_lower: &[String],
-        col_index_map_lower: &FxHashMap<String, usize>,
+        col_index_map_lower: &StringMap<usize>,
         table_alias_lower: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
@@ -5740,7 +5740,7 @@ impl Executor {
         // Helper to try building inline COALESCE action (bypasses VM for 7x speedup)
         fn try_build_coalesce_action(
             func: &crate::parser::ast::FunctionCall,
-            col_index_map_lower: &FxHashMap<String, usize>,
+            col_index_map_lower: &StringMap<usize>,
         ) -> Option<ExprAction> {
             if !func.function.eq_ignore_ascii_case("COALESCE") {
                 return None;
@@ -5793,10 +5793,7 @@ impl Executor {
         }
 
         // Helper to extract column index from identifier expressions
-        fn get_col_idx(
-            expr: &Expression,
-            col_index_map_lower: &FxHashMap<String, usize>,
-        ) -> Option<usize> {
+        fn get_col_idx(expr: &Expression, col_index_map_lower: &StringMap<usize>) -> Option<usize> {
             match expr {
                 Expression::Identifier(id) => {
                     col_index_map_lower.get(id.value_lower.as_str()).copied()
@@ -5815,7 +5812,7 @@ impl Executor {
         // Helper to convert expression to ArgSource (column or literal)
         fn expr_to_arg_source(
             expr: &Expression,
-            col_index_map_lower: &FxHashMap<String, usize>,
+            col_index_map_lower: &StringMap<usize>,
         ) -> Option<ArgSource> {
             match expr {
                 Expression::Identifier(id) => {
@@ -5859,7 +5856,7 @@ impl Executor {
         // Helper to try building inline CASE action (bypasses VM)
         fn try_build_case_action(
             case: &crate::parser::ast::CaseExpression,
-            col_index_map_lower: &FxHashMap<String, usize>,
+            col_index_map_lower: &StringMap<usize>,
         ) -> Option<ExprAction> {
             // Only handle searched CASE (no value expression)
             if case.value.is_some() {
@@ -5945,7 +5942,7 @@ impl Executor {
         // Helper to flatten nested || concatenations into a list
         fn flatten_concat(
             expr: &Expression,
-            col_index_map_lower: &FxHashMap<String, usize>,
+            col_index_map_lower: &StringMap<usize>,
             parts: &mut smallvec::SmallVec<[ArgSource; 6]>,
         ) -> bool {
             match expr {
@@ -5969,7 +5966,7 @@ impl Executor {
         // Helper to try building inline Concat action (bypasses VM)
         fn try_build_concat_action(
             expr: &Expression,
-            col_index_map_lower: &FxHashMap<String, usize>,
+            col_index_map_lower: &StringMap<usize>,
         ) -> Option<ExprAction> {
             // Only handle || operator
             if let Expression::Infix(infix) = expr {
@@ -6525,7 +6522,7 @@ impl Executor {
         evaluator: &mut CompiledEvaluator,
         expr: &Expression,
         row: &Row,
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
     ) -> Result<Value> {
         match expr {
             // Simple column reference - get from row by index using O(1) HashMap lookup

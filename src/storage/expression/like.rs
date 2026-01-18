@@ -21,28 +21,32 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::fmt;
+use std::num::NonZeroUsize;
 
+use lru::LruCache;
 use regex::Regex;
 use rustc_hash::FxHashMap;
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::core::{Result, Row, Schema};
 
-// Thread-local cache for compiled regex patterns
+/// Maximum number of cached LIKE regex patterns per thread
+const LIKE_REGEX_CACHE_SIZE: usize = 128;
+
+// Thread-local LRU cache for compiled regex patterns
 thread_local! {
-    static LIKE_REGEX_CACHE: RefCell<FxHashMap<String, Regex>> = RefCell::new(FxHashMap::default());
+    static LIKE_REGEX_CACHE: RefCell<LruCache<String, Regex>> =
+        RefCell::new(LruCache::new(NonZeroUsize::new(LIKE_REGEX_CACHE_SIZE).unwrap()));
 }
 
 /// Clear the thread-local LIKE regex cache to release memory
 pub fn clear_like_regex_cache() {
     LIKE_REGEX_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
+        cache.borrow_mut().clear();
     });
 }
 
-/// Get or compile a regex pattern, using thread-local cache
+/// Get or compile a regex pattern, using thread-local LRU cache
 fn get_or_compile_like_regex(pattern: &str) -> Option<Regex> {
     LIKE_REGEX_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -51,7 +55,7 @@ fn get_or_compile_like_regex(pattern: &str) -> Option<Regex> {
         }
         match Regex::new(pattern) {
             Ok(regex) => {
-                cache.insert(pattern.to_string(), regex.clone());
+                cache.put(pattern.to_string(), regex.clone());
                 Some(regex)
             }
             Err(_) => None,

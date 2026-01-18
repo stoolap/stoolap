@@ -27,7 +27,10 @@ use crate::core::{DataType, Error, Result, Row, SchemaBuilder, Value};
 use crate::parser::ast::*;
 use crate::storage::traits::{Engine, QueryResult};
 
-use super::context::ExecutionContext;
+use super::context::{
+    invalidate_in_subquery_cache_for_table, invalidate_scalar_subquery_cache_for_table,
+    invalidate_semi_join_cache_for_table, ExecutionContext,
+};
 use super::expression::ExpressionEval;
 use super::result::ExecResult;
 use super::Executor;
@@ -361,6 +364,9 @@ impl Executor {
 
         // Invalidate query cache for this table (schema no longer exists)
         self.query_cache.invalidate_table(table_name);
+        invalidate_semi_join_cache_for_table(table_name);
+        invalidate_scalar_subquery_cache_for_table(table_name);
+        invalidate_in_subquery_cache_for_table(table_name);
 
         Ok(Box::new(ExecResult::empty()))
     }
@@ -658,6 +664,9 @@ impl Executor {
 
         // Invalidate query cache for this table (schema may have changed)
         self.query_cache.invalidate_table(table_name);
+        invalidate_semi_join_cache_for_table(table_name);
+        invalidate_scalar_subquery_cache_for_table(table_name);
+        invalidate_in_subquery_cache_for_table(table_name);
 
         Ok(Box::new(ExecResult::empty()))
     }
@@ -695,6 +704,11 @@ impl Executor {
 
         // Drop the view (engine handles if_exists logic)
         self.engine.drop_view(view_name, stmt.if_exists)?;
+
+        // Invalidate subquery caches that may reference this view
+        invalidate_semi_join_cache_for_table(view_name);
+        invalidate_scalar_subquery_cache_for_table(view_name);
+        invalidate_in_subquery_cache_for_table(view_name);
 
         Ok(Box::new(ExecResult::empty()))
     }

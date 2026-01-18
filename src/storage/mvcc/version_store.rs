@@ -4740,7 +4740,7 @@ impl VersionStore {
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
     ) -> Vec<GroupedAggregateResult> {
-        use ahash::AHashMap;
+        use rustc_hash::FxHashMap;
 
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
@@ -4885,7 +4885,7 @@ impl VersionStore {
             // Separate NULL accumulator - avoids creating GroupKey for NULL
             let mut null_accums: Option<Vec<Accum>> = None;
             // Only used for String/other types that can't be mapped to i64
-            let mut other_groups: AHashMap<GroupKey, Vec<Accum>> = AHashMap::new();
+            let mut other_groups: FxHashMap<GroupKey, Vec<Accum>> = FxHashMap::default();
 
             for (idx, meta) in arena_meta.iter().enumerate() {
                 // Visibility check
@@ -5002,7 +5002,7 @@ impl VersionStore {
         }
 
         // SLOW PATH: Multi-column GROUP BY (currently not used from try_storage_aggregation)
-        let mut groups: AHashMap<GroupKey, Vec<Accum>> = AHashMap::new();
+        let mut groups: FxHashMap<GroupKey, Vec<Accum>> = FxHashMap::default();
 
         for (idx, meta) in arena_meta.iter().enumerate() {
             // Visibility check

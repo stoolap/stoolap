@@ -19,8 +19,7 @@
 
 use super::token::{Position, Token};
 use crate::common::SmartString;
-use ahash::AHashSet;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 
 use crate::common::CompactArc;
@@ -693,8 +692,8 @@ pub struct InHashSetExpression {
     pub token: Token,
     /// The column/expression to check
     pub column: Box<Expression>,
-    /// Pre-computed AHashSet for O(1) lookup - Arc for cheap parallel cloning
-    pub values: CompactArc<AHashSet<Value>>,
+    /// Pre-computed FxHashSet for O(1) lookup - Arc for cheap parallel cloning
+    pub values: CompactArc<FxHashSet<Value>>,
     /// Whether this is NOT IN
     pub not: bool,
 }

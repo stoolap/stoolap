@@ -741,64 +741,124 @@ impl Eq for Value {}
 const I64_SAFE_MAX: i64 = (1_i64 << 53) - 1;
 const I64_SAFE_MIN: i64 = -I64_SAFE_MAX;
 
+/// WyHash-style 128-bit multiply mixing function.
+/// Provides excellent avalanche properties - small input changes produce
+/// completely different outputs. This pre-mixes values before the hasher
+/// sees them, fixing collision problems with simple hashers like FxHash.
+#[inline(always)]
+fn wymix(a: u64, b: u64) -> u64 {
+    let r = (a as u128).wrapping_mul(b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
+}
+
+// WyHash prime constants for mixing
+const WY_P1: u64 = 0xa0761d6478bd642f;
+const WY_P2: u64 = 0xe7037ed1a0b428db;
+
 impl Hash for Value {
     #[inline(always)]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Note: We must ensure that values that are equal have the same hash.
-        // Since Integer(5) == Float(5.0), they must hash the same.
+        // Pre-mix strategy: Instead of writing raw values that may have poor
+        // distribution (causing collisions in simple hashers like FxHash),
+        // we pre-mix everything using WyHash-style 128-bit multiply mixing.
+        // This gives ANY hasher well-distributed inputs.
         //
-        // Optimization: For integers in the safe range [-2^53+1, 2^53-1], we hash
-        // directly as i64 without the expensive i64→f64 conversion. Floats with
-        // fractional parts can never equal any integer, so they use a different
-        // discriminant entirely.
+        // Constraint: Integer(5) == Float(5.0) must have equal hashes.
+        // We handle this by using the same mixing for whole-number floats.
         match self {
             Value::Null(_) => {
-                // All NULLs hash the same (discriminant 0, no value)
-                state.write_u8(0);
+                // All NULLs hash the same
+                state.write_u64(0);
             }
             Value::Integer(v) => {
-                state.write_u8(1);
+                // Pre-mix integer with discriminant
                 match *v {
-                    I64_SAFE_MIN..=I64_SAFE_MAX => state.write_i64(*v),
-                    _ => state.write_u64((*v as f64).to_bits()),
+                    I64_SAFE_MIN..=I64_SAFE_MAX => {
+                        state.write_u64(wymix(1 ^ (*v as u64), WY_P1));
+                    }
+                    _ => {
+                        // Large integer: use f64 bits for consistency with Float
+                        state.write_u64(wymix(1 ^ (*v as f64).to_bits(), WY_P1));
+                    }
                 }
             }
             Value::Float(v) => {
                 if v.is_nan() {
-                    // All NaNs are equal in PartialEq, so they must hash the same
-                    state.write_u8(6);
-                    state.write_u64(f64::NAN.to_bits());
+                    // All NaNs are equal, so they must hash the same
+                    state.write_u64(wymix(6 ^ f64::NAN.to_bits(), WY_P1));
                 } else if v.fract() == 0.0 {
                     // Whole number float - must hash same as equivalent Integer
-                    state.write_u8(1);
                     match *v as i64 {
-                        i @ I64_SAFE_MIN..=I64_SAFE_MAX => state.write_i64(i),
-                        _ => state.write_u64(v.to_bits()),
+                        i @ I64_SAFE_MIN..=I64_SAFE_MAX => {
+                            state.write_u64(wymix(1 ^ (i as u64), WY_P1));
+                        }
+                        _ => {
+                            state.write_u64(wymix(1 ^ v.to_bits(), WY_P1));
+                        }
                     }
                 } else {
-                    // Fractional - can't equal any Integer, use different discriminant
-                    state.write_u8(6);
-                    state.write_u64(v.to_bits());
+                    // Fractional float - use discriminant 6 (can't equal any Integer)
+                    state.write_u64(wymix(6 ^ v.to_bits(), WY_P1));
                 }
             }
             Value::Text(s) => {
-                state.write_u8(2);
-                // For strings, we still need to use .hash() to properly hash the bytes
-                s.hash(state);
+                // Pre-hash string with WyHash-style mixing, write single u64
+                let bytes = s.as_bytes();
+                let len = bytes.len();
+                let mut h = wymix(2 ^ (len as u64), WY_P1);
+
+                // Process 8 bytes at a time
+                let chunks = len / 8;
+                let ptr = bytes.as_ptr();
+                for i in 0..chunks {
+                    let chunk = unsafe { (ptr.add(i * 8) as *const u64).read_unaligned() };
+                    h = wymix(h ^ chunk, WY_P2);
+                }
+
+                // Handle tail bytes (0-7)
+                let tail_start = chunks * 8;
+                if tail_start < len {
+                    let mut tail = 0u64;
+                    for (j, &b) in bytes[tail_start..].iter().enumerate() {
+                        tail |= (b as u64) << (j * 8);
+                    }
+                    h = wymix(h ^ tail, WY_P1);
+                }
+
+                state.write_u64(h);
             }
             Value::Boolean(b) => {
-                // Combine discriminant and value in single write
-                // 3 for false, 259 (3 + 256) for true
-                state.write_u16(if *b { 259 } else { 3 });
+                // Pre-mixed boolean
+                state.write_u64(wymix(if *b { 5 } else { 4 }, WY_P1));
             }
             Value::Timestamp(t) => {
-                state.write_u8(4);
-                // timestamp_nanos_opt returns Option<i64>, unwrap_or for overflow case
-                state.write_i64(t.timestamp_nanos_opt().unwrap_or(i64::MAX));
+                // Pre-mix timestamp nanos
+                let nanos = t.timestamp_nanos_opt().unwrap_or(i64::MAX);
+                state.write_u64(wymix(3 ^ (nanos as u64), WY_P1));
             }
             Value::Json(s) => {
-                state.write_u8(5);
-                s.hash(state);
+                // Pre-hash JSON with WyHash-style mixing
+                let bytes = s.as_bytes();
+                let len = bytes.len();
+                let mut h = wymix(7 ^ (len as u64), WY_P1);
+
+                let chunks = len / 8;
+                let ptr = bytes.as_ptr();
+                for i in 0..chunks {
+                    let chunk = unsafe { (ptr.add(i * 8) as *const u64).read_unaligned() };
+                    h = wymix(h ^ chunk, WY_P2);
+                }
+
+                let tail_start = chunks * 8;
+                if tail_start < len {
+                    let mut tail = 0u64;
+                    for (j, &b) in bytes[tail_start..].iter().enumerate() {
+                        tail |= (b as u64) << (j * 8);
+                    }
+                    h = wymix(h ^ tail, WY_P1);
+                }
+
+                state.write_u64(h);
             }
         }
     }
@@ -1419,9 +1479,9 @@ mod tests {
 
     #[test]
     fn test_hash() {
-        use ahash::AHashSet;
+        use rustc_hash::FxHashSet;
 
-        let mut set = AHashSet::new();
+        let mut set = FxHashSet::default();
         set.insert(Value::integer(42));
         set.insert(Value::integer(42)); // Duplicate
         set.insert(Value::integer(43));
@@ -1495,10 +1555,10 @@ mod tests {
 
     #[test]
     fn test_hash_in_hashmap() {
-        use ahash::AHashMap;
+        use rustc_hash::FxHashMap;
 
         // Test that Integer and Float can be used as equivalent keys
-        let mut map = AHashMap::new();
+        let mut map = FxHashMap::default();
         map.insert(Value::integer(42), "int");
 
         // Looking up with Float(42.0) should find the Integer(42) entry

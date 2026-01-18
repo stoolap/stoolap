@@ -25,8 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustc_hash::FxHashSet;
-
+use crate::common::I64Set;
 use crate::core::{Error, Result};
 use crate::storage::{PersistenceConfig, SyncMode};
 
@@ -1584,8 +1583,8 @@ impl WALManager {
         // Phase 1: Analysis - Identify transaction outcomes
         // Only collect txn_ids, not full entries (memory efficient)
         // =====================================================
-        let mut committed_txns: FxHashSet<i64> = FxHashSet::default();
-        let mut aborted_txns: FxHashSet<i64> = FxHashSet::default();
+        let mut committed_txns: I64Set = I64Set::new();
+        let mut aborted_txns: I64Set = I64Set::new();
         let mut last_lsn = from_lsn;
 
         for wal_path in &wal_files {
@@ -1689,14 +1688,14 @@ impl WALManager {
                         // For commit markers: pass to callback so registry can be updated
                         // This is crucial for visibility - without this, committed data is invisible
                         if entry.is_commit_marker() {
-                            if committed_txns.contains(&entry.txn_id) {
+                            if committed_txns.contains(entry.txn_id) {
                                 callback(entry)?;
                             }
                             continue;
                         }
 
                         // Apply only committed transactions' data entries
-                        if committed_txns.contains(&entry.txn_id) {
+                        if committed_txns.contains(entry.txn_id) {
                             callback(entry)?;
                             applied_count += 1;
                         } else {
@@ -1741,8 +1740,8 @@ impl WALManager {
     fn scan_wal_for_txn_status(
         wal_path: &Path,
         from_lsn: u64,
-        committed_txns: &mut FxHashSet<i64>,
-        aborted_txns: &mut FxHashSet<i64>,
+        committed_txns: &mut I64Set,
+        aborted_txns: &mut I64Set,
         last_lsn: &mut u64,
     ) -> Result<()> {
         let mut file = match File::open(wal_path) {

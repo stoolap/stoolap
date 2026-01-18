@@ -74,14 +74,14 @@
 //!
 //! Future enhancement: Per-transaction cache scoping with timestamp-based invalidation
 
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::FxHasher;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-use crate::common::CompactArc;
+use crate::common::{CompactArc, StringMap};
 use crate::core::{Result, Row};
 
 /// Convert to lowercase without allocation if already lowercase.
@@ -261,7 +261,7 @@ pub enum SubsumptionResult {
 pub struct SemanticCache {
     /// Cached results: table_name -> (column_key -> Vec<CachedResult>)
     /// Nested structure enables O(1) table invalidation
-    cache: RwLock<FxHashMap<String, FxHashMap<String, Vec<CachedResult>>>>,
+    cache: RwLock<StringMap<StringMap<Vec<CachedResult>>>>,
     /// Maximum cache size per table+column combination
     max_size: usize,
     /// Cache TTL
@@ -352,7 +352,7 @@ impl SemanticCache {
         max_global_rows: usize,
     ) -> Self {
         Self {
-            cache: RwLock::new(FxHashMap::default()),
+            cache: RwLock::new(StringMap::new()),
             max_size,
             ttl,
             max_rows,
@@ -666,7 +666,7 @@ impl SemanticCache {
     /// Evict entries across all tables using global LRU until rows_to_free rows are freed
     fn evict_global_lru(
         &self,
-        cache: &mut FxHashMap<String, FxHashMap<String, Vec<CachedResult>>>,
+        cache: &mut StringMap<StringMap<Vec<CachedResult>>>,
         mut rows_to_free: usize,
         skip_table: &str,
     ) {

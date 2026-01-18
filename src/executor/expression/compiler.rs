@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::common::CompactArc;
 use crate::common::SmartString;
-use ahash::AHashSet;
+use crate::common::StringMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::ops::{CompareOp, CompiledPattern, Op};
@@ -85,15 +85,15 @@ pub enum ColumnSource {
 /// - Outer query columns (for correlated subqueries)
 pub struct CompileContext<'a> {
     /// Column name -> index (case-insensitive)
-    columns: FxHashMap<String, u16>,
+    columns: StringMap<u16>,
 
     /// Qualified column name -> (index, is_row2)
     /// For row1 columns: index is the direct row1 index
     /// For row2 columns: index is the row2 index (not offset)
-    qualified_columns: FxHashMap<String, FxHashMap<String, ColumnSource>>,
+    qualified_columns: StringMap<StringMap<ColumnSource>>,
 
     /// Second row columns (for joins)
-    columns2: Option<FxHashMap<String, u16>>,
+    columns2: Option<StringMap<u16>>,
 
     /// Tables that belong to row2 (for tracking which tables are from second row)
     row2_tables: FxHashSet<String>,
@@ -105,18 +105,17 @@ pub struct CompileContext<'a> {
     functions: &'a FunctionRegistry,
 
     /// Expression alias mapping (for HAVING with GROUP BY expressions)
-    expression_aliases: FxHashMap<String, u16>,
+    expression_aliases: StringMap<u16>,
 
     /// Column aliases
-    column_aliases: FxHashMap<String, String>,
+    column_aliases: StringMap<String>,
 }
 
 impl<'a> CompileContext<'a> {
     /// Create a new compilation context
     pub fn new(columns: &[String], functions: &'a FunctionRegistry) -> Self {
-        let mut col_map = FxHashMap::default();
-        let mut qualified_map: FxHashMap<String, FxHashMap<String, ColumnSource>> =
-            FxHashMap::default();
+        let mut col_map = StringMap::new();
+        let mut qualified_map: StringMap<StringMap<ColumnSource>> = StringMap::new();
 
         for (i, col) in columns.iter().enumerate() {
             let lower = col.to_lowercase();
@@ -144,8 +143,8 @@ impl<'a> CompileContext<'a> {
             row2_tables: FxHashSet::default(),
             outer_columns: None,
             functions,
-            expression_aliases: FxHashMap::default(),
-            column_aliases: FxHashMap::default(),
+            expression_aliases: StringMap::new(),
+            column_aliases: StringMap::new(),
         }
     }
 
@@ -156,7 +155,7 @@ impl<'a> CompileContext<'a> {
 
     /// Add second row columns (for join compilation)
     pub fn with_second_row(mut self, columns2: &[String]) -> Self {
-        let mut col_map = FxHashMap::default();
+        let mut col_map = StringMap::new();
         for (i, col) in columns2.iter().enumerate() {
             let lower = col.to_lowercase();
             col_map.insert(lower.clone(), i as u16);
@@ -194,13 +193,13 @@ impl<'a> CompileContext<'a> {
     }
 
     /// Add expression aliases (for HAVING clause)
-    pub fn with_expression_aliases(mut self, aliases: FxHashMap<String, u16>) -> Self {
+    pub fn with_expression_aliases(mut self, aliases: StringMap<u16>) -> Self {
         self.expression_aliases = aliases;
         self
     }
 
     /// Add column aliases
-    pub fn with_column_aliases(mut self, aliases: FxHashMap<String, String>) -> Self {
+    pub fn with_column_aliases(mut self, aliases: StringMap<String>) -> Self {
         self.column_aliases = aliases;
         self
     }
@@ -1044,7 +1043,7 @@ impl<'a> ExprCompiler<'a> {
 
         // Single-value IN expression
         // Build the set of values at compile time if possible
-        let mut values = AHashSet::default();
+        let mut values = FxHashSet::default();
         let mut has_null = false;
         let mut all_constant = true;
 

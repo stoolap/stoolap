@@ -34,10 +34,10 @@ pub mod version;
 pub use buffer_pool::{BufferPool, PoolStats};
 pub use compact_arc::CompactArc;
 pub use compact_vec::CompactVec;
-pub use i64_map::I64Map;
+pub use i64_map::{I64Map, I64Set};
 pub use int_maps::{
     new_btree_int64_map, new_concurrent_int64_map, new_int64_map, new_int64_map_with_capacity,
-    BTreeInt64Map, ConcurrentInt64Map, Int64Map, Int64Set,
+    BTreeInt64Map, ConcurrentInt64Map, Int64Map, Int64Set, StringMap, StringSet,
 };
 pub use smart_string::SmartString;
 pub use version::{version, version_info, SemVer, BUILD_TIME, GIT_COMMIT, MAJOR, MINOR, PATCH};

@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Fast hash maps for integer keys
+//! Fast hash maps for integer and string keys
 //!
-//! This module provides optimized hash maps for integer keys:
-//! - `FxHashMap` from rustc-hash for single-threaded access
+//! This module provides optimized hash maps:
+//! - `I64Map`/`I64Set` for i64 keys (custom pre-mixing hash)
+//! - `StringMap`/`StringSet` for String keys (AHash - 10% faster than FxHash)
 //! - `DashMap` for concurrent access (sharded, lock-free reads)
 //! - `BTreeMap` with `RwLock` for ordered iteration
 
+use ahash::{AHashMap, AHashSet};
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use rustc_hash::{FxHashSet, FxHasher};
+use rustc_hash::FxHasher;
 use std::collections::BTreeMap;
 use std::hash::BuildHasherDefault;
 
@@ -35,7 +37,21 @@ pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
 pub type Int64Map<V> = crate::common::I64Map<V>;
 
 /// Fast single-threaded hash set for i64 keys
-pub type Int64Set = FxHashSet<i64>;
+///
+/// Uses custom I64Set with pre-mixing hash for 0 sequential key collisions.
+/// Note: i64::MIN cannot be used (reserved as empty sentinel).
+pub type Int64Set = crate::common::I64Set;
+
+/// Fast hash map for String keys
+///
+/// Uses AHash which provides ~10% faster lookups than FxHash for String keys
+/// due to AES-NI instructions handling complex types well.
+pub type StringMap<V> = AHashMap<String, V>;
+
+/// Fast hash set for String keys
+///
+/// Uses AHash which provides ~10% faster lookups than FxHash for String keys.
+pub type StringSet = AHashSet<String>;
 
 /// Concurrent hash map for i64 keys
 ///
@@ -114,12 +130,12 @@ mod tests {
         set.insert(2);
         set.insert(3);
 
-        assert!(set.contains(&1));
-        assert!(set.contains(&2));
-        assert!(!set.contains(&4));
+        assert!(set.contains(1));
+        assert!(set.contains(2));
+        assert!(!set.contains(4));
 
-        set.remove(&2);
-        assert!(!set.contains(&2));
+        set.remove(2);
+        assert!(!set.contains(2));
     }
 
     #[test]

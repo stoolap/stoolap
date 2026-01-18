@@ -45,8 +45,8 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
-use ahash::AHashMap;
 use roaring::RoaringTreemap;
+use rustc_hash::FxHashMap;
 
 use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
@@ -88,7 +88,7 @@ pub struct BitmapIndex {
     /// One bitmap per distinct value
     /// Maps CompactArc<Value> -> RoaringTreemap of row IDs (supports full u64 range)
     /// Uses CompactArc<Value> keys for memory efficiency (8 bytes per key)
-    bitmaps: RwLock<AHashMap<CompactArc<Value>, RoaringTreemap>>,
+    bitmaps: RwLock<FxHashMap<CompactArc<Value>, RoaringTreemap>>,
 
     /// Reverse mapping: row_id -> CompactArc<Value> for efficient removal
     /// Uses I64Map for fast O(1) lookups and CompactArc<Value> (8 bytes per entry)
@@ -133,7 +133,7 @@ impl BitmapIndex {
             data_types,
             is_unique,
             closed: AtomicBool::new(false),
-            bitmaps: RwLock::new(AHashMap::new()),
+            bitmaps: RwLock::new(FxHashMap::default()),
             row_to_value: RwLock::new(I64Map::new()),
             distinct_count: AtomicUsize::new(0),
         }

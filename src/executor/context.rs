@@ -17,15 +17,23 @@
 //! This module provides the execution context for SQL queries, including
 //! parameter handling, transaction state, and query options.
 
-use rustc_hash::FxHashMap;
+use lru::LruCache;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::collections::BinaryHeap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+// Cache size limits for subquery caches to prevent unbounded memory growth.
+// These are per-thread limits since the caches are thread-local.
+const SCALAR_SUBQUERY_CACHE_SIZE: usize = 128;
+const IN_SUBQUERY_CACHE_SIZE: usize = 128;
+const SEMI_JOIN_CACHE_SIZE: usize = 256;
+
 use crate::api::params::ParamVec;
-use crate::common::CompactArc;
+use crate::common::{CompactArc, StringMap};
 use crate::core::{Result, Row, Value};
 
 // Static defaults for ExecutionContext to avoid allocations for empty values.
@@ -43,13 +51,15 @@ static EMPTY_SESSION_VARS: LazyLock<Arc<AHashMap<String, Value>>> =
 // Thread-local to avoid synchronization overhead.
 // Uses SQL string as key (not hash) to avoid collision risk.
 // Stores (tables_referenced, result) for table-based invalidation.
+// LRU-bounded to prevent unbounded memory growth.
 use smallvec::SmallVec;
 
 /// Cached scalar subquery entry: (tables_referenced for invalidation, result value)
 type ScalarSubqueryCacheEntry = (SmallVec<[Arc<str>; 2]>, Value);
 
 thread_local! {
-    static SCALAR_SUBQUERY_CACHE: RefCell<FxHashMap<String, ScalarSubqueryCacheEntry>> = RefCell::new(FxHashMap::default());
+    static SCALAR_SUBQUERY_CACHE: RefCell<LruCache<String, ScalarSubqueryCacheEntry>> =
+        RefCell::new(LruCache::new(NonZeroUsize::new(SCALAR_SUBQUERY_CACHE_SIZE).unwrap()));
 }
 
 /// Clear the scalar subquery cache completely.
@@ -57,9 +67,7 @@ thread_local! {
 /// This is only used for explicit cache clearing (e.g., after DDL operations).
 pub fn clear_scalar_subquery_cache() {
     SCALAR_SUBQUERY_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit(); // Release capacity to avoid memory bloat in long-running apps
+        cache.borrow_mut().clear();
     });
 }
 
@@ -72,20 +80,27 @@ pub fn invalidate_scalar_subquery_cache_for_table(table_name: &str) {
         if c.is_empty() {
             return;
         }
-        // Keep entries where no referenced table matches (case-insensitive)
-        c.retain(|_, (tables, _)| !tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)));
+        // Collect keys to remove (LruCache doesn't have retain)
+        let keys_to_remove: Vec<String> = c
+            .iter()
+            .filter(|(_, (tables, _))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys_to_remove {
+            c.pop(&key);
+        }
     });
 }
 
 /// Get a cached scalar subquery result by SQL string key.
 pub fn get_cached_scalar_subquery(key: &str) -> Option<Value> {
-    SCALAR_SUBQUERY_CACHE.with(|cache| cache.borrow().get(key).map(|(_, v)| v.clone()))
+    SCALAR_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v)| v.clone()))
 }
 
 /// Cache a scalar subquery result with the tables it references.
 pub fn cache_scalar_subquery(key: String, tables: SmallVec<[Arc<str>; 2]>, value: Value) {
     SCALAR_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, (tables, value));
+        cache.borrow_mut().put(key, (tables, value));
     });
 }
 
@@ -93,12 +108,14 @@ pub fn cache_scalar_subquery(key: String, tables: SmallVec<[Arc<str>; 2]>, value
 // Thread-local to avoid synchronization overhead.
 // Uses SQL string as key (not hash) to avoid collision risk.
 // Stores (tables_referenced, result) for table-based invalidation.
+// LRU-bounded to prevent unbounded memory growth.
 
 /// Cached IN subquery entry: (tables_referenced for invalidation, result values)
 type InSubqueryCacheEntry = (SmallVec<[Arc<str>; 2]>, Vec<Value>);
 
 thread_local! {
-    static IN_SUBQUERY_CACHE: RefCell<FxHashMap<String, InSubqueryCacheEntry>> = RefCell::new(FxHashMap::default());
+    static IN_SUBQUERY_CACHE: RefCell<LruCache<String, InSubqueryCacheEntry>> =
+        RefCell::new(LruCache::new(NonZeroUsize::new(IN_SUBQUERY_CACHE_SIZE).unwrap()));
 }
 
 /// Clear the IN subquery cache completely.
@@ -106,9 +123,7 @@ thread_local! {
 /// This is only used for explicit cache clearing (e.g., after DDL operations).
 pub fn clear_in_subquery_cache() {
     IN_SUBQUERY_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit(); // Release capacity to avoid memory bloat
+        cache.borrow_mut().clear();
     });
 }
 
@@ -121,20 +136,27 @@ pub fn invalidate_in_subquery_cache_for_table(table_name: &str) {
         if c.is_empty() {
             return;
         }
-        // Keep entries where no referenced table matches (case-insensitive)
-        c.retain(|_, (tables, _)| !tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)));
+        // Collect keys to remove (LruCache doesn't have retain)
+        let keys_to_remove: Vec<String> = c
+            .iter()
+            .filter(|(_, (tables, _))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys_to_remove {
+            c.pop(&key);
+        }
     });
 }
 
 /// Get a cached IN subquery result by SQL string key.
 pub fn get_cached_in_subquery(key: &str) -> Option<Vec<Value>> {
-    IN_SUBQUERY_CACHE.with(|cache| cache.borrow().get(key).map(|(_, v)| v.clone()))
+    IN_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v)| v.clone()))
 }
 
 /// Cache an IN subquery result with the tables it references.
 pub fn cache_in_subquery(key: String, tables: SmallVec<[Arc<str>; 2]>, values: Vec<Value>) {
     IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, (tables, values));
+        cache.borrow_mut().put(key, (tables, values));
     });
 }
 
@@ -175,11 +197,12 @@ fn collect_real_table_names(source: &Expression, tables: &mut SmallVec<[Arc<str>
 // Cache for semi-join (EXISTS) hash sets to avoid re-execution.
 // Thread-local to avoid synchronization overhead.
 // Uses u64 hash key to avoid string allocation entirely.
-use ahash::{AHashMap, AHashSet};
+// LRU-bounded to prevent unbounded memory growth.
+use ahash::AHashMap;
 use std::hash::{Hash, Hasher};
 
 /// Cached semi-join entry: (table_name for invalidation, hash_set values)
-type SemiJoinCacheEntry = (Arc<str>, CompactArc<AHashSet<Value>>);
+type SemiJoinCacheEntry = (Arc<str>, CompactArc<FxHashSet<Value>>);
 
 /// Compute a cache key hash from table, column, and predicate hash without allocation.
 #[inline]
@@ -192,7 +215,8 @@ pub fn compute_semi_join_cache_key(table: &str, column: &str, pred_hash: u64) ->
 }
 
 thread_local! {
-    static SEMI_JOIN_CACHE: RefCell<FxHashMap<u64, SemiJoinCacheEntry>> = RefCell::new(FxHashMap::default());
+    static SEMI_JOIN_CACHE: RefCell<LruCache<u64, SemiJoinCacheEntry>> =
+        RefCell::new(LruCache::new(NonZeroUsize::new(SEMI_JOIN_CACHE_SIZE).unwrap()));
 }
 
 /// Clear the semi-join cache completely.
@@ -200,9 +224,7 @@ thread_local! {
 /// For DML operations, use `invalidate_semi_join_cache_for_table` instead.
 pub fn clear_semi_join_cache() {
     SEMI_JOIN_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
+        cache.borrow_mut().clear();
     });
 }
 
@@ -215,17 +237,24 @@ pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
         if c.is_empty() {
             return;
         }
-        // Keep entries where table name doesn't match (case-insensitive)
-        c.retain(|_, (key_table, _)| !key_table.eq_ignore_ascii_case(table_name));
+        // Collect keys to remove (LruCache doesn't have retain)
+        let keys_to_remove: Vec<u64> = c
+            .iter()
+            .filter(|(_, (key_table, _))| key_table.eq_ignore_ascii_case(table_name))
+            .map(|(k, _)| *k)
+            .collect();
+        for key in keys_to_remove {
+            c.pop(&key);
+        }
     });
 }
 
 /// Get a cached semi-join hash set by key hash.
 #[inline]
-pub fn get_cached_semi_join(key_hash: u64) -> Option<CompactArc<AHashSet<Value>>> {
+pub fn get_cached_semi_join(key_hash: u64) -> Option<CompactArc<FxHashSet<Value>>> {
     SEMI_JOIN_CACHE.with(|cache| {
         cache
-            .borrow()
+            .borrow_mut()
             .get(&key_hash)
             .map(|(_, v)| CompactArc::clone(v))
     })
@@ -233,11 +262,9 @@ pub fn get_cached_semi_join(key_hash: u64) -> Option<CompactArc<AHashSet<Value>>
 
 /// Cache a semi-join hash set result (Arc version for zero-copy).
 #[inline]
-pub fn cache_semi_join_arc(key_hash: u64, table: &str, values: CompactArc<AHashSet<Value>>) {
+pub fn cache_semi_join_arc(key_hash: u64, table: &str, values: CompactArc<FxHashSet<Value>>) {
     SEMI_JOIN_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert(key_hash, (Arc::from(table), values));
+        cache.borrow_mut().put(key_hash, (Arc::from(table), values));
     });
 }
 
@@ -407,7 +434,7 @@ pub fn cache_exists_pred_key(subquery_ptr: usize, pred_key: String) {
 // Thread-local to avoid synchronization overhead.
 // The key is a stable identifier for the subquery, the value is a map from group key to aggregate value.
 thread_local! {
-    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, CompactArc<AHashMap<Value, Value>>>> = RefCell::new(FxHashMap::default());
+    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, CompactArc<FxHashMap<Value, Value>>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the batch aggregate cache. Should be called at the start of each top-level query.
@@ -420,12 +447,12 @@ pub fn clear_batch_aggregate_cache() {
 }
 
 /// Get a cached batch aggregate result map by subquery identifier.
-pub fn get_cached_batch_aggregate(key: &str) -> Option<CompactArc<AHashMap<Value, Value>>> {
+pub fn get_cached_batch_aggregate(key: &str) -> Option<CompactArc<FxHashMap<Value, Value>>> {
     BATCH_AGGREGATE_CACHE.with(|cache| cache.borrow().get(key).cloned())
 }
 
 /// Cache a batch aggregate result map.
-pub fn cache_batch_aggregate(key: String, values: AHashMap<Value, Value>) {
+pub fn cache_batch_aggregate(key: String, values: FxHashMap<Value, Value>) {
     BATCH_AGGREGATE_CACHE.with(|cache| {
         cache.borrow_mut().insert(key, CompactArc::new(values));
     });
@@ -522,24 +549,19 @@ pub fn clear_exists_correlation_cache() {
 
 /// Clear ALL thread-local caches to release memory.
 /// Call this when a database is dropped to prevent memory leaks.
-/// This also shrinks all cache capacities to zero.
+/// This also shrinks all cache capacities to zero where applicable.
 pub fn clear_all_thread_local_caches() {
-    // Clear and shrink all executor caches
+    // Clear LRU-bounded caches (no shrink_to_fit needed - fixed capacity)
     SCALAR_SUBQUERY_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
+        cache.borrow_mut().clear();
     });
     IN_SUBQUERY_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
+        cache.borrow_mut().clear();
     });
     SEMI_JOIN_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
+        cache.borrow_mut().clear();
     });
+    // Clear and shrink unbounded caches
     EXISTS_PREDICATE_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
         c.clear();
@@ -675,7 +697,7 @@ type CteData = (CompactArc<Vec<String>>, CompactArc<Vec<(i64, Row)>>);
 /// Type alias for CTE data map to reduce type complexity
 /// Uses CompactArc<Vec<String>> for columns and CompactArc<Vec<(i64, Row)>> for rows
 /// to enable zero-copy sharing of CTE results with joins
-type CteDataMap = FxHashMap<String, CteData>;
+type CteDataMap = StringMap<CteData>;
 
 impl Default for ExecutionContext {
     fn default() -> Self {

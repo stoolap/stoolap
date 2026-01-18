@@ -23,10 +23,9 @@
 
 use std::sync::Arc;
 
-use ahash::AHashSet;
 use rustc_hash::FxHashSet;
 
-use crate::common::CompactArc;
+use crate::common::{CompactArc, I64Set};
 use crate::core::{Result, Row, RowVec, Value};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
@@ -864,7 +863,7 @@ impl Executor {
                 // Instead of scanning the table, iterate through row_ids and exclude
                 // This is O(row_count) but with O(1) hashset lookup, which is faster
                 // than table scan because we only touch row_ids, not full rows
-                let exclusion_set: FxHashSet<i64> = values
+                let exclusion_set: I64Set = values
                     .iter()
                     .filter_map(|v| {
                         if let Value::Integer(id) = v {
@@ -920,7 +919,7 @@ impl Executor {
                 // Row IDs are typically 1-based and sequential
                 let row_count = table.row_count();
                 for row_id in 1..=(row_count as i64) {
-                    if !exclusion_set.contains(&row_id) {
+                    if !exclusion_set.contains(row_id) {
                         all_row_ids.push(row_id);
                         if all_row_ids.len() >= target {
                             break;
@@ -1519,7 +1518,7 @@ impl Executor {
             if is_negated {
                 // NOT IN optimization for INTEGER PRIMARY KEY (from NOT EXISTS semi-join):
                 // Iterate through row_ids and exclude those in the hash set
-                let exclusion_set: FxHashSet<i64> = values
+                let exclusion_set: I64Set = values
                     .iter()
                     .filter_map(|v| match v {
                         Value::Integer(id) => Some(*id),
@@ -1532,7 +1531,7 @@ impl Executor {
                 let row_count = table.row_count();
 
                 for row_id in 1..=(row_count as i64) {
-                    if !exclusion_set.contains(&row_id) {
+                    if !exclusion_set.contains(row_id) {
                         all_row_ids.push(row_id);
                         if all_row_ids.len() >= target {
                             break;
@@ -1714,7 +1713,7 @@ impl Executor {
         expr: &Expression,
     ) -> Option<(
         String,
-        CompactArc<AHashSet<Value>>,
+        CompactArc<FxHashSet<Value>>,
         bool,
         Option<Expression>,
     )> {

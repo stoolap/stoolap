@@ -1237,7 +1237,7 @@ impl MVCCTable {
 
         // Step 4: Add global rows that don't have local overrides
         for (row_id, row) in global_rows {
-            if local_row_ids.contains(&row_id) {
+            if local_row_ids.contains(row_id) {
                 continue; // Local version takes precedence
             }
             // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
@@ -1376,7 +1376,7 @@ impl MVCCTable {
 
         // Add global rows that don't have local overrides
         for (row_id, row) in global_rows {
-            if local_row_ids.contains(&row_id) {
+            if local_row_ids.contains(row_id) {
                 continue; // Local version takes precedence
             }
             let row = self.normalize_row_to_schema(row, schema);

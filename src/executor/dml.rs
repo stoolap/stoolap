@@ -20,12 +20,12 @@
 //! - DELETE
 
 use crate::common::CompactArc;
+use crate::common::I64Set;
 use crate::common::SmartString;
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::traits::{Engine, QueryResult, Table};
-use ahash::AHashMap;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -120,7 +120,7 @@ impl Executor {
                 if id.value_lower == pk_column_lower {
                     if in_expr.not {
                         // NOT IN: get all active row_ids and exclude the ones in the set
-                        let excluded: rustc_hash::FxHashSet<i64> = in_expr
+                        let excluded: I64Set = in_expr
                             .values
                             .iter()
                             .filter_map(|v| match v {
@@ -132,7 +132,7 @@ impl Executor {
                         let mut row_ids: Vec<i64> = table
                             .get_active_row_ids()
                             .into_iter()
-                            .filter(|id| !excluded.contains(id))
+                            .filter(|id| !excluded.contains(*id))
                             .collect();
                         row_ids.sort_unstable();
                         return Ok(Some(row_ids));
@@ -1184,8 +1184,8 @@ impl Executor {
 
             // Pre-compute values for all rows
             // Map: pk_value -> Vec<(col_idx, new_value)>
-            // OPTIMIZATION: Use AHashMap for Value keys (better hash distribution)
-            let mut precomputed: AHashMap<Value, Vec<(usize, Value)>> = AHashMap::with_capacity(64);
+            // OPTIMIZATION: Use FxHashMap for Value keys (optimized with WyMix pre-mixing)
+            let mut precomputed: FxHashMap<Value, Vec<(usize, Value)>> = FxHashMap::default();
 
             // Build column indices for scanning (all columns)
             let all_col_indices: Vec<usize> = (0..column_names.len()).collect();

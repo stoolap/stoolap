@@ -62,16 +62,16 @@ pub use string_agg::{GroupConcatFunction, StringAggFunction};
 pub use sum::SumFunction;
 
 use crate::core::Value;
-use ahash::AHashSet;
+use rustc_hash::FxHashSet;
 
 /// Helper struct for tracking distinct values
 ///
-/// Uses AHashSet<Value> directly instead of converting to strings,
+/// Uses FxHashSet<Value> directly instead of converting to strings,
 /// avoiding allocation overhead for each value.
-/// AHash provides better performance for complex keys like Value.
+/// FxHash performs well with Value keys (optimized with WyMix pre-mixing).
 #[derive(Default, Debug)]
 pub struct DistinctTracker {
-    seen: AHashSet<Value>,
+    seen: FxHashSet<Value>,
 }
 
 impl DistinctTracker {

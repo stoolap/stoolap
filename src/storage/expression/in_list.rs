@@ -26,6 +26,7 @@ use std::any::Any;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{find_column_index, resolve_alias, Expression};
+use crate::common::I64Set;
 use crate::core::{Result, Row, Schema, Value};
 
 /// Pre-computed hash sets for O(1) IN list lookup
@@ -34,7 +35,7 @@ enum HashedValues {
     /// Not yet computed
     None,
     /// Integer hash set for O(1) lookup
-    Integers(FxHashSet<i64>),
+    Integers(I64Set),
     /// String hash set for O(1) lookup
     Strings(FxHashSet<String>),
     /// Boolean set (only 2 possible values)
@@ -140,7 +141,7 @@ impl InListExpr {
         match first_type {
             Some("int") => {
                 // Check if all values are integers (or convertible floats)
-                let mut set = FxHashSet::default();
+                let mut set = I64Set::new();
                 let mut all_int = true;
                 for v in &self.values {
                     match v {
@@ -216,7 +217,7 @@ impl InListExpr {
     #[inline]
     fn check_integer(&self, val: i64) -> bool {
         match &self.hashed {
-            HashedValues::Integers(set) => set.contains(&val),
+            HashedValues::Integers(set) => set.contains(val),
             _ => {
                 // Fallback to linear search
                 for v in &self.values {

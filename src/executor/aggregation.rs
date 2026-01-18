@@ -29,7 +29,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 // SmallVec removed - Vec is faster due to spilled() check overhead in hot loops
 
-use crate::common::{CompactArc, CompactVec, I64Map};
+use crate::common::{CompactArc, CompactVec, I64Map, StringMap};
 use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::aggregate::CompiledAggregate;
 use crate::functions::AggregateFunction;
@@ -1702,7 +1702,7 @@ impl Executor {
         aggregations: &[SqlAggregateFunction],
         rows: &[(i64, Row)],
         columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
     ) -> Result<(Vec<String>, RowVec)> {
         // Check if any aggregation has an expression (e.g., SUM(val * 2)), ORDER BY, or FILTER
@@ -2243,7 +2243,7 @@ impl Executor {
         group_by_items: &[GroupByItem],
         rows: &[(i64, Row)],
         _columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
         limit: Option<usize>,
         having_filter: Option<&SimpleHavingFilter>,
     ) -> Result<Option<(Vec<String>, RowVec)>> {
@@ -3380,7 +3380,7 @@ impl Executor {
         group_by_items: &[GroupByItem],
         rows: &[(i64, Row)],
         columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         limit: Option<usize>,
@@ -3511,10 +3511,10 @@ impl Executor {
             // OPTIMIZATION: Single-column GROUP BY uses direct hash map (no Vec<Value> overhead)
             if column_indices.len() == 1 {
                 let col_idx = column_indices[0];
-                // Use AHashMap for Value keys - 50x faster than FxHash per CLAUDE.md
+                // Use FxHashMap for Value keys (optimized with WyMix pre-mixing in Value::hash)
                 // Properly handles hash collisions via Value equality
-                let mut single_col_groups: ahash::AHashMap<Value, Vec<usize>> =
-                    ahash::AHashMap::new();
+                let mut single_col_groups: rustc_hash::FxHashMap<Value, Vec<usize>> =
+                    rustc_hash::FxHashMap::default();
 
                 for (row_idx, (_, row)) in rows.iter().enumerate() {
                     let key_value = row
@@ -3544,9 +3544,9 @@ impl Executor {
                 // Tuples are 30% faster than Vec per CLAUDE.md (no heap allocation)
                 let col_idx0 = column_indices[0];
                 let col_idx1 = column_indices[1];
-                // AHashMap for tuple keys containing Value elements
-                let mut two_col_groups: ahash::AHashMap<(Value, Value), Vec<usize>> =
-                    ahash::AHashMap::new();
+                // FxHashMap for tuple keys (optimized with WyMix pre-mixing in Value::hash)
+                let mut two_col_groups: rustc_hash::FxHashMap<(Value, Value), Vec<usize>> =
+                    rustc_hash::FxHashMap::default();
 
                 for (row_idx, (_, row)) in rows.iter().enumerate() {
                     let key = (
@@ -4020,7 +4020,7 @@ impl Executor {
         group_by_items: &[GroupByItem],
         rows: &[(i64, Row)],
         columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<(Vec<String>, RowVec)> {
@@ -4436,7 +4436,7 @@ impl Executor {
 
         // Build a lookup from canonical key to group_by_items index
         // Uses the same canonical key function for consistent matching
-        let item_to_index: FxHashMap<String, usize> = group_by_items
+        let item_to_index: StringMap<usize> = group_by_items
             .iter()
             .enumerate()
             .map(|(i, item)| (group_by_item_canonical_key(item), i))
@@ -4466,7 +4466,7 @@ impl Executor {
         &self,
         group_by_items: &[GroupByItem],
         columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
     ) -> Vec<String> {
         let mut names = Vec::new();
         for item in group_by_items {
@@ -4505,10 +4505,7 @@ impl Executor {
 
     /// Look up column index, handling both qualified (e.g., "o.amount") and unqualified names.
     /// If a qualified name lookup fails, tries the unqualified part (after the dot).
-    fn lookup_column_index(
-        column_lower: &str,
-        col_index_map: &FxHashMap<String, usize>,
-    ) -> Option<usize> {
+    fn lookup_column_index(column_lower: &str, col_index_map: &StringMap<usize>) -> Option<usize> {
         // First try exact match
         if let Some(&idx) = col_index_map.get(column_lower) {
             return Some(idx);
@@ -4532,7 +4529,7 @@ impl Executor {
         row: &Row,
         column: &str,
         columns: &[String],
-        col_index_map: &FxHashMap<String, usize>,
+        col_index_map: &StringMap<usize>,
     ) -> Value {
         if column == "*" {
             // For COUNT(*), return a non-null value
@@ -4946,7 +4943,7 @@ impl Executor {
 
         // Build column index map using schema's cached lowercase column names
         let schema_lower = table.schema().column_names_lower_arc();
-        let col_index_map: rustc_hash::FxHashMap<String, usize> = schema_lower
+        let col_index_map: StringMap<usize> = schema_lower
             .iter()
             .enumerate()
             .map(|(i, c)| (c.clone(), i))
@@ -5134,7 +5131,7 @@ impl Executor {
 
         // Build column index map using schema's cached lowercase column names
         let schema_lower = table.schema().column_names_lower_arc();
-        let col_index_map: rustc_hash::FxHashMap<String, usize> = schema_lower
+        let col_index_map: StringMap<usize> = schema_lower
             .iter()
             .enumerate()
             .map(|(i, c)| (c.clone(), i))
@@ -5476,7 +5473,7 @@ impl Executor {
 
         // Build column index map from result columns
         let source_columns = result.columns().to_vec();
-        let col_index_map: FxHashMap<String, usize> = source_columns
+        let col_index_map: StringMap<usize> = source_columns
             .iter()
             .enumerate()
             .map(|(i, c)| (c.to_lowercase(), i))

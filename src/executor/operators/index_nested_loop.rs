@@ -648,7 +648,7 @@ impl BatchIndexNestedLoopJoinOperator {
 
 impl Operator for BatchIndexNestedLoopJoinOperator {
     fn open(&mut self) -> Result<()> {
-        use rustc_hash::FxHashSet;
+        use crate::common::I64Set;
 
         self.outer.open()?;
 
@@ -657,7 +657,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
 
         // Step 1: Collect all outer rows and their join keys
         let mut outer_rows: Vec<Row> = Vec::new();
-        let mut row_id_set: FxHashSet<i64> = FxHashSet::default();
+        let mut row_id_set: I64Set = I64Set::new();
         let mut key_to_outer_indices: I64Map<Vec<usize>> = I64Map::new();
 
         while let Some(row_ref) = self.outer.next()? {

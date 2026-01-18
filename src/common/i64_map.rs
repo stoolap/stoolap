@@ -731,6 +731,320 @@ pub struct Drain<V> {
     pos: usize,
 }
 
+// =============================================================================
+// I64Set - High-performance HashSet for i64 keys
+// =============================================================================
+
+/// High-performance HashSet for i64 keys.
+///
+/// Uses the same optimizations as I64Map:
+/// - i64::MIN as empty sentinel (row IDs and txn IDs are always >= 0)
+/// - FxHash with pre-mixing (XOR>>16 before multiply) - 0 sequential collisions
+/// - Backward-shift deletion (no tombstones)
+///
+/// Note: i64::MIN cannot be used as a value (reserved as empty sentinel).
+pub struct I64Set {
+    slots: Box<[i64]>,
+    len: usize,
+    mask: usize,
+}
+
+impl Clone for I64Set {
+    fn clone(&self) -> Self {
+        let mut new_set = Self::with_capacity(self.len);
+        for key in self.iter() {
+            new_set.insert(key);
+        }
+        new_set
+    }
+}
+
+impl std::fmt::Debug for I64Set {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
+impl Default for I64Set {
+    #[inline(always)]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl I64Set {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        let cap = if capacity == 0 {
+            MIN_CAPACITY
+        } else {
+            capacity
+                .saturating_mul(LOAD_FACTOR_DEN)
+                .saturating_div(LOAD_FACTOR_NUM)
+                .next_power_of_two()
+                .max(MIN_CAPACITY)
+        };
+
+        let slots: Vec<i64> = vec![EMPTY; cap];
+
+        Self {
+            slots: slots.into_boxed_slice(),
+            len: 0,
+            mask: cap - 1,
+        }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// FxHash with pre-mixing - same as I64Map
+    #[inline(always)]
+    fn hash(key: i64) -> usize {
+        let k = key as u64;
+        let k = k ^ (k >> 16);
+        k.wrapping_mul(0x517cc1b727220a95) as usize
+    }
+
+    /// Insert a value into the set. Returns true if the value was newly inserted.
+    #[inline(always)]
+    pub fn insert(&mut self, key: i64) -> bool {
+        check_key(key);
+
+        if self.len * LOAD_FACTOR_DEN >= self.slots.len() * LOAD_FACTOR_NUM {
+            self.grow();
+        }
+
+        let mask = self.mask;
+        let mut idx = Self::hash(key) & mask;
+
+        loop {
+            let slot = unsafe { *self.slots.get_unchecked(idx) };
+
+            if slot == EMPTY {
+                unsafe { *self.slots.get_unchecked_mut(idx) = key };
+                self.len += 1;
+                return true;
+            }
+
+            if slot == key {
+                return false; // Already exists
+            }
+
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, key: i64) -> bool {
+        check_key(key);
+
+        let mask = self.mask;
+        let mut idx = Self::hash(key) & mask;
+
+        loop {
+            let slot = unsafe { *self.slots.get_unchecked(idx) };
+
+            if slot == EMPTY {
+                return false;
+            }
+
+            if slot == key {
+                return true;
+            }
+
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    #[inline(always)]
+    pub fn remove(&mut self, key: i64) -> bool {
+        check_key(key);
+
+        let mask = self.mask;
+        let mut idx = Self::hash(key) & mask;
+
+        // Find the key
+        loop {
+            let slot = unsafe { *self.slots.get_unchecked(idx) };
+
+            if slot == EMPTY {
+                return false;
+            }
+
+            if slot == key {
+                break;
+            }
+
+            idx = (idx + 1) & mask;
+        }
+
+        self.len -= 1;
+
+        // Backward shift deletion
+        let mut empty_idx = idx;
+        let mut next_idx = (idx + 1) & mask;
+
+        loop {
+            let next_slot = unsafe { *self.slots.get_unchecked(next_idx) };
+
+            if next_slot == EMPTY {
+                break;
+            }
+
+            let next_home = Self::hash(next_slot) & mask;
+
+            let can_move = if next_home <= next_idx {
+                empty_idx >= next_home && empty_idx < next_idx
+            } else {
+                empty_idx >= next_home || empty_idx < next_idx
+            };
+
+            if can_move {
+                unsafe {
+                    *self.slots.get_unchecked_mut(empty_idx) = next_slot;
+                }
+                empty_idx = next_idx;
+            }
+
+            next_idx = (next_idx + 1) & mask;
+        }
+
+        unsafe {
+            *self.slots.get_unchecked_mut(empty_idx) = EMPTY;
+        }
+
+        true
+    }
+
+    fn grow(&mut self) {
+        let new_cap = (self.slots.len() * 2).max(MIN_CAPACITY);
+        let new_mask = new_cap - 1;
+
+        let new_slots: Vec<i64> = vec![EMPTY; new_cap];
+        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
+        let old_len = self.len;
+        self.len = 0;
+        self.mask = new_mask;
+
+        for slot in old_slots.iter() {
+            if *slot != EMPTY {
+                self.insert(*slot);
+            }
+        }
+
+        debug_assert_eq!(self.len, old_len);
+    }
+
+    pub fn clear(&mut self) {
+        for slot in self.slots.iter_mut() {
+            *slot = EMPTY;
+        }
+        self.len = 0;
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = i64> + '_ {
+        self.slots
+            .iter()
+            .filter_map(|&slot| if slot != EMPTY { Some(slot) } else { None })
+    }
+
+    /// Drains all values from the set, returning an iterator over them
+    #[inline]
+    pub fn drain(&mut self) -> impl Iterator<Item = i64> + '_ {
+        let len = self.len;
+        self.len = 0;
+        self.slots
+            .iter_mut()
+            .filter_map(move |slot| {
+                if *slot != EMPTY {
+                    let val = *slot;
+                    *slot = EMPTY;
+                    Some(val)
+                } else {
+                    None
+                }
+            })
+            .take(len)
+    }
+}
+
+impl IntoIterator for I64Set {
+    type Item = i64;
+    type IntoIter = I64SetIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        I64SetIntoIter {
+            slots: self.slots,
+            pos: 0,
+        }
+    }
+}
+
+/// Owning iterator over the values of an I64Set
+pub struct I64SetIntoIter {
+    slots: Box<[i64]>,
+    pos: usize,
+}
+
+impl Iterator for I64SetIntoIter {
+    type Item = i64;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.pos < self.slots.len() {
+            let slot = self.slots[self.pos];
+            self.pos += 1;
+
+            if slot != EMPTY {
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.slots.len() - self.pos))
+    }
+}
+
+impl std::iter::FromIterator<i64> for I64Set {
+    fn from_iter<T: IntoIterator<Item = i64>>(iter: T) -> Self {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        let mut set = I64Set::with_capacity(lower);
+        for key in iter {
+            set.insert(key);
+        }
+        set
+    }
+}
+
+impl Extend<i64> for I64Set {
+    fn extend<T: IntoIterator<Item = i64>>(&mut self, iter: T) {
+        for key in iter {
+            self.insert(key);
+        }
+    }
+}
+
 impl<V> Iterator for Drain<V> {
     type Item = (i64, V);
 
@@ -1071,5 +1385,118 @@ mod tests {
     fn test_i64_min_panics_on_entry() {
         let mut map = I64Map::<i64>::new();
         let _ = map.entry(i64::MIN);
+    }
+
+    // =========================================================================
+    // I64Set Tests
+    // =========================================================================
+
+    #[test]
+    fn test_i64set_basic_operations() {
+        let mut set = I64Set::new();
+
+        assert!(set.insert(1));
+        assert!(set.insert(2));
+        assert!(set.insert(3));
+        assert_eq!(set.len(), 3);
+
+        assert!(set.contains(1));
+        assert!(set.contains(2));
+        assert!(set.contains(3));
+        assert!(!set.contains(4));
+
+        // Duplicate insert returns false
+        assert!(!set.insert(2));
+        assert_eq!(set.len(), 3);
+
+        // Remove
+        assert!(set.remove(2));
+        assert!(!set.contains(2));
+        assert_eq!(set.len(), 2);
+
+        // Remove non-existent returns false
+        assert!(!set.remove(2));
+    }
+
+    #[test]
+    fn test_i64set_grow() {
+        let mut set = I64Set::new();
+
+        for i in 0..1000 {
+            set.insert(i);
+        }
+
+        assert_eq!(set.len(), 1000);
+
+        for i in 0..1000 {
+            assert!(set.contains(i), "Missing key {}", i);
+        }
+    }
+
+    #[test]
+    fn test_i64set_edge_values() {
+        let mut set = I64Set::new();
+
+        set.insert(i64::MIN + 1);
+        set.insert(i64::MAX);
+        set.insert(0);
+        set.insert(-1);
+        set.insert(1);
+
+        assert!(set.contains(i64::MIN + 1));
+        assert!(set.contains(i64::MAX));
+        assert!(set.contains(0));
+        assert!(set.contains(-1));
+        assert!(set.contains(1));
+    }
+
+    #[test]
+    fn test_i64set_into_iter() {
+        let mut set = I64Set::new();
+        set.insert(1);
+        set.insert(2);
+        set.insert(3);
+
+        let mut values: Vec<i64> = set.into_iter().collect();
+        values.sort();
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_i64set_from_iter() {
+        let set: I64Set = vec![1, 2, 3, 2, 1].into_iter().collect();
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(1));
+        assert!(set.contains(2));
+        assert!(set.contains(3));
+    }
+
+    #[test]
+    fn test_i64set_strided_keys() {
+        let mut set = I64Set::with_capacity(10000);
+        let stride = 1024;
+
+        for i in 0..10000i64 {
+            set.insert(i * stride);
+        }
+
+        assert_eq!(set.len(), 10000);
+        for i in 0..10000i64 {
+            assert!(set.contains(i * stride), "Missing key {}", i * stride);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "i64::MIN cannot be used as a key")]
+    fn test_i64set_min_panics_on_insert() {
+        let mut set = I64Set::new();
+        set.insert(i64::MIN);
+    }
+
+    #[test]
+    #[should_panic(expected = "i64::MIN cannot be used as a key")]
+    fn test_i64set_min_panics_on_contains() {
+        let set = I64Set::new();
+        let _ = set.contains(i64::MIN);
     }
 }

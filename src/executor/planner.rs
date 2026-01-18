@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use crate::common::StringMap;
 
 use crate::core::{Operator, Result, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
@@ -45,7 +45,7 @@ pub struct QueryPlanner {
     /// Reference to the storage engine for reading statistics
     engine: Arc<MVCCEngine>,
     /// Cache of table statistics to avoid repeated lookups
-    stats_cache: std::sync::RwLock<FxHashMap<String, CachedStats>>,
+    stats_cache: std::sync::RwLock<StringMap<CachedStats>>,
 }
 
 /// Default TTL for cached statistics (5 minutes)
@@ -60,7 +60,7 @@ const MAX_STATS_CACHE_SIZE: usize = 1000;
 #[derive(Clone)]
 struct CachedStats {
     table_stats: TableStats,
-    column_stats: FxHashMap<String, ColumnStatsCache>,
+    column_stats: StringMap<ColumnStatsCache>,
     #[allow(dead_code)]
     zone_maps: Option<TableZoneMap>,
     /// Timestamp when this cache entry was created
@@ -104,7 +104,7 @@ impl QueryPlanner {
     pub fn new(engine: Arc<MVCCEngine>) -> Self {
         Self {
             engine,
-            stats_cache: std::sync::RwLock::new(FxHashMap::default()),
+            stats_cache: std::sync::RwLock::new(StringMap::new()),
         }
     }
 
@@ -272,7 +272,7 @@ impl QueryPlanner {
         let column_stats = if has_column_stats {
             self.read_column_stats(&*tx, table_name)?
         } else {
-            FxHashMap::default()
+            StringMap::new()
         };
 
         // Cache the stats with current timestamp
@@ -347,8 +347,8 @@ impl QueryPlanner {
         &self,
         tx: &dyn Transaction,
         table_name: &str,
-    ) -> Result<FxHashMap<String, ColumnStatsCache>> {
-        let mut stats = FxHashMap::default();
+    ) -> Result<StringMap<ColumnStatsCache>> {
+        let mut stats = StringMap::new();
 
         let stats_table = match tx.get_table(SYS_COLUMN_STATS) {
             Ok(t) => t,

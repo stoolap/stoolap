@@ -30,10 +30,10 @@
 
 use crate::common::SmartString;
 use ahash::AHashSet;
-use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
-use crate::common::{CompactArc, CompactVec};
+use crate::common::{CompactArc, CompactVec, StringMap};
 use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
@@ -57,7 +57,7 @@ pub type CteData = (CompactArc<Vec<String>>, CompactArc<Vec<(i64, Row)>>);
 /// Type alias for CTE data map
 /// Uses CompactArc<Vec<String>> for columns and CompactArc<Vec<(i64, Row)>> for rows
 /// to enable zero-copy sharing of CTE results with joins
-pub type CteDataMap = FxHashMap<String, CteData>;
+pub type CteDataMap = StringMap<CteData>;
 
 /// Type alias for join data result (left_columns, left_rows, right_columns, right_rows)
 /// Uses Arc for zero-copy sharing of CTE results with join operators
@@ -142,7 +142,7 @@ impl CteRegistry {
     /// Create a new CTE registry
     pub fn new() -> Self {
         Self {
-            data: Arc::new(FxHashMap::default()),
+            data: Arc::new(StringMap::new()),
         }
     }
 
@@ -937,7 +937,8 @@ impl Executor {
 
                 if let Some(idx) = cte_col_idx {
                     // Extract distinct non-NULL values from CTE
-                    let mut seen: AHashSet<Value> = AHashSet::with_capacity(cte_rows.len());
+                    let mut seen: FxHashSet<Value> =
+                        FxHashSet::with_capacity_and_hasher(cte_rows.len(), Default::default());
 
                     // Iterate over CompactArc<Vec<(i64, Row)>> by dereferencing
                     for (_, row) in cte_rows.iter() {
@@ -1560,8 +1561,7 @@ impl Executor {
             .ok()?;
 
         // Build map from pre-computed lowercase names
-        let cte_defs: FxHashMap<String, &CommonTableExpression> =
-            cte_names_lower.iter().cloned().collect();
+        let cte_defs: StringMap<&CommonTableExpression> = cte_names_lower.iter().cloned().collect();
         let cte_name_set: AHashSet<&str> = cte_defs.keys().map(|s| s.as_str()).collect();
 
         // Check if any CTE references another CTE (CTE chaining)
@@ -1577,9 +1577,9 @@ impl Executor {
 
         // Count CTE references in the main query using pre-computed names
         // Separate counts for table expressions (JOIN targets) vs WHERE clause subqueries
-        let mut table_ref_counts: FxHashMap<String, usize> =
+        let mut table_ref_counts: StringMap<usize> =
             cte_defs.keys().map(|name| (name.clone(), 0)).collect();
-        let mut where_ref_counts: FxHashMap<String, usize> = table_ref_counts.clone();
+        let mut where_ref_counts: StringMap<usize> = table_ref_counts.clone();
 
         // Count references in table expression (FROM/JOIN)
         self.count_cte_references_in_expr(table_expr, &mut table_ref_counts);
@@ -1689,7 +1689,7 @@ impl Executor {
     fn count_cte_references_in_stmt(
         &self,
         stmt: &SelectStatement,
-        ref_counts: &mut FxHashMap<String, usize>,
+        ref_counts: &mut StringMap<usize>,
     ) {
         // Check table expression
         if let Some(ref table_expr) = stmt.table_expr {
@@ -1708,11 +1708,7 @@ impl Executor {
     }
 
     /// Count CTE references in an expression
-    fn count_cte_references_in_expr(
-        &self,
-        expr: &Expression,
-        ref_counts: &mut FxHashMap<String, usize>,
-    ) {
+    fn count_cte_references_in_expr(&self, expr: &Expression, ref_counts: &mut StringMap<usize>) {
         match expr {
             Expression::CteReference(cte_ref) => {
                 let name: &str = cte_ref.name.value_lower.as_str();
@@ -1768,7 +1764,7 @@ impl Executor {
     fn try_inline_cte_references(
         &self,
         expr: &Expression,
-        cte_defs: &FxHashMap<String, &CommonTableExpression>,
+        cte_defs: &StringMap<&CommonTableExpression>,
     ) -> Option<Expression> {
         match expr {
             Expression::CteReference(cte_ref) => {
@@ -2127,8 +2123,8 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         with_clause: &WithClause,
-    ) -> FxHashMap<String, CtePushdownHint> {
-        let mut hints = FxHashMap::default();
+    ) -> StringMap<CtePushdownHint> {
+        let mut hints = StringMap::new();
 
         // Must have a LIMIT on the main query
         let main_limit = match &stmt.limit {

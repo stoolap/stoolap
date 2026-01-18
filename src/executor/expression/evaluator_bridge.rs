@@ -32,7 +32,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::api::params::ParamVec;
-use crate::common::CompactArc;
+use crate::common::{CompactArc, StringMap};
 use lru::LruCache;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -451,7 +451,7 @@ impl RowFilter {
         columns: &[String],
         aliases: &[(String, usize)],
     ) -> Result<Self> {
-        let alias_map: FxHashMap<String, u16> = aliases
+        let alias_map: StringMap<u16> = aliases
             .iter()
             .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
             .collect();
@@ -751,7 +751,7 @@ impl ExpressionEval {
         columns: &[String],
         aliases: &[(String, usize)],
     ) -> Result<Self> {
-        let alias_map: FxHashMap<String, u16> = aliases
+        let alias_map: StringMap<u16> = aliases
             .iter()
             .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
             .collect();
@@ -772,7 +772,7 @@ impl ExpressionEval {
         columns: &[String],
         columns2: Option<&[String]>,
         outer_columns: Option<&[String]>,
-        expression_aliases: Option<FxHashMap<String, u16>>,
+        expression_aliases: Option<StringMap<u16>>,
         function_registry: &FunctionRegistry,
     ) -> Result<Self> {
         let mut ctx = CompileContext::new(columns, function_registry);
@@ -1016,7 +1016,7 @@ impl MultiExpressionEval {
         columns: &[String],
         aliases: &[(String, usize)],
     ) -> Result<Self> {
-        let alias_map: FxHashMap<String, u16> = aliases
+        let alias_map: StringMap<u16> = aliases
             .iter()
             .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
             .collect();
@@ -1192,10 +1192,10 @@ pub struct CompiledEvaluator<'a> {
     transaction_id: Option<u64>,
 
     /// Expression aliases for HAVING clause
-    expression_aliases: FxHashMap<String, u16>,
+    expression_aliases: StringMap<u16>,
 
     /// Column aliases
-    column_aliases: FxHashMap<String, String>,
+    column_aliases: StringMap<String>,
 
     /// VM instance (reusable)
     vm: ExprVM,
@@ -1227,8 +1227,8 @@ impl<'a> CompiledEvaluator<'a> {
             named_params: Arc::new(FxHashMap::default()),
             outer_row: None,
             transaction_id: None,
-            expression_aliases: FxHashMap::default(),
-            column_aliases: FxHashMap::default(),
+            expression_aliases: StringMap::new(),
+            column_aliases: StringMap::new(),
             vm: ExprVM::new(),
             local_cache: FxHashMap::default(),
             current_row: None,

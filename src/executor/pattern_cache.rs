@@ -33,8 +33,9 @@
 
 use memchr::memmem;
 use regex::Regex;
-use rustc_hash::FxHashMap;
 use std::sync::RwLock;
+
+use crate::common::StringMap;
 
 /// Maximum number of patterns to cache (LRU eviction when exceeded)
 const MAX_CACHE_SIZE: usize = 10_000;
@@ -142,14 +143,14 @@ struct CacheEntry {
 
 /// Thread-safe global cache for compiled LIKE patterns
 pub struct PatternCache {
-    cache: RwLock<FxHashMap<String, CacheEntry>>,
+    cache: RwLock<StringMap<CacheEntry>>,
 }
 
 impl PatternCache {
     /// Create a new pattern cache
     pub fn new() -> Self {
         Self {
-            cache: RwLock::new(FxHashMap::default()),
+            cache: RwLock::new(StringMap::new()),
         }
     }
 

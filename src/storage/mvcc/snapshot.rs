@@ -25,8 +25,7 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use rustc_hash::FxHashSet;
-
+use crate::common::I64Set;
 use crate::core::{DataType, Error, Result, Schema, SchemaColumn};
 use crate::storage::mvcc::persistence::{deserialize_row_version, serialize_row_version};
 use crate::storage::mvcc::version_store::RowVersion;
@@ -908,7 +907,7 @@ pub struct SnapshotReader {
     /// Index mapping row_id -> file offset (BTreeMap for ordered access)
     index: BTreeMap<i64, u64>,
     /// Track which row_ids have been loaded to memory
-    loaded_row_ids: RwLock<FxHashSet<i64>>,
+    loaded_row_ids: RwLock<I64Set>,
     /// Length buffer for reuse
     len_buffer: [u8; 4],
 }
@@ -1057,7 +1056,7 @@ impl SnapshotReader {
             footer,
             schema,
             index,
-            loaded_row_ids: RwLock::new(FxHashSet::default()),
+            loaded_row_ids: RwLock::new(I64Set::new()),
             len_buffer: [0u8; 4],
         })
     }
@@ -1108,7 +1107,7 @@ impl SnapshotReader {
         if self
             .loaded_row_ids
             .read()
-            .map(|s| s.contains(&row_id))
+            .map(|s| s.contains(row_id))
             .unwrap_or(false)
         {
             return false; // Already in memory
@@ -1136,7 +1135,7 @@ impl SnapshotReader {
         // Check if already loaded
         {
             let loaded = self.loaded_row_ids.read().ok()?;
-            if loaded.contains(&row_id) {
+            if loaded.contains(row_id) {
                 return None; // Already loaded
             }
         }
@@ -1254,7 +1253,7 @@ impl SnapshotReader {
     pub fn is_loaded(&self, row_id: i64) -> bool {
         self.loaded_row_ids
             .read()
-            .map(|s| s.contains(&row_id))
+            .map(|s| s.contains(row_id))
             .unwrap_or(false)
     }
 

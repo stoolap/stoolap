@@ -42,10 +42,11 @@
 //! ```
 
 use std::cell::RefCell;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use lru::LruCache;
 use memchr::memmem;
-use rustc_hash::FxHashMap;
 
 use chrono::{DateTime, Utc};
 
@@ -61,21 +62,23 @@ use super::logical::{AndExpr, ConstBoolExpr, NotExpr, OrExpr};
 use super::null_check::NullCheckExpr;
 use super::Expression;
 
-// Thread-local cache for compiled regex patterns to avoid recompilation
+/// Maximum number of cached regex patterns per thread
+const REGEX_CACHE_SIZE: usize = 128;
+
+// Thread-local LRU cache for compiled regex patterns to avoid recompilation
 thread_local! {
-    static REGEX_CACHE: RefCell<FxHashMap<String, regex::Regex>> = RefCell::new(FxHashMap::default());
+    static REGEX_CACHE: RefCell<LruCache<String, regex::Regex>> =
+        RefCell::new(LruCache::new(NonZeroUsize::new(REGEX_CACHE_SIZE).unwrap()));
 }
 
 /// Clear the thread-local regex cache to release memory
 pub fn clear_regex_cache() {
     REGEX_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
+        cache.borrow_mut().clear();
     });
 }
 
-/// Get or compile a regex pattern, using thread-local cache
+/// Get or compile a regex pattern, using thread-local LRU cache
 fn get_or_compile_regex(pattern: &str) -> regex::Regex {
     REGEX_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -83,7 +86,7 @@ fn get_or_compile_regex(pattern: &str) -> regex::Regex {
             return regex.clone();
         }
         let regex = regex::Regex::new(pattern).unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
-        cache.insert(pattern.to_string(), regex.clone());
+        cache.put(pattern.to_string(), regex.clone());
         regex
     })
 }

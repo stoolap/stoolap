@@ -21,8 +21,7 @@ use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 
-use crate::common::CompactArc;
-use rustc_hash::FxHashMap;
+use crate::common::{CompactArc, StringMap};
 
 use super::error::{Error, Result};
 use super::types::DataType;
@@ -200,7 +199,7 @@ pub struct Schema {
     pk_column_index_cache: OnceLock<Option<usize>>,
 
     /// Cached column index map (lowercase name -> index) for O(1) column lookup
-    column_index_map_cache: OnceLock<FxHashMap<String, usize>>,
+    column_index_map_cache: OnceLock<StringMap<usize>>,
 
     /// Cached primary key indices (computed lazily on first access)
     pk_indices_cache: OnceLock<Arc<Vec<usize>>>,
@@ -472,7 +471,7 @@ impl Schema {
     /// Get a cached map of lowercase column names to their indices
     /// OPTIMIZATION: Cached to avoid creating this map on every query
     #[inline]
-    pub fn column_index_map(&self) -> &FxHashMap<String, usize> {
+    pub fn column_index_map(&self) -> &StringMap<usize> {
         self.column_index_map_cache.get_or_init(|| {
             self.columns
                 .iter()

@@ -1,5 +1,5 @@
 // Copyright 2025 Stoolap Contributors
-use ahash::AHashSet;
+use rustc_hash::FxHashSet;
 
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -174,7 +174,7 @@ fn test_arithmetic() {
 fn test_in_set() {
     let mut vm = ExprVM::new();
 
-    let set: AHashSet<Value> = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+    let set: FxHashSet<Value> = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
         .into_iter()
         .collect();
 

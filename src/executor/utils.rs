@@ -27,6 +27,8 @@ use std::sync::{Arc, LazyLock};
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
+use crate::common::StringMap;
+
 use crate::core::value::NULL_VALUE;
 use crate::core::{DataType, Operator, Row, Value};
 use crate::parser::ast::{
@@ -334,7 +336,7 @@ fn substitute_outer_references_inner(
 /// Build a column name to index map for fast column lookups.
 /// Column names are lowercased for case-insensitive matching.
 #[inline]
-pub fn build_column_index_map(columns: &[String]) -> FxHashMap<String, usize> {
+pub fn build_column_index_map(columns: &[String]) -> StringMap<usize> {
     columns
         .iter()
         .enumerate()

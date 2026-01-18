@@ -507,6 +507,15 @@ impl Ord for SmartString {
 impl Hash for SmartString {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
+        // IMPORTANT: Must delegate to str::hash to maintain Hash-Borrow contract.
+        // SmartString implements Borrow<str>, so its hash must match str's hash
+        // for the same content. This allows HashMap lookups with &str keys.
+        //
+        // Unlike Value (which has no Borrow impl), we cannot use WyMix pre-mixing
+        // here as it would break compatibility with str lookups.
+        //
+        // For best performance with SmartString keys, use AHashMap which handles
+        // strings efficiently without needing pre-mixing.
         self.as_str().hash(state);
     }
 }

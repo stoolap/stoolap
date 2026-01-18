@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use crate::common::CompactArc;
 use crate::common::SmartString;
-use ahash::{AHashMap, AHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::{Error, Result, Value};
 use crate::parser::ast::*;
@@ -222,8 +222,8 @@ impl Executor {
                         // Single-column IN - use InHashSet for O(1) lookups
                         let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
 
-                        // Collect into AHashSet for O(1) membership testing (better for Value types)
-                        let hash_set: AHashSet<Value> = values.into_iter().collect();
+                        // Collect into FxHashSet for O(1) membership testing (optimized for Value types with WyMix)
+                        let hash_set: FxHashSet<Value> = values.into_iter().collect();
 
                         // Use InHashSet with Arc for fast O(1) lookup per row
                         return Ok(Expression::InHashSet(InHashSetExpression {
@@ -987,7 +987,7 @@ impl Executor {
         &self,
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
-    ) -> Result<Option<CompactArc<AHashMap<Value, Value>>>> {
+    ) -> Result<Option<CompactArc<FxHashMap<Value, Value>>>> {
         // Must have single aggregate column
         if subquery.columns.len() != 1 {
             return Ok(None);
@@ -1083,7 +1083,7 @@ impl Executor {
         let mut result = self.execute_select(&batch_query, &subquery_ctx)?;
 
         // Build the result map - use take_row() to avoid cloning
-        let mut result_map: AHashMap<Value, Value> = AHashMap::new();
+        let mut result_map: FxHashMap<Value, Value> = FxHashMap::default();
         while result.next() {
             let row = result.take_row();
             if row.len() >= 2 {
@@ -2071,9 +2071,9 @@ impl Executor {
                 let processed_left = self.process_correlated_expression(&in_expr.left, ctx)?;
 
                 if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
-                    // Use InHashSet for O(1) lookups with FxHash (optimized for trusted keys)
+                    // Use InHashSet for O(1) lookups with FxHash (optimized for Value types with WyMix)
                     let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
-                    let hash_set: AHashSet<Value> = values.into_iter().collect();
+                    let hash_set: FxHashSet<Value> = values.into_iter().collect();
 
                     return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
@@ -2357,9 +2357,9 @@ impl Executor {
                 let processed_left = self.process_correlated_where(&in_expr.left, ctx)?;
 
                 if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
-                    // Use InHashSet for O(1) lookups with FxHash (optimized for trusted keys)
+                    // Use InHashSet for O(1) lookups with FxHash (optimized for Value types with WyMix)
                     let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
-                    let hash_set: AHashSet<Value> = values.into_iter().collect();
+                    let hash_set: FxHashSet<Value> = values.into_iter().collect();
 
                     return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
@@ -2789,7 +2789,7 @@ impl Executor {
     /// Instead of executing the subquery for each outer row, we:
     /// 1. Execute the inner query once with non-correlated predicates
     /// 2. Collect all distinct values of the inner correlation column
-    /// 3. Return an AHashSet for fast O(1) lookups
+    /// 3. Return an FxHashSet for fast O(1) lookups
     ///
     /// Results are cached to avoid re-execution for the same query within a single
     /// top-level query execution.
@@ -2797,7 +2797,7 @@ impl Executor {
         &self,
         info: &SemiJoinInfo,
         ctx: &ExecutionContext,
-    ) -> Result<CompactArc<AHashSet<crate::core::Value>>> {
+    ) -> Result<CompactArc<FxHashSet<crate::core::Value>>> {
         // Build cache key hash from inner table, column, and WHERE predicate hash
         // Uses u64 hash to avoid any string allocation
         let pred_hash = info
@@ -2859,8 +2859,8 @@ impl Executor {
         let subquery_ctx = ctx.with_incremented_query_depth();
         let mut result = self.execute_select(&select_stmt, &subquery_ctx)?;
 
-        // Collect values into Vec first (faster than direct AHashSet insertion),
-        // then convert to AHashSet for deduplication and O(1) lookups
+        // Collect values into Vec first (faster than direct FxHashSet insertion),
+        // then convert to FxHashSet for deduplication and O(1) lookups
         let mut values_vec = Vec::with_capacity(10_000);
         while result.next() {
             let row = result.row();
@@ -2870,8 +2870,8 @@ impl Executor {
                 }
             }
         }
-        // Build AHashSet from Vec - this deduplicates automatically
-        let hash_set: AHashSet<crate::core::Value> = values_vec.into_iter().collect();
+        // Build FxHashSet from Vec - this deduplicates automatically
+        let hash_set: FxHashSet<crate::core::Value> = values_vec.into_iter().collect();
 
         // Wrap in CompactArc once - no cloning needed
         let hash_set_arc = CompactArc::new(hash_set);
@@ -2946,7 +2946,8 @@ impl Executor {
         // Use a HashSet for deduplication to minimize the build side
         // Cap initial capacity to avoid over-allocation when many rows have few unique keys
         let estimated_unique = inner_all_rows.len().min(10000);
-        let mut seen: AHashSet<crate::core::Value> = AHashSet::with_capacity(estimated_unique);
+        let mut seen: FxHashSet<crate::core::Value> =
+            FxHashSet::with_capacity_and_hasher(estimated_unique, Default::default());
         let mut inner_rows: Vec<crate::core::Row> = Vec::with_capacity(estimated_unique);
 
         for (_, row) in &inner_all_rows {
@@ -3043,7 +3044,7 @@ impl Executor {
     /// Replaces: EXISTS (SELECT ...) with: outer_col IN (hash_set_values)
     pub fn transform_exists_to_in_list(
         info: &SemiJoinInfo,
-        hash_set: CompactArc<AHashSet<crate::core::Value>>,
+        hash_set: CompactArc<FxHashSet<crate::core::Value>>,
     ) -> Expression {
         // For empty hash set, return FALSE (no matches exist)
         // For NOT EXISTS with empty set, return TRUE (nothing exists to negate)
