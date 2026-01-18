@@ -30,11 +30,10 @@
 
 use crate::common::SmartString;
 use ahash::AHashSet;
-use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 use crate::common::{CompactArc, CompactVec, StringMap};
-use crate::core::{Error, Result, Row, RowVec, Value};
+use crate::core::{Error, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
@@ -937,8 +936,7 @@ impl Executor {
 
                 if let Some(idx) = cte_col_idx {
                     // Extract distinct non-NULL values from CTE
-                    let mut seen: FxHashSet<Value> =
-                        FxHashSet::with_capacity_and_hasher(cte_rows.len(), Default::default());
+                    let mut seen: ValueSet = ValueSet::with_capacity(cte_rows.len());
 
                     // Iterate over CompactArc<Vec<(i64, Row)>> by dereferencing
                     for (_, row) in cte_rows.iter() {

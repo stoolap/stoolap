@@ -23,9 +23,8 @@ use std::sync::Arc;
 
 use crate::common::CompactArc;
 use crate::common::SmartString;
-use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::core::{Error, Result, Value};
+use crate::core::{Error, Result, Value, ValueMap, ValueSet};
 use crate::parser::ast::*;
 use crate::parser::token::TokenType;
 use crate::storage::traits::Engine;
@@ -223,7 +222,7 @@ impl Executor {
                         let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
 
                         // Collect into FxHashSet for O(1) membership testing (optimized for Value types with WyMix)
-                        let hash_set: FxHashSet<Value> = values.into_iter().collect();
+                        let hash_set: ValueSet = values.into_iter().collect();
 
                         // Use InHashSet with Arc for fast O(1) lookup per row
                         return Ok(Expression::InHashSet(InHashSetExpression {
@@ -987,7 +986,7 @@ impl Executor {
         &self,
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
-    ) -> Result<Option<CompactArc<FxHashMap<Value, Value>>>> {
+    ) -> Result<Option<CompactArc<ValueMap<Value>>>> {
         // Must have single aggregate column
         if subquery.columns.len() != 1 {
             return Ok(None);
@@ -1083,7 +1082,7 @@ impl Executor {
         let mut result = self.execute_select(&batch_query, &subquery_ctx)?;
 
         // Build the result map - use take_row() to avoid cloning
-        let mut result_map: FxHashMap<Value, Value> = FxHashMap::default();
+        let mut result_map: ValueMap<Value> = ValueMap::default();
         while result.next() {
             let row = result.take_row();
             if row.len() >= 2 {
@@ -2073,7 +2072,7 @@ impl Executor {
                 if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
                     // Use InHashSet for O(1) lookups with FxHash (optimized for Value types with WyMix)
                     let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
-                    let hash_set: FxHashSet<Value> = values.into_iter().collect();
+                    let hash_set: ValueSet = values.into_iter().collect();
 
                     return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
@@ -2359,7 +2358,7 @@ impl Executor {
                 if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
                     // Use InHashSet for O(1) lookups with FxHash (optimized for Value types with WyMix)
                     let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
-                    let hash_set: FxHashSet<Value> = values.into_iter().collect();
+                    let hash_set: ValueSet = values.into_iter().collect();
 
                     return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
@@ -2797,7 +2796,7 @@ impl Executor {
         &self,
         info: &SemiJoinInfo,
         ctx: &ExecutionContext,
-    ) -> Result<CompactArc<FxHashSet<crate::core::Value>>> {
+    ) -> Result<CompactArc<ValueSet>> {
         // Build cache key hash from inner table, column, and WHERE predicate hash
         // Uses u64 hash to avoid any string allocation
         let pred_hash = info
@@ -2871,7 +2870,7 @@ impl Executor {
             }
         }
         // Build FxHashSet from Vec - this deduplicates automatically
-        let hash_set: FxHashSet<crate::core::Value> = values_vec.into_iter().collect();
+        let hash_set: ValueSet = values_vec.into_iter().collect();
 
         // Wrap in CompactArc once - no cloning needed
         let hash_set_arc = CompactArc::new(hash_set);
@@ -2946,8 +2945,7 @@ impl Executor {
         // Use a HashSet for deduplication to minimize the build side
         // Cap initial capacity to avoid over-allocation when many rows have few unique keys
         let estimated_unique = inner_all_rows.len().min(10000);
-        let mut seen: FxHashSet<crate::core::Value> =
-            FxHashSet::with_capacity_and_hasher(estimated_unique, Default::default());
+        let mut seen: ValueSet = ValueSet::with_capacity(estimated_unique);
         let mut inner_rows: Vec<crate::core::Row> = Vec::with_capacity(estimated_unique);
 
         for (_, row) in &inner_all_rows {
@@ -3044,7 +3042,7 @@ impl Executor {
     /// Replaces: EXISTS (SELECT ...) with: outer_col IN (hash_set_values)
     pub fn transform_exists_to_in_list(
         info: &SemiJoinInfo,
-        hash_set: CompactArc<FxHashSet<crate::core::Value>>,
+        hash_set: CompactArc<ValueSet>,
     ) -> Expression {
         // For empty hash set, return FALSE (no matches exist)
         // For NOT EXISTS with empty set, return TRUE (nothing exists to negate)

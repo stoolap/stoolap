@@ -3227,8 +3227,8 @@ impl Default for ExprVM {
 mod tests {
     use super::*;
     use crate::common::CompactArc;
+    use crate::core::ValueSet;
     use crate::Row;
-    use rustc_hash::FxHashSet;
 
     #[test]
     fn test_simple_comparison() {
@@ -3279,7 +3279,7 @@ mod tests {
     #[test]
     fn test_in_set() {
         let mut vm = ExprVM::new();
-        let set: FxHashSet<Value> = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+        let set: ValueSet = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
             .into_iter()
             .collect();
 
@@ -4131,7 +4131,7 @@ mod tests {
     #[test]
     fn test_not_in_set() {
         let mut vm = ExprVM::new();
-        let set: FxHashSet<Value> = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+        let set: ValueSet = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
             .into_iter()
             .collect();
 
@@ -4153,7 +4153,7 @@ mod tests {
     #[test]
     fn test_in_set_with_null() {
         let mut vm = ExprVM::new();
-        let set: FxHashSet<Value> = [Value::Integer(1), Value::Integer(2)].into_iter().collect();
+        let set: ValueSet = [Value::Integer(1), Value::Integer(2)].into_iter().collect();
 
         // has_null = true means the set conceptually contains NULL
         let program = Program::new(vec![
@@ -4176,7 +4176,7 @@ mod tests {
     #[test]
     fn test_in_set_column() {
         let mut vm = ExprVM::new();
-        let set: FxHashSet<Value> = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+        let set: ValueSet = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
             .into_iter()
             .collect();
 

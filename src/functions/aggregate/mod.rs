@@ -61,17 +61,15 @@ pub use statistics::{
 pub use string_agg::{GroupConcatFunction, StringAggFunction};
 pub use sum::SumFunction;
 
-use crate::core::Value;
-use rustc_hash::FxHashSet;
+use crate::core::{Value, ValueSet};
 
 /// Helper struct for tracking distinct values
 ///
-/// Uses FxHashSet<Value> directly instead of converting to strings,
+/// Uses ValueSet directly instead of converting to strings,
 /// avoiding allocation overhead for each value.
-/// FxHash performs well with Value keys (optimized with WyMix pre-mixing).
 #[derive(Default, Debug)]
 pub struct DistinctTracker {
-    seen: FxHashSet<Value>,
+    seen: ValueSet,
 }
 
 impl DistinctTracker {

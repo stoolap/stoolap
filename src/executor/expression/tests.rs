@@ -1,5 +1,4 @@
 // Copyright 2025 Stoolap Contributors
-use rustc_hash::FxHashSet;
 
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,7 +25,7 @@ use super::compiler::{CompileContext, ExprCompiler};
 use super::ops::{CompiledPattern, Op};
 use super::program::Program;
 use super::vm::{ExecuteContext, ExprVM};
-use crate::core::Value;
+use crate::core::{Value, ValueSet};
 use crate::Row;
 
 #[test]
@@ -174,7 +173,7 @@ fn test_arithmetic() {
 fn test_in_set() {
     let mut vm = ExprVM::new();
 
-    let set: FxHashSet<Value> = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+    let set: ValueSet = [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
         .into_iter()
         .collect();
 

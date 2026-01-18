@@ -41,6 +41,14 @@ pub use types::{DataType, IndexEntry, IndexType, IsolationLevel, Operator};
 pub use value::{parse_timestamp, Value, NULL_VALUE};
 pub use value_interner::{intern_value, interned_bool, interned_int, interned_null};
 
+use ahash::{AHashMap, AHashSet};
+
+/// Hash map for Value keys with randomized hashing (HashDoS resistant)
+pub type ValueMap<V> = AHashMap<Value, V>;
+
+/// Hash set for Value keys with randomized hashing (HashDoS resistant)
+pub type ValueSet = AHashSet<Value>;
+
 #[cfg(test)]
 mod integration_tests {
     use super::*;

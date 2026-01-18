@@ -32,7 +32,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::ops::{CompareOp, CompiledPattern, Op};
 use super::program::{Program, ProgramBuilder};
-use crate::core::{DataType, Value};
+use crate::core::{DataType, Value, ValueSet};
 use crate::executor::utils::{expression_to_string, string_to_datatype};
 use crate::functions::{global_registry, FunctionRegistry};
 use crate::parser::ast::*;
@@ -1043,7 +1043,7 @@ impl<'a> ExprCompiler<'a> {
 
         // Single-value IN expression
         // Build the set of values at compile time if possible
-        let mut values = FxHashSet::default();
+        let mut values = ValueSet::default();
         let mut has_null = false;
         let mut all_constant = true;
 

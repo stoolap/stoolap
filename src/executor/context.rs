@@ -18,7 +18,7 @@
 //! parameter handling, transaction state, and query options.
 
 use lru::LruCache;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
@@ -34,7 +34,7 @@ const SEMI_JOIN_CACHE_SIZE: usize = 256;
 
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, StringMap};
-use crate::core::{Result, Row, Value};
+use crate::core::{Result, Row, Value, ValueMap, ValueSet};
 
 // Static defaults for ExecutionContext to avoid allocations for empty values.
 // These are shared across all contexts and only require Arc refcount bump on clone.
@@ -202,7 +202,7 @@ use ahash::AHashMap;
 use std::hash::{Hash, Hasher};
 
 /// Cached semi-join entry: (table_name for invalidation, hash_set values)
-type SemiJoinCacheEntry = (Arc<str>, CompactArc<FxHashSet<Value>>);
+type SemiJoinCacheEntry = (Arc<str>, CompactArc<ValueSet>);
 
 /// Compute a cache key hash from table, column, and predicate hash without allocation.
 #[inline]
@@ -251,7 +251,7 @@ pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
 
 /// Get a cached semi-join hash set by key hash.
 #[inline]
-pub fn get_cached_semi_join(key_hash: u64) -> Option<CompactArc<FxHashSet<Value>>> {
+pub fn get_cached_semi_join(key_hash: u64) -> Option<CompactArc<ValueSet>> {
     SEMI_JOIN_CACHE.with(|cache| {
         cache
             .borrow_mut()
@@ -262,7 +262,7 @@ pub fn get_cached_semi_join(key_hash: u64) -> Option<CompactArc<FxHashSet<Value>
 
 /// Cache a semi-join hash set result (Arc version for zero-copy).
 #[inline]
-pub fn cache_semi_join_arc(key_hash: u64, table: &str, values: CompactArc<FxHashSet<Value>>) {
+pub fn cache_semi_join_arc(key_hash: u64, table: &str, values: CompactArc<ValueSet>) {
     SEMI_JOIN_CACHE.with(|cache| {
         cache.borrow_mut().put(key_hash, (Arc::from(table), values));
     });
@@ -434,7 +434,7 @@ pub fn cache_exists_pred_key(subquery_ptr: usize, pred_key: String) {
 // Thread-local to avoid synchronization overhead.
 // The key is a stable identifier for the subquery, the value is a map from group key to aggregate value.
 thread_local! {
-    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, CompactArc<FxHashMap<Value, Value>>>> = RefCell::new(FxHashMap::default());
+    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, CompactArc<ValueMap<Value>>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the batch aggregate cache. Should be called at the start of each top-level query.
@@ -447,12 +447,12 @@ pub fn clear_batch_aggregate_cache() {
 }
 
 /// Get a cached batch aggregate result map by subquery identifier.
-pub fn get_cached_batch_aggregate(key: &str) -> Option<CompactArc<FxHashMap<Value, Value>>> {
+pub fn get_cached_batch_aggregate(key: &str) -> Option<CompactArc<ValueMap<Value>>> {
     BATCH_AGGREGATE_CACHE.with(|cache| cache.borrow().get(key).cloned())
 }
 
 /// Cache a batch aggregate result map.
-pub fn cache_batch_aggregate(key: String, values: FxHashMap<Value, Value>) {
+pub fn cache_batch_aggregate(key: String, values: ValueMap<Value>) {
     BATCH_AGGREGATE_CACHE.with(|cache| {
         cache.borrow_mut().insert(key, CompactArc::new(values));
     });

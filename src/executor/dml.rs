@@ -22,7 +22,7 @@
 use crate::common::CompactArc;
 use crate::common::I64Set;
 use crate::common::SmartString;
-use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value};
+use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueMap};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::traits::{Engine, QueryResult, Table};
@@ -1184,8 +1184,7 @@ impl Executor {
 
             // Pre-compute values for all rows
             // Map: pk_value -> Vec<(col_idx, new_value)>
-            // OPTIMIZATION: Use FxHashMap for Value keys (optimized with WyMix pre-mixing)
-            let mut precomputed: FxHashMap<Value, Vec<(usize, Value)>> = FxHashMap::default();
+            let mut precomputed: ValueMap<Vec<(usize, Value)>> = ValueMap::default();
 
             // Build column indices for scanning (all columns)
             let all_col_indices: Vec<usize> = (0..column_names.len()).collect();

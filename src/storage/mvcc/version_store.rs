@@ -48,6 +48,7 @@ use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::mvcc::streaming_result::{StreamingResult, VisibleRowInfo};
 use crate::storage::Index;
 // radsort removed - BTreeMap iteration is already ordered
+use ahash::AHashMap;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{smallvec, SmallVec};
@@ -90,6 +91,9 @@ impl std::hash::Hash for GroupKey {
         }
     }
 }
+
+/// Hash map for GroupKey with randomized hashing (HashDoS resistant)
+type GroupKeyMap<V> = AHashMap<GroupKey, V>;
 
 /// Result of storage-level grouped aggregation
 #[derive(Debug, Clone)]
@@ -4740,8 +4744,6 @@ impl VersionStore {
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
     ) -> Vec<GroupedAggregateResult> {
-        use rustc_hash::FxHashMap;
-
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -4885,7 +4887,7 @@ impl VersionStore {
             // Separate NULL accumulator - avoids creating GroupKey for NULL
             let mut null_accums: Option<Vec<Accum>> = None;
             // Only used for String/other types that can't be mapped to i64
-            let mut other_groups: FxHashMap<GroupKey, Vec<Accum>> = FxHashMap::default();
+            let mut other_groups: GroupKeyMap<Vec<Accum>> = GroupKeyMap::default();
 
             for (idx, meta) in arena_meta.iter().enumerate() {
                 // Visibility check
@@ -5002,7 +5004,7 @@ impl VersionStore {
         }
 
         // SLOW PATH: Multi-column GROUP BY (currently not used from try_storage_aggregation)
-        let mut groups: FxHashMap<GroupKey, Vec<Accum>> = FxHashMap::default();
+        let mut groups: GroupKeyMap<Vec<Accum>> = GroupKeyMap::default();
 
         for (idx, meta) in arena_meta.iter().enumerate() {
             // Visibility check

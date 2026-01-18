@@ -30,7 +30,7 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 // SmallVec removed - Vec is faster due to spilled() check overhead in hot loops
 
 use crate::common::{CompactArc, CompactVec, I64Map, StringMap};
-use crate::core::{Result, Row, RowVec, Value};
+use crate::core::{Result, Row, RowVec, Value, ValueMap};
 use crate::functions::aggregate::CompiledAggregate;
 use crate::functions::AggregateFunction;
 use crate::parser::ast::*;
@@ -2357,7 +2357,8 @@ impl Executor {
         // OPTIMIZATION: Use hashbrown::HashMap with Vec<Value> key directly - HashMap handles
         // collisions efficiently with open addressing, avoiding our manual Vec-based collision chaining.
         // Using raw_entry_mut API for O(1) lookup without cloning keys.
-        // OPTIMIZATION: Use FxHasher instead of AHash - much faster hasher creation per row
+        // NOTE: Uses FxHash here because raw_entry_mut().from_hash() requires compatible hasher.
+        // Value::hash() is simple (optimized for AHash), but FxHash still works correctly.
         // Start small - HashMap grows efficiently, over-allocation wastes memory
         let estimated_groups = (rows.len() / 32).clamp(16, 256);
         type FxBuildHasher = BuildHasherDefault<FxHasher>;
@@ -3511,10 +3512,8 @@ impl Executor {
             // OPTIMIZATION: Single-column GROUP BY uses direct hash map (no Vec<Value> overhead)
             if column_indices.len() == 1 {
                 let col_idx = column_indices[0];
-                // Use FxHashMap for Value keys (optimized with WyMix pre-mixing in Value::hash)
-                // Properly handles hash collisions via Value equality
-                let mut single_col_groups: rustc_hash::FxHashMap<Value, Vec<usize>> =
-                    rustc_hash::FxHashMap::default();
+                // Use ValueMap for Value keys (HashDoS resistant with AHash)
+                let mut single_col_groups: ValueMap<Vec<usize>> = ValueMap::default();
 
                 for (row_idx, (_, row)) in rows.iter().enumerate() {
                     let key_value = row
@@ -3544,9 +3543,9 @@ impl Executor {
                 // Tuples are 30% faster than Vec per CLAUDE.md (no heap allocation)
                 let col_idx0 = column_indices[0];
                 let col_idx1 = column_indices[1];
-                // FxHashMap for tuple keys (optimized with WyMix pre-mixing in Value::hash)
-                let mut two_col_groups: rustc_hash::FxHashMap<(Value, Value), Vec<usize>> =
-                    rustc_hash::FxHashMap::default();
+                // AHash for HashDoS resistance (user-controlled GROUP BY keys)
+                let mut two_col_groups: ahash::AHashMap<(Value, Value), Vec<usize>> =
+                    ahash::AHashMap::default();
 
                 for (row_idx, (_, row)) in rows.iter().enumerate() {
                     let key = (

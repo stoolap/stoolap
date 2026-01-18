@@ -23,10 +23,8 @@
 
 use std::sync::Arc;
 
-use rustc_hash::FxHashSet;
-
 use crate::common::{CompactArc, I64Set};
-use crate::core::{Result, Row, RowVec, Value};
+use crate::core::{Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
@@ -1711,12 +1709,7 @@ impl Executor {
     #[allow(clippy::type_complexity)]
     pub(crate) fn extract_in_hashset_info(
         expr: &Expression,
-    ) -> Option<(
-        String,
-        CompactArc<FxHashSet<Value>>,
-        bool,
-        Option<Expression>,
-    )> {
+    ) -> Option<(String, CompactArc<ValueSet>, bool, Option<Expression>)> {
         match expr {
             // Direct InHashSet: column IN {hash_set}
             Expression::InHashSet(in_hash) => {

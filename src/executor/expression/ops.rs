@@ -24,9 +24,8 @@ use std::sync::Arc;
 
 use crate::common::CompactArc;
 use memchr::memmem;
-use rustc_hash::FxHashSet;
 
-use crate::core::{DataType, Value};
+use crate::core::{DataType, Value, ValueSet};
 use crate::functions::{NativeFn1, ScalarFunction};
 
 /// Compiled LIKE/ILIKE pattern for fast matching
@@ -447,7 +446,7 @@ pub enum Op {
 
     /// Fused: column IN (constant set with AHash)
     /// Stack: [] -> [bool]
-    InSetColumn(u16, CompactArc<FxHashSet<Value>>, bool), // col_idx, set, has_null
+    InSetColumn(u16, CompactArc<ValueSet>, bool), // col_idx, set, has_null
 
     /// Fused: column BETWEEN low AND high (constants)
     /// Stack: [] -> [bool]
@@ -572,11 +571,11 @@ pub enum Op {
     // =========================================================================
     /// IN set membership (pre-built FxHashSet for fast lookups)
     /// Stack: [value] -> [bool]
-    InSet(CompactArc<FxHashSet<Value>>, bool), // set, has_null
+    InSet(CompactArc<ValueSet>, bool), // set, has_null
 
     /// NOT IN set membership
     /// Stack: [value] -> [bool]
-    NotInSet(CompactArc<FxHashSet<Value>>, bool), // set, has_null
+    NotInSet(CompactArc<ValueSet>, bool), // set, has_null
 
     /// BETWEEN check: value BETWEEN low AND high
     /// Stack: [value, low, high] -> [bool]
@@ -1523,7 +1522,8 @@ mod tests {
 
     #[test]
     fn test_op_debug_sets() {
-        let set = CompactArc::new(FxHashSet::default());
+        use crate::core::ValueSet;
+        let set = CompactArc::new(ValueSet::default());
         assert!(format!("{:?}", Op::InSet(set.clone(), false)).contains("InSet"));
         assert!(format!("{:?}", Op::NotInSet(set.clone(), true)).contains("NotInSet"));
         assert!(format!("{:?}", Op::InSetColumn(0, set, false)).contains("InSetColumn"));
