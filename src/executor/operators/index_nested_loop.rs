@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use crate::common::{CompactArc, CompactVec, I64Map};
+use crate::common::{CompactVec, I64Map};
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, RowVec, Value};
 use crate::executor::expression::JoinFilter;
@@ -45,14 +45,22 @@ pub enum IndexLookupStrategy {
     PrimaryKey,
 }
 
+/// Specifies which side (outer or inner) a projected column comes from.
+#[derive(Clone, Copy)]
+pub enum ColumnSource {
+    /// Column from outer row at given index
+    Outer(usize),
+    /// Column from inner row at given index
+    Inner(usize),
+}
+
 /// Projection configuration for fused projection during row combination.
 /// When set, the operator creates projected rows directly instead of full combined rows.
+/// Columns are stored in SELECT order (not outer-first/inner-second).
 #[derive(Clone)]
 pub struct JoinProjection {
-    /// Column indices from outer row to include in output
-    pub outer_indices: Vec<usize>,
-    /// Column indices from inner row to include in output
-    pub inner_indices: Vec<usize>,
+    /// Columns to extract, in SELECT order (preserves original column ordering)
+    pub columns: Vec<ColumnSource>,
 }
 
 /// Index Nested Loop Join Operator.
@@ -162,32 +170,24 @@ impl IndexNestedLoopJoinOperator {
     /// rows that would be immediately projected down to fewer columns.
     ///
     /// # Arguments
-    /// * `outer_indices` - Column indices from outer row to include in output
-    /// * `inner_indices` - Column indices from inner row to include in output
+    /// * `columns` - Column sources in SELECT order (preserves original column ordering)
     /// * `projected_schema` - Schema for the projected output
     pub fn with_projection(
         mut self,
-        outer_indices: Vec<usize>,
-        inner_indices: Vec<usize>,
+        columns: Vec<ColumnSource>,
         projected_schema: Vec<ColumnInfo>,
     ) -> Self {
-        self.projection = Some(JoinProjection {
-            outer_indices,
-            inner_indices,
-        });
+        self.projection = Some(JoinProjection { columns });
         self.schema = projected_schema;
         self
     }
 
     /// Create a NULL row for the inner side.
     /// Always creates full-width row so combine() can use consistent indexing.
-    /// Uses Owned storage (Arc values) for compatibility with as_arc_slice() in combine methods.
     #[inline]
     fn null_inner_row(&self) -> Row {
-        let null_arcs: Vec<CompactArc<Value>> = (0..self.inner_col_count)
-            .map(|_| CompactArc::new(NULL_VALUE))
-            .collect();
-        Row::from_arc_values(null_arcs)
+        let null_values: Vec<Value> = (0..self.inner_col_count).map(|_| NULL_VALUE).collect();
+        Row::from_values(null_values)
     }
 
     /// Combine outer and inner rows into reusable buffer (owns both).
@@ -201,49 +201,44 @@ impl IndexNestedLoopJoinOperator {
     fn combine_owned_into_buffer(&mut self, outer: Row, inner: Row) {
         match &self.projection {
             Some(proj) => {
-                // Fused projection into buffer
-                let vec = self.row_buffer.as_mut_arc_vec_with_capacity(
-                    proj.outer_indices.len() + proj.inner_indices.len(),
-                );
-                vec.clear();
+                // Fused projection into buffer - columns are in SELECT order
+                self.row_buffer.clear();
+                self.row_buffer.reserve(proj.columns.len());
 
-                // OPTIMIZATION: Move outer CompactArc<Value> instead of cloning (we own outer)
-                let mut outer_values = outer.into_arc_values();
-                for &idx in &proj.outer_indices {
-                    // SAFETY: outer_indices validated at planning time against outer table schema.
-                    // The planner ensures all indices are within bounds of the outer row's columns.
-                    vec.push(std::mem::take(unsafe {
-                        outer_values.get_unchecked_mut(idx)
-                    }));
-                }
+                // OPTIMIZATION: Move values instead of cloning (we own both rows)
+                let mut outer_values = outer.into_values();
+                let mut inner_values = inner.into_values();
 
-                // OPTIMIZATION: Move inner CompactArc<Value> instead of cloning (we own inner)
-                let mut inner_values = inner.into_arc_values();
-                for &idx in &proj.inner_indices {
-                    // SAFETY: inner_indices validated at planning time against inner table schema.
-                    // The planner ensures all indices are within bounds of the inner row's columns.
-                    vec.push(std::mem::take(unsafe {
-                        inner_values.get_unchecked_mut(idx)
-                    }));
+                for col_source in &proj.columns {
+                    match col_source {
+                        ColumnSource::Outer(idx) => {
+                            // SAFETY: indices validated at planning time against outer table schema.
+                            self.row_buffer.push(std::mem::take(unsafe {
+                                outer_values.get_unchecked_mut(*idx)
+                            }));
+                        }
+                        ColumnSource::Inner(idx) => {
+                            // SAFETY: indices validated at planning time against inner table schema.
+                            self.row_buffer.push(std::mem::take(unsafe {
+                                inner_values.get_unchecked_mut(*idx)
+                            }));
+                        }
+                    }
                 }
             }
             None => {
-                // Use combine_into_arc to keep buffer in Owned (Arc) storage
-                // This prevents type oscillation when take_from_buffer is called
-                self.row_buffer.combine_into_arc(outer, inner);
+                // Combine both rows into buffer
+                self.row_buffer.combine_into_owned(outer, inner);
             }
         }
     }
 
     /// Take the combined row from the buffer, preserving buffer capacity.
-    /// OPTIMIZATION: Replaces buffer contents with new Vec of same capacity,
-    /// enabling allocator reuse and consistent allocation patterns.
+    /// OPTIMIZATION: Uses take_and_clear to keep buffer capacity for next iteration,
+    /// avoiding reallocation in combine_into_owned.
     #[inline]
     fn take_from_buffer(&mut self) -> Row {
-        let vec = self.row_buffer.as_mut_arc_vec_with_capacity(0);
-        let capacity = vec.capacity();
-        let values = std::mem::replace(vec, CompactVec::with_capacity(capacity));
-        Row::from_arc_values(values.into_vec())
+        self.row_buffer.take_and_clear()
     }
 
     /// Create combined row directly (for cases where buffer can't be used).
@@ -256,37 +251,29 @@ impl IndexNestedLoopJoinOperator {
     fn create_combined_row(&self, outer: &Row, inner: Row) -> Row {
         match &self.projection {
             Some(proj) => {
-                // Fused projection: create only the columns we need
-                let total = proj.outer_indices.len() + proj.inner_indices.len();
-                let mut values = Vec::with_capacity(total);
+                // Fused projection: create only the columns we need, in SELECT order
+                let mut values: CompactVec<Value> = CompactVec::with_capacity(proj.columns.len());
 
-                // Handle both Arc and Inline storage for outer row
-                if let Some(outer_slice) = outer.try_as_arc_slice() {
-                    for &idx in &proj.outer_indices {
-                        // SAFETY: outer_indices validated at planning time against outer table schema.
-                        // The planner ensures all indices are within bounds of the outer row's columns.
-                        values.push(CompactArc::clone(unsafe { outer_slice.get_unchecked(idx) }));
-                    }
-                } else {
-                    // Inline storage: wrap values in Arc
-                    for &idx in &proj.outer_indices {
-                        if let Some(v) = outer.get(idx) {
-                            values.push(CompactArc::new(v.clone()));
+                // We need to move from inner but clone from outer (we don't own outer)
+                let outer_slice = outer.as_slice();
+                let mut inner_values = inner.into_values();
+
+                for col_source in &proj.columns {
+                    match col_source {
+                        ColumnSource::Outer(idx) => {
+                            // SAFETY: indices validated at planning time against outer table schema.
+                            values.push(unsafe { outer_slice.get_unchecked(*idx) }.clone());
+                        }
+                        ColumnSource::Inner(idx) => {
+                            // SAFETY: indices validated at planning time against inner table schema.
+                            values.push(std::mem::take(unsafe {
+                                inner_values.get_unchecked_mut(*idx)
+                            }));
                         }
                     }
                 }
 
-                // OPTIMIZATION: Move inner CompactArc<Value> instead of cloning (we own inner)
-                let mut inner_values = inner.into_arc_values();
-                for &idx in &proj.inner_indices {
-                    // SAFETY: inner_indices validated at planning time against inner table schema.
-                    // The planner ensures all indices are within bounds of the inner row's columns.
-                    values.push(std::mem::take(unsafe {
-                        inner_values.get_unchecked_mut(idx)
-                    }));
-                }
-
-                Row::from_arc_values(values)
+                Row::from_compact_vec(values)
             }
             None => Row::from_combined_clone_move(outer, inner),
         }
@@ -426,9 +413,9 @@ impl Operator for IndexNestedLoopJoinOperator {
                     if is_last_inner {
                         // No more inner rows - take ownership of outer and move values
                         let outer_row = self.current_outer_row.take().unwrap();
-                        self.combine_owned_into_buffer(outer_row, inner_row);
                         // Pre-advance to next outer for next call
                         self.advance_outer()?;
+                        self.combine_owned_into_buffer(outer_row, inner_row);
                         return Ok(Some(RowRef::Owned(self.take_from_buffer())));
                     } else {
                         // More inner rows to check - create combined row directly
@@ -446,7 +433,7 @@ impl Operator for IndexNestedLoopJoinOperator {
                 let outer_row = self.current_outer_row.take().unwrap();
                 self.advance_outer()?;
                 let null_inner = self.null_inner_row();
-                // OPTIMIZATION: Use buffer-based combine since we own outer_row
+                // Use buffer-based combine since we own outer_row
                 self.combine_owned_into_buffer(outer_row, null_inner);
                 return Ok(Some(RowRef::Owned(self.take_from_buffer())));
             }
@@ -564,19 +551,14 @@ impl BatchIndexNestedLoopJoinOperator {
     /// rows that would be immediately projected down to fewer columns.
     ///
     /// # Arguments
-    /// * `outer_indices` - Column indices from outer row to include in output
-    /// * `inner_indices` - Column indices from inner row to include in output
+    /// * `columns` - Column sources in SELECT order (preserves original column ordering)
     /// * `projected_schema` - Schema for the projected output
     pub fn with_projection(
         mut self,
-        outer_indices: Vec<usize>,
-        inner_indices: Vec<usize>,
+        columns: Vec<ColumnSource>,
         projected_schema: Vec<ColumnInfo>,
     ) -> Self {
-        self.projection = Some(JoinProjection {
-            outer_indices,
-            inner_indices,
-        });
+        self.projection = Some(JoinProjection { columns });
         self.schema = projected_schema;
         self
     }
@@ -591,44 +573,26 @@ impl BatchIndexNestedLoopJoinOperator {
     fn combine(&self, outer: &Row, inner: &Row) -> Row {
         match &self.projection {
             Some(proj) => {
-                // Fused projection: create only the columns we need
-                let total = proj.outer_indices.len() + proj.inner_indices.len();
-                let mut values: Vec<CompactArc<Value>> = Vec::with_capacity(total);
+                // Fused projection: create only the columns we need, in SELECT order
+                let mut values: CompactVec<Value> = CompactVec::with_capacity(proj.columns.len());
 
-                // Handle both Arc and Inline storage for outer row
-                if let Some(outer_slice) = outer.try_as_arc_slice() {
-                    for &idx in &proj.outer_indices {
-                        // SAFETY: outer_indices validated at planning time against outer table schema.
-                        // The planner ensures all indices are within bounds of the outer row's columns.
-                        values.push(CompactArc::clone(unsafe { outer_slice.get_unchecked(idx) }));
-                    }
-                } else {
-                    // Inline storage: wrap values in Arc
-                    for &idx in &proj.outer_indices {
-                        if let Some(v) = outer.get(idx) {
-                            values.push(CompactArc::new(v.clone()));
+                let outer_slice = outer.as_slice();
+                let inner_slice = inner.as_slice();
+
+                for col_source in &proj.columns {
+                    match col_source {
+                        ColumnSource::Outer(idx) => {
+                            // SAFETY: indices validated at planning time against outer table schema.
+                            values.push(unsafe { outer_slice.get_unchecked(*idx) }.clone());
+                        }
+                        ColumnSource::Inner(idx) => {
+                            // SAFETY: indices validated at planning time against inner table schema.
+                            values.push(unsafe { inner_slice.get_unchecked(*idx) }.clone());
                         }
                     }
                 }
 
-                // Handle both Arc and Inline storage for inner row
-                // null_inner_row() creates full-width rows for consistent indexing
-                if let Some(inner_slice) = inner.try_as_arc_slice() {
-                    for &idx in &proj.inner_indices {
-                        // SAFETY: inner_indices validated at planning time against inner table schema.
-                        // The planner ensures all indices are within bounds of the inner row's columns.
-                        values.push(CompactArc::clone(unsafe { inner_slice.get_unchecked(idx) }));
-                    }
-                } else {
-                    // Inline storage: wrap values in Arc
-                    for &idx in &proj.inner_indices {
-                        if let Some(v) = inner.get(idx) {
-                            values.push(CompactArc::new(v.clone()));
-                        }
-                    }
-                }
-
-                Row::from_arc_values(values)
+                Row::from_compact_vec(values)
             }
             None => Row::from_combined(outer, inner),
         }
@@ -636,13 +600,10 @@ impl BatchIndexNestedLoopJoinOperator {
 
     /// Create a NULL row for the inner side.
     /// Always creates full-width row so combine() can use consistent indexing.
-    /// Uses Owned storage (Arc values) for compatibility with as_arc_slice() in combine().
     #[inline]
     fn null_inner_row(&self) -> Row {
-        let null_arcs: Vec<CompactArc<Value>> = (0..self.inner_col_count)
-            .map(|_| CompactArc::new(NULL_VALUE))
-            .collect();
-        Row::from_arc_values(null_arcs)
+        let null_values: Vec<Value> = (0..self.inner_col_count).map(|_| NULL_VALUE).collect();
+        Row::from_values(null_values)
     }
 }
 

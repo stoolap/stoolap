@@ -31,6 +31,7 @@ use crate::common::StringMap;
 
 use crate::core::value::NULL_VALUE;
 use crate::core::{DataType, Operator, Row, Value};
+use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
     BetweenExpression, BooleanLiteral, Expression, FloatLiteral, FunctionCall, Identifier,
     InExpression, InfixExpression, InfixOperator, IntegerLiteral, LikeExpression, ListExpression,
@@ -1634,13 +1635,10 @@ fn create_column_identifier(col_name: &str) -> Expression {
 // ============================================================================
 
 /// Result of computing join projection indices.
-/// Contains the column indices needed from outer and inner sides
-/// to satisfy the SELECT expressions.
+/// Contains the column sources in SELECT order to satisfy the SELECT expressions.
 pub struct JoinProjectionIndices {
-    /// Column indices from outer row to include in output
-    pub outer_indices: Vec<usize>,
-    /// Column indices from inner row to include in output
-    pub inner_indices: Vec<usize>,
+    /// Column sources in SELECT order (preserves original column ordering)
+    pub columns: Vec<ColumnSource>,
     /// Output column names for the projected result
     pub output_columns: Vec<String>,
 }
@@ -1648,8 +1646,7 @@ pub struct JoinProjectionIndices {
 /// Compute projection indices for a join operator.
 ///
 /// Analyzes SELECT expressions and determines which columns from the outer and inner
-/// sides are needed. Returns None if projection cannot be pushed down (e.g., when
-/// expressions are not simple column references).
+/// sides are needed. Returns columns in SELECT order (not outer-first/inner-second).
 ///
 /// # Arguments
 /// * `select_exprs` - The SELECT expressions to analyze
@@ -1673,8 +1670,7 @@ pub fn compute_join_projection(
         .collect();
     let col_index_map = build_column_index_map(&combined);
 
-    let mut outer_indices = Vec::new();
-    let mut inner_indices = Vec::new();
+    let mut columns = Vec::new();
     let mut output_columns = Vec::new();
 
     for expr in select_exprs {
@@ -1686,9 +1682,9 @@ pub fn compute_join_projection(
                 let col_lower = id.value_lower.as_str();
                 if let Some(&idx) = col_index_map.get(col_lower) {
                     if idx < outer_col_count {
-                        outer_indices.push(idx);
+                        columns.push(ColumnSource::Outer(idx));
                     } else {
-                        inner_indices.push(idx - outer_col_count);
+                        columns.push(ColumnSource::Inner(idx - outer_col_count));
                     }
                     output_columns.push(id.value.to_string());
                 } else {
@@ -1702,9 +1698,9 @@ pub fn compute_join_projection(
                 let full_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
                 if let Some(&idx) = col_index_map.get(&full_name) {
                     if idx < outer_col_count {
-                        outer_indices.push(idx);
+                        columns.push(ColumnSource::Outer(idx));
                     } else {
-                        inner_indices.push(idx - outer_col_count);
+                        columns.push(ColumnSource::Inner(idx - outer_col_count));
                     }
                     // Output column name is just the column name, not qualified
                     // (SQL standard: SELECT e.name produces column "name", not "e.name")
@@ -1712,9 +1708,9 @@ pub fn compute_join_projection(
                 } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
                     // Fall back to unqualified name
                     if idx < outer_col_count {
-                        outer_indices.push(idx);
+                        columns.push(ColumnSource::Outer(idx));
                     } else {
-                        inner_indices.push(idx - outer_col_count);
+                        columns.push(ColumnSource::Inner(idx - outer_col_count));
                     }
                     output_columns.push(qid.name.value.to_string());
                 } else {
@@ -1731,9 +1727,9 @@ pub fn compute_join_projection(
                         let col_lower = id.value_lower.as_str();
                         if let Some(&idx) = col_index_map.get(col_lower) {
                             if idx < outer_col_count {
-                                outer_indices.push(idx);
+                                columns.push(ColumnSource::Outer(idx));
                             } else {
-                                inner_indices.push(idx - outer_col_count);
+                                columns.push(ColumnSource::Inner(idx - outer_col_count));
                             }
                             output_columns.push(alias_name);
                         } else {
@@ -1745,17 +1741,17 @@ pub fn compute_join_projection(
                             format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
                         if let Some(&idx) = col_index_map.get(&full_name) {
                             if idx < outer_col_count {
-                                outer_indices.push(idx);
+                                columns.push(ColumnSource::Outer(idx));
                             } else {
-                                inner_indices.push(idx - outer_col_count);
+                                columns.push(ColumnSource::Inner(idx - outer_col_count));
                             }
                             output_columns.push(alias_name);
                         } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str())
                         {
                             if idx < outer_col_count {
-                                outer_indices.push(idx);
+                                columns.push(ColumnSource::Outer(idx));
                             } else {
-                                inner_indices.push(idx - outer_col_count);
+                                columns.push(ColumnSource::Inner(idx - outer_col_count));
                             }
                             output_columns.push(alias_name);
                         } else {
@@ -1772,8 +1768,7 @@ pub fn compute_join_projection(
     }
 
     Some(JoinProjectionIndices {
-        outer_indices,
-        inner_indices,
+        columns,
         output_columns,
     })
 }

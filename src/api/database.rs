@@ -71,6 +71,9 @@ pub(crate) struct DatabaseInner {
     engine: Arc<MVCCEngine>,
     executor: Mutex<Executor>,
     dsn: String,
+    /// Whether this DatabaseInner owns the engine (created it via open()).
+    /// Cloned DatabaseInners share the engine but don't own it.
+    owns_engine: bool,
 }
 
 /// Type alias for Statement to use (avoids exposing DatabaseInner directly)
@@ -82,8 +85,11 @@ impl Drop for DatabaseInner {
         // This prevents memory leaks from cached Arc<dyn Index> and closures
         crate::executor::clear_all_thread_local_caches();
 
-        // Close the engine when the last reference is dropped
-        let _ = self.engine.close_engine();
+        // Only close the engine if we own it (created via open(), not clone()).
+        // Cloned databases share the engine but don't close it on drop.
+        if self.owns_engine {
+            let _ = self.engine.close_engine();
+        }
     }
 }
 
@@ -122,10 +128,25 @@ pub struct Database {
 }
 
 impl Clone for Database {
+    /// Clone the database handle.
+    ///
+    /// Each cloned handle has its own executor with independent transaction state,
+    /// but shares the same underlying storage engine. This ensures proper transaction
+    /// isolation - a BEGIN on one handle won't affect reads on another handle.
     fn clone(&self) -> Self {
-        Database {
-            inner: Arc::clone(&self.inner),
-        }
+        // Create a new executor with the same engine (shares data) but independent
+        // transaction state (no dirty reads across handles)
+        let engine = Arc::clone(&self.inner.engine);
+        let executor = crate::executor::Executor::new(Arc::clone(&engine));
+
+        let inner = Arc::new(DatabaseInner {
+            engine,
+            executor: Mutex::new(executor),
+            dsn: self.inner.dsn.clone(),
+            owns_engine: false, // Cloned handles don't own the engine
+        });
+
+        Database { inner }
     }
 }
 
@@ -142,13 +163,8 @@ impl Drop for Database {
                 }
             }
         }
-
-        // If this is the last reference, clear thread-local caches BEFORE
-        // the Arc is dropped. This breaks circular references where caches
-        // hold Arc<dyn Index> or closures that capture engine internals.
-        if Arc::strong_count(&self.inner) == 1 {
-            crate::executor::clear_all_thread_local_caches();
-        }
+        // Note: Thread-local cache clearing and engine closure happen in DatabaseInner::drop()
+        // when the last Arc<DatabaseInner> is dropped.
     }
 }
 
@@ -237,6 +253,7 @@ impl Database {
             engine,
             executor: Mutex::new(executor),
             dsn: dsn.to_string(),
+            owns_engine: true, // This DatabaseInner owns the engine
         });
 
         // Store in registry
@@ -265,6 +282,7 @@ impl Database {
             engine,
             executor: Mutex::new(executor),
             dsn: "memory://".to_string(),
+            owns_engine: true, // This DatabaseInner owns the engine
         });
 
         Ok(Database { inner })

@@ -26,7 +26,6 @@ use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
-use crate::executor::utils::combine_rows_with_nulls;
 use crate::functions::registry::global_registry;
 use crate::parser::ast::Expression;
 
@@ -120,6 +119,12 @@ impl NestedLoopJoinOperator {
             opened: false,
             left_exhausted: false,
         }
+    }
+
+    /// Create a NULL row for the left side (uses cached values).
+    #[inline]
+    fn null_left_row(&self) -> Row {
+        Row::from_values(self.cached_null_left.clone())
     }
 
     /// Create a NULL row for the right side (uses cached values).
@@ -217,13 +222,9 @@ impl Operator for NestedLoopJoinOperator {
                 self.unmatched_right_idx += 1;
 
                 if !self.right_matched[idx] {
+                    let null_left = self.null_left_row();
                     let right_row = &self.right_rows[idx];
-                    let combined = Row::from_values(combine_rows_with_nulls(
-                        right_row,
-                        self.right_col_count,
-                        self.left_col_count,
-                        false,
-                    ));
+                    let combined = self.combine(&null_left, right_row);
                     return Ok(Some(RowRef::Owned(combined)));
                 }
             }

@@ -165,18 +165,27 @@ impl Lexer {
             // String literal (single quotes)
             '\'' => {
                 let literal = self.read_string_literal();
+                if let Some(err) = self.last_error.take() {
+                    return Token::error(err, "", pos);
+                }
                 Token::new(TokenType::String, literal, pos)
             }
 
             // Double-quoted identifier
             '"' => {
                 let literal = self.read_quoted_identifier('"');
+                if let Some(err) = self.last_error.take() {
+                    return Token::error(err, "", pos);
+                }
                 Token::new(TokenType::Identifier, literal, pos)
             }
 
             // Backtick-quoted identifier (MySQL style)
             '`' => {
                 let literal = self.read_quoted_identifier('`');
+                if let Some(err) = self.last_error.take() {
+                    return Token::error(err, "", pos);
+                }
                 Token::new(TokenType::Identifier, literal, pos)
             }
 
@@ -361,7 +370,13 @@ impl Lexer {
 
         loop {
             if self.ch == '\0' {
-                self.last_error = Some("unterminated string literal".to_string());
+                // Distinguish between actual EOF and NULL byte in input
+                if self.position >= self.input.len() {
+                    self.last_error = Some("unterminated string literal".to_string());
+                } else {
+                    self.last_error =
+                        Some("NULL byte (0x00) is not allowed in string literals".to_string());
+                }
                 result.push(quote); // Add closing quote for consistency
                 break;
             } else if self.ch == quote {
@@ -417,11 +432,15 @@ impl Lexer {
         // Consume closing quote if not EOF
         if self.ch == quote {
             self.read_char();
-        } else {
+        } else if self.position >= self.input.len() {
             self.last_error = Some(format!(
                 "unterminated quoted identifier starting with {}",
                 quote
             ));
+        } else {
+            // NULL byte encountered
+            self.last_error =
+                Some("NULL byte (0x00) is not allowed in quoted identifiers".to_string());
         }
 
         result

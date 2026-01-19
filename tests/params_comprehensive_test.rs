@@ -534,11 +534,8 @@ fn test_complex_query_multiple_params() {
         .unwrap()
         .map(|r| {
             let r = r.unwrap();
-            // Due to Index NL column ordering, d.name may be in col2 instead of col0
-            let col2: Result<String, _> = r.get(2);
-            let col0: Result<String, _> = r.get(0);
-            let col1: Result<String, _> = r.get(1);
-            col2.or(col0).or(col1).unwrap()
+            // d.name is in col0 as specified in SELECT clause order
+            r.get::<String>(0).unwrap()
         })
         .collect();
 
@@ -954,11 +951,8 @@ fn test_complex_query_multiple_named_params() {
         .unwrap()
         .map(|r| {
             let r = r.unwrap();
-            // Due to Index NL column ordering, d.name may be in col2 instead of col0
-            let col2: Result<String, _> = r.get(2);
-            let col0: Result<String, _> = r.get(0);
-            let col1: Result<String, _> = r.get(1);
-            col2.or(col0).or(col1).unwrap()
+            // d.name is in col0 as specified in SELECT clause order
+            r.get::<String>(0).unwrap()
         })
         .collect();
 

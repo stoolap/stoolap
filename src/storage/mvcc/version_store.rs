@@ -675,7 +675,7 @@ impl VersionStore {
                     };
 
                     // Reuse the Arc for the version's data - enables O(1) clone on read
-                    new_version.data = Row::from_arc_slice(arc_data);
+                    new_version.data = Row::from_arc(arc_data);
                     // Update row -> arena index mapping
                     self.row_arena_index.write().insert(row_id, idx);
 
@@ -737,7 +737,7 @@ impl VersionStore {
                     // Update row -> arena index mapping
                     self.row_arena_index.write().insert(row_id, idx);
                     // Create version with Arc-backed data for O(1) clone
-                    v.data = Row::from_arc_slice(arc_data);
+                    v.data = Row::from_arc(arc_data);
                     (Some(idx), v)
                 } else {
                     (None, version)
@@ -840,7 +840,7 @@ impl VersionStore {
                         };
 
                         // Reuse the Arc for the version's data
-                        new_version.data = Row::from_arc_slice(arc_data);
+                        new_version.data = Row::from_arc(arc_data);
                         arena_index_updates.push((row_id, idx));
 
                         Some(idx)
@@ -900,7 +900,7 @@ impl VersionStore {
                         );
                         arena_index_updates.push((row_id, idx));
                         // Create version with Arc-backed data for O(1) clone
-                        v.data = Row::from_arc_slice(arc_data);
+                        v.data = Row::from_arc(arc_data);
                         (Some(idx), v)
                     } else {
                         (None, version)
@@ -1007,7 +1007,7 @@ impl VersionStore {
                         )
                     };
 
-                    new_version.data = Row::from_arc_slice(arc_data);
+                    new_version.data = Row::from_arc(arc_data);
                     // Update arena index immediately (single row, no batching needed)
                     self.row_arena_index.write().insert(row_id, idx);
 
@@ -1063,7 +1063,7 @@ impl VersionStore {
                     );
                     // Update arena index immediately
                     self.row_arena_index.write().insert(row_id, idx);
-                    v.data = Row::from_arc_slice(arc_data);
+                    v.data = Row::from_arc(arc_data);
                     (Some(idx), v)
                 } else {
                     (None, version)
@@ -1115,7 +1115,7 @@ impl VersionStore {
                     return Some(RowVersion {
                         txn_id: meta.txn_id,
                         deleted_at_txn_id: meta.deleted_at_txn_id,
-                        data: Row::from_arc_slice(arc_data),
+                        data: Row::from_arc(arc_data),
                         row_id: meta.row_id,
                         create_time: meta.create_time,
                     });
@@ -1250,10 +1250,8 @@ impl VersionStore {
                             || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
                         {
                             // O(1) success! Return from arena
-                            results.push((
-                                row_id,
-                                Row::from_arc_slice(Arc::clone(&arena_data[arena_idx])),
-                            ));
+                            results
+                                .push((row_id, Row::from_arc(Arc::clone(&arena_data[arena_idx]))));
                         }
                         // Else: deleted, skip
                         continue;
@@ -1272,7 +1270,7 @@ impl VersionStore {
                         // Get from arena if available, else clone
                         let row = if let Some(idx) = chain.arena_idx {
                             if let Some(arc_row) = arena_data.get(idx) {
-                                Row::from_arc_slice(Arc::clone(arc_row))
+                                Row::from_arc(Arc::clone(arc_row))
                             } else {
                                 chain.version.data.clone()
                             }
@@ -1295,7 +1293,7 @@ impl VersionStore {
                         {
                             let row = if let Some(idx) = e.arena_idx {
                                 if let Some(arc_row) = arena_data.get(idx) {
-                                    Row::from_arc_slice(Arc::clone(arc_row))
+                                    Row::from_arc(Arc::clone(arc_row))
                                 } else {
                                     e.version.data.clone()
                                 }
@@ -1458,7 +1456,7 @@ impl VersionStore {
         let get_row = |entry: &VersionChainEntry| -> Row {
             if let Some(idx) = entry.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc_slice(Arc::clone(arc_row));
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             entry.version.data.clone()
@@ -1734,7 +1732,7 @@ impl VersionStore {
         let get_row = |entry: &VersionChainEntry| -> Row {
             if let Some(idx) = entry.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc_slice(Arc::clone(arc_row));
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             entry.version.data.clone()
@@ -1802,7 +1800,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc_slice(Arc::clone(arc_row));
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -1870,7 +1868,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc_slice(Arc::clone(arc_row));
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -1948,7 +1946,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc_slice(Arc::clone(arc_row));
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -2048,7 +2046,7 @@ impl VersionStore {
                                 version_copy.create_time = current_seq;
                                 result.push((
                                     row_id,
-                                    Row::from_arc_slice(Arc::clone(arc_row)),
+                                    Row::from_arc(Arc::clone(arc_row)),
                                     version_copy,
                                 ));
                             }
@@ -2082,7 +2080,7 @@ impl VersionStore {
                                     version_copy.create_time = current_seq;
                                     result.push((
                                         row_id,
-                                        Row::from_arc_slice(Arc::clone(arc_row)),
+                                        Row::from_arc(Arc::clone(arc_row)),
                                         version_copy,
                                     ));
                                 }
@@ -2128,7 +2126,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc_slice(Arc::clone(arc_row));
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -2199,7 +2197,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc_slice(Arc::clone(arc_row));
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -2311,7 +2309,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc_slice(Arc::clone(arc_row));
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -2413,7 +2411,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc_slice(Arc::clone(arc_row));
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -2514,7 +2512,7 @@ impl VersionStore {
         let get_row_from_entry = |entry: &VersionChainEntry| -> Row {
             if let Some(idx) = entry.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc_slice(Arc::clone(arc_row));
+                    return Row::from_arc(Arc::clone(arc_row));
                 }
             }
             entry.version.data.clone()
@@ -2629,7 +2627,7 @@ impl VersionStore {
                     // Read row data from arena or version
                     let row_data = if let Some(idx) = e.arena_idx {
                         if let Some(arc_row) = arena_data.get(idx) {
-                            Row::from_arc_slice(Arc::clone(arc_row))
+                            Row::from_arc(Arc::clone(arc_row))
                         } else {
                             e.version.data.clone()
                         }
@@ -2738,7 +2736,7 @@ impl VersionStore {
                         if let Some(arc_row) = arena_data.get(idx) {
                             // Filter directly on Arc slice - no Row allocation for non-matching rows
                             if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
-                                result.push((row_id, Row::from_arc_slice(Arc::clone(arc_row))));
+                                result.push((row_id, Row::from_arc(Arc::clone(arc_row))));
                             }
                             break;
                         }
@@ -2819,7 +2817,7 @@ impl VersionStore {
                                 if skipped < offset {
                                     skipped += 1;
                                 } else {
-                                    result.push((row_id, Row::from_arc_slice(Arc::clone(arc_row))));
+                                    result.push((row_id, Row::from_arc(Arc::clone(arc_row))));
                                     if result.len() >= limit {
                                         return result; // Early termination!
                                     }
@@ -3036,7 +3034,7 @@ impl VersionStore {
                 // Fast path: get from arena
                 if arena_idx < arena_len {
                     if let Some(arc_row) = arena_data.get(arena_idx) {
-                        result.push((idx.row_id, Row::from_arc_slice(Arc::clone(arc_row))));
+                        result.push((idx.row_id, Row::from_arc(Arc::clone(arc_row))));
                         continue;
                     }
                 }
@@ -3058,7 +3056,7 @@ impl VersionStore {
             let arena_guard = self.arena.read_guard();
             let arena_data = arena_guard.data();
             if let Some(arc_row) = arena_data.get(arena_idx) {
-                return Some((idx.row_id, Row::from_arc_slice(Arc::clone(arc_row))));
+                return Some((idx.row_id, Row::from_arc(Arc::clone(arc_row))));
             }
         }
 
@@ -3085,7 +3083,7 @@ impl VersionStore {
             let arena_guard = self.arena.read_guard();
             let arena_data = arena_guard.data();
             if let Some(arc_row) = arena_data.get(arena_idx) {
-                return arc_row.get(col_idx).map(|arc| arc.as_ref().clone());
+                return arc_row.get(col_idx).cloned();
             }
         }
 
@@ -3120,7 +3118,7 @@ impl VersionStore {
                 if let Some(arena_idx) = idx.arena_idx {
                     if arena_idx < arena_len {
                         if let Some(arc_row) = arena_data.get(arena_idx) {
-                            return arc_row.get(col_idx).map(|arc| (**arc).clone());
+                            return arc_row.get(col_idx).cloned();
                         }
                     }
                 }
@@ -4089,7 +4087,6 @@ impl VersionStore {
         }
 
         // Update indexes with the new row data (if not deleted)
-        // Use get_arc + add_arc for zero-copy Arc sharing
         if !is_deleted {
             let indexes = self.indexes.read();
             for index in indexes.values() {
@@ -4098,9 +4095,9 @@ impl VersionStore {
                     continue;
                 }
                 let col_id = column_ids[0] as usize;
-                if let Some(arc_value) = row_data.get_arc(col_id) {
+                if let Some(value) = row_data.get(col_id) {
                     // Ignore errors during recovery - index might already have this entry
-                    let _ = index.add_arc(std::slice::from_ref(&arc_value), row_id, row_id);
+                    let _ = index.add(std::slice::from_ref(value), row_id, row_id);
                 }
             }
         }
@@ -4245,9 +4242,8 @@ impl VersionStore {
                 for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
                     if !version.is_deleted() {
-                        // Use get_arc + add_arc for zero-copy Arc sharing
-                        if let Some(arc_value) = version.data.get_arc(col_idx) {
-                            let _ = index.add_arc(std::slice::from_ref(&arc_value), row_id, row_id);
+                        if let Some(value) = version.data.get(col_idx) {
+                            let _ = index.add(std::slice::from_ref(value), row_id, row_id);
                         }
                     }
                 }
@@ -4275,18 +4271,16 @@ impl VersionStore {
                 for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
                     if !version.is_deleted() {
-                        // Use get_arc + add_arc for zero-copy Arc sharing
-                        let arc_values: Vec<CompactArc<crate::core::Value>> = col_indices
-                            .iter()
-                            .map(|&idx| {
-                                version.data.get_arc(idx).unwrap_or_else(|| {
-                                    CompactArc::new(crate::core::Value::Null(
-                                        crate::core::DataType::Null,
-                                    ))
+                        let values: SmallVec<[crate::core::Value; 2]> =
+                            col_indices
+                                .iter()
+                                .map(|&idx| {
+                                    version.data.get(idx).cloned().unwrap_or(
+                                        crate::core::Value::Null(crate::core::DataType::Null),
+                                    )
                                 })
-                            })
-                            .collect();
-                        let _ = index.add_arc(&arc_values, row_id, row_id);
+                                .collect();
+                        let _ = index.add(&values, row_id, row_id);
                     }
                 }
             }
@@ -4339,26 +4333,26 @@ impl VersionStore {
                 continue;
             }
 
-            // Add to each index - use get_arc + add_arc for zero-copy Arc sharing
+            // Add to each index
             for (col_indices, index) in &index_infos {
                 if col_indices.len() == 1 {
                     // Single-column index
-                    if let Some(arc_value) = version.data.get_arc(col_indices[0]) {
-                        let _ = index.add_arc(std::slice::from_ref(&arc_value), row_id, row_id);
+                    if let Some(value) = version.data.get(col_indices[0]) {
+                        let _ = index.add(std::slice::from_ref(value), row_id, row_id);
                     }
                 } else {
                     // Multi-column index
-                    let arc_values: Vec<CompactArc<crate::core::Value>> = col_indices
+                    let values: SmallVec<[crate::core::Value; 2]> = col_indices
                         .iter()
                         .map(|&idx| {
-                            version.data.get_arc(idx).unwrap_or_else(|| {
-                                CompactArc::new(crate::core::Value::Null(
-                                    crate::core::DataType::Null,
-                                ))
-                            })
+                            version
+                                .data
+                                .get(idx)
+                                .cloned()
+                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
                         })
                         .collect();
-                    let _ = index.add_arc(&arc_values, row_id, row_id);
+                    let _ = index.add(&values, row_id, row_id);
                 }
             }
         }
@@ -4783,7 +4777,7 @@ impl VersionStore {
         fn update_accums(
             accums: &mut [Accum],
             aggregates: &[(AggregateOp, usize)],
-            row_data: &[CompactArc<Value>],
+            row_data: &[Value],
         ) {
             for (agg_idx, (op, col_idx)) in aggregates.iter().enumerate() {
                 let accum = &mut accums[agg_idx];
@@ -4799,7 +4793,7 @@ impl VersionStore {
                     }
                     AggregateOp::Sum | AggregateOp::Avg => {
                         if *col_idx < row_data.len() {
-                            let val = &*row_data[*col_idx];
+                            let val = &row_data[*col_idx];
                             let f_opt = match val {
                                 Value::Integer(i) => Some(*i as f64),
                                 Value::Float(f) => Some(*f),
@@ -4816,10 +4810,10 @@ impl VersionStore {
                             let val = &row_data[*col_idx];
                             if !val.is_null() {
                                 match &accum.min {
-                                    None => accum.min = Some((**val).clone()),
+                                    None => accum.min = Some(val.clone()),
                                     Some(current) => {
-                                        if **val < *current {
-                                            accum.min = Some((**val).clone());
+                                        if val < current {
+                                            accum.min = Some(val.clone());
                                         }
                                     }
                                 }
@@ -4831,10 +4825,10 @@ impl VersionStore {
                             let val = &row_data[*col_idx];
                             if !val.is_null() {
                                 match &accum.max {
-                                    None => accum.max = Some((**val).clone()),
+                                    None => accum.max = Some(val.clone()),
                                     Some(current) => {
-                                        if **val > *current {
-                                            accum.max = Some((**val).clone());
+                                        if val > current {
+                                            accum.max = Some(val.clone());
                                         }
                                     }
                                 }
@@ -4904,18 +4898,19 @@ impl VersionStore {
                     None => continue,
                 };
 
-                let val = if col_idx < row_data.len() {
-                    &row_data[col_idx]
+                let row_slice = row_data.as_ref();
+                let val = if col_idx < row_slice.len() {
+                    &row_slice[col_idx]
                 } else {
                     // NULL - track separately without GroupKey allocation
                     let accums =
                         null_accums.get_or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-                    update_accums(accums, aggregates, row_data);
+                    update_accums(accums, aggregates, row_slice);
                     continue;
                 };
 
                 // Try to extract i64 key for primitive types
-                let i64_key = match &**val {
+                let i64_key = match val {
                     Value::Integer(i) => {
                         if key_type == 255 {
                             key_type = 0;
@@ -4938,7 +4933,7 @@ impl VersionStore {
                         // NULL value in the column - track separately
                         let accums = null_accums
                             .get_or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-                        update_accums(accums, aggregates, row_data);
+                        update_accums(accums, aggregates, row_slice);
                         continue;
                     }
                     _ => {
@@ -4951,12 +4946,12 @@ impl VersionStore {
                     let accums = int_groups
                         .entry(key)
                         .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-                    update_accums(accums, aggregates, row_data);
+                    update_accums(accums, aggregates, row_slice);
                 } else {
                     let accums = other_groups
-                        .entry(GroupKey::Single(CompactArc::clone(val)))
+                        .entry(GroupKey::Single(CompactArc::new(val.clone())))
                         .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-                    update_accums(accums, aggregates, row_data);
+                    update_accums(accums, aggregates, row_slice);
                 }
             }
 
@@ -5019,12 +5014,13 @@ impl VersionStore {
                 Some(data) => data,
                 None => continue,
             };
+            let row_slice = row_data.as_ref();
 
             let key_values: Vec<CompactArc<Value>> = group_by_indices
                 .iter()
                 .map(|&col_idx| {
-                    if col_idx < row_data.len() {
-                        CompactArc::clone(&row_data[col_idx])
+                    if col_idx < row_slice.len() {
+                        CompactArc::new(row_slice[col_idx].clone())
                     } else {
                         CompactArc::new(Value::Null(DataType::Null))
                     }
@@ -5035,7 +5031,7 @@ impl VersionStore {
             let accums = groups
                 .entry(group_key)
                 .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-            update_accums(accums, aggregates, row_data);
+            update_accums(accums, aggregates, row_slice);
         }
 
         // Convert to results
@@ -5133,7 +5129,7 @@ impl TransactionVersionStore {
         // Convert to Shared (Arc) storage immediately for efficient Arc sharing:
         // - get_arc() will return cheap Arc clones (no value cloning)
         // - into_arc() at commit time returns the existing Arc (no clone)
-        let data = Row::from_arc_slice(data.into_arc());
+        let data = Row::from_arc(data.into_arc());
 
         // Create the row version
         let mut rv = RowVersion::new(self.txn_id, row_id, data);
@@ -5214,7 +5210,7 @@ impl TransactionVersionStore {
         is_delete: bool,
     ) -> Result<(), Error> {
         // Convert to Shared (Arc) storage immediately for efficient Arc sharing
-        let data = Row::from_arc_slice(data.into_arc());
+        let data = Row::from_arc(data.into_arc());
 
         // Create the new row version
         let mut rv = RowVersion::new(self.txn_id, row_id, data);
@@ -5281,7 +5277,7 @@ impl TransactionVersionStore {
 
         for (row_id, data, original_version) in rows {
             // Convert to Shared (Arc) storage immediately for efficient Arc sharing
-            let data = Row::from_arc_slice(data.into_arc());
+            let data = Row::from_arc(data.into_arc());
 
             // Create the new row version
             let mut rv = RowVersion::new(self.txn_id, row_id, data);

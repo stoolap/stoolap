@@ -1207,20 +1207,59 @@ fn format_value(value: &Value) -> String {
     match value {
         Value::Null(_) => "NULL".to_string(),
         Value::Integer(i) => i.to_string(),
-        Value::Float(f) => {
-            if *f == f.trunc() {
-                format!("{:.1}", f)
-            } else {
-                format!("{:.4}", f)
-                    .trim_end_matches('0')
-                    .trim_end_matches('.')
-                    .to_string()
-            }
-        }
+        Value::Float(f) => format_float(*f),
         Value::Text(s) => s.to_string(),
         Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Timestamp(ts) => ts.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         Value::Json(s) => s.to_string(),
+    }
+}
+
+/// Format a float value consistently, using scientific notation for extreme values
+fn format_float(v: f64) -> String {
+    // Handle special cases
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_positive() {
+            "Infinity"
+        } else {
+            "-Infinity"
+        }
+        .to_string();
+    }
+
+    let abs_v = v.abs();
+
+    // Use scientific notation for very large or very small numbers
+    if abs_v != 0.0 && !(1e-4..1e15).contains(&abs_v) {
+        let s = format!("{:e}", v);
+        // Clean up trailing zeros in mantissa
+        if let Some(e_pos) = s.find('e') {
+            let (mantissa, exp) = s.split_at(e_pos);
+            let clean_mantissa = if mantissa.contains('.') {
+                mantissa
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    .to_string()
+            } else {
+                mantissa.to_string()
+            };
+            return format!("{}{}", clean_mantissa, exp);
+        }
+        return s;
+    }
+
+    // Integer-like float
+    if v == v.trunc() {
+        format!("{:.1}", v)
+    } else {
+        // Normal range - show reasonable precision
+        format!("{:.6}", v)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
     }
 }
 

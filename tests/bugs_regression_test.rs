@@ -4787,3 +4787,77 @@ fn test_reserved_keyword_error_message() {
     let key_val: String = rows[0].as_ref().unwrap().get(0).unwrap();
     assert_eq!(key_val, "test");
 }
+
+// =============================================================================
+// Bug: ORDER BY + LIMIT returns 0 rows on UNIQUE columns (Hash Index issue)
+// Description: UNIQUE constraint creates Hash Index, which doesn't support ordering.
+// When ORDER BY + LIMIT is used, the optimizer tried to use the Hash Index for
+// ordered iteration, but get_all_values() returned empty, causing 0 rows.
+// GitHub Issue: stoolap/stoolap#4
+// =============================================================================
+#[test]
+fn test_order_by_limit_with_unique_constraint() {
+    let db = setup_db("order_by_limit_unique");
+
+    // UNIQUE constraint creates a Hash Index (doesn't support ordering)
+    db.execute(
+        "CREATE TABLE items (
+            id INTEGER PRIMARY KEY AUTO_INCREMENT,
+            name TEXT NOT NULL UNIQUE
+        )",
+        (),
+    )
+    .expect("Failed to create table");
+
+    db.execute("INSERT INTO items (name) VALUES ('C'), ('A'), ('B')", ())
+        .expect("Insert failed");
+
+    // This was returning 0 rows before the fix
+    let result = db
+        .query("SELECT * FROM items ORDER BY name ASC LIMIT 2", ())
+        .expect("Query should succeed");
+
+    let rows: Vec<_> = result.collect();
+    assert_eq!(rows.len(), 2, "Should return 2 rows with LIMIT 2");
+
+    // Verify ordering: should be A, B (alphabetically)
+    let row0 = rows[0].as_ref().expect("Row should exist");
+    let name0: String = row0.get(1).unwrap();
+    assert_eq!(name0, "A", "First row should be 'A'");
+
+    let row1 = rows[1].as_ref().expect("Row should exist");
+    let name1: String = row1.get(1).unwrap();
+    assert_eq!(name1, "B", "Second row should be 'B'");
+
+    // Test DESC order
+    let result = db
+        .query("SELECT * FROM items ORDER BY name DESC LIMIT 2", ())
+        .expect("Query should succeed");
+
+    let rows: Vec<_> = result.collect();
+    assert_eq!(rows.len(), 2, "Should return 2 rows with LIMIT 2 DESC");
+
+    let row0 = rows[0].as_ref().expect("Row should exist");
+    let name0: String = row0.get(1).unwrap();
+    assert_eq!(name0, "C", "First row DESC should be 'C'");
+
+    // Test OFFSET
+    let result = db
+        .query("SELECT * FROM items ORDER BY name ASC LIMIT 1 OFFSET 1", ())
+        .expect("Query should succeed");
+
+    let rows: Vec<_> = result.collect();
+    assert_eq!(rows.len(), 1, "Should return 1 row with LIMIT 1 OFFSET 1");
+
+    let row0 = rows[0].as_ref().expect("Row should exist");
+    let name0: String = row0.get(1).unwrap();
+    assert_eq!(name0, "B", "Row at offset 1 should be 'B'");
+
+    // Without LIMIT should still work
+    let result = db
+        .query("SELECT * FROM items ORDER BY name ASC", ())
+        .expect("Query should succeed");
+
+    let rows: Vec<_> = result.collect();
+    assert_eq!(rows.len(), 3, "Should return all 3 rows without LIMIT");
+}

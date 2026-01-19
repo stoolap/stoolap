@@ -346,11 +346,11 @@ impl CompositeRow {
         let total = self.len();
         let mut values: CompactVec<Value> = CompactVec::with_capacity(total);
 
-        // Copy left values
-        values.extend(self.left.iter().cloned());
+        // Copy left values using extend_clone for efficiency
+        values.extend_clone(self.left.as_slice());
 
-        // Copy right values
-        values.extend(self.right.iter().cloned());
+        // Copy right values using extend_clone for efficiency
+        values.extend_clone(self.right.as_slice());
 
         Row::from_compact_vec(values)
     }
@@ -473,11 +473,11 @@ impl DirectBuildCompositeRow {
         let mut values: CompactVec<Value> = CompactVec::with_capacity(total);
 
         if self.probe_is_left {
-            values.extend(self.probe.iter().cloned());
-            values.extend(build_row.iter().cloned());
+            values.extend_clone(self.probe.as_slice());
+            values.extend_clone(build_row.as_slice());
         } else {
-            values.extend(build_row.iter().cloned());
-            values.extend(self.probe.iter().cloned());
+            values.extend_clone(build_row.as_slice());
+            values.extend_clone(self.probe.as_slice());
         }
 
         Row::from_compact_vec(values)
@@ -485,36 +485,23 @@ impl DirectBuildCompositeRow {
 
     /// Materialize into an owned Row by moving probe values.
     ///
-    /// OPTIMIZATION: Uses Arc storage when both rows have Arc storage.
-    /// This allows O(1) Arc::clone instead of O(n) Value::clone for strings.
+    /// Combines probe and build rows efficiently:
+    /// - Moves probe values (owned) - uses extend_into_compact_vec to avoid Vec allocation
+    /// - Clones build values (shared reference)
     #[inline]
     pub fn materialize_owned(self) -> Row {
         let build_row = &self.build_rows[self.build_idx];
         let total = self.probe_cols + build_row.len();
 
-        // Fast path: if both have Arc storage, use Arc::clone (O(1))
-        if let (Some(probe_arcs), Some(build_arcs)) =
-            (self.probe.try_as_arc_slice(), build_row.try_as_arc_slice())
-        {
-            let mut arc_values: Vec<CompactArc<Value>> = Vec::with_capacity(total);
-            if self.probe_is_left {
-                arc_values.extend(probe_arcs.iter().cloned());
-                arc_values.extend(build_arcs.iter().cloned());
-            } else {
-                arc_values.extend(build_arcs.iter().cloned());
-                arc_values.extend(probe_arcs.iter().cloned());
-            }
-            return Row::from_arc_values(arc_values);
-        }
-
-        // Fallback: use Inline storage with Value clones
         let mut values: CompactVec<Value> = CompactVec::with_capacity(total);
         if self.probe_is_left {
-            values.extend(self.probe);
-            values.extend(build_row.iter().cloned());
+            // Use extend_into_compact_vec to avoid intermediate Vec allocation
+            self.probe.extend_into_compact_vec(&mut values);
+            values.extend_clone(build_row.as_slice());
         } else {
-            values.extend(build_row.iter().cloned());
-            values.extend(self.probe);
+            values.extend_clone(build_row.as_slice());
+            // Use extend_into_compact_vec to avoid intermediate Vec allocation
+            self.probe.extend_into_compact_vec(&mut values);
         }
         Row::from_compact_vec(values)
     }

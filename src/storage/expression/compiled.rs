@@ -50,7 +50,6 @@ use memchr::memmem;
 
 use chrono::{DateTime, Utc};
 
-use crate::common::CompactArc;
 use crate::core::{Operator, Row, Schema, Value};
 
 use super::between::BetweenExpr;
@@ -1329,12 +1328,12 @@ impl CompiledFilter {
     /// - IsNotNull → false
     /// - All other comparisons → false (can't match a missing value)
     #[inline]
-    pub fn matches_arc_slice(&self, values: &[CompactArc<Value>]) -> bool {
+    pub fn matches_arc_slice(&self, values: &[Value]) -> bool {
         // Helper macro: get value or return false for missing columns
         macro_rules! get_val {
             ($col_idx:expr) => {
                 match values.get(*$col_idx) {
-                    Some(v) => v.as_ref(),
+                    Some(v) => v,
                     None => return false, // Column added after row was inserted
                 }
             };
@@ -1668,7 +1667,7 @@ impl CompiledFilter {
 
             // Dynamic fallback - needs Row, so create temporary
             CompiledFilter::Dynamic(expr) => {
-                let row = Row::from_arc_values(values.to_vec());
+                let row = Row::from_values(values.to_vec());
                 expr.evaluate_fast(&row)
             }
         }
@@ -1843,9 +1842,9 @@ impl CompiledFilter {
     }
 
     /// Check if the filter result would be UNKNOWN (NULL) due to NULL column values
-    /// This is the Arc slice-based version for zero-copy filtering.
+    /// This is the slice-based version for zero-copy filtering.
     #[inline(always)]
-    pub fn is_unknown_due_to_null_arc_slice(&self, values: &[CompactArc<Value>]) -> bool {
+    pub fn is_unknown_due_to_null_arc_slice(&self, values: &[Value]) -> bool {
         match self {
             // Comparison with NULL column produces UNKNOWN
             CompiledFilter::IntegerEq { col_idx, .. }
@@ -1908,7 +1907,7 @@ impl CompiledFilter {
 
             // Dynamic expressions - fall back to Row-based check
             CompiledFilter::Dynamic(expr) => {
-                let row = Row::from_arc_values(values.to_vec());
+                let row = Row::from_values(values.to_vec());
                 expr.is_unknown_due_to_null(&row)
             }
         }

@@ -25,7 +25,6 @@
 
 use std::sync::Arc;
 
-use crate::common::CompactArc;
 use crate::core::{Row, Value};
 use crate::storage::mvcc::arena::ArenaReadGuard;
 
@@ -52,7 +51,7 @@ pub struct StreamingResult<'a> {
     /// Temporary row buffer for the current row (to satisfy &Row interface)
     current_row: Row,
     /// Cached Arc for current row (for zero-copy access)
-    current_arc: Option<Arc<[CompactArc<Value>]>>,
+    current_arc: Option<Arc<[Value]>>,
 }
 
 impl<'a> StreamingResult<'a> {
@@ -91,7 +90,7 @@ impl<'a> StreamingResult<'a> {
 
             // O(1) Arc clones from guard - no data copying
             if let Some(arc) = self.arena_guard.data().get(info.arena_idx) {
-                self.current_row = Row::from_arc_slice(Arc::clone(arc));
+                self.current_row = Row::from_arc(Arc::clone(arc));
                 self.current_arc = Some(Arc::clone(arc));
             } else {
                 self.current_arc = None;
@@ -106,7 +105,7 @@ impl<'a> StreamingResult<'a> {
 
     /// Get current row as Arc slice (for efficient access)
     #[inline]
-    pub fn row_arc_slice(&self) -> Option<&Arc<[CompactArc<Value>]>> {
+    pub fn row_arc_slice(&self) -> Option<&Arc<[Value]>> {
         self.current_arc.as_ref()
     }
 
@@ -128,9 +127,7 @@ impl<'a> StreamingResult<'a> {
     /// Get a specific column value from current row (ZERO-COPY!)
     #[inline]
     pub fn get(&self, col: usize) -> Option<&Value> {
-        self.current_arc
-            .as_ref()
-            .and_then(|arc| arc.get(col).map(|v| v.as_ref()))
+        self.current_arc.as_ref().and_then(|arc| arc.get(col))
     }
 
     /// Get remaining count
@@ -162,15 +159,12 @@ impl<'a> StreamingResult<'a> {
 /// that can be computed in a single pass over contiguous memory with
 /// zero allocations during the scan.
 pub struct AggregationScanner<'a> {
-    arena_data: &'a [Arc<[CompactArc<Value>]>],
+    arena_data: &'a [Arc<[Value]>],
     visible_indices: &'a [VisibleRowInfo],
 }
 
 impl<'a> AggregationScanner<'a> {
-    pub fn new(
-        arena_data: &'a [Arc<[CompactArc<Value>]>],
-        visible_indices: &'a [VisibleRowInfo],
-    ) -> Self {
+    pub fn new(arena_data: &'a [Arc<[Value]>], visible_indices: &'a [VisibleRowInfo]) -> Self {
         Self {
             arena_data,
             visible_indices,
@@ -183,8 +177,8 @@ impl<'a> AggregationScanner<'a> {
         let mut sum = 0.0f64;
         for info in self.visible_indices {
             if let Some(row) = self.arena_data.get(info.arena_idx) {
-                if let Some(arc_val) = row.get(col_idx) {
-                    match arc_val.as_ref() {
+                if let Some(val) = row.get(col_idx) {
+                    match val {
                         Value::Integer(i) => sum += *i as f64,
                         Value::Float(f) => sum += *f,
                         _ => {}
@@ -207,8 +201,8 @@ impl<'a> AggregationScanner<'a> {
         let mut count = 0;
         for info in self.visible_indices {
             if let Some(row) = self.arena_data.get(info.arena_idx) {
-                if let Some(arc_val) = row.get(col_idx) {
-                    if !arc_val.is_null() {
+                if let Some(val) = row.get(col_idx) {
+                    if !val.is_null() {
                         count += 1;
                     }
                 }
@@ -222,8 +216,7 @@ impl<'a> AggregationScanner<'a> {
         let mut min: Option<Value> = None;
         for info in self.visible_indices {
             if let Some(row) = self.arena_data.get(info.arena_idx) {
-                if let Some(arc_val) = row.get(col_idx) {
-                    let val = arc_val.as_ref();
+                if let Some(val) = row.get(col_idx) {
                     if !val.is_null() {
                         match &min {
                             None => min = Some(val.clone()),
@@ -247,8 +240,7 @@ impl<'a> AggregationScanner<'a> {
         let mut max: Option<Value> = None;
         for info in self.visible_indices {
             if let Some(row) = self.arena_data.get(info.arena_idx) {
-                if let Some(arc_val) = row.get(col_idx) {
-                    let val = arc_val.as_ref();
+                if let Some(val) = row.get(col_idx) {
                     if !val.is_null() {
                         match &max {
                             None => max = Some(val.clone()),
@@ -506,8 +498,8 @@ mod tests {
         assert!(result.next());
         let slice = result.row_arc_slice().unwrap();
         assert_eq!(slice.len(), 2);
-        assert_eq!(*slice[0], Value::Integer(42));
-        assert_eq!(*slice[1], Value::Float(3.5));
+        assert_eq!(slice[0], Value::Integer(42));
+        assert_eq!(slice[1], Value::Float(3.5));
 
         // row() should also work
         let row = result.row();

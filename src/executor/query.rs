@@ -3374,10 +3374,11 @@ impl Executor {
                     let op_join_type = OperatorJoinType::parse(&join_type);
 
                     // Try to push projection into the join operator for ~2.3x speedup
-                    // Eligibility: no swap, no cross filter, no ORDER BY,
+                    // Eligibility: no cross filter, no ORDER BY,
                     // no aggregation/window, simple column references only
-                    let projection_pushdown = if !swapped
-                        && cross_filter.is_none()
+                    // Note: JoinProjection uses ColumnSource enum to preserve SELECT column order
+                    // regardless of whether the join was swapped (outer/inner assignment)
+                    let projection_pushdown = if cross_filter.is_none()
                         && stmt.order_by.is_empty()
                         && !classification.has_aggregation
                         && !classification.has_window_functions
@@ -3403,11 +3404,7 @@ impl Executor {
                         if let Some(ref proj) = projection_pushdown {
                             let projected_schema: Vec<ColumnInfo> =
                                 proj.output_columns.iter().map(ColumnInfo::new).collect();
-                            Box::new(op.with_projection(
-                                proj.outer_indices.clone(),
-                                proj.inner_indices.clone(),
-                                projected_schema,
-                            ))
+                            Box::new(op.with_projection(proj.columns.clone(), projected_schema))
                         } else {
                             Box::new(op)
                         }
@@ -3427,11 +3424,7 @@ impl Executor {
                         if let Some(ref proj) = projection_pushdown {
                             let projected_schema: Vec<ColumnInfo> =
                                 proj.output_columns.iter().map(ColumnInfo::new).collect();
-                            Box::new(op.with_projection(
-                                proj.outer_indices.clone(),
-                                proj.inner_indices.clone(),
-                                projected_schema,
-                            ))
+                            Box::new(op.with_projection(proj.columns.clone(), projected_schema))
                         } else {
                             Box::new(op)
                         }

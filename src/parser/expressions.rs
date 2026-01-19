@@ -82,6 +82,11 @@ impl Parser {
             TokenType::Keyword => self.parse_keyword_expression(),
             TokenType::Operator => self.parse_unary_expression(),
             TokenType::Punctuator => self.parse_punctuator_expression(),
+            TokenType::Error => {
+                // Error token - the literal contains the error message
+                self.add_error(self.cur_token.literal.to_string());
+                None
+            }
             _ => {
                 self.add_error(format!(
                     "no prefix parse function for {:?} at {}",
@@ -107,12 +112,22 @@ impl Parser {
                 token: self.cur_token.clone(),
                 value,
             })),
-            Err(e) => {
-                self.add_error(format!(
-                    "could not parse {} as integer: {}",
-                    self.cur_token.literal, e
-                ));
-                None
+            Err(_) => {
+                // Integer overflow - try parsing as float instead
+                // This handles very large numbers that don't fit in i64
+                match self.cur_token.literal.parse::<f64>() {
+                    Ok(value) => Some(Expression::FloatLiteral(FloatLiteral {
+                        token: self.cur_token.clone(),
+                        value,
+                    })),
+                    Err(e) => {
+                        self.add_error(format!(
+                            "could not parse {} as number: {}",
+                            self.cur_token.literal, e
+                        ));
+                        None
+                    }
+                }
             }
         }
     }

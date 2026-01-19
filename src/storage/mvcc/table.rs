@@ -21,10 +21,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::{Arc, RwLock};
 
-use crate::common::{CompactArc, Int64Set};
+use crate::common::Int64Set;
 use crate::core::{
-    interned_null, DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn,
-    Value,
+    DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
 };
 use crate::storage::expression::Expression;
 use crate::storage::mvcc::bitmap_index::BitmapIndex;
@@ -1040,66 +1039,70 @@ impl MVCCTable {
                                 continue;
                             }
 
-                            // Values differ - collect and update using Arc variants
-                            let old_values: SmallVec<[CompactArc<Value>; 2]> = column_ids
+                            // Values differ - collect and update
+                            let old_values: SmallVec<[Value; 2]> = column_ids
                                 .iter()
                                 .map(|&col_id| {
                                     old_r
-                                        .get_arc(col_id as usize)
-                                        .unwrap_or_else(|| interned_null(DataType::Null))
+                                        .get(col_id as usize)
+                                        .cloned()
+                                        .unwrap_or(Value::Null(DataType::Null))
                                 })
                                 .collect();
 
-                            let new_values: SmallVec<[CompactArc<Value>; 2]> = column_ids
+                            let new_values: SmallVec<[Value; 2]> = column_ids
                                 .iter()
                                 .map(|&col_id| {
                                     new_row
-                                        .get_arc(col_id as usize)
-                                        .unwrap_or_else(|| interned_null(DataType::Null))
+                                        .get(col_id as usize)
+                                        .cloned()
+                                        .unwrap_or(Value::Null(DataType::Null))
                                 })
                                 .collect();
 
-                            let _ = index.remove_arc(&old_values, row_id, row_id);
-                            index.add_arc(&new_values, row_id, row_id)?;
+                            let _ = index.remove(&old_values, row_id, row_id);
+                            index.add(&new_values, row_id, row_id)?;
                             continue;
                         }
                     }
 
                     if is_deleted {
-                        // DELETE: remove from index using Arc values
-                        let values_to_remove: SmallVec<[CompactArc<Value>; 2]> =
-                            if let Some(old_r) = old_row {
-                                column_ids
-                                    .iter()
-                                    .map(|&col_id| {
-                                        old_r
-                                            .get_arc(col_id as usize)
-                                            .unwrap_or_else(|| interned_null(DataType::Null))
-                                    })
-                                    .collect()
-                            } else {
-                                column_ids
-                                    .iter()
-                                    .map(|&col_id| {
-                                        new_row
-                                            .get_arc(col_id as usize)
-                                            .unwrap_or_else(|| interned_null(DataType::Null))
-                                    })
-                                    .collect()
-                            };
-                        let _ = index.remove_arc(&values_to_remove, row_id, row_id);
+                        // DELETE: remove from index
+                        let values_to_remove: SmallVec<[Value; 2]> = if let Some(old_r) = old_row {
+                            column_ids
+                                .iter()
+                                .map(|&col_id| {
+                                    old_r
+                                        .get(col_id as usize)
+                                        .cloned()
+                                        .unwrap_or(Value::Null(DataType::Null))
+                                })
+                                .collect()
+                        } else {
+                            column_ids
+                                .iter()
+                                .map(|&col_id| {
+                                    new_row
+                                        .get(col_id as usize)
+                                        .cloned()
+                                        .unwrap_or(Value::Null(DataType::Null))
+                                })
+                                .collect()
+                        };
+                        let _ = index.remove(&values_to_remove, row_id, row_id);
                     } else {
-                        // INSERT: use add_arc to avoid Value cloning
+                        // INSERT: add values to index
                         // SmallVec inlines 1-2 values (most indexes are single-column)
-                        let new_values: SmallVec<[CompactArc<Value>; 2]> = column_ids
+                        let new_values: SmallVec<[Value; 2]> = column_ids
                             .iter()
                             .map(|&col_id| {
                                 new_row
-                                    .get_arc(col_id as usize)
-                                    .unwrap_or_else(|| interned_null(DataType::Null))
+                                    .get(col_id as usize)
+                                    .cloned()
+                                    .unwrap_or(Value::Null(DataType::Null))
                             })
                             .collect();
-                        index.add_arc(&new_values, row_id, row_id)?;
+                        index.add(&new_values, row_id, row_id)?;
                     }
                 }
             }
@@ -2954,6 +2957,12 @@ impl Table for MVCCTable {
 
         // Fallback path: Get all values and sort (for non-B-tree indexes)
         let all_values = index.get_all_values();
+
+        // If the index doesn't support get_all_values (returns empty), return None
+        // to let the regular query execution path handle ORDER BY + LIMIT
+        if all_values.is_empty() {
+            return None;
+        }
 
         // Sort values using partial_cmp (Value implements PartialOrd)
         let mut sorted_values = all_values;

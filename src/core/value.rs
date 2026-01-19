@@ -113,13 +113,19 @@ impl Value {
     }
 
     /// Create a text value
+    ///
+    /// Uses SmartString::from_string_shared() for heap strings to enable
+    /// O(1) clone via Arc<str>. This allows string sharing between
+    /// Arena, Index, and VersionStore.
     pub fn text(value: impl Into<String>) -> Self {
-        Value::Text(SmartString::from_string(value.into()))
+        Value::Text(SmartString::from_string_shared(value.into()))
     }
 
-    /// Create a text value from Arc<str>
+    /// Create a text value from Arc<str> (zero-copy for heap strings)
+    ///
+    /// Preserves the Arc reference for O(1) clone and sharing.
     pub fn text_arc(value: Arc<str>) -> Self {
-        Value::Text(SmartString::from(value.as_ref()))
+        Value::Text(SmartString::from(value))
     }
 
     /// Create a boolean value
@@ -1103,11 +1109,46 @@ pub fn parse_timestamp(s: &str) -> Result<DateTime<Utc>> {
 
 /// Format a float value consistently
 fn format_float(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < 1e15 {
+    // Handle special cases
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_positive() {
+            "Infinity"
+        } else {
+            "-Infinity"
+        }
+        .to_string();
+    }
+
+    let abs_v = v.abs();
+
+    // Use scientific notation for very large or very small numbers
+    if abs_v != 0.0 && !(1e-4..1e15).contains(&abs_v) {
+        // Use scientific notation with up to 15 significant digits
+        let s = format!("{:e}", v);
+        // Clean up trailing zeros in mantissa
+        if let Some(e_pos) = s.find('e') {
+            let (mantissa, exp) = s.split_at(e_pos);
+            let clean_mantissa = if mantissa.contains('.') {
+                mantissa
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    .to_string()
+            } else {
+                mantissa.to_string()
+            };
+            return format!("{}{}", clean_mantissa, exp);
+        }
+        return s;
+    }
+
+    if v.fract() == 0.0 {
         // Integer-like float, format without decimal
         format!("{:.0}", v)
     } else {
-        // Use 'g' format: shortest representation
+        // Use standard representation for normal range
         let s = format!("{:?}", v);
         // Remove trailing zeros after decimal point
         if s.contains('.') && !s.contains('e') && !s.contains('E') {
