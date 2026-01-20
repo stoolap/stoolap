@@ -115,6 +115,10 @@ pub struct BTreeIndex {
 
 impl BTreeIndex {
     /// Creates a new B-tree index
+    ///
+    /// # Arguments
+    /// * `expected_rows` - Hint for initial capacity of row_to_value map.
+    ///   Pass 0 if unknown; the map will grow automatically.
     pub fn new(
         name: String,
         table_name: String,
@@ -122,6 +126,7 @@ impl BTreeIndex {
         column_name: String,
         data_type: DataType,
         unique: bool,
+        expected_rows: usize,
     ) -> Self {
         Self {
             name,
@@ -132,7 +137,11 @@ impl BTreeIndex {
             unique,
             closed: AtomicBool::new(false),
             sorted_values: RwLock::new(BTreeMap::new()),
-            row_to_value: RwLock::new(I64Map::new()),
+            row_to_value: RwLock::new(if expected_rows > 0 {
+                I64Map::with_capacity(expected_rows)
+            } else {
+                I64Map::new()
+            }),
             cached_min: RwLock::new(None),
             cached_max: RwLock::new(None),
             cache_valid: AtomicBool::new(true),
@@ -148,12 +157,21 @@ impl BTreeIndex {
         data_type: DataType,
         unique: bool,
         custom_name: Option<&str>,
+        expected_rows: usize,
     ) -> Self {
         let name = custom_name
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("idx_{}_{}_btree", table_name, column_name));
 
-        Self::new(name, table_name, column_id, column_name, data_type, unique)
+        Self::new(
+            name,
+            table_name,
+            column_id,
+            column_name,
+            data_type,
+            unique,
+            expected_rows,
+        )
     }
 
     /// Check if the index is closed
@@ -1173,6 +1191,7 @@ mod tests {
             "id".to_string(),
             DataType::Integer,
             false,
+            0, // expected_rows: 0 for tests (will grow as needed)
         )
     }
 
@@ -1195,6 +1214,7 @@ mod tests {
             DataType::Text,
             true,
             Some("custom_email_idx"),
+            0,
         );
         assert_eq!(index.name(), "custom_email_idx");
         assert!(index.is_unique());
@@ -1230,6 +1250,7 @@ mod tests {
             "id".to_string(),
             DataType::Integer,
             true, // unique
+            0,
         );
 
         // First insert should succeed
@@ -1367,6 +1388,7 @@ mod tests {
             "name".to_string(),
             DataType::Text,
             false,
+            0,
         );
 
         index.add(&[Value::text("Alice")], 1, 1).unwrap();
@@ -1460,6 +1482,7 @@ mod tests {
             "value".to_string(),
             DataType::Float, // Use Float type to allow mixed values
             false,
+            0,
         );
 
         // Add mixed Integer and Float values
@@ -1506,6 +1529,7 @@ mod tests {
             "value".to_string(),
             DataType::Float,
             false,
+            0,
         );
 
         index.add(&[Value::Float(1.0)], 1, 1).unwrap();
@@ -1544,6 +1568,7 @@ mod tests {
             "status".to_string(),
             DataType::Text,
             false,
+            0,
         );
 
         // Add 100 rows with just 3 distinct values (low cardinality column)

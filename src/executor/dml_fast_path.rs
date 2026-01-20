@@ -22,10 +22,9 @@
 //! (subquery checking, memory filter setup, expression compilation), we can
 //! reduce per-operation overhead significantly.
 
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
-use crate::common::SmartString;
-
+use crate::common::{CompactArc, SmartString};
 use crate::core::{Result, Row, Schema, Value};
 use crate::parser::ast::{DeleteStatement, Expression, UpdateStatement};
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpression};
@@ -283,7 +282,7 @@ impl Executor {
                     // Clone only what we need (cheap: SmartString + Arc)
                     let table_name = update.table_name.clone();
                     let pk_column_name = update.pk_column_name.clone();
-                    let schema = Arc::clone(&update.schema);
+                    let schema = update.schema.clone();
                     drop(compiled_guard);
                     return Some(self.execute_pk_update_minimal(
                         &table_name,
@@ -319,7 +318,7 @@ impl Executor {
                     // Clone only what we need (cheap: SmartString + Arc)
                     let table_name = delete.table_name.clone();
                     let pk_column_name = delete.pk_column_name.clone();
-                    let schema = Arc::clone(&delete.schema);
+                    let schema = delete.schema.clone();
                     drop(compiled_guard);
                     return Some(self.execute_pk_delete_minimal(
                         &table_name,
@@ -340,7 +339,7 @@ impl Executor {
         &self,
         table_name: &str,
         pk_column_name: &str,
-        schema: &Arc<Schema>,
+        schema: &CompactArc<Schema>,
         pk_value: i64,
         updates: Vec<(usize, Value)>,
     ) -> Result<Box<dyn QueryResult>> {
@@ -389,7 +388,7 @@ impl Executor {
         &self,
         table_name: &str,
         pk_column_name: &str,
-        schema: &Arc<Schema>,
+        schema: &CompactArc<Schema>,
         pk_value: i64,
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
@@ -569,7 +568,7 @@ impl Executor {
         // Build compiled state
         let compiled_update = CompiledPkUpdate {
             table_name: SmartString::new(table_name),
-            schema: Arc::new((*schema).clone()),
+            schema: CompactArc::new((*schema).clone()),
             pk_column_name: SmartString::new(pk_column),
             pk_value_source: pk_source,
             updates: compiled_updates,
@@ -644,7 +643,7 @@ impl Executor {
         // Build compiled state
         let compiled_delete = CompiledPkDelete {
             table_name: SmartString::new(table_name),
-            schema: Arc::new((*schema).clone()),
+            schema: CompactArc::new((*schema).clone()),
             pk_column_name: SmartString::new(pk_column),
             pk_value_source: pk_source,
             cached_epoch: self.engine.schema_epoch(),

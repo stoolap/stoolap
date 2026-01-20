@@ -43,13 +43,13 @@
 
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 use lru::LruCache;
 use memchr::memmem;
 
 use chrono::{DateTime, Utc};
 
+use crate::common::CompactArc;
 use crate::core::{Operator, Row, Schema, Value};
 
 use super::between::BetweenExpr;
@@ -94,22 +94,22 @@ fn get_or_compile_regex(pattern: &str) -> regex::Regex {
 #[derive(Debug, Clone)]
 pub enum CompiledPattern {
     /// Exact match (no wildcards)
-    Exact(Arc<str>),
+    Exact(CompactArc<str>),
     /// Prefix match (pattern%)
-    Prefix(Arc<str>),
+    Prefix(CompactArc<str>),
     /// Suffix match (%pattern)
-    Suffix(Arc<str>),
+    Suffix(CompactArc<str>),
     /// Contains match (%pattern%) - uses SIMD-accelerated substring search
     Contains {
         /// The substring to search for
-        substring: Arc<str>,
+        substring: CompactArc<str>,
         /// Pre-compiled SIMD finder for case-sensitive O(n) search (boxed to reduce enum size)
         finder: Box<memmem::Finder<'static>>,
     },
     /// Prefix with pattern (literal_prefix + wildcard_pattern%)
     /// First check starts_with(prefix), then regex for the rest
     PrefixWithPattern {
-        prefix: Arc<str>,
+        prefix: CompactArc<str>,
         prefix_len: usize,
         rest_regex: regex::Regex,
     },
@@ -144,12 +144,12 @@ impl CompiledPattern {
 
         if !has_inner_wildcards {
             match (has_leading_percent, has_trailing_percent) {
-                (false, false) => CompiledPattern::Exact(Arc::from(inner)),
-                (false, true) => CompiledPattern::Prefix(Arc::from(inner)),
-                (true, false) => CompiledPattern::Suffix(Arc::from(inner)),
+                (false, false) => CompiledPattern::Exact(CompactArc::from(inner)),
+                (false, true) => CompiledPattern::Prefix(CompactArc::from(inner)),
+                (true, false) => CompiledPattern::Suffix(CompactArc::from(inner)),
                 (true, true) => {
                     // Pre-compile SIMD finder for O(n) substring search
-                    let substring: Arc<str> = Arc::from(inner);
+                    let substring: CompactArc<str> = CompactArc::from(inner);
                     let finder = Box::new(memmem::Finder::new(substring.as_bytes()).into_owned());
                     CompiledPattern::Contains { substring, finder }
                 }
@@ -194,7 +194,7 @@ impl CompiledPattern {
                     // Use cached regex compilation
                     let rest_regex = get_or_compile_regex(&full_rest_pattern);
                     return CompiledPattern::PrefixWithPattern {
-                        prefix: Arc::from(prefix),
+                        prefix: CompactArc::from(prefix),
                         prefix_len: prefix.len(),
                         rest_regex,
                     };
@@ -409,21 +409,39 @@ pub enum CompiledFilter {
     // String comparisons
     // =========================================================================
     /// col = string
-    StringEq { col_idx: usize, value: Arc<str> },
+    StringEq {
+        col_idx: usize,
+        value: CompactArc<str>,
+    },
     /// col != string
-    StringNe { col_idx: usize, value: Arc<str> },
+    StringNe {
+        col_idx: usize,
+        value: CompactArc<str>,
+    },
     /// col > string
-    StringGt { col_idx: usize, value: Arc<str> },
+    StringGt {
+        col_idx: usize,
+        value: CompactArc<str>,
+    },
     /// col >= string
-    StringGte { col_idx: usize, value: Arc<str> },
+    StringGte {
+        col_idx: usize,
+        value: CompactArc<str>,
+    },
     /// col < string
-    StringLt { col_idx: usize, value: Arc<str> },
+    StringLt {
+        col_idx: usize,
+        value: CompactArc<str>,
+    },
     /// col <= string
-    StringLte { col_idx: usize, value: Arc<str> },
+    StringLte {
+        col_idx: usize,
+        value: CompactArc<str>,
+    },
     /// col IN (v1, v2, ...) for strings
     StringIn {
         col_idx: usize,
-        values: Vec<Arc<str>>,
+        values: Vec<CompactArc<str>>,
     },
     /// col LIKE pattern
     StringLike {
@@ -515,11 +533,20 @@ pub enum CompiledFilter {
     // Scalar function expressions
     // =========================================================================
     /// UPPER(col) = value
-    UpperEq { col_idx: usize, value: Arc<str> },
+    UpperEq {
+        col_idx: usize,
+        value: CompactArc<str>,
+    },
     /// LOWER(col) = value
-    LowerEq { col_idx: usize, value: Arc<str> },
+    LowerEq {
+        col_idx: usize,
+        value: CompactArc<str>,
+    },
     /// TRIM(col) = value
-    TrimEq { col_idx: usize, value: Arc<str> },
+    TrimEq {
+        col_idx: usize,
+        value: CompactArc<str>,
+    },
     /// LENGTH(col) = value
     LengthEq { col_idx: usize, value: i64 },
     /// LENGTH(col) != value
@@ -640,7 +667,7 @@ impl CompiledFilter {
                 }
             }
             Value::Text(s) => {
-                let s: Arc<str> = Arc::from(s.as_ref());
+                let s: CompactArc<str> = CompactArc::from(s.as_ref());
                 match op {
                     Operator::Eq => CompiledFilter::StringEq { col_idx, value: s },
                     Operator::Ne => CompiledFilter::StringNe { col_idx, value: s },
@@ -827,10 +854,10 @@ impl CompiledFilter {
                 }
             }
             Value::Text(_) => {
-                let str_values: Vec<Arc<str>> = values
+                let str_values: Vec<CompactArc<str>> = values
                     .iter()
                     .filter_map(|v| match v {
-                        Value::Text(s) => Some(Arc::from(s.as_ref())),
+                        Value::Text(s) => Some(CompactArc::from(s.as_ref())),
                         _ => None,
                     })
                     .collect();
@@ -946,7 +973,7 @@ impl CompiledFilter {
                 match compare_val {
                     Value::Text(s) => CompiledFilter::UpperEq {
                         col_idx,
-                        value: Arc::from(s.as_ref()),
+                        value: CompactArc::from(s.as_ref()),
                     },
                     _ => CompiledFilter::Dynamic(expr.clone_box()),
                 }
@@ -959,7 +986,7 @@ impl CompiledFilter {
                 match compare_val {
                     Value::Text(s) => CompiledFilter::LowerEq {
                         col_idx,
-                        value: Arc::from(s.as_ref()),
+                        value: CompactArc::from(s.as_ref()),
                     },
                     _ => CompiledFilter::Dynamic(expr.clone_box()),
                 }
@@ -972,7 +999,7 @@ impl CompiledFilter {
                 match compare_val {
                     Value::Text(s) => CompiledFilter::TrimEq {
                         col_idx,
-                        value: Arc::from(s.as_ref()),
+                        value: CompactArc::from(s.as_ref()),
                     },
                     _ => CompiledFilter::Dynamic(expr.clone_box()),
                 }
@@ -1963,7 +1990,7 @@ mod tests {
     fn test_string_eq() {
         let filter = CompiledFilter::StringEq {
             col_idx: 1,
-            value: Arc::from("Alice"),
+            value: CompactArc::from("Alice"),
         };
 
         let row1 = make_row(1, "Alice", 30, 95.5, true);
@@ -2000,11 +2027,11 @@ mod tests {
         let filter = CompiledFilter::Or(
             Box::new(CompiledFilter::StringEq {
                 col_idx: 1,
-                value: Arc::from("Alice"),
+                value: CompactArc::from("Alice"),
             }),
             Box::new(CompiledFilter::StringEq {
                 col_idx: 1,
-                value: Arc::from("Bob"),
+                value: CompactArc::from("Bob"),
             }),
         );
 
@@ -2123,7 +2150,7 @@ mod tests {
             }),
             Box::new(CompiledFilter::StringEq {
                 col_idx: 1,
-                value: Arc::from("test"),
+                value: CompactArc::from("test"),
             }),
         );
         assert!(filter2.is_fully_compiled());
@@ -2137,7 +2164,7 @@ mod tests {
     fn test_upper_eq() {
         let filter = CompiledFilter::UpperEq {
             col_idx: 1,
-            value: Arc::from("ALICE"),
+            value: CompactArc::from("ALICE"),
         };
 
         let row1 = make_row(1, "alice", 30, 95.5, true);
@@ -2155,7 +2182,7 @@ mod tests {
     fn test_lower_eq() {
         let filter = CompiledFilter::LowerEq {
             col_idx: 1,
-            value: Arc::from("alice"),
+            value: CompactArc::from("alice"),
         };
 
         let row1 = make_row(1, "alice", 30, 95.5, true);
@@ -2173,7 +2200,7 @@ mod tests {
     fn test_trim_eq() {
         let filter = CompiledFilter::TrimEq {
             col_idx: 1,
-            value: Arc::from("Alice"),
+            value: CompactArc::from("Alice"),
         };
 
         let row1 = make_row(1, "Alice", 30, 95.5, true);
@@ -2269,7 +2296,7 @@ mod tests {
     fn test_scalar_func_with_null() {
         let filter = CompiledFilter::UpperEq {
             col_idx: 1,
-            value: Arc::from("ALICE"),
+            value: CompactArc::from("ALICE"),
         };
 
         // Row with NULL in name column

@@ -442,7 +442,7 @@ impl Executor {
 
         // Get the outer value from the outer row hashmap using pre-computed lowercase keys
         // This avoids per-row to_lowercase() calls
-        // Use .as_str() for lookups since map now uses Arc<str> keys
+        // Use .as_str() for lookups since map now uses CompactArc<str> keys
         let outer_value = if let Some(ref qualified) = correlation.outer_qualified_lower {
             outer_row
                 .get(qualified.as_str())
@@ -762,7 +762,7 @@ impl Executor {
 
         // Get the outer value from the outer row hashmap using pre-computed lowercase keys
         // This avoids per-probe to_lowercase() calls
-        // Use .as_str() for lookups since map now uses Arc<str> keys
+        // Use .as_str() for lookups since map now uses CompactArc<str> keys
         let outer_value = if let Some(ref qualified) = correlation.outer_qualified_lower {
             outer_row
                 .get(qualified.as_str())
@@ -891,7 +891,7 @@ impl Executor {
         };
 
         // Get the outer value from the outer row hashmap (no allocation)
-        // Use .as_str() for lookups since map now uses Arc<str> keys
+        // Use .as_str() for lookups since map now uses CompactArc<str> keys
         let outer_value = if let Some(ref qualified) = lookup_info.outer_qualified_lower {
             outer_row
                 .get(qualified.as_str())

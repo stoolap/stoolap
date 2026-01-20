@@ -19,9 +19,7 @@
 //! - [`CastFunction`] - CAST(value AS type) - Convert value to another type
 //! - [`CollateFunction`] - COLLATE(string, collation) - Apply collation to string
 
-use std::sync::Arc;
-
-use crate::common::SmartString;
+use crate::common::{CompactArc, SmartString};
 use crate::core::{Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
@@ -164,7 +162,7 @@ fn cast_to_string(value: &Value) -> Result<Value> {
         }
         Value::Boolean(b) => Ok(Value::Text(SmartString::from_string(b.to_string()))),
         Value::Timestamp(t) => Ok(Value::Text(SmartString::from_string(t.to_rfc3339()))),
-        Value::Json(j) => Ok(Value::Text(SmartString::from(j.as_ref()))),
+        Value::Json(j) => Ok(Value::Text(SmartString::from(&**j))),
         Value::Null(_) => Ok(Value::Text(SmartString::from(""))),
     }
 }
@@ -227,14 +225,15 @@ fn cast_to_timestamp(value: &Value) -> Result<Value> {
 fn cast_to_json(value: &Value) -> Result<Value> {
     match value {
         Value::Json(j) => Ok(Value::Json(j.clone())),
-        Value::Text(s) => Ok(Value::Json(Arc::from(s.as_str()))),
-        Value::Integer(i) => Ok(Value::Json(Arc::from(i.to_string().as_str()))),
-        Value::Float(f) => Ok(Value::Json(Arc::from(f.to_string().as_str()))),
-        Value::Boolean(b) => Ok(Value::Json(Arc::from(b.to_string().as_str()))),
-        Value::Null(_) => Ok(Value::Json(Arc::from("null"))),
-        Value::Timestamp(t) => Ok(Value::Json(Arc::from(
-            format!("\"{}\"", t.to_rfc3339()).as_str(),
-        ))),
+        Value::Text(s) => Ok(Value::Json(CompactArc::from(s.as_str()))),
+        Value::Integer(i) => Ok(Value::Json(CompactArc::from(i.to_string()))),
+        Value::Float(f) => Ok(Value::Json(CompactArc::from(f.to_string()))),
+        Value::Boolean(b) => Ok(Value::Json(CompactArc::from(b.to_string()))),
+        Value::Null(_) => Ok(Value::Json(CompactArc::from("null"))),
+        Value::Timestamp(t) => Ok(Value::Json(CompactArc::from(format!(
+            "\"{}\"",
+            t.to_rfc3339()
+        )))),
     }
 }
 

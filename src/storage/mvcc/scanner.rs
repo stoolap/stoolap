@@ -17,8 +17,7 @@
 //! Provides scanner implementations for MVCC query results.
 //!
 
-use std::sync::Arc;
-
+use crate::common::CompactArc;
 use crate::core::{Result, Row, RowVec, Schema};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Scanner;
@@ -33,7 +32,7 @@ pub struct MVCCScanner {
     column_indices: Vec<usize>,
     /// Table schema (kept for future projection improvements)
     #[allow(dead_code)]
-    schema: Arc<Schema>,
+    schema: CompactArc<Schema>,
     /// Filter expression (optional, kept for streaming filter support)
     #[allow(dead_code)]
     filter: Option<Box<dyn Expression>>,
@@ -50,7 +49,7 @@ impl MVCCScanner {
     /// Creates a new MVCC scanner with filtering (legacy method)
     pub fn new(
         rows: RowVec,
-        schema: Arc<Schema>,
+        schema: CompactArc<Schema>,
         column_indices: Vec<usize>,
         filter: Option<Box<dyn Expression>>,
     ) -> Self {
@@ -68,7 +67,7 @@ impl MVCCScanner {
 
     /// Creates scanner from RowVec
     #[inline]
-    pub fn from_rows(rows: RowVec, schema: Arc<Schema>, column_indices: Vec<usize>) -> Self {
+    pub fn from_rows(rows: RowVec, schema: CompactArc<Schema>, column_indices: Vec<usize>) -> Self {
         let num_schema_cols = schema.columns.len();
 
         // Check if we need projection (column_indices is a proper subset)
@@ -113,7 +112,7 @@ impl MVCCScanner {
 
     /// Creates an empty scanner
     #[inline]
-    pub fn empty(schema: Arc<Schema>, column_indices: Vec<usize>) -> Self {
+    pub fn empty(schema: CompactArc<Schema>, column_indices: Vec<usize>) -> Self {
         Self {
             rows: RowVec::new(),
             current_index: -1,
@@ -127,7 +126,7 @@ impl MVCCScanner {
     }
 
     /// Creates a scanner with a single row
-    pub fn single(row: Row, schema: Arc<Schema>, column_indices: Vec<usize>) -> Self {
+    pub fn single(row: Row, schema: CompactArc<Schema>, column_indices: Vec<usize>) -> Self {
         let mut rows = RowVec::new();
         rows.push((0, row));
         Self {
@@ -242,7 +241,7 @@ pub struct RangeScanner {
     column_indices: Vec<usize>,
     /// Table schema (kept for future projection improvements)
     #[allow(dead_code)]
-    schema: Arc<Schema>,
+    schema: CompactArc<Schema>,
     /// Any scanning error
     error: Option<crate::core::Error>,
     /// Pre-allocated projected row buffer (kept for future optimization)
@@ -261,7 +260,7 @@ impl RangeScanner {
         end_id: i64,
         inclusive: bool,
         txn_id: i64,
-        schema: Arc<Schema>,
+        schema: CompactArc<Schema>,
         column_indices: Vec<usize>,
         rows: RowVec,
     ) -> Self {
@@ -429,8 +428,8 @@ mod tests {
     use super::*;
     use crate::core::{DataType, SchemaBuilder, Value};
 
-    fn test_schema() -> Arc<Schema> {
-        Arc::new(
+    fn test_schema() -> CompactArc<Schema> {
+        CompactArc::new(
             SchemaBuilder::new("test")
                 .column("id", DataType::Integer, false, false)
                 .build(),

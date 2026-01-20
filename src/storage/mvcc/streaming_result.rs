@@ -23,8 +23,7 @@
 //! - Memory usage: O(1) instead of O(n)
 //! - Works with MVCC visibility by pre-computing visible row indices
 
-use std::sync::Arc;
-
+use crate::common::CompactArc;
 use crate::core::{Row, Value};
 use crate::storage::mvcc::arena::ArenaReadGuard;
 
@@ -51,7 +50,7 @@ pub struct StreamingResult<'a> {
     /// Temporary row buffer for the current row (to satisfy &Row interface)
     current_row: Row,
     /// Cached Arc for current row (for zero-copy access)
-    current_arc: Option<Arc<[Value]>>,
+    current_arc: Option<CompactArc<[Value]>>,
 }
 
 impl<'a> StreamingResult<'a> {
@@ -90,8 +89,8 @@ impl<'a> StreamingResult<'a> {
 
             // O(1) Arc clones from guard - no data copying
             if let Some(arc) = self.arena_guard.data().get(info.arena_idx) {
-                self.current_row = Row::from_arc(Arc::clone(arc));
-                self.current_arc = Some(Arc::clone(arc));
+                self.current_row = Row::from_arc(CompactArc::clone(arc));
+                self.current_arc = Some(CompactArc::clone(arc));
             } else {
                 self.current_arc = None;
             }
@@ -105,7 +104,7 @@ impl<'a> StreamingResult<'a> {
 
     /// Get current row as Arc slice (for efficient access)
     #[inline]
-    pub fn row_arc_slice(&self) -> Option<&Arc<[Value]>> {
+    pub fn row_arc_slice(&self) -> Option<&CompactArc<[Value]>> {
         self.current_arc.as_ref()
     }
 
@@ -159,12 +158,15 @@ impl<'a> StreamingResult<'a> {
 /// that can be computed in a single pass over contiguous memory with
 /// zero allocations during the scan.
 pub struct AggregationScanner<'a> {
-    arena_data: &'a [Arc<[Value]>],
+    arena_data: &'a [CompactArc<[Value]>],
     visible_indices: &'a [VisibleRowInfo],
 }
 
 impl<'a> AggregationScanner<'a> {
-    pub fn new(arena_data: &'a [Arc<[Value]>], visible_indices: &'a [VisibleRowInfo]) -> Self {
+    pub fn new(
+        arena_data: &'a [CompactArc<[Value]>],
+        visible_indices: &'a [VisibleRowInfo],
+    ) -> Self {
         Self {
             arena_data,
             visible_indices,

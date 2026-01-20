@@ -102,16 +102,16 @@ use super::Executor;
 use crate::optimizer::bloom::BloomFilterBuilder;
 
 /// Pre-computed column name mappings for correlated subqueries.
-/// Uses Arc<str> for zero-cost cloning in the per-row inner loop.
+/// Uses CompactArc<str> for zero-cost cloning in the per-row inner loop.
 struct ColumnKeyMapping {
     /// Column index in the row
     index: usize,
     /// Lowercase column name (e.g., "id")
-    col_lower: Arc<str>,
+    col_lower: CompactArc<str>,
     /// Qualified name with table alias (e.g., "c.id")
-    qualified_name: Option<Arc<str>>,
+    qualified_name: Option<CompactArc<str>>,
     /// Unqualified part if original had a dot (e.g., "id" from "table.id")
-    unqualified_part: Option<Arc<str>>,
+    unqualified_part: Option<CompactArc<str>>,
 }
 
 impl ColumnKeyMapping {
@@ -123,12 +123,12 @@ impl ColumnKeyMapping {
             .iter()
             .enumerate()
             .map(|(i, col_name)| {
-                let col_lower: Arc<str> = Arc::from(col_name.to_lowercase().as_str());
-                let qualified_name =
-                    table_alias.map(|alias| Arc::from(format!("{}.{}", alias, col_lower).as_str()));
-                let unqualified_part = col_name
-                    .rfind('.')
-                    .map(|dot_idx| Arc::from(col_name[dot_idx + 1..].to_lowercase().as_str()));
+                let col_lower: CompactArc<str> = CompactArc::from(col_name.to_lowercase().as_str());
+                let qualified_name = table_alias
+                    .map(|alias| CompactArc::from(format!("{}.{}", alias, col_lower).as_str()));
+                let unqualified_part = col_name.rfind('.').map(|dot_idx| {
+                    CompactArc::from(col_name[dot_idx + 1..].to_lowercase().as_str())
+                });
                 ColumnKeyMapping {
                     index: i,
                     col_lower,
@@ -543,24 +543,24 @@ impl Executor {
                         });
 
                     // OPTIMIZATION: Pre-compute lowercase column names once before row loop
-                    // This avoids per-row to_lowercase() calls. Use Arc<str> for zero-cost clone.
-                    let columns_lower: Vec<Arc<str>> = columns
+                    // This avoids per-row to_lowercase() calls. Use CompactArc<str> for zero-cost clone.
+                    let columns_lower: Vec<CompactArc<str>> = columns
                         .iter()
-                        .map(|c| Arc::from(c.to_lowercase().as_str()))
+                        .map(|c| CompactArc::from(c.to_lowercase().as_str()))
                         .collect();
                     // Also pre-compute qualified names if alias is present
-                    let qualified_names: Option<Vec<Arc<str>>> =
+                    let qualified_names: Option<Vec<CompactArc<str>>> =
                         order_table_alias.as_ref().map(|alias| {
                             columns_lower
                                 .iter()
-                                .map(|c| Arc::from(format!("{}.{}", alias, c).as_str()))
+                                .map(|c| CompactArc::from(format!("{}.{}", alias, c).as_str()))
                                 .collect()
                         });
 
                     rows.iter()
                         .map(|(_, row)| {
                             // Build outer row context from current row
-                            let mut outer_row_map: FxHashMap<Arc<str>, Value> =
+                            let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
                                 FxHashMap::default();
                             for (idx, col_lower) in columns_lower.iter().enumerate() {
                                 let val = row.get(idx).cloned().unwrap_or(Value::null_unknown());
@@ -2348,7 +2348,7 @@ impl Executor {
 
                 // OPTIMIZATION: Pre-allocate outer_row_map with capacity and reuse
                 let base_capacity = all_columns.len() * 2 + ctx.outer_row().map_or(0, |m| m.len());
-                let mut outer_row_map: FxHashMap<Arc<str>, Value> = FxHashMap::default();
+                let mut outer_row_map: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
                 outer_row_map.reserve(base_capacity);
 
                 // OPTIMIZATION: Wrap all_columns in Arc once, reuse for all rows (only if needed)
@@ -4764,12 +4764,12 @@ impl Executor {
                             // Check if it's correlated (references outer columns)
                             if Self::has_correlated_subqueries(&a.expression) {
                                 // Build outer row context for correlated subquery
-                                let mut outer_row_map: FxHashMap<Arc<str>, Value> =
+                                let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
                                     FxHashMap::default();
                                 for (i, col_name) in extended_columns.iter().enumerate() {
                                     if let Some(value) = row.get(i) {
                                         outer_row_map.insert(
-                                            Arc::from(col_name.to_lowercase().as_str()),
+                                            CompactArc::from(col_name.to_lowercase().as_str()),
                                             value.clone(),
                                         );
                                     }
@@ -4799,12 +4799,12 @@ impl Executor {
                             // Check if it's correlated (references outer columns)
                             if Self::has_correlated_subqueries(other) {
                                 // Build outer row context for correlated subquery
-                                let mut outer_row_map: FxHashMap<Arc<str>, Value> =
+                                let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
                                     FxHashMap::default();
                                 for (i, col_name) in extended_columns.iter().enumerate() {
                                     if let Some(value) = row.get(i) {
                                         outer_row_map.insert(
-                                            Arc::from(col_name.to_lowercase().as_str()),
+                                            CompactArc::from(col_name.to_lowercase().as_str()),
                                             value.clone(),
                                         );
                                     }
@@ -5540,9 +5540,9 @@ impl Executor {
         let column_keys = ColumnKeyMapping::build_mappings(all_columns, table_alias);
 
         // OPTIMIZATION: Pre-allocate outer_row_map with capacity and reuse
-        // Uses Arc<str> keys for zero-cost cloning in the per-row loop
+        // Uses CompactArc<str> keys for zero-cost cloning in the per-row loop
         let base_capacity = all_columns.len() * 2;
-        let mut outer_row_map: FxHashMap<Arc<str>, Value> = FxHashMap::default();
+        let mut outer_row_map: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
         outer_row_map.reserve(base_capacity);
 
         // OPTIMIZATION: Wrap all_columns in CompactArc once, reuse for all rows

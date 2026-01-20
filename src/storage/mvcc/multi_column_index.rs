@@ -154,6 +154,7 @@ impl MultiColumnIndex {
         column_ids: Vec<i32>,
         data_types: Vec<DataType>,
         is_unique: bool,
+        expected_rows: usize,
     ) -> Self {
         let num_cols = column_names.len();
         let mut prefix_indexes = Vec::with_capacity(num_cols);
@@ -173,10 +174,18 @@ impl MultiColumnIndex {
             closed: AtomicBool::new(false),
             sorted_values: RwLock::new(BTreeMap::new()),
             btree_built: AtomicBool::new(false),
-            value_to_rows: RwLock::new(FxHashMap::default()),
+            value_to_rows: RwLock::new(if expected_rows > 0 {
+                FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
+            } else {
+                FxHashMap::default()
+            }),
             prefix_indexes,
             prefix_built,
-            row_to_key: RwLock::new(I64Map::new()),
+            row_to_key: RwLock::new(if expected_rows > 0 {
+                I64Map::with_capacity(expected_rows)
+            } else {
+                I64Map::new()
+            }),
         }
     }
 
@@ -968,6 +977,7 @@ mod tests {
             vec![0, 1],
             vec![DataType::Integer, DataType::Text],
             false,
+            0,
         );
 
         // Add some values
@@ -1002,6 +1012,7 @@ mod tests {
             vec![0],
             vec![DataType::Integer],
             false,
+            0,
         );
 
         // Add values
@@ -1025,6 +1036,7 @@ mod tests {
             vec![0],
             vec![DataType::Integer],
             true, // unique
+            0,
         );
 
         // First insert should succeed
@@ -1044,6 +1056,7 @@ mod tests {
             vec![0],
             vec![DataType::Integer],
             false,
+            0,
         );
 
         // Add and remove

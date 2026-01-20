@@ -99,7 +99,7 @@ pub struct CompileContext<'a> {
     row2_tables: FxHashSet<String>,
 
     /// Outer query columns (for correlated subqueries)
-    outer_columns: Option<FxHashMap<Arc<str>, u16>>,
+    outer_columns: Option<FxHashMap<CompactArc<str>, u16>>,
 
     /// Function registry
     functions: &'a FunctionRegistry,
@@ -186,7 +186,7 @@ impl<'a> CompileContext<'a> {
     pub fn with_outer_columns(mut self, outer_cols: &[String]) -> Self {
         let mut map = FxHashMap::default();
         for (i, col) in outer_cols.iter().enumerate() {
-            map.insert(Arc::from(col.to_lowercase().as_str()), i as u16);
+            map.insert(CompactArc::from(col.to_lowercase().as_str()), i as u16);
         }
         self.outer_columns = Some(map);
         self
@@ -257,11 +257,11 @@ impl<'a> CompileContext<'a> {
     }
 
     /// Resolve outer column (for correlated subqueries)
-    fn resolve_outer_column(&self, name: &str) -> Option<Arc<str>> {
+    fn resolve_outer_column(&self, name: &str) -> Option<CompactArc<str>> {
         let lower = name.to_lowercase();
         self.outer_columns.as_ref().and_then(|cols| {
             if cols.contains_key(lower.as_str()) {
-                Some(Arc::from(lower.as_str()))
+                Some(CompactArc::from(lower.as_str()))
             } else {
                 None
             }
@@ -476,7 +476,7 @@ impl<'a> ExprCompiler<'a> {
             Expression::Parameter(param) => {
                 if param.name.starts_with(':') {
                     let name = &param.name[1..];
-                    builder.emit(Op::LoadNamedParam(Arc::from(name)));
+                    builder.emit(Op::LoadNamedParam(CompactArc::from(name)));
                 } else if param.index > 0 {
                     builder.emit(Op::LoadParam((param.index - 1) as u16));
                 } else {

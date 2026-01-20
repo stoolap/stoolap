@@ -396,7 +396,7 @@ pub struct VersionStore {
     /// The name of the table this store belongs to (SmartString for inline storage ≤24 bytes)
     table_name: SmartString,
     /// Table schema (Arc for zero-cost cloning on read)
-    schema: RwLock<Arc<Schema>>,
+    schema: RwLock<CompactArc<Schema>>,
     /// Indexes on this table (FxHashMap for fast string key lookups)
     indexes: RwLock<FxHashMap<String, Arc<dyn Index>>>,
     /// Whether this store has been closed
@@ -457,7 +457,7 @@ impl VersionStore {
         Self {
             versions,
             table_name: table_name.into(),
-            schema: RwLock::new(Arc::new(schema)),
+            schema: RwLock::new(CompactArc::new(schema)),
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
@@ -489,7 +489,7 @@ impl VersionStore {
         Self {
             versions,
             table_name: table_name.into(),
-            schema: RwLock::new(Arc::new(schema)),
+            schema: RwLock::new(CompactArc::new(schema)),
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
@@ -556,14 +556,14 @@ impl VersionStore {
         &self.table_name
     }
 
-    /// Returns the schema (cheap Arc clone)
-    pub fn schema(&self) -> Arc<Schema> {
-        Arc::clone(&*self.schema.read())
+    /// Returns the schema (cheap CompactArc clone)
+    pub fn schema(&self) -> CompactArc<Schema> {
+        self.schema.read().clone()
     }
 
     /// Returns a mutable reference to the schema (for modifications)
-    /// Callers must use Arc::make_mut() to get &mut Schema
-    pub fn schema_mut(&self) -> parking_lot::RwLockWriteGuard<'_, Arc<Schema>> {
+    /// Callers must use CompactArc::make_mut() to get &mut Schema
+    pub fn schema_mut(&self) -> parking_lot::RwLockWriteGuard<'_, CompactArc<Schema>> {
         self.schema.write()
     }
 
@@ -661,7 +661,7 @@ impl VersionStore {
                             row_id,
                             new_version.txn_id,
                             new_version.create_time,
-                            Arc::clone(&arc_data),
+                            CompactArc::clone(&arc_data),
                         );
                         old_idx
                     } else {
@@ -670,7 +670,7 @@ impl VersionStore {
                             row_id,
                             new_version.txn_id,
                             new_version.create_time,
-                            Arc::clone(&arc_data),
+                            CompactArc::clone(&arc_data),
                         )
                     };
 
@@ -732,7 +732,7 @@ impl VersionStore {
                         row_id,
                         v.txn_id,
                         v.create_time,
-                        Arc::clone(&arc_data),
+                        CompactArc::clone(&arc_data),
                     );
                     // Update row -> arena index mapping
                     self.row_arena_index.write().insert(row_id, idx);
@@ -826,7 +826,7 @@ impl VersionStore {
                                 row_id,
                                 new_version.txn_id,
                                 new_version.create_time,
-                                Arc::clone(&arc_data),
+                                CompactArc::clone(&arc_data),
                             );
                             old_idx
                         } else {
@@ -835,7 +835,7 @@ impl VersionStore {
                                 row_id,
                                 new_version.txn_id,
                                 new_version.create_time,
-                                Arc::clone(&arc_data),
+                                CompactArc::clone(&arc_data),
                             )
                         };
 
@@ -896,7 +896,7 @@ impl VersionStore {
                             row_id,
                             v.txn_id,
                             v.create_time,
-                            Arc::clone(&arc_data),
+                            CompactArc::clone(&arc_data),
                         );
                         arena_index_updates.push((row_id, idx));
                         // Create version with Arc-backed data for O(1) clone
@@ -994,7 +994,7 @@ impl VersionStore {
                             row_id,
                             new_version.txn_id,
                             new_version.create_time,
-                            Arc::clone(&arc_data),
+                            CompactArc::clone(&arc_data),
                         );
                         old_idx
                     } else {
@@ -1003,7 +1003,7 @@ impl VersionStore {
                             row_id,
                             new_version.txn_id,
                             new_version.create_time,
-                            Arc::clone(&arc_data),
+                            CompactArc::clone(&arc_data),
                         )
                     };
 
@@ -1059,7 +1059,7 @@ impl VersionStore {
                         row_id,
                         v.txn_id,
                         v.create_time,
-                        Arc::clone(&arc_data),
+                        CompactArc::clone(&arc_data),
                     );
                     // Update arena index immediately
                     self.row_arena_index.write().insert(row_id, idx);
@@ -1250,8 +1250,10 @@ impl VersionStore {
                             || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
                         {
                             // O(1) success! Return from arena
-                            results
-                                .push((row_id, Row::from_arc(Arc::clone(&arena_data[arena_idx]))));
+                            results.push((
+                                row_id,
+                                Row::from_arc(CompactArc::clone(&arena_data[arena_idx])),
+                            ));
                         }
                         // Else: deleted, skip
                         continue;
@@ -1270,7 +1272,7 @@ impl VersionStore {
                         // Get from arena if available, else clone
                         let row = if let Some(idx) = chain.arena_idx {
                             if let Some(arc_row) = arena_data.get(idx) {
-                                Row::from_arc(Arc::clone(arc_row))
+                                Row::from_arc(CompactArc::clone(arc_row))
                             } else {
                                 chain.version.data.clone()
                             }
@@ -1293,7 +1295,7 @@ impl VersionStore {
                         {
                             let row = if let Some(idx) = e.arena_idx {
                                 if let Some(arc_row) = arena_data.get(idx) {
-                                    Row::from_arc(Arc::clone(arc_row))
+                                    Row::from_arc(CompactArc::clone(arc_row))
                                 } else {
                                     e.version.data.clone()
                                 }
@@ -1456,7 +1458,7 @@ impl VersionStore {
         let get_row = |entry: &VersionChainEntry| -> Row {
             if let Some(idx) = entry.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc(CompactArc::clone(arc_row));
                 }
             }
             entry.version.data.clone()
@@ -1732,7 +1734,7 @@ impl VersionStore {
         let get_row = |entry: &VersionChainEntry| -> Row {
             if let Some(idx) = entry.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc(CompactArc::clone(arc_row));
                 }
             }
             entry.version.data.clone()
@@ -1800,7 +1802,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc(CompactArc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -1868,7 +1870,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc(CompactArc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -1946,7 +1948,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc(CompactArc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -2046,7 +2048,7 @@ impl VersionStore {
                                 version_copy.create_time = current_seq;
                                 result.push((
                                     row_id,
-                                    Row::from_arc(Arc::clone(arc_row)),
+                                    Row::from_arc(CompactArc::clone(arc_row)),
                                     version_copy,
                                 ));
                             }
@@ -2080,7 +2082,7 @@ impl VersionStore {
                                     version_copy.create_time = current_seq;
                                     result.push((
                                         row_id,
-                                        Row::from_arc(Arc::clone(arc_row)),
+                                        Row::from_arc(CompactArc::clone(arc_row)),
                                         version_copy,
                                     ));
                                 }
@@ -2126,7 +2128,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc(CompactArc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -2197,7 +2199,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc(CompactArc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -2309,7 +2311,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc(CompactArc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -2411,7 +2413,7 @@ impl VersionStore {
         let get_row_data = |e: &VersionChainEntry| -> Row {
             if let Some(idx) = e.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc(CompactArc::clone(arc_row));
                 }
             }
             e.version.data.clone()
@@ -2512,7 +2514,7 @@ impl VersionStore {
         let get_row_from_entry = |entry: &VersionChainEntry| -> Row {
             if let Some(idx) = entry.arena_idx {
                 if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(Arc::clone(arc_row));
+                    return Row::from_arc(CompactArc::clone(arc_row));
                 }
             }
             entry.version.data.clone()
@@ -2627,7 +2629,7 @@ impl VersionStore {
                     // Read row data from arena or version
                     let row_data = if let Some(idx) = e.arena_idx {
                         if let Some(arc_row) = arena_data.get(idx) {
-                            Row::from_arc(Arc::clone(arc_row))
+                            Row::from_arc(CompactArc::clone(arc_row))
                         } else {
                             e.version.data.clone()
                         }
@@ -2736,7 +2738,7 @@ impl VersionStore {
                         if let Some(arc_row) = arena_data.get(idx) {
                             // Filter directly on Arc slice - no Row allocation for non-matching rows
                             if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
-                                result.push((row_id, Row::from_arc(Arc::clone(arc_row))));
+                                result.push((row_id, Row::from_arc(CompactArc::clone(arc_row))));
                             }
                             break;
                         }
@@ -2817,7 +2819,8 @@ impl VersionStore {
                                 if skipped < offset {
                                     skipped += 1;
                                 } else {
-                                    result.push((row_id, Row::from_arc(Arc::clone(arc_row))));
+                                    result
+                                        .push((row_id, Row::from_arc(CompactArc::clone(arc_row))));
                                     if result.len() >= limit {
                                         return result; // Early termination!
                                     }
@@ -3034,7 +3037,7 @@ impl VersionStore {
                 // Fast path: get from arena
                 if arena_idx < arena_len {
                     if let Some(arc_row) = arena_data.get(arena_idx) {
-                        result.push((idx.row_id, Row::from_arc(Arc::clone(arc_row))));
+                        result.push((idx.row_id, Row::from_arc(CompactArc::clone(arc_row))));
                         continue;
                     }
                 }
@@ -3056,7 +3059,7 @@ impl VersionStore {
             let arena_guard = self.arena.read_guard();
             let arena_data = arena_guard.data();
             if let Some(arc_row) = arena_data.get(arena_idx) {
-                return Some((idx.row_id, Row::from_arc(Arc::clone(arc_row))));
+                return Some((idx.row_id, Row::from_arc(CompactArc::clone(arc_row))));
             }
         }
 
@@ -4175,6 +4178,9 @@ impl VersionStore {
             return Ok(()); // Already recovered, skip
         }
 
+        // Get row count for capacity hint
+        let expected_rows = self.versions.read().len();
+
         if meta.column_names.len() == 1 {
             // Single-column index
             let column_name = &meta.column_names[0];
@@ -4195,6 +4201,7 @@ impl VersionStore {
                         vec![column_id],
                         vec![data_type],
                         meta.is_unique,
+                        expected_rows,
                     );
                     Arc::new(idx)
                 }
@@ -4206,6 +4213,7 @@ impl VersionStore {
                         vec![column_id],
                         vec![data_type],
                         meta.is_unique,
+                        expected_rows,
                     );
                     Arc::new(idx)
                 }
@@ -4218,6 +4226,7 @@ impl VersionStore {
                         column_name.clone(),
                         data_type,
                         meta.is_unique,
+                        expected_rows,
                     );
                     Arc::new(idx)
                 }
@@ -4230,6 +4239,7 @@ impl VersionStore {
                         meta.column_ids.clone(),
                         meta.data_types.clone(),
                         meta.is_unique,
+                        expected_rows,
                     );
                     Arc::new(idx)
                 }
@@ -4259,6 +4269,7 @@ impl VersionStore {
                 meta.column_ids.clone(),
                 meta.data_types.clone(),
                 meta.is_unique,
+                expected_rows,
             );
 
             let index = Arc::new(index);
@@ -5453,6 +5464,11 @@ impl TransactionVersionStore {
             .is_some_and(|lv| !lv.is_empty())
     }
 
+    /// Returns the number of local changes (distinct row IDs)
+    pub fn local_count(&self) -> usize {
+        self.local_versions.as_ref().map_or(0, |lv| lv.len())
+    }
+
     /// Iterate over local versions (returns most recent version per row)
     pub fn iter_local(&self) -> impl Iterator<Item = (i64, &RowVersion)> {
         self.local_versions
@@ -6643,6 +6659,7 @@ mod tests {
             vec![0],
             vec![DataType::Integer],
             false,
+            0,
         ));
         store.add_index("idx_test".to_string(), index);
 

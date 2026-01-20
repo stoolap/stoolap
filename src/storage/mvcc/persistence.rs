@@ -25,10 +25,10 @@ use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::common::SmartString;
+use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Error, IndexType, Result, Row, Schema, Value};
 use crate::storage::mvcc::version_store::RowVersion;
 use crate::storage::mvcc::wal_manager::{WALEntry, WALManager, WALOperationType};
@@ -266,7 +266,7 @@ pub struct PersistenceManager {
     /// Running flag for background tasks
     running: AtomicBool,
     /// Table schemas cache
-    schemas: RwLock<FxHashMap<String, Arc<Schema>>>,
+    schemas: RwLock<FxHashMap<String, CompactArc<Schema>>>,
 }
 
 impl PersistenceManager {
@@ -551,7 +551,7 @@ impl PersistenceManager {
     }
 
     /// Register a table schema
-    pub fn register_schema(&self, name: &str, schema: Arc<Schema>) {
+    pub fn register_schema(&self, name: &str, schema: CompactArc<Schema>) {
         let mut schemas = self
             .schemas
             .write()
@@ -560,7 +560,7 @@ impl PersistenceManager {
     }
 
     /// Get a table schema
-    pub fn get_schema(&self, name: &str) -> Option<Arc<Schema>> {
+    pub fn get_schema(&self, name: &str) -> Option<CompactArc<Schema>> {
         let schemas = self
             .schemas
             .read()
@@ -806,7 +806,7 @@ pub fn deserialize_value(data: &[u8]) -> Result<Value> {
             }
             let s = String::from_utf8(rest[4..4 + len].to_vec())
                 .map_err(|e| Error::internal(format!("invalid json: {}", e)))?;
-            Ok(Value::Json(Arc::from(s.as_str())))
+            Ok(Value::Json(CompactArc::from(s)))
         }
         _ => Err(Error::internal(format!(
             "unknown value type tag: {}",

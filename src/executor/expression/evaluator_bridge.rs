@@ -24,7 +24,7 @@
 //
 // Performance Optimization:
 // - For closure-based filtering, use `RowFilter` instead of creating evaluators per-row
-// - `RowFilter` pre-compiles the expression once and shares `Arc<Program>` across threads
+// - `RowFilter` pre-compiles the expression once and shares `CompactArc<Program>` across threads
 // - The VM is lightweight and can be created per-thread without performance penalty
 
 use std::hash::{Hash, Hasher};
@@ -319,7 +319,7 @@ fn compile_expression_cached(expr: &Expression, columns: &[String]) -> Result<Sh
     let compiler = ExprCompiler::new(&ctx);
     let program: SharedProgram = compiler
         .compile(expr)
-        .map(Arc::new)
+        .map(CompactArc::new)
         .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
 
     // Store in cache (O(1) insertion with automatic LRU eviction)
@@ -340,7 +340,7 @@ fn compile_expression_cached(expr: &Expression, columns: &[String]) -> Result<Sh
 /// Compile an expression to a program for a given column schema.
 ///
 /// This is the recommended way to compile expressions for use in closures
-/// or parallel execution. The returned `Arc<Program>` is `Send + Sync` and
+/// or parallel execution. The returned `CompactArc<Program>` is `Send + Sync` and
 /// can be shared across threads efficiently.
 ///
 /// **Note:** Results are cached globally for performance. Repeated calls
@@ -351,7 +351,7 @@ fn compile_expression_cached(expr: &Expression, columns: &[String]) -> Result<Sh
 /// * `columns` - Column names for the schema
 ///
 /// # Returns
-/// * `Arc<Program>` that can be executed with `RowFilter` or `ExprVM`
+/// * `CompactArc<Program>` that can be executed with `RowFilter` or `ExprVM`
 pub fn compile_expression(expr: &Expression, columns: &[String]) -> Result<SharedProgram> {
     compile_expression_cached(expr, columns)
 }
@@ -372,7 +372,7 @@ pub fn compile_expression_with_context(
     let compiler = ExprCompiler::new(&ctx);
     compiler
         .compile(expr)
-        .map(Arc::new)
+        .map(CompactArc::new)
         .map_err(|e| Error::internal(format!("Compile error: {}", e)))
 }
 
@@ -383,7 +383,7 @@ pub fn compile_expression_with_context(
 /// A lightweight, thread-safe row filter for closure-based filtering.
 ///
 /// `RowFilter` pre-compiles the expression once and can be cloned cheaply
-/// (it uses `Arc<Program>` internally). Each thread should create its own
+/// (it uses `CompactArc<Program>` internally). Each thread should create its own
 /// `ExprVM` for execution.
 ///
 /// # Example
@@ -460,7 +460,7 @@ impl RowFilter {
         let compiler = ExprCompiler::new(&ctx);
         let program = compiler
             .compile(expr)
-            .map(Arc::new)
+            .map(CompactArc::new)
             .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
 
         Ok(Self {
@@ -574,8 +574,8 @@ impl RowFilter {
 // This is safer than unsafe impl because it will fail at compile time
 // if any field doesn't implement Send/Sync, rather than causing UB at runtime.
 // All fields are Send + Sync:
-// - Arc<Program> is Send + Sync (Program is immutable)
-// - Arc<[Value]> is Send + Sync
+// - CompactArc<Program> is Send + Sync (Program is immutable)
+// - CompactArc<Value> is Send + Sync
 // - Arc<FxHashMap<String, Value>> is Send + Sync
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
@@ -617,7 +617,7 @@ impl JoinFilter {
             .compile(expr)
             .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
         Ok(Self {
-            program: Arc::new(program),
+            program: CompactArc::new(program),
             params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
         })
@@ -710,7 +710,7 @@ pub struct ExpressionEval {
     /// Named parameters (shared) - uses Arc to match ExecutionContext
     named_params: Arc<FxHashMap<String, Value>>,
     /// Outer row context for correlated subqueries
-    outer_row: Option<FxHashMap<Arc<str>, Value>>,
+    outer_row: Option<FxHashMap<CompactArc<str>, Value>>,
     /// Transaction ID
     transaction_id: Option<u64>,
 }
@@ -788,7 +788,7 @@ impl ExpressionEval {
         let compiler = ExprCompiler::new(&ctx);
         let program = compiler
             .compile(expr)
-            .map(Arc::new)
+            .map(CompactArc::new)
             .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
         Ok(Self {
             program,
@@ -833,7 +833,7 @@ impl ExpressionEval {
         // Share named_params Arc - no cloning needed
         self.named_params = Arc::clone(ctx.named_params_arc());
         if let Some(outer) = ctx.outer_row() {
-            // Clone the map directly (Arc<str> clones are cheap)
+            // Clone the map directly (CompactArc<str> clones are cheap)
             let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             self.outer_row = Some(arc_map);
         }
@@ -848,11 +848,11 @@ impl ExpressionEval {
     }
 
     /// Set outer row for correlated subqueries.
-    /// Accepts Arc<str> keys directly to avoid conversion overhead.
-    pub fn set_outer_row(&mut self, outer: &FxHashMap<Arc<str>, Value>) {
-        // Clone the map (Arc clones are cheap, Value clones may be expensive but needed)
-        let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        self.outer_row = Some(arc_map);
+    /// Accepts CompactArc<str> keys directly to avoid conversion overhead.
+    pub fn set_outer_row(&mut self, outer: &FxHashMap<CompactArc<str>, Value>) {
+        // Clone the map (CompactArc clones are cheap, Value clones may be expensive but needed)
+        let map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        self.outer_row = Some(map);
     }
 
     /// Clear outer row.
@@ -987,7 +987,7 @@ impl MultiExpressionEval {
             .map(|expr| {
                 compiler
                     .compile(expr)
-                    .map(Arc::new)
+                    .map(CompactArc::new)
                     .map_err(|e| Error::internal(format!("Compile error: {}", e)))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1029,7 +1029,7 @@ impl MultiExpressionEval {
             .map(|expr| {
                 compiler
                     .compile(expr)
-                    .map(Arc::new)
+                    .map(CompactArc::new)
                     .map_err(|e| Error::internal(format!("Compile error: {}", e)))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1112,7 +1112,7 @@ impl MultiExpressionEval {
 }
 
 /// Shared program reference for zero-copy caching
-pub type SharedProgram = Arc<Program>;
+pub type SharedProgram = CompactArc<Program>;
 
 // ============================================================================
 // COMPILED EVALUATOR - DEPRECATED, use ExpressionEval instead
@@ -1186,7 +1186,7 @@ pub struct CompiledEvaluator<'a> {
     named_params: Arc<FxHashMap<String, Value>>,
 
     /// Outer row context for correlated subqueries
-    outer_row: Option<FxHashMap<Arc<str>, Value>>,
+    outer_row: Option<FxHashMap<CompactArc<str>, Value>>,
 
     /// Current transaction ID
     transaction_id: Option<u64>,
@@ -1286,9 +1286,9 @@ impl<'a> CompiledEvaluator<'a> {
 
         // Set outer row context for correlated subqueries
         if let Some(outer) = ctx.outer_row() {
-            // Clone the map directly (Arc<str> clones are cheap)
+            // Clone the map directly (CompactArc<str> clones are cheap)
             let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            // Convert Arc<str> keys to String for outer_columns (needed for compilation)
+            // Convert CompactArc<str> keys to String for outer_columns (needed for compilation)
             let outer_cols: Vec<String> = outer.keys().map(|k| k.to_string()).collect();
             self.outer_row = Some(arc_map);
             // Also set up outer_columns for compilation
@@ -1401,23 +1401,23 @@ impl<'a> CompiledEvaluator<'a> {
     }
 
     /// Set the outer row context for correlated subqueries
-    /// Accepts Arc<str> keys directly to avoid conversion overhead.
+    /// Accepts CompactArc<str> keys directly to avoid conversion overhead.
     #[inline]
-    pub fn set_outer_row(&mut self, outer_row: Option<&FxHashMap<Arc<str>, Value>>) {
+    pub fn set_outer_row(&mut self, outer_row: Option<&FxHashMap<CompactArc<str>, Value>>) {
         if let Some(outer) = outer_row {
-            // Clone the map (Arc clones are cheap)
-            let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            self.outer_row = Some(arc_map);
+            // Clone the map (CompactArc clones are cheap)
+            let map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            self.outer_row = Some(map);
         } else {
             self.outer_row = None;
         }
     }
 
     /// Set the outer row context by taking ownership
-    /// Accepts Arc<str> keys directly to avoid conversion overhead.
+    /// Accepts CompactArc<str> keys directly to avoid conversion overhead.
     #[inline]
-    pub fn set_outer_row_owned(&mut self, outer_row: FxHashMap<Arc<str>, Value>) {
-        // Collect outer column names for compilation (convert Arc<str> to String for outer_columns)
+    pub fn set_outer_row_owned(&mut self, outer_row: FxHashMap<CompactArc<str>, Value>) {
+        // Collect outer column names for compilation (convert CompactArc<str> to String for outer_columns)
         let outer_cols: Vec<String> = outer_row.keys().map(|k| k.to_string()).collect();
         self.outer_row = Some(outer_row);
         // Also set up outer_columns for compilation so LoadOuterColumn can be emitted
@@ -1432,15 +1432,15 @@ impl<'a> CompiledEvaluator<'a> {
     }
 
     /// Compile an expression and return a shared program for parallel use.
-    /// The returned Arc<Program> can be cloned cheaply and shared across threads.
+    /// The returned CompactArc<Program> can be cloned cheaply and shared across threads.
     pub fn compile_shared(&mut self, expr: &Expression) -> Result<SharedProgram> {
         self.get_or_compile(expr)
     }
 
     /// Take ownership of the outer row back (for reuse)
-    /// Returns Arc<str> keys directly to avoid conversion overhead.
+    /// Returns CompactArc<str> keys directly to avoid conversion overhead.
     #[inline]
-    pub fn take_outer_row(&mut self) -> FxHashMap<Arc<str>, Value> {
+    pub fn take_outer_row(&mut self) -> FxHashMap<CompactArc<str>, Value> {
         self.outer_row.take().unwrap_or_default()
     }
 
@@ -1700,12 +1700,13 @@ impl<'a> CompiledEvaluator<'a> {
 
         // Check local cache (fast path, no synchronization)
         if let Some(program) = self.local_cache.get(&expr_key) {
-            return Ok(Arc::clone(program));
+            return Ok(CompactArc::clone(program));
         }
 
         // Cache miss: compile the expression
-        let program = Arc::new(self.compile_expression(expr)?);
-        self.local_cache.insert(expr_key, Arc::clone(&program));
+        let program = CompactArc::new(self.compile_expression(expr)?);
+        self.local_cache
+            .insert(expr_key, CompactArc::clone(&program));
 
         Ok(program)
     }

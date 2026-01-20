@@ -19,11 +19,10 @@
 // - A sequence of operations (the "bytecode")
 // - Metadata for efficient execution
 
-use std::sync::Arc;
-
 use rustc_hash::FxHashSet;
 
 use super::ops::Op;
+use crate::common::CompactArc;
 use crate::core::Value;
 
 /// Constant value stored in the program
@@ -32,7 +31,7 @@ pub enum Constant {
     /// A literal value
     Value(Value),
     /// A string (for patterns, column names, etc.)
-    String(Arc<str>),
+    String(CompactArc<str>),
 }
 
 /// Compiled expression program

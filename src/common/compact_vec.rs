@@ -392,32 +392,59 @@ impl<T> CompactVec<T> {
         // If exact size is known, write directly with bounds protection
         if Some(lower) == upper && lower > 0 {
             self.reserve(lower);
-            let mut len = self.len();
+            let original_len = self.len();
             let cap = self.capacity();
+
+            // RAII guard for panic safety: if iter.next() panics, we set the length
+            // to the number of successfully written elements so Drop can clean up.
+            struct ExtendGuard<'a, T> {
+                vec: &'a mut CompactVec<T>,
+                written_count: usize,
+            }
+
+            impl<T> Drop for ExtendGuard<'_, T> {
+                fn drop(&mut self) {
+                    unsafe {
+                        self.vec.set_len(self.written_count);
+                    }
+                }
+            }
+
+            let mut guard = ExtendGuard {
+                vec: self,
+                written_count: original_len,
+            };
+
             // SAFETY:
             // - reserve(lower) guarantees capacity for `lower` more elements
             // - We add bounds check (len < cap) to protect against malicious iterators
             //   that yield more elements than size_hint promised
-            // - If iterator yields fewer elements, we only set_len to actual count
+            // - If iter.next() panics, guard drops and sets len, ensuring cleanup
             unsafe {
-                let ptr = self.ptr.as_ptr();
+                let ptr = guard.vec.ptr.as_ptr();
                 for item in iter {
-                    if len >= cap {
+                    if guard.written_count >= cap {
                         // Iterator lied about size - fall back to safe push
-                        // First, set length to what we've written so far
-                        self.set_len(len);
-                        self.push(item);
-                        len = self.len();
-                        // Continue with remaining items using push
+                        // Guard already has correct written_count, push updates len
+                        let count = guard.written_count;
+                        guard.vec.set_len(count);
+                        guard.vec.push(item);
+                        guard.written_count = guard.vec.len();
                         continue;
                     }
-                    ptr::write(ptr.add(len), item);
-                    len += 1;
+                    ptr::write(ptr.add(guard.written_count), item);
+                    guard.written_count += 1;
                 }
-                self.set_len(len);
+            }
+
+            // Success! Set final length and forget the guard
+            let final_len = guard.written_count;
+            mem::forget(guard);
+            unsafe {
+                self.set_len(final_len);
             }
         } else {
-            // Fallback for unknown size
+            // Fallback for unknown size - push is already panic-safe
             self.reserve(lower);
             for item in iter {
                 self.push(item);
@@ -443,15 +470,44 @@ impl<T> CompactVec<T> {
             return;
         }
         self.reserve(slice_len);
-        let len = self.len();
+        let original_len = self.len();
+
+        // RAII guard for panic safety: if clone() panics, we set the length
+        // to the number of successfully cloned elements so Drop can clean up.
+        struct ExtendCloneGuard<'a, T> {
+            vec: &'a mut CompactVec<T>,
+            written_count: usize,
+        }
+
+        impl<T> Drop for ExtendCloneGuard<'_, T> {
+            fn drop(&mut self) {
+                unsafe {
+                    self.vec.set_len(self.written_count);
+                }
+            }
+        }
+
+        let mut guard = ExtendCloneGuard {
+            vec: self,
+            written_count: original_len,
+        };
+
         // SAFETY: reserve() guarantees capacity for slice_len more elements
+        // If clone() panics, guard drops and sets len, ensuring cleanup
         unsafe {
-            let mut dst = self.ptr.as_ptr().add(len);
+            let mut dst = guard.vec.ptr.as_ptr().add(original_len);
             for item in slice {
                 ptr::write(dst, item.clone());
+                guard.written_count += 1;
                 dst = dst.add(1);
             }
-            self.set_len(len + slice_len);
+        }
+
+        // Success! Set final length and forget the guard
+        let final_len = guard.written_count;
+        mem::forget(guard);
+        unsafe {
+            self.set_len(final_len);
         }
     }
 
@@ -616,18 +672,48 @@ impl<T: Clone> Clone for CompactVec<T> {
         }
 
         let mut new_vec = Self::with_capacity(len);
+
+        // RAII guard for panic safety: if clone() panics, we set the length
+        // to the number of successfully cloned elements so Drop can clean up.
+        struct CloneGuard<'a, T> {
+            vec: &'a mut CompactVec<T>,
+            cloned_count: usize,
+        }
+
+        impl<T> Drop for CloneGuard<'_, T> {
+            fn drop(&mut self) {
+                // Set len to cloned_count so CompactVec::drop will drop
+                // the successfully cloned elements and deallocate the buffer
+                unsafe {
+                    self.vec.set_len(self.cloned_count);
+                }
+            }
+        }
+
+        let mut guard = CloneGuard {
+            vec: &mut new_vec,
+            cloned_count: 0,
+        };
+
         // SAFETY:
         // - with_capacity(len) guarantees capacity >= len
-        // - We write exactly len elements to indices 0..len
-        // - set_len(len) matches the number of initialized elements
-        // - If clone() panics mid-way, some elements leak (not UB, just a leak)
+        // - We write elements to indices 0..len
+        // - If clone() panics, guard drops and sets len to cloned_count,
+        //   ensuring proper cleanup of partially cloned elements
         unsafe {
             let src = self.ptr.as_ptr();
-            let dst = new_vec.ptr.as_ptr();
+            let dst = guard.vec.ptr.as_ptr();
             for i in 0..len {
                 ptr::write(dst.add(i), (*src.add(i)).clone());
+                guard.cloned_count += 1;
             }
-            new_vec.set_len(len);
+        }
+
+        // Success! Set final length and forget the guard (prevent double-set)
+        let cloned = guard.cloned_count;
+        mem::forget(guard);
+        unsafe {
+            new_vec.set_len(cloned);
         }
         new_vec
     }
@@ -723,30 +809,57 @@ impl<T> FromIterator<T> for CompactVec<T> {
         if Some(lower) == upper && lower > 0 {
             let mut vec = Self::with_capacity(lower);
             let cap = vec.capacity();
+
+            // RAII guard for panic safety: if iter.next() panics, we set the length
+            // to the number of successfully written elements so Drop can clean up.
+            struct FromIterGuard<'a, T> {
+                vec: &'a mut CompactVec<T>,
+                written_count: usize,
+            }
+
+            impl<T> Drop for FromIterGuard<'_, T> {
+                fn drop(&mut self) {
+                    unsafe {
+                        self.vec.set_len(self.written_count);
+                    }
+                }
+            }
+
+            let mut guard = FromIterGuard {
+                vec: &mut vec,
+                written_count: 0,
+            };
+
             // SAFETY:
             // - with_capacity(lower) guarantees capacity >= lower
             // - We add bounds check (len < cap) to protect against malicious iterators
             //   that yield more elements than size_hint promised
-            // - If iterator yields fewer elements, we only set_len to actual count
+            // - If iter.next() panics, guard drops and sets len, ensuring cleanup
             unsafe {
-                let ptr = vec.ptr.as_ptr();
-                let mut len = 0;
+                let ptr = guard.vec.ptr.as_ptr();
                 for item in iter {
-                    if len >= cap {
+                    if guard.written_count >= cap {
                         // Iterator lied about size - fall back to safe push
-                        vec.set_len(len);
-                        vec.push(item);
-                        len = vec.len();
+                        let count = guard.written_count;
+                        guard.vec.set_len(count);
+                        guard.vec.push(item);
+                        guard.written_count = guard.vec.len();
                         continue;
                     }
-                    ptr::write(ptr.add(len), item);
-                    len += 1;
+                    ptr::write(ptr.add(guard.written_count), item);
+                    guard.written_count += 1;
                 }
-                vec.set_len(len);
+            }
+
+            // Success! Set final length and forget the guard
+            let final_len = guard.written_count;
+            mem::forget(guard);
+            unsafe {
+                vec.set_len(final_len);
             }
             vec
         } else {
-            // Fallback for unknown size - uses push with bounds checks
+            // Fallback for unknown size - push is already panic-safe
             let mut vec = Self::with_capacity(lower);
             for item in iter {
                 vec.push(item);
@@ -1072,5 +1185,207 @@ mod tests {
 
         let cloned = vec.clone();
         assert_eq!(cloned[0], "hello");
+    }
+
+    /// Test panic safety in Clone implementation
+    #[test]
+    fn test_clone_panic_safety() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static CLONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        struct PanicOnThirdClone(usize);
+
+        impl Clone for PanicOnThirdClone {
+            fn clone(&self) -> Self {
+                let count = CLONE_COUNT.fetch_add(1, Ordering::SeqCst);
+                if count == 2 {
+                    panic!("Intentional panic on third clone");
+                }
+                PanicOnThirdClone(self.0)
+            }
+        }
+
+        impl Drop for PanicOnThirdClone {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // Reset counters
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        CLONE_COUNT.store(0, Ordering::SeqCst);
+
+        let mut vec = CompactVec::new();
+        vec.push(PanicOnThirdClone(1));
+        vec.push(PanicOnThirdClone(2));
+        vec.push(PanicOnThirdClone(3));
+        vec.push(PanicOnThirdClone(4));
+
+        // Try to clone - should panic on third element
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cloned = vec.clone();
+        }));
+
+        assert!(result.is_err(), "Should have panicked");
+
+        // Verify panic safety: 2 successfully cloned elements should be dropped
+        // by the CloneGuard when the panic unwinds
+        let drops_from_cleanup = DROP_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            drops_from_cleanup, 2,
+            "Should have dropped 2 successfully cloned elements, got {}",
+            drops_from_cleanup
+        );
+
+        // Now drop the original vec (4 elements)
+        drop(vec);
+        let total_drops = DROP_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            total_drops, 6,
+            "Total drops should be 6 (2 from cleanup + 4 from original), got {}",
+            total_drops
+        );
+    }
+
+    /// Test panic safety in extend_clone implementation
+    #[test]
+    fn test_extend_clone_panic_safety() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static CLONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        struct PanicOnThirdClone(usize);
+
+        impl Clone for PanicOnThirdClone {
+            fn clone(&self) -> Self {
+                let count = CLONE_COUNT.fetch_add(1, Ordering::SeqCst);
+                if count == 2 {
+                    panic!("Intentional panic on third clone");
+                }
+                PanicOnThirdClone(self.0)
+            }
+        }
+
+        impl Drop for PanicOnThirdClone {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // Reset counters
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        CLONE_COUNT.store(0, Ordering::SeqCst);
+
+        // Create source slice (won't be dropped, just borrowed)
+        let source = [
+            PanicOnThirdClone(1),
+            PanicOnThirdClone(2),
+            PanicOnThirdClone(3),
+            PanicOnThirdClone(4),
+        ];
+
+        let mut vec: CompactVec<PanicOnThirdClone> = CompactVec::new();
+
+        // Try to extend_clone - should panic on third element
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vec.extend_clone(&source);
+        }));
+
+        assert!(result.is_err(), "Should have panicked");
+
+        // The guard has set vec's length to 2 (the successfully cloned elements)
+        // Now when we drop vec, those 2 elements should be properly dropped
+        assert_eq!(
+            vec.len(),
+            2,
+            "Guard should have set length to 2 (elements cloned before panic)"
+        );
+
+        // Drop vec - this should drop the 2 elements the guard accounted for
+        drop(vec);
+        let drops_after_vec_drop = DROP_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            drops_after_vec_drop, 2,
+            "Should have dropped 2 successfully cloned elements when vec dropped, got {}",
+            drops_after_vec_drop
+        );
+
+        // Drop source (4 elements)
+        drop(source);
+        let total_drops = DROP_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            total_drops, 6,
+            "Total drops should be 6 (2 from vec + 4 from source), got {}",
+            total_drops
+        );
+    }
+
+    /// Test panic safety in from_iter implementation
+    #[test]
+    fn test_from_iter_panic_safety() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        #[allow(dead_code)] // Field used to give struct a non-zero size
+        struct PanicOnThirdNext(usize);
+
+        impl Drop for PanicOnThirdNext {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // An iterator that panics on the third next() call
+        struct PanickingIter {
+            current: usize,
+            max: usize,
+        }
+
+        impl Iterator for PanickingIter {
+            type Item = PanicOnThirdNext;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.current >= self.max {
+                    return None;
+                }
+                self.current += 1;
+                if self.current == 3 {
+                    panic!("Intentional panic on third next()");
+                }
+                Some(PanicOnThirdNext(self.current))
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                let remaining = self.max - self.current;
+                (remaining, Some(remaining))
+            }
+        }
+
+        impl ExactSizeIterator for PanickingIter {}
+
+        // Reset counter
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        // Try to collect - should panic on third element
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _vec: CompactVec<PanicOnThirdNext> = PanickingIter { current: 0, max: 5 }.collect();
+        }));
+
+        assert!(result.is_err(), "Should have panicked");
+
+        // Verify panic safety: 2 successfully written elements should be dropped
+        let drops_after_panic = DROP_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            drops_after_panic, 2,
+            "Should have dropped 2 successfully written elements, got {}",
+            drops_after_panic
+        );
     }
 }

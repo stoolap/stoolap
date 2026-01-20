@@ -72,7 +72,7 @@ pub struct CompiledPkLookup {
     /// Table name (already lowercased)
     pub table_name: SmartString,
     /// Cached schema
-    pub schema: Arc<Schema>,
+    pub schema: CompactArc<Schema>,
     /// Pre-computed column names for result (CompactArc<Vec<String>> for zero-copy O(1) clone on execution)
     pub column_names: CompactArc<Vec<String>>,
     /// How to extract the PK value
@@ -107,7 +107,7 @@ pub struct CompiledPkUpdate {
     /// Table name (already lowercased)
     pub table_name: SmartString,
     /// Cached schema
-    pub schema: Arc<Schema>,
+    pub schema: CompactArc<Schema>,
     /// Cached PK column name
     pub pk_column_name: SmartString,
     /// How to extract the PK value
@@ -124,7 +124,7 @@ pub struct CompiledPkDelete {
     /// Table name (already lowercased)
     pub table_name: SmartString,
     /// Cached schema
-    pub schema: Arc<Schema>,
+    pub schema: CompactArc<Schema>,
     /// Cached PK column name
     pub pk_column_name: SmartString,
     /// How to extract the PK value

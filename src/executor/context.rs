@@ -55,7 +55,7 @@ static EMPTY_SESSION_VARS: LazyLock<Arc<AHashMap<String, Value>>> =
 use smallvec::SmallVec;
 
 /// Cached scalar subquery entry: (tables_referenced for invalidation, result value)
-type ScalarSubqueryCacheEntry = (SmallVec<[Arc<str>; 2]>, Value);
+type ScalarSubqueryCacheEntry = (SmallVec<[CompactArc<str>; 2]>, Value);
 
 thread_local! {
     static SCALAR_SUBQUERY_CACHE: RefCell<LruCache<String, ScalarSubqueryCacheEntry>> =
@@ -98,7 +98,7 @@ pub fn get_cached_scalar_subquery(key: &str) -> Option<Value> {
 }
 
 /// Cache a scalar subquery result with the tables it references.
-pub fn cache_scalar_subquery(key: String, tables: SmallVec<[Arc<str>; 2]>, value: Value) {
+pub fn cache_scalar_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>, value: Value) {
     SCALAR_SUBQUERY_CACHE.with(|cache| {
         cache.borrow_mut().put(key, (tables, value));
     });
@@ -111,7 +111,7 @@ pub fn cache_scalar_subquery(key: String, tables: SmallVec<[Arc<str>; 2]>, value
 // LRU-bounded to prevent unbounded memory growth.
 
 /// Cached IN subquery entry: (tables_referenced for invalidation, result values)
-type InSubqueryCacheEntry = (SmallVec<[Arc<str>; 2]>, Vec<Value>);
+type InSubqueryCacheEntry = (SmallVec<[CompactArc<str>; 2]>, Vec<Value>);
 
 thread_local! {
     static IN_SUBQUERY_CACHE: RefCell<LruCache<String, InSubqueryCacheEntry>> =
@@ -154,7 +154,7 @@ pub fn get_cached_in_subquery(key: &str) -> Option<Vec<Value>> {
 }
 
 /// Cache an IN subquery result with the tables it references.
-pub fn cache_in_subquery(key: String, tables: SmallVec<[Arc<str>; 2]>, values: Vec<Value>) {
+pub fn cache_in_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>, values: Vec<Value>) {
     IN_SUBQUERY_CACHE.with(|cache| {
         cache.borrow_mut().put(key, (tables, values));
     });
@@ -165,7 +165,7 @@ use crate::parser::ast::{Expression, SelectStatement};
 /// Extract actual table names from a SelectStatement for cache invalidation.
 /// This returns the real table names (not aliases) because DML operations
 /// reference tables by their actual names, not aliases.
-pub fn extract_table_names_for_cache(stmt: &SelectStatement) -> SmallVec<[Arc<str>; 2]> {
+pub fn extract_table_names_for_cache(stmt: &SelectStatement) -> SmallVec<[CompactArc<str>; 2]> {
     let mut tables = SmallVec::new();
     if let Some(ref table_expr) = stmt.table_expr {
         collect_real_table_names(table_expr, &mut tables);
@@ -174,11 +174,11 @@ pub fn extract_table_names_for_cache(stmt: &SelectStatement) -> SmallVec<[Arc<st
 }
 
 /// Recursively collect actual table names (not aliases) from a table source expression.
-fn collect_real_table_names(source: &Expression, tables: &mut SmallVec<[Arc<str>; 2]>) {
+fn collect_real_table_names(source: &Expression, tables: &mut SmallVec<[CompactArc<str>; 2]>) {
     match source {
         Expression::TableSource(ts) => {
             // Always use the actual table name for cache invalidation
-            tables.push(Arc::from(ts.name.value_lower.as_str()));
+            tables.push(CompactArc::from(ts.name.value_lower.as_str()));
         }
         Expression::JoinSource(js) => {
             collect_real_table_names(&js.left, tables);
@@ -202,7 +202,7 @@ use ahash::AHashMap;
 use std::hash::{Hash, Hasher};
 
 /// Cached semi-join entry: (table_name for invalidation, hash_set values)
-type SemiJoinCacheEntry = (Arc<str>, CompactArc<ValueSet>);
+type SemiJoinCacheEntry = (CompactArc<str>, CompactArc<ValueSet>);
 
 /// Compute a cache key hash from table, column, and predicate hash without allocation.
 #[inline]
@@ -260,11 +260,13 @@ pub fn get_cached_semi_join(key_hash: u64) -> Option<CompactArc<ValueSet>> {
     })
 }
 
-/// Cache a semi-join hash set result (Arc version for zero-copy).
+/// Cache a semi-join hash set result (CompactArc version for zero-copy).
 #[inline]
 pub fn cache_semi_join_arc(key_hash: u64, table: &str, values: CompactArc<ValueSet>) {
     SEMI_JOIN_CACHE.with(|cache| {
-        cache.borrow_mut().put(key_hash, (Arc::from(table), values));
+        cache
+            .borrow_mut()
+            .put(key_hash, (CompactArc::from(table), values));
     });
 }
 
@@ -678,9 +680,9 @@ pub struct ExecutionContext {
     pub(crate) query_depth: usize,
     /// Outer row context for correlated subqueries
     /// Maps column name (lowercase) to value from the outer query
-    /// Uses FxHashMap<Arc<str>, Value> for zero-cost key cloning in hot loops
+    /// Uses FxHashMap<CompactArc<str>, Value> for zero-cost key cloning in hot loops
     /// pub(crate) to allow taking ownership back for reuse in optimized loops
-    pub(crate) outer_row: Option<FxHashMap<Arc<str>, Value>>,
+    pub(crate) outer_row: Option<FxHashMap<CompactArc<str>, Value>>,
     /// Outer row column names (for qualified identifier resolution) - wrapped in Arc
     outer_columns: Option<CompactArc<Vec<String>>>,
     /// CTE data for subqueries to reference CTEs from outer query
@@ -907,7 +909,7 @@ impl ExecutionContext {
     }
 
     /// Get the outer row context for correlated subqueries
-    pub fn outer_row(&self) -> Option<&FxHashMap<Arc<str>, Value>> {
+    pub fn outer_row(&self) -> Option<&FxHashMap<CompactArc<str>, Value>> {
         self.outer_row.as_ref()
     }
 
@@ -917,11 +919,11 @@ impl ExecutionContext {
     }
 
     /// Create a new context with outer row context for correlated subqueries.
-    /// The outer_row maps lowercase column names (as Arc<str>) to their values.
+    /// The outer_row maps lowercase column names (as CompactArc<str>) to their values.
     /// NOTE: This is now cheap to clone due to Arc wrapping of immutable fields.
     pub fn with_outer_row(
         &self,
-        outer_row: FxHashMap<Arc<str>, Value>,
+        outer_row: FxHashMap<CompactArc<str>, Value>,
         outer_columns: CompactArc<Vec<String>>,
     ) -> Self {
         Self {

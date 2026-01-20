@@ -118,6 +118,10 @@ impl std::fmt::Debug for BitmapIndex {
 
 impl BitmapIndex {
     /// Create a new BitmapIndex
+    ///
+    /// # Arguments
+    /// * `expected_rows` - Hint for initial capacity of row_to_value map.
+    ///   Pass 0 if unknown; the map will grow automatically.
     pub fn new(
         name: String,
         table_name: String,
@@ -125,6 +129,7 @@ impl BitmapIndex {
         column_ids: Vec<i32>,
         data_types: Vec<DataType>,
         is_unique: bool,
+        expected_rows: usize,
     ) -> Self {
         Self {
             name,
@@ -135,7 +140,11 @@ impl BitmapIndex {
             is_unique,
             closed: AtomicBool::new(false),
             bitmaps: RwLock::new(AHashMap::default()),
-            row_to_value: RwLock::new(I64Map::new()),
+            row_to_value: RwLock::new(if expected_rows > 0 {
+                I64Map::with_capacity(expected_rows)
+            } else {
+                I64Map::new()
+            }),
             distinct_count: AtomicUsize::new(0),
         }
     }
@@ -699,6 +708,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         // Add entries
@@ -731,6 +741,7 @@ mod tests {
             vec![1],
             vec![DataType::Boolean],
             false,
+            0,
         );
 
         // Add boolean values
@@ -761,6 +772,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -781,6 +793,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -803,6 +816,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -824,6 +838,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -856,6 +871,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         // Initial value
@@ -885,6 +901,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -907,6 +924,7 @@ mod tests {
             vec![1],
             vec![DataType::Integer],
             false,
+            0,
         );
 
         // Add many distinct values
@@ -926,6 +944,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         index.add(&[Value::Null(DataType::Text)], 1, 0).unwrap();
@@ -945,6 +964,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             true, // unique
+            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -969,6 +989,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         // Use row IDs beyond u32::MAX
@@ -1014,6 +1035,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         // Negative row IDs should be rejected

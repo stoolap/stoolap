@@ -1190,19 +1190,20 @@ impl Executor {
             let all_col_indices: Vec<usize> = (0..column_names.len()).collect();
 
             // OPTIMIZATION: Use schema's cached lowercase column names instead of computing
-            // Use Arc<str> for zero-cost cloning in the per-row loop
+            // Use CompactArc<str> for zero-cost cloning in the per-row loop
             let column_names_lower = schema.column_names_lower_arc();
-            let col_name_pairs: Vec<(Arc<str>, Arc<str>)> = column_names_lower
+            let col_name_pairs: Vec<(CompactArc<str>, CompactArc<str>)> = column_names_lower
                 .iter()
                 .map(|col_lower| {
-                    let qualified = Arc::from(format!("{}.{}", table_name, col_lower).as_str());
-                    (Arc::from(col_lower.as_str()), qualified)
+                    let qualified =
+                        CompactArc::from(format!("{}.{}", table_name, col_lower).as_str());
+                    (CompactArc::from(col_lower.as_str()), qualified)
                 })
                 .collect();
 
             // Reusable outer_row_map - cleared and reused each iteration
-            // Uses Arc<str> keys for zero-cost cloning
-            let mut outer_row_map: FxHashMap<Arc<str>, Value> =
+            // Uses CompactArc<str> keys for zero-cost cloning
+            let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
                 FxHashMap::with_capacity_and_hasher(col_name_pairs.len() * 2, Default::default());
 
             // Scan all rows (WHERE filtering happens in the setter)
@@ -1599,21 +1600,27 @@ impl Executor {
 
             // OPTIMIZATION: Use schema's cached lowercase column names instead of computing
             // Each entry: (col_lower, effective_qualified, optional_table_qualified)
-            // Uses Arc<str> for zero-cost cloning in the per-row loop
+            // Uses CompactArc<str> for zero-cost cloning in the per-row loop
             let column_names_lower = schema.column_names_lower_arc();
             #[allow(clippy::type_complexity)]
-            let col_name_triples: Vec<(Arc<str>, Arc<str>, Option<Arc<str>>)> = column_names_lower
+            let col_name_triples: Vec<(
+                CompactArc<str>,
+                CompactArc<str>,
+                Option<CompactArc<str>>,
+            )> = column_names_lower
                 .iter()
                 .map(|col_lower| {
                     let effective_qualified =
-                        Arc::from(format!("{}.{}", effective_name, col_lower).as_str());
+                        CompactArc::from(format!("{}.{}", effective_name, col_lower).as_str());
                     let table_qualified = if effective_name != table_name {
-                        Some(Arc::from(format!("{}.{}", table_name, col_lower).as_str()))
+                        Some(CompactArc::from(
+                            format!("{}.{}", table_name, col_lower).as_str(),
+                        ))
                     } else {
                         None
                     };
                     (
-                        Arc::from(col_lower.as_str()),
+                        CompactArc::from(col_lower.as_str()),
                         effective_qualified,
                         table_qualified,
                     )
@@ -1621,9 +1628,9 @@ impl Executor {
                 .collect();
 
             // Reusable outer_row_map for correlated subqueries
-            // Uses Arc<str> keys for zero-cost cloning
+            // Uses CompactArc<str> keys for zero-cost cloning
             let estimated_entries = col_name_triples.len() * 3; // up to 3 entries per column
-            let mut outer_row_map: FxHashMap<Arc<str>, Value> =
+            let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
                 FxHashMap::with_capacity_and_hasher(estimated_entries, Default::default());
 
             while scanner.next() {

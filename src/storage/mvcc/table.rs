@@ -21,7 +21,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::{Arc, RwLock};
 
-use crate::common::Int64Set;
+use crate::common::{CompactArc, Int64Set};
 use crate::core::{
     DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
 };
@@ -44,7 +44,7 @@ pub struct MVCCTable {
     /// Transaction-local version store (shared between multiple MVCCTable instances for same txn+table)
     txn_versions: Arc<RwLock<TransactionVersionStore>>,
     /// Cached schema for returning references (Arc clone from version_store - O(1) instead of cloning)
-    cached_schema: Arc<Schema>,
+    cached_schema: CompactArc<Schema>,
 }
 
 impl MVCCTable {
@@ -55,8 +55,8 @@ impl MVCCTable {
         version_store: Arc<VersionStore>,
         txn_versions: TransactionVersionStore,
     ) -> Self {
-        // Arc clone - O(1) reference count increment, not full schema clone
-        let cached_schema = Arc::clone(&version_store.schema());
+        // CompactArc clone - O(1) reference count increment, not full schema clone
+        let cached_schema = version_store.schema().clone();
         Self {
             txn_id,
             version_store,
@@ -72,8 +72,8 @@ impl MVCCTable {
         version_store: Arc<VersionStore>,
         txn_versions: Arc<RwLock<TransactionVersionStore>>,
     ) -> Self {
-        // Arc clone - O(1) reference count increment, not full schema clone
-        let cached_schema = Arc::clone(&version_store.schema());
+        // CompactArc clone - O(1) reference count increment, not full schema clone
+        let cached_schema = version_store.schema().clone();
         Self {
             txn_id,
             version_store,
@@ -841,8 +841,8 @@ impl MVCCTable {
                     // Allow Text to Json coercion (JSON strings come in as Text)
                     if actual_type == DataType::Text && col.data_type == DataType::Json {
                         // Coerce Text to Json
-                        if let Some(text_val) = value.as_arc_str() {
-                            let _ = row.set(i, Value::Json(text_val));
+                        if let Some(text_str) = value.as_str() {
+                            let _ = row.set(i, Value::json(text_str));
                         }
                     } else {
                         return Err(Error::internal(format!(
@@ -1606,9 +1606,9 @@ impl Table for MVCCTable {
         );
         {
             let mut schema_guard = self.version_store.schema_mut();
-            Arc::make_mut(&mut *schema_guard).add_column(column.clone())?;
+            CompactArc::make_mut(&mut *schema_guard).add_column(column.clone())?;
         }
-        Arc::make_mut(&mut self.cached_schema).add_column(column)?;
+        CompactArc::make_mut(&mut self.cached_schema).add_column(column)?;
         Ok(())
     }
 
@@ -1616,9 +1616,9 @@ impl Table for MVCCTable {
         // Remove column from both version store and cached schema
         {
             let mut schema_guard = self.version_store.schema_mut();
-            Arc::make_mut(&mut *schema_guard).remove_column(name)?;
+            CompactArc::make_mut(&mut *schema_guard).remove_column(name)?;
         }
-        Arc::make_mut(&mut self.cached_schema).remove_column(name)?;
+        CompactArc::make_mut(&mut self.cached_schema).remove_column(name)?;
         Ok(())
     }
 
@@ -2241,8 +2241,8 @@ impl Table for MVCCTable {
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
-        // Arc clone - O(1) reference count increment instead of full Schema clone
-        let schema = Arc::clone(&self.cached_schema);
+        // CompactArc clone - O(1) reference count increment instead of full Schema clone
+        let schema = self.cached_schema.clone();
 
         // Fast path: Check if this is a primary key equality lookup (WHERE id = X)
         if let Some(expr) = where_expr {
@@ -2530,7 +2530,10 @@ impl Table for MVCCTable {
             }
         }
 
-        // Create the appropriate index type
+        // Get row count for capacity hint
+        let expected_rows = self.version_store.row_count();
+
+        // Create the appropriate index type with capacity hint
         let index: Arc<dyn Index> = match chosen_type {
             IndexType::Hash => Arc::new(HashIndex::new(
                 name.to_string(),
@@ -2539,6 +2542,7 @@ impl Table for MVCCTable {
                 column_ids,
                 data_types,
                 is_unique,
+                expected_rows,
             )),
             IndexType::Bitmap => Arc::new(BitmapIndex::new(
                 name.to_string(),
@@ -2547,6 +2551,7 @@ impl Table for MVCCTable {
                 column_ids,
                 data_types,
                 is_unique,
+                expected_rows,
             )),
             IndexType::BTree => {
                 // For single-column BTree, use BTreeIndex
@@ -2559,6 +2564,7 @@ impl Table for MVCCTable {
                         column_names[0].clone(),
                         data_types[0],
                         is_unique,
+                        expected_rows,
                     ))
                 } else {
                     Arc::new(MultiColumnIndex::new(
@@ -2568,6 +2574,7 @@ impl Table for MVCCTable {
                         column_ids,
                         data_types,
                         is_unique,
+                        expected_rows,
                     ))
                 }
             }
@@ -2580,6 +2587,7 @@ impl Table for MVCCTable {
                     column_ids,
                     data_types,
                     is_unique,
+                    expected_rows,
                 ))
             }
         };
@@ -2706,7 +2714,8 @@ impl Table for MVCCTable {
             }
         }
 
-        // Create the btree index
+        // Create the btree index with capacity hint
+        let expected_rows = self.version_store.row_count();
         let index = BTreeIndex::new(
             index_name.clone(),
             self.name().to_string(),
@@ -2714,6 +2723,7 @@ impl Table for MVCCTable {
             column_name.to_string(),
             col.data_type,
             is_unique,
+            expected_rows,
         );
 
         // Populate the index with existing data
@@ -2778,7 +2788,8 @@ impl Table for MVCCTable {
             return Err(Error::IndexAlreadyExistsByName(name.to_string()));
         }
 
-        // Create the multi-column index
+        // Create the multi-column index with capacity hint
+        let expected_rows = self.version_store.row_count();
         let index = MultiColumnIndex::new(
             name.to_string(),
             self.name().to_string(),
@@ -2786,6 +2797,7 @@ impl Table for MVCCTable {
             column_ids,
             data_types,
             is_unique,
+            expected_rows,
         );
 
         // Populate the index with existing data

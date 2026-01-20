@@ -17,8 +17,7 @@
 
 use rustc_hash::FxHashMap;
 
-use std::sync::Arc;
-
+use crate::common::CompactArc;
 use crate::core::{IsolationLevel, Result, RowVec, Schema};
 use crate::storage::config::Config;
 use crate::storage::traits::{Index, Transaction};
@@ -83,7 +82,7 @@ pub trait Engine: Send + Sync {
     ///
     /// Returns an Arc to avoid cloning the schema on every access.
     /// This is a critical optimization for hot paths like PK lookups.
-    fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>>;
+    fn get_table_schema(&self, table_name: &str) -> Result<CompactArc<Schema>>;
 
     /// Gets the current schema epoch
     ///

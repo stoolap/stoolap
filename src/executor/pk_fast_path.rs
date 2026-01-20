@@ -26,10 +26,9 @@
 //! For Index Nested Loop joins that perform thousands of PK lookups,
 //! this fast-path can provide significant speedups by amortizing less overhead.
 
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
-use crate::common::SmartString;
-
+use crate::common::{CompactArc, SmartString};
 use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement};
 use crate::storage::traits::{Engine, QueryResult};
@@ -48,7 +47,7 @@ struct PkLookupInfo {
     /// How to extract the PK value (for caching)
     pk_value_source: PkValueSource,
     /// Cached schema to avoid second lookup
-    schema: Arc<Schema>,
+    schema: CompactArc<Schema>,
 }
 
 impl Executor {

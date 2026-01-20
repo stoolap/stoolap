@@ -26,7 +26,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 
 use super::error::{Error, Result};
 use super::types::DataType;
-use crate::common::SmartString;
+use crate::common::{CompactArc, SmartString};
 
 /// Timestamp formats supported for parsing
 /// Order matters - more specific formats first
@@ -55,9 +55,15 @@ const TIME_FORMATS: &[&str] = &[
 /// Each variant carries its data directly, avoiding the need for interface
 /// indirection or separate value references.
 ///
-/// Note: Text uses SmartString for inline storage of strings up to 22 bytes.
-/// Longer strings use Arc<str> for O(1) clone and sharing.
-/// Json also uses Arc<str> for potentially large documents.
+/// ## Memory Layout (16 bytes)
+///
+/// Value is exactly 16 bytes due to niche optimization:
+/// - Text(SmartString): 16 bytes with niches in tag byte (values 17-255 unused)
+/// - Json(Arc<String>): 8 bytes thin pointer with null niche
+/// - Rust stores Value's discriminant in these niche values
+///
+/// Note: Text uses SmartString for inline storage of strings up to 15 bytes.
+/// Longer strings use Arc<String> for O(1) clone and sharing.
 #[derive(Debug, Clone)]
 pub enum Value {
     /// NULL value with optional type hint
@@ -69,7 +75,7 @@ pub enum Value {
     /// 64-bit floating point
     Float(f64),
 
-    /// UTF-8 text string (SmartString: inline ≤22 bytes, Arc for larger)
+    /// UTF-8 text string (SmartString: inline ≤15 bytes, Arc for larger)
     Text(SmartString),
 
     /// Boolean value
@@ -78,8 +84,8 @@ pub enum Value {
     /// Timestamp (UTC)
     Timestamp(DateTime<Utc>),
 
-    /// JSON document (Arc for cheap cloning)
-    Json(Arc<str>),
+    /// JSON document (CompactArc<str> for cheap cloning, 16-byte fat pointer)
+    Json(CompactArc<str>),
 }
 
 /// Static NULL value for zero-cost reuse
@@ -140,11 +146,11 @@ impl Value {
 
     /// Create a JSON value
     pub fn json(value: impl Into<String>) -> Self {
-        Value::Json(Arc::from(value.into().as_str()))
+        Value::Json(CompactArc::from(value.into()))
     }
 
-    /// Create a JSON value from Arc<str> (zero-copy)
-    pub fn json_arc(value: Arc<str>) -> Self {
+    /// Create a JSON value from CompactArc<str> (zero-copy)
+    pub fn json_arc(value: CompactArc<str>) -> Self {
         Value::Json(value)
     }
 
@@ -264,11 +270,11 @@ impl Value {
         }
     }
 
-    /// Extract as Arc<str> (creates Arc for Text, cheap clone for Json)
-    pub fn as_arc_str(&self) -> Option<Arc<str>> {
+    /// Extract as CompactArc<str> (creates CompactArc for Text, cheap clone for Json)
+    pub fn as_arc_str(&self) -> Option<CompactArc<str>> {
         match self {
-            Value::Text(s) => Some(Arc::from(s.as_str())),
-            Value::Json(s) => Some(Arc::clone(s)),
+            Value::Text(s) => Some(CompactArc::from(s.as_str())),
+            Value::Json(s) => Some(s.clone()),
             _ => None,
         }
     }
@@ -424,7 +430,7 @@ impl Value {
                         if let Some(s) = v.downcast_ref::<String>() {
                             // Validate JSON
                             if serde_json::from_str::<serde_json::Value>(s).is_ok() {
-                                Value::Json(Arc::from(s.as_str()))
+                                Value::Json(CompactArc::from(s.as_str()))
                             } else {
                                 Value::Null(data_type)
                             }
@@ -557,19 +563,21 @@ impl Value {
             DataType::Json => {
                 // Convert to JSON
                 match self {
-                    Value::Json(s) => Value::Json(Arc::clone(s)),
+                    Value::Json(s) => Value::Json(s.clone()),
                     Value::Text(s) => {
                         // Validate JSON
                         if serde_json::from_str::<serde_json::Value>(s.as_str()).is_ok() {
-                            Value::Json(Arc::from(s.as_str()))
+                            Value::Json(CompactArc::from(s.as_str()))
                         } else {
                             Value::Null(target_type)
                         }
                     }
                     // Convert other types to JSON representation
-                    Value::Integer(v) => Value::Json(Arc::from(v.to_string().as_str())),
-                    Value::Float(v) => Value::Json(Arc::from(format_float(*v).as_str())),
-                    Value::Boolean(b) => Value::Json(Arc::from(if *b { "true" } else { "false" })),
+                    Value::Integer(v) => Value::Json(CompactArc::from(v.to_string())),
+                    Value::Float(v) => Value::Json(CompactArc::from(format_float(*v))),
+                    Value::Boolean(b) => {
+                        Value::Json(CompactArc::from(if *b { "true" } else { "false" }))
+                    }
                     _ => Value::Null(target_type),
                 }
             }
@@ -666,14 +674,16 @@ impl Value {
                 Value::Json(s) => Value::Json(s),
                 Value::Text(s) => {
                     if serde_json::from_str::<serde_json::Value>(s.as_str()).is_ok() {
-                        Value::Json(Arc::from(s.as_str()))
+                        Value::Json(CompactArc::from(s.as_str()))
                     } else {
                         Value::Null(target_type)
                     }
                 }
-                Value::Integer(v) => Value::Json(Arc::from(v.to_string().as_str())),
-                Value::Float(v) => Value::Json(Arc::from(format_float(v).as_str())),
-                Value::Boolean(b) => Value::Json(Arc::from(if b { "true" } else { "false" })),
+                Value::Integer(v) => Value::Json(CompactArc::from(v.to_string())),
+                Value::Float(v) => Value::Json(CompactArc::from(format_float(v))),
+                Value::Boolean(b) => {
+                    Value::Json(CompactArc::from(if b { "true" } else { "false" }))
+                }
                 _ => Value::Null(target_type),
             },
             DataType::Null => Value::Null(DataType::Null),
@@ -1174,6 +1184,31 @@ fn compare_floats(a: f64, b: f64) -> Ordering {
 mod tests {
     use super::*;
     use chrono::{Datelike, Timelike};
+
+    // =========================================================================
+    // Size verification tests
+    // =========================================================================
+
+    #[test]
+    fn test_value_size() {
+        use std::mem::size_of;
+
+        // Value must be exactly 16 bytes for memory efficiency
+        assert_eq!(
+            size_of::<Value>(),
+            16,
+            "Value should be 16 bytes, got {}",
+            size_of::<Value>()
+        );
+
+        // Option<Value> should also be 16 bytes due to niche optimization
+        assert_eq!(
+            size_of::<Option<Value>>(),
+            16,
+            "Option<Value> should be 16 bytes (niche optimization), got {}",
+            size_of::<Option<Value>>()
+        );
+    }
 
     // =========================================================================
     // Constructor tests

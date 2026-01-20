@@ -32,9 +32,9 @@ use std::cell::RefCell;
 const POOL_SIZE: usize = 16;
 
 /// Maximum capacity to cache (prevents unbounded memory retention)
-/// 128K elements = ~2MB at 16 bytes per (i64, Row) tuple
+/// 64K elements = ~2MB at 32 bytes per (i64, Row) tuple
 /// This allows caching large table scan buffers from window functions and version store
-const MAX_CACHED_CAPACITY: usize = 128_000;
+const MAX_CACHED_CAPACITY: usize = 64_000;
 
 // Thread-local pool for row vectors - kept sorted by capacity (ascending)
 thread_local! {

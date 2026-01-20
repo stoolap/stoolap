@@ -156,6 +156,10 @@ impl std::fmt::Debug for HashIndex {
 
 impl HashIndex {
     /// Create a new HashIndex
+    ///
+    /// # Arguments
+    /// * `expected_rows` - Hint for initial capacity of row_to_hash map.
+    ///   Pass 0 if unknown; the map will grow automatically.
     pub fn new(
         name: String,
         table_name: String,
@@ -163,6 +167,7 @@ impl HashIndex {
         column_ids: Vec<i32>,
         data_types: Vec<DataType>,
         is_unique: bool,
+        expected_rows: usize,
     ) -> Self {
         Self {
             name,
@@ -172,9 +177,21 @@ impl HashIndex {
             data_types,
             is_unique,
             closed: AtomicBool::new(false),
-            hash_to_rows: RwLock::new(FxHashMap::default()),
-            row_to_hash: RwLock::new(I64Map::new()),
-            hash_to_values: RwLock::new(FxHashMap::default()),
+            hash_to_rows: RwLock::new(if expected_rows > 0 {
+                FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
+            } else {
+                FxHashMap::default()
+            }),
+            row_to_hash: RwLock::new(if expected_rows > 0 {
+                I64Map::with_capacity(expected_rows)
+            } else {
+                I64Map::new()
+            }),
+            hash_to_values: RwLock::new(if expected_rows > 0 {
+                FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
+            } else {
+                FxHashMap::default()
+            }),
         }
     }
 
@@ -828,6 +845,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         // Add some entries
@@ -870,6 +888,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             true, // unique
+            0,
         );
 
         // Add first entry
@@ -896,6 +915,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             true, // unique
+            0,
         );
 
         // NULL values don't violate uniqueness
@@ -916,6 +936,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         index
@@ -952,6 +973,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         // Add initial value
@@ -987,6 +1009,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
+            0,
         );
 
         // Range query should fail
@@ -1008,6 +1031,7 @@ mod tests {
             vec![1, 2],
             vec![DataType::Text, DataType::Text],
             false,
+            0,
         );
 
         index
@@ -1055,6 +1079,7 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false, // not unique
+            0,
         );
 
         // Multiple rows with same value

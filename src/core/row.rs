@@ -17,7 +17,7 @@
 //! # Storage Design
 //!
 //! Row uses a simple 2-variant storage model:
-//! - `Shared(Arc<[Value]>)`: O(1) clone, for storage reads and sharing
+//! - `Shared(CompactArc<[Value]>)`: O(1) clone, for storage reads and sharing
 //! - `Owned(CompactVec<Value>)`: Mutable, for intermediate results
 //!
 //! This design avoids per-value Arc overhead while enabling:
@@ -27,13 +27,12 @@
 
 use std::fmt;
 use std::ops::Index;
-use std::sync::Arc;
 
 use super::error::{Error, Result};
 use super::schema::Schema;
 use super::types::DataType;
 use super::value::Value;
-use crate::common::CompactVec;
+use crate::common::{CompactArc, CompactVec};
 
 /// Internal storage for Row - simple 2-variant design
 ///
@@ -44,7 +43,7 @@ use crate::common::CompactVec;
 #[derive(Debug, Clone)]
 enum RowStorage {
     /// Shared storage - O(1) clone, immutable (checked first for read-heavy workloads)
-    Shared(Arc<[Value]>),
+    Shared(CompactArc<[Value]>),
     /// Owned storage - mutable, for intermediate results
     Owned(CompactVec<Value>),
 }
@@ -61,7 +60,7 @@ impl PartialEq for RowStorage {
         match (self, other) {
             (RowStorage::Shared(a), RowStorage::Shared(b)) => {
                 // Fast path: same Arc pointer
-                Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref()
+                CompactArc::ptr_eq(a, b) || a.as_ref() == b.as_ref()
             }
             (RowStorage::Owned(a), RowStorage::Owned(b)) => a.as_slice() == b.as_slice(),
             // Mixed storage types - compare by value
@@ -226,7 +225,7 @@ impl Row {
 
     /// Create a row from an Arc slice - O(1), no copying
     #[inline]
-    pub fn from_arc(values: Arc<[Value]>) -> Self {
+    pub fn from_arc(values: CompactArc<[Value]>) -> Self {
         Self {
             storage: RowStorage::Shared(values),
         }
@@ -514,14 +513,15 @@ impl Row {
         matches!(self.storage, RowStorage::Owned(_))
     }
 
-    /// Convert Row to Arc<[Value]>, consuming self
-    /// - Shared: returns the Arc directly (O(1))
+    /// Convert Row to CompactArc<[Value]>, consuming self
+    /// - Shared: returns the CompactArc directly (O(1))
     /// - Owned: creates new Arc (O(n))
     #[inline]
-    pub fn into_arc(self) -> Arc<[Value]> {
+    pub fn into_arc(self) -> CompactArc<[Value]> {
         match self.storage {
             RowStorage::Shared(arc) => arc,
-            RowStorage::Owned(vec) => Arc::from(vec.into_boxed_slice()),
+            // Use into_vec() to avoid cloning each Value - O(1) ptr transfer
+            RowStorage::Owned(vec) => CompactArc::from_vec(vec.into_vec()),
         }
     }
 
@@ -534,14 +534,15 @@ impl Row {
         match self.storage {
             RowStorage::Shared(_) => self, // Already shared
             RowStorage::Owned(vec) => Self {
-                storage: RowStorage::Shared(Arc::from(vec.into_boxed_slice())),
+                // Use into_vec() to avoid cloning each Value - O(1) ptr transfer
+                storage: RowStorage::Shared(CompactArc::from_vec(vec.into_vec())),
             },
         }
     }
 
-    /// Get Arc<[Value]> reference if shared, None if owned
+    /// Get CompactArc<[Value]> reference if shared, None if owned
     #[inline]
-    pub fn as_arc(&self) -> Option<&Arc<[Value]>> {
+    pub fn as_arc(&self) -> Option<&CompactArc<[Value]>> {
         match &self.storage {
             RowStorage::Shared(arc) => Some(arc),
             RowStorage::Owned(_) => None,
@@ -770,8 +771,8 @@ impl From<Vec<Value>> for Row {
     }
 }
 
-impl From<Arc<[Value]>> for Row {
-    fn from(values: Arc<[Value]>) -> Self {
+impl From<CompactArc<[Value]>> for Row {
+    fn from(values: CompactArc<[Value]>) -> Self {
         Row::from_arc(values)
     }
 }
@@ -803,6 +804,7 @@ macro_rules! row {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::CompactArc;
     use crate::core::schema::SchemaBuilder;
 
     fn create_test_schema() -> Schema {
@@ -837,7 +839,8 @@ mod tests {
 
     #[test]
     fn test_row_from_arc() {
-        let values: Arc<[Value]> = Arc::from(vec![Value::integer(1), Value::text("hello")]);
+        let values: CompactArc<[Value]> =
+            CompactArc::from(vec![Value::integer(1), Value::text("hello")]);
         let row = Row::from_arc(values);
         assert_eq!(row.len(), 2);
         assert!(row.is_shared());
@@ -865,7 +868,8 @@ mod tests {
     #[test]
     fn test_row_copy_on_write() {
         // Create shared row
-        let values: Arc<[Value]> = Arc::from(vec![Value::integer(1), Value::text("hello")]);
+        let values: CompactArc<[Value]> =
+            CompactArc::from(vec![Value::integer(1), Value::text("hello")]);
         let mut row = Row::from_arc(values);
         assert!(row.is_shared());
 
@@ -1044,9 +1048,9 @@ mod tests {
         assert_eq!(arc.len(), 2);
 
         // From shared - should be O(1)
-        let row2 = Row::from_arc(Arc::clone(&arc));
+        let row2 = Row::from_arc(CompactArc::clone(&arc));
         let arc2 = row2.into_arc();
-        assert!(Arc::ptr_eq(&arc, &arc2));
+        assert!(CompactArc::ptr_eq(&arc, &arc2));
     }
 
     #[test]
@@ -1063,7 +1067,10 @@ mod tests {
     #[test]
     fn test_shared_owned_equality() {
         let owned = Row::from_values(vec![Value::integer(1), Value::text("hello")]);
-        let shared = Row::from_arc(Arc::from(vec![Value::integer(1), Value::text("hello")]));
+        let shared = Row::from_arc(CompactArc::from(vec![
+            Value::integer(1),
+            Value::text("hello"),
+        ]));
 
         assert_eq!(owned, shared);
     }

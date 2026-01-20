@@ -21,7 +21,7 @@
 //! - HAVING clause: `SELECT category, SUM(amount) FROM sales GROUP BY category HAVING SUM(amount) > 100`
 
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 use ahash::AHasher;
 use hashbrown::hash_map::RawEntryMut;
@@ -964,17 +964,18 @@ impl Executor {
 
         // OPTIMIZATION: Pre-compute lowercase and qualified column names for correlated expressions
         // This avoids repeated to_lowercase() and format!() allocations per row
-        // Uses Arc<str> for zero-cost cloning in the per-row loop
+        // Uses CompactArc<str> for zero-cost cloning in the per-row loop
         #[allow(clippy::type_complexity)]
-        let correlated_col_names: Option<Vec<(Arc<str>, Option<Arc<str>>)>> =
+        let correlated_col_names: Option<Vec<(CompactArc<str>, Option<CompactArc<str>>)>> =
             if has_correlated_sources {
                 Some(
                     agg_columns
                         .iter()
                         .map(|col_name| {
-                            let col_lower: Arc<str> = Arc::from(col_name.to_lowercase().as_str());
+                            let col_lower: CompactArc<str> =
+                                CompactArc::from(col_name.to_lowercase().as_str());
                             let qualified = table_alias.as_ref().map(|alias| {
-                                Arc::from(format!("{}.{}", alias, col_lower).as_str())
+                                CompactArc::from(format!("{}.{}", alias, col_lower).as_str())
                             });
                             (col_lower, qualified)
                         })
@@ -985,9 +986,9 @@ impl Executor {
             };
 
         // Reusable map for correlated expressions
-        // Uses Arc<str> keys for zero-cost cloning
+        // Uses CompactArc<str> keys for zero-cost cloning
         let estimated_entries = agg_columns.len() * 2;
-        let mut outer_row_map: FxHashMap<Arc<str>, Value> =
+        let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
             FxHashMap::with_capacity_and_hasher(estimated_entries, Default::default());
 
         for (id, row) in agg_rows {

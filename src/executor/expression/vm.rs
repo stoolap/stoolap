@@ -22,14 +22,13 @@
 // - No recursion
 
 use std::borrow::Cow;
-use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use super::ops::{CompareOp, Op};
 use super::program::Program;
-use crate::common::SmartString;
+use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
 
 /// Stack value that can be borrowed (from row/constants) or owned (from operations)
@@ -65,7 +64,7 @@ pub struct ExecuteContext<'a> {
     pub row2: Option<&'a Row>,
 
     /// Outer row context for correlated subqueries
-    pub outer_row: Option<&'a FxHashMap<Arc<str>, Value>>,
+    pub outer_row: Option<&'a FxHashMap<CompactArc<str>, Value>>,
 
     /// Positional parameters
     pub params: &'a [Value],
@@ -148,7 +147,7 @@ impl<'a> ExecuteContext<'a> {
     }
 
     /// Add outer row context
-    pub fn with_outer_row(mut self, outer_row: &'a FxHashMap<Arc<str>, Value>) -> Self {
+    pub fn with_outer_row(mut self, outer_row: &'a FxHashMap<CompactArc<str>, Value>) -> Self {
         self.outer_row = Some(outer_row);
         self
     }
@@ -166,14 +165,14 @@ pub trait SubqueryExecutor {
     fn execute_scalar(
         &self,
         subquery_index: u16,
-        outer_row: Option<&FxHashMap<Arc<str>, Value>>,
+        outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
     ) -> Result<Value>;
 
     /// Execute EXISTS subquery
     fn execute_exists(
         &self,
         subquery_index: u16,
-        outer_row: Option<&FxHashMap<Arc<str>, Value>>,
+        outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
     ) -> Result<bool>;
 
     /// Execute IN subquery and check membership
@@ -181,7 +180,7 @@ pub trait SubqueryExecutor {
         &self,
         subquery_index: u16,
         value: &Value,
-        outer_row: Option<&FxHashMap<Arc<str>, Value>>,
+        outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
     ) -> Result<bool>;
 
     /// Execute ALL subquery
@@ -190,7 +189,7 @@ pub trait SubqueryExecutor {
         subquery_index: u16,
         value: &Value,
         op: CompareOp,
-        outer_row: Option<&FxHashMap<Arc<str>, Value>>,
+        outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
     ) -> Result<bool>;
 
     /// Execute ANY subquery
@@ -199,7 +198,7 @@ pub trait SubqueryExecutor {
         subquery_index: u16,
         value: &Value,
         op: CompareOp,
-        outer_row: Option<&FxHashMap<Arc<str>, Value>>,
+        outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
     ) -> Result<bool>;
 }
 
@@ -1007,9 +1006,9 @@ impl ExprVM {
                     }
 
                     // Build result - optimize for inline vs heap
-                    let result = if all_text && total_len <= 22 {
+                    let result = if all_text && total_len <= 15 {
                         // Fast path: build directly into inline SmartString (no heap allocation)
-                        let mut data = [0u8; 22];
+                        let mut data = [0u8; 15];
                         let mut pos = 0;
                         for v in self.stack.drain(start..) {
                             if let Value::Text(text) = v {
@@ -1018,10 +1017,12 @@ impl ExprVM {
                                 pos += bytes.len();
                             }
                         }
-                        // SAFETY: SmartString only stores valid UTF-8
-                        SmartString::Inline {
-                            len: total_len as u8,
-                            data,
+                        // SAFETY: SmartString only stores valid UTF-8, build_inline returns Some for len <= 15
+                        unsafe {
+                            SmartString::build_inline(total_len, |buf| {
+                                buf.copy_from_slice(&data[..total_len]);
+                            })
+                            .unwrap_unchecked()
                         }
                     } else if all_text {
                         // Heap path: exact capacity, into_boxed_str is O(1) when len == capacity
@@ -2349,9 +2350,9 @@ impl ExprVM {
                     }
 
                     // Build result - optimize for inline vs heap
-                    let result = if all_text && total_len <= 22 {
+                    let result = if all_text && total_len <= 15 {
                         // Fast path: build directly into inline SmartString (no heap allocation)
-                        let mut data = [0u8; 22];
+                        let mut data = [0u8; 15];
                         let mut pos = 0;
                         for v in stack.drain(start..) {
                             if let Value::Text(text) = &*v {
@@ -2360,10 +2361,12 @@ impl ExprVM {
                                 pos += bytes.len();
                             }
                         }
-                        // SAFETY: SmartString only stores valid UTF-8
-                        SmartString::Inline {
-                            len: total_len as u8,
-                            data,
+                        // SAFETY: SmartString only stores valid UTF-8, build_inline returns Some for len <= 15
+                        unsafe {
+                            SmartString::build_inline(total_len, |buf| {
+                                buf.copy_from_slice(&data[..total_len]);
+                            })
+                            .unwrap_unchecked()
                         }
                     } else if all_text {
                         // Heap path: exact capacity, into_boxed_str is O(1) when len == capacity
@@ -3100,7 +3103,7 @@ impl ExprVM {
                     }
                 } else {
                     // -> returns JSON
-                    Value::Json(Arc::from(v.to_string().as_str()))
+                    Value::Json(CompactArc::from(v.to_string()))
                 }
             }
             None => Value::Null(if as_text {
@@ -3229,6 +3232,7 @@ mod tests {
     use crate::common::CompactArc;
     use crate::core::ValueSet;
     use crate::Row;
+    use std::sync::Arc;
 
     #[test]
     fn test_simple_comparison() {
@@ -3349,8 +3353,8 @@ mod tests {
     #[test]
     fn test_context_with_outer_row() {
         let row = Row::from_values(vec![Value::Integer(1)]);
-        let mut outer: FxHashMap<Arc<str>, Value> = FxHashMap::default();
-        outer.insert(Arc::from("outer_col"), Value::Integer(42));
+        let mut outer: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
+        outer.insert(CompactArc::from("outer_col"), Value::Integer(42));
         let ctx = ExecuteContext::new(&row).with_outer_row(&outer);
         assert!(ctx.outer_row.is_some());
     }
@@ -3439,7 +3443,10 @@ mod tests {
     #[test]
     fn test_load_named_param() {
         let mut vm = ExprVM::new();
-        let program = Program::new(vec![Op::LoadNamedParam(Arc::from("myvar")), Op::Return]);
+        let program = Program::new(vec![
+            Op::LoadNamedParam(CompactArc::from("myvar")),
+            Op::Return,
+        ]);
         let row = Row::new();
         let mut named = FxHashMap::default();
         named.insert("myvar".to_string(), Value::Integer(999));
@@ -3460,12 +3467,12 @@ mod tests {
     fn test_load_outer_column() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![
-            Op::LoadOuterColumn(Arc::from("outer_val")),
+            Op::LoadOuterColumn(CompactArc::from("outer_val")),
             Op::Return,
         ]);
         let row = Row::new();
-        let mut outer: FxHashMap<Arc<str>, Value> = FxHashMap::default();
-        outer.insert(Arc::from("outer_val"), Value::Integer(100));
+        let mut outer: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
+        outer.insert(CompactArc::from("outer_val"), Value::Integer(100));
         let ctx = ExecuteContext::new(&row).with_outer_row(&outer);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(100));
     }

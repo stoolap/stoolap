@@ -17,7 +17,7 @@
 //! Provides the main MVCC storage engine implementation.
 //!
 
-use crate::common::{I64Map, SmartString};
+use crate::common::{CompactArc, I64Map, SmartString};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -297,7 +297,7 @@ pub struct MVCCEngine {
     config: RwLock<Config>,
     /// Table schemas (Arc-wrapped for safe sharing with transactions)
     /// Each schema is also Arc-wrapped to avoid cloning on lookup (critical for PK fast path)
-    schemas: Arc<RwLock<FxHashMap<String, Arc<Schema>>>>,
+    schemas: Arc<RwLock<FxHashMap<String, CompactArc<Schema>>>>,
     /// Version stores for each table (Arc-wrapped for safe sharing with transactions)
     version_stores: Arc<RwLock<FxHashMap<String, Arc<VersionStore>>>>,
     /// Transaction registry
@@ -592,7 +592,7 @@ impl MVCCEngine {
         // Store the schema and version store
         {
             let mut schemas = self.schemas.write().unwrap();
-            schemas.insert(table_name_lower.clone(), Arc::new(schema));
+            schemas.insert(table_name_lower.clone(), CompactArc::new(schema));
         }
         {
             let mut stores = self.version_stores.write().unwrap();
@@ -666,7 +666,7 @@ impl MVCCEngine {
 
                     {
                         let mut schemas = self.schemas.write().unwrap();
-                        schemas.insert(table_name.clone(), Arc::new(schema));
+                        schemas.insert(table_name.clone(), CompactArc::new(schema));
                     }
                     {
                         let mut stores = self.version_stores.write().unwrap();
@@ -1308,7 +1308,7 @@ impl MVCCEngine {
         let return_schema = schema.clone();
         {
             let mut schemas = self.schemas.write().unwrap();
-            schemas.insert(table_name.clone(), Arc::new(schema));
+            schemas.insert(table_name.clone(), CompactArc::new(schema));
         }
         {
             let mut stores = self.version_stores.write().unwrap();
@@ -1389,7 +1389,7 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema (using Arc::make_mut for copy-on-write)
+        // Get and modify schema (using CompactArc::make_mut for copy-on-write)
         let mut schemas = self.schemas.write().unwrap();
         let schema_arc = schemas
             .get_mut(&table_name_lower)
@@ -1401,7 +1401,7 @@ impl MVCCEngine {
         }
 
         // Add column to schema (Arc::make_mut clones only if there are other refs)
-        let schema = Arc::make_mut(schema_arc);
+        let schema = CompactArc::make_mut(schema_arc);
         let column = crate::core::SchemaColumn::new(
             schema.columns.len(),
             column_name,
@@ -1415,7 +1415,7 @@ impl MVCCEngine {
         let stores = self.version_stores.read().unwrap();
         if let Some(store) = stores.get(&table_name_lower) {
             let mut vs_schema_guard = store.schema_mut();
-            let vs_schema = Arc::make_mut(&mut *vs_schema_guard);
+            let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
             let col = crate::core::SchemaColumn::new(
                 vs_schema.columns.len(),
                 column_name,
@@ -1447,7 +1447,7 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema (using Arc::make_mut for copy-on-write)
+        // Get and modify schema (using CompactArc::make_mut for copy-on-write)
         let mut schemas = self.schemas.write().unwrap();
         let schema_arc = schemas
             .get_mut(&table_name_lower)
@@ -1459,7 +1459,7 @@ impl MVCCEngine {
         }
 
         // Add column to schema with default expression (Arc::make_mut clones only if there are other refs)
-        let schema = Arc::make_mut(schema_arc);
+        let schema = CompactArc::make_mut(schema_arc);
         let mut column = crate::core::SchemaColumn::new(
             schema.columns.len(),
             column_name,
@@ -1474,7 +1474,7 @@ impl MVCCEngine {
         let stores = self.version_stores.read().unwrap();
         if let Some(store) = stores.get(&table_name_lower) {
             let mut vs_schema_guard = store.schema_mut();
-            let vs_schema = Arc::make_mut(&mut *vs_schema_guard);
+            let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
             let mut col = crate::core::SchemaColumn::new(
                 vs_schema.columns.len(),
                 column_name,
@@ -1521,7 +1521,7 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema (using Arc::make_mut for copy-on-write)
+        // Get and modify schema (using CompactArc::make_mut for copy-on-write)
         let mut schemas = self.schemas.write().unwrap();
         let schema_arc = schemas
             .get_mut(&table_name_lower)
@@ -1537,13 +1537,13 @@ impl MVCCEngine {
         }
 
         // Remove column from schema (Arc::make_mut clones only if there are other refs)
-        Arc::make_mut(schema_arc).remove_column(column_name)?;
+        CompactArc::make_mut(schema_arc).remove_column(column_name)?;
 
         // Also update version store schema
         let stores = self.version_stores.read().unwrap();
         if let Some(store) = stores.get(&table_name_lower) {
             let mut vs_schema_guard = store.schema_mut();
-            Arc::make_mut(&mut *vs_schema_guard).remove_column(column_name)?;
+            CompactArc::make_mut(&mut *vs_schema_guard).remove_column(column_name)?;
         }
 
         // Increment schema epoch for cache invalidation
@@ -1560,7 +1560,7 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema (using Arc::make_mut for copy-on-write)
+        // Get and modify schema (using CompactArc::make_mut for copy-on-write)
         let mut schemas = self.schemas.write().unwrap();
         let schema_arc = schemas
             .get_mut(&table_name_lower)
@@ -1577,13 +1577,13 @@ impl MVCCEngine {
         }
 
         // Rename column in schema (Arc::make_mut clones only if there are other refs)
-        Arc::make_mut(schema_arc).rename_column(old_name, new_name)?;
+        CompactArc::make_mut(schema_arc).rename_column(old_name, new_name)?;
 
         // Also update version store schema
         let stores = self.version_stores.read().unwrap();
         if let Some(store) = stores.get(&table_name_lower) {
             let mut vs_schema_guard = store.schema_mut();
-            Arc::make_mut(&mut *vs_schema_guard).rename_column(old_name, new_name)?;
+            CompactArc::make_mut(&mut *vs_schema_guard).rename_column(old_name, new_name)?;
         }
 
         // Increment schema epoch for cache invalidation
@@ -1606,7 +1606,7 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema (using Arc::make_mut for copy-on-write)
+        // Get and modify schema (using CompactArc::make_mut for copy-on-write)
         let mut schemas = self.schemas.write().unwrap();
         let schema_arc = schemas
             .get_mut(&table_name_lower)
@@ -1618,13 +1618,17 @@ impl MVCCEngine {
         }
 
         // Modify column in schema (Arc::make_mut clones only if there are other refs)
-        Arc::make_mut(schema_arc).modify_column(column_name, Some(data_type), Some(nullable))?;
+        CompactArc::make_mut(schema_arc).modify_column(
+            column_name,
+            Some(data_type),
+            Some(nullable),
+        )?;
 
         // Also update version store schema
         let stores = self.version_stores.read().unwrap();
         if let Some(store) = stores.get(&table_name_lower) {
             let mut vs_schema_guard = store.schema_mut();
-            Arc::make_mut(&mut *vs_schema_guard).modify_column(
+            CompactArc::make_mut(&mut *vs_schema_guard).modify_column(
                 column_name,
                 Some(data_type),
                 Some(nullable),
@@ -1661,7 +1665,7 @@ impl MVCCEngine {
         {
             let mut schemas = self.schemas.write().unwrap();
             if let Some(mut schema_arc) = schemas.remove(&old_name_lower) {
-                Arc::make_mut(&mut schema_arc).table_name = new_name.to_string();
+                CompactArc::make_mut(&mut schema_arc).table_name = new_name.to_string();
                 schemas.insert(new_name_lower.clone(), schema_arc);
             }
         }
@@ -1673,7 +1677,7 @@ impl MVCCEngine {
                 // Update the schema's table name within the store
                 {
                     let mut vs_schema_guard = store.schema_mut();
-                    Arc::make_mut(&mut *vs_schema_guard).table_name = new_name.to_string();
+                    CompactArc::make_mut(&mut *vs_schema_guard).table_name = new_name.to_string();
                 }
                 stores.insert(new_name_lower, store);
             }
@@ -1925,7 +1929,7 @@ impl Engine for MVCCEngine {
         )))
     }
 
-    fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>> {
+    fn get_table_schema(&self, table_name: &str) -> Result<CompactArc<Schema>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2636,7 +2640,7 @@ impl Drop for CleanupHandle {
 /// from transactions without raw pointers.
 struct EngineOperations {
     /// Shared reference to schemas (each schema is Arc-wrapped to avoid cloning on lookup)
-    schemas: Arc<RwLock<FxHashMap<String, Arc<Schema>>>>,
+    schemas: Arc<RwLock<FxHashMap<String, CompactArc<Schema>>>>,
     /// Shared reference to version stores
     version_stores: Arc<RwLock<FxHashMap<String, Arc<VersionStore>>>>,
     /// Shared reference to registry
@@ -2663,7 +2667,7 @@ impl EngineOperations {
         }
     }
 
-    fn schemas(&self) -> &RwLock<FxHashMap<String, Arc<Schema>>> {
+    fn schemas(&self) -> &RwLock<FxHashMap<String, CompactArc<Schema>>> {
         &self.schemas
     }
 
@@ -2764,7 +2768,7 @@ impl TransactionEngineOperations for EngineOperations {
         // Store schema and version store
         {
             let mut schemas = self.schemas().write().unwrap();
-            schemas.insert(table_name.clone(), Arc::new(schema));
+            schemas.insert(table_name.clone(), CompactArc::new(schema));
         }
         {
             let mut stores = self.version_stores().write().unwrap();
@@ -2824,7 +2828,7 @@ impl TransactionEngineOperations for EngineOperations {
         {
             let mut schemas = self.schemas().write().unwrap();
             if let Some(mut schema_arc) = schemas.remove(&old_name_lower) {
-                Arc::make_mut(&mut schema_arc).table_name = new_name.to_string();
+                CompactArc::make_mut(&mut schema_arc).table_name = new_name.to_string();
                 schemas.insert(new_name_lower.clone(), schema_arc);
             }
         }

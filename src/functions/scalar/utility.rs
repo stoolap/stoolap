@@ -16,6 +16,7 @@
 
 use chrono::Utc;
 
+use crate::common::CompactArc;
 use crate::core::{Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
@@ -490,7 +491,7 @@ fn json_to_value(json: &serde_json::Value) -> Result<Value> {
         }
         serde_json::Value::String(s) => Ok(Value::text(s)),
         // For arrays and objects, return as JSON string
-        _ => Ok(Value::Json(std::sync::Arc::from(json.to_string().as_str()))),
+        _ => Ok(Value::Json(CompactArc::from(json.to_string()))),
     }
 }
 
@@ -613,9 +614,7 @@ impl ScalarFunction for JsonArrayFunction {
         let json_values: Vec<serde_json::Value> = args.iter().map(value_to_json).collect();
 
         let json_array = serde_json::Value::Array(json_values);
-        Ok(Value::Json(std::sync::Arc::from(
-            json_array.to_string().as_str(),
-        )))
+        Ok(Value::Json(CompactArc::from(json_array.to_string())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -677,9 +676,7 @@ impl ScalarFunction for JsonObjectFunction {
         }
 
         let json_object = serde_json::Value::Object(map);
-        Ok(Value::Json(std::sync::Arc::from(
-            json_object.to_string().as_str(),
-        )))
+        Ok(Value::Json(CompactArc::from(json_object.to_string())))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -926,9 +923,7 @@ impl ScalarFunction for JsonKeysFunction {
                     .map(|k| serde_json::Value::String(k.clone()))
                     .collect();
                 let keys_array = serde_json::Value::Array(keys);
-                Ok(Value::Json(std::sync::Arc::from(
-                    keys_array.to_string().as_str(),
-                )))
+                Ok(Value::Json(CompactArc::from(keys_array.to_string())))
             }
             _ => Ok(Value::null_unknown()), // Not an object, return NULL
         }
@@ -1382,7 +1377,9 @@ mod tests {
     #[test]
     fn test_json_extract_simple() {
         let f = JsonExtractFunction;
-        let json = Value::Json(std::sync::Arc::from(r#"{"name": "Alice", "age": 30}"#));
+        let json = Value::Json(CompactArc::from(
+            r#"{"name": "Alice", "age": 30}"#.to_owned(),
+        ));
 
         // Extract string
         assert_eq!(
@@ -1400,7 +1397,7 @@ mod tests {
     #[test]
     fn test_json_extract_nested() {
         let f = JsonExtractFunction;
-        let json = Value::Json(std::sync::Arc::from(r#"{"user": {"name": "Bob"}}"#));
+        let json = Value::Json(CompactArc::from(r#"{"user": {"name": "Bob"}}"#.to_owned()));
 
         assert_eq!(
             f.evaluate(&[json, Value::text("$.user.name")]).unwrap(),
@@ -1411,7 +1408,7 @@ mod tests {
     #[test]
     fn test_json_extract_array() {
         let f = JsonExtractFunction;
-        let json = Value::Json(std::sync::Arc::from(r#"{"items": [1, 2, 3]}"#));
+        let json = Value::Json(CompactArc::from(r#"{"items": [1, 2, 3]}"#.to_owned()));
 
         assert_eq!(
             f.evaluate(&[json.clone(), Value::text("$.items[0]")])
@@ -1428,7 +1425,7 @@ mod tests {
     #[test]
     fn test_json_extract_missing_path() {
         let f = JsonExtractFunction;
-        let json = Value::Json(std::sync::Arc::from(r#"{"name": "Alice"}"#));
+        let json = Value::Json(CompactArc::from(r#"{"name": "Alice"}"#.to_owned()));
 
         assert!(f
             .evaluate(&[json, Value::text("$.missing")])
@@ -1489,7 +1486,7 @@ mod tests {
     fn test_typeof_json() {
         let f = TypeOfFunction;
         assert_eq!(
-            f.evaluate(&[Value::Json(std::sync::Arc::from("{}"))])
+            f.evaluate(&[Value::Json(CompactArc::from("{}".to_owned()))])
                 .unwrap(),
             Value::text("JSON")
         );

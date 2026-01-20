@@ -354,7 +354,7 @@ pub enum Op {
     /// Load from outer row context (for correlated subqueries)
     /// Uses pre-resolved key
     /// Stack: [] -> [value]
-    LoadOuterColumn(Arc<str>),
+    LoadOuterColumn(CompactArc<str>),
 
     /// Load constant value (pre-cloned at compile time)
     /// Stack: [] -> [value]
@@ -366,7 +366,7 @@ pub enum Op {
 
     /// Load named parameter
     /// Stack: [] -> [value]
-    LoadNamedParam(Arc<str>),
+    LoadNamedParam(CompactArc<str>),
 
     /// Load NULL with type hint
     /// Stack: [] -> [null]

@@ -15,14 +15,12 @@
 //! CAST expression for Stoolap
 //!
 
-use std::sync::Arc;
-
 use rustc_hash::FxHashMap;
 
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::{find_column_index, resolve_alias, Expression};
-use crate::common::SmartString;
+use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Operator, Result, Row, Schema, Value};
 
 /// CAST expression (CAST(column AS type))
@@ -447,7 +445,7 @@ fn cast_to_string(value: &Value) -> Result<Value> {
             "false"
         }))),
         Value::Timestamp(t) => Ok(Value::Text(SmartString::from_string(t.to_rfc3339()))),
-        Value::Json(j) => Ok(Value::Text(SmartString::from(j.as_ref()))),
+        Value::Json(j) => Ok(Value::Text(SmartString::from(&**j))),
         Value::Null(_) => Ok(Value::null(DataType::Text)),
     }
 }
@@ -493,12 +491,16 @@ fn cast_to_timestamp(value: &Value) -> Result<Value> {
 fn cast_to_json(value: &Value) -> Result<Value> {
     match value {
         Value::Json(j) => Ok(Value::Json(j.clone())),
-        Value::Text(s) => Ok(Value::Json(Arc::from(s.as_str()))),
-        Value::Integer(v) => Ok(Value::Json(Arc::from(v.to_string().as_str()))),
-        Value::Float(v) => Ok(Value::Json(Arc::from(v.to_string().as_str()))),
-        Value::Boolean(b) => Ok(Value::Json(Arc::from(if *b { "true" } else { "false" }))),
-        Value::Null(_) => Ok(Value::Json(Arc::from("null"))),
-        _ => Ok(Value::Json(Arc::from("null"))),
+        Value::Text(s) => Ok(Value::Json(CompactArc::from(s.as_str()))),
+        Value::Integer(v) => Ok(Value::Json(CompactArc::from(v.to_string()))),
+        Value::Float(v) => Ok(Value::Json(CompactArc::from(v.to_string()))),
+        Value::Boolean(b) => Ok(Value::Json(CompactArc::from(if *b {
+            "true"
+        } else {
+            "false"
+        }))),
+        Value::Null(_) => Ok(Value::Json(CompactArc::from("null"))),
+        _ => Ok(Value::Json(CompactArc::from("null"))),
     }
 }
 
