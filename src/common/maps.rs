@@ -16,15 +16,14 @@
 //!
 //! This module provides optimized hash maps:
 //! - `I64Map`/`I64Set` for i64 keys (custom pre-mixing hash)
-//! - `StringMap`/`StringSet` for String keys (AHash - 10% faster than FxHash)
-//! - `DashMap` for concurrent access (sharded, lock-free reads)
-//! - `BTreeMap` with `RwLock` for ordered iteration
+//! - `StringMap`/`StringSet` for String keys (AHash)
+//! - `ConcurrentI64Map` for concurrent access (DashMap)
+//! - `CowBTreeMap` for ordered iteration with lock-free reads
 
 use ahash::{AHashMap, AHashSet};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rustc_hash::FxHasher;
-use std::collections::BTreeMap;
 use std::hash::BuildHasherDefault;
 
 /// Type alias for FxHash's BuildHasher
@@ -34,13 +33,13 @@ pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
 ///
 /// Uses custom I64Map with key transformation for 45% faster lookups
 /// compared to FxHashMap while maintaining similar insert performance.
-pub type Int64Map<V> = crate::common::I64Map<V>;
+pub type I64Map<V> = crate::common::i64_map::I64Map<V>;
 
 /// Fast single-threaded hash set for i64 keys
 ///
 /// Uses custom I64Set with pre-mixing hash for 0 sequential key collisions.
 /// Note: i64::MIN cannot be used (reserved as empty sentinel).
-pub type Int64Set = crate::common::I64Set;
+pub type I64Set = crate::common::i64_map::I64Set;
 
 /// Fast hash map for String keys
 ///
@@ -57,36 +56,42 @@ pub type StringSet = AHashSet<String>;
 ///
 /// Uses DashMap with FxHash for fast concurrent access.
 /// Provides sharded, lock-free reads and fine-grained locking for writes.
-pub type ConcurrentInt64Map<V> = DashMap<i64, V, FxBuildHasher>;
+pub type ConcurrentI64Map<V> = DashMap<i64, V, FxBuildHasher>;
 
-/// BTreeMap-based map for i64 keys using parking_lot::RwLock
+/// Copy-on-Write B-tree map for i64 keys with lock-free reads
 ///
-/// Uses BTreeMap for ordered iteration and O(log n) lookups.
-/// Better for large datasets (1M+ rows) due to memory efficiency.
-pub type BTreeInt64Map<V> = RwLock<BTreeMap<i64, V>>;
+/// Key advantage: `.read().clone()` is O(1) for creating snapshots.
+///
+/// Usage pattern for lock-free reads:
+/// ```ignore
+/// // Brief lock, O(1) clone, then lock-free iteration
+/// let snapshot = map.read().clone();
+/// for (k, v) in snapshot.iter() { ... }  // No lock held!
+/// ```
+pub type CowBTreeMap<V> = RwLock<crate::common::CowBTree<V>>;
 
-/// Create a new Int64Map with default capacity
+/// Create a new I64Map with default capacity
 #[inline]
-pub fn new_int64_map<V>() -> Int64Map<V> {
-    crate::common::I64Map::new()
+pub fn new_i64_map<V>() -> I64Map<V> {
+    crate::common::i64_map::I64Map::new()
 }
 
-/// Create a new Int64Map with specified capacity
+/// Create a new I64Map with specified capacity
 #[inline]
-pub fn new_int64_map_with_capacity<V>(capacity: usize) -> Int64Map<V> {
-    crate::common::I64Map::with_capacity(capacity)
+pub fn new_i64_map_with_capacity<V>(capacity: usize) -> I64Map<V> {
+    crate::common::i64_map::I64Map::with_capacity(capacity)
 }
 
-/// Create a new ConcurrentInt64Map with default capacity
+/// Create a new ConcurrentI64Map with default capacity
 #[inline]
-pub fn new_concurrent_int64_map<V>() -> ConcurrentInt64Map<V> {
+pub fn new_concurrent_i64_map<V>() -> ConcurrentI64Map<V> {
     DashMap::with_hasher(FxBuildHasher::default())
 }
 
-/// Create a new BTreeInt64Map
+/// Create a new CowBTreeMap (lock-free reads via snapshots)
 #[inline]
-pub fn new_btree_int64_map<V>() -> BTreeInt64Map<V> {
-    RwLock::new(BTreeMap::new())
+pub fn new_cow_btree_map<V: Clone>() -> CowBTreeMap<V> {
+    RwLock::new(crate::common::CowBTree::new())
 }
 
 #[cfg(test)]
@@ -96,8 +101,8 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn test_int64_map_basic() {
-        let mut map: Int64Map<String> = new_int64_map();
+    fn test_i64_map_basic() {
+        let mut map: I64Map<String> = new_i64_map();
 
         map.insert(1, "one".to_string());
         map.insert(2, "two".to_string());
@@ -117,14 +122,14 @@ mod tests {
     }
 
     #[test]
-    fn test_int64_map_with_capacity() {
-        let map: Int64Map<i32> = new_int64_map_with_capacity(100);
+    fn test_i64_map_with_capacity() {
+        let map: I64Map<i32> = new_i64_map_with_capacity(100);
         assert!(map.capacity() >= 100);
     }
 
     #[test]
-    fn test_int64_set() {
-        let mut set = Int64Set::default();
+    fn test_i64_set() {
+        let mut set = I64Set::default();
 
         set.insert(1);
         set.insert(2);
@@ -139,8 +144,8 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_int64_map() {
-        let map: ConcurrentInt64Map<String> = new_concurrent_int64_map();
+    fn test_concurrent_i64_map() {
+        let map: ConcurrentI64Map<String> = new_concurrent_i64_map();
 
         map.insert(1, "one".to_string());
         map.insert(2, "two".to_string());
@@ -153,8 +158,8 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_int64_map_multithreaded() {
-        let map: Arc<ConcurrentInt64Map<i64>> = Arc::new(new_concurrent_int64_map());
+    fn test_concurrent_i64_map_multithreaded() {
+        let map: Arc<ConcurrentI64Map<i64>> = Arc::new(new_concurrent_i64_map());
         let num_threads: i64 = 4;
         let ops_per_thread: i64 = 100;
 
@@ -182,17 +187,67 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_int64_map() {
-        let map: BTreeInt64Map<String> = new_btree_int64_map();
+    fn test_cow_btree_map() {
+        let map: CowBTreeMap<String> = new_cow_btree_map();
 
         map.write().insert(3, "three".to_string());
         map.write().insert(1, "one".to_string());
         map.write().insert(2, "two".to_string());
 
-        assert_eq!(map.read().get(&1), Some(&"one".to_string()));
+        // Read via read lock
+        assert_eq!(map.read().get(1), Some(&"one".to_string()));
+        assert_eq!(map.read().len(), 3);
 
-        // Verify ordered iteration
-        let keys: Vec<i64> = map.read().keys().copied().collect();
+        // O(1) snapshot for lock-free iteration
+        let snapshot = map.read().clone(); // This is O(1) for CowBTree!
+        let keys: Vec<i64> = snapshot.keys().collect();
         assert_eq!(keys, vec![1, 2, 3]);
+
+        // Snapshot is independent - writer can modify while reader iterates
+        map.write().insert(4, "four".to_string());
+        assert_eq!(snapshot.len(), 3); // Snapshot unchanged
+        assert_eq!(map.read().len(), 4); // Map updated
+    }
+
+    #[test]
+    fn test_cow_btree_map_multithreaded() {
+        let map: Arc<CowBTreeMap<i64>> = Arc::new(new_cow_btree_map());
+        let num_threads: i64 = 4;
+        let ops_per_thread: i64 = 100;
+
+        // Writer threads
+        let write_handles: Vec<_> = (0..num_threads)
+            .map(|t| {
+                let map = Arc::clone(&map);
+                thread::spawn(move || {
+                    let base = t * ops_per_thread;
+                    for i in 0..ops_per_thread {
+                        map.write().insert(base + i, (base + i) * 2);
+                    }
+                })
+            })
+            .collect();
+
+        // Reader threads using O(1) snapshots (lock-free after clone)
+        let read_handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let map = Arc::clone(&map);
+                thread::spawn(move || {
+                    for _ in 0..100 {
+                        let snapshot = map.read().clone(); // O(1) clone!
+                        let _count = snapshot.iter().count(); // Lock-free iteration
+                    }
+                })
+            })
+            .collect();
+
+        for handle in write_handles {
+            handle.join().unwrap();
+        }
+        for handle in read_handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(map.read().len(), (num_threads * ops_per_thread) as usize);
     }
 }

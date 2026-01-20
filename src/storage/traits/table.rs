@@ -694,7 +694,7 @@ pub trait Table: Send + Sync {
     /// Keyset pagination optimization for PRIMARY KEY columns
     ///
     /// For queries like `WHERE id > X ORDER BY id LIMIT Y`, this uses the PK's
-    /// natural ordering (BTreeMap) to start iteration from X and return only Y rows.
+    /// natural ordering to start iteration from X and return only Y rows.
     /// This provides O(limit) complexity instead of O(n) for full table scans.
     ///
     /// # Arguments

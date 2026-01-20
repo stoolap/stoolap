@@ -35,8 +35,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::common::SmartString;
 
 use crate::common::{
-    new_btree_int64_map, new_int64_map, new_int64_map_with_capacity, BTreeInt64Map, CompactArc,
-    Int64Map,
+    new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CompactArc, CowBTreeMap, I64Map,
 };
 use crate::core::types::DataType;
 use crate::core::{Error, Row, RowVec, Schema, Value};
@@ -47,7 +46,6 @@ use crate::storage::mvcc::get_fast_timestamp;
 use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::mvcc::streaming_result::{StreamingResult, VisibleRowInfo};
 use crate::storage::Index;
-// radsort removed - BTreeMap iteration is already ordered
 use ahash::AHashMap;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -242,34 +240,34 @@ pub struct WriteSetEntry {
 const MAP_POOL_MAX_SIZE: usize = 64;
 
 /// Global pool for VersionList maps (local_versions in TransactionVersionStore)
-static VERSION_LIST_MAP_POOL: Mutex<Vec<Int64Map<VersionList>>> = Mutex::new(Vec::new());
+static VERSION_LIST_MAP_POOL: Mutex<Vec<I64Map<VersionList>>> = Mutex::new(Vec::new());
 
 /// Global pool for WriteSetEntry maps (write_set in TransactionVersionStore)
-static WRITE_SET_MAP_POOL: Mutex<Vec<Int64Map<WriteSetEntry>>> = Mutex::new(Vec::new());
+static WRITE_SET_MAP_POOL: Mutex<Vec<I64Map<WriteSetEntry>>> = Mutex::new(Vec::new());
 
 /// Get a VersionList map from pool or create a new one
 #[inline]
-fn get_version_list_map() -> Int64Map<VersionList> {
+fn get_version_list_map() -> I64Map<VersionList> {
     if let Some(map) = VERSION_LIST_MAP_POOL.lock().pop() {
         map
     } else {
-        new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY)
+        new_i64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY)
     }
 }
 
 /// Get a WriteSetEntry map from pool or create a new one
 #[inline]
-fn get_write_set_map() -> Int64Map<WriteSetEntry> {
+fn get_write_set_map() -> I64Map<WriteSetEntry> {
     if let Some(map) = WRITE_SET_MAP_POOL.lock().pop() {
         map
     } else {
-        new_int64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY)
+        new_i64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY)
     }
 }
 
 /// Return a VersionList map to the pool for reuse
 #[inline]
-fn return_version_list_map(mut map: Int64Map<VersionList>) {
+fn return_version_list_map(mut map: I64Map<VersionList>) {
     map.clear();
     let mut pool = VERSION_LIST_MAP_POOL.lock();
     if pool.len() < MAP_POOL_MAX_SIZE {
@@ -280,7 +278,7 @@ fn return_version_list_map(mut map: Int64Map<VersionList>) {
 
 /// Return a WriteSetEntry map to the pool for reuse
 #[inline]
-fn return_write_set_map(mut map: Int64Map<WriteSetEntry>) {
+fn return_write_set_map(mut map: I64Map<WriteSetEntry>) {
     map.clear();
     let mut pool = WRITE_SET_MAP_POOL.lock();
     if pool.len() < MAP_POOL_MAX_SIZE {
@@ -380,8 +378,9 @@ pub trait VisibilityChecker: Send + Sync {
 
 /// VersionStore tracks the latest committed version of each row for a table
 ///
-/// Uses OrderedInt64Map (RwLock<BTreeMap>) for the version store because:
-/// - Ordered iteration is free (BTreeMap is sorted by key)
+/// Uses CowBTreeMap (RwLock<CowBTree>) for the version store because:
+/// - O(1) snapshot cloning for lock-free reads (critical for MVCC)
+/// - Ordered iteration is free (B+ tree is sorted by key)
 /// - MVCC has single-writer semantics per transaction, so DashMap's sharding is overhead
 /// - Point lookups are O(log n) which is fast enough for typical row counts
 /// - Eliminates the ~350μs sort overhead during full scans
@@ -391,8 +390,8 @@ pub trait VisibilityChecker: Send + Sync {
 /// - Returning slices instead of clones during iteration
 /// - Eliminating per-row allocation overhead
 pub struct VersionStore {
-    /// Row versions indexed by row ID (BTreeMap for ordered iteration)
-    versions: BTreeInt64Map<VersionChainEntry>,
+    /// Row versions indexed by row ID (CowBTree for O(1) snapshot cloning)
+    versions: CowBTreeMap<VersionChainEntry>,
     /// The name of the table this store belongs to (SmartString for inline storage ≤24 bytes)
     table_name: SmartString,
     /// Table schema (Arc for zero-cost cloning on read)
@@ -404,7 +403,7 @@ pub struct VersionStore {
     /// Auto-increment counter for tables without explicit PK
     auto_increment_counter: AtomicI64,
     /// Track which transaction has uncommitted changes to each row
-    uncommitted_writes: RwLock<Int64Map<i64>>,
+    uncommitted_writes: RwLock<I64Map<i64>>,
     /// Visibility checker (registry reference)
     /// Production: concrete type for zero-cost inlining in hot paths
     /// Test: dyn trait for TestVisibilityChecker flexibility
@@ -414,8 +413,8 @@ pub struct VersionStore {
     visibility_checker: Option<Arc<dyn VisibilityChecker>>,
     /// Arena-based storage for zero-copy full table scans
     arena: RowArena,
-    /// Maps row_id to the latest arena index for that row (Int64Map for fast i64 key lookups)
-    row_arena_index: RwLock<Int64Map<usize>>,
+    /// Maps row_id to the latest arena index for that row (I64Map for fast i64 key lookups)
+    row_arena_index: RwLock<I64Map<usize>>,
     /// Zone maps for segment pruning (set by ANALYZE)
     /// Uses Arc to avoid cloning on every read - critical for high QPS workloads
     zone_maps: RwLock<Option<Arc<crate::storage::mvcc::zonemap::TableZoneMap>>>,
@@ -446,13 +445,13 @@ impl VersionStore {
         checker: Option<Arc<TransactionRegistry>>,
         expected_rows: usize,
     ) -> Self {
-        // BTreeMap doesn't support capacity hints, but row_arena_index (HashMap) does
+        // CowBTree doesn't support capacity hints, but row_arena_index (HashMap) does
         let row_arena_index = if expected_rows > 0 {
-            RwLock::new(new_int64_map_with_capacity(expected_rows))
+            RwLock::new(new_i64_map_with_capacity(expected_rows))
         } else {
-            RwLock::new(new_int64_map())
+            RwLock::new(new_i64_map())
         };
-        let versions = new_btree_int64_map();
+        let versions = new_cow_btree_map();
 
         Self {
             versions,
@@ -461,7 +460,7 @@ impl VersionStore {
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
-            uncommitted_writes: RwLock::new(new_int64_map()),
+            uncommitted_writes: RwLock::new(new_i64_map()),
             visibility_checker: checker,
             arena: RowArena::new(),
             row_arena_index,
@@ -480,11 +479,11 @@ impl VersionStore {
         expected_rows: usize,
     ) -> Self {
         let row_arena_index = if expected_rows > 0 {
-            RwLock::new(new_int64_map_with_capacity(expected_rows))
+            RwLock::new(new_i64_map_with_capacity(expected_rows))
         } else {
-            RwLock::new(new_int64_map())
+            RwLock::new(new_i64_map())
         };
-        let versions = new_btree_int64_map();
+        let versions = new_cow_btree_map();
 
         Self {
             versions,
@@ -493,7 +492,7 @@ impl VersionStore {
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
-            uncommitted_writes: RwLock::new(new_int64_map()),
+            uncommitted_writes: RwLock::new(new_i64_map()),
             visibility_checker: checker,
             arena: RowArena::new(),
             row_arena_index,
@@ -613,9 +612,9 @@ impl VersionStore {
         // Use write lock for the entire operation (MVCC single-writer semantics)
         let mut versions = self.versions.write();
 
-        // Use entry API to avoid double BTreeMap traversal (get + insert -> single entry)
+        // Use entry API to avoid double traversal
         match versions.entry(row_id) {
-            std::collections::btree_map::Entry::Occupied(mut occupied) => {
+            crate::common::cow_btree::Entry::Occupied(mut occupied) => {
                 // Extract existing data from the entry
                 let existing = occupied.get();
                 let existing_arena_idx = existing.arena_idx;
@@ -717,7 +716,7 @@ impl VersionStore {
                 // Replace entry in-place (no additional tree traversal)
                 occupied.insert(new_entry);
             }
-            std::collections::btree_map::Entry::Vacant(vacant) => {
+            crate::common::cow_btree::Entry::Vacant(vacant) => {
                 // First version for this row - store in arena
                 // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
                 let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
@@ -780,9 +779,9 @@ impl VersionStore {
         for (row_id, version) in batch {
             let is_new_version_deleted = version.deleted_at_txn_id != 0;
 
-            // Use entry API to avoid double BTreeMap traversal (get + insert -> single entry)
+            // Use entry API to avoid double traversal
             match versions.entry(row_id) {
-                std::collections::btree_map::Entry::Occupied(mut occupied) => {
+                crate::common::cow_btree::Entry::Occupied(mut occupied) => {
                     // Extract existing data from the entry
                     let existing = occupied.get();
                     let existing_arena_idx = existing.arena_idx;
@@ -881,7 +880,7 @@ impl VersionStore {
                     // Replace entry in-place (no additional tree traversal)
                     occupied.insert(new_entry);
                 }
-                std::collections::btree_map::Entry::Vacant(vacant) => {
+                crate::common::cow_btree::Entry::Vacant(vacant) => {
                     // First version for this row - store in arena with Arc reuse
                     // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
                     let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
@@ -950,7 +949,7 @@ impl VersionStore {
         let mut versions = self.versions.write();
 
         match versions.entry(row_id) {
-            std::collections::btree_map::Entry::Occupied(mut occupied) => {
+            crate::common::cow_btree::Entry::Occupied(mut occupied) => {
                 // Extract existing data from the entry
                 let existing = occupied.get();
                 let existing_arena_idx = existing.arena_idx;
@@ -1048,7 +1047,7 @@ impl VersionStore {
 
                 occupied.insert(new_entry);
             }
-            std::collections::btree_map::Entry::Vacant(vacant) => {
+            crate::common::cow_btree::Entry::Vacant(vacant) => {
                 let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
                     // New non-deleted row -> increment counter
                     self.committed_row_count.fetch_add(1, Ordering::Relaxed);
@@ -1087,7 +1086,7 @@ impl VersionStore {
             return false;
         }
 
-        self.versions.read().contains_key(&row_id)
+        self.versions.read().clone().contains_key(row_id)
     }
 
     /// Gets the latest visible version of a row
@@ -1098,20 +1097,15 @@ impl VersionStore {
 
         let checker = self.visibility_checker.as_ref()?;
 
-        // ARENA FAST PATH: O(1) HashMap lookup instead of O(log n) BTreeMap
-        // This bypasses BTreeMap entirely when HEAD is visible (common case).
-        // row_arena_index maps row_id → arena_idx for O(1) access.
+        // ARENA FAST PATH: O(1) lookup when HEAD is visible (common case)
         if let Some(&arena_idx) = self.row_arena_index.read().get(row_id) {
             if let Some((meta, arc_data)) = self.arena.get_meta_and_arc(arena_idx) {
-                // Check HEAD visibility using arena metadata
                 if checker.is_visible(meta.txn_id, txn_id) {
-                    // HEAD is visible - check if deleted
                     if meta.deleted_at_txn_id != 0
                         && checker.is_visible(meta.deleted_at_txn_id, txn_id)
                     {
-                        return None; // Row is deleted
+                        return None;
                     }
-                    // Return from arena - O(1) total!
                     return Some(RowVersion {
                         txn_id: meta.txn_id,
                         deleted_at_txn_id: meta.deleted_at_txn_id,
@@ -1120,14 +1114,13 @@ impl VersionStore {
                         create_time: meta.create_time,
                     });
                 }
-                // HEAD not visible - fall through to BTreeMap for version chain
+                // HEAD not visible - fall through to version chain
             }
         }
 
-        // BTREE SLOW PATH: HEAD not visible or row not in arena index
-        // Need BTreeMap for version chain traversal (Snapshot Isolation, AS OF, etc.)
-        let versions = self.versions.read();
-        let chain = versions.get(&row_id)?;
+        // SLOW PATH: version chain traversal (Snapshot Isolation, AS OF, etc.)
+        let versions = self.versions.read().clone();
+        let chain = versions.get(row_id)?;
 
         // Check HEAD in case arena path was skipped
         let head_txn_id = chain.version.txn_id;
@@ -1169,10 +1162,10 @@ impl VersionStore {
         }
 
         let checker = self.visibility_checker.as_ref()?;
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
 
         for &row_id in row_ids {
-            if let Some(chain) = versions.get(&row_id) {
+            if let Some(chain) = versions.get(row_id) {
                 // Check HEAD visibility (most common case)
                 let head_txn_id = chain.version.txn_id;
                 let head_deleted_at = chain.version.deleted_at_txn_id;
@@ -1212,8 +1205,7 @@ impl VersionStore {
     /// Uses parallel processing for large batches (>1000 row_ids) to leverage
     /// multiple CPU cores for visibility checking and row materialization.
     ///
-    /// OPTIMIZATION: Uses arena fast path (O(1) HashMap) before falling back to
-    /// BTreeMap (O(log n)) for version chain traversal.
+    /// Uses arena fast path before falling back to version chain traversal.
     pub fn get_visible_versions_batch(&self, row_ids: &[i64], txn_id: i64) -> RowVec {
         if self.closed.load(Ordering::Acquire) {
             return RowVec::new();
@@ -1229,8 +1221,8 @@ impl VersionStore {
         let arena_data = arena_guard.data();
         let arena_meta = arena_guard.meta();
         let row_index = self.row_arena_index.read();
-        // BTreeMap for fallback when HEAD not visible (Snapshot Isolation, AS OF)
-        let versions = self.versions.read();
+        // Version chain for fallback when HEAD not visible
+        let versions = self.versions.read().clone();
 
         // Sequential processing - avoids Rayon allocation overhead
         let mut results = RowVec::with_capacity(row_ids.len());
@@ -1258,12 +1250,12 @@ impl VersionStore {
                         // Else: deleted, skip
                         continue;
                     }
-                    // HEAD not visible - fall through to BTreeMap
+                    // HEAD not visible - fall through to version chain
                 }
             }
 
-            // BTREE FALLBACK: Version chain traversal for Snapshot Isolation
-            if let Some(chain) = versions.get(&row_id) {
+            // FALLBACK: Version chain traversal for Snapshot Isolation
+            if let Some(chain) = versions.get(row_id) {
                 let head_txn_id = chain.version.txn_id;
                 let head_deleted_at = chain.version.deleted_at_txn_id;
 
@@ -1336,9 +1328,9 @@ impl VersionStore {
         /// Chunk size for parallel processing (balances parallelism vs. overhead)
         const PARALLEL_CHUNK_SIZE: usize = 512;
 
-        // BTreeMap with RwLock - hold read lock during parallel processing
+        // Hold read lock during parallel processing
         // Read locks are shared, so concurrent readers can proceed
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
 
         if row_ids.len() >= PARALLEL_THRESHOLD {
             // Parallel path: process chunks while holding read lock (zero-copy)
@@ -1348,7 +1340,7 @@ impl VersionStore {
                 .map(|chunk| {
                     let mut chunk_count = 0;
                     for &row_id in chunk {
-                        if let Some(chain) = versions.get(&row_id) {
+                        if let Some(chain) = versions.get(row_id) {
                             // FAST PATH: Check HEAD version first - O(1) for common case
                             let head_txn_id = chain.version.txn_id;
                             let head_deleted_at = chain.version.deleted_at_txn_id;
@@ -1390,7 +1382,7 @@ impl VersionStore {
             // Sequential path for small batches
             let mut count = 0;
             for &row_id in row_ids {
-                if let Some(chain) = versions.get(&row_id) {
+                if let Some(chain) = versions.get(row_id) {
                     // FAST PATH: Check HEAD version first - O(1) for common case
                     let head_txn_id = chain.version.txn_id;
                     let head_deleted_at = chain.version.deleted_at_txn_id;
@@ -1467,9 +1459,9 @@ impl VersionStore {
         let current_seq = checker.get_current_sequence();
         let mut results = Vec::with_capacity(row_ids.len());
 
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
         for &row_id in row_ids {
-            if let Some(chain) = versions.get(&row_id) {
+            if let Some(chain) = versions.get(row_id) {
                 // FAST PATH: Check HEAD version first - O(1) for common case
                 let head_txn_id = chain.version.txn_id;
                 let head_deleted_at = chain.version.deleted_at_txn_id;
@@ -1529,8 +1521,8 @@ impl VersionStore {
             return None;
         }
 
-        let versions = self.versions.read();
-        let chain = versions.get(&row_id)?;
+        let versions = self.versions.read().clone();
+        let chain = versions.get(row_id)?;
 
         // Traverse version chain from newest to oldest
         let mut current: Option<&VersionChainEntry> = Some(chain);
@@ -1559,8 +1551,8 @@ impl VersionStore {
             return None;
         }
 
-        let versions = self.versions.read();
-        let chain = versions.get(&row_id)?;
+        let versions = self.versions.read().clone();
+        let chain = versions.get(row_id)?;
 
         // Traverse version chain from newest to oldest
         let mut current: Option<&VersionChainEntry> = Some(chain);
@@ -1580,13 +1572,13 @@ impl VersionStore {
         None
     }
 
-    /// Returns all row IDs in the version store (already sorted by BTreeMap)
+    /// Returns all row IDs in the version store (sorted)
     pub fn get_all_row_ids(&self) -> Vec<i64> {
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
         }
 
-        self.versions.read().keys().copied().collect()
+        self.versions.read().clone().keys().collect()
     }
 
     /// Returns all row IDs that are visible to the given transaction
@@ -1604,7 +1596,7 @@ impl VersionStore {
         };
 
         // Single pass through all versions (holding read lock once)
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
         let mut visible_row_ids = Vec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -1656,7 +1648,7 @@ impl VersionStore {
         let mut count = 0;
 
         // Single pass through all versions (holding read lock)
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
         for chain in versions.values() {
             // FAST PATH: Check HEAD version first - O(1) for common case
             let head_txn_id = chain.version.txn_id;
@@ -1707,10 +1699,9 @@ impl VersionStore {
     ///
     /// This is more efficient than calling get_visible_version for each row
     /// because it batches the visibility checks and avoids repeated map lookups.
-    /// Results are already sorted by row_id (BTreeMap iteration order).
+    /// Results are sorted by row_id.
     #[inline]
     pub fn get_all_visible_rows(&self, txn_id: i64) -> RowVec {
-        // BTreeMap is already sorted, no additional sorting needed!
         self.get_all_visible_rows_internal(txn_id)
     }
 
@@ -1740,8 +1731,8 @@ impl VersionStore {
             entry.version.data.clone()
         };
 
-        // Collect all versions in one pass (BTreeMap is sorted)
-        let versions = self.versions.read();
+        // Collect all versions in one pass
+        let versions = self.versions.read().clone();
         let mut results = RowVec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -1773,7 +1764,6 @@ impl VersionStore {
             }
         }
 
-        // BTreeMap already iterates in sorted order, no need to sort
         results
     }
 
@@ -1808,8 +1798,8 @@ impl VersionStore {
             e.version.data.clone()
         };
 
-        // Single-pass: read directly from arena during visibility check (BTreeMap is sorted)
-        let versions = self.versions.read();
+        // Single-pass: read directly from arena during visibility check
+        let versions = self.versions.read().clone();
         let mut result = RowVec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -1841,7 +1831,6 @@ impl VersionStore {
             }
         }
 
-        // BTreeMap already iterates in sorted order, no need to sort
         result
     }
 
@@ -1877,7 +1866,7 @@ impl VersionStore {
         };
 
         // Single-pass: read directly from arena during visibility check
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
 
         // Ensure capacity
         let current_capacity = result.capacity();
@@ -1954,8 +1943,8 @@ impl VersionStore {
             e.version.data.clone()
         };
 
-        // Single-pass: read directly from arena during visibility check (BTreeMap)
-        let versions = self.versions.read();
+        // Single-pass: read directly from arena during visibility check
+        let versions = self.versions.read().clone();
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -2027,8 +2016,8 @@ impl VersionStore {
         let arena_guard = self.arena.read_guard();
         let arena_data = arena_guard.data();
 
-        // Single-pass: read, filter, and collect in one loop (BTreeMap)
-        let versions = self.versions.read();
+        // Single-pass: read, filter, and collect in one loop
+        let versions = self.versions.read().clone();
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len() / 4);
 
         for (&row_id, chain) in versions.iter() {
@@ -2107,8 +2096,7 @@ impl VersionStore {
 
     /// Returns all visible rows.
     ///
-    /// Note: With BTreeMap, this is functionally identical to get_all_visible_rows_arena
-    /// since BTreeMap iteration is inherently ordered.
+    /// Note: Functionally identical to get_all_visible_rows_arena (iteration is ordered).
     #[inline]
     pub fn get_all_visible_rows_unsorted(&self, txn_id: i64) -> RowVec {
         if self.closed.load(Ordering::Acquire) {
@@ -2134,8 +2122,8 @@ impl VersionStore {
             e.version.data.clone()
         };
 
-        // Single-pass: read directly from arena during visibility check (BTreeMap is sorted)
-        let versions = self.versions.read();
+        // Single-pass: read directly from arena during visibility check
+        let versions = self.versions.read().clone();
         let mut result = RowVec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -2173,7 +2161,7 @@ impl VersionStore {
     /// Get visible rows with limit and offset applied at the storage layer.
     ///
     /// # True Early Termination
-    /// With BTreeMap, iteration is already ordered by row_id. We can now do true
+    /// Iteration is ordered by row_id, enabling true
     /// early termination: skip `offset` visible rows, then collect `limit` rows
     /// and stop iterating.
     ///
@@ -2205,8 +2193,8 @@ impl VersionStore {
             e.version.data.clone()
         };
 
-        // BTreeMap is sorted - collect with early termination
-        let versions = self.versions.read();
+        // Collect with early termination
+        let versions = self.versions.read().clone();
         let mut result = RowVec::with_capacity(limit);
         let mut skipped = 0usize;
 
@@ -2263,8 +2251,7 @@ impl VersionStore {
 
     /// Get visible rows with LIMIT (with early termination).
     ///
-    /// Note: With BTreeMap, this is functionally identical to get_visible_rows_with_limit
-    /// since BTreeMap iteration is inherently ordered by row_id. Kept for API compatibility.
+    /// Note: Functionally identical to get_visible_rows_with_limit. Kept for API compatibility.
     #[inline]
     pub fn get_visible_rows_with_limit_unordered(
         &self,
@@ -2272,14 +2259,14 @@ impl VersionStore {
         limit: usize,
         offset: usize,
     ) -> RowVec {
-        // Delegate to the sorted version - BTreeMap is always sorted
+        // Delegate to the sorted version
         self.get_visible_rows_with_limit(txn_id, limit, offset)
     }
 
     /// Get a batch of visible rows starting after a given row_id (cursor-based pagination).
     ///
     /// This is designed for lazy/streaming scanners that fetch rows in batches.
-    /// Uses BTreeMap's range() for efficient cursor-based iteration.
+    /// Uses range() for efficient cursor-based iteration.
     ///
     /// # Arguments
     /// * `txn_id` - Transaction ID for visibility check
@@ -2317,8 +2304,8 @@ impl VersionStore {
             e.version.data.clone()
         };
 
-        // BTreeMap is sorted - use range for efficient cursor-based iteration
-        let versions = self.versions.read();
+        // Use range for efficient cursor-based iteration
+        let versions = self.versions.read().clone();
         let mut result = RowVec::with_capacity(batch_size);
         let mut has_more = false;
 
@@ -2419,8 +2406,8 @@ impl VersionStore {
             e.version.data.clone()
         };
 
-        // BTreeMap is sorted - use range for efficient cursor-based iteration
-        let versions = self.versions.read();
+        // Use range for efficient cursor-based iteration
+        let versions = self.versions.read().clone();
         buffer.reserve(batch_size);
         let mut has_more = false;
 
@@ -2478,7 +2465,7 @@ impl VersionStore {
 
     /// Collect visible rows ordered by row_id (PRIMARY KEY) with efficient OFFSET/LIMIT
     ///
-    /// This method uses BTreeMap range iteration to efficiently skip OFFSET rows
+    /// This method uses range iteration to efficiently skip OFFSET rows
     /// without cloning them, providing O(offset + limit) complexity instead of
     /// O(n) for full materialization.
     ///
@@ -2520,8 +2507,8 @@ impl VersionStore {
             entry.version.data.clone()
         };
 
-        // BTreeMap is already sorted ascending - collect with offset/limit
-        let versions = self.versions.read();
+        // Collect with offset/limit
+        let versions = self.versions.read().clone();
         // Cap capacity to avoid overflow when limit is usize::MAX
         let capacity = limit.min(versions.len()).min(10_000);
         let mut result = RowVec::with_capacity(capacity);
@@ -2581,7 +2568,7 @@ impl VersionStore {
 
     /// Collect visible rows using keyset pagination (WHERE id > X ORDER BY id LIMIT Y)
     ///
-    /// This method uses BTreeMap range iteration starting from a specific row_id,
+    /// This method uses range iteration starting from a specific row_id,
     /// providing O(limit) complexity instead of O(n) for full table scans.
     ///
     /// # Arguments
@@ -2652,8 +2639,8 @@ impl VersionStore {
             std::ops::Bound::Unbounded
         };
 
-        // BTreeMap is already sorted - collect with early termination
-        let versions = self.versions.read();
+        // Collect with early termination
+        let versions = self.versions.read().clone();
         let mut result = RowVec::with_capacity(limit);
 
         if ascending {
@@ -2716,8 +2703,8 @@ impl VersionStore {
         let arena_guard = self.arena.read_guard();
         let arena_data = arena_guard.data();
 
-        // Single-pass: read, filter, and collect in one loop (BTreeMap is sorted)
-        let versions = self.versions.read();
+        // Single-pass: read, filter, and collect in one loop
+        let versions = self.versions.read().clone();
         let mut result = RowVec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -2753,14 +2740,13 @@ impl VersionStore {
             }
         }
 
-        // BTreeMap already iterates in sorted order
         result
     }
 
     /// Get visible rows with filter, limit and offset applied at the storage layer.
     ///
     /// # True Early Termination
-    /// With BTreeMap, we get ordered iteration. After collecting `limit` matching rows
+    /// Iteration is ordered. After collecting `limit` matching rows
     /// (after skipping `offset`), we can stop iterating.
     ///
     /// # Arguments
@@ -2793,8 +2779,8 @@ impl VersionStore {
         let arena_guard = self.arena.read_guard();
         let arena_data = arena_guard.data();
 
-        // BTreeMap is already sorted - collect with offset/limit and early termination
-        let versions = self.versions.read();
+        // Collect with offset/limit and early termination
+        let versions = self.versions.read().clone();
         let mut result = RowVec::with_capacity(limit);
         let mut skipped = 0usize;
 
@@ -2851,8 +2837,7 @@ impl VersionStore {
 
     /// Get visible rows with filter and LIMIT (with early termination).
     ///
-    /// Note: With BTreeMap, this is functionally identical to get_visible_rows_filtered_with_limit
-    /// since BTreeMap iteration is inherently ordered by row_id. Kept for API compatibility.
+    /// Note: Functionally identical to get_visible_rows_filtered_with_limit. Kept for API compatibility.
     #[inline]
     pub fn get_visible_rows_filtered_with_limit_unordered(
         &self,
@@ -2861,7 +2846,7 @@ impl VersionStore {
         limit: usize,
         offset: usize,
     ) -> RowVec {
-        // Delegate to the sorted version - BTreeMap is always sorted
+        // Delegate to the sorted version
         self.get_visible_rows_filtered_with_limit(txn_id, filter, limit, offset)
     }
 
@@ -2911,8 +2896,8 @@ impl VersionStore {
         // Drop arena guard before slow path to avoid holding locks
         drop(arena_guard);
 
-        // SLOW PATH: Full iteration (BTreeMap is sorted)
-        let versions = self.versions.read();
+        // SLOW PATH: Full iteration
+        let versions = self.versions.read().clone();
         let mut indices: Vec<RowIndex> = Vec::with_capacity(versions.len());
 
         if let Some(checker) = checker {
@@ -2939,7 +2924,6 @@ impl VersionStore {
             }
         }
 
-        // BTreeMap already iterates in sorted order
         indices
     }
 
@@ -2980,8 +2964,8 @@ impl VersionStore {
         // Drop arena guard before slow path to avoid holding locks
         drop(arena_guard);
 
-        // SLOW PATH: Full iteration (BTreeMap is sorted but we don't need it)
-        let versions = self.versions.read();
+        // SLOW PATH: Full iteration
+        let versions = self.versions.read().clone();
         let mut indices: Vec<RowIndex> = Vec::with_capacity(versions.len());
 
         if let Some(checker) = checker {
@@ -3028,7 +3012,7 @@ impl VersionStore {
         let arena_len = arena_guard.len();
 
         // Pre-acquire versions lock ONCE for all slow path lookups
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
 
         let mut result = RowVec::with_capacity(indices.len());
 
@@ -3044,7 +3028,7 @@ impl VersionStore {
             }
 
             // Slow path: look up in version chain (lock already held)
-            if let Some(entry) = versions.get(&idx.row_id) {
+            if let Some(entry) = versions.get(idx.row_id) {
                 result.push((idx.row_id, entry.version.data.clone()));
             }
         }
@@ -3064,9 +3048,9 @@ impl VersionStore {
         }
 
         // Slow path: look up in version chain
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
         versions
-            .get(&idx.row_id)
+            .get(idx.row_id)
             .map(|chain| (idx.row_id, chain.version.data.clone()))
     }
 
@@ -3091,9 +3075,9 @@ impl VersionStore {
         }
 
         // Slow path: look up in version chain
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
         versions
-            .get(&idx.row_id)
+            .get(idx.row_id)
             .and_then(|entry| entry.version.data.get(col_idx).cloned())
     }
 
@@ -3114,7 +3098,7 @@ impl VersionStore {
         let arena_data = arena_guard.data();
         let arena_len = arena_guard.len();
 
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
         indices
             .iter()
             .map(|idx| {
@@ -3127,7 +3111,7 @@ impl VersionStore {
                 }
                 // Slow path: version chain lookup
                 versions
-                    .get(&idx.row_id)
+                    .get(idx.row_id)
                     .and_then(|entry| entry.version.data.get(col_idx).cloned())
             })
             .collect()
@@ -3295,7 +3279,7 @@ impl VersionStore {
         drop(arena_guard);
 
         // SLOW PATH: Full iteration over version chains (single pass)
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
 
         // Cache visibility for slow path too
         let mut last_txn_id: i64 = -1;
@@ -3399,7 +3383,7 @@ impl VersionStore {
         drop(arena_guard);
 
         // SLOW PATH: Full iteration over version chains (single pass)
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
 
         // Cache visibility for slow path too
         let mut last_txn_id: i64 = -1;
@@ -3502,7 +3486,7 @@ impl VersionStore {
         drop(arena_guard);
 
         // SLOW PATH: Full iteration over version chains (single pass)
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
 
         // Cache visibility for slow path too
         let mut last_txn_id: i64 = -1;
@@ -3569,7 +3553,7 @@ impl VersionStore {
         let arena_data = arena_guard.data();
 
         // Pre-acquire versions lock ONCE for all slow path lookups
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
 
         // Initialize accumulators
         let mut results: Vec<AggregateAccumulator> = aggregates
@@ -3659,7 +3643,7 @@ impl VersionStore {
                 }
             }
             // Slow path: version chain lookup (lock already held)
-            if let Some(entry) = versions.get(&idx.row_id) {
+            if let Some(entry) = versions.get(idx.row_id) {
                 for (i, (op, col_idx)) in aggregates.iter().enumerate() {
                     if let Some(val) = entry.version.data.get(*col_idx) {
                         update_accumulator(&mut results[i], op, val);
@@ -3750,8 +3734,8 @@ impl VersionStore {
             }
         }
 
-        // SLOW PATH: Full iteration (BTreeMap is sorted)
-        let versions = self.versions.read();
+        // SLOW PATH: Full iteration
+        let versions = self.versions.read().clone();
         let mut visible_indices: Vec<VisibleRowInfo> = Vec::with_capacity(versions.len());
 
         if let Some(checker) = checker {
@@ -3783,13 +3767,12 @@ impl VersionStore {
         }
         drop(versions); // Release lock before returning
 
-        // BTreeMap already iterates in sorted order
         StreamingResult::new(arena_guard, visible_indices, columns)
     }
 
     /// Returns the count of rows
     pub fn row_count(&self) -> usize {
-        self.versions.read().len()
+        self.versions.read().clone().len()
     }
     /// Tries to claim a row for update (dirty write prevention)
     pub fn try_claim_row(&self, row_id: i64, txn_id: i64) -> Result<(), Error> {
@@ -4065,8 +4048,8 @@ impl VersionStore {
         // This prevents duplicate version chain entries when both snapshot and WAL
         // contain the same row data (can happen due to race conditions during snapshot)
         {
-            let versions = self.versions.read();
-            if let Some(existing_entry) = versions.get(&row_id) {
+            let versions = self.versions.read().clone();
+            if let Some(existing_entry) = versions.get(row_id) {
                 let existing = &existing_entry.version;
                 // Check if data is identical (both deleted status and row data)
                 if existing.is_deleted() == is_deleted && existing.data == row_data {
@@ -4179,7 +4162,7 @@ impl VersionStore {
         }
 
         // Get row count for capacity hint
-        let expected_rows = self.versions.read().len();
+        let expected_rows = self.versions.read().clone().len();
 
         if meta.column_names.len() == 1 {
             // Single-column index
@@ -4248,7 +4231,7 @@ impl VersionStore {
             // Populate the index with existing data unless deferred
             if !skip_population {
                 let col_idx = column_id as usize;
-                let versions = self.versions.read();
+                let versions = self.versions.read().clone();
                 for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
                     if !version.is_deleted() {
@@ -4278,7 +4261,7 @@ impl VersionStore {
             if !skip_population {
                 let col_indices: Vec<usize> =
                     meta.column_ids.iter().map(|&id| id as usize).collect();
-                let versions = self.versions.read();
+                let versions = self.versions.read().clone();
                 for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
                     if !version.is_deleted() {
@@ -4335,8 +4318,8 @@ impl VersionStore {
             return;
         }
 
-        // Single pass over all rows (BTreeMap)
-        let versions = self.versions.read();
+        // Single pass over all rows
+        let versions = self.versions.read().clone();
         for (&row_id, version_chain) in versions.iter() {
             let version = &version_chain.version;
 
@@ -4390,7 +4373,7 @@ impl VersionStore {
 
         // First pass: identify deleted rows older than retention period
         {
-            let versions = self.versions.read();
+            let versions = self.versions.read().clone();
             for (&row_id, chain) in versions.iter() {
                 let version = &chain.version;
                 // Only process rows that are actually deleted and old enough
@@ -4418,10 +4401,10 @@ impl VersionStore {
 
         // Second pass: remove from indexes (single lock acquisition for all rows)
         {
-            let versions = self.versions.read();
+            let versions = self.versions.read().clone();
             let indexes = self.indexes.read();
             for row_id in &rows_to_delete {
-                if let Some(entry) = versions.get(row_id) {
+                if let Some(entry) = versions.get(*row_id) {
                     let version = &entry.version;
                     for index in indexes.values() {
                         let column_ids = index.column_ids();
@@ -4455,7 +4438,7 @@ impl VersionStore {
         {
             let mut versions = self.versions.write();
             for row_id in &rows_to_delete {
-                versions.remove(row_id);
+                versions.remove(*row_id);
             }
         }
 
@@ -4523,11 +4506,11 @@ impl VersionStore {
 
         let mut cleaned = 0;
 
-        // Collect entries that need cleanup (BTreeMap doesn't support in-place mutation while iterating)
+        // Collect entries that need cleanup (no in-place mutation while iterating)
         let mut updates: Vec<(i64, VersionChainEntry)> = Vec::new();
 
         // First pass: identify entries that need pruning
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
         for (&row_id, chain_entry) in versions.iter() {
             // Find the oldest version we need to keep
             let mut current = chain_entry.prev.as_ref();
@@ -4653,8 +4636,8 @@ impl VersionStore {
         let snapshot_txn_id = i64::MAX;
         let use_cutoff = commit_seq_cutoff > 0;
 
-        // Iterate all versions (BTreeMap maintains sorted order)
-        let versions = self.versions.read();
+        // Iterate all versions
+        let versions = self.versions.read().clone();
         for (&row_id, chain_entry) in versions.iter() {
             // Walk the version chain to find the visible version
             let mut current: Option<&VersionChainEntry> = Some(chain_entry);
@@ -4710,7 +4693,7 @@ impl VersionStore {
         let snapshot_txn_id = i64::MAX;
         let mut count = 0;
 
-        let versions = self.versions.read();
+        let versions = self.versions.read().clone();
         for (_, chain_entry) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain_entry);
 
@@ -4888,7 +4871,7 @@ impl VersionStore {
 
             // Track key type: 0=Integer, 1=Float, 2=Boolean, 3=Mixed/Other
             let mut key_type: u8 = 255; // uninitialized
-            let mut int_groups: Int64Map<Vec<Accum>> = Int64Map::new();
+            let mut int_groups: I64Map<Vec<Accum>> = I64Map::new();
             // Separate NULL accumulator - avoids creating GroupKey for NULL
             let mut null_accums: Option<Vec<Accum>> = None;
             // Only used for String/other types that can't be mapped to i64
@@ -5090,14 +5073,14 @@ pub struct TransactionVersionStore {
     /// The list is ordered by create_time (oldest first, newest last)
     /// Lazily allocated on first write to avoid allocation overhead for read-only queries.
     /// Uses SmallVec<[RowVersion; 1]> to avoid heap allocation for single-version rows.
-    local_versions: Option<Int64Map<VersionList>>,
+    local_versions: Option<I64Map<VersionList>>,
     /// Parent (shared) version store
     parent_store: Arc<VersionStore>,
     /// This transaction's ID
     txn_id: i64,
     /// Write set for conflict detection
     /// Lazily allocated on first write to avoid allocation overhead for read-only queries
-    write_set: Option<Int64Map<WriteSetEntry>>,
+    write_set: Option<I64Map<WriteSetEntry>>,
 }
 
 impl TransactionVersionStore {
@@ -5124,14 +5107,14 @@ impl TransactionVersionStore {
     /// Ensures local_versions map is allocated, returning a mutable reference.
     /// Uses pooled maps when available to reduce allocation overhead.
     #[inline]
-    fn ensure_local_versions(&mut self) -> &mut Int64Map<VersionList> {
+    fn ensure_local_versions(&mut self) -> &mut I64Map<VersionList> {
         self.local_versions.get_or_insert_with(get_version_list_map)
     }
 
     /// Ensures write_set map is allocated, returning a mutable reference.
     /// Uses pooled maps when available to reduce allocation overhead.
     #[inline]
-    fn ensure_write_set(&mut self) -> &mut Int64Map<WriteSetEntry> {
+    fn ensure_write_set(&mut self) -> &mut I64Map<WriteSetEntry> {
         self.write_set.get_or_insert_with(get_write_set_map)
     }
 
@@ -5142,8 +5125,11 @@ impl TransactionVersionStore {
         // - into_arc() at commit time returns the existing Arc (no clone)
         let data = Row::from_arc(data.into_arc());
 
-        // Create the row version
-        let mut rv = RowVersion::new(self.txn_id, row_id, data);
+        // Get timestamp once at the start (avoids calling SystemTime::now() inside RowVersion::new)
+        let timestamp = get_fast_timestamp();
+
+        // Create the row version with pre-computed timestamp
+        let mut rv = RowVersion::new_with_timestamp(self.txn_id, row_id, data, timestamp);
         if is_delete {
             rv.deleted_at_txn_id = self.txn_id;
         }
@@ -5223,8 +5209,11 @@ impl TransactionVersionStore {
         // Convert to Shared (Arc) storage immediately for efficient Arc sharing
         let data = Row::from_arc(data.into_arc());
 
-        // Create the new row version
-        let mut rv = RowVersion::new(self.txn_id, row_id, data);
+        // Get timestamp once at the start (avoids calling SystemTime::now() inside RowVersion::new)
+        let timestamp = get_fast_timestamp();
+
+        // Create the new row version with pre-computed timestamp
+        let mut rv = RowVersion::new_with_timestamp(self.txn_id, row_id, data, timestamp);
         if is_delete {
             rv.deleted_at_txn_id = self.txn_id;
         }
@@ -5290,9 +5279,9 @@ impl TransactionVersionStore {
             // Convert to Shared (Arc) storage immediately for efficient Arc sharing
             let data = Row::from_arc(data.into_arc());
 
-            // Create the new row version
-            let mut rv = RowVersion::new(self.txn_id, row_id, data);
-            rv.create_time = now;
+            // Create the new row version with pre-computed timestamp (avoids wasteful
+            // get_fast_timestamp() call inside RowVersion::new that would be overwritten)
+            let rv = RowVersion::new_with_timestamp(self.txn_id, row_id, data, now);
 
             // Check if already in local versions (already processed in this transaction)
             if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
@@ -5343,6 +5332,9 @@ impl TransactionVersionStore {
     /// Parameters:
     /// - rows: RowVec of (row_id, row_data) to mark as deleted
     pub fn put_batch_deleted(&mut self, rows: RowVec) -> Result<(), Error> {
+        // Get timestamp once for all rows in the batch
+        let timestamp = get_fast_timestamp();
+
         for (row_id, data) in rows {
             // Check if we already have a local version
             let has_local = self
@@ -5383,8 +5375,8 @@ impl TransactionVersionStore {
                 }
             }
 
-            // Create deleted row version
-            let mut rv = RowVersion::new(self.txn_id, row_id, data);
+            // Create deleted row version with pre-computed timestamp
+            let mut rv = RowVersion::new_with_timestamp(self.txn_id, row_id, data, timestamp);
             rv.deleted_at_txn_id = self.txn_id;
 
             // Append to version history for this row
@@ -5407,9 +5399,12 @@ impl TransactionVersionStore {
         &mut self,
         rows: Vec<(i64, Row, RowVersion)>,
     ) -> Result<(), Error> {
+        // Get timestamp once for all rows in the batch
+        let timestamp = get_fast_timestamp();
+
         for (row_id, data, original_version) in rows {
-            // Create deleted row version
-            let mut rv = RowVersion::new(self.txn_id, row_id, data);
+            // Create deleted row version with pre-computed timestamp
+            let mut rv = RowVersion::new_with_timestamp(self.txn_id, row_id, data, timestamp);
             rv.deleted_at_txn_id = self.txn_id;
 
             // Check if already in local versions (already processed in this transaction)
@@ -6017,8 +6012,8 @@ mod tests {
         // After 5 versions with limit 3:
         // v4 triggered drop (4 > 3), so chain was: v4 -> v3 -> None (depth=2)
         // v5 added: v5 -> v4 -> v3 -> None (depth=3)
-        let versions = store.versions.read();
-        let entry = versions.get(&row_id).expect("Row should exist");
+        let versions = store.versions.read().clone();
+        let entry = versions.get(row_id).expect("Row should exist");
 
         // Chain depth should be at most limit + 1 (oscillates between 2 and limit+1)
         assert!(
@@ -6059,8 +6054,8 @@ mod tests {
         }
 
         // Verify chain is bounded (between 2 and limit+1)
-        let versions = store.versions.read();
-        let entry = versions.get(&row_id).expect("Row should exist");
+        let versions = store.versions.read().clone();
+        let entry = versions.get(row_id).expect("Row should exist");
 
         let mut count = 1;
         let mut current = entry.prev.as_ref();
@@ -6096,8 +6091,8 @@ mod tests {
         }
 
         // Count chain length - should be 15 (unlimited)
-        let versions = store.versions.read();
-        let entry = versions.get(&row_id).expect("Row should exist");
+        let versions = store.versions.read().clone();
+        let entry = versions.get(row_id).expect("Row should exist");
 
         let mut count = 1;
         let mut current = entry.prev.as_ref();
@@ -6139,8 +6134,8 @@ mod tests {
 
         // Verify chain is bounded (at most limit+1)
         // Chain can be as short as 1 right after pruning (when new_depth > limit)
-        let versions = store.versions.read();
-        let entry = versions.get(&row_id).expect("Row should exist");
+        let versions = store.versions.read().clone();
+        let entry = versions.get(row_id).expect("Row should exist");
 
         let mut count = 1;
         let mut current = entry.prev.as_ref();
@@ -7029,7 +7024,7 @@ mod tests {
 
         // Verify versions map is empty
         assert_eq!(
-            store.versions.read().len(),
+            store.versions.read().clone().len(),
             0,
             "Versions map should be empty"
         );
@@ -7063,7 +7058,7 @@ mod tests {
 
         // Verify row still exists
         assert_eq!(
-            store.versions.read().len(),
+            store.versions.read().clone().len(),
             1,
             "Row should still exist in versions"
         );
@@ -7095,7 +7090,7 @@ mod tests {
 
         assert_eq!(cleaned, 3, "Should clean only 3 deleted rows");
         assert_eq!(
-            store.versions.read().len(),
+            store.versions.read().clone().len(),
             2,
             "2 non-deleted rows should remain"
         );

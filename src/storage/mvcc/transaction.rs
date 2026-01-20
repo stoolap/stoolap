@@ -99,7 +99,10 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// Get all tables with pending changes for a transaction
     fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn Table>>>;
 
-    /// Commit all tables for a transaction at once
+    /// Check if transaction has any pending DML changes (without allocating)
+    fn has_pending_dml_changes(&self, txn_id: i64) -> bool;
+
+    /// Commit all tables for a transaction at once (includes WAL recording)
     fn commit_all_tables(&self, txn_id: i64) -> Result<()>;
 
     /// Rollback all tables for a transaction at once
@@ -273,41 +276,23 @@ impl Transaction for MvccTransaction {
         // Update state to committing
         self.state = TransactionState::Committing;
 
-        // Get tables with pending changes from the engine
-        // This ensures we commit ALL tables accessed by this transaction,
-        // not just the ones cached in self.tables
-        let tables_with_changes = if let Some(ops) = &self.engine_operations {
-            ops.get_tables_with_pending_changes(self.id)?
-        } else {
-            Vec::new()
-        };
-
         // Check if read-only: no DDL changes and no DML changes
-        let is_read_only = self.created_tables.is_empty()
-            && self.dropped_tables.is_empty()
-            && tables_with_changes.is_empty();
+        // Use has_pending_dml_changes() to avoid allocating Vec<Box<dyn Table>>
+        let has_dml_changes = self
+            .engine_operations
+            .as_ref()
+            .is_some_and(|ops| ops.has_pending_dml_changes(self.id));
+
+        let is_read_only =
+            self.created_tables.is_empty() && self.dropped_tables.is_empty() && !has_dml_changes;
 
         // Two-phase commit protocol
         if !is_read_only {
             // Phase 1: Start commit - mark transaction as "committing"
             self.registry.start_commit(self.id);
 
-            // Record DML operations to WAL BEFORE committing tables
-            // (commit_table needs to see the pending versions before they're moved to global)
-            if let Some(ops) = &self.engine_operations {
-                for table in tables_with_changes.iter() {
-                    if let Err(e) = ops.commit_table(self.id, table.as_ref()) {
-                        // WAL write failed - abort the transaction
-                        self.registry.abort_transaction(self.id);
-                        self.state = TransactionState::RolledBack;
-                        self.cleanup();
-                        return Err(e);
-                    }
-                }
-            }
-
             // Phase 2: Commit all tables - apply local changes to global store
-            // Use the engine's commit_all_tables which knows about all pending changes
+            // This now includes WAL recording internally (before each table commit)
             if let Some(ops) = &self.engine_operations {
                 if let Err(e) = ops.commit_all_tables(self.id) {
                     // Abort on failure
@@ -321,7 +306,7 @@ impl Transaction for MvccTransaction {
             // Phase 3: Complete commit - make changes visible
             self.registry.complete_commit(self.id);
 
-            // Record in WAL
+            // Record commit marker in WAL
             if let Some(ops) = &self.engine_operations {
                 let _ = ops.record_commit(self.id);
             }
@@ -333,10 +318,6 @@ impl Transaction for MvccTransaction {
         // Mark as committed
         self.state = TransactionState::Committed;
         self.cleanup();
-
-        // tables_with_changes dropped here synchronously
-        // (async channel cleanup was tested but macOS semaphore_signal is 10x slower)
-        drop(tables_with_changes);
 
         Ok(())
     }

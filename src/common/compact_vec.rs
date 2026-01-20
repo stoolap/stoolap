@@ -511,6 +511,33 @@ impl<T> CompactVec<T> {
         }
     }
 
+    /// Extends the vector by copying elements from a slice (optimized for Copy types).
+    ///
+    /// This uses `ptr::copy_nonoverlapping` (memcpy) which is significantly faster
+    /// than iterating and cloning for simple types like i64.
+    #[inline]
+    pub fn extend_copy(&mut self, slice: &[T])
+    where
+        T: Copy,
+    {
+        let slice_len = slice.len();
+        if slice_len == 0 {
+            return;
+        }
+        self.reserve(slice_len);
+        let len = self.len();
+
+        // SAFETY:
+        // - reserve() guarantees capacity
+        // - T is Copy, so no panic safety issues during copy
+        // - ptrs are valid
+        unsafe {
+            let dst = self.ptr.as_ptr().add(len);
+            ptr::copy_nonoverlapping(slice.as_ptr(), dst, slice_len);
+            self.set_len(len + slice_len);
+        }
+    }
+
     /// Returns a slice containing all elements.
     #[inline(always)]
     pub fn as_slice(&self) -> &[T] {

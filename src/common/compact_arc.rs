@@ -188,6 +188,23 @@ impl<T: ?Sized> CompactArc<T> {
     fn is_unique(this: &Self) -> bool {
         unsafe { (*this.ptr.as_ptr()).count.load(AtomicOrdering::Acquire) == 1 }
     }
+
+    /// Returns the metadata stored in the header (used for count).
+    #[inline]
+    pub fn meta(this: &Self) -> usize {
+        unsafe { (*this.ptr.as_ptr()).len }
+    }
+
+    /// Sets the metadata in the header.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure exclusive access to this Arc (i.e., after `make_mut`
+    /// or when `is_unique` returns true). Writing to shared metadata is UB.
+    #[inline]
+    pub unsafe fn set_meta(this: &mut Self, meta: usize) {
+        (*this.ptr.as_ptr()).len = meta;
+    }
 }
 
 // ============================================================================
@@ -213,6 +230,14 @@ impl<T> CompactArc<T> {
     #[inline]
     #[must_use]
     pub fn new(data: T) -> Self {
+        Self::new_with_meta(data, 0)
+    }
+
+    /// Creates a new `CompactArc<T>` containing the given value and metadata.
+    /// The metadata is stored in the header's `len` field, which is unused for Sized types.
+    #[inline]
+    #[must_use]
+    pub fn new_with_meta(data: T, meta: usize) -> Self {
         let data_offset = data_offset_for::<T>();
         let align = mem::align_of::<T>().max(mem::align_of::<Header>());
         let total_size = data_offset + mem::size_of::<T>();
@@ -231,7 +256,7 @@ impl<T> CompactArc<T> {
                 Header {
                     count: AtomicUsize::new(1),
                     dropper: drop_sized::<T>, // Store type-specific dropper!
-                    len: 0,                   // Sized types use 0
+                    len: meta,                // Store metadata (count) here!
                 },
             );
 
@@ -305,8 +330,9 @@ impl<T> CompactArc<T> {
     {
         // Check if we're the only reference (uses Acquire ordering)
         if !Self::is_unique(this) {
+            let meta = Self::meta(this);
             // Clone the data since there are other references
-            *this = CompactArc::new((**this).clone());
+            *this = CompactArc::new_with_meta((**this).clone(), meta);
         }
         // SAFETY: After the above, we're guaranteed to be the only reference
         Self::get_mut(this).unwrap()

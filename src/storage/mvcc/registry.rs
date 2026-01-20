@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::common::{new_concurrent_int64_map, ConcurrentInt64Map};
+use crate::common::{new_concurrent_i64_map, ConcurrentI64Map};
 use crate::core::IsolationLevel;
 use crate::storage::mvcc::VisibilityChecker;
 
@@ -148,7 +148,7 @@ pub struct TransactionRegistry {
     /// - State transitions are atomic updates, not remove+insert
     /// - Single lookup for visibility checks
     /// - 60% fewer DashMap operations per commit
-    transactions: ConcurrentInt64Map<TxnState>,
+    transactions: ConcurrentI64Map<TxnState>,
 
     /// Global isolation level for new transactions (stored as u8 for lock-free access)
     /// 0 = ReadCommitted, 1 = SnapshotIsolation
@@ -156,7 +156,7 @@ pub struct TransactionRegistry {
 
     /// Per-transaction isolation level overrides
     /// Key: txn_id, Value: isolation level as u8 (0 = ReadCommitted, 1 = SnapshotIsolation)
-    transaction_isolation_levels: ConcurrentInt64Map<u8>,
+    transaction_isolation_levels: ConcurrentI64Map<u8>,
 
     /// Count of active per-transaction isolation level overrides
     /// When 0, is_visible() can skip the DashMap lookup entirely
@@ -174,9 +174,9 @@ impl TransactionRegistry {
     pub fn new() -> Self {
         Self {
             next_txn_id: AtomicI64::new(0),
-            transactions: new_concurrent_int64_map(),
+            transactions: new_concurrent_i64_map(),
             global_isolation_level: AtomicU8::new(0), // 0 = ReadCommitted
-            transaction_isolation_levels: new_concurrent_int64_map(),
+            transaction_isolation_levels: new_concurrent_i64_map(),
             isolation_override_count: AtomicUsize::new(0),
             accepting: AtomicBool::new(true),
             next_sequence: AtomicI64::new(0),

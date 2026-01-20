@@ -257,7 +257,7 @@ impl Executor {
     /// Keyset pagination optimization for PRIMARY KEY columns
     ///
     /// For queries like `SELECT * FROM table WHERE id > X ORDER BY id LIMIT Y`,
-    /// uses the PK's BTreeMap natural ordering to start iteration from X and return only Y rows.
+    /// uses the PK's natural ordering to start iteration from X and return only Y rows.
     /// This provides O(limit) complexity instead of O(n) for full table scans.
     #[allow(clippy::type_complexity)]
     pub(crate) fn try_keyset_pagination_optimization(
@@ -954,7 +954,7 @@ impl Executor {
             }
         }
 
-        // Sort row_ids for better BTreeMap cache locality during version lookup
+        // Sort row_ids for better cache locality during version lookup
         // and deduplicate. More efficient than HashSet when sorted output is needed anyway.
         // (only for IN, NOT IN is already ordered)
         if !is_negated {
@@ -1178,7 +1178,7 @@ impl Executor {
             }
         }
 
-        // Sort row_ids for better BTreeMap cache locality during version lookup
+        // Sort row_ids for better cache locality during version lookup
         // and deduplicate. More efficient than HashSet when sorted output is needed anyway.
         all_row_ids.sort_unstable();
         all_row_ids.dedup();
@@ -1582,7 +1582,7 @@ impl Executor {
             return Ok(Some((Box::new(result), output_columns)));
         }
 
-        // Sort row_ids for better BTreeMap cache locality during version lookup
+        // Sort row_ids for better cache locality during version lookup
         // and deduplicate. More efficient than HashSet when sorted output is needed anyway.
         all_row_ids.sort_unstable();
         all_row_ids.dedup();

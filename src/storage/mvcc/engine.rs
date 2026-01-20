@@ -2686,6 +2686,35 @@ impl EngineOperations {
     fn should_skip_wal(&self) -> bool {
         self.loading_from_disk.load(Ordering::Acquire)
     }
+
+    /// Record pending versions for a table to WAL (helper for commit_all_tables)
+    fn record_table_to_wal(&self, txn_id: i64, table: &MVCCTable) -> Result<()> {
+        if let Some(ref pm) = self.persistence() {
+            let table_name = table.name();
+            let pending = table.get_pending_versions();
+
+            for (row_id, row_data, is_deleted, version_txn_id) in pending {
+                let version = RowVersion {
+                    txn_id: version_txn_id,
+                    deleted_at_txn_id: if is_deleted { version_txn_id } else { 0 },
+                    data: row_data,
+                    row_id,
+                    create_time: 0,
+                };
+
+                let op = if is_deleted {
+                    WALOperationType::Delete
+                } else {
+                    WALOperationType::Insert
+                };
+
+                if let Err(e) = pm.record_dml_operation(txn_id, table_name, row_id, op, &version) {
+                    eprintln!("Warning: Failed to record DML in WAL: {}", e);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TransactionEngineOperations for EngineOperations {
@@ -2963,11 +2992,32 @@ impl TransactionEngineOperations for EngineOperations {
         Ok(tables)
     }
 
+    fn has_pending_dml_changes(&self, txn_id: i64) -> bool {
+        // O(1) lookup by txn_id
+        let cache = self.txn_version_stores().read().unwrap();
+        if let Some(txn_tables) = cache.get(txn_id) {
+            for (_table_name, txn_store) in txn_tables.iter() {
+                let store = txn_store.read().unwrap();
+                if store.has_local_changes() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn commit_all_tables(&self, txn_id: i64) -> Result<()> {
         // O(1) lookup by txn_id using nested HashMap
         let cache = self.txn_version_stores().read().unwrap();
 
         if let Some(txn_tables) = cache.get(txn_id) {
+            // Check if WAL recording is needed (persistence enabled and not in recovery)
+            let should_record_wal = !self.should_skip_wal()
+                && self
+                    .persistence()
+                    .as_ref()
+                    .is_some_and(|pm| pm.is_enabled());
+
             for (table_name, txn_store) in txn_tables.iter() {
                 // Check if there are local changes before committing
                 let has_changes = {
@@ -2987,6 +3037,12 @@ impl TransactionEngineOperations for EngineOperations {
                             Arc::clone(&version_store),
                             Arc::clone(txn_store),
                         );
+
+                        // Record to WAL BEFORE commit (while pending versions still exist)
+                        if should_record_wal {
+                            self.record_table_to_wal(txn_id, &table)?;
+                        }
+
                         table.commit()?;
                     }
                 }

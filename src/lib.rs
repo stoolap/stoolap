@@ -61,7 +61,7 @@
 //! - [`functions`] - 101+ SQL functions (scalar, aggregate, window)
 //! - [`executor`] - Query executor with parallel execution
 //! - [`optimizer`] - Cost-based query optimizer with cardinality feedback
-//! - [`common`] - Utilities (BufferPool, Int64Map, version)
+//! - [`common`] - Utilities (BufferPool, I64Map, version)
 
 // Use mimalloc as global allocator when feature is enabled
 // (but not when dhat-heap is enabled, as it needs its own allocator)
@@ -85,9 +85,7 @@ pub use core::{
 };
 
 // Re-export common utilities
-pub use common::{
-    BufferPool, ConcurrentInt64Map, Int64Map, Int64Set, PoolStats, SemVer, SmartString,
-};
+pub use common::{BufferPool, ConcurrentI64Map, I64Map, I64Set, PoolStats, SemVer, SmartString};
 
 // Re-export storage/expression types
 pub use storage::{

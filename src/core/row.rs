@@ -100,7 +100,12 @@ impl RowStorage {
             RowStorage::Owned(vec) => vec,
             RowStorage::Shared(arc) => {
                 // Copy-on-write: convert shared to owned
-                *self = RowStorage::Owned(arc.iter().cloned().collect());
+                // Use extend_clone directly instead of .cloned().collect() to avoid
+                // the Cloned iterator adapter overhead
+                let len = arc.len();
+                let mut vec = CompactVec::with_capacity(len);
+                vec.extend_clone(arc);
+                *self = RowStorage::Owned(vec);
                 match self {
                     RowStorage::Owned(vec) => vec,
                     _ => unreachable!(),

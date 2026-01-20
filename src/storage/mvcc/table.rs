@@ -21,7 +21,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::{Arc, RwLock};
 
-use crate::common::{CompactArc, Int64Set};
+use crate::common::{CompactArc, I64Set};
 use crate::core::{
     DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
 };
@@ -1229,8 +1229,8 @@ impl MVCCTable {
         // Uses thread-local cached Vec for zero-allocation reuse
         let global_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
 
-        // Step 2: Build set of local row IDs for quick lookup (Int64Set for fast i64 lookups)
-        let local_row_ids: Int64Set = txn_versions
+        // Step 2: Build set of local row IDs for quick lookup (I64Set for fast i64 lookups)
+        let local_row_ids: I64Set = txn_versions
             .iter_local()
             .map(|(row_id, _)| row_id)
             .collect();
@@ -1278,7 +1278,6 @@ impl MVCCTable {
     #[inline]
     fn collect_visible_rows_unsorted(&self) -> RowVec {
         // For GROUP BY, order doesn't matter - use same cached path
-        // BTreeMap iteration is already sorted anyway
         self.collect_visible_rows(None)
     }
 
@@ -1369,7 +1368,7 @@ impl MVCCTable {
         let global_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
 
         // Build set of local row IDs for quick lookup
-        let local_row_ids: Int64Set = txn_versions
+        let local_row_ids: I64Set = txn_versions
             .iter_local()
             .map(|(row_id, _)| row_id)
             .collect();
@@ -2302,7 +2301,6 @@ impl Table for MVCCTable {
     }
 
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
-        // Use cached collection - BTreeMap is already sorted anyway
         Ok(self.collect_visible_rows_unsorted())
     }
 
@@ -2909,14 +2907,10 @@ impl Table for MVCCTable {
     ) -> Option<RowVec> {
         // OPTIMIZATION: Handle PRIMARY KEY column specially
         // For INTEGER PRIMARY KEY, the row_id IS the value, so we can iterate
-        // the BTreeMap directly in order without any sorting.
-        // This uses efficient BTreeMap iteration with skip/take semantics.
+        // directly in order without any sorting using skip/take semantics.
         if let Some(pk_idx) = self.cached_schema.pk_column_index() {
             let pk_col = &self.cached_schema.columns[pk_idx];
             if pk_col.name_lower == column_name.to_lowercase() {
-                // Use efficient BTreeMap iteration with OFFSET/LIMIT
-                // This iterates the BTreeMap directly (already sorted by row_id)
-                // and only clones rows that are actually returned (not skipped)
                 return self.version_store.collect_rows_pk_ordered(
                     self.txn_id,
                     ascending,

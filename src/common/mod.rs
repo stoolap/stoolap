@@ -18,15 +18,16 @@
 //!
 //! - [`version`] - Version information and constants
 //! - [`buffer_pool`] - Self-tuning buffer pool for efficient memory reuse
-//! - [`int_maps`] - Fast hash maps for integer keys
+//! - [`maps`] - Fast hash maps for integer keys
 //! - [`compact_vec`] - 16-byte vector optimized for Row storage
 //! - [`compact_arc`] - Memory-efficient Arc without weak reference support
 
 pub mod buffer_pool;
 pub mod compact_arc;
 pub mod compact_vec;
+pub mod cow_btree;
 pub mod i64_map;
-pub mod int_maps;
+pub mod maps;
 pub mod smart_string;
 pub mod version;
 
@@ -34,10 +35,11 @@ pub mod version;
 pub use buffer_pool::{BufferPool, PoolStats};
 pub use compact_arc::CompactArc;
 pub use compact_vec::CompactVec;
+pub use cow_btree::CowBTree;
 pub use i64_map::{I64Map, I64Set};
-pub use int_maps::{
-    new_btree_int64_map, new_concurrent_int64_map, new_int64_map, new_int64_map_with_capacity,
-    BTreeInt64Map, ConcurrentInt64Map, Int64Map, Int64Set, StringMap, StringSet,
+pub use maps::{
+    new_concurrent_i64_map, new_cow_btree_map, new_i64_map, new_i64_map_with_capacity,
+    ConcurrentI64Map, CowBTreeMap, StringMap, StringSet,
 };
 pub use smart_string::SmartString;
 pub use version::{version, version_info, SemVer, BUILD_TIME, GIT_COMMIT, MAJOR, MINOR, PATCH};
@@ -47,10 +49,10 @@ mod integration_tests {
     use super::*;
 
     #[test]
-    fn test_buffer_pool_with_int64_map() {
-        // Test buffer pool and int64 map working together
+    fn test_buffer_pool_with_i64_map() {
+        // Test buffer pool and i64 map working together
         let pool = BufferPool::new(1024, 4096, "test");
-        let map: Int64Map<Vec<u8>> = new_int64_map();
+        let map: I64Map<Vec<u8>> = new_i64_map();
 
         // Get buffer, use it, store in map
         let mut buf = pool.get();
@@ -79,12 +81,12 @@ mod integration_tests {
         use std::thread;
 
         let pool = Arc::new(BufferPool::new(1024, 4096, "test"));
-        let map: Arc<ConcurrentInt64Map<Vec<u8>>> = Arc::new(new_concurrent_int64_map());
+        let map: Arc<ConcurrentI64Map<Vec<u8>>> = Arc::new(new_concurrent_i64_map());
 
         let handles: Vec<_> = (0i64..4)
             .map(|i| {
                 let pool = Arc::clone(&pool);
-                let map: Arc<ConcurrentInt64Map<Vec<u8>>> = Arc::clone(&map);
+                let map: Arc<ConcurrentI64Map<Vec<u8>>> = Arc::clone(&map);
                 thread::spawn(move || {
                     for j in 0i64..10 {
                         let mut buf = pool.get();
