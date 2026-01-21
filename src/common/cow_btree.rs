@@ -3583,4 +3583,51 @@ mod tests {
             assert_eq!(tree.get(i), Some(&i));
         }
     }
+
+    #[test]
+    fn test_update_separator_keys() {
+        // This test triggers the Ok(i) => i + 1 path in insert_recursive
+        // by updating keys that are separator keys in internal nodes.
+        // Separator keys are promoted during splits.
+        let mut tree: CowBTree<i64> = CowBTree::new();
+
+        // Insert in reverse order to use insert_recursive (not rightmost optimization)
+        // This ensures splits go through split_internal, not split_internal_rightmost
+        for i in (0..1000).rev() {
+            tree.insert(i, i);
+        }
+
+        // Now update ALL keys - some of them are separator keys in internal nodes
+        // When we update a separator key, search returns Ok(i) and we go to child i+1
+        for i in 0..1000 {
+            let old = tree.insert(i, i * 100);
+            assert_eq!(old, Some(i), "Key {} should have existed", i);
+        }
+
+        // Verify updates
+        for i in 0..1000 {
+            assert_eq!(tree.get(i), Some(&(i * 100)));
+        }
+    }
+
+    #[test]
+    fn test_reverse_insert_internal_node_split() {
+        // This test ensures split_internal() (not split_internal_rightmost) is called
+        // by inserting in reverse order with enough keys to overflow internal nodes.
+        // With MAX_KEYS=128, we need 128*128 = 16384+ keys for 3 levels.
+        let mut tree: CowBTree<i64> = CowBTree::new();
+
+        // Insert 20K keys in reverse order
+        // All inserts go through insert_recursive since key < max_key
+        for i in (0..20_000).rev() {
+            tree.insert(i, i);
+        }
+
+        assert_eq!(tree.len(), 20_000);
+
+        // Verify all keys
+        for i in (0..20_000).step_by(100) {
+            assert_eq!(tree.get(i), Some(&i));
+        }
+    }
 }
