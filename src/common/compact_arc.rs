@@ -114,7 +114,10 @@ pub struct CompactArc<T: ?Sized> {
 }
 
 // SAFETY: CompactArc can be sent between threads if T can be sent and shared.
+// The refcount is atomic (AtomicUsize) ensuring thread-safe increment/decrement.
+// T: Send + Sync ensures the data itself can be safely shared across threads.
 unsafe impl<T: ?Sized + Send + Sync> Send for CompactArc<T> {}
+// SAFETY: Same reasoning as Send - atomic refcount and T: Send + Sync.
 unsafe impl<T: ?Sized + Send + Sync> Sync for CompactArc<T> {}
 
 // ============================================================================
@@ -125,11 +128,17 @@ impl<T: ?Sized> Drop for CompactArc<T> {
     #[inline]
     fn drop(&mut self) {
         let header = self.ptr.as_ptr();
+        // SAFETY: self.ptr is always valid (NonNull) and points to a properly initialized
+        // Header. The atomic decrement is safe for concurrent access. Release ordering
+        // ensures our writes are visible to whoever sees the decremented count.
         let old_count = unsafe { (*header).count.fetch_sub(1, AtomicOrdering::Release) };
 
         if old_count == 1 {
             std::sync::atomic::fence(AtomicOrdering::Acquire);
-            // Call the stored dropper - it knows how to handle this specific type!
+            // SAFETY: old_count == 1 means we had the last reference. The Acquire fence
+            // synchronizes with Release in other drops, ensuring we see all their writes.
+            // The dropper function pointer was set during allocation and handles type-specific
+            // drop logic and deallocation.
             unsafe {
                 let dropper = (*header).dropper;
                 dropper(header);
@@ -146,6 +155,9 @@ impl<T: ?Sized> Clone for CompactArc<T> {
     #[inline]
     fn clone(&self) -> Self {
         let header = self.ptr.as_ptr();
+        // SAFETY: self.ptr is always valid (NonNull) and points to a properly initialized
+        // Header. The atomic increment is safe for concurrent access. Relaxed ordering
+        // is sufficient since we don't need to synchronize any data with this operation.
         let old_count = unsafe { (*header).count.fetch_add(1, AtomicOrdering::Relaxed) };
 
         if old_count > isize::MAX as usize {
@@ -176,6 +188,8 @@ impl<T: ?Sized> CompactArc<T> {
     /// debugging/logging purposes, not for synchronization decisions.
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
+        // SAFETY: this.ptr is always valid (NonNull) and points to a properly initialized
+        // Header. Reading the atomic count with Relaxed ordering is always safe.
         unsafe { (*this.ptr.as_ptr()).count.load(AtomicOrdering::Relaxed) }
     }
 
@@ -186,12 +200,17 @@ impl<T: ?Sized> CompactArc<T> {
     /// before they dropped their references.
     #[inline]
     fn is_unique(this: &Self) -> bool {
+        // SAFETY: this.ptr is always valid (NonNull) and points to a properly initialized
+        // Header. Acquire ordering synchronizes with Release in drop.
         unsafe { (*this.ptr.as_ptr()).count.load(AtomicOrdering::Acquire) == 1 }
     }
 
     /// Returns the metadata stored in the header (used for count).
     #[inline]
     pub fn meta(this: &Self) -> usize {
+        // SAFETY: this.ptr is always valid (NonNull) and points to a properly initialized
+        // Header. The len field is immutable after construction (for DSTs) or can be
+        // safely read (for sized types using it as metadata).
         unsafe { (*this.ptr.as_ptr()).len }
     }
 
@@ -243,6 +262,10 @@ impl<T> CompactArc<T> {
         let total_size = data_offset + mem::size_of::<T>();
         let layout = Layout::from_size_align(total_size, align).expect("layout overflow");
 
+        // SAFETY: We allocate memory with the correct layout for Header + T.
+        // We initialize all fields before returning. The allocation is guaranteed
+        // to be non-null (we call handle_alloc_error on failure). data_offset_for<T>()
+        // ensures proper alignment for T after the header.
         unsafe {
             let ptr = alloc(layout);
             if ptr.is_null() {
@@ -277,6 +300,9 @@ impl<T> CompactArc<T> {
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
         let header = this.ptr.as_ptr();
 
+        // SAFETY: this.ptr is valid. compare_exchange atomically checks if count == 1
+        // and sets it to 0. Acquire ordering on success synchronizes with Release in
+        // other drops, ensuring we see all their writes.
         if unsafe {
             (*header)
                 .count
@@ -285,6 +311,9 @@ impl<T> CompactArc<T> {
         } {
             let _ = ManuallyDrop::new(this);
 
+            // SAFETY: compare_exchange succeeded, so we had the only reference and now
+            // own the data exclusively. We read the data out (moving it), then deallocate
+            // the memory without calling the dropper (since we took ownership of the data).
             unsafe {
                 // Read data
                 let data_offset = data_offset_for::<T>();
@@ -311,6 +340,9 @@ impl<T> CompactArc<T> {
     #[inline]
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
         if Self::is_unique(this) {
+            // SAFETY: is_unique() returned true with Acquire ordering, meaning we have
+            // exclusive access. this.ptr is valid and data_offset_for<T>() gives the
+            // correct offset to the properly aligned T.
             unsafe {
                 let data_ptr = (this.ptr.as_ptr() as *mut u8).add(data_offset_for::<T>()) as *mut T;
                 Some(&mut *data_ptr)
@@ -372,6 +404,9 @@ impl<T> Deref for CompactArc<T> {
 
     #[inline]
     fn deref(&self) -> &T {
+        // SAFETY: self.ptr is always valid (NonNull) and points to a properly initialized
+        // allocation. data_offset_for<T>() gives the correct offset to the properly aligned
+        // T data. The data was initialized in new() or new_with_meta().
         unsafe {
             let data_ptr = (self.ptr.as_ptr() as *const u8).add(data_offset_for::<T>()) as *const T;
             &*data_ptr
@@ -474,6 +509,9 @@ impl CompactArc<str> {
         let layout = Layout::from_size_align(total_size, mem::align_of::<Header>())
             .expect("layout overflow");
 
+        // SAFETY: We allocate memory with the correct layout for Header + str bytes.
+        // We initialize all fields before returning. The source string s is valid UTF-8,
+        // and we copy its bytes verbatim, preserving UTF-8 validity.
         unsafe {
             let ptr = alloc(layout);
             if ptr.is_null() {
@@ -505,6 +543,8 @@ impl CompactArc<str> {
     /// Returns the length of the string in bytes.
     #[inline]
     pub fn len(&self) -> usize {
+        // SAFETY: self.ptr is valid and points to an initialized Header.
+        // The len field contains the string length set during construction.
         unsafe { (*self.ptr.as_ptr()).len }
     }
 
@@ -520,6 +560,9 @@ impl Deref for CompactArc<str> {
 
     #[inline]
     fn deref(&self) -> &str {
+        // SAFETY: self.ptr is valid and points to an initialized allocation.
+        // The len field contains the correct string length. The bytes were copied
+        // from a valid UTF-8 string in from_str_slice(), so they are valid UTF-8.
         unsafe {
             let header = self.ptr.as_ptr();
             let len = (*header).len;
@@ -633,6 +676,10 @@ impl<T> CompactArc<[T]> {
         let layout =
             Layout::from_size_align(data_offset + data_size, align).expect("layout overflow");
 
+        // SAFETY: We allocate memory with the correct layout for Header + [T].
+        // We copy (move) the elements from vec into the allocation, then set vec's len to 0
+        // to prevent double-free. The vec's buffer is still freed when vec drops, but
+        // its elements have been moved to our allocation.
         unsafe {
             let ptr = alloc(layout);
             if ptr.is_null() {
@@ -682,6 +729,10 @@ impl<T: Clone> CompactArc<[T]> {
         let layout = Layout::from_size_align(data_offset + mem::size_of_val(slice), align)
             .expect("layout overflow");
 
+        // SAFETY: We allocate memory with the correct layout for Header + [T].
+        // We use a CloneGuard for panic safety - if any clone() panics, the guard
+        // drops all successfully cloned elements and frees the allocation.
+        // On success, we forget the guard and return the initialized CompactArc.
         unsafe {
             let ptr = alloc(layout);
             if ptr.is_null() {
@@ -711,6 +762,9 @@ impl<T: Clone> CompactArc<[T]> {
 
             impl<T> Drop for CloneGuard<T> {
                 fn drop(&mut self) {
+                    // SAFETY: data_ptr points to an array where the first `written` elements
+                    // are initialized. We drop those elements, then deallocate the memory
+                    // using the stored layout. This is only called on panic during clone.
                     unsafe {
                         // Drop all successfully written elements
                         let slice = ptr::slice_from_raw_parts_mut(self.data_ptr, self.written);
@@ -749,6 +803,8 @@ impl<T> CompactArc<[T]> {
     /// Returns the number of elements in the slice.
     #[inline]
     pub fn len(&self) -> usize {
+        // SAFETY: self.ptr is valid and points to an initialized Header.
+        // The len field contains the slice length set during construction.
         unsafe { (*self.ptr.as_ptr()).len }
     }
 
@@ -764,6 +820,10 @@ impl<T> Deref for CompactArc<[T]> {
 
     #[inline]
     fn deref(&self) -> &[T] {
+        // SAFETY: self.ptr is valid and points to an initialized allocation.
+        // The len field contains the correct element count. data_offset_for<T>()
+        // gives the correct offset to the properly aligned [T] data. All len
+        // elements were initialized in from_slice() or from_vec().
         unsafe {
             let header = self.ptr.as_ptr();
             let len = (*header).len;

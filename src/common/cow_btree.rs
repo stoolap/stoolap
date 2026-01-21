@@ -15,95 +15,833 @@
 //! Copy-on-Write B-tree for i64 keys
 //!
 //! Design:
-//! - Each node is wrapped in CompactArc (8 bytes) for reference counting
-//! - Readers clone the root Arc (atomic, ~1ns) and traverse without locks
-//! - Writers use CompactArc::make_mut() which clones only if shared
+//! - Each node is wrapped in CompactArc (8 bytes) for memory management
+//! - Nodes maintain their own `drop_count` (AtomicU32) for thread-safe V drops
+//! - Readers clone the root (atomic, ~1ns) and traverse without locks
+//! - Writers check `drop_count` and deep-clone only if shared (COW)
 //! - Structural sharing: unmodified subtrees are shared between versions
+//!
+//! Thread safety:
+//! - `drop_count` uses atomic fetch_sub to coordinate drops across threads
+//! - Exactly one thread (whoever sees old_count=1) drops V values
+//! - This avoids race conditions that could cause memory leaks
 //!
 //! Performance characteristics:
 //! - Reads: O(log n), completely lock-free
 //! - Writes: O(log n) + O(B) per modified node for COW
-//! - Clone: O(1) - just increments root's reference count
+//! - Clone: O(1) - just increments reference counts
 //! - Memory: Shared nodes between snapshots
 
-use super::{CompactArc, CompactVec};
+use super::CompactArc;
+use std::marker::PhantomData;
+use std::mem;
 use std::ops::Bound;
+use std::ptr;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Maximum keys per node. Smaller = more nodes but faster COW.
-/// 64 gives good balance for database workloads.
+/// 128 gives good balance for database workloads.
 const MAX_KEYS: usize = 128;
 
 /// Minimum keys per node (except root).
 const MIN_KEYS: usize = MAX_KEYS / 2;
 
-/// A B+ tree node (values only in leaves)
-struct Node<V: Clone> {
-    /// Keys stored in this node
-    keys: CompactVec<i64>,
-    /// Values (only for leaf nodes, same length as keys)
-    values: CompactVec<V>,
-    /// Child pointers (only for internal nodes, len = keys.len() + 1)
-    children: CompactVec<CompactArc<Node<V>>>,
+/// Header: 8 bytes
+/// [ len (u16) | is_leaf (u8) | pad (1) | drop_count (4) ]
+///
+/// `drop_count` is a separate refcount that coordinates dropping V values.
+/// This fixes a race condition where multiple threads could skip dropping
+/// V values when relying solely on CompactArc's is_unique() check.
+#[repr(C)]
+struct NodeHeader {
+    len: u16,
+    is_leaf: u8,
+    _pad1: u8,
+    /// Refcount for coordinating V/children drops.
+    /// Decremented atomically in NodePtr::drop; whoever sees old_count=1 drops contents.
+    /// Using U32 to support up to ~4 billion concurrent snapshots.
+    drop_count: AtomicU32,
 }
 
-impl<V: Clone> Node<V> {
-    fn new_leaf() -> Self {
+/// A Ref-counted pointer to a Byte-Packed Node.
+/// Memory Layout: [ Header | Keys (MAX_KEYS) | Values/Children ]
+/// One contiguous allocation.
+pub struct NodePtr<V: Clone> {
+    ptr: CompactArc<[u8]>,
+    _marker: PhantomData<V>,
+}
+
+impl<V: Clone> Clone for NodePtr<V> {
+    fn clone(&self) -> Self {
+        // Clone CompactArc first (keeps memory alive), then increment drop_count.
+        // This ordering ensures drop_count is only incremented after the clone succeeds.
+        let new_ptr = self.ptr.clone();
+
+        // SAFETY: ptr points to a valid CompactArc allocation that starts with NodeHeader.
+        // The header is read-only here (only accessing drop_count atomically).
+        let header = unsafe { &*(self.ptr.as_ptr() as *const NodeHeader) };
+        header.drop_count.fetch_add(1, Ordering::Relaxed);
+
         Self {
-            keys: CompactVec::with_capacity(8),
-            values: CompactVec::with_capacity(8),
-            children: CompactVec::new(),
+            ptr: new_ptr,
+            _marker: PhantomData,
         }
+    }
+}
+
+impl<V: Clone> Drop for NodePtr<V> {
+    fn drop(&mut self) {
+        // Atomically decrement drop_count and check if we're the last reference.
+        // This fixes a race condition where multiple threads using is_unique()
+        // could all see refcount > 1 and skip dropping V values.
+        //
+        // With atomic fetch_sub, exactly one thread will see old_count == 1
+        // and that thread is responsible for dropping the contents.
+        // SAFETY: ptr points to a valid CompactArc allocation that starts with NodeHeader.
+        let header = unsafe { &*(self.ptr.as_ptr() as *const NodeHeader) };
+        let old_count = header.drop_count.fetch_sub(1, Ordering::AcqRel);
+
+        if old_count != 1 {
+            // Not the last reference - don't drop contents
+            return;
+        }
+
+        // We're the last reference - drop contents
+        let len = self.len();
+        if self.is_leaf() {
+            // Drop values in valid range
+            // SAFETY: We are the last reference (old_count == 1). The values at indices
+            // 0..len are valid initialized V instances. After dropping, we don't access them.
+            unsafe {
+                let v_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+                for i in 0..len {
+                    ptr::drop_in_place(v_ptr.add(i));
+                }
+            }
+        } else {
+            // Drop children (keys count + 1)
+            // SAFETY: We are the last reference (old_count == 1). The children at indices
+            // 0..=len are valid NodePtr instances. After dropping, we don't access them.
+            unsafe {
+                let c_ptr =
+                    (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+                for i in 0..=len {
+                    ptr::drop_in_place(c_ptr.add(i));
+                }
+            }
+        }
+    }
+}
+
+impl<V: Clone> NodePtr<V> {
+    /// Keys start immediately after the header
+    const fn keys_offset() -> usize {
+        mem::size_of::<NodeHeader>()
+    }
+
+    /// Offset to values array (leaf nodes only).
+    /// Same as `children_offset` - this is union-style memory sharing:
+    /// leaf nodes store values here, internal nodes store children here.
+    /// A node is either leaf OR internal, never both.
+    const fn values_offset() -> usize {
+        Self::keys_offset() + ((MAX_KEYS + 1) * 8)
+    }
+
+    /// Offset to children array (internal nodes only).
+    /// Same as `values_offset` - see comment above.
+    const fn children_offset() -> usize {
+        Self::keys_offset() + ((MAX_KEYS + 1) * 8)
+    }
+
+    fn new_leaf() -> Self {
+        let size = Self::values_offset() + ((MAX_KEYS + 1) * mem::size_of::<V>());
+        let vec = vec![0u8; size];
+
+        let mut ptr = NodePtr {
+            ptr: CompactArc::from_vec(vec),
+            _marker: PhantomData,
+        };
+
+        let header = ptr.header_mut();
+        header.len = 0;
+        header.is_leaf = 1;
+        header.drop_count = AtomicU32::new(1);
+
+        ptr
     }
 
     fn new_internal() -> Self {
-        Self {
-            keys: CompactVec::with_capacity(8),
-            values: CompactVec::new(),
-            children: CompactVec::with_capacity(8),
+        let size = Self::children_offset() + ((MAX_KEYS + 2) * mem::size_of::<NodePtr<V>>());
+        let vec = vec![0u8; size];
+
+        let mut ptr = NodePtr {
+            ptr: CompactArc::from_vec(vec),
+            _marker: PhantomData,
+        };
+
+        let header = ptr.header_mut();
+        header.len = 0;
+        header.is_leaf = 0;
+        header.drop_count = AtomicU32::new(1);
+
+        ptr
+    }
+
+    fn make_mut(&mut self) -> &mut Self {
+        // Check if this node is shared using our own drop_count.
+        // If drop_count > 1, we need to deep clone to maintain COW semantics.
+        // SAFETY: ptr points to a valid CompactArc allocation that starts with NodeHeader.
+        let header = unsafe { &*(self.ptr.as_ptr() as *const NodeHeader) };
+        if header.drop_count.load(Ordering::Acquire) != 1 {
+            // Shared - need proper deep clone (not just byte copy!)
+            // Byte copy would cause double-free for non-Copy value types
+            *self = self.deep_clone();
+        }
+        self
+    }
+
+    /// Create a deep clone of this node.
+    /// For leaf nodes: clones all values using V::clone()
+    /// For internal nodes: clones all children (incrementing their refcounts)
+    fn deep_clone(&self) -> Self {
+        let len = self.len();
+
+        if self.is_leaf() {
+            let mut new_node = NodePtr::new_leaf();
+            // Do NOT set len yet to ensure exception safety!
+            // If V::clone() panics, new_node.drop() will only drop 0 elements.
+
+            // Copy keys (i64 is Copy, byte copy is fine)
+            // SAFETY: Both src and dst are valid pointers within their respective node allocations.
+            // Keys are i64 (Copy type), so byte copy is safe. len <= MAX_KEYS.
+            unsafe {
+                let k_src = self.ptr.as_ptr().add(Self::keys_offset()) as *const i64;
+                let k_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                ptr::copy_nonoverlapping(k_src, k_dst, len);
+            }
+
+            // Clone values using V::clone() - critical for non-Copy types!
+            // SAFETY: v_src points to len valid V instances. v_dst points to uninitialized memory.
+            // We use ptr::write to initialize each slot, and increment len after each successful
+            // clone to maintain exception safety (if clone panics, only initialized values are dropped).
+            unsafe {
+                let v_src = self.ptr.as_ptr().add(Self::values_offset()) as *const V;
+                let v_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+                for i in 0..len {
+                    ptr::write(v_dst.add(i), (*v_src.add(i)).clone());
+                    // Increment len after successful write/clone
+                    // If clone panics on next iteration, this node will correctly drop 'i' elements
+                    new_node.set_len(i + 1);
+                }
+            }
+
+            new_node
+        } else {
+            let mut new_node = NodePtr::new_internal();
+            new_node.set_len(len);
+
+            // Copy keys (i64 is Copy)
+            // SAFETY: Both src and dst are valid pointers within their respective node allocations.
+            // Keys are i64 (Copy type), so byte copy is safe. len <= MAX_KEYS.
+            unsafe {
+                let k_src = self.ptr.as_ptr().add(Self::keys_offset()) as *const i64;
+                let k_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                ptr::copy_nonoverlapping(k_src, k_dst, len);
+            }
+
+            // Clone children (NodePtr::clone increments CompactArc refcount)
+            // NodePtr::clone cannot panic, so strict exception safety sequence not needed here,
+            // but setting len upfront is fine.
+            // SAFETY: c_src points to len+1 valid NodePtr instances. c_dst points to uninitialized memory.
+            // NodePtr::clone only does atomic operations and cannot panic.
+            unsafe {
+                let c_src = self.ptr.as_ptr().add(Self::children_offset()) as *const NodePtr<V>;
+                let c_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::children_offset())
+                    as *mut NodePtr<V>;
+                for i in 0..=len {
+                    // children count = keys count + 1
+                    ptr::write(c_dst.add(i), (*c_src.add(i)).clone());
+                }
+            }
+
+            new_node
         }
     }
 
-    #[inline]
+    fn header(&self) -> &NodeHeader {
+        // SAFETY: ptr points to a valid CompactArc allocation that starts with NodeHeader.
+        unsafe { &*(self.ptr.as_ptr() as *const NodeHeader) }
+    }
+
+    fn header_mut(&mut self) -> &mut NodeHeader {
+        // Assumes we have unique access (called make_mut)
+        // SAFETY: ptr points to a valid CompactArc allocation. Caller guarantees unique access.
+        unsafe { &mut *(self.ptr.as_ptr() as *mut NodeHeader) }
+    }
+
     fn is_leaf(&self) -> bool {
-        self.children.is_empty()
+        self.header().is_leaf == 1
     }
 
-    /// Binary search for key position
-    #[inline]
+    fn len(&self) -> usize {
+        self.header().len as usize
+    }
+
+    fn set_len(&mut self, len: usize) {
+        self.header_mut().len = len as u16;
+    }
+
+    fn keys(&self) -> &[i64] {
+        let len = self.len();
+        // SAFETY: ptr + keys_offset points to an array of len initialized i64 keys.
+        // The slice lifetime is tied to &self, ensuring validity.
+        unsafe {
+            let ptr = self.ptr.as_ptr().add(Self::keys_offset()) as *const i64;
+            std::slice::from_raw_parts(ptr, len)
+        }
+    }
+
+    fn values(&self) -> &[V] {
+        assert!(self.is_leaf());
+        let len = self.len();
+        // SAFETY: This is a leaf node (asserted). ptr + values_offset points to
+        // an array of len initialized V values. The slice lifetime is tied to &self.
+        unsafe {
+            let ptr = self.ptr.as_ptr().add(Self::values_offset()) as *const V;
+            std::slice::from_raw_parts(ptr, len)
+        }
+    }
+
+    fn values_mut_slice(&mut self) -> &mut [V] {
+        assert!(self.is_leaf());
+        let len = self.len();
+        // SAFETY: This is a leaf node (asserted). ptr + values_offset points to
+        // an array of len initialized V values. Caller has &mut self, ensuring unique access.
+        unsafe {
+            let ptr = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            std::slice::from_raw_parts_mut(ptr, len)
+        }
+    }
+
+    fn children(&self) -> &[NodePtr<V>] {
+        assert!(!self.is_leaf());
+        let len = self.len() + 1; // Children = keys + 1
+                                  // SAFETY: This is an internal node (asserted). ptr + children_offset points to
+                                  // an array of len initialized NodePtr children. The slice lifetime is tied to &self.
+        unsafe {
+            let ptr = self.ptr.as_ptr().add(Self::children_offset()) as *const NodePtr<V>;
+            std::slice::from_raw_parts(ptr, len)
+        }
+    }
+
+    fn children_mut_slice(&mut self) -> &mut [NodePtr<V>] {
+        assert!(!self.is_leaf());
+        let len = self.len() + 1;
+        // SAFETY: This is an internal node (asserted). ptr + children_offset points to
+        // an array of len initialized NodePtr children. Caller has &mut self, ensuring unique access.
+        unsafe {
+            let ptr =
+                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+            std::slice::from_raw_parts_mut(ptr, len)
+        }
+    }
+
+    fn child(&self, index: usize) -> &NodePtr<V> {
+        &self.children()[index]
+    }
+
+    fn child_mut(&mut self, index: usize) -> &mut NodePtr<V> {
+        &mut self.children_mut_slice()[index]
+    }
+
     fn search(&self, key: i64) -> Result<usize, usize> {
-        self.keys.binary_search(&key)
+        self.keys().binary_search(&key)
     }
-}
 
-impl<V: Clone> Clone for Node<V> {
-    fn clone(&self) -> Self {
-        // Optimization: reserve MAX_KEYS + 1 capacity to avoid immediate reallocation upon insert.
-        // COW operations typically pattern: clone node -> insert key.
-        // If we only allocate exactly len(), the subsequent insert triggers a grow() + realloc.
-        // By reserving full capacity (plus 1 for overflow before split), we avoid this second allocation.
+    fn push_leaf(&mut self, key: i64, value: V) {
+        assert!(self.is_leaf());
+        let len = self.len();
+        assert!(len <= MAX_KEYS); // Allow temporary overflow
 
-        let mut keys = CompactVec::with_capacity(MAX_KEYS + 1);
-        keys.extend_copy(&self.keys);
+        // SAFETY: This is a leaf node (asserted). len <= MAX_KEYS, so index len is within
+        // the allocated array bounds (size MAX_KEYS + 1). We write to uninitialized slots.
+        unsafe {
+            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            ptr::write(k_ptr.add(len), key);
 
-        let mut values = CompactVec::new();
-        if !self.values.is_empty() || self.is_leaf() {
-            // Leaves need value capacity. Internal nodes don't use values.
-            values.reserve(MAX_KEYS + 1);
-            values.extend_clone(&self.values);
+            let v_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            ptr::write(v_ptr.add(len), value);
+        }
+        self.set_len(len + 1);
+    }
+
+    fn remove_leaf(&mut self, index: usize) -> V {
+        assert!(self.is_leaf());
+        let len = self.len();
+        assert!(index < len);
+
+        // SAFETY: This is a leaf node (asserted). index < len, so all accesses are in bounds.
+        // We read the value at index (moving it out), then shift remaining elements left.
+        // The last position becomes logically invalid and is excluded by set_len.
+        unsafe {
+            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            ptr::copy(k_ptr.add(index + 1), k_ptr.add(index), len - index - 1);
+
+            let v_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let val = ptr::read(v_ptr.add(index));
+            ptr::copy(v_ptr.add(index + 1), v_ptr.add(index), len - index - 1);
+
+            self.set_len(len - 1);
+            val
+        }
+    }
+
+    fn insert_leaf(&mut self, index: usize, key: i64, value: V) {
+        assert!(self.is_leaf());
+        let len = self.len();
+        assert!(len <= MAX_KEYS);
+
+        // SAFETY: This is a leaf node (asserted). len <= MAX_KEYS, so we have room for one more.
+        // We shift elements at [index..len] to [index+1..len+1], then write the new key/value at index.
+        unsafe {
+            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let p_key = k_ptr.add(index);
+            ptr::copy(p_key, p_key.add(1), len - index);
+            ptr::write(p_key, key);
+
+            let v_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let p_val = v_ptr.add(index);
+            ptr::copy(p_val, p_val.add(1), len - index);
+            ptr::write(p_val, value);
+        }
+        self.set_len(len + 1);
+    }
+
+    fn push_internal(&mut self, key: i64, child: NodePtr<V>) {
+        assert!(!self.is_leaf());
+        let len = self.len();
+        assert!(len <= MAX_KEYS);
+
+        // SAFETY: This is an internal node (asserted). len <= MAX_KEYS, so indices len (for key)
+        // and len+1 (for child) are within allocated bounds. We write to uninitialized slots.
+        unsafe {
+            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            ptr::write(k_ptr.add(len), key);
+
+            let c_ptr =
+                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+            ptr::write(c_ptr.add(len + 1), child);
+        }
+        self.set_len(len + 1);
+    }
+
+    fn split_internal(&mut self) -> (i64, NodePtr<V>) {
+        let len = self.len();
+        let mid = len / 2;
+        let med_key = self.keys()[mid];
+        let mut right = NodePtr::new_internal();
+        let right_keys_count = len - mid - 1;
+        let right_children_count = right_keys_count + 1;
+
+        // SAFETY: Both self and right are internal nodes. We copy keys from indices [mid+1..len)
+        // and children from indices [mid+1..len+1) of self into the start of right. The source
+        // and destination do not overlap (different allocations). Keys are Copy (i64). Children
+        // (NodePtr<V>) are bitwise copied - this is safe because we set self.len = mid afterwards,
+        // so those slots become logically uninitialized (won't be dropped when self is dropped).
+        unsafe {
+            let k_src = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_dst = (right.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            ptr::copy_nonoverlapping(k_src.add(mid + 1), k_dst, right_keys_count);
+
+            let c_src =
+                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+            let c_dst =
+                (right.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+            ptr::copy_nonoverlapping(c_src.add(mid + 1), c_dst, right_children_count);
         }
 
-        let mut children = CompactVec::new();
-        if !self.children.is_empty() {
-            // Internal nodes need children capacity (MAX_KEYS + 2)
-            children.reserve(MAX_KEYS + 2);
-            children.extend_clone(&self.children);
+        right.set_len(right_keys_count);
+        self.set_len(mid);
+        (med_key, right)
+    }
+
+    /// Optimized split for rightmost (sequential) inserts on internal nodes.
+    /// Keeps MAX_KEYS keys in left node, moves only the last child to right.
+    /// The median key (last key) goes to parent. Right node has 0 keys, 1 child.
+    fn split_internal_rightmost(&mut self) -> (i64, NodePtr<V>) {
+        let len = self.len();
+        debug_assert!(
+            len == MAX_KEYS + 1,
+            "split_internal_rightmost expects overflow node"
+        );
+
+        // Median is the last key - it goes to parent
+        let med_key = self.keys()[len - 1];
+
+        let mut right = NodePtr::new_internal();
+
+        // SAFETY: self is an internal node with MAX_KEYS + 1 keys (MAX_KEYS + 2 children).
+        // We move only the last child to right. Children are moved via ptr::read then ptr::write.
+        // After set_len(len-1), the source slots are logically uninitialized.
+        unsafe {
+            let c_src =
+                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+            let c_dst =
+                (right.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+
+            // Move last child (index len, since we have len+1 children)
+            ptr::write(c_dst, ptr::read(c_src.add(len)));
         }
 
-        Self {
-            keys,
-            values,
-            children,
+        right.set_len(0); // 0 keys, but 1 child
+        self.set_len(len - 1); // MAX_KEYS keys, MAX_KEYS + 1 children
+
+        (med_key, right)
+    }
+
+    fn borrow_from_left(&mut self, index: usize) {
+        assert!(!self.is_leaf());
+        let is_left_leaf = self.child(index - 1).is_leaf();
+
+        if is_left_leaf {
+            let (key, val) = {
+                let left = self.child_mut(index - 1).make_mut();
+                let left_len = left.len();
+                let key = left.keys()[left_len - 1];
+                // SAFETY: left is a leaf node (verified by is_left_leaf). left_len > 0 because
+                // we only borrow from siblings with spare keys. Index left_len - 1 is valid.
+                // We move the value out via ptr::read, then set_len(left_len - 1) marks it
+                // as logically removed so it won't be double-dropped.
+                let val = unsafe {
+                    let val_ptr =
+                        (left.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+                    ptr::read(val_ptr.add(left_len - 1))
+                };
+                left.set_len(left_len - 1);
+                (key, val)
+            };
+
+            let current = self.child_mut(index).make_mut();
+            current.insert_leaf(0, key, val);
+
+            // SAFETY: self is an internal node (asserted). index > 0 (we're borrowing from left).
+            // index - 1 is a valid key index in self (parent of left and current).
+            // Writing i64 which is Copy, overwriting existing separator key.
+            unsafe {
+                let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                ptr::write(k_ptr.add(index - 1), key);
+            }
+        } else {
+            let (child, key) = {
+                let left = self.child_mut(index - 1).make_mut();
+                let left_len = left.len();
+                let key = left.keys()[left_len - 1];
+                // SAFETY: left is an internal node (is_left_leaf is false). left_len > 0.
+                // Index left_len is valid for children array (internal nodes have len+1 children).
+                // We move the child out via ptr::read, then set_len(left_len - 1) ensures it
+                // won't be double-dropped.
+                let child = unsafe {
+                    let c_ptr = (left.ptr.as_ptr() as *mut u8).add(Self::children_offset())
+                        as *mut NodePtr<V>;
+                    ptr::read(c_ptr.add(left_len))
+                };
+                left.set_len(left_len - 1);
+                (child, key)
+            };
+
+            let separator_idx = index - 1;
+            let separator = self.keys()[separator_idx];
+
+            let current = self.child_mut(index).make_mut();
+            current.insert_internal_at_start(separator, child);
+
+            // SAFETY: self is an internal node (asserted). separator_idx is valid key index.
+            // Writing i64 which is Copy, overwriting existing separator key.
+            unsafe {
+                let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                ptr::write(k_ptr.add(separator_idx), key);
+            }
         }
+    }
+
+    fn insert_internal(&mut self, index: usize, key: i64, child: NodePtr<V>) {
+        assert!(!self.is_leaf());
+        let len = self.len();
+        assert!(len <= MAX_KEYS);
+
+        // SAFETY: This is an internal node (asserted). len <= MAX_KEYS, so there's space.
+        // index <= len. We shift keys [index..len) right by 1 to make room, then write key
+        // at index. We shift children [index+1..len+1) right by 1, then write new child at
+        // index+1. ptr::copy handles overlapping regions correctly. Keys are Copy (i64).
+        // The new child is moved in (not cloned) via ptr::write.
+        unsafe {
+            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            ptr::copy(k_ptr.add(index), k_ptr.add(index + 1), len - index);
+            ptr::write(k_ptr.add(index), key);
+
+            let c_ptr =
+                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+            ptr::copy(c_ptr.add(index + 1), c_ptr.add(index + 2), len - index);
+            ptr::write(c_ptr.add(index + 1), child);
+        }
+        self.set_len(len + 1);
+    }
+
+    fn insert_internal_at_start(&mut self, key: i64, child: NodePtr<V>) {
+        let len = self.len();
+        // SAFETY: This is an internal node (only called from internal node contexts).
+        // We shift all keys [0..len) right by 1 and write new key at index 0.
+        // We shift all children [0..len+1) right by 1 and write new child at index 0.
+        // ptr::copy handles overlapping regions correctly. Keys are Copy (i64).
+        // The new child is moved in via ptr::write. len + 1 <= MAX_KEYS + 1 by B-tree invariants.
+        unsafe {
+            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            ptr::copy(k_ptr, k_ptr.add(1), len);
+            ptr::write(k_ptr, key);
+
+            let c_ptr =
+                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+            ptr::copy(c_ptr, c_ptr.add(1), len + 1);
+            ptr::write(c_ptr, child);
+        }
+        self.set_len(len + 1);
+    }
+
+    fn borrow_from_right(&mut self, index: usize) {
+        assert!(!self.is_leaf());
+        let is_right_leaf = self.child(index + 1).is_leaf();
+
+        if is_right_leaf {
+            let (key, val) = {
+                let right = self.child_mut(index + 1).make_mut();
+                let key = right.keys()[0];
+                let val = right.remove_leaf(0);
+                (key, val)
+            };
+
+            let current = self.child_mut(index).make_mut();
+            current.push_leaf(key, val);
+
+            let right = self.child(index + 1);
+            let new_sep = right.keys()[0];
+            // SAFETY: self is an internal node (asserted). index is valid key index in self
+            // (it's the separator between children at index and index+1).
+            // Writing i64 which is Copy, overwriting existing separator key.
+            unsafe {
+                let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                ptr::write(k_ptr.add(index), new_sep);
+            }
+        } else {
+            let (child, key) = {
+                let right = self.child_mut(index + 1).make_mut();
+                let key = right.keys()[0];
+                // SAFETY: right is an internal node (is_right_leaf is false). right.len() > 0.
+                // Index 0 is valid for children array. We move the first child out via ptr::read,
+                // then remove_internal_at_start() shifts remaining elements left and decrements len.
+                let child = unsafe {
+                    let c_ptr = (right.ptr.as_ptr() as *mut u8).add(Self::children_offset())
+                        as *mut NodePtr<V>;
+                    ptr::read(c_ptr)
+                };
+                right.remove_internal_at_start();
+                (child, key)
+            };
+
+            let separator = self.keys()[index];
+
+            let current = self.child_mut(index).make_mut();
+            current.push_internal(separator, child);
+
+            // SAFETY: self is an internal node (asserted). index is valid key index.
+            // Writing i64 which is Copy, overwriting existing separator key.
+            unsafe {
+                let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                ptr::write(k_ptr.add(index), key);
+            }
+        }
+    }
+
+    fn remove_internal_at_start(&mut self) {
+        let len = self.len();
+        // SAFETY: This is an internal node (only called from internal node contexts). len > 0.
+        // We shift keys [1..len) left by 1 (overwriting key at index 0).
+        // We shift children [1..len+1) left by 1 (overwriting child at index 0, which was
+        // already moved out by caller via ptr::read). Keys are Copy (i64). Children are
+        // bitwise copied (ptr::copy handles overlap correctly). The child at the end becomes
+        // logically uninitialized after set_len decrements the count.
+        unsafe {
+            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            ptr::copy(k_ptr.add(1), k_ptr, len - 1);
+
+            let c_ptr =
+                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+            ptr::copy(c_ptr.add(1), c_ptr, len);
+        }
+        self.set_len(len - 1);
+    }
+
+    fn merge_with_left(&mut self, index: usize) {
+        let separator = self.keys()[index - 1];
+
+        // Make right uniquely owned so we can move data out of it
+        let right_raw = self.child_mut(index) as *mut NodePtr<V>;
+        // SAFETY: right_raw points to a valid NodePtr<V> in self's children array at index.
+        // We need a raw pointer here to avoid borrow checker issues: we'll access left sibling
+        // later, but Rust sees child_mut(index) and child_mut(index-1) as conflicting borrows.
+        // The raw pointer lets us work around this while maintaining actual safety since we
+        // only access right through right_raw, and later access left through child_mut.
+        let right = unsafe { (*right_raw).make_mut() };
+        let is_leaf = right.is_leaf();
+        let r_len = right.len();
+
+        if is_leaf {
+            // Move keys and values out of right using ptr::read (no clone!)
+            let mut keys_vals: Vec<(i64, V)> = Vec::with_capacity(r_len);
+            // SAFETY: right is a leaf node (verified by is_leaf). We read all keys and values
+            // from indices [0..r_len). Keys are Copy (i64). Values are moved via ptr::read.
+            // We set_len(0) immediately after to mark them as logically removed, preventing
+            // double-free when right's NodePtr is eventually dropped.
+            unsafe {
+                let k_ptr = right.ptr.as_ptr().add(Self::keys_offset()) as *const i64;
+                let v_ptr = right.ptr.as_ptr().add(Self::values_offset()) as *mut V;
+                for i in 0..r_len {
+                    let key = *k_ptr.add(i);
+                    let val = ptr::read(v_ptr.add(i)); // Move, not clone!
+                    keys_vals.push((key, val));
+                }
+            }
+            // Set len=0 BEFORE any other operation to prevent double-free when right is dropped
+            right.set_len(0);
+
+            // Now we can safely mutably borrow left
+            let left = self.child_mut(index - 1).make_mut();
+            for (k, v) in keys_vals {
+                left.push_leaf(k, v);
+            }
+        } else {
+            // Move keys and children out of right using ptr::read (not clone!)
+            // After make_mut(), we have unique ownership of the node structure,
+            // so we can safely move the children out.
+            let keys: Vec<i64> = right.keys().to_vec();
+            // SAFETY: right is an internal node. We read all children from indices [0..r_len+1).
+            // Children are moved via ptr::read. We set_len(0) immediately after to mark them
+            // as logically removed, preventing double-free when right's NodePtr is dropped.
+            let children: Vec<NodePtr<V>> = unsafe {
+                let c_ptr = right.ptr.as_ptr().add(Self::children_offset()) as *const NodePtr<V>;
+                (0..=r_len).map(|i| ptr::read(c_ptr.add(i))).collect()
+            };
+            // Set len=0 AFTER reading - children have been moved out
+            right.set_len(0);
+
+            let left = self.child_mut(index - 1).make_mut();
+
+            // Move children to left using into_iter (no cloning needed)
+            let mut children_iter = children.into_iter();
+            left.push_internal(separator, children_iter.next().unwrap());
+            for (key, child) in keys.into_iter().zip(children_iter) {
+                left.push_internal(key, child);
+            }
+        }
+
+        self.remove_key_and_child(index - 1, index);
+    }
+
+    fn merge_with_right(&mut self, index: usize) {
+        self.merge_with_left(index + 1)
+    }
+
+    fn remove_key_and_child(&mut self, key_idx: usize, child_idx: usize) {
+        let len = self.len();
+        // SAFETY: This is an internal node (only called from internal node contexts).
+        // key_idx < len and child_idx <= len (valid indices). We shift keys [key_idx+1..len)
+        // left by 1 to fill the gap. For children, we first drop_in_place the child being
+        // removed (it's a NodePtr that needs cleanup), then shift children [child_idx+1..len+1)
+        // left by 1. ptr::copy handles overlapping regions. Keys are Copy (i64). The slots
+        // at the end become logically uninitialized after set_len decrements the count.
+        unsafe {
+            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            ptr::copy(
+                k_ptr.add(key_idx + 1),
+                k_ptr.add(key_idx),
+                len - key_idx - 1,
+            );
+
+            let c_ptr =
+                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+            // Drop the child being removed before overwriting it
+            ptr::drop_in_place(c_ptr.add(child_idx));
+            ptr::copy(
+                c_ptr.add(child_idx + 1),
+                c_ptr.add(child_idx),
+                len - child_idx,
+            );
+        }
+        self.set_len(len - 1);
+    }
+
+    fn split_leaf(&mut self) -> (i64, NodePtr<V>) {
+        let mid = self.len() / 2;
+        let right_count = self.len() - mid;
+
+        let mut right = NodePtr::new_leaf();
+
+        // SAFETY: Both self and right are leaf nodes. We copy keys from indices [mid..len)
+        // and values from indices [mid..len) of self into the start of right. The source
+        // and destination do not overlap (different allocations). Keys are Copy (i64). Values
+        // are bitwise copied - this is safe because we set self.len = mid afterwards, so those
+        // slots become logically uninitialized (won't be dropped when self is dropped).
+        unsafe {
+            let k_src = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_dst = (right.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            ptr::copy_nonoverlapping(k_src.add(mid), k_dst, right_count);
+
+            let v_src = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let v_dst = (right.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            ptr::copy_nonoverlapping(v_src.add(mid), v_dst, right_count);
+        }
+
+        right.set_len(right_count);
+        self.set_len(mid);
+
+        let median = right.keys()[0];
+        (median, right)
+    }
+
+    /// Optimized split for rightmost (sequential) inserts.
+    /// Keeps MAX_KEYS in left node, moves only 1 key to right.
+    /// This achieves ~100% fill factor for sequential insert workloads
+    /// instead of the standard 50% from midpoint splits.
+    fn split_leaf_rightmost(&mut self) -> (i64, NodePtr<V>) {
+        let len = self.len();
+        debug_assert!(
+            len == MAX_KEYS + 1,
+            "split_leaf_rightmost expects overflow node"
+        );
+
+        let mut right = NodePtr::new_leaf();
+
+        // SAFETY: self is a leaf with MAX_KEYS + 1 elements. We move only the last
+        // key/value to right. The key is Copy (i64). The value is moved via ptr::read
+        // then ptr::write. After set_len(len-1), the source slot is logically uninitialized.
+        unsafe {
+            let k_src = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *const i64;
+            let k_dst = (right.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+
+            let v_src = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let v_dst = (right.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+
+            // Copy last key
+            ptr::write(k_dst, *k_src.add(len - 1));
+
+            // Move last value (ptr::read moves ownership out)
+            ptr::write(v_dst, ptr::read(v_src.add(len - 1)));
+        }
+
+        right.set_len(1);
+        self.set_len(len - 1); // MAX_KEYS
+
+        let median = right.keys()[0];
+        (median, right)
     }
 }
 
@@ -111,10 +849,69 @@ impl<V: Clone> Clone for Node<V> {
 ///
 /// Provides lock-free reads through structural sharing.
 /// Clone is O(1) - just increments root's reference count.
+///
+/// # Thread Safety
+///
+/// - **Readers**: Multiple readers can safely access the tree concurrently via cloned
+///   snapshots. Each snapshot is immutable from the reader's perspective.
+/// - **Writers**: Write operations (`insert`, `remove`, `get_mut`, `entry`) require
+///   exclusive access (`&mut self`). External synchronization (e.g., `Mutex`, `RwLock`)
+///   is required if multiple threads need write access.
+/// - **Pattern**: Clone the tree to create a snapshot, then readers use the snapshot
+///   while writers mutate the original. This is the standard MVCC pattern.
+const MAX_TREE_DEPTH: usize = 16;
+
+/// Stack-based path to avoid allocations
+#[derive(Clone, Copy)]
+pub struct NodePath {
+    indices: [u8; MAX_TREE_DEPTH],
+    len: u8,
+}
+
+impl Default for NodePath {
+    fn default() -> Self {
+        Self {
+            indices: [0; MAX_TREE_DEPTH],
+            len: 0,
+        }
+    }
+}
+
+impl NodePath {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn depth_overflow() -> ! {
+        panic!("B-Tree depth exceeded maximum")
+    }
+
+    pub fn push(&mut self, idx: usize) {
+        if (self.len as usize) < MAX_TREE_DEPTH {
+            self.indices[self.len as usize] = idx as u8;
+            self.len += 1;
+        } else {
+            Self::depth_overflow();
+        }
+    }
+
+    fn get(&self, depth: usize) -> usize {
+        self.indices[depth] as usize
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len as usize).map(|i| self.indices[i] as usize)
+    }
+}
+
 pub struct CowBTree<V: Clone> {
-    root: Option<CompactArc<Node<V>>>,
+    root: Option<NodePtr<V>>,
     /// Cached maximum key in the tree. Valid if root.is_some().
     max_key: i64,
+    /// Number of elements in the tree
+    len: usize,
 }
 
 impl<V: Clone> Default for CowBTree<V> {
@@ -130,6 +927,7 @@ impl<V: Clone> Clone for CowBTree<V> {
         Self {
             root: self.root.clone(),
             max_key: self.max_key,
+            len: self.len,
         }
     }
 }
@@ -137,15 +935,20 @@ impl<V: Clone> Clone for CowBTree<V> {
 impl<V: Clone> CowBTree<V> {
     #[inline]
     pub fn new() -> Self {
+        assert!(
+            mem::align_of::<V>() <= 8,
+            "CowBTree value type alignment must be <= 8"
+        );
         Self {
             root: None,
             max_key: 0,
+            len: 0,
         }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.root.as_ref().map(CompactArc::meta).unwrap_or(0)
+        self.len
     }
 
     #[inline]
@@ -161,17 +964,15 @@ impl<V: Clone> CowBTree<V> {
             match node.search(key) {
                 Ok(i) => {
                     if node.is_leaf() {
-                        return Some(&node.values[i]);
+                        return Some(&node.values()[i]);
                     }
-                    // In B+ tree, keys in internal nodes are separators
-                    // Go to right child
-                    node = &node.children[i + 1];
+                    node = node.child(i + 1);
                 }
                 Err(i) => {
                     if node.is_leaf() {
                         return None;
                     }
-                    node = &node.children[i];
+                    node = node.child(i);
                 }
             }
         }
@@ -180,46 +981,26 @@ impl<V: Clone> CowBTree<V> {
     /// Get a mutable reference to a value. Triggers COW if needed.
     #[inline]
     pub fn get_mut(&mut self, key: i64) -> Option<&mut V> {
-        // Navigate to the leaf, applying COW along the path
-        let mut path: CompactVec<usize> = CompactVec::new();
-        {
-            let mut node = self.root.as_ref()?;
-            loop {
-                match node.search(key) {
-                    Ok(i) => {
-                        if node.is_leaf() {
-                            path.push(i);
-                            break;
-                        }
-                        path.push(i + 1);
-                        node = &node.children[i + 1];
-                    }
-                    Err(i) => {
-                        if node.is_leaf() {
-                            return None; // Key not found
-                        }
-                        path.push(i);
-                        node = &node.children[i];
-                    }
-                }
-            }
-        }
+        let (path, leaf_idx) = self.search_path(key);
+        let leaf_idx = leaf_idx.ok()?;
 
-        // Now traverse with COW
+        self.get_mut_with_path(key, &path, leaf_idx)
+    }
+
+    fn get_mut_with_path(&mut self, _key: i64, path: &NodePath, leaf_idx: usize) -> Option<&mut V> {
         let root = self.root.as_mut()?;
-        let mut node = CompactArc::make_mut(root);
+        let mut node = root.make_mut();
 
-        for (depth, &idx) in path.iter().enumerate() {
-            if depth == path.len() - 1 {
-                // Last level - this is the key index in the leaf
-                return Some(&mut node.values[idx]);
-            }
-            // Apply COW to child
-            let child = &mut node.children[idx];
-            node = CompactArc::make_mut(child);
+        for idx in path.iter() {
+            let child = node.child_mut(idx);
+            node = child.make_mut();
         }
 
-        None
+        if leaf_idx < node.len() {
+            Some(&mut node.values_mut_slice()[leaf_idx])
+        } else {
+            None
+        }
     }
 
     /// Check if key exists. Lock-free, O(log n).
@@ -231,12 +1012,11 @@ impl<V: Clone> CowBTree<V> {
     /// Insert a key-value pair. Returns old value if key existed.
     pub fn insert(&mut self, key: i64, value: V) -> Option<V> {
         if self.root.is_none() {
-            let mut node = Node::new_leaf();
-            node.keys.push(key);
-            node.values.push(value);
-            // Count stored in Arc meta
-            self.root = Some(CompactArc::new_with_meta(node, 1));
+            let mut node = NodePtr::new_leaf();
+            node.push_leaf(key, value);
+            self.root = Some(node);
             self.max_key = key;
+            self.len = 1;
             return None;
         }
 
@@ -244,29 +1024,33 @@ impl<V: Clone> CowBTree<V> {
         if self.is_key_greater_than_max(key) {
             let root = self.root.as_mut().unwrap();
             let result = Self::insert_rightmost(root, key, value);
-
-            // Update max_key since we know we are appending to the end
             self.max_key = key;
 
             return match result {
                 InsertResult::Done(old) => {
-                    // Update count in root
-                    let root_arc = self.root.as_mut().unwrap();
-                    let count = CompactArc::meta(root_arc);
-                    // We must ensure we have a unique root to update meta
-                    // insert_rightmost already called make_mut on root, so it IS unique.
-                    // We can safely update meta.
-                    unsafe { CompactArc::set_meta(root_arc, count + 1) };
+                    if old.is_none() {
+                        self.len += 1;
+                    }
                     old
                 }
                 InsertResult::Split(median, right) => {
                     let old_root = self.root.take().unwrap();
-                    let old_len = CompactArc::meta(&old_root);
-                    let mut new_root = Node::new_internal();
-                    new_root.keys.push(median);
-                    new_root.children.push(old_root);
-                    new_root.children.push(right);
-                    self.root = Some(CompactArc::new_with_meta(new_root, old_len + 1));
+                    let mut new_root = NodePtr::new_internal();
+
+                    // SAFETY: new_root is a freshly created internal node with len=0.
+                    // We write old_root to children[0]. Internal nodes have len+1 children,
+                    // so with len=0 we have space for 1 child at index 0. old_root is moved
+                    // (not cloned) into the slot. push_internal will add children[1] and set len=1.
+                    unsafe {
+                        let c_ptr = (new_root.ptr.as_ptr() as *mut u8)
+                            .add(NodePtr::<V>::children_offset())
+                            as *mut NodePtr<V>;
+                        ptr::write(c_ptr, old_root);
+                    }
+
+                    new_root.push_internal(median, right);
+                    self.root = Some(new_root);
+                    self.len += 1;
                     None
                 }
             };
@@ -275,7 +1059,6 @@ impl<V: Clone> CowBTree<V> {
         let root = self.root.as_mut().unwrap();
         let result = Self::insert_recursive(root, key, value);
 
-        // Update max_key if necessary
         if key > self.max_key {
             self.max_key = key;
         }
@@ -283,163 +1066,147 @@ impl<V: Clone> CowBTree<V> {
         match result {
             InsertResult::Done(old) => {
                 if old.is_none() {
-                    // Update count in root
-                    let root_arc = self.root.as_mut().unwrap();
-                    let count = CompactArc::meta(root_arc);
-                    // insert_recursive ensures root is unique (make_mut)
-                    unsafe { CompactArc::set_meta(root_arc, count + 1) };
+                    self.len += 1;
                 }
                 old
             }
             InsertResult::Split(median, right) => {
-                // Root was split, create new root
                 let old_root = self.root.take().unwrap();
-                let old_len = CompactArc::meta(&old_root);
-                let mut new_root = Node::new_internal();
-                new_root.keys.push(median);
-                new_root.children.push(old_root);
-                new_root.children.push(right);
-                self.root = Some(CompactArc::new_with_meta(new_root, old_len + 1));
+                let mut new_root = NodePtr::new_internal();
+                // SAFETY: new_root is a freshly created internal node with len=0.
+                // We write old_root to children[0]. Internal nodes have len+1 children,
+                // so with len=0 we have space for 1 child at index 0. old_root is moved
+                // (not cloned) into the slot. push_internal will add children[1] and set len=1.
+                unsafe {
+                    let c_ptr = (new_root.ptr.as_ptr() as *mut u8)
+                        .add(NodePtr::<V>::children_offset())
+                        as *mut NodePtr<V>;
+                    ptr::write(c_ptr, old_root);
+                }
+                new_root.push_internal(median, right);
+                self.root = Some(new_root);
+                self.len += 1;
                 None
             }
         }
     }
 
-    // ...
-
     /// Check if key is greater than maximum key in tree (O(1) with caching)
     #[inline]
     fn is_key_greater_than_max(&self, key: i64) -> bool {
-        // If root is None, this function shouldn't be called or implies tree empty
-        // In insert, we check root.is_none() first.
-        // So here self.max_key is valid.
-        key > self.max_key
+        self.root.is_some() && key > self.max_key
     }
 
     /// Fast path: insert into rightmost leaf (for sequential inserts)
-    fn insert_rightmost(node_arc: &mut CompactArc<Node<V>>, key: i64, value: V) -> InsertResult<V> {
-        let node = CompactArc::make_mut(node_arc);
+    fn insert_rightmost(node: &mut NodePtr<V>, key: i64, value: V) -> InsertResult<V> {
+        let (res, _) = Self::insert_rightmost_return_ptr(node, key, value);
+        res
+    }
+
+    fn insert_rightmost_return_ptr(
+        node: &mut NodePtr<V>,
+        key: i64,
+        value: V,
+    ) -> (InsertResult<V>, *mut V) {
+        let node = node.make_mut();
 
         if node.is_leaf() {
-            // Append to end (O(1) push instead of O(n) insert)
-            node.keys.push(key);
-            node.values.push(value);
+            node.push_leaf(key, value);
 
-            if node.keys.len() > MAX_KEYS {
-                let (median, right) = Self::split_leaf(node);
-                InsertResult::Split(median, CompactArc::new_with_meta(right, 0))
-            // New node len is unknown/0 internal
-            } else {
-                InsertResult::Done(None)
+            // SAFETY: node is a leaf (verified above). We just pushed a value, so len >= 1.
+            // We compute a pointer to the newly inserted value (at index len - 1).
+            // If the node overflows (len > MAX_KEYS), we use rightmost split which moves
+            // only the last element to the new right node, so the pointer is at right[0].
+            // All pointer arithmetic stays within allocated bounds.
+            unsafe {
+                let len = node.len();
+                let v_ptr =
+                    (node.ptr.as_ptr() as *mut u8).add(NodePtr::<V>::values_offset()) as *mut V;
+                let ptr = v_ptr.add(len - 1);
+
+                if node.len() > MAX_KEYS {
+                    // Use rightmost split: keeps MAX_KEYS in left, moves 1 to right
+                    let (median, right) = node.split_leaf_rightmost();
+                    // After rightmost split, the inserted value is at right[0]
+                    let v_ptr_new = (right.ptr.as_ptr() as *mut u8)
+                        .add(NodePtr::<V>::values_offset())
+                        as *mut V;
+                    (InsertResult::Split(median, right), v_ptr_new)
+                } else {
+                    (InsertResult::Done(None), ptr)
+                }
             }
         } else {
-            // Go to rightmost child
-            let last_idx = node.children.len() - 1;
-            let result = Self::insert_rightmost(&mut node.children[last_idx], key, value);
+            let last_idx = node.len();
+            let child = node.child_mut(last_idx);
+            let (result, ptr) = Self::insert_rightmost_return_ptr(child, key, value);
 
             match result {
-                InsertResult::Done(old) => InsertResult::Done(old),
+                InsertResult::Done(old) => (InsertResult::Done(old), ptr),
                 InsertResult::Split(median, right) => {
-                    // Child was split, append to end
-                    node.keys.push(median);
-                    node.children.push(right);
+                    node.push_internal(median, right);
 
-                    if node.keys.len() > MAX_KEYS {
-                        let (m, r) = Self::split_internal(node);
-                        InsertResult::Split(m, CompactArc::new_with_meta(r, 0))
+                    if node.len() > MAX_KEYS {
+                        // Use rightmost split for internal nodes too
+                        let (m, r) = node.split_internal_rightmost();
+                        (InsertResult::Split(m, r), ptr)
                     } else {
-                        InsertResult::Done(None)
+                        (InsertResult::Done(None), ptr)
                     }
                 }
             }
         }
     }
 
-    fn insert_recursive(node_arc: &mut CompactArc<Node<V>>, key: i64, value: V) -> InsertResult<V> {
-        // COW: clone node if shared
-        let node = CompactArc::make_mut(node_arc);
+    fn insert_recursive(node: &mut NodePtr<V>, key: i64, value: V) -> InsertResult<V> {
+        let node = node.make_mut();
 
         if node.is_leaf() {
             match node.search(key) {
-                Ok(i) => {
-                    // Key exists, replace value
-                    let old = std::mem::replace(&mut node.values[i], value);
+                // SAFETY: node is a leaf (verified above). search returned Ok(i), meaning
+                // key exists at index i (where i < node.len()). We read the old value via
+                // ptr::read and write the new value via ptr::write. This is a replacement
+                // of an existing value, so no len change is needed.
+                Ok(i) => unsafe {
+                    let v_ptr =
+                        (node.ptr.as_ptr() as *mut u8).add(NodePtr::<V>::values_offset()) as *mut V;
+                    let old = ptr::read(v_ptr.add(i));
+                    ptr::write(v_ptr.add(i), value);
                     InsertResult::Done(Some(old))
-                }
+                },
                 Err(i) => {
-                    // Insert at position i
-                    node.keys.insert(i, key);
-                    node.values.insert(i, value);
+                    node.insert_leaf(i, key, value);
 
-                    // Check if split needed
-                    if node.keys.len() > MAX_KEYS {
-                        let (median, right) = Self::split_leaf(node);
-                        InsertResult::Split(median, CompactArc::new_with_meta(right, 0))
+                    if node.len() > MAX_KEYS {
+                        let (median, right) = node.split_leaf();
+                        InsertResult::Split(median, right)
                     } else {
                         InsertResult::Done(None)
                     }
                 }
             }
         } else {
-            // Internal node - find child to recurse into
             let i = match node.search(key) {
                 Ok(i) => i + 1,
                 Err(i) => i,
             };
 
-            let result = Self::insert_recursive(&mut node.children[i], key, value);
+            let result = Self::insert_recursive(node.child_mut(i), key, value);
 
             match result {
                 InsertResult::Done(old) => InsertResult::Done(old),
                 InsertResult::Split(median, right) => {
-                    // Child was split, insert median into this node
-                    node.keys.insert(i, median);
-                    node.children.insert(i + 1, right);
+                    node.insert_internal(i, median, right);
 
-                    // Check if this node needs splitting
-                    if node.keys.len() > MAX_KEYS {
-                        let (m, r) = Self::split_internal(node);
-                        InsertResult::Split(m, CompactArc::new_with_meta(r, 0))
+                    if node.len() > MAX_KEYS {
+                        let (m, r) = node.split_internal();
+                        InsertResult::Split(m, r)
                     } else {
                         InsertResult::Done(None)
                     }
                 }
             }
         }
-    }
-
-    /// Split a leaf node. Returns (median_key, right_node).
-    fn split_leaf(node: &mut Node<V>) -> (i64, Node<V>) {
-        let mid = node.keys.len() / 2;
-
-        let right_keys: CompactVec<i64> = node.keys.drain(mid..).collect();
-        let right_values: CompactVec<V> = node.values.drain(mid..).collect();
-
-        let median = right_keys[0];
-        let right = Node {
-            keys: right_keys,
-            values: right_values,
-            children: CompactVec::new(),
-        };
-
-        (median, right)
-    }
-
-    fn split_internal(node: &mut Node<V>) -> (i64, Node<V>) {
-        let mid = node.keys.len() / 2;
-
-        let right_keys: CompactVec<i64> = node.keys.drain(mid + 1..).collect();
-        let median = node.keys.pop().unwrap();
-        let right_children: CompactVec<CompactArc<Node<V>>> =
-            node.children.drain(mid + 1..).collect();
-
-        let right = Node {
-            keys: right_keys,
-            values: CompactVec::new(),
-            children: right_children,
-        };
-
-        (median, right)
     }
 
     /// Remove a key. Returns the value if it existed.
@@ -448,33 +1215,21 @@ impl<V: Clone> CowBTree<V> {
         let result = Self::remove_recursive(root, key);
 
         if result.is_some() {
-            // Update len in root
-            let root_arc = self.root.as_mut().unwrap();
-            let count = CompactArc::meta(root_arc);
-            // remove_recursive ensures root is unique (make_mut)
-            let new_count = count - 1;
-            unsafe { CompactArc::set_meta(root_arc, new_count) };
+            self.len -= 1;
 
-            if new_count == 0 {
+            if self.len == 0 {
                 self.root = None;
-                self.max_key = 0; // reset
+                self.max_key = 0;
             } else if self.max_key == key {
-                // We removed the max key, need to find the new max
                 self.refresh_max_key();
             }
 
-            // If root is empty internal node, make its only child the new root
-            if let Some(ref root) = self.root {
-                if !root.is_leaf() && root.keys.is_empty() {
-                    if root.children.len() == 1 {
-                        let child_node = root.children[0].clone();
-                        // Propagate count from old root to new root
-                        self.root = Some(child_node);
-                        let new_root_arc = self.root.as_mut().unwrap();
-                        unsafe { CompactArc::set_meta(new_root_arc, new_count) };
-                    }
-                } else if root.is_leaf() && root.keys.is_empty() {
-                    // Should be covered by new_count == 0 check above, but safe
+            if let Some(ref mut root) = self.root {
+                let root = root.make_mut();
+                if !root.is_leaf() && root.len() == 0 {
+                    let child_node = root.child_mut(0).clone();
+                    self.root = Some(child_node);
+                } else if root.is_leaf() && root.len() == 0 {
                     self.root = None;
                     self.max_key = 0;
                 }
@@ -484,30 +1239,136 @@ impl<V: Clone> CowBTree<V> {
         result
     }
 
+    /// Search and return path to the leaf.
+    /// Returns (path_indices, leaf_search_result)
+    /// path_indices: indices of children taken to reach the leaf
+    fn search_path(&self, key: i64) -> (NodePath, Result<usize, usize>) {
+        let mut path = NodePath::new();
+        if self.root.is_none() {
+            return (path, Err(0));
+        }
+
+        let mut node = self.root.as_ref().unwrap();
+        loop {
+            match node.search(key) {
+                Ok(i) => {
+                    if node.is_leaf() {
+                        return (path, Ok(i));
+                    }
+                    path.push(i + 1);
+                    node = node.child(i + 1);
+                }
+                Err(i) => {
+                    if node.is_leaf() {
+                        return (path, Err(i));
+                    }
+                    path.push(i);
+                    node = node.child(i);
+                }
+            }
+        }
+    }
+
+    /// Insert using pre-computed path and leaf index (avoids redundant search).
+    /// `leaf_idx` is the index in the leaf where the key should be inserted.
+    fn insert_with_path(
+        node_ptr: &mut NodePtr<V>,
+        key: i64,
+        value: V,
+        path: &NodePath,
+        depth: usize,
+        leaf_idx: usize,
+    ) -> (InsertResult<V>, *mut V) {
+        let node = node_ptr.make_mut();
+
+        if node.is_leaf() {
+            // Use pre-computed leaf_idx directly - no search needed
+            let i = leaf_idx;
+            node.insert_leaf(i, key, value);
+
+            if node.len() > MAX_KEYS {
+                let (median, right_node) = node.split_leaf();
+                // Must match split_leaf's mid calculation: self.len() / 2
+                // Before split, len was MAX_KEYS + 1, so mid = (MAX_KEYS + 1) / 2 = MAX_KEYS.div_ceil(2)
+                let mid = MAX_KEYS.div_ceil(2);
+
+                let ptr = if i < mid {
+                    // SAFETY: After split, i < mid means the inserted value stayed in node.
+                    // node is a valid leaf with i < node.len() after the split. We compute a
+                    // pointer to the inserted value at index i.
+                    unsafe {
+                        let v_ptr = (node.ptr.as_ptr() as *mut u8)
+                            .add(NodePtr::<V>::values_offset())
+                            as *mut V;
+                        v_ptr.add(i)
+                    }
+                } else {
+                    let right_idx = i - mid;
+                    // SAFETY: After split, i >= mid means the inserted value moved to right_node.
+                    // right_node is a valid leaf with right_idx < right_node.len() after the split.
+                    // We compute a pointer to the inserted value at index right_idx.
+                    unsafe {
+                        let v_ptr = (right_node.ptr.as_ptr() as *mut u8)
+                            .add(NodePtr::<V>::values_offset())
+                            as *mut V;
+                        v_ptr.add(right_idx)
+                    }
+                };
+
+                (InsertResult::Split(median, right_node), ptr)
+            } else {
+                // SAFETY: node is a leaf, we just inserted at index i (where i < node.len()).
+                // We compute a pointer to the newly inserted value.
+                unsafe {
+                    let v_ptr =
+                        (node.ptr.as_ptr() as *mut u8).add(NodePtr::<V>::values_offset()) as *mut V;
+                    let ptr = v_ptr.add(i);
+                    (InsertResult::Done(None), ptr)
+                }
+            }
+        } else {
+            let i = path.get(depth);
+
+            let (result, ptr) =
+                Self::insert_with_path(node.child_mut(i), key, value, path, depth + 1, leaf_idx);
+
+            match result {
+                InsertResult::Done(old) => (InsertResult::Done(old), ptr),
+                InsertResult::Split(median, right) => {
+                    node.insert_internal(i, median, right);
+
+                    if node.len() > MAX_KEYS {
+                        let (m, r) = node.split_internal();
+                        (InsertResult::Split(m, r), ptr)
+                    } else {
+                        (InsertResult::Done(None), ptr)
+                    }
+                }
+            }
+        }
+    }
+
     fn refresh_max_key(&mut self) {
         if let Some(root) = &self.root {
-            let mut node = root.as_ref();
+            let mut node = root;
             loop {
                 if node.is_leaf() {
-                    self.max_key = node.keys.last().copied().unwrap_or(0);
+                    self.max_key = node.keys().last().copied().unwrap_or(0);
                     break;
                 }
-                node = node.children.last().unwrap().as_ref();
+                node = node.children().last().unwrap();
             }
         } else {
             self.max_key = 0;
         }
     }
 
-    fn remove_recursive(node_arc: &mut CompactArc<Node<V>>, key: i64) -> Option<V> {
-        let node = CompactArc::make_mut(node_arc);
+    fn remove_recursive(node: &mut NodePtr<V>, key: i64) -> Option<V> {
+        let node = node.make_mut();
 
         if node.is_leaf() {
             match node.search(key) {
-                Ok(i) => {
-                    node.keys.remove(i);
-                    Some(node.values.remove(i))
-                }
+                Ok(i) => Some(node.remove_leaf(i)),
                 Err(_) => None,
             }
         } else {
@@ -516,158 +1377,43 @@ impl<V: Clone> CowBTree<V> {
                 Err(i) => i,
             };
 
-            // Ensure child has enough keys before recursing
-            if node.children[i].keys.len() <= MIN_KEYS {
+            if node.child(i).len() <= MIN_KEYS {
                 Self::ensure_child_can_lose_key(node, i);
             }
 
-            // Recalculate index after rebalancing
             let new_i = match node.search(key) {
                 Ok(i) => i + 1,
                 Err(i) => i,
             };
 
-            let i = new_i.min(node.children.len() - 1);
-            Self::remove_recursive(&mut node.children[i], key)
+            let i = new_i.min(node.len()); // Children len is len+1. Max index len.
+            Self::remove_recursive(node.child_mut(i), key)
         }
     }
 
-    fn ensure_child_can_lose_key(node: &mut Node<V>, i: usize) {
-        let can_borrow_left = i > 0 && node.children[i - 1].keys.len() > MIN_KEYS;
-        let can_borrow_right =
-            i < node.children.len() - 1 && node.children[i + 1].keys.len() > MIN_KEYS;
+    fn ensure_child_can_lose_key(node: &mut NodePtr<V>, i: usize) {
+        let can_borrow_left = i > 0 && node.child(i - 1).len() > MIN_KEYS;
+        let can_borrow_right = i < node.len() && node.child(i + 1).len() > MIN_KEYS;
 
         if can_borrow_left {
-            Self::borrow_from_left(node, i);
+            node.borrow_from_left(i);
         } else if can_borrow_right {
-            Self::borrow_from_right(node, i);
+            node.borrow_from_right(i);
         } else if i > 0 {
-            Self::merge_with_left(node, i);
-        } else if i < node.children.len() - 1 {
-            Self::merge_with_right(node, i);
-        }
-    }
-
-    fn borrow_from_left(node: &mut Node<V>, i: usize) {
-        // First, extract what we need from left sibling
-        let is_leaf = node.children[i - 1].is_leaf();
-        let (borrowed_key, borrowed_val, borrowed_child) = {
-            let left = CompactArc::make_mut(&mut node.children[i - 1]);
-            let key = left.keys.pop().unwrap();
-            let val = if is_leaf {
-                Some(left.values.pop().unwrap())
-            } else {
-                None
-            };
-            let child = if !is_leaf {
-                Some(left.children.pop().unwrap())
-            } else {
-                None
-            };
-            (key, val, child)
-        };
-
-        // Now modify the current child
-        let child = CompactArc::make_mut(&mut node.children[i]);
-        if is_leaf {
-            child.keys.insert(0, borrowed_key);
-            child.values.insert(0, borrowed_val.unwrap());
-            // Update separator to be the new first key of child
-            node.keys[i - 1] = child.keys[0];
-        } else {
-            let separator = std::mem::replace(&mut node.keys[i - 1], borrowed_key);
-            child.keys.insert(0, separator);
-            child.children.insert(0, borrowed_child.unwrap());
-        }
-    }
-
-    fn borrow_from_right(node: &mut Node<V>, i: usize) {
-        // First, extract what we need from right sibling
-        let is_leaf = node.children[i + 1].is_leaf();
-        let (borrowed_key, borrowed_val, borrowed_child, new_separator) = {
-            let right = CompactArc::make_mut(&mut node.children[i + 1]);
-            let key = right.keys.remove(0);
-            let val = if is_leaf {
-                Some(right.values.remove(0))
-            } else {
-                None
-            };
-            let child = if !is_leaf {
-                Some(right.children.remove(0))
-            } else {
-                None
-            };
-            let new_sep = if is_leaf { right.keys[0] } else { key };
-            (key, val, child, new_sep)
-        };
-
-        // Now modify the current child
-        let child = CompactArc::make_mut(&mut node.children[i]);
-        if is_leaf {
-            child.keys.push(borrowed_key);
-            child.values.push(borrowed_val.unwrap());
-            // Update separator to be the new first key of right
-            node.keys[i] = new_separator;
-        } else {
-            let separator = std::mem::replace(&mut node.keys[i], new_separator);
-            child.keys.push(separator);
-            child.children.push(borrowed_child.unwrap());
-        }
-    }
-
-    fn merge_with_left(node: &mut Node<V>, i: usize) {
-        let separator = node.keys.remove(i - 1);
-        let right = node.children.remove(i);
-
-        let left = CompactArc::make_mut(&mut node.children[i - 1]);
-
-        if !left.is_leaf() {
-            left.keys.push(separator);
-        }
-
-        // Move all from right to left
-        for k in right.keys.iter() {
-            left.keys.push(*k);
-        }
-        for v in right.values.iter() {
-            left.values.push(v.clone());
-        }
-        for c in right.children.iter() {
-            left.children.push(c.clone());
-        }
-    }
-
-    fn merge_with_right(node: &mut Node<V>, i: usize) {
-        let separator = node.keys.remove(i);
-        let right = node.children.remove(i + 1);
-
-        let left = CompactArc::make_mut(&mut node.children[i]);
-
-        if !left.is_leaf() {
-            left.keys.push(separator);
-        }
-
-        for k in right.keys.iter() {
-            left.keys.push(*k);
-        }
-        for v in right.values.iter() {
-            left.values.push(v.clone());
-        }
-        for c in right.children.iter() {
-            left.children.push(c.clone());
+            node.merge_with_left(i);
+        } else if i < node.len() {
+            node.merge_with_right(i);
         }
     }
 
     /// Iterate over chunks of keys and values (O(1) amortized traversal)
     /// Yields `(&[i64], &[V])` slices directly from leaf nodes.
-    /// This is ~100x faster for iteration overhead as it traverses the tree once per 128 items.
     pub fn iter_chunks(&self) -> impl Iterator<Item = (&[i64], &[V])> {
         CowBTreeChunkIter::new(self.root.as_ref())
     }
 
     /// Iterate over all key-value pairs in sorted order
     pub fn iter(&self) -> impl Iterator<Item = (&i64, &V)> {
-        // Optimized to use chunk iteration internally
         self.iter_chunks()
             .flat_map(|(keys, values)| keys.iter().zip(values.iter()))
     }
@@ -704,15 +1450,122 @@ impl<V: Clone> CowBTree<V> {
     pub fn clear(&mut self) {
         self.root = None;
         self.max_key = 0;
+        self.len = 0;
     }
 
-    /// Entry API for in-place updates
-    pub fn entry(&mut self, key: i64) -> Entry<'_, V> {
-        if self.contains_key(key) {
-            Entry::Occupied(OccupiedEntry { tree: self, key })
-        } else {
-            Entry::Vacant(VacantEntry { tree: self, key })
+    fn insert_rightmost_entry(&mut self, key: i64, value: V) -> *mut V {
+        let root = self.root.as_mut().unwrap();
+        let (result, ptr) = Self::insert_rightmost_return_ptr(root, key, value);
+        self.max_key = key;
+
+        match result {
+            InsertResult::Done(old) => {
+                if old.is_none() {
+                    self.len += 1;
+                }
+            }
+            InsertResult::Split(median, right) => {
+                let old_root = self.root.take().unwrap();
+                let mut new_root = NodePtr::new_internal();
+                // SAFETY: new_root is a freshly created internal node with len=0.
+                // We write old_root to children[0]. Internal nodes have len+1 children,
+                // so with len=0 we have space for 1 child at index 0. old_root is moved
+                // (not cloned) into the slot. push_internal will add children[1] and set len=1.
+                unsafe {
+                    let c_ptr = (new_root.ptr.as_ptr() as *mut u8)
+                        .add(NodePtr::<V>::children_offset())
+                        as *mut NodePtr<V>;
+                    ptr::write(c_ptr, old_root);
+                }
+                new_root.push_internal(median, right);
+                self.root = Some(new_root);
+                self.len += 1;
+            }
         }
+
+        ptr
+    }
+
+    /// Entry API for in-place updates.
+    /// Optimized: single traversal, O(1) get().
+    /// - entry(): 1 traversal
+    /// - OccupiedEntry::get(): O(1) via cached pointer
+    /// - OccupiedEntry::get_mut()/insert(): 1 traversal with COW
+    pub fn entry(&mut self, key: i64) -> Entry<'_, V> {
+        // Fast path for sequential append
+        if self.is_key_greater_than_max(key) {
+            return Entry::Vacant(VacantEntry {
+                tree: self,
+                key,
+                path: NodePath::new(), // Dummy, not used for rightmost
+                leaf_idx: 0,           // Dummy, not used for rightmost
+                is_rightmost: true,
+            });
+        }
+
+        let (path, leaf_result) = self.search_path(key);
+        match leaf_result {
+            Ok(idx) => Entry::Occupied(OccupiedEntry {
+                tree: self,
+                key,
+                path,
+                leaf_idx: idx,
+            }),
+            Err(idx) => Entry::Vacant(VacantEntry {
+                tree: self,
+                key,
+                path,
+                leaf_idx: idx,
+                is_rightmost: false,
+            }),
+        }
+    }
+
+    fn insert_using_path(
+        &mut self,
+        key: i64,
+        value: V,
+        path: &NodePath,
+        leaf_idx: usize,
+    ) -> *mut V {
+        if self.root.is_none() {
+            self.insert(key, value);
+            return self.get_mut(key).unwrap() as *mut V;
+        }
+
+        let root = self.root.as_mut().unwrap();
+        let (result, ptr) = Self::insert_with_path(root, key, value, path, 0, leaf_idx);
+
+        if key > self.max_key {
+            self.max_key = key;
+        }
+
+        match result {
+            InsertResult::Done(old) => {
+                if old.is_none() {
+                    self.len += 1;
+                }
+            }
+            InsertResult::Split(median, right) => {
+                let old_root = self.root.take().unwrap();
+                let mut new_root = NodePtr::new_internal();
+                // SAFETY: new_root is a freshly created internal node with len=0.
+                // We write old_root to children[0]. Internal nodes have len+1 children,
+                // so with len=0 we have space for 1 child at index 0. old_root is moved
+                // (not cloned) into the slot. push_internal will add children[1] and set len=1.
+                unsafe {
+                    let c_ptr = (new_root.ptr.as_ptr() as *mut u8)
+                        .add(NodePtr::<V>::children_offset())
+                        as *mut NodePtr<V>;
+                    ptr::write(c_ptr, old_root);
+                }
+                new_root.push_internal(median, right);
+                self.root = Some(new_root);
+                self.len += 1;
+            }
+        }
+
+        ptr
     }
 }
 
@@ -722,10 +1575,41 @@ pub enum Entry<'a, V: Clone> {
     Vacant(VacantEntry<'a, V>),
 }
 
+impl<'a, V: Clone> Entry<'a, V> {
+    pub fn or_insert(self, default: V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    pub fn and_modify<F>(self, f: F) -> Self
+    where
+        F: FnOnce(&mut V),
+    {
+        match self {
+            Entry::Occupied(mut entry) => {
+                f(entry.get_mut());
+                Entry::Occupied(entry)
+            }
+            Entry::Vacant(entry) => Entry::Vacant(entry),
+        }
+    }
+
+    pub fn key(&self) -> i64 {
+        match self {
+            Entry::Occupied(entry) => entry.key(),
+            Entry::Vacant(entry) => entry.key(),
+        }
+    }
+}
+
 /// An occupied entry in the CowBTree
 pub struct OccupiedEntry<'a, V: Clone> {
     tree: &'a mut CowBTree<V>,
     key: i64,
+    path: NodePath,
+    leaf_idx: usize,
 }
 
 impl<'a, V: Clone> OccupiedEntry<'a, V> {
@@ -734,28 +1618,48 @@ impl<'a, V: Clone> OccupiedEntry<'a, V> {
         self.key
     }
 
+    /// O(log n) - traverses the cached path to reach the leaf
     #[inline]
     pub fn get(&self) -> &V {
-        // Safe because we verified key exists in entry()
-        self.tree.get(self.key).unwrap()
+        let mut node = self.tree.root.as_ref().unwrap();
+        for idx in self.path.iter() {
+            node = node.child(idx);
+        }
+        &node.values()[self.leaf_idx]
     }
 
-    #[inline]
     pub fn get_mut(&mut self) -> &mut V {
-        // Safe because we verified key exists in entry()
-        self.tree.get_mut(self.key).unwrap()
+        self.tree
+            .get_mut_with_path(self.key, &self.path, self.leaf_idx)
+            .unwrap()
     }
 
-    #[inline]
     pub fn into_mut(self) -> &'a mut V {
-        // Safe because we verified key exists in entry()
-        self.tree.get_mut(self.key).unwrap()
+        self.tree
+            .get_mut_with_path(self.key, &self.path, self.leaf_idx)
+            .unwrap()
     }
 
-    #[inline]
     pub fn insert(&mut self, value: V) -> V {
-        // Replace existing value, returns old value
-        self.tree.insert(self.key, value).unwrap()
+        let node = self.tree.root.as_mut().unwrap();
+        let mut node = node.make_mut();
+
+        for idx in self.path.iter() {
+            let child = node.child_mut(idx);
+            node = child.make_mut();
+        }
+
+        // SAFETY: node is a leaf (we followed the path to a leaf). self.leaf_idx is the
+        // index where the key was found during entry lookup, so it's valid (< node.len()).
+        // We read the old value via ptr::read and write the new value via ptr::write.
+        // This is a replacement of an existing value, so no len change is needed.
+        unsafe {
+            let v_ptr = (node.ptr.as_ptr() as *mut u8).add(NodePtr::<V>::values_offset()) as *mut V;
+            let ptr = v_ptr.add(self.leaf_idx);
+            let old = ptr::read(ptr);
+            ptr::write(ptr, value);
+            old
+        }
     }
 }
 
@@ -763,6 +1667,11 @@ impl<'a, V: Clone> OccupiedEntry<'a, V> {
 pub struct VacantEntry<'a, V: Clone> {
     tree: &'a mut CowBTree<V>,
     key: i64,
+    path: NodePath,
+    /// Index in the leaf node where the key should be inserted
+    leaf_idx: usize,
+    /// Optimization: true if this entry represents a sequential insert (key > max_key)
+    is_rightmost: bool,
 }
 
 impl<'a, V: Clone> VacantEntry<'a, V> {
@@ -773,45 +1682,58 @@ impl<'a, V: Clone> VacantEntry<'a, V> {
 
     #[inline]
     pub fn insert(self, value: V) -> &'a mut V {
-        self.tree.insert(self.key, value);
-        // Safe because we just inserted
-        self.tree.get_mut(self.key).unwrap()
+        if self.is_rightmost {
+            let ptr = self.tree.insert_rightmost_entry(self.key, value);
+            // SAFETY: insert_rightmost_entry returns a valid pointer to the newly inserted
+            // value. The pointer remains valid for the lifetime 'a because we have exclusive
+            // access to the tree (&'a mut). The insert functions guarantee the pointer points
+            // to initialized, properly aligned memory within a leaf node.
+            unsafe { &mut *ptr }
+        } else {
+            let ptr = self
+                .tree
+                .insert_using_path(self.key, value, &self.path, self.leaf_idx);
+            // SAFETY: insert_using_path returns a valid pointer to the newly inserted value.
+            // The pointer remains valid for the lifetime 'a because we have exclusive access
+            // to the tree (&'a mut). The insert functions guarantee the pointer points to
+            // initialized, properly aligned memory within a leaf node.
+            unsafe { &mut *ptr }
+        }
     }
 }
 
 enum InsertResult<V: Clone> {
     Done(Option<V>),
-    Split(i64, CompactArc<Node<V>>),
+    Split(i64, NodePtr<V>),
 }
 
 /// Iterator over chunks of a CowBTree (leaf slices)
 struct CowBTreeChunkIter<'a, V: Clone> {
     /// Stack of (node, next_child_index) for traversal
     /// Only holds internal nodes.
-    stack: Vec<(&'a Node<V>, usize)>,
+    stack: Vec<(&'a NodePtr<V>, usize)>,
     /// Current leaf node being yielded (if any)
-    current_leaf: Option<&'a Node<V>>,
+    current_leaf: Option<&'a NodePtr<V>>,
 }
 
 impl<'a, V: Clone> CowBTreeChunkIter<'a, V> {
-    fn new(root: Option<&'a CompactArc<Node<V>>>) -> Self {
+    fn new(root: Option<&'a NodePtr<V>>) -> Self {
         let mut iter = Self {
             stack: Vec::new(),
             current_leaf: None,
         };
         if let Some(root) = root {
-            iter.descend_to_leftmost(root.as_ref());
+            iter.descend_to_leftmost(root);
         }
         iter
     }
 
     /// Descend to the leftmost leaf, pushing internal nodes onto the stack
-    fn descend_to_leftmost(&mut self, mut node: &'a Node<V>) {
+    fn descend_to_leftmost(&mut self, mut node: &'a NodePtr<V>) {
         while !node.is_leaf() {
-            self.stack.push((node, 1)); // Start at child 1 (we're descending to child 0)
-            node = node.children[0].as_ref();
+            self.stack.push((node, 1));
+            node = node.child(0);
         }
-        // Found a leaf - this is our first chunk
         self.current_leaf = Some(node);
     }
 }
@@ -820,27 +1742,23 @@ impl<'a, V: Clone> Iterator for CowBTreeChunkIter<'a, V> {
     type Item = (&'a [i64], &'a [V]);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // If we have a current leaf, yield it and consume it
         if let Some(leaf) = self.current_leaf.take() {
-            return Some((&leaf.keys, &leaf.values));
+            return Some((leaf.keys(), leaf.values()));
         }
 
-        // No current leaf, find next leaf from stack
         loop {
             let (node, idx) = self.stack.last_mut()?;
 
-            if *idx < node.children.len() {
+            if *idx < node.len() + 1 {
                 let child_idx = *idx;
                 *idx += 1;
-                let child = node.children[child_idx].as_ref();
+                let child = node.child(child_idx);
                 self.descend_to_leftmost(child);
 
-                // descend_to_leftmost sets current_leaf to the found leaf
                 if let Some(leaf) = self.current_leaf.take() {
-                    return Some((&leaf.keys, &leaf.values));
+                    return Some((leaf.keys(), leaf.values()));
                 }
             } else {
-                // Done with all children of this internal node
                 self.stack.pop();
             }
         }
@@ -850,15 +1768,15 @@ impl<'a, V: Clone> Iterator for CowBTreeChunkIter<'a, V> {
 /// Range iterator over a CowBTree yielding chunks
 /// Optimized: Seeks directly to start bound and yields slices
 struct CowBTreeRangeChunkIter<'a, V: Clone, R> {
-    stack: Vec<(&'a Node<V>, usize)>,
+    stack: Vec<(&'a NodePtr<V>, usize)>,
     range: R,
-    current_leaf: Option<&'a Node<V>>,
+    current_leaf: Option<&'a NodePtr<V>>,
     current_idx: usize,
     finished: bool,
 }
 
 impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> CowBTreeRangeChunkIter<'a, V, R> {
-    fn new(root: Option<&'a CompactArc<Node<V>>>, range: R) -> Self {
+    fn new(root: Option<&'a NodePtr<V>>, range: R) -> Self {
         let mut iter = Self {
             stack: Vec::new(),
             range,
@@ -867,14 +1785,14 @@ impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> CowBTreeRangeChunkIter<'a, V, 
             finished: false,
         };
         if let Some(root) = root {
-            iter.seek_to_start(root.as_ref());
+            iter.seek_to_start(root);
         } else {
             iter.finished = true;
         }
         iter
     }
 
-    fn seek_to_start(&mut self, mut node: &'a Node<V>) {
+    fn seek_to_start(&mut self, mut node: &'a NodePtr<V>) {
         let start_key = match self.range.start_bound() {
             Bound::Included(&k) => Some(k),
             Bound::Excluded(&k) => Some(k),
@@ -883,8 +1801,9 @@ impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> CowBTreeRangeChunkIter<'a, V, 
 
         loop {
             if node.is_leaf() {
+                let keys = node.keys();
                 let mut idx = if let Some(k) = start_key {
-                    match node.keys.binary_search(&k) {
+                    match keys.binary_search(&k) {
                         Ok(i) => i,
                         Err(i) => i,
                     }
@@ -893,7 +1812,7 @@ impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> CowBTreeRangeChunkIter<'a, V, 
                 };
 
                 if let Bound::Excluded(&k) = self.range.start_bound() {
-                    if idx < node.keys.len() && node.keys[idx] == k {
+                    if idx < keys.len() && keys[idx] == k {
                         idx += 1;
                     }
                 }
@@ -912,7 +1831,7 @@ impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> CowBTreeRangeChunkIter<'a, V, 
                 };
 
                 self.stack.push((node, idx + 1));
-                node = node.children[idx].as_ref();
+                node = node.child(idx);
             }
         }
     }
@@ -927,27 +1846,27 @@ impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> Iterator for CowBTreeRangeChun
         }
 
         loop {
-            // Check if we have a current leaf to yield from
             if let Some(leaf) = self.current_leaf {
-                if self.current_idx < leaf.keys.len() {
+                let keys = leaf.keys();
+                let values = leaf.values();
+                if self.current_idx < keys.len() {
                     let start = self.current_idx;
-                    // Determine end of chunk via bounds check
                     let end = match self.range.end_bound() {
-                        Bound::Unbounded => leaf.keys.len(),
+                        Bound::Unbounded => keys.len(),
                         Bound::Included(&k) => {
-                            if leaf.keys.last().unwrap() <= &k {
-                                leaf.keys.len()
+                            if keys.last().unwrap() <= &k {
+                                keys.len()
                             } else {
-                                let pos = leaf.keys[start..].partition_point(|&x| x <= k);
+                                let pos = keys[start..].partition_point(|&x| x <= k);
                                 self.finished = true;
                                 start + pos
                             }
                         }
                         Bound::Excluded(&k) => {
-                            if leaf.keys.last().unwrap() < &k {
-                                leaf.keys.len()
+                            if keys.last().unwrap() < &k {
+                                keys.len()
                             } else {
-                                let pos = leaf.keys[start..].partition_point(|&x| x < k);
+                                let pos = keys[start..].partition_point(|&x| x < k);
                                 self.finished = true;
                                 start + pos
                             }
@@ -961,9 +1880,9 @@ impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> Iterator for CowBTreeRangeChun
                     }
 
                     self.current_idx = end;
-                    let result = (&leaf.keys[start..end], &leaf.values[start..end]);
+                    let result = (&keys[start..end], &values[start..end]);
 
-                    if end == leaf.keys.len() && !self.finished {
+                    if end == keys.len() && !self.finished {
                         self.current_leaf = None;
                     } else {
                         self.finished = true;
@@ -980,12 +1899,11 @@ impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> Iterator for CowBTreeRangeChun
                 return None;
             }
 
-            // Find next leaf from stack
             if let Some((node, idx)) = self.stack.last_mut() {
-                if *idx < node.children.len() {
+                if *idx < node.len() + 1 {
                     let child_idx = *idx;
                     *idx += 1;
-                    let mut child = node.children[child_idx].as_ref();
+                    let mut child = node.child(child_idx);
 
                     loop {
                         if child.is_leaf() {
@@ -994,7 +1912,7 @@ impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> Iterator for CowBTreeRangeChun
                             break;
                         } else {
                             self.stack.push((child, 1));
-                            child = child.children[0].as_ref();
+                            child = child.child(0);
                         }
                     }
                 } else {
@@ -1056,18 +1974,14 @@ mod tests {
             tree.insert(i, i * 10);
         }
 
-        // Clone is O(1)
         let snapshot = tree.clone();
 
-        // Modify original
         tree.insert(50, 999);
         tree.insert(200, 2000);
 
-        // Snapshot still has old values
         assert_eq!(snapshot.get(50), Some(&500));
         assert_eq!(snapshot.get(200), None);
 
-        // Original has new values
         assert_eq!(tree.get(50), Some(&999));
         assert_eq!(tree.get(200), Some(&2000));
     }
@@ -1090,8 +2004,6 @@ mod tests {
     #[test]
     fn test_random_inserts() {
         let mut tree: CowBTree<i64> = CowBTree::new();
-
-        // Pseudo-random inserts
         let keys: Vec<i64> = (0..1000).map(|i| (i * 7919 + 13) % 10000).collect();
 
         for &k in &keys {
@@ -1152,14 +2064,12 @@ mod tests {
             tree.insert(i, i);
         }
 
-        // Remove every other
         for i in (0..1000).step_by(2) {
             assert_eq!(tree.remove(i), Some(i));
         }
 
         assert_eq!(tree.len(), 500);
 
-        // Check remaining
         for i in 0..1000 {
             if i % 2 == 0 {
                 assert_eq!(tree.get(i), None);
@@ -1195,20 +2105,404 @@ mod tests {
 
         let snapshot = tree.clone();
 
-        // Modify via get_mut
         if let Some(v) = tree.get_mut(50) {
             *v = 999;
         }
 
-        // Snapshot unchanged
         assert_eq!(snapshot.get(50), Some(&50));
-        // Original changed
         assert_eq!(tree.get(50), Some(&999));
     }
 
     #[test]
     fn test_memory_size() {
-        // CowBTree should be small (root: 8 + max_key: 8 = 16 bytes)
-        assert!(std::mem::size_of::<CowBTree<i64>>() <= 16);
+        assert!(std::mem::size_of::<CowBTree<i64>>() <= 24);
+    }
+
+    #[test]
+    fn test_entry_api() {
+        let mut tree: CowBTree<i64> = CowBTree::new();
+
+        let v = tree.entry(1).or_insert(10);
+        assert_eq!(*v, 10);
+        assert_eq!(tree.get(1), Some(&10));
+
+        let v = tree.entry(1).or_insert(20);
+        assert_eq!(*v, 10);
+
+        tree.entry(1).and_modify(|v| *v += 5);
+        assert_eq!(tree.get(1), Some(&15));
+
+        for i in 2..100 {
+            tree.entry(i).or_insert(i * 10);
+        }
+        assert_eq!(tree.len(), 99);
+        assert_eq!(tree.get(50), Some(&500));
+
+        tree.entry(50).and_modify(|v| *v = 999);
+        assert_eq!(tree.get(50), Some(&999));
+    }
+
+    #[test]
+    fn test_entry_vacant() {
+        let mut tree: CowBTree<i64> = CowBTree::new();
+
+        match tree.entry(42) {
+            Entry::Occupied(_) => panic!("Expected vacant"),
+            Entry::Vacant(v) => {
+                assert_eq!(v.key(), 42);
+                let val = v.insert(420);
+                assert_eq!(*val, 420);
+            }
+        }
+        assert_eq!(tree.get(42), Some(&420));
+        assert_eq!(tree.len(), 1);
+
+        tree.insert(10, 100);
+        tree.insert(50, 500);
+
+        match tree.entry(30) {
+            Entry::Occupied(_) => panic!("Expected vacant"),
+            Entry::Vacant(v) => {
+                assert_eq!(v.key(), 30);
+                v.insert(300);
+            }
+        }
+        assert_eq!(tree.get(30), Some(&300));
+        assert_eq!(tree.len(), 4);
+
+        match tree.entry(5) {
+            Entry::Occupied(_) => panic!("Expected vacant"),
+            Entry::Vacant(v) => {
+                v.insert(50);
+            }
+        }
+        match tree.entry(100) {
+            Entry::Occupied(_) => panic!("Expected vacant"),
+            Entry::Vacant(v) => {
+                v.insert(1000);
+            }
+        }
+        assert_eq!(tree.get(5), Some(&50));
+        assert_eq!(tree.get(100), Some(&1000));
+    }
+
+    #[test]
+    fn test_entry_occupied() {
+        let mut tree: CowBTree<i64> = CowBTree::new();
+
+        for i in 0..100 {
+            tree.insert(i, i * 10);
+        }
+
+        match tree.entry(50) {
+            Entry::Occupied(o) => {
+                assert_eq!(o.key(), 50);
+            }
+            Entry::Vacant(_) => panic!("Expected occupied"),
+        }
+
+        match tree.entry(50) {
+            Entry::Occupied(o) => {
+                assert_eq!(*o.get(), 500);
+            }
+            Entry::Vacant(_) => panic!("Expected occupied"),
+        }
+
+        match tree.entry(50) {
+            Entry::Occupied(mut o) => {
+                *o.get_mut() = 5000;
+            }
+            Entry::Vacant(_) => panic!("Expected occupied"),
+        }
+        assert_eq!(tree.get(50), Some(&5000));
+
+        match tree.entry(50) {
+            Entry::Occupied(mut o) => {
+                let old = o.insert(50000);
+                assert_eq!(old, 5000);
+            }
+            Entry::Vacant(_) => panic!("Expected occupied"),
+        }
+        assert_eq!(tree.get(50), Some(&50000));
+
+        let val_ref = match tree.entry(50) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(_) => panic!("Expected occupied"),
+        };
+        *val_ref = 500000;
+        assert_eq!(tree.get(50), Some(&500000));
+    }
+
+    #[test]
+    fn test_entry_cow_semantics() {
+        let mut tree: CowBTree<i64> = CowBTree::new();
+
+        for i in 0..100 {
+            tree.insert(i, i);
+        }
+
+        let snapshot = tree.clone();
+
+        match tree.entry(50) {
+            Entry::Occupied(mut o) => {
+                o.insert(999);
+            }
+            Entry::Vacant(_) => panic!("Expected occupied"),
+        }
+
+        match tree.entry(200) {
+            Entry::Occupied(_) => panic!("Expected vacant"),
+            Entry::Vacant(v) => {
+                v.insert(2000);
+            }
+        }
+
+        assert_eq!(snapshot.get(50), Some(&50));
+        assert_eq!(snapshot.get(200), None);
+        assert_eq!(snapshot.len(), 100);
+
+        assert_eq!(tree.get(50), Some(&999));
+        assert_eq!(tree.get(200), Some(&2000));
+        assert_eq!(tree.len(), 101);
+    }
+
+    #[test]
+    fn test_entry_many_inserts() {
+        let mut tree: CowBTree<i64> = CowBTree::new();
+
+        for i in 0..1000 {
+            match tree.entry(i) {
+                Entry::Occupied(_) => panic!("Should be vacant"),
+                Entry::Vacant(v) => {
+                    v.insert(i * 10);
+                }
+            }
+        }
+
+        assert_eq!(tree.len(), 1000);
+
+        for i in 0..1000 {
+            match tree.entry(i) {
+                Entry::Occupied(mut o) => {
+                    assert_eq!(*o.get(), i * 10);
+                    o.insert(i * 20);
+                }
+                Entry::Vacant(_) => panic!("Should be occupied"),
+            }
+        }
+
+        for i in 0..1000 {
+            assert_eq!(tree.get(i), Some(&(i * 20)));
+        }
+    }
+
+    #[test]
+    fn test_node_path_limit() {
+        let mut path = NodePath::new();
+        for i in 0..MAX_TREE_DEPTH {
+            path.push(i);
+        }
+        assert_eq!(path.len, MAX_TREE_DEPTH as u8);
+    }
+
+    #[test]
+    fn test_entry_sequential_optimization() {
+        let mut tree: CowBTree<i64> = CowBTree::new();
+
+        tree.insert(0, 0);
+
+        for i in 1..1000 {
+            tree.entry(i).or_insert(i * 10);
+        }
+
+        assert_eq!(tree.len(), 1000);
+        assert_eq!(tree.get(999), Some(&9990));
+        assert_eq!(tree.max_key, 999);
+    }
+
+    #[test]
+    fn test_drop_is_called() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone)]
+        #[allow(dead_code)]
+        struct DropCounter(i64);
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        {
+            let mut tree: CowBTree<DropCounter> = CowBTree::new();
+            for i in 0..100 {
+                tree.insert(i, DropCounter(i));
+            }
+            assert_eq!(tree.len(), 100);
+        }
+
+        let drops = DROP_COUNT.load(Ordering::SeqCst);
+        assert_eq!(drops, 100, "Expected 100 drops, got {}", drops);
+    }
+
+    #[test]
+    fn test_drop_with_splits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone)]
+        #[allow(dead_code)]
+        struct DropCounter(i64);
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        {
+            let mut tree: CowBTree<DropCounter> = CowBTree::new();
+            for i in 0..500 {
+                tree.insert(i, DropCounter(i));
+            }
+            assert_eq!(tree.len(), 500);
+        }
+
+        let drops = DROP_COUNT.load(Ordering::SeqCst);
+        assert_eq!(drops, 500, "Expected 500 drops, got {}", drops);
+    }
+
+    #[test]
+    fn test_drop_with_clone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone)]
+        #[allow(dead_code)]
+        struct DropCounter(i64);
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        {
+            let mut tree1: CowBTree<DropCounter> = CowBTree::new();
+            for i in 0..100 {
+                tree1.insert(i, DropCounter(i));
+            }
+
+            let tree2 = tree1.clone();
+            assert_eq!(tree1.len(), 100);
+            assert_eq!(tree2.len(), 100);
+
+            drop(tree1);
+            assert_eq!(
+                DROP_COUNT.load(Ordering::SeqCst),
+                0,
+                "Data should not be dropped while clone exists"
+            );
+            drop(tree2);
+        }
+
+        let drops = DROP_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            drops, 100,
+            "Expected 100 drops after both trees dropped, got {}",
+            drops
+        );
+    }
+
+    #[test]
+    fn test_rightmost_split_optimization() {
+        // Test that sequential inserts use rightmost split optimization
+        // which achieves ~100% fill factor instead of 50%
+        let mut tree: CowBTree<i64> = CowBTree::new();
+
+        // Insert enough to cause multiple splits
+        // With MAX_KEYS=128, after 1000 inserts we should have ~8 leaf nodes
+        // With standard 50% split: ~16 leaf nodes at 50% fill
+        // With rightmost split: ~8 leaf nodes at ~100% fill
+        for i in 0..1000 {
+            tree.insert(i, i * 10);
+        }
+
+        assert_eq!(tree.len(), 1000);
+
+        // Verify all values are correct
+        for i in 0..1000 {
+            assert_eq!(tree.get(i), Some(&(i * 10)), "Failed at key {}", i);
+        }
+
+        // Count leaf nodes and check fill factor
+        let mut leaf_count = 0;
+        let mut total_keys = 0;
+        for (keys, _) in tree.iter_chunks() {
+            leaf_count += 1;
+            total_keys += keys.len();
+
+            // All but the last (rightmost) leaf should be nearly full (MAX_KEYS)
+            // The rightmost leaf can have 1..=MAX_KEYS keys
+            // With rightmost split, non-rightmost leaves have exactly MAX_KEYS
+        }
+
+        assert_eq!(total_keys, 1000);
+
+        // With rightmost split optimization:
+        // - 1000 keys, MAX_KEYS=128
+        // - First 7 leaves should have 128 keys each = 896 keys
+        // - Last leaf should have 104 keys
+        // - Total: 8 leaves
+        //
+        // Without optimization (50% split):
+        // - Would have ~16 leaves at ~64 keys each
+
+        // We expect 8 leaves (1000 / 128 = 7.8, rounded up)
+        // Allow some variance, but should be much less than 16
+        assert!(
+            leaf_count <= 10,
+            "Expected ~8 leaf nodes with rightmost split, got {} (suggests 50% split is being used)",
+            leaf_count
+        );
+
+        // Verify fill factor: total_keys / (leaf_count * MAX_KEYS) should be > 75%
+        let fill_factor = (total_keys as f64) / (leaf_count as f64 * MAX_KEYS as f64);
+        assert!(
+            fill_factor > 0.75,
+            "Expected fill factor > 75%, got {:.1}%",
+            fill_factor * 100.0
+        );
+    }
+
+    #[test]
+    fn test_rightmost_split_with_entry_api() {
+        // Test that entry API also benefits from rightmost split
+        let mut tree: CowBTree<i64> = CowBTree::new();
+
+        for i in 0..1000 {
+            tree.entry(i).or_insert(i * 10);
+        }
+
+        assert_eq!(tree.len(), 1000);
+
+        // Count leaves - should match the insert test
+        let leaf_count = tree.iter_chunks().count();
+        assert!(
+            leaf_count <= 10,
+            "Expected ~8 leaf nodes with rightmost split via entry API, got {}",
+            leaf_count
+        );
     }
 }

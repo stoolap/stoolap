@@ -827,6 +827,9 @@ impl Hash for Value {
                 let chunks = len / 8;
                 let ptr = bytes.as_ptr();
                 for i in 0..chunks {
+                    // SAFETY: We iterate i from 0..chunks where chunks = len/8.
+                    // So i*8 is always < len, and we read 8 bytes which is valid
+                    // since (i+1)*8 <= chunks*8 <= len. read_unaligned handles alignment.
                     let chunk = unsafe { (ptr.add(i * 8) as *const u64).read_unaligned() };
                     h = wymix(h ^ chunk, WY_P2);
                 }
@@ -861,6 +864,9 @@ impl Hash for Value {
                 let chunks = len / 8;
                 let ptr = bytes.as_ptr();
                 for i in 0..chunks {
+                    // SAFETY: We iterate i from 0..chunks where chunks = len/8.
+                    // So i*8 is always < len, and we read 8 bytes which is valid
+                    // since (i+1)*8 <= chunks*8 <= len. read_unaligned handles alignment.
                     let chunk = unsafe { (ptr.add(i * 8) as *const u64).read_unaligned() };
                     h = wymix(h ^ chunk, WY_P2);
                 }

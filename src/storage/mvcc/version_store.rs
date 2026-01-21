@@ -1086,7 +1086,7 @@ impl VersionStore {
             return false;
         }
 
-        self.versions.read().clone().contains_key(row_id)
+        self.versions.read().contains_key(row_id)
     }
 
     /// Gets the latest visible version of a row
@@ -1119,7 +1119,8 @@ impl VersionStore {
         }
 
         // SLOW PATH: version chain traversal (Snapshot Isolation, AS OF, etc.)
-        let versions = self.versions.read().clone();
+        // No need to clone tree for single-row lookup - just hold read guard
+        let versions = self.versions.read();
         let chain = versions.get(row_id)?;
 
         // Check HEAD in case arena path was skipped
@@ -1521,7 +1522,8 @@ impl VersionStore {
             return None;
         }
 
-        let versions = self.versions.read().clone();
+        // No need to clone tree for single-row lookup - just hold read guard
+        let versions = self.versions.read();
         let chain = versions.get(row_id)?;
 
         // Traverse version chain from newest to oldest
@@ -1551,7 +1553,8 @@ impl VersionStore {
             return None;
         }
 
-        let versions = self.versions.read().clone();
+        // No need to clone tree for single-row lookup - just hold read guard
+        let versions = self.versions.read();
         let chain = versions.get(row_id)?;
 
         // Traverse version chain from newest to oldest
@@ -1578,7 +1581,9 @@ impl VersionStore {
             return Vec::new();
         }
 
-        self.versions.read().clone().keys().collect()
+        // Clone tree to avoid holding lock for the duration of iteration
+        let versions = self.versions.read().clone();
+        versions.keys().collect()
     }
 
     /// Returns all row IDs that are visible to the given transaction
@@ -3048,8 +3053,9 @@ impl VersionStore {
         }
 
         // Slow path: look up in version chain
-        let versions = self.versions.read().clone();
-        versions
+        // No need to clone tree for single-row lookup - just hold read guard
+        self.versions
+            .read()
             .get(idx.row_id)
             .map(|chain| (idx.row_id, chain.version.data.clone()))
     }
@@ -3075,8 +3081,9 @@ impl VersionStore {
         }
 
         // Slow path: look up in version chain
-        let versions = self.versions.read().clone();
-        versions
+        // No need to clone tree for single-row lookup - just hold read guard
+        self.versions
+            .read()
             .get(idx.row_id)
             .and_then(|entry| entry.version.data.get(col_idx).cloned())
     }
@@ -3772,7 +3779,7 @@ impl VersionStore {
 
     /// Returns the count of rows
     pub fn row_count(&self) -> usize {
-        self.versions.read().clone().len()
+        self.versions.read().len()
     }
     /// Tries to claim a row for update (dirty write prevention)
     pub fn try_claim_row(&self, row_id: i64, txn_id: i64) -> Result<(), Error> {
@@ -4047,8 +4054,9 @@ impl VersionStore {
         // Check for duplicate: if row already exists with identical data, skip adding
         // This prevents duplicate version chain entries when both snapshot and WAL
         // contain the same row data (can happen due to race conditions during snapshot)
+        // No need to clone tree for single-row lookup - just hold read guard
         {
-            let versions = self.versions.read().clone();
+            let versions = self.versions.read();
             if let Some(existing_entry) = versions.get(row_id) {
                 let existing = &existing_entry.version;
                 // Check if data is identical (both deleted status and row data)
@@ -4162,7 +4170,8 @@ impl VersionStore {
         }
 
         // Get row count for capacity hint
-        let expected_rows = self.versions.read().clone().len();
+        // No need to clone tree just for len()
+        let expected_rows = self.versions.read().len();
 
         if meta.column_names.len() == 1 {
             // Single-column index
@@ -7024,7 +7033,7 @@ mod tests {
 
         // Verify versions map is empty
         assert_eq!(
-            store.versions.read().clone().len(),
+            store.versions.read().len(),
             0,
             "Versions map should be empty"
         );
@@ -7058,7 +7067,7 @@ mod tests {
 
         // Verify row still exists
         assert_eq!(
-            store.versions.read().clone().len(),
+            store.versions.read().len(),
             1,
             "Row should still exist in versions"
         );
@@ -7090,7 +7099,7 @@ mod tests {
 
         assert_eq!(cleaned, 3, "Should clean only 3 deleted rows");
         assert_eq!(
-            store.versions.read().clone().len(),
+            store.versions.read().len(),
             2,
             "2 non-deleted rows should remain"
         );

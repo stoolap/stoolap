@@ -404,6 +404,10 @@ impl<T> CompactVec<T> {
 
             impl<T> Drop for ExtendGuard<'_, T> {
                 fn drop(&mut self) {
+                    // SAFETY: written_count tracks how many elements were successfully
+                    // written before a panic. Setting len to this value ensures Drop
+                    // will clean up exactly those elements. This is only reached on panic
+                    // (normal path uses mem::forget).
                     unsafe {
                         self.vec.set_len(self.written_count);
                     }
@@ -440,6 +444,8 @@ impl<T> CompactVec<T> {
             // Success! Set final length and forget the guard
             let final_len = guard.written_count;
             mem::forget(guard);
+            // SAFETY: final_len equals the number of elements written by the loop.
+            // reserve() ensured capacity, and the loop wrote exactly final_len elements.
             unsafe {
                 self.set_len(final_len);
             }
@@ -481,6 +487,10 @@ impl<T> CompactVec<T> {
 
         impl<T> Drop for ExtendCloneGuard<'_, T> {
             fn drop(&mut self) {
+                // SAFETY: written_count tracks how many elements were successfully
+                // cloned before a panic. Setting len to this value ensures Drop
+                // will clean up exactly those elements. This is only reached on panic
+                // (normal path uses mem::forget).
                 unsafe {
                     self.vec.set_len(self.written_count);
                 }
@@ -506,6 +516,8 @@ impl<T> CompactVec<T> {
         // Success! Set final length and forget the guard
         let final_len = guard.written_count;
         mem::forget(guard);
+        // SAFETY: final_len equals original_len + slice_len. reserve() ensured capacity,
+        // and the loop successfully cloned all slice_len elements.
         unsafe {
             self.set_len(final_len);
         }
@@ -709,8 +721,10 @@ impl<T: Clone> Clone for CompactVec<T> {
 
         impl<T> Drop for CloneGuard<'_, T> {
             fn drop(&mut self) {
-                // Set len to cloned_count so CompactVec::drop will drop
-                // the successfully cloned elements and deallocate the buffer
+                // SAFETY: cloned_count tracks how many elements were successfully
+                // cloned before a panic. Setting len to this value ensures Drop
+                // will clean up exactly those elements. This is only reached on panic
+                // (normal path uses mem::forget).
                 unsafe {
                     self.vec.set_len(self.cloned_count);
                 }
@@ -739,6 +753,8 @@ impl<T: Clone> Clone for CompactVec<T> {
         // Success! Set final length and forget the guard (prevent double-set)
         let cloned = guard.cloned_count;
         mem::forget(guard);
+        // SAFETY: cloned equals len (the number of elements in self).
+        // with_capacity(len) ensured capacity, and all len elements were cloned.
         unsafe {
             new_vec.set_len(cloned);
         }
@@ -846,6 +862,10 @@ impl<T> FromIterator<T> for CompactVec<T> {
 
             impl<T> Drop for FromIterGuard<'_, T> {
                 fn drop(&mut self) {
+                    // SAFETY: written_count tracks how many elements were successfully
+                    // written before a panic. Setting len to this value ensures Drop
+                    // will clean up exactly those elements. This is only reached on panic
+                    // (normal path uses mem::forget).
                     unsafe {
                         self.vec.set_len(self.written_count);
                     }
@@ -881,6 +901,8 @@ impl<T> FromIterator<T> for CompactVec<T> {
             // Success! Set final length and forget the guard
             let final_len = guard.written_count;
             mem::forget(guard);
+            // SAFETY: final_len equals the number of elements written by the loop.
+            // with_capacity() ensured capacity, and the loop wrote exactly final_len elements.
             unsafe {
                 vec.set_len(final_len);
             }

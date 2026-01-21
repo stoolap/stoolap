@@ -834,9 +834,12 @@ impl I64Set {
         let mut idx = Self::hash(key) & mask;
 
         loop {
+            // SAFETY: idx is always (hash & mask), where mask = slots.len() - 1.
+            // Since slots.len() is a power of 2, idx is always in bounds.
             let slot = unsafe { *self.slots.get_unchecked(idx) };
 
             if slot == EMPTY {
+                // SAFETY: Same bounds reasoning as above - idx is always valid.
                 unsafe { *self.slots.get_unchecked_mut(idx) = key };
                 self.len += 1;
                 return true;
@@ -858,6 +861,8 @@ impl I64Set {
         let mut idx = Self::hash(key) & mask;
 
         loop {
+            // SAFETY: idx is always (hash & mask), where mask = slots.len() - 1.
+            // Since slots.len() is a power of 2, idx is always in bounds.
             let slot = unsafe { *self.slots.get_unchecked(idx) };
 
             if slot == EMPTY {
@@ -881,6 +886,8 @@ impl I64Set {
 
         // Find the key
         loop {
+            // SAFETY: idx is always (hash & mask), where mask = slots.len() - 1.
+            // Since slots.len() is a power of 2, idx is always in bounds.
             let slot = unsafe { *self.slots.get_unchecked(idx) };
 
             if slot == EMPTY {
@@ -901,6 +908,8 @@ impl I64Set {
         let mut next_idx = (idx + 1) & mask;
 
         loop {
+            // SAFETY: next_idx is always (some_value & mask), where mask = slots.len() - 1.
+            // Since slots.len() is a power of 2, next_idx is always in bounds.
             let next_slot = unsafe { *self.slots.get_unchecked(next_idx) };
 
             if next_slot == EMPTY {
@@ -916,6 +925,8 @@ impl I64Set {
             };
 
             if can_move {
+                // SAFETY: empty_idx was either the original idx (valid) or a previous
+                // next_idx (also valid by the same mask reasoning).
                 unsafe {
                     *self.slots.get_unchecked_mut(empty_idx) = next_slot;
                 }
@@ -925,6 +936,7 @@ impl I64Set {
             next_idx = (next_idx + 1) & mask;
         }
 
+        // SAFETY: empty_idx is always a valid index (same mask reasoning as above).
         unsafe {
             *self.slots.get_unchecked_mut(empty_idx) = EMPTY;
         }
