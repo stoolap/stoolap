@@ -584,18 +584,32 @@ impl Drop for PersistenceManager {
     }
 }
 
-/// Serialize a RowVersion to binary format
+/// Magic bytes for RowVersion format v2: 8 bytes representing a negative i64
+///
+/// This distinguishes v2 (without row_id) from v1 (with row_id).
+/// The magic is designed as a negative i64 value (MSB has high bit set) because:
+/// - v1 format starts with txn_id (always positive i64)
+/// - A negative i64 can NEVER appear as the first 8 bytes of v1 data
+/// - This eliminates any collision risk between magic bytes and valid v1 data
+///
+/// Value: 0x8000000000325652 as little-endian = "RV2\0" + padding + 0x80
+const ROW_VERSION_MAGIC_V2: [u8; 8] = [0x52, 0x56, 0x32, 0x00, 0x00, 0x00, 0x00, 0x80];
+
+/// Serialize a RowVersion to binary format (v2 - without row_id)
+///
+/// Format v2: magic(8) + txn_id(8) + deleted_at(8) + create_time(8) + values
+/// Format v1 (legacy): txn_id(8) + deleted_at(8) + row_id(8) + create_time(8) + values
 pub fn serialize_row_version(version: &RowVersion) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
+
+    // Magic bytes for v2 format
+    buf.extend_from_slice(&ROW_VERSION_MAGIC_V2);
 
     // Transaction ID
     buf.extend_from_slice(&version.txn_id.to_le_bytes());
 
     // Deleted at transaction ID (0 if not deleted)
     buf.extend_from_slice(&version.deleted_at_txn_id.to_le_bytes());
-
-    // Row ID
-    buf.extend_from_slice(&version.row_id.to_le_bytes());
 
     // Create time
     buf.extend_from_slice(&version.create_time.to_le_bytes());
@@ -613,9 +627,24 @@ pub fn serialize_row_version(version: &RowVersion) -> Result<Vec<u8>> {
 }
 
 /// Deserialize a RowVersion from binary format
+///
+/// Supports both v1 (with row_id) and v2 (without row_id) formats.
+/// v2 format is detected by 8-byte magic that represents a negative i64.
+/// Since v1 starts with txn_id (always positive), there's no collision risk.
 pub fn deserialize_row_version(data: &[u8]) -> Result<RowVersion> {
+    // Check for v2 format (8-byte magic representing negative i64)
+    if data.len() >= 8 && data[0..8] == ROW_VERSION_MAGIC_V2 {
+        return deserialize_row_version_v2(data);
+    }
+
+    // Fall back to v1 format (legacy with row_id)
+    deserialize_row_version_v1(data)
+}
+
+/// Deserialize v1 format (legacy with row_id - row_id is ignored)
+fn deserialize_row_version_v1(data: &[u8]) -> Result<RowVersion> {
     if data.len() < 32 {
-        return Err(Error::internal("data too short for RowVersion"));
+        return Err(Error::internal("data too short for RowVersion v1"));
     }
 
     let mut pos = 0;
@@ -628,8 +657,8 @@ pub fn deserialize_row_version(data: &[u8]) -> Result<RowVersion> {
     let deleted_at_txn_id = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
     pos += 8;
 
-    // Row ID
-    let row_id = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+    // Row ID (read but ignored - caller has it from context)
+    let _row_id = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
     pos += 8;
 
     // Create time
@@ -663,7 +692,57 @@ pub fn deserialize_row_version(data: &[u8]) -> Result<RowVersion> {
         txn_id,
         deleted_at_txn_id,
         data: Row::from_values(values),
-        row_id,
+        create_time,
+    })
+}
+
+/// Deserialize v2 format (without row_id)
+fn deserialize_row_version_v2(data: &[u8]) -> Result<RowVersion> {
+    if data.len() < 32 {
+        return Err(Error::internal("data too short for RowVersion v2"));
+    }
+
+    let mut pos = 8; // Skip 8-byte magic
+
+    // Transaction ID
+    let txn_id = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+
+    // Deleted at transaction ID
+    let deleted_at_txn_id = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+
+    // Create time
+    let create_time = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+
+    // Data (values)
+    if pos + 4 > data.len() {
+        return Err(Error::internal("missing value count"));
+    }
+    let value_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        if pos + 4 > data.len() {
+            return Err(Error::internal("missing value length"));
+        }
+        let value_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        if pos + value_len > data.len() {
+            return Err(Error::internal("missing value data"));
+        }
+        let value = deserialize_value(&data[pos..pos + value_len])?;
+        pos += value_len;
+        values.push(value);
+    }
+
+    Ok(RowVersion {
+        txn_id,
+        deleted_at_txn_id,
+        data: Row::from_values(values),
         create_time,
     })
 }
@@ -905,7 +984,7 @@ mod tests {
         assert_eq!(pm.current_lsn(), 2); // DDL entry + commit marker
 
         // Record DML
-        let version = RowVersion::new(1, 100, Row::from_values(vec![Value::Integer(42)]));
+        let version = RowVersion::new(1, Row::from_values(vec![Value::Integer(42)]));
         pm.record_dml_operation(1, "test", 100, WALOperationType::Insert, &version)
             .unwrap();
         assert_eq!(pm.current_lsn(), 3);
@@ -954,7 +1033,6 @@ mod tests {
     fn test_row_version_serialization() {
         let version = RowVersion::new(
             123,
-            100,
             Row::from_values(vec![
                 Value::Integer(100),
                 Value::text("test"),
@@ -966,7 +1044,6 @@ mod tests {
         let deserialized = deserialize_row_version(&serialized).unwrap();
 
         assert_eq!(deserialized.txn_id, 123);
-        assert_eq!(deserialized.row_id, 100);
         assert_eq!(deserialized.deleted_at_txn_id, 0);
         assert_eq!(deserialized.data.len(), 3);
     }
@@ -986,8 +1063,7 @@ mod tests {
             pm.start().unwrap();
 
             for i in 1..=5 {
-                let version =
-                    RowVersion::new(i, i * 100, Row::from_values(vec![Value::Integer(i * 10)]));
+                let version = RowVersion::new(i, Row::from_values(vec![Value::Integer(i * 10)]));
                 pm.record_dml_operation(i, "test", i * 100, WALOperationType::Insert, &version)
                     .unwrap();
                 // Commit each transaction

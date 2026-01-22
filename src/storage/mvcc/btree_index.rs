@@ -409,9 +409,6 @@ impl Index for BTreeIndex {
         // BTree index only uses the first value (single column)
         let value = &values[0];
 
-        // Wrap value in Arc for O(1) cloning
-        let arc_value = CompactArc::new(value.clone());
-
         // Hold write locks for entire operation to prevent race conditions
         // (read-then-write pattern is unsafe with concurrent modifications)
         let mut sorted_values = self.sorted_values.write().unwrap();
@@ -438,7 +435,7 @@ impl Index for BTreeIndex {
 
         // Check uniqueness constraint using BTreeMap O(log n) lookup
         if self.unique && !value.is_null() {
-            if let Some(rows) = sorted_values.get(&arc_value) {
+            if let Some(rows) = sorted_values.get(value) {
                 // Check if any OTHER row has this value (allow updating same row)
                 for existing_row_id in rows.iter() {
                     if *existing_row_id != row_id {
@@ -451,6 +448,16 @@ impl Index for BTreeIndex {
                 }
             }
         }
+
+        // Try to reuse existing Arc if value already exists (O(1) clone)
+        // Only create new Arc if this is a new unique value
+        let arc_value = if let Some((existing_arc, _)) = sorted_values.get_key_value(value) {
+            // Value exists - reuse the existing Arc (O(1) atomic refcount bump)
+            CompactArc::clone(existing_arc)
+        } else {
+            // New unique value - create Arc once
+            CompactArc::new(value.clone())
+        };
 
         // Add to sorted index (for O(log n) range and equality queries)
         // Insert in sorted order for O(N+M) intersection/union without re-sorting
@@ -522,14 +529,24 @@ impl Index for BTreeIndex {
             }
         }
 
+        // Try to reuse existing Arc if value already exists in index (memory deduplication)
+        // This ensures only one Arc per unique value across the entire index
+        let final_arc = if let Some((existing_arc, _)) = sorted_values.get_key_value(&**arc_value) {
+            // Value exists - reuse the existing Arc for memory efficiency
+            CompactArc::clone(existing_arc)
+        } else {
+            // New unique value - use the provided Arc
+            CompactArc::clone(arc_value)
+        };
+
         // Add to sorted index and row mapping - O(1) Arc clone, no Value clone!
         let btree_rows = sorted_values
-            .entry(CompactArc::clone(arc_value))
+            .entry(CompactArc::clone(&final_arc))
             .or_default();
         if let Err(pos) = btree_rows.binary_search(&row_id) {
             btree_rows.insert(pos, row_id);
         }
-        row_to_value.insert(row_id, CompactArc::clone(arc_value));
+        row_to_value.insert(row_id, final_arc);
 
         // Drop locks before invalidating cache
         drop(sorted_values);

@@ -580,12 +580,12 @@ impl MVCCEngine {
         ));
 
         // Load all rows from the snapshot
-        reader.for_each(|_row_id, mut version| {
+        reader.for_each(|row_id, mut version| {
             // Snapshot versions have txn_id = -1, we need to use the recovery txn_id
             version.txn_id = super::RECOVERY_TRANSACTION_ID;
 
             // Apply to version store
-            version_store.apply_recovered_version(version);
+            version_store.apply_recovered_version(row_id, version);
             true
         })?;
 
@@ -714,7 +714,7 @@ impl MVCCEngine {
                     let table_name = entry.table_name.to_lowercase();
                     if let Ok(store) = self.get_version_store(&table_name) {
                         // Apply the version to the store
-                        store.apply_recovered_version(row_version);
+                        store.apply_recovered_version(entry.row_id, row_version);
                     }
                 }
             }
@@ -2095,16 +2095,13 @@ impl Engine for MVCCEngine {
                 // between the WAL checkpoint and the snapshot contents.
                 let mut write_error = false;
                 store.for_each_committed_version_with_cutoff(
-                    |_row_id, version| {
+                    |row_id, version| {
                         // Clone version with snapshot TxnID marker
                         let mut snapshot_version = version.clone();
                         snapshot_version.txn_id = -1; // Mark as snapshot version
 
-                        if let Err(e) = writer.append_row(&snapshot_version) {
-                            eprintln!(
-                                "Warning: Failed to write row {} to snapshot: {}",
-                                _row_id, e
-                            );
+                        if let Err(e) = writer.append_row(row_id, &snapshot_version) {
+                            eprintln!("Warning: Failed to write row {} to snapshot: {}", row_id, e);
                             write_error = true;
                             return false; // Stop iteration
                         }
@@ -2698,7 +2695,6 @@ impl EngineOperations {
                     txn_id: version_txn_id,
                     deleted_at_txn_id: if is_deleted { version_txn_id } else { 0 },
                     data: row_data,
-                    row_id,
                     create_time: 0,
                 };
 
@@ -2891,7 +2887,6 @@ impl TransactionEngineOperations for EngineOperations {
                         txn_id: version_txn_id,
                         deleted_at_txn_id: if is_deleted { version_txn_id } else { 0 },
                         data: row_data,
-                        row_id,
                         create_time: 0, // Not needed for persistence
                     };
 

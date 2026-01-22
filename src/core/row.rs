@@ -525,8 +525,8 @@ impl Row {
     pub fn into_arc(self) -> CompactArc<[Value]> {
         match self.storage {
             RowStorage::Shared(arc) => arc,
-            // Use into_vec() to avoid cloning each Value - O(1) ptr transfer
-            RowStorage::Owned(vec) => CompactArc::from_vec(vec.into_vec()),
+            // Use from_compact_vec directly - avoids intermediate Vec conversion
+            RowStorage::Owned(vec) => CompactArc::from_compact_vec(vec),
         }
     }
 
@@ -539,8 +539,8 @@ impl Row {
         match self.storage {
             RowStorage::Shared(_) => self, // Already shared
             RowStorage::Owned(vec) => Self {
-                // Use into_vec() to avoid cloning each Value - O(1) ptr transfer
-                storage: RowStorage::Shared(CompactArc::from_vec(vec.into_vec())),
+                // Use from_compact_vec directly - avoids intermediate Vec conversion
+                storage: RowStorage::Shared(CompactArc::from_compact_vec(vec)),
             },
         }
     }

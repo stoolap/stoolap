@@ -268,6 +268,134 @@ impl BitmapIndex {
             CompactArc::new(composite)
         }
     }
+
+    /// Slow path for multi-column indexes with Arc values (rare case)
+    #[cold]
+    #[allow(clippy::too_many_arguments)]
+    fn add_arc_multi_column(
+        &self,
+        arc_key: CompactArc<Value>,
+        row_id: i64,
+        row_id_u64: u64,
+        values: &[CompactArc<Value>],
+        mut bitmaps: std::sync::RwLockWriteGuard<'_, AHashMap<CompactArc<Value>, RoaringTreemap>>,
+        mut row_to_value: std::sync::RwLockWriteGuard<'_, I64Map<CompactArc<Value>>>,
+    ) -> Result<()> {
+        // Check uniqueness constraint
+        if self.is_unique {
+            let has_null = values.iter().any(|v| v.is_null());
+            if !has_null {
+                if let Some(bitmap) = bitmaps.get(&arc_key) {
+                    let existing_count = if bitmap.contains(row_id_u64) {
+                        bitmap.len() - 1
+                    } else {
+                        bitmap.len()
+                    };
+                    if existing_count > 0 {
+                        let values_str: Vec<String> =
+                            values.iter().map(|v| format!("{:?}", v)).collect();
+                        return Err(Error::unique_constraint(
+                            &self.name,
+                            self.column_names.join(", "),
+                            format!("[{}]", values_str.join(", ")),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Check if row already exists with a different value
+        if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
+            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
+                if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
+                    old_bitmap.remove(row_id_u64);
+                    if old_bitmap.is_empty() {
+                        bitmaps.remove(&old_arc_key);
+                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        // Add to bitmap
+        let is_new_value = !bitmaps.contains_key(&arc_key);
+        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
+        bitmap.insert(row_id_u64);
+
+        // Update reverse mapping
+        row_to_value.insert(row_id, arc_key);
+
+        if is_new_value {
+            self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+
+        Ok(())
+    }
+
+    /// Slow path for multi-column indexes (rare case)
+    /// Creates composite key and handles add operation
+    #[cold]
+    fn add_multi_column_slow(
+        &self,
+        values: &[Value],
+        row_id: i64,
+        row_id_u64: u64,
+        mut bitmaps: std::sync::RwLockWriteGuard<'_, AHashMap<CompactArc<Value>, RoaringTreemap>>,
+        mut row_to_value: std::sync::RwLockWriteGuard<'_, I64Map<CompactArc<Value>>>,
+    ) -> Result<()> {
+        // Create composite key for multi-column lookup
+        let arc_key = self.value_to_arc_key(values);
+
+        // Check uniqueness constraint
+        if self.is_unique {
+            let has_null = values.iter().any(|v| v.is_null());
+            if !has_null {
+                if let Some(bitmap) = bitmaps.get(&arc_key) {
+                    let existing_count = if bitmap.contains(row_id_u64) {
+                        bitmap.len() - 1
+                    } else {
+                        bitmap.len()
+                    };
+                    if existing_count > 0 {
+                        let values_str: Vec<String> =
+                            values.iter().map(|v| format!("{:?}", v)).collect();
+                        return Err(Error::unique_constraint(
+                            &self.name,
+                            self.column_names.join(", "),
+                            format!("[{}]", values_str.join(", ")),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Check if row already exists with a different value
+        if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
+            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
+                if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
+                    old_bitmap.remove(row_id_u64);
+                    if old_bitmap.is_empty() {
+                        bitmaps.remove(&old_arc_key);
+                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        // Add to bitmap
+        let is_new_value = !bitmaps.contains_key(&arc_key);
+        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
+        bitmap.insert(row_id_u64);
+
+        // Update reverse mapping
+        row_to_value.insert(row_id, arc_key);
+
+        if is_new_value {
+            self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+
+        Ok(())
+    }
 }
 
 impl Index for BitmapIndex {
@@ -306,37 +434,48 @@ impl Index for BitmapIndex {
             )));
         }
 
-        // Intern value to get Arc key
-        let arc_key = self.value_to_arc_key(values);
-
         // Acquire write locks
         let mut bitmaps = self.bitmaps.write().unwrap();
         let mut row_to_value = self.row_to_value.write().unwrap();
 
-        // Check uniqueness constraint
-        if self.is_unique {
-            // NULL values don't violate uniqueness
-            let has_null = values.iter().any(|v| v.is_null());
-            if !has_null {
-                if let Some(bitmap) = bitmaps.get(&arc_key) {
-                    // Check if there's already a row with this value (excluding current row)
-                    let existing_count = if bitmap.contains(row_id_u64) {
-                        bitmap.len() - 1
-                    } else {
-                        bitmap.len()
-                    };
-                    if existing_count > 0 {
-                        let values_str: Vec<String> =
-                            values.iter().map(|v| format!("{:?}", v)).collect();
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            format!("[{}]", values_str.join(", ")),
-                        ));
-                    }
+        // Build lookup key (for single-column, just the first value)
+        let lookup_value = if values.len() == 1 {
+            &values[0]
+        } else {
+            // For multi-column, we need to create a composite key for lookup
+            // This is less common but supported
+            return self.add_multi_column_slow(values, row_id, row_id_u64, bitmaps, row_to_value);
+        };
+
+        // Check uniqueness constraint (using Borrow trait for &Value lookup)
+        if self.is_unique && !lookup_value.is_null() {
+            if let Some(bitmap) = bitmaps.get(lookup_value) {
+                // Check if there's already a row with this value (excluding current row)
+                let existing_count = if bitmap.contains(row_id_u64) {
+                    bitmap.len() - 1
+                } else {
+                    bitmap.len()
+                };
+                if existing_count > 0 {
+                    return Err(Error::unique_constraint(
+                        &self.name,
+                        self.column_names.join(", "),
+                        format!("{:?}", lookup_value),
+                    ));
                 }
             }
         }
+
+        // Try to reuse existing Arc if value already exists (O(1) clone)
+        // Only create new Arc if this is a new unique value
+        let (arc_key, is_new_value) =
+            if let Some((existing_arc, _)) = bitmaps.get_key_value(lookup_value) {
+                // Value exists - reuse the existing Arc (O(1) atomic refcount bump)
+                (CompactArc::clone(existing_arc), false)
+            } else {
+                // New unique value - create Arc once
+                (CompactArc::new(lookup_value.clone()), true)
+            };
 
         // Check if row already exists with a different value (for updates)
         if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
@@ -354,7 +493,6 @@ impl Index for BitmapIndex {
         }
 
         // Add to bitmap
-        let is_new_value = !bitmaps.contains_key(&arc_key);
         let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
         bitmap.insert(row_id_u64);
 
@@ -392,37 +530,52 @@ impl Index for BitmapIndex {
             )));
         }
 
-        // Get Arc key - O(1) for single column (just Arc::clone)
-        let arc_key = self.arc_values_to_arc_key(values);
-
         // Acquire write locks
         let mut bitmaps = self.bitmaps.write().unwrap();
         let mut row_to_value = self.row_to_value.write().unwrap();
 
+        // For single-column, use the value directly for lookup
+        // For multi-column, fall back to composite key
+        let lookup_value: &Value = if values.len() == 1 {
+            &values[0]
+        } else {
+            // Multi-column: create composite key and use original path
+            let arc_key = self.arc_values_to_arc_key(values);
+            return self.add_arc_multi_column(
+                arc_key,
+                row_id,
+                row_id_u64,
+                values,
+                bitmaps,
+                row_to_value,
+            );
+        };
+
         // Check uniqueness constraint
-        if self.is_unique {
-            // NULL values don't violate uniqueness
-            let has_null = values.iter().any(|v| v.is_null());
-            if !has_null {
-                if let Some(bitmap) = bitmaps.get(&arc_key) {
-                    // Check if there's already a row with this value (excluding current row)
-                    let existing_count = if bitmap.contains(row_id_u64) {
-                        bitmap.len() - 1
-                    } else {
-                        bitmap.len()
-                    };
-                    if existing_count > 0 {
-                        let values_str: Vec<String> =
-                            values.iter().map(|v| format!("{:?}", v)).collect();
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            format!("[{}]", values_str.join(", ")),
-                        ));
-                    }
+        if self.is_unique && !lookup_value.is_null() {
+            if let Some(bitmap) = bitmaps.get(lookup_value) {
+                let existing_count = if bitmap.contains(row_id_u64) {
+                    bitmap.len() - 1
+                } else {
+                    bitmap.len()
+                };
+                if existing_count > 0 {
+                    return Err(Error::unique_constraint(
+                        &self.name,
+                        self.column_names.join(", "),
+                        format!("{:?}", lookup_value),
+                    ));
                 }
             }
         }
+
+        // Try to reuse existing Arc if value already exists in index (memory deduplication)
+        let (arc_key, is_new_value) =
+            if let Some((existing_arc, _)) = bitmaps.get_key_value(lookup_value) {
+                (CompactArc::clone(existing_arc), false)
+            } else {
+                (CompactArc::clone(&values[0]), true)
+            };
 
         // Check if row already exists with a different value (for updates)
         if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
@@ -440,7 +593,6 @@ impl Index for BitmapIndex {
         }
 
         // Add to bitmap
-        let is_new_value = !bitmaps.contains_key(&arc_key);
         let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
         bitmap.insert(row_id_u64);
 

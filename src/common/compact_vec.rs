@@ -117,9 +117,15 @@ impl<T> CompactVec<T> {
         Self::unpack_cap(self.len_cap) as usize
     }
 
-    /// Set the length (unsafe - caller must ensure elements are initialized)
+    /// Set the length.
+    ///
+    /// # Safety
+    ///
+    /// - `new_len` must be less than or equal to `capacity()`
+    /// - The elements at `old_len..new_len` must be initialized (if growing)
+    /// - The elements at `new_len..old_len` will NOT be dropped (if shrinking)
     #[inline(always)]
-    unsafe fn set_len(&mut self, new_len: usize) {
+    pub unsafe fn set_len(&mut self, new_len: usize) {
         let cap = Self::unpack_cap(self.len_cap);
         self.len_cap = Self::pack(new_len as u32, cap);
     }

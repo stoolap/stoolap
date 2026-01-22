@@ -714,13 +714,13 @@ impl SnapshotWriter {
         Ok(())
     }
 
-    /// Append a single row version
-    pub fn append_row(&mut self, version: &RowVersion) -> Result<()> {
+    /// Append a single row version with its row_id
+    pub fn append_row(&mut self, row_id: i64, version: &RowVersion) -> Result<()> {
         // Check for duplicate row_id
-        if self.row_index.contains_key(&version.row_id) {
+        if self.row_index.contains_key(&row_id) {
             return Err(Error::internal(format!(
                 "duplicate row_id in snapshot: {}",
-                version.row_id
+                row_id
             )));
         }
 
@@ -728,7 +728,7 @@ impl SnapshotWriter {
         let row_bytes = serialize_row_version(version)?;
 
         // Store the offset in our index
-        self.row_index.insert(version.row_id, self.data_offset);
+        self.row_index.insert(row_id, self.data_offset);
 
         // Track committed transaction
         self.committed_txn_ids
@@ -776,10 +776,10 @@ impl SnapshotWriter {
         Ok(())
     }
 
-    /// Append a batch of row versions
-    pub fn append_batch(&mut self, versions: &[RowVersion]) -> Result<()> {
-        for version in versions {
-            self.append_row(version)?;
+    /// Append a batch of row versions with their row_ids
+    pub fn append_batch(&mut self, versions: &[(i64, RowVersion)]) -> Result<()> {
+        for (row_id, version) in versions {
+            self.append_row(*row_id, version)?;
         }
         Ok(())
     }
@@ -1324,14 +1324,14 @@ impl DiskVersionStore {
 
         // Write rows from iterator
         let mut row_iterator = row_iterator;
-        let mut batch: Vec<RowVersion> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
+        let mut batch: Vec<(i64, RowVersion)> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
 
-        row_iterator(&mut |_row_id, version| {
+        row_iterator(&mut |row_id, version| {
             if !version.is_deleted() {
                 // Clone with snapshot TxnID (-1)
                 let mut snapshot_version = version.clone();
                 snapshot_version.txn_id = -1;
-                batch.push(snapshot_version);
+                batch.push((row_id, snapshot_version));
 
                 if batch.len() >= DEFAULT_BATCH_SIZE {
                     if writer.append_batch(&batch).is_err() {
@@ -1629,14 +1629,13 @@ mod tests {
             for i in 1..=100 {
                 let version = RowVersion::new(
                     1,
-                    i,
                     Row::from_values(vec![
                         Value::Integer(i),
                         Value::text(format!("row_{}", i)),
                         Value::Float(i as f64 * 1.5),
                     ]),
                 );
-                writer.append_row(&version).unwrap();
+                writer.append_row(i, &version).unwrap();
             }
 
             writer.finalize().unwrap();
@@ -1649,16 +1648,16 @@ mod tests {
             assert_eq!(reader.row_count(), 100);
             assert_eq!(reader.schema().table_name, "test_table");
 
-            // Get specific row
+            // Get specific row - row_id is known from the call parameter
             let row = reader.get_row(50).unwrap();
-            assert_eq!(row.row_id, 50);
+            assert_eq!(row.data.len(), 3); // Verify data was read correctly
 
             // Already loaded, should return None
             assert!(reader.get_row(50).is_none());
 
             // Get another row
             let row = reader.get_row(75).unwrap();
-            assert_eq!(row.row_id, 75);
+            assert_eq!(row.data.len(), 3); // Verify data was read correctly
         }
     }
 
@@ -1677,14 +1676,13 @@ mod tests {
             for i in 1..=50 {
                 let version = RowVersion::new(
                     1,
-                    i,
                     Row::from_values(vec![
                         Value::Integer(i),
                         Value::text(format!("item_{}", i)),
                         Value::Float(i as f64),
                     ]),
                 );
-                writer.append_row(&version).unwrap();
+                writer.append_row(i, &version).unwrap();
             }
 
             writer.finalize().unwrap();
@@ -1700,7 +1698,7 @@ mod tests {
                 .for_each(|row_id, version| {
                     count += 1;
                     sum += row_id;
-                    assert_eq!(version.row_id, row_id);
+                    assert_eq!(version.data.len(), 3); // Verify data integrity
                     true
                 })
                 .unwrap();

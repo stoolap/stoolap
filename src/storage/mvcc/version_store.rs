@@ -27,6 +27,7 @@
 //!
 
 use std::fmt;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -113,20 +114,17 @@ pub struct RowVersion {
     pub deleted_at_txn_id: i64,
     /// Complete row data
     pub data: Row,
-    /// Row identifier
-    pub row_id: i64,
     /// Timestamp when this version was created
     pub create_time: i64,
 }
 
 impl RowVersion {
     /// Creates a new row version
-    pub fn new(txn_id: i64, row_id: i64, data: Row) -> Self {
+    pub fn new(txn_id: i64, data: Row) -> Self {
         Self {
             txn_id,
             deleted_at_txn_id: 0,
             data,
-            row_id,
             create_time: get_fast_timestamp(),
         }
     }
@@ -134,40 +132,32 @@ impl RowVersion {
     /// Creates a new row version with a pre-computed timestamp
     /// This avoids calling SystemTime::now() for each row in bulk operations
     #[inline]
-    pub fn new_with_timestamp(txn_id: i64, row_id: i64, data: Row, create_time: i64) -> Self {
+    pub fn new_with_timestamp(txn_id: i64, data: Row, create_time: i64) -> Self {
         Self {
             txn_id,
             deleted_at_txn_id: 0,
             data,
-            row_id,
             create_time,
         }
     }
 
     /// Creates a new deleted version
-    pub fn new_deleted(txn_id: i64, row_id: i64, data: Row) -> Self {
+    pub fn new_deleted(txn_id: i64, data: Row) -> Self {
         Self {
             txn_id,
             deleted_at_txn_id: txn_id,
             data,
-            row_id,
             create_time: get_fast_timestamp(),
         }
     }
 
     /// Creates a new deleted version with a pre-computed timestamp
     #[inline]
-    pub fn new_deleted_with_timestamp(
-        txn_id: i64,
-        row_id: i64,
-        data: Row,
-        create_time: i64,
-    ) -> Self {
+    pub fn new_deleted_with_timestamp(txn_id: i64, data: Row, create_time: i64) -> Self {
         Self {
             txn_id,
             deleted_at_txn_id: txn_id,
             data,
-            row_id,
             create_time,
         }
     }
@@ -183,7 +173,6 @@ impl fmt::Debug for RowVersion {
         f.debug_struct("RowVersion")
             .field("txn_id", &self.txn_id)
             .field("deleted_at_txn_id", &self.deleted_at_txn_id)
-            .field("row_id", &self.row_id)
             .field("create_time", &self.create_time)
             .finish()
     }
@@ -193,24 +182,67 @@ impl fmt::Display for RowVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "RowVersion{{TxnID: {}, DeletedAtTxnID: {}, RowID: {}, CreateTime: {}}}",
-            self.txn_id, self.deleted_at_txn_id, self.row_id, self.create_time
+            "RowVersion{{TxnID: {}, DeletedAtTxnID: {}, CreateTime: {}}}",
+            self.txn_id, self.deleted_at_txn_id, self.create_time
         )
     }
 }
 
 /// Entry in the version chain (linked list of versions)
 /// Uses Arc for the prev pointer to enable O(1) cloning of the chain
+///
+/// # Memory Optimization
+/// - `arena_idx`: Uses `Option<NonZeroU64>` (8 bytes) instead of `Option<usize>` (16 bytes)
+///   Stored as `idx + 1` to enable niche optimization (0 = None)
 struct VersionChainEntry {
     /// Current version
     version: RowVersion,
     /// Previous version in the chain (Arc allows cheap cloning)
     prev: Option<Arc<VersionChainEntry>>,
     /// Index into the arena for zero-copy access (None if data not in arena)
-    arena_idx: Option<usize>,
-    /// Depth of this chain (number of previous versions including this one)
-    /// Used for amortized O(1) truncation - only truncate when depth exceeds limit
-    chain_depth: usize,
+    /// Stored as `idx + 1` to enable niche optimization (NonZeroU64)
+    arena_idx: Option<NonZeroU64>,
+}
+
+/// Count the depth of a version chain by traversing prev pointers.
+/// O(k) where k is the chain length (typically <= max_version_history).
+#[inline]
+fn count_chain_depth(entry: &VersionChainEntry) -> usize {
+    let mut depth = 1;
+    let mut current = &entry.prev;
+    while let Some(prev) = current {
+        depth += 1;
+        current = &prev.prev;
+    }
+    depth
+}
+
+/// Convert arena index (usize) to compact representation (Option<NonZeroU64>)
+/// Stores `idx + 1` so that 0 can represent None via niche optimization
+#[inline(always)]
+fn pack_arena_idx(idx: usize) -> Option<NonZeroU64> {
+    // idx + 1 is always > 0, supports full usize range on 64-bit systems
+    NonZeroU64::new((idx as u64).saturating_add(1))
+}
+
+/// Convert compact arena index back to usize
+/// Returns None if the stored value was None
+#[inline(always)]
+fn unpack_arena_idx(packed: Option<NonZeroU64>) -> Option<usize> {
+    packed.map(|nz| (nz.get() - 1) as usize)
+}
+
+/// Convert Option<usize> to Option<NonZeroUsize> for RowIndex
+/// Stores `idx + 1` so that 0 can represent None via niche optimization
+#[inline(always)]
+fn pack_row_arena_idx(idx: Option<usize>) -> Option<NonZeroUsize> {
+    idx.and_then(|i| NonZeroUsize::new(i.wrapping_add(1)))
+}
+
+/// Convert Option<NonZeroUsize> back to Option<usize> for RowIndex
+#[inline(always)]
+fn unpack_row_arena_idx(packed: Option<NonZeroUsize>) -> Option<usize> {
+    packed.map(|nz| nz.get().wrapping_sub(1))
 }
 
 /// Tracks write operations with the version read for conflict detection
@@ -306,12 +338,34 @@ const TX_VERSION_MAP_INITIAL_CAPACITY: usize = 16;
 /// For `SELECT * FROM t WHERE x > 100 LIMIT 10` on 100K rows:
 /// - Old: Clone 100K rows, filter to 50K, limit to 10 (100K allocations)
 /// - New: Get 100K indices, filter to 50K, limit to 10, clone 10 (10 allocations)
+///
+/// # Memory Optimization
+/// Uses `Option<NonZeroUsize>` (8 bytes) instead of `Option<usize>` (16 bytes)
+/// for arena_idx, reducing struct size from 24 to 16 bytes (33% smaller).
 #[derive(Clone, Copy, Debug)]
 pub struct RowIndex {
     /// Row ID
     pub row_id: i64,
     /// Arena index (None if row data is not in arena, must clone from version)
-    pub arena_idx: Option<usize>,
+    /// Stored as `idx + 1` to enable niche optimization (0 = None)
+    arena_idx: Option<NonZeroUsize>,
+}
+
+impl RowIndex {
+    /// Create a new RowIndex with the given row_id and arena index
+    #[inline(always)]
+    pub fn new(row_id: i64, arena_idx: Option<usize>) -> Self {
+        Self {
+            row_id,
+            arena_idx: pack_row_arena_idx(arena_idx),
+        }
+    }
+
+    /// Get the arena index (unpacked to Option<usize>)
+    #[inline(always)]
+    pub fn arena_idx(&self) -> Option<usize> {
+        unpack_row_arena_idx(self.arena_idx)
+    }
 }
 
 /// Aggregate operation type for deferred aggregation
@@ -509,8 +563,11 @@ impl VersionStore {
     /// - 0 = unlimited (not recommended for write-heavy workloads)
     /// - 1 = only keep immediate previous (minimal memory, limited AS OF range)
     /// - 10 = default, good balance for most workloads
+    ///
+    /// Note: Values above 254 are capped to 254 for practical reasons.
     pub fn set_max_version_history(&mut self, limit: usize) {
-        self.max_version_history = limit;
+        // Cap at 254 for practical memory management
+        self.max_version_history = limit.min(254);
     }
 
     /// Gets the current max version history limit
@@ -618,7 +675,6 @@ impl VersionStore {
                 // Extract existing data from the entry
                 let existing = occupied.get();
                 let existing_arena_idx = existing.arena_idx;
-                let existing_depth = existing.chain_depth;
                 let was_deleted = existing.version.deleted_at_txn_id != 0;
 
                 // Update committed row count based on delete state transitions
@@ -630,8 +686,9 @@ impl VersionStore {
                     self.committed_row_count.fetch_sub(1, Ordering::Relaxed);
                 }
 
-                // O(1) chain management with depth tracking
+                // O(k) chain management - depth computed by traversal
                 // When limit exceeded: drop old chain AND reuse arena slot
+                let existing_depth = count_chain_depth(existing);
                 let new_depth = existing_depth + 1;
                 let can_reuse_arena =
                     self.max_version_history > 0 && new_depth > self.max_version_history;
@@ -653,7 +710,7 @@ impl VersionStore {
 
                     // Always reuse existing arena slot if available
                     // Historical versions are stored in prev_chain.version.data
-                    let idx = if let Some(old_idx) = existing_arena_idx {
+                    let idx = if let Some(old_idx) = unpack_arena_idx(existing_arena_idx) {
                         // Reuse the arena slot - prevents unbounded growth
                         self.arena.update_at(
                             old_idx,
@@ -678,10 +735,10 @@ impl VersionStore {
                     // Update row -> arena index mapping
                     self.row_arena_index.write().insert(row_id, idx);
 
-                    Some(idx)
+                    pack_arena_idx(idx)
                 } else {
                     // Deleted version - mark arena as deleted for visibility
-                    if let Some(old_arena_idx) = existing_arena_idx {
+                    if let Some(old_arena_idx) = unpack_arena_idx(existing_arena_idx) {
                         self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
                     }
                     existing_arena_idx
@@ -690,27 +747,24 @@ impl VersionStore {
                 // Build version chain entry
                 // When limit exceeded: drop entire history (no prev_chain allocation)
                 // When under limit: create prev_chain with existing version
-                let (final_prev, final_depth) = if can_reuse_arena {
+                let final_prev = if can_reuse_arena {
                     // Exceeded limit - drop all history, no allocation
-                    (None, 1)
+                    None
                 } else {
                     // Under limit - clone existing version and create chain
                     let existing_version = existing.version.clone();
                     let existing_prev = existing.prev.clone();
-                    let prev_chain = Arc::new(VersionChainEntry {
+                    Some(Arc::new(VersionChainEntry {
                         version: existing_version,
                         prev: existing_prev,
                         arena_idx: existing_arena_idx,
-                        chain_depth: existing_depth, // Preserve existing chain depth
-                    });
-                    (Some(prev_chain), existing_depth + 1) // New entry is one deeper
+                    }))
                 };
 
                 let new_entry = VersionChainEntry {
                     version: new_version,
                     prev: final_prev,
                     arena_idx,
-                    chain_depth: final_depth,
                 };
 
                 // Replace entry in-place (no additional tree traversal)
@@ -737,7 +791,7 @@ impl VersionStore {
                     self.row_arena_index.write().insert(row_id, idx);
                     // Create version with Arc-backed data for O(1) clone
                     v.data = Row::from_arc(arc_data);
-                    (Some(idx), v)
+                    (pack_arena_idx(idx), v)
                 } else {
                     (None, version)
                 };
@@ -746,7 +800,6 @@ impl VersionStore {
                     version: final_version,
                     prev: None,
                     arena_idx,
-                    chain_depth: 1, // First version
                 };
 
                 // Insert into vacant slot (no additional traversal)
@@ -785,7 +838,6 @@ impl VersionStore {
                     // Extract existing data from the entry
                     let existing = occupied.get();
                     let existing_arena_idx = existing.arena_idx;
-                    let existing_depth = existing.chain_depth;
                     let was_deleted = existing.version.deleted_at_txn_id != 0;
 
                     // Track row count changes based on delete state transitions
@@ -795,8 +847,9 @@ impl VersionStore {
                         count_delta -= 1; // Row deleted
                     }
 
-                    // O(1) chain management with depth tracking
+                    // O(k) chain management - depth computed by traversal
                     // When limit exceeded: drop old chain AND reuse arena slot
+                    let existing_depth = count_chain_depth(existing);
                     let new_depth = existing_depth + 1;
                     let can_reuse_arena =
                         self.max_version_history > 0 && new_depth > self.max_version_history;
@@ -818,7 +871,7 @@ impl VersionStore {
 
                         // Always reuse existing arena slot if available
                         // Historical versions are stored in prev_chain.version.data
-                        let idx = if let Some(old_idx) = existing_arena_idx {
+                        let idx = if let Some(old_idx) = unpack_arena_idx(existing_arena_idx) {
                             // Reuse the arena slot - prevents unbounded growth
                             self.arena.update_at(
                                 old_idx,
@@ -842,10 +895,10 @@ impl VersionStore {
                         new_version.data = Row::from_arc(arc_data);
                         arena_index_updates.push((row_id, idx));
 
-                        Some(idx)
+                        pack_arena_idx(idx)
                     } else {
                         // Deleted version - mark arena as deleted for visibility
-                        if let Some(old_arena_idx) = existing_arena_idx {
+                        if let Some(old_arena_idx) = unpack_arena_idx(existing_arena_idx) {
                             self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
                         }
                         existing_arena_idx
@@ -854,27 +907,24 @@ impl VersionStore {
                     // Build version chain entry
                     // When limit exceeded: drop entire history (no prev_chain allocation)
                     // When under limit: create prev_chain with existing version
-                    let (final_prev, final_depth) = if can_reuse_arena {
+                    let final_prev = if can_reuse_arena {
                         // Exceeded limit - drop all history, no allocation
-                        (None, 1)
+                        None
                     } else {
                         // Under limit - clone existing version and create chain
                         let existing_version = existing.version.clone();
                         let existing_prev = existing.prev.clone();
-                        let prev_chain = Arc::new(VersionChainEntry {
+                        Some(Arc::new(VersionChainEntry {
                             version: existing_version,
                             prev: existing_prev,
                             arena_idx: existing_arena_idx,
-                            chain_depth: existing_depth, // Preserve existing chain depth
-                        });
-                        (Some(prev_chain), existing_depth + 1) // New entry is one deeper
+                        }))
                     };
 
                     let new_entry = VersionChainEntry {
                         version: new_version,
                         prev: final_prev,
                         arena_idx,
-                        chain_depth: final_depth,
                     };
 
                     // Replace entry in-place (no additional tree traversal)
@@ -900,7 +950,7 @@ impl VersionStore {
                         arena_index_updates.push((row_id, idx));
                         // Create version with Arc-backed data for O(1) clone
                         v.data = Row::from_arc(arc_data);
-                        (Some(idx), v)
+                        (pack_arena_idx(idx), v)
                     } else {
                         (None, version)
                     };
@@ -909,7 +959,6 @@ impl VersionStore {
                         version: final_version,
                         prev: None,
                         arena_idx,
-                        chain_depth: 1,
                     };
 
                     // Insert into vacant slot (no additional traversal)
@@ -953,7 +1002,6 @@ impl VersionStore {
                 // Extract existing data from the entry
                 let existing = occupied.get();
                 let existing_arena_idx = existing.arena_idx;
-                let existing_depth = existing.chain_depth;
                 let was_deleted = existing.version.deleted_at_txn_id != 0;
 
                 // Update committed row count based on delete state transitions
@@ -965,8 +1013,9 @@ impl VersionStore {
                     self.committed_row_count.fetch_sub(1, Ordering::Relaxed);
                 }
 
-                // O(1) chain management with depth tracking
+                // O(k) chain management - depth computed by traversal
                 // When limit exceeded: drop old chain AND reuse arena slot
+                let existing_depth = count_chain_depth(existing);
                 let new_depth = existing_depth + 1;
                 let can_reuse_arena =
                     self.max_version_history > 0 && new_depth > self.max_version_history;
@@ -986,7 +1035,7 @@ impl VersionStore {
 
                     // Always reuse existing arena slot if available
                     // Historical versions are stored in prev_chain.version.data
-                    let idx = if let Some(old_idx) = existing_arena_idx {
+                    let idx = if let Some(old_idx) = unpack_arena_idx(existing_arena_idx) {
                         // Reuse the arena slot - prevents unbounded growth
                         self.arena.update_at(
                             old_idx,
@@ -1010,10 +1059,10 @@ impl VersionStore {
                     // Update arena index immediately (single row, no batching needed)
                     self.row_arena_index.write().insert(row_id, idx);
 
-                    Some(idx)
+                    pack_arena_idx(idx)
                 } else {
                     // Deleted version - mark arena as deleted for visibility
-                    if let Some(old_arena_idx) = existing_arena_idx {
+                    if let Some(old_arena_idx) = unpack_arena_idx(existing_arena_idx) {
                         self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
                     }
                     existing_arena_idx
@@ -1022,27 +1071,24 @@ impl VersionStore {
                 // Build version chain entry
                 // When limit exceeded: drop entire history (no prev_chain allocation)
                 // When under limit: create prev_chain with existing version
-                let (final_prev, final_depth) = if can_reuse_arena {
+                let final_prev = if can_reuse_arena {
                     // Exceeded limit - drop all history, no allocation
-                    (None, 1)
+                    None
                 } else {
                     // Under limit - clone existing version and create chain
                     let existing_version = existing.version.clone();
                     let existing_prev = existing.prev.clone();
-                    let prev_chain = Arc::new(VersionChainEntry {
+                    Some(Arc::new(VersionChainEntry {
                         version: existing_version,
                         prev: existing_prev,
                         arena_idx: existing_arena_idx,
-                        chain_depth: existing_depth, // Preserve existing chain depth
-                    });
-                    (Some(prev_chain), existing_depth + 1) // New entry is one deeper
+                    }))
                 };
 
                 let new_entry = VersionChainEntry {
                     version: new_version,
                     prev: final_prev,
                     arena_idx,
-                    chain_depth: final_depth,
                 };
 
                 occupied.insert(new_entry);
@@ -1063,7 +1109,7 @@ impl VersionStore {
                     // Update arena index immediately
                     self.row_arena_index.write().insert(row_id, idx);
                     v.data = Row::from_arc(arc_data);
-                    (Some(idx), v)
+                    (pack_arena_idx(idx), v)
                 } else {
                     (None, version)
                 };
@@ -1072,7 +1118,6 @@ impl VersionStore {
                     version: final_version,
                     prev: None,
                     arena_idx,
-                    chain_depth: 1,
                 };
 
                 vacant.insert(new_entry);
@@ -1110,7 +1155,6 @@ impl VersionStore {
                         txn_id: meta.txn_id,
                         deleted_at_txn_id: meta.deleted_at_txn_id,
                         data: Row::from_arc(arc_data),
-                        row_id: meta.row_id,
                         create_time: meta.create_time,
                     });
                 }
@@ -1263,7 +1307,7 @@ impl VersionStore {
                 if checker.is_visible(head_txn_id, txn_id) {
                     if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
                         // Get from arena if available, else clone
-                        let row = if let Some(idx) = chain.arena_idx {
+                        let row = if let Some(idx) = unpack_arena_idx(chain.arena_idx) {
                             if let Some(arc_row) = arena_data.get(idx) {
                                 Row::from_arc(CompactArc::clone(arc_row))
                             } else {
@@ -1286,7 +1330,7 @@ impl VersionStore {
                         if e.version.deleted_at_txn_id == 0
                             || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
                         {
-                            let row = if let Some(idx) = e.arena_idx {
+                            let row = if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                                 if let Some(arc_row) = arena_data.get(idx) {
                                     Row::from_arc(CompactArc::clone(arc_row))
                                 } else {
@@ -1449,7 +1493,7 @@ impl VersionStore {
 
         // Helper: get row from arena (O(1)) or version (O(n) clone)
         let get_row = |entry: &VersionChainEntry| -> Row {
-            if let Some(idx) = entry.arena_idx {
+            if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
                 if let Some(arc_row) = arena_data.get(idx) {
                     return Row::from_arc(CompactArc::clone(arc_row));
                 }
@@ -1728,7 +1772,7 @@ impl VersionStore {
 
         // Helper: get row from arena (O(1)) or version (O(n) clone)
         let get_row = |entry: &VersionChainEntry| -> Row {
-            if let Some(idx) = entry.arena_idx {
+            if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
                 if let Some(arc_row) = arena_data.get(idx) {
                     return Row::from_arc(CompactArc::clone(arc_row));
                 }
@@ -1795,7 +1839,7 @@ impl VersionStore {
 
         // Helper closure to get row data from arena or version
         let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = e.arena_idx {
+            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                 if let Some(arc_row) = arena_data.get(idx) {
                     return Row::from_arc(CompactArc::clone(arc_row));
                 }
@@ -1862,7 +1906,7 @@ impl VersionStore {
 
         // Helper closure to get row data from arena or version
         let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = e.arena_idx {
+            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                 if let Some(arc_row) = arena_data.get(idx) {
                     return Row::from_arc(CompactArc::clone(arc_row));
                 }
@@ -1940,7 +1984,7 @@ impl VersionStore {
 
         // Helper closure to get row data from arena or version
         let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = e.arena_idx {
+            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                 if let Some(arc_row) = arena_data.get(idx) {
                     return Row::from_arc(CompactArc::clone(arc_row));
                 }
@@ -2034,7 +2078,7 @@ impl VersionStore {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
                     // Try arena path first (zero-copy filter check using matches_arc_slice)
-                    if let Some(idx) = chain.arena_idx {
+                    if let Some(idx) = unpack_arena_idx(chain.arena_idx) {
                         if let Some(arc_row) = arena_data.get(idx) {
                             // Filter directly on Arc slice - no Row allocation for non-matching rows
                             if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
@@ -2068,7 +2112,7 @@ impl VersionStore {
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
                         // Try arena path first (zero-copy filter check using matches_arc_slice)
-                        if let Some(idx) = e.arena_idx {
+                        if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                             if let Some(arc_row) = arena_data.get(idx) {
                                 // Filter directly on Arc slice - no Row allocation for non-matching rows
                                 if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
@@ -2119,7 +2163,7 @@ impl VersionStore {
 
         // Helper closure to get row data from arena or version
         let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = e.arena_idx {
+            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                 if let Some(arc_row) = arena_data.get(idx) {
                     return Row::from_arc(CompactArc::clone(arc_row));
                 }
@@ -2190,7 +2234,7 @@ impl VersionStore {
 
         // Helper closure to get row data from arena or version
         let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = e.arena_idx {
+            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                 if let Some(arc_row) = arena_data.get(idx) {
                     return Row::from_arc(CompactArc::clone(arc_row));
                 }
@@ -2301,7 +2345,7 @@ impl VersionStore {
 
         // Helper closure to get row data from arena or version
         let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = e.arena_idx {
+            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                 if let Some(arc_row) = arena_data.get(idx) {
                     return Row::from_arc(CompactArc::clone(arc_row));
                 }
@@ -2403,7 +2447,7 @@ impl VersionStore {
 
         // Helper closure to get row data from arena or version
         let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = e.arena_idx {
+            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                 if let Some(arc_row) = arena_data.get(idx) {
                     return Row::from_arc(CompactArc::clone(arc_row));
                 }
@@ -2504,7 +2548,7 @@ impl VersionStore {
 
         // Helper to get row data from an entry
         let get_row_from_entry = |entry: &VersionChainEntry| -> Row {
-            if let Some(idx) = entry.arena_idx {
+            if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
                 if let Some(arc_row) = arena_data.get(idx) {
                     return Row::from_arc(CompactArc::clone(arc_row));
                 }
@@ -2619,7 +2663,7 @@ impl VersionStore {
                     }
 
                     // Read row data from arena or version
-                    let row_data = if let Some(idx) = e.arena_idx {
+                    let row_data = if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                         if let Some(arc_row) = arena_data.get(idx) {
                             Row::from_arc(CompactArc::clone(arc_row))
                         } else {
@@ -2726,7 +2770,7 @@ impl VersionStore {
 
                     // OPTIMIZATION: Filter BEFORE cloning to avoid allocation for non-matching rows
                     // Try arena path first (zero-copy filter check using matches_arc_slice)
-                    if let Some(idx) = e.arena_idx {
+                    if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                         if let Some(arc_row) = arena_data.get(idx) {
                             // Filter directly on Arc slice - no Row allocation for non-matching rows
                             if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
@@ -2803,7 +2847,7 @@ impl VersionStore {
 
                     // OPTIMIZATION: Filter BEFORE cloning to avoid allocation for non-matching rows
                     // Try arena path first (zero-copy filter check using matches_arc_slice)
-                    if let Some(idx) = e.arena_idx {
+                    if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                         if let Some(arc_row) = arena_data.get(idx) {
                             // Filter directly on Arc slice - no Row allocation for non-matching rows
                             if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
@@ -2885,10 +2929,7 @@ impl VersionStore {
 
                 for (idx, meta) in arena_meta.iter().enumerate() {
                     if meta.deleted_at_txn_id == 0 && checker.is_visible(meta.txn_id, txn_id) {
-                        indices.push(RowIndex {
-                            row_id: meta.row_id,
-                            arena_idx: Some(idx),
-                        });
+                        indices.push(RowIndex::new(meta.row_id, Some(idx)));
                     }
                 }
 
@@ -2917,10 +2958,7 @@ impl VersionStore {
                         if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
                         {
                             // Found visible, non-deleted version
-                            indices.push(RowIndex {
-                                row_id,
-                                arena_idx: e.arena_idx,
-                            });
+                            indices.push(RowIndex::new(row_id, unpack_arena_idx(e.arena_idx)));
                         }
                         break;
                     }
@@ -2954,10 +2992,7 @@ impl VersionStore {
 
                 for (idx, meta) in arena_meta.iter().enumerate() {
                     if meta.deleted_at_txn_id == 0 && checker.is_visible(meta.txn_id, txn_id) {
-                        indices.push(RowIndex {
-                            row_id: meta.row_id,
-                            arena_idx: Some(idx),
-                        });
+                        indices.push(RowIndex::new(meta.row_id, Some(idx)));
                     }
                 }
 
@@ -2984,10 +3019,7 @@ impl VersionStore {
                     if checker.is_visible(version_txn_id, txn_id) {
                         if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
                         {
-                            indices.push(RowIndex {
-                                row_id,
-                                arena_idx: e.arena_idx,
-                            });
+                            indices.push(RowIndex::new(row_id, unpack_arena_idx(e.arena_idx)));
                         }
                         break;
                     }
@@ -3022,7 +3054,7 @@ impl VersionStore {
         let mut result = RowVec::with_capacity(indices.len());
 
         for idx in indices {
-            if let Some(arena_idx) = idx.arena_idx {
+            if let Some(arena_idx) = idx.arena_idx() {
                 // Fast path: get from arena
                 if arena_idx < arena_len {
                     if let Some(arc_row) = arena_data.get(arena_idx) {
@@ -3044,7 +3076,7 @@ impl VersionStore {
     /// Materialize a single row by index (for use in iterators)
     #[inline]
     pub fn materialize_row(&self, idx: &RowIndex) -> Option<(i64, Row)> {
-        if let Some(arena_idx) = idx.arena_idx {
+        if let Some(arena_idx) = idx.arena_idx() {
             let arena_guard = self.arena.read_guard();
             let arena_data = arena_guard.data();
             if let Some(arc_row) = arena_data.get(arena_idx) {
@@ -3072,7 +3104,7 @@ impl VersionStore {
     /// - New: Load 100K single values, sort indices, clone 10 rows (200 values)
     #[inline]
     pub fn get_column_value(&self, idx: &RowIndex, col_idx: usize) -> Option<Value> {
-        if let Some(arena_idx) = idx.arena_idx {
+        if let Some(arena_idx) = idx.arena_idx() {
             let arena_guard = self.arena.read_guard();
             let arena_data = arena_guard.data();
             if let Some(arc_row) = arena_data.get(arena_idx) {
@@ -3109,7 +3141,7 @@ impl VersionStore {
         indices
             .iter()
             .map(|idx| {
-                if let Some(arena_idx) = idx.arena_idx {
+                if let Some(arena_idx) = idx.arena_idx() {
                     if arena_idx < arena_len {
                         if let Some(arc_row) = arena_data.get(arena_idx) {
                             return arc_row.get(col_idx).cloned();
@@ -3639,7 +3671,7 @@ impl VersionStore {
         // Single pass through all rows
         for idx in &indices {
             // Try arena path first (fast)
-            if let Some(arena_idx) = idx.arena_idx {
+            if let Some(arena_idx) = idx.arena_idx() {
                 if let Some(arc_row) = arena_data.get(arena_idx) {
                     for (i, (op, col_idx)) in aggregates.iter().enumerate() {
                         if let Some(val) = arc_row.get(*col_idx) {
@@ -3757,7 +3789,7 @@ impl VersionStore {
                         if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
                         {
                             // Found visible, non-deleted version
-                            if let Some(idx) = e.arena_idx {
+                            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
                                 if idx < arena_len {
                                     visible_indices.push(VisibleRowInfo {
                                         row_id,
@@ -4046,8 +4078,7 @@ impl VersionStore {
     /// the version is skipped to avoid duplicate entries in the version chain. This can
     /// occur when snapshot and WAL both contain the same committed data due to race
     /// conditions during snapshot creation.
-    pub fn apply_recovered_version(&self, version: RowVersion) {
-        let row_id = version.row_id;
+    pub fn apply_recovered_version(&self, row_id: i64, version: RowVersion) {
         let is_deleted = version.is_deleted();
         let row_data = version.data.clone();
 
@@ -4112,7 +4143,6 @@ impl VersionStore {
             txn_id,
             deleted_at_txn_id: txn_id,
             data: Row::new(),
-            row_id,
             create_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as i64)
@@ -5061,7 +5091,6 @@ impl Clone for VersionChainEntry {
             version: self.version.clone(),
             prev: self.prev.clone(), // Arc clone is O(1)
             arena_idx: self.arena_idx,
-            chain_depth: self.chain_depth,
         }
     }
 }
@@ -5138,7 +5167,7 @@ impl TransactionVersionStore {
         let timestamp = get_fast_timestamp();
 
         // Create the row version with pre-computed timestamp
-        let mut rv = RowVersion::new_with_timestamp(self.txn_id, row_id, data, timestamp);
+        let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
         if is_delete {
             rv.deleted_at_txn_id = self.txn_id;
         }
@@ -5222,7 +5251,7 @@ impl TransactionVersionStore {
         let timestamp = get_fast_timestamp();
 
         // Create the new row version with pre-computed timestamp
-        let mut rv = RowVersion::new_with_timestamp(self.txn_id, row_id, data, timestamp);
+        let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
         if is_delete {
             rv.deleted_at_txn_id = self.txn_id;
         }
@@ -5290,7 +5319,7 @@ impl TransactionVersionStore {
 
             // Create the new row version with pre-computed timestamp (avoids wasteful
             // get_fast_timestamp() call inside RowVersion::new that would be overwritten)
-            let rv = RowVersion::new_with_timestamp(self.txn_id, row_id, data, now);
+            let rv = RowVersion::new_with_timestamp(self.txn_id, data, now);
 
             // Check if already in local versions (already processed in this transaction)
             if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
@@ -5385,7 +5414,7 @@ impl TransactionVersionStore {
             }
 
             // Create deleted row version with pre-computed timestamp
-            let mut rv = RowVersion::new_with_timestamp(self.txn_id, row_id, data, timestamp);
+            let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
             rv.deleted_at_txn_id = self.txn_id;
 
             // Append to version history for this row
@@ -5413,7 +5442,7 @@ impl TransactionVersionStore {
 
         for (row_id, data, original_version) in rows {
             // Create deleted row version with pre-computed timestamp
-            let mut rv = RowVersion::new_with_timestamp(self.txn_id, row_id, data, timestamp);
+            let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
             rv.deleted_at_txn_id = self.txn_id;
 
             // Check if already in local versions (already processed in this transaction)
@@ -5779,10 +5808,9 @@ mod tests {
     #[test]
     fn test_row_version_creation() {
         let row = Row::from(vec![Value::from(1), Value::from("test")]);
-        let version = RowVersion::new(1, 100, row);
+        let version = RowVersion::new(1, row);
 
         assert_eq!(version.txn_id, 1);
-        assert_eq!(version.row_id, 100);
         assert!(!version.is_deleted());
         assert!(version.create_time > 0);
     }
@@ -5790,7 +5818,7 @@ mod tests {
     #[test]
     fn test_row_version_deleted() {
         let row = Row::from(vec![Value::from(1)]);
-        let version = RowVersion::new_deleted(1, 100, row);
+        let version = RowVersion::new_deleted(1, row);
 
         assert!(version.is_deleted());
         assert_eq!(version.deleted_at_txn_id, 1);
@@ -5835,7 +5863,7 @@ mod tests {
             VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
 
         let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(1, 100, row);
+        let version = RowVersion::new(1, row);
 
         store.add_version(100, version);
 
@@ -5853,7 +5881,7 @@ mod tests {
 
         // Add version from transaction 5
         let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(5, 100, row);
+        let version = RowVersion::new(5, row);
         store.add_version(100, version);
 
         // Transaction 3 should NOT see version from transaction 5
@@ -5877,11 +5905,11 @@ mod tests {
 
         // Add version from transaction 1
         let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(1, 100, row.clone());
+        let version = RowVersion::new(1, row.clone());
         store.add_version(100, version);
 
         // Delete in transaction 2
-        let deleted_version = RowVersion::new_deleted(2, 100, row);
+        let deleted_version = RowVersion::new_deleted(2, row);
         store.add_version(100, deleted_version);
 
         // Transaction 1 should still see the row (delete not visible)
@@ -5898,9 +5926,9 @@ mod tests {
         let store = VersionStore::new("test_table".to_string(), test_schema());
 
         let row = Row::from(vec![Value::from(1)]);
-        store.add_version(100, RowVersion::new(1, 100, row.clone()));
-        store.add_version(200, RowVersion::new(1, 200, row.clone()));
-        store.add_version(300, RowVersion::new(1, 300, row));
+        store.add_version(100, RowVersion::new(1, row.clone()));
+        store.add_version(200, RowVersion::new(1, row.clone()));
+        store.add_version(300, RowVersion::new(1, row));
 
         let row_ids = store.get_all_row_ids();
         assert_eq!(row_ids.len(), 3);
@@ -5919,7 +5947,7 @@ mod tests {
 
         // Operations should be no-ops when closed
         let row = Row::from(vec![Value::from(1)]);
-        store.add_version(100, RowVersion::new(1, 100, row));
+        store.add_version(100, RowVersion::new(1, row));
         assert_eq!(store.row_count(), 0);
     }
 
@@ -6014,7 +6042,7 @@ mod tests {
         // v5: depth=3
         for txn_id in 1..=5 {
             let row = Row::from(vec![Value::from(txn_id)]);
-            let version = RowVersion::new(txn_id, row_id, row);
+            let version = RowVersion::new(txn_id, row);
             store.add_version(row_id, version);
         }
 
@@ -6024,23 +6052,15 @@ mod tests {
         let versions = store.versions.read().clone();
         let entry = versions.get(row_id).expect("Row should exist");
 
+        // Count actual chain length
+        let chain_depth = count_chain_depth(entry);
+
         // Chain depth should be at most limit + 1 (oscillates between 2 and limit+1)
         assert!(
-            entry.chain_depth <= 4,
+            chain_depth <= 4,
             "Chain depth {} exceeds limit+1",
-            entry.chain_depth
+            chain_depth
         );
-
-        // Count actual chain length
-        let mut count = 1;
-        let mut current = entry.prev.as_ref();
-        while let Some(prev) = current {
-            count += 1;
-            current = prev.prev.as_ref();
-        }
-
-        // Should be <= limit + 1
-        assert!(count <= 4, "Actual chain length {} exceeds limit+1", count);
     }
 
     #[test]
@@ -6058,7 +6078,7 @@ mod tests {
         // Pattern: 1,2,3,4,5,6(drop->2),3,4,5,6(drop->2),...
         for txn_id in 1..=20 {
             let row = Row::from(vec![Value::from(txn_id)]);
-            let version = RowVersion::new(txn_id, row_id, row);
+            let version = RowVersion::new(txn_id, row);
             store.add_version(row_id, version);
         }
 
@@ -6095,7 +6115,7 @@ mod tests {
         // Add 15 versions
         for txn_id in 1..=15 {
             let row = Row::from(vec![Value::from(txn_id)]);
-            let version = RowVersion::new(txn_id, row_id, row);
+            let version = RowVersion::new(txn_id, row);
             store.add_version(row_id, version);
         }
 
@@ -6127,7 +6147,7 @@ mod tests {
         // First add some versions individually (depth reaches 3)
         for txn_id in 1..=3 {
             let row = Row::from(vec![Value::from(txn_id)]);
-            let version = RowVersion::new(txn_id, row_id, row);
+            let version = RowVersion::new(txn_id, row);
             store.add_version(row_id, version);
         }
 
@@ -6135,7 +6155,7 @@ mod tests {
         let batch: Vec<(i64, RowVersion)> = (4..=7)
             .map(|txn_id| {
                 let row = Row::from(vec![Value::from(txn_id)]);
-                (row_id, RowVersion::new(txn_id, row_id, row))
+                (row_id, RowVersion::new(txn_id, row))
             })
             .collect();
 
@@ -6167,10 +6187,9 @@ mod tests {
     fn test_row_version_with_timestamp() {
         let row = Row::from(vec![Value::from(1)]);
         let timestamp = 12345678;
-        let version = RowVersion::new_with_timestamp(1, 100, row, timestamp);
+        let version = RowVersion::new_with_timestamp(1, row, timestamp);
 
         assert_eq!(version.txn_id, 1);
-        assert_eq!(version.row_id, 100);
         assert_eq!(version.create_time, timestamp);
         assert!(!version.is_deleted());
     }
@@ -6179,7 +6198,7 @@ mod tests {
     fn test_row_version_deleted_with_timestamp() {
         let row = Row::from(vec![Value::from(1)]);
         let timestamp = 87654321;
-        let version = RowVersion::new_deleted_with_timestamp(1, 100, row, timestamp);
+        let version = RowVersion::new_deleted_with_timestamp(1, row, timestamp);
 
         assert_eq!(version.txn_id, 1);
         assert_eq!(version.deleted_at_txn_id, 1);
@@ -6190,22 +6209,22 @@ mod tests {
     #[test]
     fn test_row_version_debug_display() {
         let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(1, 100, row);
+        let version = RowVersion::new(1, row);
 
         let debug = format!("{:?}", version);
         assert!(debug.contains("RowVersion"));
         assert!(debug.contains("txn_id: 1"));
-        assert!(debug.contains("row_id: 100"));
+        assert!(debug.contains("create_time"));
 
         let display = format!("{}", version);
         assert!(display.contains("TxnID: 1"));
-        assert!(display.contains("RowID: 100"));
+        assert!(display.contains("CreateTime"));
     }
 
     #[test]
     fn test_write_set_entry_clone() {
         let row = Row::from(vec![Value::from(1)]);
-        let version = RowVersion::new(1, 100, row);
+        let version = RowVersion::new(1, row);
 
         let entry = WriteSetEntry {
             read_version: Some(version),
@@ -6227,31 +6246,28 @@ mod tests {
 
     #[test]
     fn test_row_index() {
-        let idx = RowIndex {
-            row_id: 100,
-            arena_idx: Some(5),
-        };
+        let idx = RowIndex::new(100, Some(5));
 
         // Test Copy trait
         let copied = idx;
         assert_eq!(copied.row_id, 100);
-        assert_eq!(copied.arena_idx, Some(5));
+        assert_eq!(copied.arena_idx(), Some(5));
 
         // Test Clone trait (use Clone::clone to avoid clone_on_copy warning)
         let cloned = Clone::clone(&idx);
         assert_eq!(cloned.row_id, 100);
 
         // Test with None arena_idx
-        let idx_none = RowIndex {
-            row_id: 200,
-            arena_idx: None,
-        };
-        assert!(idx_none.arena_idx.is_none());
+        let idx_none = RowIndex::new(200, None);
+        assert!(idx_none.arena_idx().is_none());
 
         // Test Debug
         let debug = format!("{:?}", idx);
         assert!(debug.contains("RowIndex"));
         assert!(debug.contains("100"));
+
+        // Test memory optimization: RowIndex should be 16 bytes (not 24)
+        assert_eq!(std::mem::size_of::<RowIndex>(), 16);
     }
 
     #[test]
@@ -6297,7 +6313,7 @@ mod tests {
 
         // Add a row
         let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(1, 100, row);
+        let version = RowVersion::new(1, row);
         store.add_version(100, version);
 
         // Row exists
@@ -6314,7 +6330,7 @@ mod tests {
         // Add rows
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i * 10)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6334,7 +6350,7 @@ mod tests {
         // Add rows
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6353,7 +6369,7 @@ mod tests {
         // Add rows
         for i in 1..=10 {
             let row = Row::from(vec![Value::from(i)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6368,7 +6384,7 @@ mod tests {
 
         // Add a row
         let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(1, 100, row);
+        let version = RowVersion::new(1, row);
         store.add_version(100, version);
 
         // Mark it deleted
@@ -6393,7 +6409,7 @@ mod tests {
         // Add 20 rows
         for i in 1..=20 {
             let row = Row::from(vec![Value::from(i)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6414,12 +6430,12 @@ mod tests {
 
         // Add version from transaction 5
         let row = Row::from(vec![Value::from(100)]);
-        let version = RowVersion::new(5, 1, row);
+        let version = RowVersion::new(5, row);
         store.add_version(1, version);
 
         // Add updated version from transaction 10
         let row2 = Row::from(vec![Value::from(200)]);
-        let version2 = RowVersion::new(10, 1, row2);
+        let version2 = RowVersion::new(10, row2);
         store.add_version(1, version2);
 
         // AS OF transaction 7 should see the first version
@@ -6451,12 +6467,12 @@ mod tests {
 
         // Add version with specific timestamp
         let row = Row::from(vec![Value::from(100)]);
-        let version = RowVersion::new_with_timestamp(1, 1, row, 1000);
+        let version = RowVersion::new_with_timestamp(1, row, 1000);
         store.add_version(1, version);
 
         // Add version with later timestamp
         let row2 = Row::from(vec![Value::from(200)]);
-        let version2 = RowVersion::new_with_timestamp(2, 1, row2, 2000);
+        let version2 = RowVersion::new_with_timestamp(2, row2, 2000);
         store.add_version(1, version2);
 
         // AS OF timestamp 1500 should see first version
@@ -6483,7 +6499,7 @@ mod tests {
         // Add rows with integer values
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i * 10)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6502,7 +6518,7 @@ mod tests {
         let values = [1.5, 2.5, 3.5];
         for (i, v) in values.iter().enumerate() {
             let row = Row::from(vec![Value::from(*v)]);
-            let version = RowVersion::new(1, (i + 1) as i64, row);
+            let version = RowVersion::new(1, row);
             store.add_version((i + 1) as i64, version);
         }
 
@@ -6520,7 +6536,7 @@ mod tests {
         // Add rows
         for i in [30, 10, 50, 20, 40] {
             let row = Row::from(vec![Value::from(i)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6551,7 +6567,7 @@ mod tests {
         // Add rows
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i * 10)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6610,7 +6626,7 @@ mod tests {
         // Add rows
         for i in 1..=3 {
             let row = Row::from(vec![Value::from(i * 10)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6704,7 +6720,7 @@ mod tests {
         // Add rows
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6724,7 +6740,7 @@ mod tests {
 
         // Add a row with multiple columns
         let row = Row::from(vec![Value::from(42), Value::from("test")]);
-        let version = RowVersion::new(1, 1, row);
+        let version = RowVersion::new(1, row);
         store.add_version(1, version);
 
         let indices = store.get_visible_row_indices(2);
@@ -6748,8 +6764,8 @@ mod tests {
 
         // Apply a recovered version
         let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(1, 100, row);
-        store.apply_recovered_version(version);
+        let version = RowVersion::new(1, row);
+        store.apply_recovered_version(100, version);
 
         assert_eq!(store.row_count(), 1);
         assert!(store.quick_check_row_existence(100));
@@ -6781,7 +6797,7 @@ mod tests {
 
         // Verify it works with the new checker
         let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(1, 100, row);
+        let version = RowVersion::new(1, row);
         store.add_version(100, version);
 
         let visible = store.get_visible_version(100, 2);
@@ -6799,7 +6815,7 @@ mod tests {
 
         // Add a row first
         let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(1, 100, row);
+        let version = RowVersion::new(1, row);
         store.add_version(100, version);
 
         // Start a new transaction and update
@@ -6835,7 +6851,7 @@ mod tests {
 
         // Add a row first
         let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(1, 100, row);
+        let version = RowVersion::new(1, row);
         store.add_version(100, version);
 
         // Start a new transaction and delete
@@ -6866,7 +6882,7 @@ mod tests {
         // Add rows
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i * 10)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6895,7 +6911,7 @@ mod tests {
         // Add rows
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6914,7 +6930,7 @@ mod tests {
         // Add rows in non-sequential order
         for i in [5, 3, 1, 4, 2] {
             let row = Row::from(vec![Value::from(i * 10)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6963,7 +6979,7 @@ mod tests {
         // Add rows
         for i in 1..=10 {
             let row = Row::from(vec![Value::from(i)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -6978,7 +6994,7 @@ mod tests {
 
         // Add a row
         let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(1, 100, row);
+        let version = RowVersion::new(1, row);
         store.add_version(100, version);
 
         let indices = store.get_visible_row_indices(2);
@@ -6992,10 +7008,7 @@ mod tests {
         assert_eq!(row.get(0), Some(&Value::from(42)));
 
         // Invalid index
-        let invalid_idx = RowIndex {
-            row_id: 999,
-            arena_idx: None,
-        };
+        let invalid_idx = RowIndex::new(999, None);
         let result = store.materialize_row(&invalid_idx);
         assert!(result.is_none());
     }
@@ -7013,14 +7026,14 @@ mod tests {
         // Add 10 rows from transaction 1
         for i in 1..=10 {
             let row = Row::from(vec![Value::from(i)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
         // Delete all rows in transaction 2
         for i in 1..=10 {
             let row = Row::from(vec![Value::from(i)]);
-            let mut version = RowVersion::new(1, i, row);
+            let mut version = RowVersion::new(1, row);
             version.deleted_at_txn_id = 2;
             store.add_version(i, version);
         }
@@ -7054,10 +7067,10 @@ mod tests {
 
         // Add and delete a row
         let row = Row::from(vec![Value::from(1)]);
-        let version = RowVersion::new(1, 1, row.clone());
+        let version = RowVersion::new(1, row.clone());
         store.add_version(1, version);
 
-        let mut deleted_version = RowVersion::new(1, 1, row);
+        let mut deleted_version = RowVersion::new(1, row);
         deleted_version.deleted_at_txn_id = 2;
         store.add_version(1, deleted_version);
 
@@ -7082,14 +7095,14 @@ mod tests {
         // Add 5 rows, delete only 3
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i)]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
         // Delete rows 1, 3, 5
         for i in [1, 3, 5] {
             let row = Row::from(vec![Value::from(i)]);
-            let mut version = RowVersion::new(1, i, row);
+            let mut version = RowVersion::new(1, row);
             version.deleted_at_txn_id = 2;
             store.add_version(i, version);
         }
@@ -7114,7 +7127,7 @@ mod tests {
         // Add rows with data
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i), Value::text(format!("data_{}", i))]);
-            let version = RowVersion::new(1, i, row);
+            let version = RowVersion::new(1, row);
             store.add_version(i, version);
         }
 
@@ -7125,7 +7138,7 @@ mod tests {
         // Delete all rows
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i), Value::text(format!("data_{}", i))]);
-            let mut version = RowVersion::new(1, i, row);
+            let mut version = RowVersion::new(1, row);
             version.deleted_at_txn_id = 2;
             store.add_version(i, version);
         }
@@ -7147,5 +7160,43 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn test_pack_arena_idx_no_overflow() {
+        // Verify that NonZeroU64 handles all valid indices correctly without overflow
+
+        // Case 1: Small index
+        let small = 100usize;
+        let packed = pack_arena_idx(small);
+        assert!(packed.is_some());
+        assert_eq!(unpack_arena_idx(packed), Some(small));
+
+        // Case 2: Max u32 value (previously caused issues with NonZeroU32)
+        let max_u32 = u32::MAX as usize;
+        let packed_u32 = pack_arena_idx(max_u32);
+        assert!(packed_u32.is_some());
+        assert_eq!(unpack_arena_idx(packed_u32), Some(max_u32));
+
+        // Case 3: Beyond u32::MAX (previously caused corruption with NonZeroU32)
+        let beyond_u32 = u32::MAX as usize + 1;
+        let packed_beyond = pack_arena_idx(beyond_u32);
+        assert!(packed_beyond.is_some());
+        assert_eq!(unpack_arena_idx(packed_beyond), Some(beyond_u32)); // Now correct!
+
+        // Case 4: Large index (5 billion - would have corrupted with u32)
+        let large = 5_000_000_000usize;
+        let packed_large = pack_arena_idx(large);
+        assert!(packed_large.is_some());
+        assert_eq!(unpack_arena_idx(packed_large), Some(large)); // Now correct!
+
+        // Case 5: Zero index
+        let zero = 0usize;
+        let packed_zero = pack_arena_idx(zero);
+        assert!(packed_zero.is_some());
+        assert_eq!(unpack_arena_idx(packed_zero), Some(zero));
+
+        // Case 6: None unpacks to None
+        assert_eq!(unpack_arena_idx(None), None);
     }
 }

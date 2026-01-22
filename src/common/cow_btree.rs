@@ -41,7 +41,16 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Maximum keys per node. Smaller = more nodes but faster COW.
 /// 128 gives good balance for database workloads.
+///
+/// CONSTRAINT: MAX_KEYS <= 255 because NodePath uses u8 for child indices.
+/// Internal nodes have MAX_KEYS + 1 children, so index can be at most MAX_KEYS.
 const MAX_KEYS: usize = 128;
+
+// Compile-time assertion: MAX_KEYS must fit in u8 (NodePath uses [u8; MAX_TREE_DEPTH])
+const _: () = assert!(
+    MAX_KEYS <= 255,
+    "MAX_KEYS must be <= 255 (NodePath uses u8 indices)"
+);
 
 /// Minimum keys per node (except root).
 const MIN_KEYS: usize = MAX_KEYS / 2;
@@ -400,6 +409,13 @@ impl<V: Clone> NodePtr<V> {
         assert!(self.is_leaf());
         let len = self.len();
         assert!(len <= MAX_KEYS);
+        assert!(
+            index <= len,
+            "insert_leaf: index {} > len {} for key {}",
+            index,
+            len,
+            key
+        );
 
         // SAFETY: This is a leaf node (asserted). len <= MAX_KEYS, so we have room for one more.
         // We shift elements at [index..len] to [index+1..len+1], then write the new key/value at index.

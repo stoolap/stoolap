@@ -62,6 +62,8 @@ use std::ops::Deref;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+use super::CompactVec;
+
 // ============================================================================
 // Unified Header - The Magic Trick!
 // ============================================================================
@@ -710,6 +712,54 @@ impl<T> CompactArc<[T]> {
             }
         }
     }
+
+    /// Creates a new `CompactArc<[T]>` by moving elements from a CompactVec.
+    ///
+    /// This is more efficient than `from_slice` as it moves elements instead of cloning.
+    /// Avoids the intermediate Vec conversion compared to `from_vec`.
+    #[must_use]
+    pub fn from_compact_vec(mut vec: CompactVec<T>) -> Self {
+        let len = vec.len();
+        let data_offset = data_offset_for::<T>();
+        let align = mem::align_of::<T>().max(mem::align_of::<Header>());
+        let data_size = mem::size_of::<T>() * len;
+        let layout =
+            Layout::from_size_align(data_offset + data_size, align).expect("layout overflow");
+
+        // SAFETY: We allocate memory with the correct layout for Header + [T].
+        // We copy (move) the elements from vec into the allocation, then set vec's len to 0
+        // to prevent double-free. The vec's buffer is still freed when vec drops, but
+        // its elements have been moved to our allocation.
+        unsafe {
+            let ptr = alloc(layout);
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+
+            // Write header
+            let header = ptr as *mut Header;
+            ptr::write(
+                header,
+                Header {
+                    count: AtomicUsize::new(1),
+                    dropper: drop_slice::<T>,
+                    len,
+                },
+            );
+
+            // Move elements from CompactVec (copy bytes, then prevent CompactVec from dropping them)
+            let data_ptr = ptr.add(data_offset) as *mut T;
+            ptr::copy_nonoverlapping(vec.as_ptr(), data_ptr, len);
+
+            // Prevent CompactVec from dropping the moved elements (buffer will still be freed)
+            vec.set_len(0);
+
+            CompactArc {
+                ptr: NonNull::new_unchecked(header),
+                _marker: PhantomData,
+            }
+        }
+    }
 }
 
 impl<T: Clone> CompactArc<[T]> {
@@ -1264,6 +1314,71 @@ mod tests {
         assert_eq!(&arr[0], "a");
         assert_eq!(&arr[1], "b");
         assert_eq!(&arr[2], "c");
+    }
+
+    #[test]
+    fn test_slice_from_compact_vec() {
+        let mut compact_vec = CompactVec::new();
+        compact_vec.push(String::from("x"));
+        compact_vec.push(String::from("y"));
+        compact_vec.push(String::from("z"));
+
+        let arr: CompactArc<[String]> = CompactArc::from_compact_vec(compact_vec);
+        assert_eq!(arr.len(), 3);
+        assert_eq!(&arr[0], "x");
+        assert_eq!(&arr[1], "y");
+        assert_eq!(&arr[2], "z");
+    }
+
+    #[test]
+    fn test_from_compact_vec_moves_elements() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static CLONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug, PartialEq)]
+        struct MoveTracker(u32);
+
+        impl Clone for MoveTracker {
+            fn clone(&self) -> Self {
+                CLONE_COUNT.fetch_add(1, Ordering::SeqCst);
+                MoveTracker(self.0)
+            }
+        }
+
+        impl Drop for MoveTracker {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        CLONE_COUNT.store(0, Ordering::SeqCst);
+
+        {
+            let mut compact_vec = CompactVec::new();
+            compact_vec.push(MoveTracker(1));
+            compact_vec.push(MoveTracker(2));
+            compact_vec.push(MoveTracker(3));
+
+            let arr: CompactArc<[MoveTracker]> = CompactArc::from_compact_vec(compact_vec);
+
+            // Verify elements are accessible
+            assert_eq!(arr[0].0, 1);
+            assert_eq!(arr[1].0, 2);
+            assert_eq!(arr[2].0, 3);
+
+            // No clones should have happened (elements were moved)
+            assert_eq!(
+                CLONE_COUNT.load(Ordering::SeqCst),
+                0,
+                "from_compact_vec should move, not clone"
+            );
+        }
+
+        // Only 3 drops: the elements in the CompactArc
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
     }
 
     #[test]
