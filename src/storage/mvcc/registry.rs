@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::common::{new_concurrent_i64_map, ConcurrentI64Map};
+use crate::common::maps::{new_concurrent_i64_map, ConcurrentI64Map};
 use crate::core::IsolationLevel;
 use crate::storage::mvcc::VisibilityChecker;
 
@@ -147,7 +147,7 @@ pub struct TransactionRegistry {
     /// Benefits:
     /// - State transitions are atomic updates, not remove+insert
     /// - Single lookup for visibility checks
-    /// - 60% fewer DashMap operations per commit
+    /// - Lock-free concurrent access via ConcurrentI64Map (DashMap + FxHash)
     transactions: ConcurrentI64Map<TxnState>,
 
     /// Global isolation level for new transactions (stored as u8 for lock-free access)
