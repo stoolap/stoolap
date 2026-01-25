@@ -29,6 +29,11 @@ const MIN_CAPACITY: usize = 8;
 const LOAD_FACTOR_NUM: usize = 3;
 const LOAD_FACTOR_DEN: usize = 4;
 
+/// Shrink threshold: shrink when len < capacity / SHRINK_DIVISOR
+/// Only shrink if capacity > MIN_SHRINK_CAPACITY to avoid thrashing
+const SHRINK_DIVISOR: usize = 4;
+const MIN_SHRINK_CAPACITY: usize = 64;
+
 // Empty sentinel - i64::MIN is never used as row ID or transaction ID
 const EMPTY: i64 = i64::MIN;
 
@@ -308,6 +313,11 @@ impl<V> I64Map<V> {
             self.slots.get_unchecked_mut(empty_idx).key = EMPTY;
         }
 
+        // Check if we should shrink after removal
+        if self.should_shrink() {
+            self.shrink();
+        }
+
         Some(value)
     }
 
@@ -336,6 +346,63 @@ impl<V> I64Map<V> {
         }
 
         debug_assert_eq!(self.len, old_len);
+    }
+
+    /// Check if we should shrink: len < capacity / SHRINK_DIVISOR
+    /// Only shrink if capacity > MIN_SHRINK_CAPACITY to avoid thrashing
+    #[inline]
+    fn should_shrink(&self) -> bool {
+        let cap = self.slots.len();
+        cap > MIN_SHRINK_CAPACITY && self.len < cap / SHRINK_DIVISOR
+    }
+
+    /// Shrink the table to fit current entries
+    fn shrink(&mut self) {
+        // Calculate new capacity needed for current entries
+        let new_cap = if self.len == 0 {
+            MIN_CAPACITY
+        } else {
+            self.len
+                .saturating_mul(LOAD_FACTOR_DEN)
+                .saturating_div(LOAD_FACTOR_NUM)
+                .next_power_of_two()
+                .max(MIN_CAPACITY)
+        };
+
+        if new_cap >= self.slots.len() {
+            return; // No need to shrink
+        }
+
+        let new_mask = new_cap - 1;
+
+        let new_slots: Vec<Slot<V>> = (0..new_cap)
+            .map(|_| Slot {
+                key: EMPTY,
+                value: MaybeUninit::uninit(),
+            })
+            .collect();
+
+        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
+        let old_len = self.len;
+        self.len = 0;
+        self.mask = new_mask;
+
+        for slot in Vec::from(old_slots) {
+            if slot.key != EMPTY {
+                // SAFETY: slot.key != EMPTY means the value is initialized.
+                let value = unsafe { slot.value.assume_init() };
+                self.insert(slot.key, value);
+            }
+        }
+
+        debug_assert_eq!(self.len, old_len);
+    }
+
+    /// Shrink the map to fit its current contents, releasing excess memory.
+    ///
+    /// Call this after removing many entries to reclaim memory.
+    pub fn shrink_to_fit(&mut self) {
+        self.shrink();
     }
 
     pub fn clear(&mut self) {
@@ -941,6 +1008,11 @@ impl I64Set {
             *self.slots.get_unchecked_mut(empty_idx) = EMPTY;
         }
 
+        // Check if we should shrink after removal
+        if self.should_shrink() {
+            self.shrink();
+        }
+
         true
     }
 
@@ -961,6 +1033,55 @@ impl I64Set {
         }
 
         debug_assert_eq!(self.len, old_len);
+    }
+
+    /// Check if we should shrink: len < capacity / SHRINK_DIVISOR
+    /// Only shrink if capacity > MIN_SHRINK_CAPACITY to avoid thrashing
+    #[inline]
+    fn should_shrink(&self) -> bool {
+        let cap = self.slots.len();
+        cap > MIN_SHRINK_CAPACITY && self.len < cap / SHRINK_DIVISOR
+    }
+
+    /// Shrink the set to fit current entries
+    fn shrink(&mut self) {
+        // Calculate new capacity needed for current entries
+        let new_cap = if self.len == 0 {
+            MIN_CAPACITY
+        } else {
+            self.len
+                .saturating_mul(LOAD_FACTOR_DEN)
+                .saturating_div(LOAD_FACTOR_NUM)
+                .next_power_of_two()
+                .max(MIN_CAPACITY)
+        };
+
+        if new_cap >= self.slots.len() {
+            return; // No need to shrink
+        }
+
+        let new_mask = new_cap - 1;
+
+        let new_slots: Vec<i64> = vec![EMPTY; new_cap];
+        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
+        let old_len = self.len;
+        self.len = 0;
+        self.mask = new_mask;
+
+        for slot in old_slots.iter() {
+            if *slot != EMPTY {
+                self.insert(*slot);
+            }
+        }
+
+        debug_assert_eq!(self.len, old_len);
+    }
+
+    /// Shrink the set to fit its current contents, releasing excess memory.
+    ///
+    /// Call this after removing many entries to reclaim memory.
+    pub fn shrink_to_fit(&mut self) {
+        self.shrink();
     }
 
     pub fn clear(&mut self) {
@@ -1348,6 +1469,69 @@ mod tests {
     }
 
     #[test]
+    fn test_shrink_after_delete() {
+        let mut map = I64Map::new();
+
+        // Insert many entries to grow the map
+        for i in 0..1000 {
+            map.insert(i, i * 2);
+        }
+
+        let capacity_after_insert = map.capacity();
+        assert!(capacity_after_insert >= 1000);
+
+        // Remove most entries (keep only 10)
+        for i in 10..1000 {
+            map.remove(i);
+        }
+
+        assert_eq!(map.len(), 10);
+
+        // Capacity should have shrunk (automatic shrink after remove)
+        let capacity_after_remove = map.capacity();
+        assert!(
+            capacity_after_remove < capacity_after_insert,
+            "capacity should shrink: {} < {}",
+            capacity_after_remove,
+            capacity_after_insert
+        );
+
+        // Verify remaining entries still work
+        for i in 0..10 {
+            assert_eq!(map.get(i), Some(&(i * 2)));
+        }
+    }
+
+    #[test]
+    fn test_shrink_to_fit() {
+        let mut map: I64Map<i64> = I64Map::with_capacity(1000);
+
+        // Insert only a few entries
+        for i in 0..10 {
+            map.insert(i, i);
+        }
+
+        let initial_capacity = map.capacity();
+        assert!(initial_capacity >= 1000);
+
+        // Shrink to fit
+        map.shrink_to_fit();
+
+        let after_shrink = map.capacity();
+        assert!(
+            after_shrink < initial_capacity,
+            "capacity should shrink: {} < {}",
+            after_shrink,
+            initial_capacity
+        );
+
+        // Verify entries still work
+        for i in 0..10 {
+            assert_eq!(map.get(i), Some(&i));
+        }
+    }
+
+    #[test]
     fn test_strided_keys_no_collision_catastrophe() {
         // This test verifies that strided keys (e.g., multiples of 1024)
         // don't cause catastrophic collisions that would result in O(N^2) behavior.
@@ -1481,6 +1665,69 @@ mod tests {
         assert!(set.contains(1));
         assert!(set.contains(2));
         assert!(set.contains(3));
+    }
+
+    #[test]
+    fn test_i64set_shrink_after_delete() {
+        let mut set = I64Set::new();
+
+        // Insert many entries to grow the set
+        for i in 0..1000 {
+            set.insert(i);
+        }
+
+        let capacity_after_insert = set.capacity();
+        assert!(capacity_after_insert >= 1000);
+
+        // Remove most entries (keep only 10)
+        for i in 10..1000 {
+            set.remove(i);
+        }
+
+        assert_eq!(set.len(), 10);
+
+        // Capacity should have shrunk (automatic shrink after remove)
+        let capacity_after_remove = set.capacity();
+        assert!(
+            capacity_after_remove < capacity_after_insert,
+            "capacity should shrink: {} < {}",
+            capacity_after_remove,
+            capacity_after_insert
+        );
+
+        // Verify remaining entries still work
+        for i in 0..10 {
+            assert!(set.contains(i));
+        }
+    }
+
+    #[test]
+    fn test_i64set_shrink_to_fit() {
+        let mut set = I64Set::with_capacity(1000);
+
+        // Insert only a few entries
+        for i in 0..10 {
+            set.insert(i);
+        }
+
+        let initial_capacity = set.capacity();
+        assert!(initial_capacity >= 1000);
+
+        // Shrink to fit
+        set.shrink_to_fit();
+
+        let after_shrink = set.capacity();
+        assert!(
+            after_shrink < initial_capacity,
+            "capacity should shrink: {} < {}",
+            after_shrink,
+            initial_capacity
+        );
+
+        // Verify entries still work
+        for i in 0..10 {
+            assert!(set.contains(i));
+        }
     }
 
     #[test]

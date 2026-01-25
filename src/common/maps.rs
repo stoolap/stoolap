@@ -17,17 +17,10 @@
 //! This module provides optimized hash maps:
 //! - `I64Map`/`I64Set` for i64 keys (custom pre-mixing hash)
 //! - `StringMap`/`StringSet` for String keys (AHash)
-//! - `ConcurrentI64Map` for concurrent access (DashMap)
 //! - `CowBTreeMap` for ordered iteration with lock-free reads
 
 use ahash::{AHashMap, AHashSet};
-use dashmap::DashMap;
 use parking_lot::RwLock;
-use rustc_hash::FxHasher;
-use std::hash::BuildHasherDefault;
-
-/// Type alias for FxHash's BuildHasher
-pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 /// Fast single-threaded hash map for i64 keys
 ///
@@ -52,12 +45,6 @@ pub type StringMap<V> = AHashMap<String, V>;
 /// Uses AHash which provides ~10% faster lookups than FxHash for String keys.
 pub type StringSet = AHashSet<String>;
 
-/// Concurrent hash map for i64 keys
-///
-/// Uses DashMap with FxHash for fast concurrent access.
-/// Provides sharded, lock-free reads and fine-grained locking for writes.
-pub type ConcurrentI64Map<V> = DashMap<i64, V, FxBuildHasher>;
-
 /// Copy-on-Write B-tree map for i64 keys with lock-free reads
 ///
 /// Key advantage: `.read().clone()` is O(1) for creating snapshots.
@@ -80,12 +67,6 @@ pub fn new_i64_map<V>() -> I64Map<V> {
 #[inline]
 pub fn new_i64_map_with_capacity<V>(capacity: usize) -> I64Map<V> {
     crate::common::i64_map::I64Map::with_capacity(capacity)
-}
-
-/// Create a new ConcurrentI64Map with default capacity
-#[inline]
-pub fn new_concurrent_i64_map<V>() -> ConcurrentI64Map<V> {
-    DashMap::with_hasher(FxBuildHasher::default())
 }
 
 /// Create a new CowBTreeMap (lock-free reads via snapshots)
@@ -141,49 +122,6 @@ mod tests {
 
         set.remove(2);
         assert!(!set.contains(2));
-    }
-
-    #[test]
-    fn test_concurrent_i64_map() {
-        let map: ConcurrentI64Map<String> = new_concurrent_i64_map();
-
-        map.insert(1, "one".to_string());
-        map.insert(2, "two".to_string());
-
-        assert_eq!(map.get(&1).map(|v| v.clone()), Some("one".to_string()));
-        assert!(map.get(&3).is_none());
-
-        map.remove(&1);
-        assert!(map.get(&1).is_none());
-    }
-
-    #[test]
-    fn test_concurrent_i64_map_multithreaded() {
-        let map: Arc<ConcurrentI64Map<i64>> = Arc::new(new_concurrent_i64_map());
-        let num_threads: i64 = 4;
-        let ops_per_thread: i64 = 100;
-
-        let handles: Vec<_> = (0..num_threads)
-            .map(|t| {
-                let map = Arc::clone(&map);
-                thread::spawn(move || {
-                    let base = t * ops_per_thread;
-                    for i in 0..ops_per_thread {
-                        map.insert(base + i, (base + i) * 2);
-                    }
-                    for i in 0..ops_per_thread {
-                        let key = base + i;
-                        assert_eq!(map.get(&key).map(|v| *v), Some(key * 2));
-                    }
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        assert_eq!(map.len(), (num_threads * ops_per_thread) as usize);
     }
 
     #[test]

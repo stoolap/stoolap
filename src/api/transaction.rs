@@ -303,8 +303,15 @@ impl Transaction {
                     (Row::from_values(new_values), true)
                 };
 
-                // Use None for where_expr since we handle WHERE in the setter
-                let updated_count = table.update(None, &mut setter)?;
+                // Try to convert WHERE clause to storage expression for index optimization
+                // (PK lookup, secondary index, etc.). If conversion fails for complex
+                // expressions, fall back to None and let the setter handle filtering.
+                let storage_where_expr = stmt
+                    .where_clause
+                    .as_ref()
+                    .and_then(|expr| self.convert_to_storage_expression(expr, ctx).ok());
+
+                let updated_count = table.update(storage_where_expr.as_deref(), &mut setter)?;
 
                 // Check if any errors were captured during update
                 if let Some(err) = update_error.into_inner() {

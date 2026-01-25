@@ -435,7 +435,7 @@ pub trait VisibilityChecker: Send + Sync {
 /// Uses CowBTreeMap (RwLock<CowBTree>) for the version store because:
 /// - O(1) snapshot cloning for lock-free reads (critical for MVCC)
 /// - Ordered iteration is free (B+ tree is sorted by key)
-/// - MVCC has single-writer semantics per transaction, so DashMap's sharding is overhead
+/// - MVCC has single-writer semantics per transaction, so concurrent map sharding is overhead
 /// - Point lookups are O(log n) which is fast enough for typical row counts
 /// - Eliminates the ~350μs sort overhead during full scans
 ///
@@ -757,7 +757,8 @@ impl VersionStore {
                     Some(Arc::new(VersionChainEntry {
                         version: existing_version,
                         prev: existing_prev,
-                        arena_idx: existing_arena_idx,
+                        // Historical versions don't use arena (slot reused by new HEAD)
+                        arena_idx: None,
                     }))
                 };
 
@@ -917,7 +918,8 @@ impl VersionStore {
                         Some(Arc::new(VersionChainEntry {
                             version: existing_version,
                             prev: existing_prev,
-                            arena_idx: existing_arena_idx,
+                            // Historical versions don't use arena (slot reused by new HEAD)
+                            arena_idx: None,
                         }))
                     };
 
@@ -1081,7 +1083,8 @@ impl VersionStore {
                     Some(Arc::new(VersionChainEntry {
                         version: existing_version,
                         prev: existing_prev,
-                        arena_idx: existing_arena_idx,
+                        // Historical versions don't use arena (slot reused by new HEAD)
+                        arena_idx: None,
                     }))
                 };
 
@@ -3716,7 +3719,7 @@ impl VersionStore {
     /// - Eliminates ALL cloning during iteration
     /// - Single lock acquisition for entire scan
     /// - Cache-friendly contiguous memory access
-    /// - Fast path: O(n) arena scan when all rows are visible (skips DashMap)
+    /// - Fast path: O(n) arena scan when all rows are visible (skips version map)
     ///
     /// # Usage
     /// ```ignore
@@ -3743,7 +3746,7 @@ impl VersionStore {
             .map(|c| c.name.clone())
             .collect();
 
-        // FAST PATH: If we can iterate arena directly without DashMap
+        // FAST PATH: If we can iterate arena directly without version map lookup
         // This is possible when:
         // 1. No active uncommitted writes
         // 2. All arena rows are visible to this transaction
@@ -3753,7 +3756,7 @@ impl VersionStore {
             let uncommitted_empty = self.uncommitted_writes.read().is_empty();
 
             if uncommitted_empty && arena_len > 0 {
-                // Fast path: scan arena directly, skip DashMap iteration
+                // Fast path: scan arena directly, skip version map iteration
                 let mut visible_indices: Vec<VisibleRowInfo> = Vec::with_capacity(arena_len);
 
                 for (idx, meta) in arena_guard.meta().iter().enumerate() {

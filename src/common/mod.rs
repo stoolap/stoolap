@@ -26,6 +26,7 @@ pub mod buffer_pool;
 pub mod compact_arc;
 pub mod compact_vec;
 pub mod cow_btree;
+pub mod cow_hashmap;
 pub mod i64_map;
 pub mod maps;
 pub mod smart_string;
@@ -36,10 +37,10 @@ pub use buffer_pool::{BufferPool, PoolStats};
 pub use compact_arc::CompactArc;
 pub use compact_vec::CompactVec;
 pub use cow_btree::CowBTree;
+pub use cow_hashmap::CowHashMap;
 pub use i64_map::{I64Map, I64Set};
 pub use maps::{
-    new_concurrent_i64_map, new_cow_btree_map, new_i64_map, new_i64_map_with_capacity,
-    ConcurrentI64Map, CowBTreeMap, StringMap, StringSet,
+    new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CowBTreeMap, StringMap, StringSet,
 };
 pub use smart_string::SmartString;
 pub use version::{version, version_info, SemVer, BUILD_TIME, GIT_COMMIT, MAJOR, MINOR, PATCH};
@@ -73,34 +74,5 @@ mod integration_tests {
 
         let info = version_info();
         assert!(info.contains("stoolap"));
-    }
-
-    #[test]
-    fn test_concurrent_map_with_buffer_pool() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let pool = Arc::new(BufferPool::new(1024, 4096, "test"));
-        let map: Arc<ConcurrentI64Map<Vec<u8>>> = Arc::new(new_concurrent_i64_map());
-
-        let handles: Vec<_> = (0i64..4)
-            .map(|i| {
-                let pool = Arc::clone(&pool);
-                let map: Arc<ConcurrentI64Map<Vec<u8>>> = Arc::clone(&map);
-                thread::spawn(move || {
-                    for j in 0i64..10 {
-                        let mut buf = pool.get();
-                        buf.extend_from_slice(format!("thread {} item {}", i, j).as_bytes());
-                        map.insert(i * 100 + j, buf);
-                    }
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        assert_eq!(map.len(), 40);
     }
 }

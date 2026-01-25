@@ -53,8 +53,8 @@
 //! less frequent than reads.
 //!
 //! **Alternative considered**: Using a single RwLock<struct> would have similar
-//! contention characteristics. DashMap could help for truly concurrent writes but
-//! would complicate atomicity across the three maps.
+//! contention characteristics. A concurrent map could help for truly concurrent writes
+//! but would complicate atomicity across the three maps.
 
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};

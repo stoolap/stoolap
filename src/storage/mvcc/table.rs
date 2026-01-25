@@ -1274,7 +1274,7 @@ impl MVCCTable {
     /// Collect visible rows WITHOUT sorting for GROUP BY optimization.
     ///
     /// This skips the O(n log n) sort since GROUP BY doesn't care about row order.
-    /// Returns rows in DashMap iteration order (non-deterministic).
+    /// Returns rows in version store iteration order.
     #[inline]
     fn collect_visible_rows_unsorted(&self) -> RowVec {
         // For GROUP BY, order doesn't matter - use same cached path
