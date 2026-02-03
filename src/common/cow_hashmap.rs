@@ -169,9 +169,10 @@ impl<V: Clone> Drop for CowHashMap<V> {
 
         if mem::needs_drop::<V>() {
             let slots = self.slots();
-            // SAFETY: We are the last reference. Drop all occupied values.
             for slot in slots.iter() {
                 if slot.key != EMPTY {
+                    // SAFETY: We are the last reference (ref_count == 1 checked above).
+                    // The slot is occupied (key != EMPTY), so value is initialized.
                     unsafe {
                         ptr::drop_in_place(slot.value.as_ptr() as *mut V);
                     }

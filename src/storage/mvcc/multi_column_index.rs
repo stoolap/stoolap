@@ -218,37 +218,6 @@ impl MultiColumnIndex {
         }
     }
 
-    /// Helper to compare stored CompactArc<Value> with input &[CompactArc<Value>]
-    /// Specialized unrolling for common cases (1-4 columns): ~5% faster than zip().all()
-    #[inline]
-    fn arc_values_match(stored: &[CompactArc<Value>], input: &[CompactArc<Value>]) -> bool {
-        #[inline]
-        fn eq(s: &CompactArc<Value>, i: &CompactArc<Value>) -> bool {
-            CompactArc::ptr_eq(s, i) || s.as_ref() == i.as_ref()
-        }
-        if stored.len() != input.len() {
-            return false;
-        }
-        match stored.len() {
-            0 => true,
-            1 => eq(&stored[0], &input[0]),
-            2 => eq(&stored[0], &input[0]) && eq(&stored[1], &input[1]),
-            3 => {
-                eq(&stored[0], &input[0]) && eq(&stored[1], &input[1]) && eq(&stored[2], &input[2])
-            }
-            4 => {
-                eq(&stored[0], &input[0])
-                    && eq(&stored[1], &input[1])
-                    && eq(&stored[2], &input[2])
-                    && eq(&stored[3], &input[3])
-            }
-            _ => stored
-                .iter()
-                .zip(input.iter())
-                .all(|(s, i)| CompactArc::ptr_eq(s, i) || s.as_ref() == i.as_ref()),
-        }
-    }
-
     /// Build BTree index lazily from hash index (on first range query)
     fn ensure_btree_built(&self) {
         if self.btree_built.load(AtomicOrdering::Acquire) {
@@ -379,9 +348,8 @@ impl Index for MultiColumnIndex {
 
         let key = CompositeKey(values.to_vec());
 
-        // Wrap values in Arc for O(1) cloning in row_to_key
-        let arc_values: Vec<CompactArc<Value>> =
-            values.iter().map(|v| CompactArc::new(v.clone())).collect();
+        // Track old key if this is an update (for BTree/prefix cleanup after releasing locks)
+        let mut old_key_for_cleanup: Option<Vec<CompactArc<Value>>> = None;
 
         // Acquire BOTH write locks FIRST to prevent race conditions during updates
         // Lock order: value_to_rows → row_to_key (same as remove())
@@ -397,7 +365,10 @@ impl Index for MultiColumnIndex {
                 return Ok(());
             }
 
-            // Different key - create CompositeKey from existing Arc values for removal
+            // Different key - save for BTree/prefix cleanup AFTER releasing locks
+            old_key_for_cleanup = Some(existing_arc_values.clone());
+
+            // Create CompositeKey from existing Arc values for removal
             let existing_key =
                 CompositeKey(existing_arc_values.iter().map(|a| (**a).clone()).collect());
 
@@ -409,37 +380,6 @@ impl Index for MultiColumnIndex {
                 }
             }
             // Note: row_to_key will be overwritten below, no need to remove here
-
-            // Also update BTree if built
-            if self.btree_built.load(AtomicOrdering::Acquire) {
-                let mut sorted_values = self.sorted_values.write().unwrap();
-                if let Some(rows) = sorted_values.get_mut(&existing_key) {
-                    rows.retain(|id| *id != row_id);
-                    if rows.is_empty() {
-                        sorted_values.remove(&existing_key);
-                    }
-                }
-            }
-
-            // Update prefix indexes if built
-            for prefix_len in 1..existing_arc_values.len() {
-                let idx = prefix_len - 1;
-                if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
-                    let prefix_key = CompositeKey(
-                        existing_arc_values[..prefix_len]
-                            .iter()
-                            .map(|a| (**a).clone())
-                            .collect(),
-                    );
-                    let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
-                    if let Some(rows) = prefix_index.get_mut(&prefix_key) {
-                        rows.retain(|id| *id != row_id);
-                        if rows.is_empty() {
-                            prefix_index.remove(&prefix_key);
-                        }
-                    }
-                }
-            }
         }
 
         // Check uniqueness while holding write lock (atomic check + insert)
@@ -447,6 +387,10 @@ impl Index for MultiColumnIndex {
 
         // Check if BTree needs update before we move key
         let btree_needs_update = self.btree_built.load(AtomicOrdering::Acquire);
+
+        // Wrap values in Arc for O(1) cloning in row_to_key
+        let arc_values: Vec<CompactArc<Value>> =
+            values.iter().map(|v| CompactArc::new(v.clone())).collect();
 
         // Add to hash index (for exact lookups) - ALWAYS maintained
         // Clone key once for hash index, keep original for BTree
@@ -460,84 +404,19 @@ impl Index for MultiColumnIndex {
         // Store CompactArc<Value> references in row_to_key (memory efficient)
         row_to_key.insert(row_id, arc_values);
 
+        // Release main locks BEFORE acquiring BTree/prefix locks
+        // This ensures consistent lock ordering across all code paths
+        drop(value_to_rows);
+        drop(row_to_key);
+
         // Update BTree only if it was already built
         if btree_needs_update {
-            drop(value_to_rows);
-            drop(row_to_key);
             let mut sorted_values = self.sorted_values.write().unwrap();
-            let btree_rows = sorted_values.entry(key).or_default();
-            if let Err(pos) = btree_rows.binary_search(&row_id) {
-                btree_rows.insert(pos, row_id);
-            }
-        }
 
-        // Update prefix indexes only if they were already built
-        // Insert in sorted order for O(N+M) merge operations
-        for prefix_len in 1..num_cols {
-            let idx = prefix_len - 1;
-            if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
-                let prefix_key = CompositeKey(values[..prefix_len].to_vec());
-                let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
-                let prefix_rows = prefix_index.entry(prefix_key).or_default();
-                if let Err(pos) = prefix_rows.binary_search(&row_id) {
-                    prefix_rows.insert(pos, row_id);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn add_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
-        if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::IndexClosed);
-        }
-
-        let num_cols = self.column_ids.len();
-        if values.len() != num_cols {
-            return Err(Error::internal(format!(
-                "expected {} values, got {}",
-                num_cols,
-                values.len()
-            )));
-        }
-
-        // Create CompositeKey by dereferencing Arc values
-        let key = CompositeKey(values.iter().map(|a| (**a).clone()).collect());
-
-        // Clone Arc references - O(1) per value, no value cloning!
-        let arc_values: Vec<CompactArc<Value>> = values.iter().map(CompactArc::clone).collect();
-
-        // Acquire BOTH write locks FIRST to prevent race conditions during updates
-        // Lock order: value_to_rows → row_to_key (same as remove())
-        let mut value_to_rows = self.value_to_rows.write().unwrap();
-        let mut row_to_key = self.row_to_key.write().unwrap();
-
-        // Check if row already exists with different key (for updates)
-        // Now safe to do atomically since we hold both write locks
-        if let Some(existing_arc_values) = row_to_key.get(row_id) {
-            // Compare Arc pointers first (fast path), then values using optimized helper
-            if Self::arc_values_match(existing_arc_values, values) {
-                // Same key, nothing to do
-                return Ok(());
-            }
-
-            // Different key - create CompositeKey from existing Arc values for removal
-            let existing_key =
-                CompositeKey(existing_arc_values.iter().map(|a| (**a).clone()).collect());
-
-            // Remove old entry from value_to_rows
-            if let Some(rows) = value_to_rows.get_mut(&existing_key) {
-                rows.retain(|id| *id != row_id);
-                if rows.is_empty() {
-                    value_to_rows.remove(&existing_key);
-                }
-            }
-            // Note: row_to_key will be overwritten below, no need to remove here
-
-            // Also update BTree if built
-            if self.btree_built.load(AtomicOrdering::Acquire) {
-                let mut sorted_values = self.sorted_values.write().unwrap();
+            // First remove old entry if this was an update
+            if let Some(ref old_arc_values) = old_key_for_cleanup {
+                let existing_key =
+                    CompositeKey(old_arc_values.iter().map(|a| (**a).clone()).collect());
                 if let Some(rows) = sorted_values.get_mut(&existing_key) {
                     rows.retain(|id| *id != row_id);
                     if rows.is_empty() {
@@ -546,50 +425,7 @@ impl Index for MultiColumnIndex {
                 }
             }
 
-            // Update prefix indexes if built
-            for prefix_len in 1..existing_arc_values.len() {
-                let idx = prefix_len - 1;
-                if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
-                    let prefix_key = CompositeKey(
-                        existing_arc_values[..prefix_len]
-                            .iter()
-                            .map(|a| (**a).clone())
-                            .collect(),
-                    );
-                    let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
-                    if let Some(rows) = prefix_index.get_mut(&prefix_key) {
-                        rows.retain(|id| *id != row_id);
-                        if rows.is_empty() {
-                            prefix_index.remove(&prefix_key);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check uniqueness while holding write lock (atomic check + insert)
-        self.check_unique_constraint_locked(&key, row_id, &value_to_rows)?;
-
-        // Check if BTree needs update before we move key
-        let btree_needs_update = self.btree_built.load(AtomicOrdering::Acquire);
-
-        // Add to hash index (for exact lookups) - ALWAYS maintained
-        // Clone key once for hash index, keep original for BTree
-        // Insert in sorted order for O(N+M) merge operations
-        let key_for_hash = key.clone();
-        let hash_rows = value_to_rows.entry(key_for_hash).or_default();
-        if let Err(pos) = hash_rows.binary_search(&row_id) {
-            hash_rows.insert(pos, row_id);
-        }
-
-        // Store CompactArc<Value> references in row_to_key (memory efficient - O(1) clones)
-        row_to_key.insert(row_id, arc_values);
-
-        // Update BTree only if it was already built
-        if btree_needs_update {
-            drop(value_to_rows);
-            drop(row_to_key);
-            let mut sorted_values = self.sorted_values.write().unwrap();
+            // Then add new entry
             let btree_rows = sorted_values.entry(key).or_default();
             if let Err(pos) = btree_rows.binary_search(&row_id) {
                 btree_rows.insert(pos, row_id);
@@ -601,9 +437,28 @@ impl Index for MultiColumnIndex {
         for prefix_len in 1..num_cols {
             let idx = prefix_len - 1;
             if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
-                let prefix_key =
-                    CompositeKey(values[..prefix_len].iter().map(|a| (**a).clone()).collect());
                 let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
+
+                // First remove old entry if this was an update
+                if let Some(ref old_arc_values) = old_key_for_cleanup {
+                    if old_arc_values.len() >= prefix_len {
+                        let old_prefix_key = CompositeKey(
+                            old_arc_values[..prefix_len]
+                                .iter()
+                                .map(|a| (**a).clone())
+                                .collect(),
+                        );
+                        if let Some(rows) = prefix_index.get_mut(&old_prefix_key) {
+                            rows.retain(|id| *id != row_id);
+                            if rows.is_empty() {
+                                prefix_index.remove(&old_prefix_key);
+                            }
+                        }
+                    }
+                }
+
+                // Then add new entry
+                let prefix_key = CompositeKey(values[..prefix_len].to_vec());
                 let prefix_rows = prefix_index.entry(prefix_key).or_default();
                 if let Err(pos) = prefix_rows.binary_search(&row_id) {
                     prefix_rows.insert(pos, row_id);
@@ -680,20 +535,218 @@ impl Index for MultiColumnIndex {
         Ok(())
     }
 
-    fn remove_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
+    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
+        for (row_id, values) in entries.iter() {
+            self.remove(values, row_id, 0)?;
+        }
+        Ok(())
+    }
+
+    fn add_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
         }
 
-        // Create CompositeKey by dereferencing Arc values
-        let key = CompositeKey(values.iter().map(|a| (**a).clone()).collect());
+        let num_cols = self.column_ids.len();
 
-        // LAZY: Only update hash index and reverse mapping
-        {
-            let mut value_to_rows = self.value_to_rows.write().unwrap();
-            let mut row_to_key = self.row_to_key.write().unwrap();
+        // Validate all entries first
+        for &(_row_id, values) in entries {
+            if values.len() != num_cols {
+                return Err(Error::internal(format!(
+                    "expected {} values, got {}",
+                    num_cols,
+                    values.len()
+                )));
+            }
+        }
 
-            // Remove from hash index (row_ids are sorted, use binary search)
+        // Acquire ALL write locks ONCE for the entire batch
+        let mut value_to_rows = self.value_to_rows.write().unwrap();
+        let mut row_to_key = self.row_to_key.write().unwrap();
+
+        // Reserve capacity to reduce reallocations
+        value_to_rows.reserve(entries.len());
+        row_to_key.reserve(entries.len());
+
+        // Check if BTree needs update
+        let btree_needs_update = self.btree_built.load(AtomicOrdering::Acquire);
+
+        // Pre-check unique constraints if this is a unique index
+        if self.is_unique {
+            // Build a set of keys in this batch for intra-batch duplicate detection
+            let mut batch_keys: FxHashMap<CompositeKey, i64> =
+                FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+
+            for &(row_id, values) in entries {
+                // Skip if any value is NULL (NULL doesn't violate uniqueness)
+                let has_null = values.iter().any(|v| v.is_null());
+                if has_null {
+                    continue;
+                }
+
+                let key = CompositeKey(values.to_vec());
+
+                // Check intra-batch duplicates
+                if let Some(&existing_row_id) = batch_keys.get(&key) {
+                    if existing_row_id != row_id {
+                        let values_str: Vec<String> =
+                            values.iter().map(|v| format!("{:?}", v)).collect();
+                        return Err(Error::unique_constraint(
+                            &self.name,
+                            self.column_names.join(", "),
+                            format!("[{}]", values_str.join(", ")),
+                        ));
+                    }
+                }
+
+                // Check against existing index
+                if let Some(existing_rows) = value_to_rows.get(&key) {
+                    if !existing_rows.is_empty() && !existing_rows.contains(&row_id) {
+                        let values_str: Vec<String> =
+                            values.iter().map(|v| format!("{:?}", v)).collect();
+                        return Err(Error::unique_constraint(
+                            &self.name,
+                            self.column_names.join(", "),
+                            format!("[{}]", values_str.join(", ")),
+                        ));
+                    }
+                }
+
+                batch_keys.insert(key, row_id);
+            }
+        }
+
+        // Collect old keys for rows that need updating (to remove from BTree/prefix later)
+        // We need to collect these before modifying row_to_key
+        let mut updates_to_old_key: Vec<(i64, Vec<CompactArc<Value>>)> = Vec::new();
+
+        // Now add all entries
+        for &(row_id, values) in entries {
+            let key = CompositeKey(values.to_vec());
+
+            // Wrap values in Arc for O(1) cloning in row_to_key
+            let arc_values: Vec<CompactArc<Value>> =
+                values.iter().map(|v| CompactArc::new(v.clone())).collect();
+
+            // Check if row already exists with different key (for updates)
+            if let Some(existing_arc_values) = row_to_key.get(row_id) {
+                if !Self::values_match(existing_arc_values, values) {
+                    // Different key - collect for BTree/prefix removal later
+                    updates_to_old_key.push((row_id, existing_arc_values.clone()));
+
+                    // Remove old entry from value_to_rows
+                    let existing_key =
+                        CompositeKey(existing_arc_values.iter().map(|a| (**a).clone()).collect());
+
+                    if let Some(rows) = value_to_rows.get_mut(&existing_key) {
+                        rows.retain(|id| *id != row_id);
+                        if rows.is_empty() {
+                            value_to_rows.remove(&existing_key);
+                        }
+                    }
+                }
+            }
+
+            // Add to hash index - insert in sorted order
+            let hash_rows = value_to_rows.entry(key).or_default();
+            if let Err(pos) = hash_rows.binary_search(&row_id) {
+                hash_rows.insert(pos, row_id);
+            }
+
+            // Store Arc references in row_to_key
+            row_to_key.insert(row_id, arc_values);
+        }
+
+        // Release main locks before updating BTree/prefix indexes
+        drop(value_to_rows);
+        drop(row_to_key);
+
+        // Update BTree only if it was already built
+        if btree_needs_update {
+            let mut sorted_values = self.sorted_values.write().unwrap();
+
+            // First remove old entries for updated rows
+            for (row_id, existing_arc_values) in &updates_to_old_key {
+                let existing_key =
+                    CompositeKey(existing_arc_values.iter().map(|a| (**a).clone()).collect());
+                if let Some(rows) = sorted_values.get_mut(&existing_key) {
+                    rows.retain(|id| *id != *row_id);
+                    if rows.is_empty() {
+                        sorted_values.remove(&existing_key);
+                    }
+                }
+            }
+
+            // Then add new entries
+            for &(row_id, values) in entries {
+                let key = CompositeKey(values.to_vec());
+                let btree_rows = sorted_values.entry(key).or_default();
+                if let Err(pos) = btree_rows.binary_search(&row_id) {
+                    btree_rows.insert(pos, row_id);
+                }
+            }
+        }
+
+        // Update prefix indexes only if they were already built
+        for prefix_len in 1..num_cols {
+            let idx = prefix_len - 1;
+            if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
+                let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
+
+                // First remove old entries for updated rows
+                for (row_id, existing_arc_values) in &updates_to_old_key {
+                    if existing_arc_values.len() >= prefix_len {
+                        let prefix_key = CompositeKey(
+                            existing_arc_values[..prefix_len]
+                                .iter()
+                                .map(|a| (**a).clone())
+                                .collect(),
+                        );
+                        if let Some(rows) = prefix_index.get_mut(&prefix_key) {
+                            rows.retain(|id| *id != *row_id);
+                            if rows.is_empty() {
+                                prefix_index.remove(&prefix_key);
+                            }
+                        }
+                    }
+                }
+
+                // Then add new entries
+                for &(row_id, values) in entries {
+                    let prefix_key = CompositeKey(values[..prefix_len].to_vec());
+                    let prefix_rows = prefix_index.entry(prefix_key).or_default();
+                    if let Err(pos) = prefix_rows.binary_search(&row_id) {
+                        prefix_rows.insert(pos, row_id);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Err(Error::IndexClosed);
+        }
+
+        // Acquire BOTH write locks ONCE for entire batch
+        let mut value_to_rows = self.value_to_rows.write().unwrap();
+        let mut row_to_key = self.row_to_key.write().unwrap();
+
+        // Remove all entries from hash index and reverse mapping
+        for &(row_id, values) in entries {
+            let key = CompositeKey(values.to_vec());
+
+            // Remove from hash index
             if let Some(rows) = value_to_rows.get_mut(&key) {
                 if let Ok(pos) = rows.binary_search(&row_id) {
                     rows.remove(pos);
@@ -703,48 +756,51 @@ impl Index for MultiColumnIndex {
                 }
             }
 
-            // Remove reverse mapping - ALWAYS maintained
+            // Remove reverse mapping
             row_to_key.remove(row_id);
         }
 
-        // Only update BTree if it was built (row_ids are sorted, use binary search)
+        // Release main locks before updating BTree/prefix indexes
+        drop(value_to_rows);
+        drop(row_to_key);
+
+        // Only update BTree if it was built
         if self.btree_built.load(AtomicOrdering::Acquire) {
             let mut sorted_values = self.sorted_values.write().unwrap();
-            if let Some(rows) = sorted_values.get_mut(&key) {
-                if let Ok(pos) = rows.binary_search(&row_id) {
-                    rows.remove(pos);
-                }
-                if rows.is_empty() {
-                    sorted_values.remove(&key);
-                }
-            }
-        }
-
-        // Only update prefix indexes if they were built (row_ids are sorted, use binary search)
-        for prefix_len in 1..values.len() {
-            let idx = prefix_len - 1;
-            if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
-                let prefix_key =
-                    CompositeKey(values[..prefix_len].iter().map(|a| (**a).clone()).collect());
-                let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
-                if let Some(rows) = prefix_index.get_mut(&prefix_key) {
+            for &(row_id, values) in entries {
+                let key = CompositeKey(values.to_vec());
+                if let Some(rows) = sorted_values.get_mut(&key) {
                     if let Ok(pos) = rows.binary_search(&row_id) {
                         rows.remove(pos);
                     }
                     if rows.is_empty() {
-                        prefix_index.remove(&prefix_key);
+                        sorted_values.remove(&key);
                     }
                 }
             }
         }
 
-        Ok(())
-    }
-
-    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        for (row_id, values) in entries.iter() {
-            self.remove(values, row_id, 0)?;
+        // Only update prefix indexes if they were built
+        for prefix_len in 1..self.column_ids.len() {
+            let idx = prefix_len - 1;
+            if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
+                let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
+                for &(row_id, values) in entries {
+                    if values.len() >= prefix_len {
+                        let prefix_key = CompositeKey(values[..prefix_len].to_vec());
+                        if let Some(rows) = prefix_index.get_mut(&prefix_key) {
+                            if let Ok(pos) = rows.binary_search(&row_id) {
+                                rows.remove(pos);
+                            }
+                            if rows.is_empty() {
+                                prefix_index.remove(&prefix_key);
+                            }
+                        }
+                    }
+                }
+            }
         }
+
         Ok(())
     }
 

@@ -1022,6 +1022,7 @@ mod tests {
         let arc = CompactArc::new(42);
         let ptr = CompactArc::into_raw(arc);
 
+        // SAFETY: ptr was obtained from into_raw and has not been used since
         let arc2 = unsafe { CompactArc::from_raw(ptr) };
         assert_eq!(*arc2, 42);
     }

@@ -247,91 +247,6 @@ impl BitmapIndex {
         }
     }
 
-    /// Convert CompactArc<Value> slice to an CompactArc<Value> key
-    /// For single-column indexes, clones the Arc (O(1))
-    /// For multi-column indexes, creates a composite key
-    fn arc_values_to_arc_key(&self, values: &[CompactArc<Value>]) -> CompactArc<Value> {
-        if values.len() == 1 {
-            // O(1) Arc clone - no value copying!
-            CompactArc::clone(&values[0])
-        } else {
-            // For multi-column bitmap index, create a composite key
-            // This is less common but supported
-            let composite = Value::Text(
-                values
-                    .iter()
-                    .map(|v| format!("{:?}", v))
-                    .collect::<Vec<_>>()
-                    .join("||")
-                    .into(),
-            );
-            CompactArc::new(composite)
-        }
-    }
-
-    /// Slow path for multi-column indexes with Arc values (rare case)
-    #[cold]
-    #[allow(clippy::too_many_arguments)]
-    fn add_arc_multi_column(
-        &self,
-        arc_key: CompactArc<Value>,
-        row_id: i64,
-        row_id_u64: u64,
-        values: &[CompactArc<Value>],
-        mut bitmaps: std::sync::RwLockWriteGuard<'_, AHashMap<CompactArc<Value>, RoaringTreemap>>,
-        mut row_to_value: std::sync::RwLockWriteGuard<'_, I64Map<CompactArc<Value>>>,
-    ) -> Result<()> {
-        // Check uniqueness constraint
-        if self.is_unique {
-            let has_null = values.iter().any(|v| v.is_null());
-            if !has_null {
-                if let Some(bitmap) = bitmaps.get(&arc_key) {
-                    let existing_count = if bitmap.contains(row_id_u64) {
-                        bitmap.len() - 1
-                    } else {
-                        bitmap.len()
-                    };
-                    if existing_count > 0 {
-                        let values_str: Vec<String> =
-                            values.iter().map(|v| format!("{:?}", v)).collect();
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            format!("[{}]", values_str.join(", ")),
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Check if row already exists with a different value
-        if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
-                if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
-                    old_bitmap.remove(row_id_u64);
-                    if old_bitmap.is_empty() {
-                        bitmaps.remove(&old_arc_key);
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
-                }
-            }
-        }
-
-        // Add to bitmap
-        let is_new_value = !bitmaps.contains_key(&arc_key);
-        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
-        bitmap.insert(row_id_u64);
-
-        // Update reverse mapping
-        row_to_value.insert(row_id, arc_key);
-
-        if is_new_value {
-            self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-
-        Ok(())
-    }
-
     /// Slow path for multi-column indexes (rare case)
     /// Creates composite key and handles add operation
     #[cold]
@@ -507,106 +422,6 @@ impl Index for BitmapIndex {
         Ok(())
     }
 
-    fn add_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
-        if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::IndexClosed);
-        }
-
-        // Validate row_id is non-negative (can be safely converted to u64)
-        if row_id < 0 {
-            return Err(Error::internal(format!(
-                "bitmap index: row_id must be non-negative, got {}",
-                row_id
-            )));
-        }
-        let row_id_u64 = row_id as u64;
-
-        let num_cols = self.column_ids.len();
-        if values.len() != num_cols {
-            return Err(Error::internal(format!(
-                "expected {} values, got {}",
-                num_cols,
-                values.len()
-            )));
-        }
-
-        // Acquire write locks
-        let mut bitmaps = self.bitmaps.write().unwrap();
-        let mut row_to_value = self.row_to_value.write().unwrap();
-
-        // For single-column, use the value directly for lookup
-        // For multi-column, fall back to composite key
-        let lookup_value: &Value = if values.len() == 1 {
-            &values[0]
-        } else {
-            // Multi-column: create composite key and use original path
-            let arc_key = self.arc_values_to_arc_key(values);
-            return self.add_arc_multi_column(
-                arc_key,
-                row_id,
-                row_id_u64,
-                values,
-                bitmaps,
-                row_to_value,
-            );
-        };
-
-        // Check uniqueness constraint
-        if self.is_unique && !lookup_value.is_null() {
-            if let Some(bitmap) = bitmaps.get(lookup_value) {
-                let existing_count = if bitmap.contains(row_id_u64) {
-                    bitmap.len() - 1
-                } else {
-                    bitmap.len()
-                };
-                if existing_count > 0 {
-                    return Err(Error::unique_constraint(
-                        &self.name,
-                        self.column_names.join(", "),
-                        format!("{:?}", lookup_value),
-                    ));
-                }
-            }
-        }
-
-        // Try to reuse existing Arc if value already exists in index (memory deduplication)
-        let (arc_key, is_new_value) =
-            if let Some((existing_arc, _)) = bitmaps.get_key_value(lookup_value) {
-                (CompactArc::clone(existing_arc), false)
-            } else {
-                (CompactArc::clone(&values[0]), true)
-            };
-
-        // Check if row already exists with a different value (for updates)
-        if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-            // Compare Arc pointers - if same Arc, same value
-            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
-                // Remove from old bitmap
-                if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
-                    old_bitmap.remove(row_id_u64);
-                    if old_bitmap.is_empty() {
-                        bitmaps.remove(&old_arc_key);
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
-                }
-            }
-        }
-
-        // Add to bitmap
-        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
-        bitmap.insert(row_id_u64);
-
-        // Update reverse mapping with Arc reference - O(1) Arc clone
-        row_to_value.insert(row_id, arc_key);
-
-        // Update cardinality if this is a new distinct value
-        if is_new_value {
-            self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-
-        Ok(())
-    }
-
     fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
         for (row_id, values) in entries.iter() {
             self.add(values, row_id, 0)?;
@@ -649,45 +464,169 @@ impl Index for BitmapIndex {
         Ok(())
     }
 
-    fn remove_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
-        if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::IndexClosed);
-        }
-
-        // Validate row_id is non-negative
-        if row_id < 0 {
-            return Err(Error::internal(format!(
-                "bitmap index: row_id must be non-negative, got {}",
-                row_id
-            )));
-        }
-        let row_id_u64 = row_id as u64;
-
-        // Get Arc key directly - O(1) for single column
-        let arc_key = self.arc_values_to_arc_key(values);
-
-        let mut bitmaps = self.bitmaps.write().unwrap();
-        let mut row_to_value = self.row_to_value.write().unwrap();
-
-        // Remove from bitmap
-        if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
-            bitmap.remove(row_id_u64);
-            if bitmap.is_empty() {
-                bitmaps.remove(&arc_key);
-                self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-            }
-        }
-
-        // Remove from reverse mapping
-        row_to_value.remove(row_id);
-
-        Ok(())
-    }
-
     fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
         for (row_id, values) in entries.iter() {
             self.remove(values, row_id, 0)?;
         }
+        Ok(())
+    }
+
+    /// Optimized batch add with single lock acquisition
+    fn add_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Err(Error::IndexClosed);
+        }
+
+        let num_cols = self.column_ids.len();
+
+        // Acquire write locks ONCE for entire batch
+        let mut bitmaps = self.bitmaps.write().unwrap();
+        let mut row_to_value = self.row_to_value.write().unwrap();
+
+        // Reserve capacity
+        row_to_value.reserve(entries.len());
+
+        // PRE-CHECK PHASE: Validate all unique constraints BEFORE modifying anything
+        // This prevents partial batch execution on failure
+        if self.is_unique {
+            // Track keys seen in this batch for intra-batch duplicate detection
+            let mut batch_keys: AHashMap<CompactArc<Value>, i64> =
+                AHashMap::with_capacity(entries.len());
+
+            for &(row_id, values) in entries {
+                if row_id < 0 || values.len() != num_cols {
+                    continue;
+                }
+
+                // NULL values don't violate uniqueness
+                if values.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+
+                let row_id_u64 = row_id as u64;
+                let arc_key = self.value_to_arc_key(values);
+
+                // Check intra-batch duplicates
+                if let Some(&existing_row_id) = batch_keys.get(&arc_key) {
+                    if existing_row_id != row_id {
+                        return Err(Error::unique_constraint(
+                            &self.name,
+                            self.column_names.join(", "),
+                            format!("{:?}", values),
+                        ));
+                    }
+                }
+
+                // Check against existing index
+                if let Some(bitmap) = bitmaps.get(&arc_key) {
+                    let existing_count = if bitmap.contains(row_id_u64) {
+                        bitmap.len() - 1
+                    } else {
+                        bitmap.len()
+                    };
+                    if existing_count > 0 {
+                        return Err(Error::unique_constraint(
+                            &self.name,
+                            self.column_names.join(", "),
+                            format!("{:?}", values),
+                        ));
+                    }
+                }
+
+                batch_keys.insert(arc_key, row_id);
+            }
+        }
+
+        // MODIFICATION PHASE: All constraints checked, now safe to modify
+        for &(row_id, values) in entries {
+            if row_id < 0 {
+                continue; // Skip invalid row IDs
+            }
+            let row_id_u64 = row_id as u64;
+
+            if values.len() != num_cols {
+                continue;
+            }
+
+            let arc_key = self.value_to_arc_key(values);
+
+            // Try to reuse existing Arc
+            let (final_arc_key, is_new_value) =
+                if let Some((existing_arc, _)) = bitmaps.get_key_value(&arc_key) {
+                    (CompactArc::clone(existing_arc), false)
+                } else {
+                    (arc_key, true)
+                };
+
+            // Handle update case - remove from old bitmap
+            if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
+                if !CompactArc::ptr_eq(&old_arc_key, &final_arc_key) {
+                    if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
+                        old_bitmap.remove(row_id_u64);
+                        if old_bitmap.is_empty() {
+                            bitmaps.remove(&old_arc_key);
+                            self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
+                        }
+                    }
+                }
+            }
+
+            // Add to bitmap
+            let bitmap = bitmaps
+                .entry(CompactArc::clone(&final_arc_key))
+                .or_default();
+            bitmap.insert(row_id_u64);
+
+            // Update reverse mapping
+            row_to_value.insert(row_id, final_arc_key);
+
+            if is_new_value {
+                self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Optimized batch remove with single lock acquisition
+    fn remove_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Err(Error::IndexClosed);
+        }
+
+        // Acquire write locks ONCE for entire batch
+        let mut bitmaps = self.bitmaps.write().unwrap();
+        let mut row_to_value = self.row_to_value.write().unwrap();
+
+        for &(row_id, values) in entries {
+            if row_id < 0 {
+                continue;
+            }
+            let row_id_u64 = row_id as u64;
+
+            let arc_key = self.value_to_arc_key(values);
+
+            // Remove from bitmap
+            if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
+                bitmap.remove(row_id_u64);
+                if bitmap.is_empty() {
+                    bitmaps.remove(&arc_key);
+                    self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
+                }
+            }
+
+            // Remove from reverse mapping
+            row_to_value.remove(row_id);
+        }
+
         Ok(())
     }
 

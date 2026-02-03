@@ -4271,16 +4271,25 @@ impl VersionStore {
             };
 
             // Populate the index with existing data unless deferred
+            // Uses batch_slice for better performance
             if !skip_population {
                 let col_idx = column_id as usize;
                 let versions = self.versions.read().clone();
+                let mut entries: Vec<(i64, Vec<crate::core::Value>)> = Vec::new();
                 for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
                     if !version.is_deleted() {
                         if let Some(value) = version.data.get(col_idx) {
-                            let _ = index.add(std::slice::from_ref(value), row_id, row_id);
+                            entries.push((row_id, vec![value.clone()]));
                         }
                     }
+                }
+                if !entries.is_empty() {
+                    let entry_refs: Vec<(i64, &[crate::core::Value])> = entries
+                        .iter()
+                        .map(|(row_id, values)| (*row_id, values.as_slice()))
+                        .collect();
+                    let _ = index.add_batch_slice(&entry_refs);
                 }
             }
 
@@ -4300,14 +4309,16 @@ impl VersionStore {
             let index = Arc::new(index);
 
             // Populate the index with existing data unless deferred
+            // Uses batch_slice for better performance
             if !skip_population {
                 let col_indices: Vec<usize> =
                     meta.column_ids.iter().map(|&id| id as usize).collect();
                 let versions = self.versions.read().clone();
+                let mut entries: Vec<(i64, Vec<crate::core::Value>)> = Vec::new();
                 for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
                     if !version.is_deleted() {
-                        let values: SmallVec<[crate::core::Value; 2]> =
+                        let values: Vec<crate::core::Value> =
                             col_indices
                                 .iter()
                                 .map(|&idx| {
@@ -4316,8 +4327,15 @@ impl VersionStore {
                                     )
                                 })
                                 .collect();
-                        let _ = index.add(&values, row_id, row_id);
+                        entries.push((row_id, values));
                     }
+                }
+                if !entries.is_empty() {
+                    let entry_refs: Vec<(i64, &[crate::core::Value])> = entries
+                        .iter()
+                        .map(|(row_id, values)| (*row_id, values.as_slice()))
+                        .collect();
+                    let _ = index.add_batch_slice(&entry_refs);
                 }
             }
 
@@ -4331,6 +4349,9 @@ impl VersionStore {
     ///
     /// This is O(N + M) where N = number of rows and M = number of indexes,
     /// compared to O(N * M) when populating each index separately.
+    ///
+    /// OPTIMIZATION: Uses batch_slice operations to reduce lock acquisitions
+    /// from O(rows × indexes) to O(indexes).
     ///
     /// Call this after WAL replay completes with skip_population=true.
     pub fn populate_all_indexes(&self) {
@@ -4360,7 +4381,12 @@ impl VersionStore {
             return;
         }
 
-        // Single pass over all rows
+        // Pre-allocate per-index batch vectors
+        let num_indexes = index_infos.len();
+        let mut batches: Vec<Vec<(i64, Vec<crate::core::Value>)>> =
+            (0..num_indexes).map(|_| Vec::new()).collect();
+
+        // First pass: Collect all entries per index
         let versions = self.versions.read().clone();
         for (&row_id, version_chain) in versions.iter() {
             let version = &version_chain.version;
@@ -4369,27 +4395,38 @@ impl VersionStore {
                 continue;
             }
 
-            // Add to each index
-            for (col_indices, index) in &index_infos {
+            // Collect entries for each index
+            for (idx, (col_indices, _)) in index_infos.iter().enumerate() {
                 if col_indices.len() == 1 {
                     // Single-column index
                     if let Some(value) = version.data.get(col_indices[0]) {
-                        let _ = index.add(std::slice::from_ref(value), row_id, row_id);
+                        batches[idx].push((row_id, vec![value.clone()]));
                     }
                 } else {
                     // Multi-column index
-                    let values: SmallVec<[crate::core::Value; 2]> = col_indices
-                        .iter()
-                        .map(|&idx| {
-                            version
-                                .data
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
-                        })
-                        .collect();
-                    let _ = index.add(&values, row_id, row_id);
+                    let values: Vec<crate::core::Value> =
+                        col_indices
+                            .iter()
+                            .map(|&col_idx| {
+                                version.data.get(col_idx).cloned().unwrap_or(
+                                    crate::core::Value::Null(crate::core::DataType::Null),
+                                )
+                            })
+                            .collect();
+                    batches[idx].push((row_id, values));
                 }
+            }
+        }
+
+        // Second pass: Apply batch operations per index
+        // This reduces lock acquisitions from O(rows × indexes) to O(indexes)
+        for (idx, (_, index)) in index_infos.iter().enumerate() {
+            if !batches[idx].is_empty() {
+                let entry_refs: Vec<(i64, &[crate::core::Value])> = batches[idx]
+                    .iter()
+                    .map(|(row_id, values)| (*row_id, values.as_slice()))
+                    .collect();
+                let _ = index.add_batch_slice(&entry_refs);
             }
         }
     }
@@ -4441,37 +4478,52 @@ impl VersionStore {
                 .collect()
         };
 
-        // Second pass: remove from indexes (single lock acquisition for all rows)
+        // Second pass: remove from indexes using batch operations (single lock per index)
         {
             let versions = self.versions.read().clone();
             let indexes = self.indexes.read();
-            for row_id in &rows_to_delete {
-                if let Some(entry) = versions.get(*row_id) {
-                    let version = &entry.version;
-                    for index in indexes.values() {
-                        let column_ids = index.column_ids();
-                        if !column_ids.is_empty() {
-                            if column_ids.len() == 1 {
-                                // Single-column index
-                                let col_id = column_ids[0] as usize;
-                                if let Some(value) = version.data.get(col_id) {
-                                    let _ =
-                                        index.remove(std::slice::from_ref(value), *row_id, *row_id);
-                                }
-                            } else {
-                                // Multi-column index
-                                let values: Vec<crate::core::Value> = column_ids
-                                    .iter()
-                                    .map(|&col_id| {
-                                        version.data.get(col_id as usize).cloned().unwrap_or(
-                                            crate::core::Value::Null(crate::core::DataType::Null),
-                                        )
-                                    })
-                                    .collect();
-                                let _ = index.remove(&values, *row_id, *row_id);
+
+            for index in indexes.values() {
+                let column_ids = index.column_ids();
+                if column_ids.is_empty() {
+                    continue;
+                }
+
+                // Collect all entries for this index
+                let mut entries: Vec<(i64, Vec<crate::core::Value>)> =
+                    Vec::with_capacity(rows_to_delete.len());
+
+                for &row_id in &rows_to_delete {
+                    if let Some(entry) = versions.get(row_id) {
+                        let version = &entry.version;
+                        if column_ids.len() == 1 {
+                            // Single-column index
+                            let col_id = column_ids[0] as usize;
+                            if let Some(value) = version.data.get(col_id) {
+                                entries.push((row_id, vec![value.clone()]));
                             }
+                        } else {
+                            // Multi-column index
+                            let values: Vec<crate::core::Value> = column_ids
+                                .iter()
+                                .map(|&col_id| {
+                                    version.data.get(col_id as usize).cloned().unwrap_or(
+                                        crate::core::Value::Null(crate::core::DataType::Null),
+                                    )
+                                })
+                                .collect();
+                            entries.push((row_id, values));
                         }
                     }
+                }
+
+                if !entries.is_empty() {
+                    // Convert to slice format for remove_batch_slice
+                    let batch: Vec<(i64, &[crate::core::Value])> = entries
+                        .iter()
+                        .map(|(row_id, values)| (*row_id, values.as_slice()))
+                        .collect();
+                    let _ = index.remove_batch_slice(&batch);
                 }
             }
         }
@@ -4753,6 +4805,24 @@ impl VersionStore {
         }
 
         count
+    }
+
+    /// Get the transaction ID of the latest committed version for a row.
+    ///
+    /// This retrieves the "head" of the version chain, effectively checking
+    /// the most recently committed change. This is critical for conflict
+    /// detection (First-Committer-Wins).
+    ///
+    /// Returns:
+    /// - Some(txn_id) if the row exists
+    /// - None if the row does not exist
+    pub fn get_latest_version_id(&self, row_id: i64) -> Option<i64> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let versions = self.versions.read();
+        versions.get(row_id).map(|entry| entry.version.txn_id)
     }
 
     /// Compute grouped aggregates directly from arena storage.
@@ -5574,55 +5644,41 @@ impl TransactionVersionStore {
             return Ok(());
         };
 
-        // OPTIMIZATION: For single-row auto-commit (common case), avoid Vec allocation
-        // by checking directly without collecting
-        if write_set.len() == 1 {
-            // Single entry - check directly
-            if let Some((row_id, write_entry)) = write_set.iter().next() {
-                if write_entry.read_version.is_none() {
-                    // Single insert - check conflict directly without Vec
-                    if self
-                        .parent_store
-                        .has_any_visible_version(&[row_id], self.txn_id)
-                        .is_some()
-                    {
+        for (row_id, write_entry) in write_set.iter() {
+            if let Some(read_version) = &write_entry.read_version {
+                // UPDATE Conflict Check
+                // Ensure the version we read is still the latest committed version.
+                // If get_latest_version_id returns a different txn_id, it means
+                // another transaction committed an update after we read.
+                if let Some(latest_txn_id) = self.parent_store.get_latest_version_id(row_id) {
+                    if latest_txn_id != read_version.txn_id {
                         return Err(Error::internal(format!(
-                            "write conflict: row {} was inserted by another transaction",
+                            "write conflict: row {} was modified by another transaction",
                             row_id
                         )));
                     }
+                } else {
+                    // Row vanished (e.g. GC'd) - treat as conflict
+                    return Err(Error::internal(format!(
+                        "write conflict: row {} was deleted by another transaction",
+                        row_id
+                    )));
+                }
+            } else {
+                // INSERT Conflict Check
+                // Check if row matches any existing version visible to us
+                // Note: unique indexes handle strict uniqueness, this handles MVCC row overlaps
+                if self
+                    .parent_store
+                    .has_any_visible_version(&[row_id], self.txn_id)
+                    .is_some()
+                {
+                    return Err(Error::internal(format!(
+                        "write conflict: row {} was inserted by another transaction",
+                        row_id
+                    )));
                 }
             }
-            return Ok(());
-        }
-
-        // Multi-row path: collect row_ids for inserts that need conflict checking
-        let insert_row_ids: Vec<i64> = write_set
-            .iter()
-            .filter_map(|(row_id, write_entry)| {
-                if write_entry.read_version.is_none() {
-                    Some(row_id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Fast path: no inserts, no conflicts possible
-        if insert_row_ids.is_empty() {
-            return Ok(());
-        }
-
-        // Batch check: see if any insert row_id has a visible version (conflict)
-        // OPTIMIZATION: Single lock acquisition, early exit on first conflict
-        if let Some(conflicting_row_id) = self
-            .parent_store
-            .has_any_visible_version(&insert_row_ids, self.txn_id)
-        {
-            return Err(Error::internal(format!(
-                "write conflict: row {} was inserted by another transaction",
-                conflicting_row_id
-            )));
         }
 
         Ok(())
@@ -5653,6 +5709,11 @@ impl TransactionVersionStore {
         // Detect conflicts first
         self.detect_conflicts()?;
 
+        // Update indexes BEFORE committing versions
+        // This ensures indexes reflect the committed data
+        // Errors (e.g., unique constraint violations) must propagate
+        self.update_indexes_on_commit()?;
+
         // OPTIMIZATION: Single-row fast path (common auto-commit INSERT case)
         // Avoids Vec allocation for both local_versions and write_set
         if let Some(local_versions) = self.local_versions.as_mut() {
@@ -5673,22 +5734,466 @@ impl TransactionVersionStore {
             }
 
             // Multi-row path: collect into Vec
-            let batch: Vec<(i64, RowVersion)> = local_versions
+            let mut batch: Vec<(i64, RowVersion)> = local_versions
                 .drain()
                 .filter_map(|(row_id, mut versions)| versions.pop().map(|v| (row_id, v)))
                 .collect();
+
+            // Sort by row_id to ensure deterministic locking order
+            batch.sort_by_key(|(row_id, _)| *row_id);
 
             self.parent_store.add_versions_batch(batch);
         }
 
         // Release all claims - drain write_set to get row_ids
         if let Some(write_set) = self.write_set.as_mut() {
-            let row_ids: Vec<i64> = write_set.drain().map(|(row_id, _)| row_id).collect();
+            let mut row_ids: Vec<i64> = write_set.drain().map(|(row_id, _)| row_id).collect();
+            // Sort by row_id to ensure deterministic locking order
+            row_ids.sort_unstable();
             self.parent_store
                 .release_row_claims_batch(&row_ids, self.txn_id);
         }
 
         Ok(())
+    }
+
+    /// Update indexes during commit
+    ///
+    /// This method updates all indexes with the changes from this transaction.
+    /// For each row being committed:
+    /// - If there's an old version (UPDATE/DELETE), remove the old indexed values
+    /// - If the new version is not deleted (INSERT/UPDATE), add the new indexed values
+    ///
+    /// Uses two paths:
+    /// - Single-row fast path: SmallVec + immediate apply (zero heap allocation for 1-2 column indexes)
+    /// - Multi-row batch path: Collects changes, then applies in batch (reduces lock acquisitions)
+    ///
+    /// Returns an error if a unique constraint is violated.
+    fn update_indexes_on_commit(&self) -> Result<(), Error> {
+        // Early exit if no local changes
+        let Some(local_versions) = self.local_versions.as_ref() else {
+            return Ok(());
+        };
+
+        if local_versions.is_empty() {
+            return Ok(());
+        }
+
+        // Get all indexes - early exit if none
+        let indexes = self.parent_store.get_all_indexes();
+        if indexes.is_empty() {
+            return Ok(());
+        }
+
+        // FAST PATH: Single-row commit (most common case for auto-commit INSERT/UPDATE/DELETE)
+        // Uses SmallVec to avoid heap allocation for 1-2 column indexes
+        if local_versions.len() == 1 {
+            return self.update_indexes_single_row(&indexes);
+        }
+
+        // BATCH PATH: Multi-row commit
+        // Sort indexes by name for deterministic lock ordering (prevents deadlocks)
+        let mut indexes: Vec<_> = indexes.into_vec();
+        indexes.sort_by(|a, b| a.name().cmp(b.name()));
+
+        let num_indexes = indexes.len();
+
+        // Pre-allocate per-index batch vectors
+        let mut add_batches: Vec<Vec<(i64, Vec<crate::core::Value>)>> =
+            (0..num_indexes).map(|_| Vec::new()).collect();
+        let mut remove_batches: Vec<Vec<(i64, Vec<crate::core::Value>)>> =
+            (0..num_indexes).map(|_| Vec::new()).collect();
+
+        // Collect index updates for each row
+        for (row_id, versions) in local_versions.iter() {
+            // Get the latest version for this row (last in the list)
+            let Some(new_version) = versions.last() else {
+                continue;
+            };
+
+            let is_deleted = new_version.is_deleted();
+            let new_row = &new_version.data;
+
+            // Get old version from write_set (if exists)
+            let old_row: Option<&crate::core::Row> = self
+                .write_set
+                .as_ref()
+                .and_then(|ws| ws.get(row_id))
+                .and_then(|entry| entry.read_version.as_ref())
+                .map(|rv| &rv.data);
+
+            for (idx, index) in indexes.iter().enumerate() {
+                let column_ids = index.column_ids();
+                if column_ids.is_empty() {
+                    continue;
+                }
+
+                // OPTIMIZATION: For UPDATEs, check if any indexed column changed
+                // BEFORE allocating Vecs
+                if let Some(old_r) = old_row {
+                    if !is_deleted {
+                        // UPDATE case: check if indexed columns differ
+                        let any_changed = column_ids.iter().any(|&col_id| {
+                            let col_idx = col_id as usize;
+                            let old_val = old_r.get(col_idx);
+                            let new_val = new_row.get(col_idx);
+                            old_val != new_val
+                        });
+
+                        if !any_changed {
+                            // Indexed columns unchanged - skip this index
+                            continue;
+                        }
+
+                        // Values differ - collect old and new values
+                        let old_values: Vec<crate::core::Value> = column_ids
+                            .iter()
+                            .map(|&col_id| {
+                                old_r.get(col_id as usize).cloned().unwrap_or(
+                                    crate::core::Value::Null(crate::core::DataType::Null),
+                                )
+                            })
+                            .collect();
+
+                        let new_values: Vec<crate::core::Value> = column_ids
+                            .iter()
+                            .map(|&col_id| {
+                                new_row.get(col_id as usize).cloned().unwrap_or(
+                                    crate::core::Value::Null(crate::core::DataType::Null),
+                                )
+                            })
+                            .collect();
+
+                        remove_batches[idx].push((row_id, old_values));
+                        add_batches[idx].push((row_id, new_values));
+                        continue;
+                    }
+                }
+
+                if is_deleted {
+                    // DELETE: collect values to remove from index
+                    // Use old_row if available, otherwise fall back to new_row
+                    let source_row = old_row.unwrap_or(new_row);
+                    let values_to_remove: Vec<crate::core::Value> = column_ids
+                        .iter()
+                        .map(|&col_id| {
+                            source_row
+                                .get(col_id as usize)
+                                .cloned()
+                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
+                        })
+                        .collect();
+                    remove_batches[idx].push((row_id, values_to_remove));
+                } else {
+                    // INSERT: collect values to add to index
+                    // (old_row.is_some() cases with !is_deleted are handled above with continue)
+                    let new_values: Vec<crate::core::Value> = column_ids
+                        .iter()
+                        .map(|&col_id| {
+                            new_row
+                                .get(col_id as usize)
+                                .cloned()
+                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
+                        })
+                        .collect();
+                    add_batches[idx].push((row_id, new_values));
+                }
+            }
+        }
+
+        // PHASE 1: Pre-validate ALL unique indexes before modifying ANY index
+        // This prevents index pollution when a later index fails
+        for (idx, index) in indexes.iter().enumerate() {
+            if !index.is_unique() || add_batches[idx].is_empty() {
+                continue;
+            }
+
+            // Build a set of row_ids being removed for O(1) conflict resolution
+            // For unique indexes, if a row_id is being removed, its current value is being removed.
+            // We don't need to track values - just knowing the row_id is sufficient.
+            let removals_set: crate::common::I64Set = remove_batches[idx]
+                .iter()
+                .map(|(row_id, _)| *row_id)
+                .collect();
+
+            // Check for intra-batch duplicates first
+            let mut seen: ahash::AHashMap<&[crate::core::Value], i64> =
+                ahash::AHashMap::with_capacity(add_batches[idx].len());
+
+            for (row_id, values) in &add_batches[idx] {
+                // Skip NULLs - they don't violate uniqueness
+                if values.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+
+                // Check intra-batch duplicate
+                if let Some(&existing_row_id) = seen.get(values.as_slice()) {
+                    if existing_row_id != *row_id {
+                        let values_str: Vec<String> =
+                            values.iter().map(|v| format!("{:?}", v)).collect();
+                        return Err(Error::unique_constraint(
+                            index.name(),
+                            index.column_names().join(", "),
+                            format!("[{}]", values_str.join(", ")),
+                        ));
+                    }
+                }
+                seen.insert(values.as_slice(), *row_id);
+
+                // Check against existing index entries
+                let existing = index.get_row_ids_equal(values);
+
+                // Identify potential conflicts (exclude self and rows being removed)
+                // O(1) lookup using removals_set instead of O(N) scan
+                let has_real_conflict = existing.iter().any(|&conflict_id| {
+                    conflict_id != *row_id && !removals_set.contains(conflict_id)
+                });
+
+                if has_real_conflict {
+                    let values_str: Vec<String> =
+                        values.iter().map(|v| format!("{:?}", v)).collect();
+                    return Err(Error::unique_constraint(
+                        index.name(),
+                        index.column_names().join(", "),
+                        format!("[{}]", values_str.join(", ")),
+                    ));
+                }
+            }
+        }
+
+        // PHASE 2: All validations passed - now modify all indexes
+        // Track modifications for rollback if a later index fails (race condition protection)
+        // Between Phase 1 validation and Phase 2 modification, another transaction could commit,
+        // causing a unique constraint violation that wasn't detected in Phase 1.
+        let mut completed_removals: Vec<usize> = Vec::new();
+        let mut completed_additions: Vec<usize> = Vec::new();
+
+        for (idx, index) in indexes.iter().enumerate() {
+            // Remove old entries first (for UPDATE correctness)
+            if !remove_batches[idx].is_empty() {
+                let batch: Vec<(i64, &[crate::core::Value])> = remove_batches[idx]
+                    .iter()
+                    .map(|(row_id, values)| (*row_id, values.as_slice()))
+                    .collect();
+                // Note: remove_batch_slice can fail (e.g., I/O error), but typically succeeds
+                if index.remove_batch_slice(&batch).is_ok() {
+                    completed_removals.push(idx);
+                }
+            }
+
+            // Add new entries
+            if !add_batches[idx].is_empty() {
+                let batch: Vec<(i64, &[crate::core::Value])> = add_batches[idx]
+                    .iter()
+                    .map(|(row_id, values)| (*row_id, values.as_slice()))
+                    .collect();
+
+                if let Err(e) = index.add_batch_slice(&batch) {
+                    // ROLLBACK: A later index failed - undo all previous modifications
+                    // This prevents index corruption where indexes point to uncommitted rows
+
+                    // 1. Remove additions we made to earlier indexes
+                    for &rollback_idx in &completed_additions {
+                        let rollback_batch: Vec<(i64, &[crate::core::Value])> = add_batches
+                            [rollback_idx]
+                            .iter()
+                            .map(|(row_id, values)| (*row_id, values.as_slice()))
+                            .collect();
+                        let _ = indexes[rollback_idx].remove_batch_slice(&rollback_batch);
+                    }
+
+                    // 2. Re-add removals we made to earlier indexes
+                    for &rollback_idx in &completed_removals {
+                        let rollback_batch: Vec<(i64, &[crate::core::Value])> = remove_batches
+                            [rollback_idx]
+                            .iter()
+                            .map(|(row_id, values)| (*row_id, values.as_slice()))
+                            .collect();
+                        // Rollback additions - ignore errors as we're in error recovery
+                        let _ = indexes[rollback_idx].add_batch_slice(&rollback_batch);
+                    }
+
+                    return Err(e);
+                }
+                completed_additions.push(idx);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fast path for single-row index updates
+    ///
+    /// Uses SmallVec to avoid heap allocation for indexes with 1-2 columns (most common case).
+    /// Applies changes immediately without batching overhead.
+    fn update_indexes_single_row(&self, indexes: &[Arc<dyn Index>]) -> Result<(), Error> {
+        let local_versions = self.local_versions.as_ref().unwrap();
+
+        // Get the single row entry
+        let Some((row_id, versions)) = local_versions.iter().next() else {
+            return Ok(());
+        };
+
+        let Some(new_version) = versions.last() else {
+            return Ok(());
+        };
+
+        let is_deleted = new_version.is_deleted();
+        let new_row = &new_version.data;
+
+        // Get old version from write_set (if exists)
+        let old_row: Option<&Row> = self
+            .write_set
+            .as_ref()
+            .and_then(|ws| ws.get(row_id))
+            .and_then(|entry| entry.read_version.as_ref())
+            .map(|rv| &rv.data);
+
+        // Track what we've done for rollback on error
+        let mut completed_ops: SmallVec<[(usize, bool); 4]> = SmallVec::new(); // (index_idx, is_add)
+
+        for (idx, index) in indexes.iter().enumerate() {
+            let column_ids = index.column_ids();
+            if column_ids.is_empty() {
+                continue;
+            }
+
+            // OPTIMIZATION: For UPDATEs, check if any indexed column changed BEFORE allocating
+            if let Some(old_r) = old_row {
+                if !is_deleted {
+                    // UPDATE case: check if indexed columns differ (no allocation)
+                    let any_changed = column_ids.iter().any(|&col_id| {
+                        let col_idx = col_id as usize;
+                        old_r.get(col_idx) != new_row.get(col_idx)
+                    });
+
+                    if !any_changed {
+                        // Indexed columns unchanged - skip this index entirely
+                        continue;
+                    }
+
+                    // Values differ - collect and update using SmallVec (stack allocation for 1-2 cols)
+                    let old_values: SmallVec<[Value; 2]> = column_ids
+                        .iter()
+                        .map(|&col_id| {
+                            old_r
+                                .get(col_id as usize)
+                                .cloned()
+                                .unwrap_or(Value::Null(DataType::Null))
+                        })
+                        .collect();
+
+                    let new_values: SmallVec<[Value; 2]> = column_ids
+                        .iter()
+                        .map(|&col_id| {
+                            new_row
+                                .get(col_id as usize)
+                                .cloned()
+                                .unwrap_or(Value::Null(DataType::Null))
+                        })
+                        .collect();
+
+                    // Remove old, add new
+                    let _ = index.remove(&old_values, row_id, row_id);
+                    completed_ops.push((idx, false)); // false = removal
+
+                    if let Err(e) = index.add(&new_values, row_id, row_id) {
+                        // Rollback: re-add the old value we removed
+                        let _ = index.add(&old_values, row_id, row_id);
+                        // Rollback previous indexes
+                        self.rollback_single_row_ops(
+                            &completed_ops,
+                            indexes,
+                            row_id,
+                            old_row,
+                            new_row,
+                        );
+                        return Err(e);
+                    }
+                    completed_ops.push((idx, true)); // true = addition
+                    continue;
+                }
+            }
+
+            if is_deleted {
+                // DELETE: remove from index
+                let source_row = old_row.unwrap_or(new_row);
+                let values_to_remove: SmallVec<[Value; 2]> = column_ids
+                    .iter()
+                    .map(|&col_id| {
+                        source_row
+                            .get(col_id as usize)
+                            .cloned()
+                            .unwrap_or(Value::Null(DataType::Null))
+                    })
+                    .collect();
+                let _ = index.remove(&values_to_remove, row_id, row_id);
+                completed_ops.push((idx, false));
+            } else {
+                // INSERT: add values to index
+                let new_values: SmallVec<[Value; 2]> = column_ids
+                    .iter()
+                    .map(|&col_id| {
+                        new_row
+                            .get(col_id as usize)
+                            .cloned()
+                            .unwrap_or(Value::Null(DataType::Null))
+                    })
+                    .collect();
+
+                if let Err(e) = index.add(&new_values, row_id, row_id) {
+                    // Rollback previous indexes
+                    self.rollback_single_row_ops(&completed_ops, indexes, row_id, old_row, new_row);
+                    return Err(e);
+                }
+                completed_ops.push((idx, true));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Rollback helper for single-row operations
+    #[inline]
+    fn rollback_single_row_ops(
+        &self,
+        completed_ops: &[(usize, bool)],
+        indexes: &[Arc<dyn Index>],
+        row_id: i64,
+        old_row: Option<&Row>,
+        new_row: &Row,
+    ) {
+        for &(idx, is_add) in completed_ops.iter().rev() {
+            let index = &indexes[idx];
+            let column_ids = index.column_ids();
+
+            if is_add {
+                // We added new values - remove them
+                let values: SmallVec<[Value; 2]> = column_ids
+                    .iter()
+                    .map(|&col_id| {
+                        new_row
+                            .get(col_id as usize)
+                            .cloned()
+                            .unwrap_or(Value::Null(DataType::Null))
+                    })
+                    .collect();
+                let _ = index.remove(&values, row_id, row_id);
+            } else {
+                // We removed old values - re-add them
+                let source = old_row.unwrap_or(new_row);
+                let values: SmallVec<[Value; 2]> = column_ids
+                    .iter()
+                    .map(|&col_id| {
+                        source
+                            .get(col_id as usize)
+                            .cloned()
+                            .unwrap_or(Value::Null(DataType::Null))
+                    })
+                    .collect();
+                let _ = index.add(&values, row_id, row_id);
+            }
+        }
     }
 
     /// Rollback - discard local changes and release claims
@@ -5736,7 +6241,9 @@ impl TransactionVersionStore {
         };
         // OPTIMIZATION: Collect row_ids first, then batch release
         // Avoids holding write_set iterator while accessing parent_store
-        let row_ids: Vec<i64> = write_set.keys().collect();
+        let mut row_ids: Vec<i64> = write_set.keys().collect();
+        // Sort by row_id to ensure deterministic locking order
+        row_ids.sort_unstable();
         self.parent_store
             .release_row_claims_batch(&row_ids, self.txn_id);
     }
@@ -7199,7 +7706,137 @@ mod tests {
         assert!(packed_zero.is_some());
         assert_eq!(unpack_arena_idx(packed_zero), Some(zero));
 
-        // Case 6: None unpacks to None
         assert_eq!(unpack_arena_idx(None), None);
+    }
+
+    #[test]
+    fn test_unique_constraint_swap() {
+        use crate::core::DataType;
+        use crate::storage::mvcc::HashIndex;
+
+        // Setup: Table with unique index on column 'u' (index 1)
+        let schema = crate::core::SchemaBuilder::new("test_swap")
+            .column("id", DataType::Integer, false, true) // nullable=false, pk=true
+            .column("u", DataType::Integer, true, false) // nullable=true, pk=false
+            .build();
+
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "test_swap".to_string(),
+            schema.clone(),
+            checker,
+        ));
+
+        // Create Unique Hash Index on 'u'
+        let index = Arc::new(HashIndex::new(
+            "idx_u".to_string(),
+            "test_swap".to_string(),
+            vec!["u".to_string()],
+            vec![1],
+            vec![DataType::Integer],
+            true, // is_unique
+            0,
+        ));
+        store.add_index("idx_u".to_string(), index);
+
+        // Initial data: (1, 10), (2, 20)
+        let mut txn1 = TransactionVersionStore::new(Arc::clone(&store), 1);
+        txn1.put(1, Row::from(vec![Value::from(1), Value::from(10)]), false)
+            .unwrap();
+        txn1.put(2, Row::from(vec![Value::from(2), Value::from(20)]), false)
+            .unwrap();
+        txn1.commit().unwrap();
+
+        // Swap: (1, 20), (2, 10) in Single Transaction
+        let mut txn2 = TransactionVersionStore::new(Arc::clone(&store), 2);
+
+        // Update row 1: 10 -> 20 (conflict with row 2's old value)
+        txn2.put(1, Row::from(vec![Value::from(1), Value::from(20)]), false)
+            .unwrap();
+
+        // Update row 2: 20 -> 10 (taking row 1's old value)
+        txn2.put(2, Row::from(vec![Value::from(2), Value::from(10)]), false)
+            .unwrap();
+
+        // Commit should succeed
+        let result = txn2.commit();
+        assert!(result.is_ok(), "Commit failed: {:?}", result.err());
+
+        // Verify values
+        let v1_new = store.get_visible_version(1, 3).unwrap();
+        assert_eq!(v1_new.data.get(1).unwrap(), &Value::from(20));
+
+        let v2_new = store.get_visible_version(2, 3).unwrap();
+        assert_eq!(v2_new.data.get(1).unwrap(), &Value::from(10));
+    }
+
+    #[test]
+    fn test_unique_constraint_performance_bulk_update() {
+        use crate::core::DataType;
+        use crate::storage::mvcc::HashIndex;
+        use std::time::Instant;
+
+        // Setup: Table with unique index on column 'u' (index 1)
+        let schema = crate::core::SchemaBuilder::new("test_perf")
+            .column("id", DataType::Integer, false, true) // nullable=false, pk=true
+            .column("u", DataType::Integer, true, false) // nullable=true, pk=false
+            .build();
+
+        let checker = Arc::new(TestVisibilityChecker::new());
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "test_perf".to_string(),
+            schema.clone(),
+            checker,
+        ));
+
+        // Create Unique Hash Index on 'u'
+        let index = Arc::new(HashIndex::new(
+            "idx_u".to_string(),
+            "test_perf".to_string(),
+            vec!["u".to_string()],
+            vec![1],
+            vec![DataType::Integer],
+            true, // is_unique
+            0,
+        ));
+        store.add_index("idx_u".to_string(), index);
+
+        let row_count = 30000;
+        let mut txn1 = TransactionVersionStore::new(Arc::clone(&store), 1);
+        for i in 0..row_count {
+            txn1.put(
+                i as i64,
+                Row::from(vec![Value::from(i), Value::from(i)]),
+                false,
+            )
+            .unwrap();
+        }
+        txn1.commit().unwrap();
+
+        let mut txn2 = TransactionVersionStore::new(Arc::clone(&store), 2);
+        // Bulk update: shift every value by 1 (e.g., 0->1, 1->2, ... 4999->5000)
+        // This will cause every row to conflict with the next one's old value
+        for i in 0..row_count {
+            txn2.put(
+                i as i64,
+                Row::from(vec![Value::from(i), Value::from(i + 1)]),
+                false,
+            )
+            .unwrap();
+        }
+
+        let start = Instant::now();
+        txn2.commit().unwrap();
+        let duration = start.elapsed();
+        println!("Commit time for {} rows: {:?}", row_count, duration);
+
+        // If it's O(N^2), 5000 rows might take > 1-2 seconds.
+        // If it's O(N), it should be < 100ms.
+        // We set a threshold of 800ms to be safe but detect regression.
+        assert!(
+            duration.as_millis() < 800,
+            "Performance regression detected! Commit took {:?}",
+            duration
+        );
     }
 }

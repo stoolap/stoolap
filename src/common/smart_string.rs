@@ -886,6 +886,7 @@ mod tests {
 
     #[test]
     fn test_build_inline() {
+        // SAFETY: Callback writes exactly 5 valid UTF-8 bytes ("hello")
         let s = unsafe {
             SmartString::build_inline(5, |buf| {
                 buf.copy_from_slice(b"hello");
@@ -894,6 +895,7 @@ mod tests {
         assert!(s.is_some());
         assert_eq!(s.unwrap().as_str(), "hello");
 
+        // SAFETY: Length 20 exceeds inline capacity, callback won't be invoked
         let s = unsafe {
             SmartString::build_inline(20, |_| {
                 // Too long, won't be called

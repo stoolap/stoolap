@@ -133,6 +133,50 @@ impl<V> I64Map<V> {
         self.slots.len()
     }
 
+    /// Reserves capacity for at least `additional` more elements to be inserted
+    /// in the map. The collection may reserve more space to avoid frequent reallocations.
+    pub fn reserve(&mut self, additional: usize) {
+        let target_len = self.len + additional;
+        let target_cap = if target_len == 0 {
+            MIN_CAPACITY
+        } else {
+            target_len
+                .saturating_mul(LOAD_FACTOR_DEN)
+                .saturating_div(LOAD_FACTOR_NUM)
+                .next_power_of_two()
+                .max(MIN_CAPACITY)
+        };
+
+        if target_cap <= self.slots.len() {
+            return;
+        }
+
+        let new_cap = target_cap;
+        let new_mask = new_cap - 1;
+
+        let new_slots: Vec<Slot<V>> = (0..new_cap)
+            .map(|_| Slot {
+                key: EMPTY,
+                value: MaybeUninit::uninit(),
+            })
+            .collect();
+
+        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
+        let old_len = self.len;
+        self.len = 0;
+        self.mask = new_mask;
+
+        for slot in old_slots.iter() {
+            if slot.key != EMPTY {
+                // SAFETY: We are moving valid initialized values
+                let value = unsafe { slot.value.as_ptr().read() };
+                self.insert(slot.key, value);
+            }
+        }
+
+        debug_assert_eq!(self.len, old_len);
+    }
+
     /// FxHash with pre-mixing - XOR the key with its shifted self before
     /// multiplication to break stride patterns while preserving bijectivity.
     /// This maintains 0 collisions for sequential keys while reducing strided
@@ -878,6 +922,42 @@ impl I64Set {
     #[inline(always)]
     pub fn capacity(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Reserves capacity for at least `additional` more elements to be inserted
+    /// in the set. The collection may reserve more space to avoid frequent reallocations.
+    pub fn reserve(&mut self, additional: usize) {
+        let target_len = self.len + additional;
+        let target_cap = if target_len == 0 {
+            MIN_CAPACITY
+        } else {
+            target_len
+                .saturating_mul(LOAD_FACTOR_DEN)
+                .saturating_div(LOAD_FACTOR_NUM)
+                .next_power_of_two()
+                .max(MIN_CAPACITY)
+        };
+
+        if target_cap <= self.slots.len() {
+            return;
+        }
+
+        let new_cap = target_cap;
+        let new_mask = new_cap - 1;
+
+        let new_slots: Vec<i64> = vec![EMPTY; new_cap];
+        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
+        let old_len = self.len;
+        self.len = 0;
+        self.mask = new_mask;
+
+        for slot in old_slots.iter() {
+            if *slot != EMPTY {
+                self.insert(*slot);
+            }
+        }
+
+        debug_assert_eq!(self.len, old_len);
     }
 
     /// FxHash with pre-mixing - same as I64Map

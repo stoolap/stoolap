@@ -87,19 +87,6 @@ fn hash_values(values: &[Value]) -> u64 {
     hasher.finish()
 }
 
-/// Compute hash for a slice of CompactArc<Value> using ahash
-/// Uses same fixed seeds as hash_values for consistency
-#[inline]
-fn hash_arc_values(values: &[CompactArc<Value>]) -> u64 {
-    let hasher_builder =
-        ahash::RandomState::with_seeds(HASH_SEEDS[0], HASH_SEEDS[1], HASH_SEEDS[2], HASH_SEEDS[3]);
-    let mut hasher = hasher_builder.build_hasher();
-    for v in values {
-        v.as_ref().hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 /// Hash Index for O(1) equality lookups
 ///
 /// Optimized for TEXT, VARCHAR, and UUID columns where equality queries
@@ -263,77 +250,6 @@ impl HashIndex {
                 .all(|(s, i)| s.as_ref() == i),
         }
     }
-
-    /// Helper to compare stored CompactArc<Value> with input &[CompactArc<Value>]
-    /// Specialized unrolling for common cases (1-4 columns): ~5% faster than zip().all()
-    #[inline]
-    fn arc_values_match(stored: &[CompactArc<Value>], input: &[CompactArc<Value>]) -> bool {
-        #[inline]
-        fn eq(s: &CompactArc<Value>, i: &CompactArc<Value>) -> bool {
-            CompactArc::ptr_eq(s, i) || s.as_ref() == i.as_ref()
-        }
-        if stored.len() != input.len() {
-            return false;
-        }
-        match stored.len() {
-            0 => true,
-            1 => eq(&stored[0], &input[0]),
-            2 => eq(&stored[0], &input[0]) && eq(&stored[1], &input[1]),
-            3 => {
-                eq(&stored[0], &input[0]) && eq(&stored[1], &input[1]) && eq(&stored[2], &input[2])
-            }
-            4 => {
-                eq(&stored[0], &input[0])
-                    && eq(&stored[1], &input[1])
-                    && eq(&stored[2], &input[2])
-                    && eq(&stored[3], &input[3])
-            }
-            _ => stored
-                .iter()
-                .zip(input.iter())
-                .all(|(s, i)| CompactArc::ptr_eq(s, i) || s.as_ref() == i.as_ref()),
-        }
-    }
-
-    /// Check uniqueness constraint for Arc values
-    #[allow(clippy::type_complexity)]
-    fn check_unique_constraint_arc(
-        &self,
-        values: &[CompactArc<Value>],
-        row_id: i64,
-        hash: u64,
-        hash_to_values: &FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, CompactVec<i64>)>>,
-    ) -> Result<()> {
-        if !self.is_unique {
-            return Ok(());
-        }
-
-        // NULL values don't violate uniqueness
-        for v in values {
-            if v.is_null() {
-                return Ok(());
-            }
-        }
-
-        if let Some(entries) = hash_to_values.get(&hash) {
-            for (stored_values, row_ids) in entries {
-                // Compare CompactArc<Value> contents
-                if Self::arc_values_match(stored_values, values) && !row_ids.is_empty() {
-                    // Check if any row_id is different (would be a duplicate)
-                    if row_ids.iter().any(|&id| id != row_id) {
-                        let values_str: Vec<String> =
-                            values.iter().map(|v| format!("{:?}", v)).collect();
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            format!("[{}]", values_str.join(", ")),
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Index for HashIndex {
@@ -373,12 +289,22 @@ impl Index for HashIndex {
         // Check if row already exists (for updates)
         if let Some(&old_hash) = row_to_hash.get(row_id) {
             if old_hash == hash {
-                // Same hash - might be same values, check if we need to update
-                // (could be hash collision with different values)
-                return Ok(());
+                // Same hash - but could be hash collision with different values!
+                // Must compare actual values to determine if this is a no-op
+                if let Some(entries) = hash_to_values.get(&old_hash) {
+                    let old_values_match = entries.iter().any(|(stored_values, row_ids)| {
+                        row_ids.contains(&row_id) && Self::values_match(stored_values, values)
+                    });
+                    if old_values_match {
+                        // Truly the same values - no update needed
+                        return Ok(());
+                    }
+                }
+                // Hash collision: different values with same hash
+                // Fall through to remove old and add new
             }
 
-            // Different hash - remove old entry
+            // Different hash (or same hash with different values) - remove old entry
             if let Some(rows) = hash_to_rows.get_mut(&old_hash) {
                 rows.retain(|id| *id != row_id);
                 if rows.is_empty() {
@@ -429,93 +355,6 @@ impl Index for HashIndex {
             // Wrap values in Arc for O(1) cloning
             let arc_values: Vec<CompactArc<Value>> =
                 values.iter().map(|v| CompactArc::new(v.clone())).collect();
-            let mut row_ids = CompactVec::new();
-            row_ids.push(row_id); // First element, already sorted
-            entries.push((arc_values, row_ids));
-        }
-
-        Ok(())
-    }
-
-    fn add_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
-        if self.closed.load(AtomicOrdering::Acquire) {
-            return Err(Error::IndexClosed);
-        }
-
-        let num_cols = self.column_ids.len();
-        if values.len() != num_cols {
-            return Err(Error::internal(format!(
-                "expected {} values, got {}",
-                num_cols,
-                values.len()
-            )));
-        }
-
-        let hash = hash_arc_values(values);
-
-        // Acquire all write locks to ensure atomic operation
-        let mut hash_to_rows = self.hash_to_rows.write().unwrap();
-        let mut row_to_hash = self.row_to_hash.write().unwrap();
-        let mut hash_to_values = self.hash_to_values.write().unwrap();
-
-        // Check if row already exists (for updates)
-        if let Some(&old_hash) = row_to_hash.get(row_id) {
-            if old_hash == hash {
-                // Same hash - might be same values, check if we need to update
-                // (could be hash collision with different values)
-                return Ok(());
-            }
-
-            // Different hash - remove old entry
-            if let Some(rows) = hash_to_rows.get_mut(&old_hash) {
-                rows.retain(|id| *id != row_id);
-                if rows.is_empty() {
-                    hash_to_rows.remove(&old_hash);
-                }
-            }
-
-            // Remove from values storage
-            if let Some(entries) = hash_to_values.get_mut(&old_hash) {
-                for (_, row_ids) in entries.iter_mut() {
-                    row_ids.retain(|id| *id != row_id);
-                }
-                entries.retain(|(_, row_ids)| !row_ids.is_empty());
-                if entries.is_empty() {
-                    hash_to_values.remove(&old_hash);
-                }
-            }
-        }
-
-        // Check uniqueness constraint
-        self.check_unique_constraint_arc(values, row_id, hash, &hash_to_values)?;
-
-        // Add to hash_to_rows (insert sorted for O(N+M) merge operations)
-        let rows = hash_to_rows.entry(hash).or_default();
-        if let Err(pos) = rows.binary_search(&row_id) {
-            rows.insert(pos, row_id);
-        }
-
-        // Add to row_to_hash
-        row_to_hash.insert(row_id, hash);
-
-        // Add to hash_to_values for collision handling
-        // Use Arc::clone - O(1), no value cloning!
-        let entries = hash_to_values.entry(hash).or_default();
-        let mut found = false;
-        for (stored_values, row_ids) in entries.iter_mut() {
-            // Compare Arc values
-            if Self::arc_values_match(stored_values, values) {
-                // Insert sorted for O(N+M) merge operations
-                if let Err(pos) = row_ids.binary_search(&row_id) {
-                    row_ids.insert(pos, row_id);
-                }
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            // Clone Arc references - O(1) per value, no value cloning!
-            let arc_values: Vec<CompactArc<Value>> = values.iter().map(CompactArc::clone).collect();
             let mut row_ids = CompactVec::new();
             row_ids.push(row_id); // First element, already sorted
             entries.push((arc_values, row_ids));
@@ -575,54 +414,209 @@ impl Index for HashIndex {
         Ok(())
     }
 
-    fn remove_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
+    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
+        for (row_id, values) in entries.iter() {
+            self.remove(values, row_id, 0)?;
+        }
+        Ok(())
+    }
+
+    /// Optimized batch add with single lock acquisition
+    ///
+    /// Performance: O(1) lock acquisitions instead of O(N)
+    fn add_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
         }
 
-        let hash = hash_arc_values(values);
+        let num_cols = self.column_ids.len();
 
+        // Acquire all write locks ONCE for entire batch
         let mut hash_to_rows = self.hash_to_rows.write().unwrap();
         let mut row_to_hash = self.row_to_hash.write().unwrap();
         let mut hash_to_values = self.hash_to_values.write().unwrap();
 
-        // Remove from hash_to_rows (row_ids are sorted, use binary search)
-        if let Some(rows) = hash_to_rows.get_mut(&hash) {
-            if let Ok(pos) = rows.binary_search(&row_id) {
-                rows.remove(pos);
-            }
-            if rows.is_empty() {
-                hash_to_rows.remove(&hash);
+        // Reserve capacity to reduce reallocations
+        hash_to_rows.reserve(entries.len());
+        row_to_hash.reserve(entries.len());
+        hash_to_values.reserve(entries.len());
+
+        // For unique indexes: pre-check all entries before modifying
+        // This detects both existing duplicates AND intra-batch duplicates
+        if self.is_unique {
+            // Track actual values seen in this batch for intra-batch duplicate detection
+            // Use AHashMap<&[Value], i64> to properly handle hash collisions with different values
+            // (using hash as key would lose track of entries when collisions occur)
+            let mut batch_values: ahash::AHashMap<&[Value], i64> =
+                ahash::AHashMap::with_capacity(entries.len());
+
+            for &(row_id, values) in entries {
+                if values.len() != num_cols {
+                    return Err(Error::internal(format!(
+                        "expected {} values, got {}",
+                        num_cols,
+                        values.len()
+                    )));
+                }
+
+                // Skip NULL values (don't violate uniqueness)
+                if values.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+
+                let hash = hash_values(values);
+
+                // Check against existing index entries
+                self.check_unique_constraint(values, row_id, hash, &hash_to_values)?;
+
+                // Check against other entries in this batch using actual values as key
+                if let Some(&existing_row_id) = batch_values.get(values) {
+                    if existing_row_id != row_id {
+                        let values_str: Vec<String> =
+                            values.iter().map(|v| format!("{:?}", v)).collect();
+                        return Err(Error::unique_constraint(
+                            &self.name,
+                            self.column_names.join(", "),
+                            format!("[{}]", values_str.join(", ")),
+                        ));
+                    }
+                }
+                batch_values.insert(values, row_id);
             }
         }
 
-        // Remove from row_to_hash
-        row_to_hash.remove(row_id);
+        // All uniqueness checks passed - now add all entries
+        for &(row_id, values) in entries {
+            if values.len() != num_cols {
+                continue; // Already validated above for unique indexes
+            }
 
-        // Remove from hash_to_values (row_ids are sorted, use binary search)
-        if let Some(entries) = hash_to_values.get_mut(&hash) {
-            for (stored_values, row_ids) in entries.iter_mut() {
-                // Compare CompactArc<Value> contents with input Arc values
-                if Self::arc_values_match(stored_values, values) {
-                    if let Ok(pos) = row_ids.binary_search(&row_id) {
-                        row_ids.remove(pos);
+            let hash = hash_values(values);
+
+            // Handle existing row (update case)
+            if let Some(&old_hash) = row_to_hash.get(row_id) {
+                if old_hash == hash {
+                    // Same hash - but could be hash collision with different values!
+                    // Must compare actual values to determine if this is a no-op
+                    let old_values_match = if let Some(entries) = hash_to_values.get(&old_hash) {
+                        entries.iter().any(|(stored_values, row_ids)| {
+                            row_ids.contains(&row_id) && Self::values_match(stored_values, values)
+                        })
+                    } else {
+                        false
+                    };
+                    if old_values_match {
+                        continue; // Truly the same values - no update needed
                     }
+                    // Hash collision: different values with same hash - fall through to update
+                }
+
+                // Different hash (or same hash with different values) - remove old entry
+                if let Some(rows) = hash_to_rows.get_mut(&old_hash) {
+                    rows.retain(|id| *id != row_id);
+                    if rows.is_empty() {
+                        hash_to_rows.remove(&old_hash);
+                    }
+                }
+
+                if let Some(val_entries) = hash_to_values.get_mut(&old_hash) {
+                    for (_, row_ids) in val_entries.iter_mut() {
+                        row_ids.retain(|id| *id != row_id);
+                    }
+                    val_entries.retain(|(_, row_ids)| !row_ids.is_empty());
+                    if val_entries.is_empty() {
+                        hash_to_values.remove(&old_hash);
+                    }
+                }
+            }
+
+            // Add to hash_to_rows (sorted insertion)
+            let rows = hash_to_rows.entry(hash).or_default();
+            if let Err(pos) = rows.binary_search(&row_id) {
+                rows.insert(pos, row_id);
+            }
+
+            // Add to row_to_hash
+            row_to_hash.insert(row_id, hash);
+
+            // Add to hash_to_values
+            let val_entries = hash_to_values.entry(hash).or_default();
+            let mut found = false;
+            for (stored_values, row_ids) in val_entries.iter_mut() {
+                if Self::values_match(stored_values, values) {
+                    if let Err(pos) = row_ids.binary_search(&row_id) {
+                        row_ids.insert(pos, row_id);
+                    }
+                    found = true;
                     break;
                 }
             }
-            entries.retain(|(_, row_ids)| !row_ids.is_empty());
-            if entries.is_empty() {
-                hash_to_values.remove(&hash);
+            if !found {
+                let arc_values: Vec<CompactArc<Value>> =
+                    values.iter().map(|v| CompactArc::new(v.clone())).collect();
+                let mut row_ids = CompactVec::new();
+                row_ids.push(row_id);
+                val_entries.push((arc_values, row_ids));
             }
         }
 
         Ok(())
     }
 
-    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        for (row_id, values) in entries.iter() {
-            self.remove(values, row_id, 0)?;
+    /// Optimized batch remove with single lock acquisition
+    ///
+    /// Performance: O(1) lock acquisitions instead of O(N)
+    fn remove_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
         }
+
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Err(Error::IndexClosed);
+        }
+
+        // Acquire all write locks ONCE for entire batch
+        let mut hash_to_rows = self.hash_to_rows.write().unwrap();
+        let mut row_to_hash = self.row_to_hash.write().unwrap();
+        let mut hash_to_values = self.hash_to_values.write().unwrap();
+
+        for &(row_id, values) in entries {
+            let hash = hash_values(values);
+
+            // Remove from hash_to_rows
+            if let Some(rows) = hash_to_rows.get_mut(&hash) {
+                if let Ok(pos) = rows.binary_search(&row_id) {
+                    rows.remove(pos);
+                }
+                if rows.is_empty() {
+                    hash_to_rows.remove(&hash);
+                }
+            }
+
+            // Remove from row_to_hash
+            row_to_hash.remove(row_id);
+
+            // Remove from hash_to_values
+            if let Some(val_entries) = hash_to_values.get_mut(&hash) {
+                for (stored_values, row_ids) in val_entries.iter_mut() {
+                    if Self::values_match(stored_values, values) {
+                        if let Ok(pos) = row_ids.binary_search(&row_id) {
+                            row_ids.remove(pos);
+                        }
+                        break;
+                    }
+                }
+                val_entries.retain(|(_, row_ids)| !row_ids.is_empty());
+                if val_entries.is_empty() {
+                    hash_to_values.remove(&hash);
+                }
+            }
+        }
+
         Ok(())
     }
 

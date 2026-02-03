@@ -33,12 +33,13 @@
 //! ```
 
 use crate::api::params::ParamVec;
-use crate::core::{Error, Result, Row, RowVec, Value};
+use crate::core::{Error, Result, Row, RowVec, Schema, Value};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::ExpressionEval;
 use crate::executor::result::ExecutorResult;
 use crate::parser::ast::{Expression, Statement};
 use crate::parser::Parser;
+use crate::storage::expression::Expression as StorageExprTrait;
 use crate::storage::traits::{QueryResult, Transaction as StorageTransaction};
 
 use super::database::FromValue;
@@ -230,8 +231,9 @@ impl Transaction {
 
                 let table_name = &stmt.table_name.value;
                 let mut table = tx.get_table(table_name)?;
-                // Get column names owned to avoid borrow conflict with table.update()
-                let columns: Vec<String> = table.schema().column_names_owned().to_vec();
+                // Get schema and column names owned to avoid borrow conflict with table.update()
+                let schema = table.schema().clone();
+                let columns: Vec<String> = schema.column_names_owned().to_vec();
 
                 // Build the setter function that applies updates
                 let updates = stmt.updates.clone();
@@ -309,7 +311,7 @@ impl Transaction {
                 let storage_where_expr = stmt
                     .where_clause
                     .as_ref()
-                    .and_then(|expr| self.convert_to_storage_expression(expr, ctx).ok());
+                    .and_then(|expr| self.convert_to_storage_expression(expr, ctx, &schema).ok());
 
                 let updated_count = table.update(storage_where_expr.as_deref(), &mut setter)?;
 
@@ -325,12 +327,13 @@ impl Transaction {
             Statement::Delete(stmt) => {
                 let table_name = &stmt.table_name.value;
                 let mut table = tx.get_table(table_name)?;
+                let schema = table.schema().clone();
 
                 // Convert WHERE clause to Expression if present
                 let where_expr = stmt
                     .where_clause
                     .as_ref()
-                    .map(|expr| self.convert_to_storage_expression(expr, ctx))
+                    .map(|expr| self.convert_to_storage_expression(expr, ctx, &schema))
                     .transpose()?;
 
                 let deleted_count = table.delete(where_expr.as_deref())?;
@@ -388,7 +391,7 @@ impl Transaction {
                 let where_expr = stmt
                     .where_clause
                     .as_ref()
-                    .map(|expr| self.convert_to_storage_expression(expr, ctx))
+                    .map(|expr| self.convert_to_storage_expression(expr, ctx, schema))
                     .transpose()?;
 
                 // Scan table
@@ -430,6 +433,7 @@ impl Transaction {
         &self,
         expr: &Expression,
         ctx: &ExecutionContext,
+        schema: &Schema,
     ) -> Result<Box<dyn crate::storage::expression::Expression>> {
         use crate::core::Operator;
         use crate::storage::expression::{AndExpr, ComparisonExpr, OrExpr};
@@ -439,13 +443,15 @@ impl Transaction {
                 let op_str = infix.operator.as_str();
                 match op_str {
                     "AND" => {
-                        let left = self.convert_to_storage_expression(&infix.left, ctx)?;
-                        let right = self.convert_to_storage_expression(&infix.right, ctx)?;
+                        let left = self.convert_to_storage_expression(&infix.left, ctx, schema)?;
+                        let right =
+                            self.convert_to_storage_expression(&infix.right, ctx, schema)?;
                         return Ok(Box::new(AndExpr::and(left, right)));
                     }
                     "OR" => {
-                        let left = self.convert_to_storage_expression(&infix.left, ctx)?;
-                        let right = self.convert_to_storage_expression(&infix.right, ctx)?;
+                        let left = self.convert_to_storage_expression(&infix.left, ctx, schema)?;
+                        let right =
+                            self.convert_to_storage_expression(&infix.right, ctx, schema)?;
                         return Ok(Box::new(OrExpr::or(left, right)));
                     }
                     _ => {}
@@ -482,7 +488,10 @@ impl Transaction {
                     .with_context(ctx)
                     .eval_slice(&Row::new())?;
 
-                Ok(Box::new(ComparisonExpr::new(column, op, value)))
+                // Create expression and prepare it for the schema
+                let mut storage_expr = ComparisonExpr::new(column, op, value);
+                storage_expr.prepare_for_schema(schema);
+                Ok(Box::new(storage_expr))
             }
             _ => Err(Error::NotSupportedMessage(format!(
                 "Expression type {:?} not supported in transaction WHERE clause",

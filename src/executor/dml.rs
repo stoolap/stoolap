@@ -1567,19 +1567,20 @@ impl Executor {
         let pk_col_idx = schema.pk_column_index();
         let pk_col_name = pk_col_idx.map(|idx| schema.columns[idx].name.clone());
 
-        // Build column names with effective prefix (alias or table name)
-        // This allows WHERE clauses to reference columns using the alias
-        let column_names_with_prefix: Vec<String> = column_names_owned
-            .iter()
-            .map(|c| format!("{}.{}", effective_name, c))
-            .collect();
-
         // Delete rows
         let rows_affected = if needs_memory_filter || has_returning {
             // Complex WHERE expression OR RETURNING - need to scan rows first
             // Scan all rows, filter with evaluator, collect for RETURNING, delete matching ones by primary key
             // Clone schema for later use to avoid borrow conflict
             let schema_clone = schema.clone();
+
+            // Build column names with effective prefix (alias or table name)
+            // This allows WHERE clauses to reference columns using the alias
+            // OPTIMIZATION: Only build when needed (memory filter or RETURNING)
+            let column_names_with_prefix: Vec<String> = column_names_owned
+                .iter()
+                .map(|c| format!("{}.{}", effective_name, c))
+                .collect();
 
             // Create evaluator for WHERE filtering
             let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);

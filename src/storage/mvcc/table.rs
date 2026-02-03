@@ -18,7 +18,6 @@
 //!
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
 use std::sync::{Arc, RwLock};
 
 use crate::common::{CompactArc, I64Set};
@@ -1002,119 +1001,16 @@ impl MVCCTable {
 
     /// Commits the transaction's local changes
     ///
-    /// This method updates indexes before committing versions to the global store.
+    /// Index updates are handled by TransactionVersionStore::commit() using batch
+    /// operations to reduce lock acquisitions from O(rows × indexes) to O(indexes).
     pub fn commit(&mut self) -> Result<()> {
-        // Update indexes using already-cached old versions (no extra lookups needed)
-        // OPTIMIZATION: get_all_indexes() returns Arc clones (cheap atomic increment)
-        // instead of String clones + HashMap lookups per index
-        let indexes = self.version_store.get_all_indexes();
-
-        if !indexes.is_empty() {
-            let txn_versions = self.txn_versions.read().unwrap();
-            for (row_id, new_version, old_row) in txn_versions.iter_local_with_old() {
-                let is_deleted = new_version.is_deleted();
-                let new_row = &new_version.data;
-
-                for index in &indexes {
-                    let column_ids = index.column_ids();
-                    if column_ids.is_empty() {
-                        continue;
-                    }
-
-                    // OPTIMIZATION: For UPDATEs, check if any indexed column changed
-                    // BEFORE allocating Vecs. This avoids allocation overhead when
-                    // updating columns that aren't indexed.
-                    if let Some(old_r) = old_row {
-                        if !is_deleted {
-                            // UPDATE case: check if indexed columns differ (no allocation)
-                            let any_changed = column_ids.iter().any(|&col_id| {
-                                let idx = col_id as usize;
-                                let old_val = old_r.get(idx);
-                                let new_val = new_row.get(idx);
-                                old_val != new_val
-                            });
-
-                            if !any_changed {
-                                // Indexed columns unchanged - skip this index entirely
-                                continue;
-                            }
-
-                            // Values differ - collect and update
-                            let old_values: SmallVec<[Value; 2]> = column_ids
-                                .iter()
-                                .map(|&col_id| {
-                                    old_r
-                                        .get(col_id as usize)
-                                        .cloned()
-                                        .unwrap_or(Value::Null(DataType::Null))
-                                })
-                                .collect();
-
-                            let new_values: SmallVec<[Value; 2]> = column_ids
-                                .iter()
-                                .map(|&col_id| {
-                                    new_row
-                                        .get(col_id as usize)
-                                        .cloned()
-                                        .unwrap_or(Value::Null(DataType::Null))
-                                })
-                                .collect();
-
-                            let _ = index.remove(&old_values, row_id, row_id);
-                            index.add(&new_values, row_id, row_id)?;
-                            continue;
-                        }
-                    }
-
-                    if is_deleted {
-                        // DELETE: remove from index
-                        let values_to_remove: SmallVec<[Value; 2]> = if let Some(old_r) = old_row {
-                            column_ids
-                                .iter()
-                                .map(|&col_id| {
-                                    old_r
-                                        .get(col_id as usize)
-                                        .cloned()
-                                        .unwrap_or(Value::Null(DataType::Null))
-                                })
-                                .collect()
-                        } else {
-                            column_ids
-                                .iter()
-                                .map(|&col_id| {
-                                    new_row
-                                        .get(col_id as usize)
-                                        .cloned()
-                                        .unwrap_or(Value::Null(DataType::Null))
-                                })
-                                .collect()
-                        };
-                        let _ = index.remove(&values_to_remove, row_id, row_id);
-                    } else {
-                        // INSERT: add values to index
-                        // SmallVec inlines 1-2 values (most indexes are single-column)
-                        let new_values: SmallVec<[Value; 2]> = column_ids
-                            .iter()
-                            .map(|&col_id| {
-                                new_row
-                                    .get(col_id as usize)
-                                    .cloned()
-                                    .unwrap_or(Value::Null(DataType::Null))
-                            })
-                            .collect();
-                        index.add(&new_values, row_id, row_id)?;
-                    }
-                }
-            }
-        }
-
         // Check if there are local changes before committing
         let has_changes = {
             let txn_versions = self.txn_versions.read().unwrap();
             txn_versions.has_local_changes()
         };
 
-        // Now commit the versions to the version store
+        // Commit versions to the version store (this also updates indexes)
         self.txn_versions.write().unwrap().commit()?;
 
         // Mark zone maps as stale if we had any data changes
@@ -2590,7 +2486,10 @@ impl Table for MVCCTable {
             }
         };
 
-        // Populate the index with existing data
+        // Populate the index with existing data using batch_slice for better performance
+        // Collect all entries first, then add in a single batch operation
+        let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
+
         for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
             if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
                 if !version.is_deleted() {
@@ -2604,29 +2503,39 @@ impl Table for MVCCTable {
                                 .unwrap_or(Value::Null(DataType::Null))
                         })
                         .collect();
-                    index.add(&values, row_id, row_id)?;
+                    entries.push((row_id, values));
                 }
             }
         }
 
-        // Also add any local uncommitted data
-        let txn_versions = self.txn_versions.read().unwrap();
-        for (row_id, version) in txn_versions.iter_local() {
-            if !version.is_deleted() && !self.version_store.quick_check_row_existence(row_id) {
-                let values: Vec<Value> = col_indices
-                    .iter()
-                    .map(|&idx| {
-                        version
-                            .data
-                            .get(idx)
-                            .cloned()
-                            .unwrap_or(Value::Null(DataType::Null))
-                    })
-                    .collect();
-                index.add(&values, row_id, row_id)?;
+        // Also collect any local uncommitted data
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            for (row_id, version) in txn_versions.iter_local() {
+                if !version.is_deleted() && !self.version_store.quick_check_row_existence(row_id) {
+                    let values: Vec<Value> = col_indices
+                        .iter()
+                        .map(|&idx| {
+                            version
+                                .data
+                                .get(idx)
+                                .cloned()
+                                .unwrap_or(Value::Null(DataType::Null))
+                        })
+                        .collect();
+                    entries.push((row_id, values));
+                }
             }
         }
-        drop(txn_versions);
+
+        // Add all entries in a single batch operation
+        if !entries.is_empty() {
+            let entry_refs: Vec<(i64, &[Value])> = entries
+                .iter()
+                .map(|(row_id, values)| (*row_id, values.as_slice()))
+                .collect();
+            index.add_batch_slice(&entry_refs)?;
+        }
 
         // Add to version store
         self.version_store.add_index(name.to_string(), index);
@@ -2724,31 +2633,43 @@ impl Table for MVCCTable {
             expected_rows,
         );
 
-        // Populate the index with existing data
+        // Populate the index with existing data using batch_slice
+        let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
+
         // Scan all visible rows
         for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
             if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
                 if !version.is_deleted() {
                     if let Some(value) = version.data.get(col_idx) {
-                        index.add(std::slice::from_ref(value), row_id, row_id)?;
+                        entries.push((row_id, vec![value.clone()]));
                     }
                 }
             }
         }
 
-        // Also add any local uncommitted data
-        let txn_versions = self.txn_versions.read().unwrap();
-        for (row_id, version) in txn_versions.iter_local() {
-            if !version.is_deleted() {
-                if let Some(value) = version.data.get(col_idx) {
-                    // Skip if already added from global store
-                    if !self.version_store.quick_check_row_existence(row_id) {
-                        index.add(std::slice::from_ref(value), row_id, row_id)?;
+        // Also collect any local uncommitted data
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            for (row_id, version) in txn_versions.iter_local() {
+                if !version.is_deleted() {
+                    if let Some(value) = version.data.get(col_idx) {
+                        // Skip if already added from global store
+                        if !self.version_store.quick_check_row_existence(row_id) {
+                            entries.push((row_id, vec![value.clone()]));
+                        }
                     }
                 }
             }
         }
-        drop(txn_versions);
+
+        // Add all entries in a single batch operation
+        if !entries.is_empty() {
+            let entry_refs: Vec<(i64, &[Value])> = entries
+                .iter()
+                .map(|(row_id, values)| (*row_id, values.as_slice()))
+                .collect();
+            index.add_batch_slice(&entry_refs)?;
+        }
 
         // Add to version store
         self.version_store.add_index(index_name, Arc::new(index));
@@ -2798,7 +2719,9 @@ impl Table for MVCCTable {
             expected_rows,
         );
 
-        // Populate the index with existing data
+        // Populate the index with existing data using batch_slice
+        let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
+
         for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
             if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
                 if !version.is_deleted() {
@@ -2813,32 +2736,42 @@ impl Table for MVCCTable {
                                 .unwrap_or(Value::Null(DataType::Null))
                         })
                         .collect();
-                    index.add(&values, row_id, row_id)?;
+                    entries.push((row_id, values));
                 }
             }
         }
 
-        // Also add any local uncommitted data
-        let txn_versions = self.txn_versions.read().unwrap();
-        for (row_id, version) in txn_versions.iter_local() {
-            if !version.is_deleted() {
-                // Skip if already added from global store
-                if !self.version_store.quick_check_row_existence(row_id) {
-                    let values: Vec<Value> = col_indices
-                        .iter()
-                        .map(|&idx| {
-                            version
-                                .data
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or(Value::Null(DataType::Null))
-                        })
-                        .collect();
-                    index.add(&values, row_id, row_id)?;
+        // Also collect any local uncommitted data
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            for (row_id, version) in txn_versions.iter_local() {
+                if !version.is_deleted() {
+                    // Skip if already added from global store
+                    if !self.version_store.quick_check_row_existence(row_id) {
+                        let values: Vec<Value> = col_indices
+                            .iter()
+                            .map(|&idx| {
+                                version
+                                    .data
+                                    .get(idx)
+                                    .cloned()
+                                    .unwrap_or(Value::Null(DataType::Null))
+                            })
+                            .collect();
+                        entries.push((row_id, values));
+                    }
                 }
             }
         }
-        drop(txn_versions);
+
+        // Add all entries in a single batch operation
+        if !entries.is_empty() {
+            let entry_refs: Vec<(i64, &[Value])> = entries
+                .iter()
+                .map(|(row_id, values)| (*row_id, values.as_slice()))
+                .collect();
+            index.add_batch_slice(&entry_refs)?;
+        }
 
         // Add to version store
         self.version_store

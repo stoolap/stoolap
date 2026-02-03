@@ -1205,7 +1205,13 @@ impl<V: Clone> CowBTree<V> {
                     node.insert_leaf(i, key, value);
 
                     if node.len() > MAX_KEYS {
-                        let (median, right) = node.split_leaf();
+                        // Optimization: if we inserted at the end, use rightmost split
+                        // This handles interleaved sequential inserts that miss the global fast path
+                        let (median, right) = if i == node.len() - 1 {
+                            node.split_leaf_rightmost()
+                        } else {
+                            node.split_leaf()
+                        };
                         InsertResult::Split(median, right)
                     } else {
                         InsertResult::Done(None)
@@ -1226,7 +1232,12 @@ impl<V: Clone> CowBTree<V> {
                     node.insert_internal(i, median, right);
 
                     if node.len() > MAX_KEYS {
-                        let (m, r) = node.split_internal();
+                        // Optimization: if we inserted at the end, use rightmost split
+                        let (m, r) = if i == node.len() - 1 {
+                            node.split_internal_rightmost()
+                        } else {
+                            node.split_internal()
+                        };
                         InsertResult::Split(m, r)
                     } else {
                         InsertResult::Done(None)
@@ -1365,7 +1376,12 @@ impl<V: Clone> CowBTree<V> {
                     node.insert_internal(i, median, right);
 
                     if node.len() > MAX_KEYS {
-                        let (m, r) = node.split_internal();
+                        // Optimization: if we inserted at the end, use rightmost split
+                        let (m, r) = if i == node.len() - 1 {
+                            node.split_internal_rightmost()
+                        } else {
+                            node.split_internal()
+                        };
                         (InsertResult::Split(m, r), ptr)
                     } else {
                         (InsertResult::Done(None), ptr)

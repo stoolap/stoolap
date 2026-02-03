@@ -15,7 +15,6 @@
 //! Index trait for database indexes
 //!
 
-use crate::common::CompactArc;
 use crate::common::I64Map;
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
@@ -50,17 +49,6 @@ pub trait Index: Send + Sync {
     /// Note: Uses `&self` with interior mutability for thread-safe concurrent access
     fn add(&self, values: &[Value], row_id: i64, ref_id: i64) -> Result<()>;
 
-    /// Adds CompactArc<Value> references to the index - shares ownership without cloning
-    ///
-    /// This is the preferred method when you already have CompactArc<Value> references
-    /// (e.g., from Row storage) as it avoids cloning the underlying values.
-    ///
-    /// # Arguments
-    /// * `values` - Arc references to the column values to index
-    /// * `row_id` - The row ID in the table
-    /// * `ref_id` - The reference ID in the index
-    fn add_arc(&self, values: &[CompactArc<Value>], row_id: i64, ref_id: i64) -> Result<()>;
-
     /// Adds multiple entries to the index in a single batch operation
     ///
     /// # Arguments
@@ -77,22 +65,53 @@ pub trait Index: Send + Sync {
     /// Note: Uses `&self` with interior mutability for thread-safe concurrent access
     fn remove(&self, values: &[Value], row_id: i64, ref_id: i64) -> Result<()>;
 
-    /// Removes CompactArc<Value> references from the index - avoids cloning when you have Arc refs
-    ///
-    /// This is the preferred method when you already have CompactArc<Value> references
-    /// (e.g., from Row storage) as it avoids cloning the underlying values.
-    ///
-    /// # Arguments
-    /// * `values` - Arc references to the column values to remove
-    /// * `row_id` - The row ID in the table
-    /// * `ref_id` - The reference ID in the index
-    fn remove_arc(&self, values: &[CompactArc<Value>], row_id: i64, ref_id: i64) -> Result<()>;
-
     /// Removes multiple entries from the index in a single batch operation
     ///
     /// # Arguments
     /// * `entries` - Map from row_id to column values
     fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()>;
+
+    /// Adds multiple entries from a slice with single lock acquisition
+    ///
+    /// This is the most efficient batch method - avoids intermediate allocations
+    /// and acquires write locks only once for the entire batch.
+    ///
+    /// # Arguments
+    /// * `entries` - Slice of (row_id, values) pairs
+    ///
+    /// # Performance
+    /// - Single lock acquisition for entire batch (vs N acquisitions for N calls to add())
+    /// - No intermediate HashMap construction
+    /// - Values are borrowed, not cloned (caller owns the data)
+    fn add_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
+        // Default implementation: delegate to add() for backwards compatibility
+        // Concrete implementations should override for single-lock optimization
+        for &(row_id, values) in entries {
+            self.add(values, row_id, row_id)?;
+        }
+        Ok(())
+    }
+
+    /// Removes multiple entries from a slice with single lock acquisition
+    ///
+    /// This is the most efficient batch removal method - avoids intermediate allocations
+    /// and acquires write locks only once for the entire batch.
+    ///
+    /// # Arguments
+    /// * `entries` - Slice of (row_id, values) pairs
+    ///
+    /// # Performance
+    /// - Single lock acquisition for entire batch (vs N acquisitions for N calls to remove())
+    /// - No intermediate HashMap construction
+    /// - Values are borrowed, not cloned (caller owns the data)
+    fn remove_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
+        // Default implementation: delegate to remove() for backwards compatibility
+        // Concrete implementations should override for single-lock optimization
+        for &(row_id, values) in entries {
+            self.remove(values, row_id, row_id)?;
+        }
+        Ok(())
+    }
 
     /// Returns the column IDs for this index
     fn column_ids(&self) -> &[i32];

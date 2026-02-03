@@ -481,81 +481,6 @@ impl Index for BTreeIndex {
         Ok(())
     }
 
-    fn add_arc(&self, values: &[CompactArc<Value>], row_id: i64, _ref_id: i64) -> Result<()> {
-        self.check_closed()?;
-
-        if values.is_empty() {
-            return Ok(());
-        }
-
-        // BTree index only uses the first value (single column)
-        let arc_value = &values[0];
-
-        // Hold write locks for entire operation to prevent race conditions
-        let mut sorted_values = self.sorted_values.write().unwrap();
-        let mut row_to_value = self.row_to_value.write().unwrap();
-
-        // Check if this row_id already exists with the same value (no-op)
-        // or different value (need to remove old entry first)
-        if let Some(old_arc) = row_to_value.get(row_id) {
-            if old_arc == arc_value {
-                // Same value, nothing to do
-                return Ok(());
-            }
-            // Different value - remove old entry from sorted index
-            let old_arc = old_arc.clone();
-            if let Some(rows) = sorted_values.get_mut(&old_arc) {
-                if let Ok(pos) = rows.binary_search(&row_id) {
-                    rows.remove(pos);
-                }
-                if rows.is_empty() {
-                    sorted_values.remove(&old_arc);
-                }
-            }
-        }
-
-        // Check uniqueness constraint using BTreeMap O(log n) lookup
-        if self.unique && !arc_value.is_null() {
-            if let Some(rows) = sorted_values.get(arc_value) {
-                for existing_row_id in rows.iter() {
-                    if *existing_row_id != row_id {
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            &self.column_name,
-                            format!("{:?}", arc_value),
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Try to reuse existing Arc if value already exists in index (memory deduplication)
-        // This ensures only one Arc per unique value across the entire index
-        let final_arc = if let Some((existing_arc, _)) = sorted_values.get_key_value(&**arc_value) {
-            // Value exists - reuse the existing Arc for memory efficiency
-            CompactArc::clone(existing_arc)
-        } else {
-            // New unique value - use the provided Arc
-            CompactArc::clone(arc_value)
-        };
-
-        // Add to sorted index and row mapping - O(1) Arc clone, no Value clone!
-        let btree_rows = sorted_values
-            .entry(CompactArc::clone(&final_arc))
-            .or_default();
-        if let Err(pos) = btree_rows.binary_search(&row_id) {
-            btree_rows.insert(pos, row_id);
-        }
-        row_to_value.insert(row_id, final_arc);
-
-        // Drop locks before invalidating cache
-        drop(sorted_values);
-        drop(row_to_value);
-
-        self.invalidate_cache();
-        Ok(())
-    }
-
     fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
         self.check_closed()?;
 
@@ -595,17 +520,173 @@ impl Index for BTreeIndex {
         Ok(())
     }
 
-    fn remove_arc(&self, _values: &[CompactArc<Value>], row_id: i64, ref_id: i64) -> Result<()> {
-        // BTreeIndex looks up by row_id, so values aren't used - delegate to remove
-        self.remove(&[], row_id, ref_id)
-    }
-
     fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
         self.check_closed()?;
 
         for (row_id, values) in entries.iter() {
             self.remove(values, row_id, 0)?;
         }
+        Ok(())
+    }
+
+    /// Optimized batch add with single lock acquisition
+    ///
+    /// Performance: O(1) lock acquisitions instead of O(N)
+    fn add_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        self.check_closed()?;
+
+        // Acquire write locks ONCE for entire batch
+        let mut sorted_values = self.sorted_values.write().unwrap();
+        let mut row_to_value = self.row_to_value.write().unwrap();
+
+        // Reserve capacity
+        row_to_value.reserve(entries.len());
+
+        // For unique indexes: pre-check all entries before modifying
+        if self.unique {
+            for &(row_id, values) in entries {
+                if values.is_empty() {
+                    continue;
+                }
+                let value = &values[0];
+                if value.is_null() {
+                    continue;
+                }
+
+                // Check uniqueness against existing index
+                if let Some(rows) = sorted_values.get(value) {
+                    for &existing_row_id in rows.iter() {
+                        if existing_row_id != row_id {
+                            return Err(Error::unique_constraint(
+                                &self.name,
+                                &self.column_name,
+                                format!("{:?}", value),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Check for intra-batch duplicates
+            // Use AHashMap per CLAUDE.md guidelines for Value keys (HashDoS resistance)
+            let mut seen: ahash::AHashMap<&Value, i64> =
+                ahash::AHashMap::with_capacity(entries.len());
+            for &(row_id, values) in entries {
+                if values.is_empty() {
+                    continue;
+                }
+                let value = &values[0];
+                if value.is_null() {
+                    continue;
+                }
+                if let Some(&existing_row_id) = seen.get(value) {
+                    if existing_row_id != row_id {
+                        return Err(Error::unique_constraint(
+                            &self.name,
+                            &self.column_name,
+                            format!("{:?}", value),
+                        ));
+                    }
+                }
+                seen.insert(value, row_id);
+            }
+        }
+
+        // All checks passed - now add all entries
+        for &(row_id, values) in entries {
+            if values.is_empty() {
+                continue;
+            }
+
+            let value = &values[0];
+
+            // Handle existing row (update case)
+            if let Some(old_arc) = row_to_value.get(row_id) {
+                if old_arc.as_ref() == value {
+                    continue; // Same value, skip
+                }
+                // Different value - remove old entry
+                let old_arc = old_arc.clone();
+                if let Some(rows) = sorted_values.get_mut(&old_arc) {
+                    if let Ok(pos) = rows.binary_search(&row_id) {
+                        rows.remove(pos);
+                    }
+                    if rows.is_empty() {
+                        sorted_values.remove(&old_arc);
+                    }
+                }
+            }
+
+            // Try to reuse existing Arc if value exists (memory deduplication)
+            let arc_value = if let Some((existing_arc, _)) = sorted_values.get_key_value(value) {
+                CompactArc::clone(existing_arc)
+            } else {
+                CompactArc::new(value.clone())
+            };
+
+            // Add to sorted index (sorted insertion)
+            let btree_rows = sorted_values
+                .entry(CompactArc::clone(&arc_value))
+                .or_default();
+            if let Err(pos) = btree_rows.binary_search(&row_id) {
+                btree_rows.insert(pos, row_id);
+            }
+
+            // Add to row_to_value
+            row_to_value.insert(row_id, arc_value);
+        }
+
+        // Drop locks before invalidating cache
+        drop(sorted_values);
+        drop(row_to_value);
+
+        self.invalidate_cache();
+        Ok(())
+    }
+
+    /// Optimized batch remove with single lock acquisition
+    ///
+    /// Performance: O(1) lock acquisitions instead of O(N)
+    fn remove_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        self.check_closed()?;
+
+        // Acquire write locks ONCE for entire batch
+        let mut sorted_values = self.sorted_values.write().unwrap();
+        let mut row_to_value = self.row_to_value.write().unwrap();
+
+        let mut any_removed = false;
+
+        for &(row_id, _values) in entries {
+            // BTreeIndex looks up by row_id, values aren't used
+            if let Some(arc_value) = row_to_value.remove(row_id) {
+                if let Some(rows) = sorted_values.get_mut(&arc_value) {
+                    if let Ok(pos) = rows.binary_search(&row_id) {
+                        rows.remove(pos);
+                        any_removed = true;
+                    }
+                    if rows.is_empty() {
+                        sorted_values.remove(&arc_value);
+                    }
+                }
+            }
+        }
+
+        // Drop locks before invalidating cache
+        drop(sorted_values);
+        drop(row_to_value);
+
+        if any_removed {
+            self.invalidate_cache();
+        }
+
         Ok(())
     }
 
