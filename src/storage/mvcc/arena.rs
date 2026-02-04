@@ -33,6 +33,9 @@ use crate::common::CompactArc;
 use crate::core::{Row, Value};
 
 /// Metadata for a row stored in the arena
+///
+/// Note: create_time is NOT stored here to save 8 bytes per row.
+/// It's available via RowVersion in the version chain when needed.
 #[derive(Clone, Copy, Debug)]
 pub struct ArenaRowMeta {
     /// Row ID
@@ -41,8 +44,6 @@ pub struct ArenaRowMeta {
     pub txn_id: i64,
     /// Transaction ID that deleted this row (0 if not deleted)
     pub deleted_at_txn_id: i64,
-    /// Creation timestamp
-    pub create_time: i64,
 }
 
 impl ArenaRowMeta {
@@ -110,7 +111,7 @@ impl RowArena {
     /// Returns the index of the row metadata.
     /// Reuses cleared slots from the free list to prevent unbounded growth.
     #[inline]
-    pub fn insert(&self, row_id: i64, txn_id: i64, create_time: i64, values: &[Value]) -> usize {
+    pub fn insert(&self, row_id: i64, txn_id: i64, values: &[Value]) -> usize {
         // Check free list first (separate lock, doesn't affect read path)
         let reuse_idx = self.free_list.lock().pop();
 
@@ -123,7 +124,6 @@ impl RowArena {
             row_id,
             txn_id,
             deleted_at_txn_id: 0,
-            create_time,
         };
 
         // Reuse a slot from the free list if available
@@ -143,7 +143,7 @@ impl RowArena {
     /// Handles all storage types: Shared Arc is cloned O(1), Owned values create new Arc.
     /// Reuses cleared slots from the free list to prevent unbounded growth.
     #[inline]
-    pub fn insert_row(&self, row_id: i64, txn_id: i64, create_time: i64, row: &Row) -> usize {
+    pub fn insert_row(&self, row_id: i64, txn_id: i64, row: &Row) -> usize {
         // Check free list first (separate lock, doesn't affect read path)
         let reuse_idx = self.free_list.lock().pop();
 
@@ -165,7 +165,6 @@ impl RowArena {
             row_id,
             txn_id,
             deleted_at_txn_id: 0,
-            create_time,
         };
 
         // Reuse a slot from the free list if available
@@ -190,7 +189,6 @@ impl RowArena {
         &self,
         row_id: i64,
         txn_id: i64,
-        create_time: i64,
         row: &Row,
     ) -> (usize, CompactArc<[Value]>) {
         // Check free list first (separate lock, doesn't affect read path)
@@ -212,7 +210,6 @@ impl RowArena {
             row_id,
             txn_id,
             deleted_at_txn_id: 0,
-            create_time,
         };
 
         // Reuse a slot from the free list if available
@@ -233,13 +230,7 @@ impl RowArena {
     /// Returns the index where it was stored
     /// Reuses cleared slots from the free list to prevent unbounded growth.
     #[inline]
-    pub fn insert_arc(
-        &self,
-        row_id: i64,
-        txn_id: i64,
-        create_time: i64,
-        arc_data: CompactArc<[Value]>,
-    ) -> usize {
+    pub fn insert_arc(&self, row_id: i64, txn_id: i64, arc_data: CompactArc<[Value]>) -> usize {
         // Check free list first (separate lock, doesn't affect read path)
         let reuse_idx = self.free_list.lock().pop();
 
@@ -249,7 +240,6 @@ impl RowArena {
             row_id,
             txn_id,
             deleted_at_txn_id: 0,
-            create_time,
         };
 
         // Reuse a slot from the free list if available
@@ -291,7 +281,6 @@ impl RowArena {
                     row_id: 0,
                     txn_id: 0,
                     deleted_at_txn_id: 0,
-                    create_time: 0,
                 };
                 true
             } else {
@@ -321,7 +310,6 @@ impl RowArena {
                 row_id: 0,
                 txn_id: 0,
                 deleted_at_txn_id: 0,
-                create_time: 0,
             };
 
             for &arena_idx in arena_indices {
@@ -354,7 +342,6 @@ impl RowArena {
         arena_idx: usize,
         row_id: i64,
         txn_id: i64,
-        create_time: i64,
         arc_data: CompactArc<[Value]>,
     ) -> bool {
         let mut inner = self.inner.write();
@@ -364,7 +351,6 @@ impl RowArena {
                 row_id,
                 txn_id,
                 deleted_at_txn_id: 0,
-                create_time,
             };
             true
         } else {
@@ -472,19 +458,16 @@ mod tests {
         arena.insert(
             1,
             100,
-            1000,
             &[Value::Integer(1), Value::text("Alice"), Value::Float(100.0)],
         );
         arena.insert(
             2,
             100,
-            1001,
             &[Value::Integer(2), Value::text("Bob"), Value::Float(200.0)],
         );
         arena.insert(
             3,
             100,
-            1002,
             &[Value::Integer(3), Value::text("Carol"), Value::Float(300.0)],
         );
 
@@ -510,7 +493,7 @@ mod tests {
     fn test_arena_arc_clone() {
         let arena = RowArena::new();
 
-        arena.insert(1, 100, 1000, &[Value::Integer(42), Value::text("test")]);
+        arena.insert(1, 100, &[Value::Integer(42), Value::text("test")]);
 
         let guard = arena.read_guard();
         assert_eq!(guard.len(), 1);
@@ -530,7 +513,7 @@ mod tests {
     fn test_arena_deletion() {
         let arena = RowArena::new();
 
-        let idx = arena.insert(1, 100, 1000, &[Value::Integer(1), Value::text("test")]);
+        let idx = arena.insert(1, 100, &[Value::Integer(1), Value::text("test")]);
 
         // Mark as deleted
         arena.mark_deleted(idx, 101);
@@ -547,7 +530,6 @@ mod tests {
         arena.insert(
             1,
             100,
-            1000,
             &[Value::Integer(42), Value::text("hello"), Value::Float(3.15)],
         );
 
@@ -574,8 +556,8 @@ mod tests {
     fn test_arena_read_guard() {
         let arena = RowArena::new();
 
-        arena.insert(1, 100, 1000, &[Value::Integer(1), Value::text("a")]);
-        arena.insert(2, 100, 1001, &[Value::Integer(2), Value::text("b")]);
+        arena.insert(1, 100, &[Value::Integer(1), Value::text("a")]);
+        arena.insert(2, 100, &[Value::Integer(2), Value::text("b")]);
 
         let guard = arena.read_guard();
         assert_eq!(guard.len(), 2);
@@ -592,7 +574,6 @@ mod tests {
             arena.insert(
                 i,
                 100,
-                1000 + i,
                 &[Value::Integer(i), Value::text(format!("row{}", i))],
             );
         }
@@ -613,8 +594,8 @@ mod tests {
         }
 
         // Insert new rows - should reuse cleared slots (3 then 1, LIFO order)
-        let idx1 = arena.insert(10, 200, 2000, &[Value::Integer(10), Value::text("new1")]);
-        let idx2 = arena.insert(11, 200, 2001, &[Value::Integer(11), Value::text("new2")]);
+        let idx1 = arena.insert(10, 200, &[Value::Integer(10), Value::text("new1")]);
+        let idx2 = arena.insert(11, 200, &[Value::Integer(11), Value::text("new2")]);
 
         // Slots should be reused, not appended
         assert_eq!(arena.len(), 5); // Still 5, slots were reused
@@ -631,7 +612,7 @@ mod tests {
         }
 
         // Insert one more - should append since free list is empty
-        let idx3 = arena.insert(12, 200, 2002, &[Value::Integer(12), Value::text("new3")]);
+        let idx3 = arena.insert(12, 200, &[Value::Integer(12), Value::text("new3")]);
         assert_eq!(idx3, 5); // New slot at end
         assert_eq!(arena.len(), 6);
     }
@@ -642,7 +623,7 @@ mod tests {
 
         // Insert 10 rows
         for i in 0..10 {
-            arena.insert(i, 100, 1000 + i, &[Value::Integer(i)]);
+            arena.insert(i, 100, &[Value::Integer(i)]);
         }
         assert_eq!(arena.len(), 10);
 
@@ -654,7 +635,7 @@ mod tests {
         // Insert 4 new rows - should reuse all 4 cleared slots
         let mut new_indices = Vec::new();
         for i in 100..104 {
-            new_indices.push(arena.insert(i, 200, 2000 + i, &[Value::Integer(i)]));
+            new_indices.push(arena.insert(i, 200, &[Value::Integer(i)]));
         }
 
         // Should still be 10 (all slots reused)

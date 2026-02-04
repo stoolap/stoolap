@@ -716,7 +716,6 @@ impl VersionStore {
                             old_idx,
                             row_id,
                             new_version.txn_id,
-                            new_version.create_time,
                             CompactArc::clone(&arc_data),
                         );
                         old_idx
@@ -725,7 +724,6 @@ impl VersionStore {
                         self.arena.insert_arc(
                             row_id,
                             new_version.txn_id,
-                            new_version.create_time,
                             CompactArc::clone(&arc_data),
                         )
                     };
@@ -782,12 +780,9 @@ impl VersionStore {
                     // Convert Row to Arc once (takes ownership, no copy if already Arc)
                     let arc_data = std::mem::take(&mut v.data).into_arc();
                     // Insert Arc into arena (just Arc::clone, no data copy)
-                    let idx = self.arena.insert_arc(
-                        row_id,
-                        v.txn_id,
-                        v.create_time,
-                        CompactArc::clone(&arc_data),
-                    );
+                    let idx = self
+                        .arena
+                        .insert_arc(row_id, v.txn_id, CompactArc::clone(&arc_data));
                     // Update row -> arena index mapping
                     self.row_arena_index.write().insert(row_id, idx);
                     // Create version with Arc-backed data for O(1) clone
@@ -878,7 +873,6 @@ impl VersionStore {
                                 old_idx,
                                 row_id,
                                 new_version.txn_id,
-                                new_version.create_time,
                                 CompactArc::clone(&arc_data),
                             );
                             old_idx
@@ -887,7 +881,6 @@ impl VersionStore {
                             self.arena.insert_arc(
                                 row_id,
                                 new_version.txn_id,
-                                new_version.create_time,
                                 CompactArc::clone(&arc_data),
                             )
                         };
@@ -943,12 +936,9 @@ impl VersionStore {
                         // Convert Row to Arc once (takes ownership, no copy if already Arc)
                         let arc_data = std::mem::take(&mut v.data).into_arc();
                         // Insert Arc into arena (just Arc::clone, no data copy)
-                        let idx = self.arena.insert_arc(
-                            row_id,
-                            v.txn_id,
-                            v.create_time,
-                            CompactArc::clone(&arc_data),
-                        );
+                        let idx =
+                            self.arena
+                                .insert_arc(row_id, v.txn_id, CompactArc::clone(&arc_data));
                         arena_index_updates.push((row_id, idx));
                         // Create version with Arc-backed data for O(1) clone
                         v.data = Row::from_arc(arc_data);
@@ -1043,7 +1033,6 @@ impl VersionStore {
                             old_idx,
                             row_id,
                             new_version.txn_id,
-                            new_version.create_time,
                             CompactArc::clone(&arc_data),
                         );
                         old_idx
@@ -1052,7 +1041,6 @@ impl VersionStore {
                         self.arena.insert_arc(
                             row_id,
                             new_version.txn_id,
-                            new_version.create_time,
                             CompactArc::clone(&arc_data),
                         )
                     };
@@ -1103,12 +1091,9 @@ impl VersionStore {
 
                     let mut v = version;
                     let arc_data = std::mem::take(&mut v.data).into_arc();
-                    let idx = self.arena.insert_arc(
-                        row_id,
-                        v.txn_id,
-                        v.create_time,
-                        CompactArc::clone(&arc_data),
-                    );
+                    let idx = self
+                        .arena
+                        .insert_arc(row_id, v.txn_id, CompactArc::clone(&arc_data));
                     // Update arena index immediately
                     self.row_arena_index.write().insert(row_id, idx);
                     v.data = Row::from_arc(arc_data);
@@ -1154,11 +1139,13 @@ impl VersionStore {
                     {
                         return None;
                     }
+                    // create_time is NOT fetched here to avoid lock + lookup overhead.
+                    // Callers needing create_time (AS OF queries) use version chain directly.
                     return Some(RowVersion {
                         txn_id: meta.txn_id,
                         deleted_at_txn_id: meta.deleted_at_txn_id,
                         data: Row::from_arc(arc_data),
-                        create_time: meta.create_time,
+                        create_time: 0,
                     });
                 }
                 // HEAD not visible - fall through to version chain
@@ -1966,8 +1953,8 @@ impl VersionStore {
     /// callers can use `put_batch_with_originals()` to avoid redundant `get_visible_version()`
     /// calls during the put phase.
     ///
-    /// Returns: Vec of (row_id, row_data, original_version) tuples
-    /// The original_version.create_time contains the read_version_seq for conflict detection.
+    /// Returns: Vec of (row_id, row_data, original_version) tuples.
+    /// Note: read_version_seq is obtained from visibility_checker, not from create_time.
     #[inline]
     pub fn get_all_visible_rows_for_update(&self, txn_id: i64) -> Vec<(i64, Row, RowVersion)> {
         if self.closed.load(Ordering::Acquire) {
@@ -5379,7 +5366,7 @@ impl TransactionVersionStore {
     ///
     /// Parameters:
     /// - rows: Vec of (row_id, new_row_data, original_version)
-    ///   where original_version.create_time contains the read_version_seq
+    ///   Note: read_version_seq is obtained from visibility_checker, not from create_time
     pub fn put_batch_with_originals(
         &mut self,
         rows: Vec<(i64, Row, RowVersion)>,

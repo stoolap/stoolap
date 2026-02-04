@@ -272,9 +272,9 @@ mod tests {
     fn test_aggregation_scanner() {
         // Create test data using RowArena
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Integer(1), Value::Float(10.0)]);
-        arena.insert(2, 1, 0, &[Value::Integer(2), Value::Float(20.0)]);
-        arena.insert(3, 1, 0, &[Value::Integer(3), Value::Float(30.0)]);
+        arena.insert(1, 1, &[Value::Integer(1), Value::Float(10.0)]);
+        arena.insert(2, 1, &[Value::Integer(2), Value::Float(20.0)]);
+        arena.insert(3, 1, &[Value::Integer(3), Value::Float(30.0)]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -319,9 +319,9 @@ mod tests {
     #[test]
     fn test_streaming_result_iteration() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Integer(100), Value::Text("a".into())]);
-        arena.insert(2, 1, 0, &[Value::Integer(200), Value::Text("b".into())]);
-        arena.insert(3, 1, 0, &[Value::Integer(300), Value::Text("c".into())]);
+        arena.insert(1, 1, &[Value::Integer(100), Value::Text("a".into())]);
+        arena.insert(2, 1, &[Value::Integer(200), Value::Text("b".into())]);
+        arena.insert(3, 1, &[Value::Integer(300), Value::Text("c".into())]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -374,8 +374,8 @@ mod tests {
     #[test]
     fn test_streaming_result_reset() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Integer(1)]);
-        arena.insert(2, 1, 0, &[Value::Integer(2)]);
+        arena.insert(1, 1, &[Value::Integer(1)]);
+        arena.insert(2, 1, &[Value::Integer(2)]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn test_streaming_result_row_id_edge_cases() {
         let arena = RowArena::new();
-        arena.insert(100, 1, 0, &[Value::Integer(1)]);
+        arena.insert(100, 1, &[Value::Integer(1)]);
 
         let guard = arena.read_guard();
         let visible = vec![VisibleRowInfo {
@@ -438,9 +438,9 @@ mod tests {
     #[test]
     fn test_streaming_result_row_id_with_many_rows() {
         let arena = RowArena::new();
-        arena.insert(10, 1, 0, &[Value::Integer(1)]);
-        arena.insert(20, 1, 0, &[Value::Integer(2)]);
-        arena.insert(30, 1, 0, &[Value::Integer(3)]);
+        arena.insert(10, 1, &[Value::Integer(1)]);
+        arena.insert(20, 1, &[Value::Integer(2)]);
+        arena.insert(30, 1, &[Value::Integer(3)]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn test_streaming_result_row_slice_and_row() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Integer(42), Value::Float(3.5)]);
+        arena.insert(1, 1, &[Value::Integer(42), Value::Float(3.5)]);
 
         let guard = arena.read_guard();
         let visible = vec![VisibleRowInfo {
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn test_streaming_result_invalid_arena_index() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Integer(1)]);
+        arena.insert(1, 1, &[Value::Integer(1)]);
 
         let guard = arena.read_guard();
         // Invalid arena_idx (999 doesn't exist)
@@ -532,8 +532,8 @@ mod tests {
     #[test]
     fn test_streaming_result_as_aggregation_scanner() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Integer(10)]);
-        arena.insert(2, 1, 0, &[Value::Integer(20)]);
+        arena.insert(1, 1, &[Value::Integer(10)]);
+        arena.insert(2, 1, &[Value::Integer(20)]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -573,19 +573,9 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_with_nulls() {
         let arena = RowArena::new();
-        arena.insert(
-            1,
-            1,
-            0,
-            &[Value::Integer(10), Value::Null(DataType::Integer)],
-        );
-        arena.insert(
-            2,
-            1,
-            0,
-            &[Value::Null(DataType::Integer), Value::Integer(20)],
-        );
-        arena.insert(3, 1, 0, &[Value::Integer(30), Value::Integer(30)]);
+        arena.insert(1, 1, &[Value::Integer(10), Value::Null(DataType::Integer)]);
+        arena.insert(2, 1, &[Value::Null(DataType::Integer), Value::Integer(20)]);
+        arena.insert(3, 1, &[Value::Integer(30), Value::Integer(30)]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -620,9 +610,9 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_all_nulls() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Null(DataType::Integer)]);
-        arena.insert(2, 1, 0, &[Value::Null(DataType::Integer)]);
-        arena.insert(3, 1, 0, &[Value::Null(DataType::Integer)]);
+        arena.insert(1, 1, &[Value::Null(DataType::Integer)]);
+        arena.insert(2, 1, &[Value::Null(DataType::Integer)]);
+        arena.insert(3, 1, &[Value::Null(DataType::Integer)]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -652,10 +642,10 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_min_max() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Integer(50)]);
-        arena.insert(2, 1, 0, &[Value::Integer(10)]);
-        arena.insert(3, 1, 0, &[Value::Integer(30)]);
-        arena.insert(4, 1, 0, &[Value::Null(DataType::Integer)]);
+        arena.insert(1, 1, &[Value::Integer(50)]);
+        arena.insert(2, 1, &[Value::Integer(10)]);
+        arena.insert(3, 1, &[Value::Integer(30)]);
+        arena.insert(4, 1, &[Value::Null(DataType::Integer)]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -686,9 +676,9 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_min_max_floats() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Float(3.15)]);
-        arena.insert(2, 1, 0, &[Value::Float(2.72)]);
-        arena.insert(3, 1, 0, &[Value::Float(1.42)]);
+        arena.insert(1, 1, &[Value::Float(3.15)]);
+        arena.insert(2, 1, &[Value::Float(2.72)]);
+        arena.insert(3, 1, &[Value::Float(1.42)]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -715,9 +705,9 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_min_max_text() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Text("banana".into())]);
-        arena.insert(2, 1, 0, &[Value::Text("apple".into())]);
-        arena.insert(3, 1, 0, &[Value::Text("cherry".into())]);
+        arena.insert(1, 1, &[Value::Text("banana".into())]);
+        arena.insert(2, 1, &[Value::Text("apple".into())]);
+        arena.insert(3, 1, &[Value::Text("cherry".into())]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -744,9 +734,9 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_sum_non_numeric() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Text("hello".into())]);
-        arena.insert(2, 1, 0, &[Value::Boolean(true)]);
-        arena.insert(3, 1, 0, &[Value::Integer(10)]);
+        arena.insert(1, 1, &[Value::Text("hello".into())]);
+        arena.insert(2, 1, &[Value::Boolean(true)]);
+        arena.insert(3, 1, &[Value::Integer(10)]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -773,9 +763,9 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_mixed_numeric() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Integer(10)]);
-        arena.insert(2, 1, 0, &[Value::Float(20.5)]);
-        arena.insert(3, 1, 0, &[Value::Integer(30)]);
+        arena.insert(1, 1, &[Value::Integer(10)]);
+        arena.insert(2, 1, &[Value::Float(20.5)]);
+        arena.insert(3, 1, &[Value::Integer(30)]);
 
         let guard = arena.read_guard();
         let visible = vec![
@@ -801,7 +791,7 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_invalid_column() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Integer(10)]);
+        arena.insert(1, 1, &[Value::Integer(10)]);
 
         let guard = arena.read_guard();
         let visible = vec![VisibleRowInfo {
@@ -821,7 +811,7 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_invalid_arena_index() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Integer(10)]);
+        arena.insert(1, 1, &[Value::Integer(10)]);
 
         let guard = arena.read_guard();
         // Include an invalid arena index
@@ -865,7 +855,7 @@ mod tests {
     #[test]
     fn test_streaming_result_single_row() {
         let arena = RowArena::new();
-        arena.insert(1, 1, 0, &[Value::Integer(42)]);
+        arena.insert(1, 1, &[Value::Integer(42)]);
 
         let guard = arena.read_guard();
         let visible = vec![VisibleRowInfo {

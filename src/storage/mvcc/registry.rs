@@ -12,282 +12,296 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Transaction registry for MVCC visibility
+//! Transaction registry for MVCC visibility.
 //!
-//! Manages transaction states and visibility rules for MVCC.
-//! Uses concurrent hash maps for high-performance thread-safe access.
+//! Optimized design with minimal memory footprint:
+//! - Active/Committing/Aborted transactions: tracked in single map
+//! - Committed transactions: implicit (not in map = committed)
+//! - Single lock acquisition in hot path
 //!
+//! Memory: O(active_transactions + aborted_transactions)
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::common::{CowHashMap, I64Map};
+use crate::common::I64Map;
 use crate::core::IsolationLevel;
 use crate::storage::VisibilityChecker;
 
-/// Invalid transaction ID returned when registry is not accepting new transactions
+/// Invalid transaction ID returned when registry is not accepting new transactions.
 pub const INVALID_TRANSACTION_ID: i64 = -999999999;
 
-/// Special transaction ID for recovery transactions (always visible)
+/// Special transaction ID for recovery transactions (always visible).
 pub const RECOVERY_TRANSACTION_ID: i64 = -1;
 
-/// Transaction status for unified state tracking
+/// Sentinel value for aborted transactions (negative begin_seq).
+const ABORTED_SENTINEL: i64 = -1;
+
+/// Transaction status.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum TxnStatus {
-    /// Transaction is in progress, changes not visible to others
+    /// Transaction is in progress
     Active = 0,
-    /// Two-phase commit in progress, changes being finalized
+    /// Two-phase commit in progress
     Committing = 1,
-    /// Transaction complete, changes visible per isolation rules
-    Committed = 2,
+    /// Transaction was aborted
+    Aborted = 2,
 }
 
-/// Unified transaction state - replaces 3 separate maps with 1
-/// This reduces map operations per commit from 5 to 2
+/// Packed transaction state (16 bytes).
+///
+/// - For Active/Committing: begin_seq > 0, state_seq encodes status + commit_seq
+/// - For Aborted: begin_seq = ABORTED_SENTINEL (-1)
 #[derive(Clone, Copy, Debug)]
 pub struct TxnState {
-    /// Current transaction status
-    pub status: TxnStatus,
-    /// Sequence number when transaction began
-    pub begin_seq: i64,
-    /// Sequence number when transaction committed (0 if not yet committing)
-    pub commit_seq: i64,
+    /// Sequence when transaction began (negative = aborted sentinel)
+    begin_seq: i64,
+    /// Packed: lower 62 bits = commit_seq, upper 2 bits = status
+    state_seq: i64,
 }
 
+const STATUS_SHIFT: u32 = 62;
+const SEQ_MASK: i64 = (1i64 << STATUS_SHIFT) - 1;
+
 impl TxnState {
+    /// Creates a new active transaction state.
     #[inline]
     const fn new_active(begin_seq: i64) -> Self {
         Self {
-            status: TxnStatus::Active,
             begin_seq,
-            commit_seq: 0,
+            state_seq: 0, // Active=0, commit_seq=0
         }
+    }
+
+    /// Creates an aborted transaction marker.
+    #[inline]
+    const fn new_aborted() -> Self {
+        Self {
+            begin_seq: ABORTED_SENTINEL,
+            state_seq: (TxnStatus::Aborted as i64) << STATUS_SHIFT,
+        }
+    }
+
+    /// Returns true if this is an aborted transaction.
+    #[inline(always)]
+    pub const fn is_aborted(&self) -> bool {
+        self.begin_seq == ABORTED_SENTINEL
+    }
+
+    /// Returns the begin sequence (0 if aborted).
+    #[inline(always)]
+    pub const fn begin_seq(&self) -> i64 {
+        if self.begin_seq == ABORTED_SENTINEL {
+            0
+        } else {
+            self.begin_seq
+        }
+    }
+
+    /// Returns the transaction status.
+    #[inline(always)]
+    pub const fn status(&self) -> TxnStatus {
+        if self.begin_seq == ABORTED_SENTINEL {
+            return TxnStatus::Aborted;
+        }
+        match (self.state_seq >> STATUS_SHIFT) as u8 {
+            0 => TxnStatus::Active,
+            1 => TxnStatus::Committing,
+            _ => TxnStatus::Aborted,
+        }
+    }
+
+    /// Returns true if Active or Committing (not aborted).
+    #[inline(always)]
+    pub const fn is_active_or_committing(&self) -> bool {
+        self.begin_seq != ABORTED_SENTINEL
+    }
+
+    /// Sets status to Committing with given commit_seq.
+    #[inline(always)]
+    fn set_committing(&mut self, commit_seq: i64) {
+        self.state_seq = commit_seq | (1i64 << STATUS_SHIFT);
+    }
+
+    /// Returns the commit sequence (0 if not committing).
+    #[inline(always)]
+    pub const fn commit_seq(&self) -> i64 {
+        self.state_seq & SEQ_MASK
     }
 }
 
-/// Cache size for thread-local committed transaction cache
-/// 65536 entries (512KB per thread) covers the working set of visible transactions
-/// for almost all realistic workloads, eliminating >99% of map lookups during
-/// scans. This significantly reduces lock contention on the shared registry.
-const COMMITTED_CACHE_SIZE: usize = 65536;
+/// Thread-local cache size (512KB per thread).
+const CACHE_SIZE: usize = 65536;
 
-// Thread-local cache for committed transaction IDs
-// Avoids repeated map lookups during table scans
 thread_local! {
-    static COMMITTED_TXN_CACHE: RefCell<CommittedTxnCache> = const { RefCell::new(CommittedTxnCache::new()) };
+    static COMMITTED_CACHE: RefCell<CommittedCache> = const { RefCell::new(CommittedCache::new()) };
 }
 
-/// Simple fixed-size cache for committed transaction IDs
-/// Uses circular buffer with direct-mapped indexing for O(1) lookup
-struct CommittedTxnCache {
-    /// Cached transaction IDs (0 = empty slot)
-    entries: [i64; COMMITTED_CACHE_SIZE],
+/// Direct-mapped cache for committed transaction IDs.
+struct CommittedCache {
+    entries: [i64; CACHE_SIZE],
 }
 
-impl CommittedTxnCache {
+impl CommittedCache {
     #[inline]
     const fn new() -> Self {
         Self {
-            entries: [0; COMMITTED_CACHE_SIZE],
+            entries: [0; CACHE_SIZE],
         }
     }
 
-    /// Check if txn_id is in cache
     #[inline(always)]
     fn contains(&self, txn_id: i64) -> bool {
-        // Direct-mapped: use lower bits of txn_id as index
-        let idx = (txn_id as usize) & (COMMITTED_CACHE_SIZE - 1);
+        let idx = (txn_id as usize) & (CACHE_SIZE - 1);
         self.entries[idx] == txn_id
     }
 
-    /// Add txn_id to cache
     #[inline(always)]
     fn insert(&mut self, txn_id: i64) {
-        let idx = (txn_id as usize) & (COMMITTED_CACHE_SIZE - 1);
+        let idx = (txn_id as usize) & (CACHE_SIZE - 1);
         self.entries[idx] = txn_id;
     }
 }
 
-/// Transaction registry manages transaction states and visibility rules
+/// Transaction registry with minimal memory footprint.
 ///
-/// This is a lock-free implementation using concurrent hash maps for optimal
-/// performance and concurrency. It supports both READ COMMITTED and SNAPSHOT
-/// isolation levels.
+/// Design:
+/// - `transactions`: Single map for Active/Committing/Aborted
+/// - If txn_id not in map and valid → committed (implicit)
+/// - `snapshot_seqs`: Commit sequences for snapshot isolation
 ///
-/// # Transaction States
-///
-/// Transactions go through the following states:
-/// 1. **Active**: Transaction is in progress, changes not visible to others
-/// 2. **Committing**: Two-phase commit in progress, changes being finalized
-/// 3. **Committed**: Transaction complete, changes visible per isolation rules
-/// 4. **Aborted**: Transaction rolled back, changes discarded
-///
-/// Transaction registry manages transaction states and visibility rules
-///
-/// This is a high-performance implementation using:
-/// - `CowHashMap` for transaction state (O(1) snapshots, lock-free iteration)
-/// - Atomic operations for sequence generation
-/// - Thread-local caching to minimize lock contention
-///
-/// # Performance
-///
-/// All operations are O(1) with minimal lock contention:
-/// - `begin_transaction()`: ~50ns (2 atomic ops + 1 map insert)
-/// - `start_commit()`: ~30ns (1 atomic op + map update)
-/// - `complete_commit()`: ~20ns (map update)
-/// - `is_visible()`: ~15ns (cached) to ~30ns (map lookup)
+/// Memory: O(active + aborted) instead of O(total)
 pub struct TransactionRegistry {
-    /// Next transaction ID to assign
+    /// All tracked transactions (Active, Committing, Aborted).
+    /// Committed transactions are REMOVED from this map.
+    transactions: Mutex<I64Map<TxnState>>,
+
+    /// For SNAPSHOT ISOLATION: txn_id -> commit_seq.
+    /// GC removes old entries when commit_seq < min_active_begin_seq.
+    snapshot_seqs: Mutex<I64Map<i64>>,
+
+    /// Last assigned transaction ID (after begin_transaction, equals txn_id).
     next_txn_id: AtomicI64,
 
-    /// Unified transaction state map: txn_id -> TxnState
-    /// Replaces 3 separate maps (active, committing, committed) with 1
-    /// Benefits:
-    /// - State transitions are atomic updates, not remove+insert
-    /// - Single lookup for visibility checks
-    /// - O(1) snapshot for lock-free iteration during scans
-    /// - Mutex is faster than RwLock under high contention (benchmark verified)
-    transactions: Mutex<CowHashMap<TxnState>>,
+    /// Last assigned sequence number (after begin/commit, equals that seq).
+    next_sequence: AtomicI64,
 
-    /// Global isolation level for new transactions (stored as u8 for lock-free access)
-    /// 0 = ReadCommitted, 1 = SnapshotIsolation
+    /// Global isolation level (0 = ReadCommitted, 1 = SnapshotIsolation).
     global_isolation_level: AtomicU8,
 
-    /// Per-transaction isolation level overrides
-    /// Key: txn_id, Value: isolation level as u8 (0 = ReadCommitted, 1 = SnapshotIsolation)
-    /// Uses Mutex<I64Map> since this map is typically empty or very small,
-    /// and the atomic isolation_override_count skips lookup in 99% of cases.
-    transaction_isolation_levels: Mutex<I64Map<u8>>,
+    /// Per-transaction isolation level overrides.
+    isolation_overrides: Mutex<I64Map<u8>>,
 
-    /// Count of active per-transaction isolation level overrides
-    /// When 0, is_visible() can skip the isolation override lookup entirely
-    isolation_override_count: AtomicUsize,
+    /// Count of active isolation overrides (skip lookup when 0).
+    override_count: AtomicUsize,
 
-    /// Whether new transactions are being accepted
+    /// Whether new transactions are being accepted.
     accepting: AtomicBool,
-
-    /// Monotonic sequence for both begin and commit ordering
-    next_sequence: AtomicI64,
 }
 
 impl TransactionRegistry {
-    /// Creates a new transaction registry
+    /// Creates a new transaction registry.
     pub fn new() -> Self {
         Self::with_capacity(1024)
     }
 
-    /// Creates a new transaction registry with pre-allocated capacity
+    /// Creates a new transaction registry with pre-allocated capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
+            transactions: Mutex::new(I64Map::with_capacity(capacity)),
+            snapshot_seqs: Mutex::new(I64Map::new()),
             next_txn_id: AtomicI64::new(0),
-            transactions: Mutex::new(CowHashMap::with_capacity(capacity)),
-            global_isolation_level: AtomicU8::new(0), // 0 = ReadCommitted
-            transaction_isolation_levels: Mutex::new(I64Map::new()),
-            isolation_override_count: AtomicUsize::new(0),
-            accepting: AtomicBool::new(true),
             next_sequence: AtomicI64::new(0),
+            global_isolation_level: AtomicU8::new(0),
+            isolation_overrides: Mutex::new(I64Map::new()),
+            override_count: AtomicUsize::new(0),
+            accepting: AtomicBool::new(true),
         }
     }
 
-    /// Converts IsolationLevel to u8 for atomic storage
     #[inline(always)]
-    const fn isolation_level_to_u8(level: IsolationLevel) -> u8 {
+    const fn isolation_to_u8(level: IsolationLevel) -> u8 {
         match level {
             IsolationLevel::ReadCommitted => 0,
             IsolationLevel::SnapshotIsolation => 1,
         }
     }
 
-    /// Converts u8 to IsolationLevel
     #[inline(always)]
-    const fn u8_to_isolation_level(value: u8) -> IsolationLevel {
+    const fn u8_to_isolation(value: u8) -> IsolationLevel {
         match value {
             0 => IsolationLevel::ReadCommitted,
             _ => IsolationLevel::SnapshotIsolation,
         }
     }
 
-    /// Sets the isolation level for a specific transaction
-    pub fn set_transaction_isolation_level(&self, txn_id: i64, level: IsolationLevel) {
-        let mut map = self.transaction_isolation_levels.lock();
-        // Check if this is a new override (not replacing existing)
-        let is_new = !map.contains_key(txn_id);
-        map.insert(txn_id, Self::isolation_level_to_u8(level));
-        if is_new {
-            self.isolation_override_count
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Removes the isolation level for a transaction
-    pub fn remove_transaction_isolation_level(&self, txn_id: i64) {
-        if self
-            .transaction_isolation_levels
-            .lock()
-            .remove(txn_id)
-            .is_some()
-        {
-            self.isolation_override_count
-                .fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Sets the global isolation level for new transactions (lock-free)
+    /// Sets the global isolation level.
     pub fn set_global_isolation_level(&self, level: IsolationLevel) {
         self.global_isolation_level
-            .store(Self::isolation_level_to_u8(level), Ordering::Release);
+            .store(Self::isolation_to_u8(level), Ordering::Release);
     }
 
-    /// Gets the current global isolation level (lock-free)
+    /// Gets the current global isolation level.
     #[inline(always)]
     pub fn get_global_isolation_level(&self) -> IsolationLevel {
-        Self::u8_to_isolation_level(self.global_isolation_level.load(Ordering::Acquire))
+        Self::u8_to_isolation(self.global_isolation_level.load(Ordering::Acquire))
     }
 
-    /// Gets the isolation level for a specific transaction
-    ///
-    /// Returns the transaction-specific level if set, otherwise the global level.
+    /// Sets the isolation level for a specific transaction.
+    pub fn set_transaction_isolation_level(&self, txn_id: i64, level: IsolationLevel) {
+        let mut map = self.isolation_overrides.lock();
+        let is_new = !map.contains_key(txn_id);
+        map.insert(txn_id, Self::isolation_to_u8(level));
+        if is_new {
+            self.override_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Removes the isolation level override for a transaction.
+    pub fn remove_transaction_isolation_level(&self, txn_id: i64) {
+        if self.isolation_overrides.lock().remove(txn_id).is_some() {
+            self.override_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Gets the isolation level for a specific transaction.
     #[inline(always)]
     pub fn get_isolation_level(&self, txn_id: i64) -> IsolationLevel {
-        // Check for transaction-specific level first
-        if let Some(&level) = self.transaction_isolation_levels.lock().get(txn_id) {
-            return Self::u8_to_isolation_level(level);
+        if self.override_count.load(Ordering::Relaxed) > 0 {
+            if let Some(&level) = self.isolation_overrides.lock().get(txn_id) {
+                return Self::u8_to_isolation(level);
+            }
         }
-
-        // Fall back to global level (atomic load)
         self.get_global_isolation_level()
     }
 
-    /// Begins a new transaction
-    ///
-    /// Returns `(txn_id, begin_sequence)` on success, or
-    /// `(INVALID_TRANSACTION_ID, 0)` if not accepting new transactions.
-    ///
-    /// # Concurrency
-    ///
-    /// This is a lock-free operation. New transactions do NOT wait for
-    /// committing transactions - visibility rules handle isolation correctly.
-    /// This enables high-throughput concurrent transaction starts.
+    /// Checks if snapshot isolation is needed for a transaction.
+    #[inline(always)]
+    fn needs_snapshot_isolation(&self, txn_id: i64) -> bool {
+        let global = self.global_isolation_level.load(Ordering::Relaxed);
+        if global == 1 {
+            return true;
+        }
+        if self.override_count.load(Ordering::Relaxed) > 0 {
+            if let Some(&level) = self.isolation_overrides.lock().get(txn_id) {
+                return level == 1;
+            }
+        }
+        false
+    }
+
+    /// Begins a new transaction.
     pub fn begin_transaction(&self) -> (i64, i64) {
-        // Check if we're accepting new transactions
         if !self.accepting.load(Ordering::Acquire) {
             return (INVALID_TRANSACTION_ID, 0);
         }
 
-        // Lock-free transaction start - no waiting for commits!
-        // Visibility rules ensure correct isolation:
-        // - Committing transactions are NOT visible to new transactions
-        // - Only fully committed transactions become visible
-
-        // Generate new transaction ID and sequence atomically
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::AcqRel) + 1;
         let begin_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
-        // Record the transaction as active
         self.transactions
             .lock()
             .insert(txn_id, TxnState::new_active(begin_seq));
@@ -295,228 +309,128 @@ impl TransactionRegistry {
         (txn_id, begin_seq)
     }
 
-    /// Starts the commit process (two-phase commit)
-    ///
-    /// Moves transaction from active to committing state.
-    /// Changes won't be visible to other transactions yet.
-    ///
-    /// # Concurrency
-    ///
-    /// Uses CowHashMap with Mutex for state updates.
-    /// Multiple transactions can start committing concurrently.
+    /// Starts the commit process (two-phase commit).
     #[inline]
     pub fn start_commit(&self, txn_id: i64) -> i64 {
-        // Get commit sequence atomically
         let commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
-        // Atomic state transition: Active -> Committing
-        let mut map = self.transactions.lock();
-        if let Some(entry) = map.get_mut(txn_id) {
-            entry.status = TxnStatus::Committing;
-            entry.commit_seq = commit_seq;
+        if let Some(entry) = self.transactions.lock().get_mut(txn_id) {
+            entry.set_committing(commit_seq);
         }
 
         commit_seq
     }
 
-    /// Completes the commit process (two-phase commit)
-    ///
-    /// Moves transaction from committing to committed state,
-    /// making all changes atomically visible.
-    ///
-    /// # Concurrency
-    ///
-    /// Uses CowHashMap with Mutex for state update.
+    /// Completes the commit process (two-phase commit).
     #[inline]
     pub fn complete_commit(&self, txn_id: i64) {
-        // Atomic state transition: Committing -> Committed
-        let mut map = self.transactions.lock();
-        if let Some(entry) = map.get_mut(txn_id) {
-            entry.status = TxnStatus::Committed;
+        let commit_seq = {
+            let mut txns = self.transactions.lock();
+            let seq = txns.get(txn_id).map(|e| e.commit_seq()).unwrap_or(0);
+            txns.remove(txn_id);
+            seq
+        };
+
+        // Store commit_seq for snapshot isolation if ANY transaction might need it
+        if self.global_isolation_level.load(Ordering::Relaxed) == 1
+            || self.override_count.load(Ordering::Relaxed) > 0
+        {
+            self.snapshot_seqs.lock().insert(txn_id, commit_seq);
         }
     }
 
-    /// Commits a transaction (for read-only transactions)
-    ///
-    /// This is a simplified commit path for transactions that made no changes.
-    /// Uses atomic update instead of remove+insert.
+    /// Commits a transaction (single-phase).
     pub fn commit_transaction(&self, txn_id: i64) -> i64 {
         let commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
-        // Atomic state transition: Active -> Committed
-        let mut map = self.transactions.lock();
-        if let Some(entry) = map.get_mut(txn_id) {
-            entry.status = TxnStatus::Committed;
-            entry.commit_seq = commit_seq;
+        self.transactions.lock().remove(txn_id);
+
+        // Store commit_seq for snapshot isolation if ANY transaction might need it
+        if self.global_isolation_level.load(Ordering::Relaxed) == 1
+            || self.override_count.load(Ordering::Relaxed) > 0
+        {
+            self.snapshot_seqs.lock().insert(txn_id, commit_seq);
         }
 
         commit_seq
     }
 
-    /// Recovers a committed transaction during startup recovery
-    pub fn recover_committed_transaction(&self, txn_id: i64, commit_seq: i64) {
-        // Insert directly as committed state
-        self.transactions.lock().insert(
-            txn_id,
-            TxnState {
-                status: TxnStatus::Committed,
-                begin_seq: commit_seq, // Use commit_seq as begin_seq for recovered txns
-                commit_seq,
-            },
-        );
-
-        // Update next_txn_id if necessary
-        loop {
-            let current = self.next_txn_id.load(Ordering::Acquire);
-            if txn_id >= current {
-                if self
-                    .next_txn_id
-                    .compare_exchange(current, txn_id + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        // CRITICAL: Update next_sequence if necessary
-        // During WAL recovery, commit_seq is the LSN value. We need to ensure
-        // next_sequence is updated so that current_commit_sequence() returns a value
-        // greater than all recovered commit sequences. Without this, recovered
-        // transactions would be incorrectly excluded from subsequent snapshots
-        // because is_committed_before(recovered_commit_seq, current_commit_seq) would
-        // return false when recovered_commit_seq > current_commit_seq.
-        loop {
-            let current = self.next_sequence.load(Ordering::Acquire);
-            if commit_seq >= current {
-                if self
-                    .next_sequence
-                    .compare_exchange(current, commit_seq + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Records an aborted transaction during recovery
-    pub fn recover_aborted_transaction(&self, txn_id: i64) {
-        // Update next_txn_id if necessary
-        loop {
-            let current = self.next_txn_id.load(Ordering::Acquire);
-            if txn_id >= current {
-                if self
-                    .next_txn_id
-                    .compare_exchange(current, txn_id + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Aborts a transaction
-    ///
-    /// # Concurrency
-    ///
-    /// Lock-free abort - just remove from unified map.
+    /// Aborts a transaction.
     #[inline]
     pub fn abort_transaction(&self, txn_id: i64) {
-        // Remove from unified map (handles any state: active or committing)
-        self.transactions.lock().remove(txn_id);
-    }
-
-    /// Gets the commit sequence for a transaction
-    pub fn get_commit_sequence(&self, txn_id: i64) -> Option<i64> {
-        let map = self.transactions.lock();
-        map.get(txn_id).and_then(|entry| {
-            if entry.status == TxnStatus::Committed {
-                Some(entry.commit_seq)
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Gets the begin sequence for an active transaction
-    pub fn get_transaction_begin_sequence(&self, txn_id: i64) -> i64 {
+        // Replace with aborted marker (don't remove - need to track for visibility)
         self.transactions
             .lock()
-            .get(txn_id)
-            .map(|entry| entry.begin_seq)
-            .unwrap_or(0)
+            .insert(txn_id, TxnState::new_aborted());
     }
 
-    /// Gets the current sequence number
-    pub fn get_current_sequence(&self) -> i64 {
-        self.next_sequence.load(Ordering::Acquire)
+    /// Recovers a committed transaction during startup recovery.
+    pub fn recover_committed_transaction(&self, txn_id: i64, commit_seq: i64) {
+        // Store in snapshot_seqs for visibility checks
+        self.snapshot_seqs.lock().insert(txn_id, commit_seq);
+
+        // Update next_txn_id if necessary (next_txn_id = last assigned)
+        loop {
+            let current = self.next_txn_id.load(Ordering::Acquire);
+            if txn_id > current {
+                if self
+                    .next_txn_id
+                    .compare_exchange(current, txn_id, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Update next_sequence if necessary (next_sequence = last assigned)
+        loop {
+            let current = self.next_sequence.load(Ordering::Acquire);
+            if commit_seq > current {
+                if self
+                    .next_sequence
+                    .compare_exchange(current, commit_seq, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
     }
 
-    /// Checks if a version is directly visible (for READ COMMITTED)
-    ///
-    /// This is an ultra-fast path with minimal checks.
-    /// Used when we know the viewer is using READ COMMITTED isolation.
-    ///
-    /// Uses thread-local cache to avoid repeated map lookups during scans.
-    /// For a 100K row scan with rows from ~10 transactions, this reduces
-    /// map lookups from 100K to ~10 (99.99% reduction).
-    #[inline(always)]
-    pub fn is_directly_visible(&self, version_txn_id: i64) -> bool {
-        // Special case for recovery transactions (rare path)
-        if version_txn_id == RECOVERY_TRANSACTION_ID {
-            return true;
-        }
-
-        // FAST PATH: Check thread-local cache first (~1-2ns)
-        let cached = COMMITTED_TXN_CACHE.with(|cache| cache.borrow().contains(version_txn_id));
-        if cached {
-            return true;
-        }
-
-        // SLOW PATH: Single CowHashMap lookup (~15-20ns)
-        // Release lock before updating cache to minimize lock hold time
-        let is_committed = self
-            .transactions
+    /// Records an aborted transaction during recovery.
+    pub fn recover_aborted_transaction(&self, txn_id: i64) {
+        self.transactions
             .lock()
-            .get(version_txn_id)
-            .map(|entry| entry.status == TxnStatus::Committed)
-            .unwrap_or(false);
+            .insert(txn_id, TxnState::new_aborted());
 
-        if is_committed {
-            // Cache for future lookups (lock already released)
-            COMMITTED_TXN_CACHE.with(|cache| cache.borrow_mut().insert(version_txn_id));
-            return true;
+        // Update next_txn_id if necessary (next_txn_id = last assigned)
+        loop {
+            let current = self.next_txn_id.load(Ordering::Acquire);
+            if txn_id > current {
+                if self
+                    .next_txn_id
+                    .compare_exchange(current, txn_id, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
-
-        // Active or Committing transactions are NOT visible
-        false
     }
 
-    /// Determines if a row version is visible to a transaction
+    /// Checks if a version is visible (main entry point).
     ///
-    /// # Performance
-    ///
-    /// This is the hot path for MVCC - called for every row during scans.
-    /// High-performance implementation using thread-local caching and CowHashMap.
-    /// Optimized for the common case (READ COMMITTED, committed versions).
-    ///
-    /// # Arguments
-    /// * `version_txn_id` - Transaction that created the version
-    /// * `viewer_txn_id` - Transaction trying to see the version
-    ///
-    /// # Returns
-    /// `true` if the version is visible to the viewer
+    /// Hot path - optimized with single lock acquisition.
     #[inline(always)]
     pub fn is_visible(&self, version_txn_id: i64, viewer_txn_id: i64) -> bool {
-        // FAST PATH 1: Own writes are always visible (most common for writes)
+        // FAST PATH 1: Own writes always visible
         if version_txn_id == viewer_txn_id {
             return true;
         }
@@ -526,255 +440,347 @@ impl TransactionRegistry {
             return true;
         }
 
-        // FAST PATH 3: READ COMMITTED with no per-txn override (common case)
-        // Check global level first (atomic load - ~1ns)
-        if self.global_isolation_level.load(Ordering::Relaxed) == 0 {
-            // Global is ReadCommitted
-            // Check if ANY overrides exist (atomic load - ~1ns)
-            // This avoids the isolation override lookup when none exist (99% of cases)
-            if self.isolation_override_count.load(Ordering::Relaxed) == 0 {
-                return self.is_directly_visible(version_txn_id);
-            }
-            // Some overrides exist - check if this txn has one (~15-20ns with lock)
-            let override_level = self
-                .transaction_isolation_levels
-                .lock()
-                .get(viewer_txn_id)
-                .copied();
-            match override_level {
-                None => {
-                    // No override for this txn - use global ReadCommitted
-                    return self.is_directly_visible(version_txn_id);
-                }
-                Some(0) => {
-                    // Override is also ReadCommitted
-                    return self.is_directly_visible(version_txn_id);
-                }
-                Some(_) => {
-                    // Has SnapshotIsolation override - fall through to slow path
-                }
-            }
-        }
+        // FAST PATH 3: Check isolation level
+        let needs_snapshot = self.needs_snapshot_isolation(viewer_txn_id);
 
-        // SLOW PATH: Snapshot Isolation or per-transaction override
-        self.is_visible_snapshot(version_txn_id, viewer_txn_id)
+        if needs_snapshot {
+            self.is_visible_snapshot(version_txn_id, viewer_txn_id)
+        } else {
+            self.check_committed(version_txn_id)
+        }
     }
 
-    /// Snapshot isolation visibility check (slower path)
-    #[inline(never)]
-    fn is_visible_snapshot(&self, version_txn_id: i64, viewer_txn_id: i64) -> bool {
-        // Check isolation level
-        if self.get_isolation_level(viewer_txn_id) == IsolationLevel::ReadCommitted {
-            return self.is_directly_visible(version_txn_id);
+    /// Checks if a transaction is committed (READ COMMITTED visibility).
+    ///
+    /// Single lock acquisition for the hot path.
+    #[inline(always)]
+    fn check_committed(&self, txn_id: i64) -> bool {
+        // Cache check first (no lock)
+        if COMMITTED_CACHE.with(|c| c.borrow().contains(txn_id)) {
+            return true;
         }
 
-        let map = self.transactions.lock();
-
-        // Single lookup for version transaction state
-        let version_state = match map.get(version_txn_id) {
-            Some(entry) => *entry,
-            None => return false,
-        };
-
-        // Must be committed (not active or committing)
-        if version_state.status != TxnStatus::Committed {
+        // SINGLE lock acquisition - check if in transactions map
+        // If in map = Active, Committing, or Aborted = not committed
+        if self.transactions.lock().contains_key(txn_id) {
             return false;
         }
 
-        // For Snapshot Isolation, version must be committed before viewer began
-        let viewer_begin_seq = match map.get(viewer_txn_id) {
-            Some(entry) => entry.begin_seq,
-            None => return false,
-        };
-
-        version_state.commit_seq <= viewer_begin_seq
-    }
-
-    /// Cleans up old committed transactions
-    ///
-    /// In READ COMMITTED mode, we cannot clean up committed transactions
-    /// because visibility depends on their presence in the committed map.
-    ///
-    /// Returns the number of transactions removed.
-    pub fn cleanup_old_transactions(&self, max_age: Duration) -> i32 {
-        let isolation_level = self.get_global_isolation_level();
-
-        // In READ COMMITTED, we cannot clean up
-        if isolation_level == IsolationLevel::ReadCommitted {
-            return 0;
+        // Not in map - committed if valid txn_id
+        let next = self.next_txn_id.load(Ordering::Acquire);
+        if txn_id > 0 && txn_id <= next {
+            COMMITTED_CACHE.with(|c| c.borrow_mut().insert(txn_id));
+            return true;
         }
 
-        let cutoff_time = Instant::now()
-            .checked_sub(max_age)
-            .map(|_| self.next_sequence.load(Ordering::Acquire) - (max_age.as_nanos() as i64))
-            .unwrap_or(0);
+        false
+    }
 
-        // Take O(1) snapshot for lock-free iteration
-        let snapshot = self.transactions.lock().clone();
+    /// Checks if a version is directly visible (for READ COMMITTED).
+    #[inline(always)]
+    pub fn is_directly_visible(&self, version_txn_id: i64) -> bool {
+        if version_txn_id == RECOVERY_TRANSACTION_ID {
+            return true;
+        }
+        self.check_committed(version_txn_id)
+    }
 
-        // Collect transactions to remove (committed with old commit_seq)
-        let txns_to_remove: Vec<i64> = snapshot
-            .iter()
-            .filter(|(txn_id, state)| {
-                // Never clean up negative transaction IDs
-                if *txn_id < 0 {
-                    return false;
+    /// Snapshot isolation visibility check.
+    ///
+    /// Single lock acquisition for transactions map.
+    #[cold]
+    #[inline(never)]
+    fn is_visible_snapshot(&self, version_txn_id: i64, viewer_txn_id: i64) -> bool {
+        // Get both version and viewer state in SINGLE lock acquisition
+        let (version_state, viewer_begin_seq) = {
+            let txns = self.transactions.lock();
+
+            // Get viewer's begin_seq (must be active to be viewing)
+            let viewer_begin_seq = match txns.get(viewer_txn_id) {
+                Some(state) if state.is_active_or_committing() => state.begin_seq(),
+                _ => {
+                    // Viewer not active - this is unusual but handle gracefully
+                    // Try to get from snapshot_seqs as fallback
+                    drop(txns);
+                    // For a committed viewer, use current sequence as begin_seq
+                    // (they can see everything committed before they finished)
+                    return self.check_committed(version_txn_id);
                 }
+            };
 
-                // Only cleanup committed transactions
-                if state.status != TxnStatus::Committed {
-                    return false;
+            // Get version's state
+            let version_state = txns.get(version_txn_id).copied();
+
+            (version_state, viewer_begin_seq)
+        };
+
+        // Check version state
+        match version_state {
+            Some(state) => {
+                if state.is_aborted() {
+                    return false; // Aborted = never visible
                 }
-
-                // Only remove old transactions
-                state.commit_seq < cutoff_time
-            })
-            .map(|(txn_id, _)| txn_id)
-            .collect();
-
-        // Remove collected transactions
-        let mut removed = 0;
-        if !txns_to_remove.is_empty() {
-            let mut map = self.transactions.lock();
-            for txn_id in txns_to_remove {
-                map.remove(txn_id);
-                removed += 1;
+                // Active or Committing = not visible to others
+                false
             }
+            None => {
+                // Not in transactions map - either committed or invalid
+                let next = self.next_txn_id.load(Ordering::Acquire);
+                if version_txn_id <= 0 || version_txn_id > next {
+                    return false; // Invalid txn_id
+                }
+
+                // Committed - check commit_seq against viewer's begin_seq
+                if let Some(&commit_seq) = self.snapshot_seqs.lock().get(version_txn_id) {
+                    return commit_seq <= viewer_begin_seq;
+                }
+
+                // Not in snapshot_seqs = old committed (GC'd)
+                // GC only removes when commit_seq < min_active_begin_seq
+                // Since viewer is active, viewer_begin_seq >= min_active_begin_seq
+                // So if GC'd, commit_seq < min_active_begin_seq <= viewer_begin_seq
+                // Therefore visible
+                true
+            }
+        }
+    }
+
+    /// Gets the commit sequence for a transaction.
+    pub fn get_commit_sequence(&self, txn_id: i64) -> Option<i64> {
+        // Check snapshot_seqs first
+        if let Some(&seq) = self.snapshot_seqs.lock().get(txn_id) {
+            return Some(seq);
+        }
+
+        // Check if still active/aborted
+        if let Some(state) = self.transactions.lock().get(txn_id) {
+            if state.is_aborted() || state.is_active_or_committing() {
+                return None;
+            }
+        }
+
+        // Valid committed transaction (GC'd from snapshot_seqs)
+        let next = self.next_txn_id.load(Ordering::Acquire);
+        if txn_id > 0 && txn_id <= next {
+            return Some(0); // Committed but commit_seq unknown
+        }
+
+        None
+    }
+
+    /// Gets the begin sequence for an active transaction.
+    pub fn get_transaction_begin_sequence(&self, txn_id: i64) -> i64 {
+        self.transactions
+            .lock()
+            .get(txn_id)
+            .map(|e| e.begin_seq())
+            .unwrap_or(0)
+    }
+
+    /// Gets the current sequence number.
+    pub fn get_current_sequence(&self) -> i64 {
+        self.next_sequence.load(Ordering::Acquire)
+    }
+
+    /// Gets the current commit sequence number.
+    pub fn current_commit_sequence(&self) -> i64 {
+        self.next_sequence.load(Ordering::Acquire)
+    }
+
+    /// Runs garbage collection.
+    ///
+    /// Removes:
+    /// - Old aborted entries (txn_id < min_active_txn_id - buffer)
+    /// - Old snapshot_seqs entries (commit_seq < min_active_begin_seq)
+    pub fn run_gc(&self) -> usize {
+        // Get min values from active transactions
+        let (min_begin_seq, min_txn_id) = {
+            let txns = self.transactions.lock();
+            let mut min_begin = i64::MAX;
+            let mut min_id = i64::MAX;
+
+            for (id, state) in txns.iter() {
+                if state.is_active_or_committing() {
+                    min_begin = min_begin.min(state.begin_seq());
+                    min_id = min_id.min(id);
+                }
+            }
+
+            if min_id == i64::MAX {
+                min_id = self.next_txn_id.load(Ordering::Acquire);
+            }
+
+            (min_begin, min_id)
+        };
+
+        let mut removed = 0;
+
+        // GC snapshot_seqs: remove old commit sequences
+        {
+            let mut seqs = self.snapshot_seqs.lock();
+            let to_remove: Vec<i64> = seqs
+                .iter()
+                .filter(|(_, &commit_seq)| commit_seq < min_begin_seq)
+                .map(|(txn_id, _)| txn_id)
+                .collect();
+            for txn_id in &to_remove {
+                seqs.remove(*txn_id);
+            }
+            removed += to_remove.len();
+        }
+
+        // GC aborted: remove old aborted entries
+        // Conservative buffer to handle in-flight queries
+        let aborted_cutoff = min_txn_id.saturating_sub(10000);
+        if aborted_cutoff > 0 {
+            let mut txns = self.transactions.lock();
+            let to_remove: Vec<i64> = txns
+                .iter()
+                .filter(|(id, state)| state.is_aborted() && *id < aborted_cutoff)
+                .map(|(id, _)| id)
+                .collect();
+            for id in &to_remove {
+                txns.remove(*id);
+            }
+            removed += to_remove.len();
+        }
+
+        // GC isolation overrides for completed transactions
+        {
+            let txns = self.transactions.lock();
+            let mut overrides = self.isolation_overrides.lock();
+            let to_remove: Vec<i64> = overrides
+                .keys()
+                .filter(|&txn_id| !txns.contains_key(txn_id))
+                .collect();
+            for txn_id in &to_remove {
+                overrides.remove(*txn_id);
+            }
+            let removed_overrides = to_remove.len();
+            if removed_overrides > 0 {
+                self.override_count
+                    .fetch_sub(removed_overrides, Ordering::Relaxed);
+            }
+            removed += removed_overrides;
         }
 
         removed
     }
 
-    /// Waits for active transactions to complete with timeout
-    ///
-    /// Returns the number of transactions still active after timeout.
-    pub fn wait_for_active_transactions(&self, timeout: Duration) -> i32 {
-        let deadline = Instant::now() + timeout;
+    /// Cleans up old transactions (legacy API).
+    pub fn cleanup_old_transactions(&self, _max_age: std::time::Duration) -> i32 {
+        self.run_gc() as i32
+    }
+
+    /// Waits for active transactions to complete with timeout.
+    pub fn wait_for_active_transactions(&self, timeout: std::time::Duration) -> i32 {
+        let deadline = std::time::Instant::now() + timeout;
 
         loop {
-            if Instant::now() > deadline {
+            if std::time::Instant::now() > deadline {
                 break;
             }
 
-            let active_count = self.active_count();
-            if active_count == 0 {
+            let count = self.active_count();
+            if count == 0 {
                 return 0;
             }
 
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         self.active_count() as i32
     }
 
-    /// Stops accepting new transactions
+    /// Stops accepting new transactions.
     pub fn stop_accepting_transactions(&self) {
         self.accepting.store(false, Ordering::Release);
     }
 
-    /// Starts accepting new transactions
+    /// Starts accepting new transactions.
     pub fn start_accepting_transactions(&self) {
         self.accepting.store(true, Ordering::Release);
     }
 
-    /// Shuts down the registry (alias for stop_accepting_transactions)
+    /// Shuts down the registry.
     pub fn shutdown(&self) {
         self.stop_accepting_transactions();
     }
 
-    /// Checks if the registry is accepting new transactions
+    /// Checks if the registry is accepting new transactions.
     pub fn is_accepting(&self) -> bool {
         self.accepting.load(Ordering::Acquire)
     }
 
-    /// Gets the count of active transactions
+    /// Gets the count of active transactions.
     pub fn active_count(&self) -> usize {
-        // O(1) snapshot for lock-free iteration
-        let snapshot = self.transactions.lock().clone();
-        snapshot
-            .iter()
-            .filter(|(_, state)| state.status == TxnStatus::Active)
+        self.transactions
+            .lock()
+            .values()
+            .filter(|s| s.status() == TxnStatus::Active)
             .count()
     }
 
-    /// Gets the count of committed transactions
+    /// Gets the count of entries in snapshot_seqs.
     pub fn committed_count(&self) -> usize {
-        // O(1) snapshot for lock-free iteration
-        let snapshot = self.transactions.lock().clone();
-        snapshot
-            .iter()
-            .filter(|(_, state)| state.status == TxnStatus::Committed)
-            .count()
+        self.snapshot_seqs.lock().len()
     }
 
-    /// Checks if a transaction is active
+    /// Checks if a transaction is active.
     pub fn is_active(&self, txn_id: i64) -> bool {
         self.transactions
             .lock()
             .get(txn_id)
-            .map(|entry| entry.status == TxnStatus::Active)
+            .map(|e| e.status() == TxnStatus::Active)
             .unwrap_or(false)
     }
 
-    /// Checks if a transaction is committed
+    /// Checks if a transaction is committed.
     pub fn is_committed(&self, txn_id: i64) -> bool {
-        self.transactions
-            .lock()
-            .get(txn_id)
-            .map(|entry| entry.status == TxnStatus::Committed)
-            .unwrap_or(false)
+        // Check if in transactions map
+        if self.transactions.lock().contains_key(txn_id) {
+            // If aborted or active/committing, not committed
+            return false;
+        }
+
+        // Not in map - committed if valid ID
+        let next = self.next_txn_id.load(Ordering::Acquire);
+        txn_id > 0 && txn_id <= next
     }
 
-    /// Checks if a transaction is in committing state (for testing)
+    /// Checks if a transaction is in committing state.
     #[cfg(test)]
     pub fn is_committing(&self, txn_id: i64) -> bool {
         self.transactions
             .lock()
             .get(txn_id)
-            .map(|entry| entry.status == TxnStatus::Committing)
+            .map(|e| e.status() == TxnStatus::Committing)
             .unwrap_or(false)
     }
 
-    /// Get the current commit sequence number
-    ///
-    /// This returns the sequence number that will be assigned to the NEXT commit.
-    /// Any transaction with commit_seq < this value is guaranteed to be committed.
-    /// Used for creating consistent snapshots - only include transactions with
-    /// commit_seq < snapshot_commit_seq.
-    pub fn current_commit_sequence(&self) -> i64 {
-        self.next_sequence.load(Ordering::Acquire)
-    }
-
-    /// Check if a transaction was committed before a given commit sequence
-    ///
-    /// Returns true if the transaction is committed AND its commit sequence
-    /// is less than the cutoff. This is used for consistent snapshot iteration.
-    ///
-    /// IMPORTANT: This should only be called for transactions already confirmed
-    /// as committed via `is_visible`. If a committed transaction is not in the
-    /// `transactions` map, it means it's an old transaction that was
-    /// cleaned up, so it definitely committed before the cutoff.
+    /// Checks if a transaction was committed before a given sequence.
     pub fn is_committed_before(&self, txn_id: i64, cutoff_commit_seq: i64) -> bool {
-        // Special case: snapshot versions (txn_id = -1) are always "old" commits
+        // Special case: negative IDs are always "old"
         if txn_id < 0 {
             return true;
         }
 
-        let map = self.transactions.lock();
-        if let Some(entry) = map.get(txn_id) {
-            if entry.status == TxnStatus::Committed {
-                // Use <= because current_commit_sequence() returns next_sequence which equals
-                // the commit_seq of the most recently committed transaction. Without <=, the
-                // last committed transaction before the cutoff would be incorrectly excluded.
-                return entry.commit_seq <= cutoff_commit_seq;
-            }
+        // Check if still in transactions map
+        if self.transactions.lock().contains_key(txn_id) {
+            // If aborted or still active/committing, not committed
             return false;
         }
 
-        // If a transaction is committed (caller verified via is_visible) but
-        // not in the map, it's an old transaction that was cleaned up.
-        // Old transactions definitely committed before our cutoff.
-        true
+        // Check snapshot_seqs for exact commit_seq
+        if let Some(&commit_seq) = self.snapshot_seqs.lock().get(txn_id) {
+            return commit_seq <= cutoff_commit_seq;
+        }
+
+        // Not in snapshot_seqs = old committed (GC'd)
+        // GC'd means commit_seq was < min_active_begin_seq
+        // Therefore definitely < cutoff_commit_seq
+        let next = self.next_txn_id.load(Ordering::Acquire);
+        txn_id > 0 && txn_id <= next
     }
 }
 
@@ -784,9 +790,6 @@ impl Default for TransactionRegistry {
     }
 }
 
-/// Implementation of VisibilityChecker for TransactionRegistry
-///
-/// This allows the version store to check visibility through the registry.
 impl VisibilityChecker for TransactionRegistry {
     fn is_visible(&self, version_txn_id: i64, viewing_txn_id: i64) -> bool {
         TransactionRegistry::is_visible(self, version_txn_id, viewing_txn_id)
@@ -797,12 +800,11 @@ impl VisibilityChecker for TransactionRegistry {
     }
 
     fn get_active_transaction_ids(&self) -> Vec<i64> {
-        // O(1) snapshot for lock-free iteration
-        let snapshot = self.transactions.lock().clone();
-        snapshot
+        self.transactions
+            .lock()
             .iter()
-            .filter(|(_, state)| state.status == TxnStatus::Active)
-            .map(|(txn_id, _)| txn_id)
+            .filter(|(_, s)| s.status() == TxnStatus::Active)
+            .map(|(id, _)| id)
             .collect()
     }
 
@@ -847,13 +849,11 @@ mod tests {
 
         let (txn_id, _) = registry.begin_transaction();
 
-        // Start commit
         let commit_seq = registry.start_commit(txn_id);
         assert!(commit_seq > 0);
         assert!(!registry.is_active(txn_id));
         assert!(registry.is_committing(txn_id));
 
-        // Complete commit
         registry.complete_commit(txn_id);
         assert!(!registry.is_committing(txn_id));
         assert!(registry.is_committed(txn_id));
@@ -869,6 +869,10 @@ mod tests {
         registry.abort_transaction(txn_id);
         assert!(!registry.is_active(txn_id));
         assert!(!registry.is_committed(txn_id));
+
+        // Verify aborted status
+        let state = registry.transactions.lock().get(txn_id).copied();
+        assert!(state.map(|s| s.is_aborted()).unwrap_or(false));
     }
 
     #[test]
@@ -876,8 +880,6 @@ mod tests {
         let registry = TransactionRegistry::new();
 
         let (txn_id, _) = registry.begin_transaction();
-
-        // Own writes are always visible
         assert!(registry.is_visible(txn_id, txn_id));
     }
 
@@ -886,8 +888,6 @@ mod tests {
         let registry = TransactionRegistry::new();
 
         let (viewer_id, _) = registry.begin_transaction();
-
-        // Recovery transactions are always visible
         assert!(registry.is_visible(RECOVERY_TRANSACTION_ID, viewer_id));
     }
 
@@ -946,20 +946,17 @@ mod tests {
 
         let (txn_id, _) = registry.begin_transaction();
 
-        // Default is global level
         assert_eq!(
             registry.get_isolation_level(txn_id),
             IsolationLevel::ReadCommitted
         );
 
-        // Override for specific transaction
         registry.set_transaction_isolation_level(txn_id, IsolationLevel::SnapshotIsolation);
         assert_eq!(
             registry.get_isolation_level(txn_id),
             IsolationLevel::SnapshotIsolation
         );
 
-        // Remove override
         registry.remove_transaction_isolation_level(txn_id);
         assert_eq!(
             registry.get_isolation_level(txn_id),
@@ -970,6 +967,7 @@ mod tests {
     #[test]
     fn test_get_commit_sequence() {
         let registry = TransactionRegistry::new();
+        registry.set_global_isolation_level(IsolationLevel::SnapshotIsolation);
 
         let (txn_id, _) = registry.begin_transaction();
         assert!(registry.get_commit_sequence(txn_id).is_none());
@@ -982,14 +980,77 @@ mod tests {
     fn test_recover_committed_transaction() {
         let registry = TransactionRegistry::new();
 
-        // Recover a transaction with high ID
         registry.recover_committed_transaction(1000, 500);
 
         assert!(registry.is_committed(1000));
         assert_eq!(registry.get_commit_sequence(1000), Some(500));
 
-        // Next transaction should have higher ID
         let (new_id, _) = registry.begin_transaction();
         assert!(new_id > 1000);
+    }
+
+    #[test]
+    fn test_gc() {
+        let registry = TransactionRegistry::new();
+        registry.set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+
+        for _ in 0..10 {
+            let (txn_id, _) = registry.begin_transaction();
+            registry.commit_transaction(txn_id);
+        }
+
+        assert_eq!(registry.snapshot_seqs.lock().len(), 10);
+
+        let (active_txn, _) = registry.begin_transaction();
+
+        for _ in 0..5 {
+            let (txn_id, _) = registry.begin_transaction();
+            registry.commit_transaction(txn_id);
+        }
+
+        let removed = registry.run_gc();
+        assert!(removed > 0);
+
+        registry.commit_transaction(active_txn);
+    }
+
+    #[test]
+    fn test_aborted_not_visible() {
+        let registry = TransactionRegistry::new();
+
+        let (txn1, _) = registry.begin_transaction();
+        let (txn2, _) = registry.begin_transaction();
+
+        registry.abort_transaction(txn1);
+
+        assert!(!registry.is_visible(txn1, txn2));
+        assert!(!registry.is_committed(txn1));
+    }
+
+    #[test]
+    fn test_per_transaction_snapshot_isolation() {
+        let registry = TransactionRegistry::new();
+        // Global is READ COMMITTED
+        registry.set_global_isolation_level(IsolationLevel::ReadCommitted);
+
+        let (txn1, _) = registry.begin_transaction();
+        registry.commit_transaction(txn1);
+
+        // txn2 uses SNAPSHOT ISOLATION override
+        let (txn2, _) = registry.begin_transaction();
+        registry.set_transaction_isolation_level(txn2, IsolationLevel::SnapshotIsolation);
+
+        // txn1 committed before txn2 began - visible
+        assert!(registry.is_visible(txn1, txn2));
+
+        let (txn3, _) = registry.begin_transaction();
+        registry.commit_transaction(txn3);
+
+        // txn3 committed after txn2 began - NOT visible (snapshot isolation)
+        assert!(!registry.is_visible(txn3, txn2));
+
+        // But txn4 (READ COMMITTED) should see txn3
+        let (txn4, _) = registry.begin_transaction();
+        assert!(registry.is_visible(txn3, txn4));
     }
 }
