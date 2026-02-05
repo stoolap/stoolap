@@ -505,6 +505,37 @@ impl<V> I64Map<V> {
         })
     }
 
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, remove all entries `(k, v)` where `f(k, &mut v)` returns `false`.
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(i64, &mut V) -> bool,
+    {
+        // Collect keys to remove (can't remove while iterating due to backward-shift)
+        let keys_to_remove: Vec<i64> = self
+            .slots
+            .iter_mut()
+            .filter_map(|slot| {
+                if slot.key != EMPTY {
+                    // SAFETY: slot.key != EMPTY means the value is initialized.
+                    let value = unsafe { slot.value.assume_init_mut() };
+                    if f(slot.key, value) {
+                        None // Keep this entry
+                    } else {
+                        Some(slot.key) // Mark for removal
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for key in keys_to_remove {
+            self.remove(key);
+        }
+    }
+
     /// Drains all entries from the map, returning an iterator over them
     #[inline]
     pub fn drain(&mut self) -> Drain<V> {

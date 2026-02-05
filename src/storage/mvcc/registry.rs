@@ -136,6 +136,10 @@ impl TxnState {
 /// Thread-local cache size (512KB per thread).
 const CACHE_SIZE: usize = 65536;
 
+/// Cache index shift for XOR mixing (log2 of CACHE_SIZE).
+/// XOR mixing prevents 0% hit rate when txn_ids are strided by CACHE_SIZE.
+const CACHE_SHIFT: u32 = CACHE_SIZE.trailing_zeros();
+
 thread_local! {
     static COMMITTED_CACHE: RefCell<CommittedCache> = const { RefCell::new(CommittedCache::new()) };
 }
@@ -153,15 +157,22 @@ impl CommittedCache {
         }
     }
 
+    /// Compute cache index with XOR mixing to avoid collisions on strided IDs.
+    #[inline(always)]
+    fn cache_index(txn_id: i64) -> usize {
+        let x = txn_id as u64;
+        ((x ^ (x >> CACHE_SHIFT)) as usize) & (CACHE_SIZE - 1)
+    }
+
     #[inline(always)]
     fn contains(&self, txn_id: i64) -> bool {
-        let idx = (txn_id as usize) & (CACHE_SIZE - 1);
+        let idx = Self::cache_index(txn_id);
         self.entries[idx] == txn_id
     }
 
     #[inline(always)]
     fn insert(&mut self, txn_id: i64) {
-        let idx = (txn_id as usize) & (CACHE_SIZE - 1);
+        let idx = Self::cache_index(txn_id);
         self.entries[idx] = txn_id;
     }
 }
@@ -198,6 +209,9 @@ pub struct TransactionRegistry {
     /// Count of active isolation overrides (skip lookup when 0).
     override_count: AtomicUsize,
 
+    /// Count of active transactions (O(1) lookup).
+    active_txn_count: AtomicUsize,
+
     /// Whether new transactions are being accepted.
     accepting: AtomicBool,
 }
@@ -218,6 +232,7 @@ impl TransactionRegistry {
             global_isolation_level: AtomicU8::new(0),
             isolation_overrides: Mutex::new(I64Map::new()),
             override_count: AtomicUsize::new(0),
+            active_txn_count: AtomicUsize::new(0),
             accepting: AtomicBool::new(true),
         }
     }
@@ -305,6 +320,7 @@ impl TransactionRegistry {
         self.transactions
             .lock()
             .insert(txn_id, TxnState::new_active(begin_seq));
+        self.active_txn_count.fetch_add(1, Ordering::Relaxed);
 
         (txn_id, begin_seq)
     }
@@ -324,33 +340,42 @@ impl TransactionRegistry {
     /// Completes the commit process (two-phase commit).
     #[inline]
     pub fn complete_commit(&self, txn_id: i64) {
-        let commit_seq = {
+        {
             let mut txns = self.transactions.lock();
             let seq = txns.get(txn_id).map(|e| e.commit_seq()).unwrap_or(0);
-            txns.remove(txn_id);
-            seq
-        };
 
-        // Store commit_seq for snapshot isolation if ANY transaction might need it
-        if self.global_isolation_level.load(Ordering::Relaxed) == 1
-            || self.override_count.load(Ordering::Relaxed) > 0
-        {
-            self.snapshot_seqs.lock().insert(txn_id, commit_seq);
-        }
+            // Store commit_seq for snapshot isolation while holding transactions lock
+            // This prevents a race where the transaction is removed from txns but not yet
+            // in snapshot_seqs, which could cause concurrent readers to incorrectly
+            // treat it as an "old committed" transaction (visible).
+            if self.global_isolation_level.load(Ordering::Relaxed) == 1
+                || self.override_count.load(Ordering::Relaxed) > 0
+            {
+                self.snapshot_seqs.lock().insert(txn_id, seq);
+            }
+
+            txns.remove(txn_id);
+        };
+        self.active_txn_count.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Commits a transaction (single-phase).
     pub fn commit_transaction(&self, txn_id: i64) -> i64 {
         let commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
-        self.transactions.lock().remove(txn_id);
-
-        // Store commit_seq for snapshot isolation if ANY transaction might need it
-        if self.global_isolation_level.load(Ordering::Relaxed) == 1
-            || self.override_count.load(Ordering::Relaxed) > 0
         {
-            self.snapshot_seqs.lock().insert(txn_id, commit_seq);
+            let mut txns = self.transactions.lock();
+
+            // Store commit_seq for snapshot isolation while holding transactions lock
+            if self.global_isolation_level.load(Ordering::Relaxed) == 1
+                || self.override_count.load(Ordering::Relaxed) > 0
+            {
+                self.snapshot_seqs.lock().insert(txn_id, commit_seq);
+            }
+
+            txns.remove(txn_id);
         }
+        self.active_txn_count.fetch_sub(1, Ordering::Relaxed);
 
         commit_seq
     }
@@ -359,9 +384,25 @@ impl TransactionRegistry {
     #[inline]
     pub fn abort_transaction(&self, txn_id: i64) {
         // Replace with aborted marker (don't remove - need to track for visibility)
-        self.transactions
-            .lock()
-            .insert(txn_id, TxnState::new_aborted());
+        // Only decrement counter if transaction was actually active/committing
+        //
+        // CRITICAL: We must check if the transaction exists before inserting the aborted marker.
+        // If it's not in the map, it's already committed (or invalid), and we must NOT
+        // resurrect it as an aborted transaction.
+        let should_decrement = {
+            let mut txns = self.transactions.lock();
+            if let Some(state) = txns.get_mut(txn_id) {
+                let was_active = state.is_active_or_committing();
+                *state = TxnState::new_aborted();
+                was_active
+            } else {
+                false
+            }
+        };
+
+        if should_decrement {
+            self.active_txn_count.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Recovers a committed transaction during startup recovery.
@@ -487,11 +528,11 @@ impl TransactionRegistry {
 
     /// Snapshot isolation visibility check.
     ///
-    /// Single lock acquisition for transactions map.
+    /// Avoids nested locking by releasing transactions lock before acquiring snapshot_seqs.
     #[cold]
     #[inline(never)]
     fn is_visible_snapshot(&self, version_txn_id: i64, viewer_txn_id: i64) -> bool {
-        // Get both version and viewer state in SINGLE lock acquisition
+        // First lock: get transaction states
         let (version_state, viewer_begin_seq) = {
             let txns = self.transactions.lock();
 
@@ -500,7 +541,6 @@ impl TransactionRegistry {
                 Some(state) if state.is_active_or_committing() => state.begin_seq(),
                 _ => {
                     // Viewer not active - this is unusual but handle gracefully
-                    // Try to get from snapshot_seqs as fallback
                     drop(txns);
                     // For a committed viewer, use current sequence as begin_seq
                     // (they can see everything committed before they finished)
@@ -513,6 +553,7 @@ impl TransactionRegistry {
 
             (version_state, viewer_begin_seq)
         };
+        // transactions lock released here
 
         // Check version state
         match version_state {
@@ -530,8 +571,11 @@ impl TransactionRegistry {
                     return false; // Invalid txn_id
                 }
 
+                // Second lock: get commit_seq (only if needed)
+                let commit_seq = self.snapshot_seqs.lock().get(version_txn_id).copied();
+
                 // Committed - check commit_seq against viewer's begin_seq
-                if let Some(&commit_seq) = self.snapshot_seqs.lock().get(version_txn_id) {
+                if let Some(commit_seq) = commit_seq {
                     return commit_seq <= viewer_begin_seq;
                 }
 
@@ -592,10 +636,24 @@ impl TransactionRegistry {
     /// Removes:
     /// - Old aborted entries (txn_id < min_active_txn_id - buffer)
     /// - Old snapshot_seqs entries (commit_seq < min_active_begin_seq)
+    /// - Isolation overrides for completed transactions
     pub fn run_gc(&self) -> usize {
-        // Get min values from active transactions
-        let (min_begin_seq, min_txn_id) = {
-            let txns = self.transactions.lock();
+        let mut removed = 0;
+
+        // Step 1: Collect override keys FIRST if any exist (O(Overrides))
+        // This avoids building O(ActiveTxns) set just to filter O(Overrides) entries
+        let override_keys: Vec<i64> = if self.override_count.load(Ordering::Relaxed) > 0 {
+            self.isolation_overrides.lock().keys().collect()
+        } else {
+            Vec::new()
+        };
+
+        // Step 2: Single lock on transactions to:
+        // - Calculate min values
+        // - Remove old aborted entries
+        // - Check which override keys are no longer active
+        let (min_begin_seq, invalid_overrides) = {
+            let mut txns = self.transactions.lock();
             let mut min_begin = i64::MAX;
             let mut min_id = i64::MAX;
 
@@ -610,58 +668,49 @@ impl TransactionRegistry {
                 min_id = self.next_txn_id.load(Ordering::Acquire);
             }
 
-            (min_begin, min_id)
+            // GC aborted entries while holding lock
+            let aborted_cutoff = min_id.saturating_sub(10000);
+            if aborted_cutoff > 0 {
+                let len_before = txns.len();
+                txns.retain(|id, state| !state.is_aborted() || id >= aborted_cutoff);
+                removed += len_before - txns.len();
+            }
+
+            // Check which override keys are no longer active (O(Overrides) lookups)
+            let invalid: Vec<i64> = override_keys
+                .iter()
+                .filter(|&&txn_id| {
+                    // Invalid if not in transactions map (committed/unknown)
+                    // or if aborted
+                    match txns.get(txn_id) {
+                        None => true, // Not active = committed or never existed
+                        Some(state) => state.is_aborted(),
+                    }
+                })
+                .copied()
+                .collect();
+
+            (min_begin, invalid)
         };
 
-        let mut removed = 0;
-
-        // GC snapshot_seqs: remove old commit sequences
+        // Step 3: GC snapshot_seqs
         {
             let mut seqs = self.snapshot_seqs.lock();
-            let to_remove: Vec<i64> = seqs
-                .iter()
-                .filter(|(_, &commit_seq)| commit_seq < min_begin_seq)
-                .map(|(txn_id, _)| txn_id)
-                .collect();
-            for txn_id in &to_remove {
-                seqs.remove(*txn_id);
-            }
-            removed += to_remove.len();
+            let len_before = seqs.len();
+            seqs.retain(|_, &mut commit_seq| commit_seq >= min_begin_seq);
+            removed += len_before - seqs.len();
         }
 
-        // GC aborted: remove old aborted entries
-        // Conservative buffer to handle in-flight queries
-        let aborted_cutoff = min_txn_id.saturating_sub(10000);
-        if aborted_cutoff > 0 {
-            let mut txns = self.transactions.lock();
-            let to_remove: Vec<i64> = txns
-                .iter()
-                .filter(|(id, state)| state.is_aborted() && *id < aborted_cutoff)
-                .map(|(id, _)| id)
-                .collect();
-            for id in &to_remove {
-                txns.remove(*id);
-            }
-            removed += to_remove.len();
-        }
-
-        // GC isolation overrides for completed transactions
-        {
-            let txns = self.transactions.lock();
+        // Step 4: Remove invalid isolation overrides (O(InvalidOverrides))
+        if !invalid_overrides.is_empty() {
             let mut overrides = self.isolation_overrides.lock();
-            let to_remove: Vec<i64> = overrides
-                .keys()
-                .filter(|&txn_id| !txns.contains_key(txn_id))
-                .collect();
-            for txn_id in &to_remove {
-                overrides.remove(*txn_id);
+            for txn_id in &invalid_overrides {
+                if overrides.remove(*txn_id).is_some() {
+                    removed += 1;
+                }
             }
-            let removed_overrides = to_remove.len();
-            if removed_overrides > 0 {
-                self.override_count
-                    .fetch_sub(removed_overrides, Ordering::Relaxed);
-            }
-            removed += removed_overrides;
+            self.override_count
+                .fetch_sub(invalid_overrides.len(), Ordering::Relaxed);
         }
 
         removed
@@ -713,12 +762,9 @@ impl TransactionRegistry {
     }
 
     /// Gets the count of active transactions.
+    #[inline]
     pub fn active_count(&self) -> usize {
-        self.transactions
-            .lock()
-            .values()
-            .filter(|s| s.status() == TxnStatus::Active)
-            .count()
+        self.active_txn_count.load(Ordering::Relaxed)
     }
 
     /// Gets the count of entries in snapshot_seqs.
