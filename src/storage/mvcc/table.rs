@@ -288,7 +288,7 @@ impl MVCCTable {
     #[allow(clippy::only_used_in_recursion)]
     fn try_index_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<RowIdVec> {
         use crate::core::Operator;
-        use crate::storage::mvcc::{intersect_sorted_ids, union_sorted_ids};
+        use crate::storage::mvcc::intersect_sorted_ids;
 
         // First, try simple comparison on a single column
         if let Some((col_name, operator, value)) = expr.get_comparison_info() {
@@ -316,7 +316,6 @@ impl MVCCTable {
 
             for operand in or_operands {
                 // Recursively try index lookup for each OR operand
-                // Row IDs are already sorted by index (sorted insertion)
                 if let Some(row_ids) = self.try_index_lookup(operand.as_ref(), schema) {
                     indexed_row_ids.push(row_ids);
                 } else {
@@ -338,11 +337,60 @@ impl MVCCTable {
                 return Some(indexed_row_ids.into_iter().next().unwrap());
             }
 
-            let mut result = union_sorted_ids(&indexed_row_ids[0], &indexed_row_ids[1]);
-            for other in &indexed_row_ids[2..] {
-                result = union_sorted_ids(&result, other);
+            // Bitset union: build a bitset for deduplication, collect unique row IDs
+            // Cap at 131072 words (~1MB) to prevent OOM with large/sparse row IDs.
+            // Negative row IDs (from user-specified PKs) cannot use the bitset path
+            // because `id as usize` wraps to a huge value.
+            const MAX_BITSET_WORDS: usize = 131_072;
+            let mut max_id = 0i64;
+            let mut min_id = 0i64;
+            for ids in &indexed_row_ids {
+                for &id in ids.iter() {
+                    if id > max_id {
+                        max_id = id;
+                    }
+                    if id < min_id {
+                        min_id = id;
+                    }
+                }
             }
-            return Some(result);
+            let num_words = (max_id as usize / 64) + 1;
+            let total_len: usize = indexed_row_ids.iter().map(|v| v.len()).sum();
+            if min_id >= 0 && num_words <= MAX_BITSET_WORDS {
+                // Fast bitset path
+                let mut bits = vec![0u64; num_words];
+                let mut result = RowIdVec::with_capacity(total_len);
+                for ids in &indexed_row_ids {
+                    for &id in ids.iter() {
+                        let idx = id as usize;
+                        let word = idx / 64;
+                        let mask = 1u64 << (idx % 64);
+                        if (bits[word] & mask) == 0 {
+                            bits[word] |= mask;
+                            result.push(id);
+                        }
+                    }
+                }
+                return Some(result);
+            } else {
+                // Fallback: I64Set-based union for large/sparse row IDs
+                let mut seen = I64Set::with_capacity(total_len);
+                let mut has_i64_min = false;
+                let mut result = RowIdVec::with_capacity(total_len);
+                for ids in &indexed_row_ids {
+                    for &id in ids.iter() {
+                        if id == i64::MIN {
+                            if !has_i64_min {
+                                has_i64_min = true;
+                                result.push(id);
+                            }
+                        } else if seen.insert(id) {
+                            result.push(id);
+                        }
+                    }
+                }
+                return Some(result);
+            }
         }
 
         // OPTIMIZATION: Detect BETWEEN/range pattern (col >= X AND col <= Y) for single range scan
@@ -372,11 +420,14 @@ impl MVCCTable {
                             && matches!(upper_op, Operator::Lt | Operator::Lte)
                         {
                             if let Some(index) = self.version_store.get_index_by_column(col1) {
-                                // Only B-tree indexes support range queries
+                                // Only B-tree and PrimaryKey indexes support range queries
                                 // Hash and Bitmap indexes return empty for range queries,
                                 // which would incorrectly indicate "no matches" instead of
                                 // "can't handle this query"
-                                if index.index_type() != IndexType::BTree {
+                                if !matches!(
+                                    index.index_type(),
+                                    IndexType::BTree | IndexType::PrimaryKey
+                                ) {
                                     return None; // Fall back to full scan
                                 }
                                 let min_inclusive = matches!(lower_op, Operator::Gte);
@@ -421,13 +472,55 @@ impl MVCCTable {
                     return Some(indexed_row_ids.into_iter().next().unwrap());
                 }
 
-                // Row IDs are already sorted by index (sorted insertion)
-                // Just sort by length for optimal intersection order
+                // Bitset intersection: build a bitset from the larger list for O(1) lookups,
+                // then retain only matching elements from the smaller list.
+                // Cap at MAX_BITSET_WORDS (~1MB) to prevent OOM with large/sparse row IDs.
+                // Negative row IDs skip the bitset path (id as usize wraps).
+                const MAX_BITSET_WORDS: usize = 131_072;
                 indexed_row_ids.sort_by_key(|v| v.len());
-                let mut result = indexed_row_ids.swap_remove(0); // Take ownership, not clone
+                let mut result = indexed_row_ids.swap_remove(0); // smallest
                 for other in &indexed_row_ids {
-                    result = intersect_sorted_ids(&result, other);
-                    // Early termination if intersection is empty
+                    let mut max_id = 0i64;
+                    let mut min_id = 0i64;
+                    for &id in other.iter() {
+                        if id > max_id {
+                            max_id = id;
+                        }
+                        if id < min_id {
+                            min_id = id;
+                        }
+                    }
+                    let num_words = (max_id as usize / 64) + 1;
+                    if min_id >= 0 && num_words <= MAX_BITSET_WORDS {
+                        // Fast bitset path
+                        let mut bits = vec![0u64; num_words];
+                        for &id in other.iter() {
+                            let idx = id as usize;
+                            bits[idx / 64] |= 1u64 << (idx % 64);
+                        }
+                        result.retain(|id| {
+                            let idx = *id as usize;
+                            idx < num_words * 64 && (bits[idx / 64] & (1u64 << (idx % 64))) != 0
+                        });
+                    } else {
+                        // Fallback: I64Set-based intersection for large/sparse row IDs
+                        let mut set = I64Set::with_capacity(other.len());
+                        let mut has_i64_min = false;
+                        for &id in other.iter() {
+                            if id == i64::MIN {
+                                has_i64_min = true;
+                            } else {
+                                set.insert(id);
+                            }
+                        }
+                        result.retain(|id| {
+                            if *id == i64::MIN {
+                                has_i64_min
+                            } else {
+                                set.contains(*id)
+                            }
+                        });
+                    }
                     if result.is_empty() {
                         return Some(RowIdVec::new());
                     }
@@ -779,28 +872,26 @@ impl MVCCTable {
             return None; // Fall through to full path
         }
 
-        // No local changes - fetch directly from version store by row IDs
+        // No local changes - use for_each_visible for single lock acquisition + early termination
         let mut result = RowVec::with_capacity(limit.min(row_ids.len()));
         let mut skipped = 0usize;
 
-        for row_id in row_ids {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                if !version.is_deleted() {
-                    // Re-apply filter (index may return superset for complex expressions)
-                    let row = self.normalize_row_to_schema(version.data.clone(), schema);
-                    if expr.evaluate_fast(&row) {
-                        if skipped < offset {
-                            skipped += 1;
-                        } else {
-                            result.push((row_id, row));
-                            if result.len() >= limit {
-                                return Some(result);
-                            }
+        self.version_store
+            .for_each_visible(&row_ids, self.txn_id, |row_id, row_data| {
+                // Re-apply filter (index may return superset for complex expressions)
+                let row = self.normalize_row_to_schema(row_data, schema);
+                if expr.evaluate_fast(&row) {
+                    if skipped < offset {
+                        skipped += 1;
+                    } else {
+                        result.push((row_id, row));
+                        if result.len() >= limit {
+                            return false; // Stop: LIMIT reached
                         }
                     }
                 }
-            }
-        }
+                true // Continue
+            });
         Some(result)
     }
 
@@ -1071,7 +1162,12 @@ impl MVCCTable {
         if txn_versions.has_local_changes() {
             return None;
         }
-        // No local changes - use the O(1) committed row count
+        // Under snapshot isolation, committed_row_count includes rows committed
+        // after our snapshot point, so the O(1) count would be wrong.
+        if self.version_store.needs_snapshot_isolation(self.txn_id) {
+            return None;
+        }
+        // No local changes, read-committed - use the O(1) committed row count
         Some(self.version_store.committed_row_count())
     }
 
@@ -1126,17 +1222,22 @@ impl MVCCTable {
         let global_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
 
         // Step 2: Build set of local row IDs for quick lookup (I64Set for fast i64 lookups)
-        let local_row_ids: I64Set = txn_versions
-            .iter_local()
-            .map(|(row_id, _)| row_id)
-            .collect();
+        let mut local_row_ids = I64Set::new();
+        let mut local_has_i64_min = false;
+        for (row_id, _) in txn_versions.iter_local() {
+            if row_id == i64::MIN {
+                local_has_i64_min = true;
+            } else {
+                local_row_ids.insert(row_id);
+            }
+        }
 
         // Step 3: Pre-allocate result
         let mut rows = RowVec::with_capacity(global_rows.len() + local_row_ids.len());
 
         // Step 4: Add global rows that don't have local overrides
         for (row_id, row) in global_rows {
-            if local_row_ids.contains(row_id) {
+            if (row_id == i64::MIN && local_has_i64_min) || local_row_ids.contains(row_id) {
                 continue; // Local version takes precedence
             }
             // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
@@ -1264,17 +1365,22 @@ impl MVCCTable {
         let global_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
 
         // Build set of local row IDs for quick lookup
-        let local_row_ids: I64Set = txn_versions
-            .iter_local()
-            .map(|(row_id, _)| row_id)
-            .collect();
+        let mut local_row_ids = I64Set::new();
+        let mut local_has_i64_min = false;
+        for (row_id, _) in txn_versions.iter_local() {
+            if row_id == i64::MIN {
+                local_has_i64_min = true;
+            } else {
+                local_row_ids.insert(row_id);
+            }
+        }
 
         let mut result = RowVec::with_capacity(limit);
         let mut count = 0;
 
         // Add global rows that don't have local overrides
         for (row_id, row) in global_rows {
-            if local_row_ids.contains(row_id) {
+            if (row_id == i64::MIN && local_has_i64_min) || local_row_ids.contains(row_id) {
                 continue; // Local version takes precedence
             }
             let row = self.normalize_row_to_schema(row, schema);
@@ -1745,23 +1851,45 @@ impl Table for MVCCTable {
                     .collect()
             };
 
-        // Also check local inserts that might not be in global store
-        // OPTIMIZATION: Filter on reference BEFORE cloning to avoid wasted allocations
+        // Overlay local transaction changes onto the global rows:
+        // - Rows locally updated: use local data instead of stale global data
+        // - Rows locally deleted: remove from update set
+        // - Rows locally inserted (not in global store): add to update set
         let local_rows_to_update: RowVec = {
             let txn_versions = self.txn_versions.read().unwrap();
+            if txn_versions.has_local_changes() {
+                // Fix up global rows that have local modifications
+                rows_with_originals.retain_mut(|(row_id, row, _orig)| {
+                    if let Some(local_version) = txn_versions.get_latest_local(*row_id) {
+                        if local_version.is_deleted() {
+                            // Locally deleted — exclude from update
+                            return false;
+                        }
+                        // Locally modified — use local data instead of stale global data
+                        *row = self.normalize_row_to_schema(local_version.data.clone(), schema);
+                        // Re-check filter against local data
+                        if let Some(expr) = where_expr {
+                            if !expr.evaluate(row).unwrap_or(false) {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                });
+            }
+
+            // Collect local-only inserts (not in global store)
             txn_versions
                 .iter_local()
                 .filter_map(|(row_id, version)| {
-                    // Skip if already in global store (already processed above)
+                    // Skip if already in global store (processed above)
                     if self.version_store.quick_check_row_existence(row_id) {
                         return None;
                     }
                     if version.is_deleted() {
                         return None;
                     }
-                    // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
                     let row = self.normalize_row_to_schema(version.data.clone(), schema);
-                    // Apply filter on normalized row
                     if let Some(expr) = where_expr {
                         if !expr.evaluate(&row).unwrap_or(false) {
                             return None;
@@ -2131,6 +2259,13 @@ impl Table for MVCCTable {
         Ok(delete_count)
     }
 
+    fn truncate(&mut self) -> Result<i32> {
+        // Fast path: drop all storage directly, bypassing per-row MVCC versioning.
+        // This is O(1) instead of O(N) for delete-all.
+        // Fails if other transactions have uncommitted writes on this table.
+        self.version_store.truncate_all()
+    }
+
     fn scan(
         &self,
         column_indices: &[usize],
@@ -2377,6 +2512,11 @@ impl Table for MVCCTable {
         // For multi-column indexes, check all existing indexes
         if columns.len() == 1 {
             if let Some(existing_idx) = self.version_store.get_index_by_column(columns[0]) {
+                // If the existing index is a PkIndex, silently skip -
+                // the PK column is already covered
+                if existing_idx.index_type() == IndexType::PrimaryKey {
+                    return Ok(());
+                }
                 if is_unique && !existing_idx.is_unique() {
                     return Err(Error::internal(format!(
                         "cannot create unique index on column '{}': a non-unique index already exists",
@@ -2483,6 +2623,12 @@ impl Table for MVCCTable {
                     is_unique,
                     expected_rows,
                 ))
+            }
+            IndexType::PrimaryKey => {
+                // PrimaryKey indexes are auto-created, users cannot CREATE INDEX with this type
+                return Err(Error::internal(
+                    "cannot explicitly create a primary key index; use PRIMARY KEY constraint instead".to_string(),
+                ));
             }
         };
 
@@ -2838,6 +2984,16 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Option<RowVec> {
+        // If transaction has local changes (inserts/updates/deletes), fall back to
+        // the regular path which correctly merges local changes via collect_visible_rows.
+        // This optimization only reads from the global version store and indexes.
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            if txn_versions.has_local_changes() {
+                return None;
+            }
+        }
+
         // OPTIMIZATION: Handle PRIMARY KEY column specially
         // For INTEGER PRIMARY KEY, the row_id IS the value, so we can iterate
         // directly in order without any sorting using skip/take semantics.
@@ -2960,6 +3116,14 @@ impl Table for MVCCTable {
         // Only works if table has a single-column INTEGER PRIMARY KEY
         self.cached_schema.pk_column_index()?;
 
+        // If transaction has local changes, fall back to regular path
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            if txn_versions.has_local_changes() {
+                return None;
+            }
+        }
+
         // Use the efficient keyset iteration from version store
         // Returns RowVec with (row_id, Row) tuples
         Some(self.version_store.collect_rows_keyset(
@@ -2972,6 +3136,14 @@ impl Table for MVCCTable {
     }
 
     fn collect_rows_grouped_by_partition(&self, column_name: &str) -> Option<Vec<(Value, RowVec)>> {
+        // If transaction has local changes, fall back to regular path
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            if txn_versions.has_local_changes() {
+                return None;
+            }
+        }
+
         // Check if column has an index
         let index = self.version_store.get_index_by_column(column_name)?;
 
@@ -3042,6 +3214,14 @@ impl Table for MVCCTable {
         column_name: &str,
         partition_value: &Value,
     ) -> Option<RowVec> {
+        // If transaction has local changes, fall back to regular path
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            if txn_versions.has_local_changes() {
+                return None;
+            }
+        }
+
         // Get index for the column
         let index = self.version_store.get_index_by_column(column_name)?;
 
@@ -3466,11 +3646,8 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        Some(self.version_store.compute_grouped_aggregates(
-            self.txn_id,
-            group_by_indices,
-            aggregates,
-        ))
+        self.version_store
+            .compute_grouped_aggregates(self.txn_id, group_by_indices, aggregates)
     }
 }
 

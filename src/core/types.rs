@@ -251,6 +251,11 @@ pub enum IndexType {
     /// Hybrid: Hash for exact lookups (O(1)), lazy BTree for range queries
     /// Best for: WHERE col1 = x AND col2 = y AND col3 = z
     MultiColumn,
+
+    /// Primary key index backed by a hybrid bitset + I64Set
+    /// Automatically created for INTEGER PRIMARY KEY columns
+    /// O(1) existence checks, not user-creatable via CREATE INDEX
+    PrimaryKey,
 }
 
 impl IndexType {
@@ -261,6 +266,7 @@ impl IndexType {
             IndexType::BTree => "btree",
             IndexType::Hash => "hash",
             IndexType::MultiColumn => "multicolumn",
+            IndexType::PrimaryKey => "primarykey",
         }
     }
 }
@@ -280,6 +286,7 @@ impl FromStr for IndexType {
             "btree" | "b-tree" => Ok(IndexType::BTree),
             "hash" => Ok(IndexType::Hash),
             "multicolumn" | "multi-column" | "composite" => Ok(IndexType::MultiColumn),
+            "primarykey" | "primary-key" | "primary_key" => Ok(IndexType::PrimaryKey),
             _ => Err(Error::parse(format!("unknown index type: {}", s))),
         }
     }

@@ -233,6 +233,13 @@ impl CachedResult {
         self.cached_at.elapsed() > ttl
     }
 
+    /// Check if this cached result has expired, using a pre-computed `now` instant.
+    /// Avoids repeated `Instant::now()` calls (each is a syscall on macOS).
+    #[inline]
+    pub fn is_expired_at(&self, ttl: Duration, now: Instant) -> bool {
+        now.duration_since(self.cached_at) > ttl
+    }
+
     /// Record an access to this cached result
     pub fn record_access(&mut self) {
         self.last_accessed = Instant::now();
@@ -408,9 +415,10 @@ impl SemanticCache {
             // Try to find a usable cached result
             // Store (index, predicate_hash) for TOCTOU-safe access update
             let mut found = None;
+            let now = Instant::now();
             for (idx, entry) in entries.iter().enumerate() {
                 // Skip expired entries
-                if entry.is_expired(self.ttl) {
+                if entry.is_expired_at(self.ttl, now) {
                     continue;
                 }
 
@@ -505,71 +513,7 @@ impl SemanticCache {
         };
 
         let entry = CachedResult::new(fingerprint, columns, rows, predicate);
-
-        let mut cache = match self.cache.write() {
-            Ok(c) => c,
-            Err(_) => {
-                self.stats.lock_failures.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        };
-
-        // Check global limit and evict across other tables first if needed
-        let current_global = self.global_row_count.load(Ordering::Relaxed) as usize;
-        if current_global + new_row_count > self.max_global_rows {
-            let rows_to_free =
-                (current_global + new_row_count).saturating_sub(self.max_global_rows);
-            self.evict_global_lru(&mut cache, rows_to_free, &table_key);
-        }
-
-        // Navigate to nested entries: table -> columns -> entries
-        let table_cache = cache.entry(table_key).or_default();
-        let entries = table_cache.entry(column_key).or_default();
-
-        // Evict expired entries and track row count reduction
-        let mut rows_freed: usize = 0;
-        let before_len = entries.len();
-        entries.retain(|e| {
-            if e.is_expired(self.ttl) {
-                rows_freed += e.rows.len();
-                false
-            } else {
-                true
-            }
-        });
-        let evicted = before_len - entries.len();
-        if evicted > 0 {
-            self.stats
-                .ttl_evictions
-                .fetch_add(evicted as u64, Ordering::Relaxed);
-        }
-
-        // Evict if at per-table capacity (LRU)
-        while entries.len() >= self.max_size {
-            // Find least recently used
-            if let Some((idx, _)) = entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, e)| (e.last_accessed, e.access_count))
-            {
-                rows_freed += entries[idx].rows.len();
-                entries.remove(idx);
-                self.stats.size_evictions.fetch_add(1, Ordering::Relaxed);
-            } else {
-                break;
-            }
-        }
-
-        // Update global row count (subtract freed, add new)
-        if rows_freed > 0 {
-            self.global_row_count
-                .fetch_sub(rows_freed as u64, Ordering::Relaxed);
-        }
-
-        // Add the new entry and update global count
-        self.global_row_count
-            .fetch_add(new_row_count as u64, Ordering::Relaxed);
-        entries.push(entry);
+        self.insert_entry(entry, new_row_count, table_key, column_key);
     }
 
     /// Insert a query result into the cache using a pre-wrapped Arc
@@ -597,7 +541,17 @@ impl SemanticCache {
         };
 
         let entry = CachedResult::new_with_arc(fingerprint, columns, rows, predicate);
+        self.insert_entry(entry, new_row_count, table_key, column_key);
+    }
 
+    /// Shared insert logic for both `insert` and `insert_arc`
+    fn insert_entry(
+        &self,
+        entry: CachedResult,
+        new_row_count: usize,
+        table_key: String,
+        column_key: String,
+    ) {
         let mut cache = match self.cache.write() {
             Ok(c) => c,
             Err(_) => {
@@ -621,8 +575,9 @@ impl SemanticCache {
         // Evict expired entries and track row count reduction
         let mut rows_freed: usize = 0;
         let before_len = entries.len();
+        let now = Instant::now();
         entries.retain(|e| {
-            if e.is_expired(self.ttl) {
+            if e.is_expired_at(self.ttl, now) {
                 rows_freed += e.rows.len();
                 false
             } else {
@@ -920,6 +875,13 @@ fn hash_expr_structure(expr: &Expression, hasher: &mut FxHasher) {
         Expression::List(list) => {
             13u8.hash(hasher);
             list.elements.len().hash(hasher);
+        }
+        Expression::Window(win) => {
+            14u8.hash(hasher);
+            win.function.function.to_lowercase().hash(hasher);
+            win.function.arguments.len().hash(hasher);
+            win.partition_by.len().hash(hasher);
+            win.order_by.len().hash(hasher);
         }
         _ => {
             // Default case for other expressions

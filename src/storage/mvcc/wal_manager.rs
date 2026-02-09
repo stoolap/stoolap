@@ -173,6 +173,7 @@ pub enum WALOperationType {
     DropIndex = 10,
     CreateView = 11,
     DropView = 12,
+    TruncateTable = 13,
 }
 
 impl WALOperationType {
@@ -191,6 +192,7 @@ impl WALOperationType {
             10 => Some(WALOperationType::DropIndex),
             11 => Some(WALOperationType::CreateView),
             12 => Some(WALOperationType::DropView),
+            13 => Some(WALOperationType::TruncateTable),
             _ => None,
         }
     }
@@ -206,6 +208,7 @@ impl WALOperationType {
                 | WALOperationType::DropIndex
                 | WALOperationType::CreateView
                 | WALOperationType::DropView
+                | WALOperationType::TruncateTable
         )
     }
 
@@ -2431,11 +2434,16 @@ mod tests {
             WALOperationType::from_u8(12),
             Some(WALOperationType::DropView)
         );
-        assert_eq!(WALOperationType::from_u8(13), None); // Invalid value
+        assert_eq!(
+            WALOperationType::from_u8(13),
+            Some(WALOperationType::TruncateTable)
+        );
+        assert_eq!(WALOperationType::from_u8(14), None); // Invalid value
 
         assert!(WALOperationType::CreateTable.is_ddl());
         assert!(WALOperationType::CreateView.is_ddl());
         assert!(WALOperationType::DropView.is_ddl());
+        assert!(WALOperationType::TruncateTable.is_ddl());
         assert!(!WALOperationType::Insert.is_ddl());
         assert!(WALOperationType::Commit.is_transaction_end());
         assert!(!WALOperationType::Insert.is_transaction_end());

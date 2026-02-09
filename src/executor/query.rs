@@ -7881,12 +7881,14 @@ impl Executor {
             ))
         };
 
-        // Build list of value literals
+        // Build list of value literals.
+        // IntegerLiteral uses "0" token (Display uses self.value, not token.literal).
+        // FloatLiteral must use f.to_string() (Display uses token.literal).
         let value_exprs: Vec<Expression> = values
             .iter()
             .map(|v| match v {
                 Value::Integer(i) => Expression::IntegerLiteral(IntegerLiteral {
-                    token: Token::new(TokenType::Integer, i.to_string(), Position::default()),
+                    token: Token::new(TokenType::Integer, "0", Position::default()),
                     value: *i,
                 }),
                 Value::Float(f) => Expression::FloatLiteral(FloatLiteral {
@@ -8038,9 +8040,14 @@ impl Executor {
             _ => return Ok(None),
         };
 
-        // Check for B-tree index on GROUP BY column
+        // Check for B-tree or primary key index on GROUP BY column
         let btree_index = match table.get_index_on_column(&group_col_name) {
-            Some(idx) if idx.index_type() == IndexType::BTree => idx,
+            Some(idx)
+                if idx.index_type() == IndexType::BTree
+                    || idx.index_type() == IndexType::PrimaryKey =>
+            {
+                idx
+            }
             _ => return Ok(None),
         };
 

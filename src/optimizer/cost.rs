@@ -782,6 +782,11 @@ impl CostEstimator {
                 let hash_lookup_cost = self.constants.random_page_cost * 0.15; // Slightly more than single-col hash
                 (hash_lookup_cost, 0.0)
             }
+            IndexType::PrimaryKey => {
+                // PkIndex: O(1) bitset lookup - cheapest possible
+                let pk_cost = self.constants.random_page_cost * 0.05;
+                (pk_cost, 0.0)
+            }
         };
 
         // CPU cost for index entries
@@ -798,6 +803,10 @@ impl CostEstimator {
             IndexType::MultiColumn => {
                 // Multi-column: Hash computation on composite key + equality
                 estimated_rows as f64 * self.constants.cpu_operator_cost * 1.2 // Slightly more than single hash
+            }
+            IndexType::PrimaryKey => {
+                // PkIndex: Direct bitset test, cheapest CPU cost
+                estimated_rows as f64 * self.constants.cpu_operator_cost * 0.5
             }
         };
 

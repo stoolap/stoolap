@@ -106,6 +106,8 @@ impl IndexMetadata {
             IndexType::Hash => 1,
             IndexType::Bitmap => 2,
             IndexType::MultiColumn => 3,
+            // PrimaryKey is auto-created from schema, never serialized as IndexMetadata
+            IndexType::PrimaryKey => unreachable!("PkIndex is never persisted via IndexMetadata"),
         };
         buf.push(index_type_byte);
 

@@ -359,6 +359,12 @@ pub trait Index: Send + Sync {
         None // Default implementation - only B-tree indexes support this
     }
 
+    /// Clears all data from the index without closing it.
+    /// Used by TRUNCATE for O(1) memory release.
+    fn clear(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Closes the index and releases any resources
     fn close(&mut self) -> Result<()>;
 }

@@ -1134,28 +1134,24 @@ impl Index for BTreeIndex {
         Some(Ok(()))
     }
 
-    fn close(&mut self) -> Result<()> {
-        self.closed.store(true, AtomicOrdering::Release);
+    fn clear(&self) -> Result<()> {
+        let mut sorted_values = self.sorted_values.write().unwrap();
+        sorted_values.clear();
+        drop(sorted_values);
 
-        // Clear all data structures
-        {
-            let mut sorted_values = self.sorted_values.write().unwrap();
-            sorted_values.clear();
-        }
-        {
-            let mut row_to_value = self.row_to_value.write().unwrap();
-            row_to_value.clear();
-        }
-        {
-            let mut cached_min = self.cached_min.write().unwrap();
-            *cached_min = None;
-        }
-        {
-            let mut cached_max = self.cached_max.write().unwrap();
-            *cached_max = None;
-        }
+        let mut row_to_value = self.row_to_value.write().unwrap();
+        row_to_value.clear();
+        drop(row_to_value);
+
+        *self.cached_min.write().unwrap() = None;
+        *self.cached_max.write().unwrap() = None;
 
         Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.closed.store(true, AtomicOrdering::Release);
+        self.clear()
     }
 }
 

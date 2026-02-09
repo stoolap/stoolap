@@ -177,7 +177,7 @@ impl Executor {
                     std::slice::from_ref(col_name),
                     true,
                     idx_type,
-                );
+                )?;
             }
 
             // Create multi-column unique indexes from table-level constraints
@@ -191,8 +191,13 @@ impl Executor {
                     .map(|idx| idx.index_type())
                     .unwrap_or(crate::core::IndexType::BTree);
                 // Record index creation to WAL for persistence
-                self.engine
-                    .record_create_index(table_name, &index_name, col_names, true, idx_type);
+                self.engine.record_create_index(
+                    table_name,
+                    &index_name,
+                    col_names,
+                    true,
+                    idx_type,
+                )?;
             }
         } else {
             // No active transaction - use direct engine call (auto-committed)
@@ -219,7 +224,7 @@ impl Executor {
                         std::slice::from_ref(col_name),
                         true,
                         idx_type,
-                    );
+                    )?;
                 }
 
                 // Create multi-column unique indexes from table-level constraints
@@ -239,7 +244,7 @@ impl Executor {
                         col_names,
                         true,
                         idx_type,
-                    );
+                    )?;
                 }
             }
         }
@@ -458,7 +463,7 @@ impl Executor {
             &column_names,
             is_unique,
             index_type,
-        );
+        )?;
 
         Ok(Box::new(ExecResult::empty()))
     }
@@ -503,7 +508,7 @@ impl Executor {
         table.drop_index(index_name)?;
 
         // Record index drop to WAL for persistence
-        self.engine.record_drop_index(&table_name, index_name);
+        self.engine.record_drop_index(&table_name, index_name)?;
 
         Ok(Box::new(ExecResult::empty()))
     }
@@ -576,7 +581,7 @@ impl Executor {
                         data_type,
                         nullable,
                         default_expr.as_deref(),
-                    );
+                    )?;
                 } else {
                     return Err(Error::InvalidArgumentMessage(
                         "ADD COLUMN requires column definition".to_string(),
@@ -592,7 +597,7 @@ impl Executor {
 
                     // Record ALTER TABLE DROP COLUMN to WAL for persistence
                     self.engine
-                        .record_alter_table_drop_column(table_name, &col_name.value);
+                        .record_alter_table_drop_column(table_name, &col_name.value)?;
                 } else {
                     return Err(Error::InvalidArgumentMessage(
                         "DROP COLUMN requires column name".to_string(),
@@ -611,7 +616,7 @@ impl Executor {
                         table_name,
                         &old_name.value,
                         &new_name.value,
-                    );
+                    )?;
                 }
                 _ => {
                     return Err(Error::InvalidArgumentMessage(
@@ -638,7 +643,7 @@ impl Executor {
                         &col_def.name.value,
                         data_type,
                         nullable,
-                    );
+                    )?;
                 } else {
                     return Err(Error::InvalidArgumentMessage(
                         "MODIFY COLUMN requires column definition".to_string(),
@@ -651,7 +656,7 @@ impl Executor {
 
                     // Record ALTER TABLE RENAME TO WAL for persistence
                     self.engine
-                        .record_alter_table_rename(table_name, &new_name.value);
+                        .record_alter_table_rename(table_name, &new_name.value)?;
                 } else {
                     return Err(Error::InvalidArgumentMessage(
                         "RENAME TABLE requires new table name".to_string(),

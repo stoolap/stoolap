@@ -995,24 +995,21 @@ impl Index for MultiColumnIndex {
         RowIdVec::new()
     }
 
+    fn clear(&self) -> Result<()> {
+        self.sorted_values.write().unwrap().clear();
+        self.btree_built.store(false, AtomicOrdering::Release);
+        self.value_to_rows.write().unwrap().clear();
+        for (prefix_index, built_flag) in self.prefix_indexes.iter().zip(self.prefix_built.iter()) {
+            prefix_index.write().unwrap().clear();
+            built_flag.store(false, AtomicOrdering::Release);
+        }
+        self.row_to_key.write().unwrap().clear();
+        Ok(())
+    }
+
     fn close(&mut self) -> Result<()> {
         self.closed.store(true, AtomicOrdering::Release);
-
-        let mut sorted_values = self.sorted_values.write().unwrap();
-        sorted_values.clear();
-
-        let mut value_to_rows = self.value_to_rows.write().unwrap();
-        value_to_rows.clear();
-
-        for prefix_index in &self.prefix_indexes {
-            let mut pi = prefix_index.write().unwrap();
-            pi.clear();
-        }
-
-        let mut row_to_key = self.row_to_key.write().unwrap();
-        row_to_key.clear();
-
-        Ok(())
+        self.clear()
     }
 }
 

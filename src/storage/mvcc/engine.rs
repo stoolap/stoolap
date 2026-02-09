@@ -47,8 +47,9 @@ use crate::storage::mvcc::wal_manager::WALOperationType;
 #[cfg(test)]
 use crate::storage::mvcc::VisibilityChecker;
 use crate::storage::mvcc::{
-    MVCCTable, MvccTransaction, PersistenceManager, RowVersion, TransactionEngineOperations,
-    TransactionRegistry, TransactionVersionStore, VersionStore, INVALID_TRANSACTION_ID,
+    MVCCTable, MvccTransaction, PersistenceManager, PkIndex, RowVersion,
+    TransactionEngineOperations, TransactionRegistry, TransactionVersionStore, VersionStore,
+    INVALID_TRANSACTION_ID,
 };
 use crate::storage::traits::{Engine, Index, Table, Transaction};
 
@@ -75,6 +76,22 @@ fn registry_as_visibility_checker(
     registry: &Arc<TransactionRegistry>,
 ) -> Arc<dyn VisibilityChecker> {
     Arc::clone(registry) as Arc<dyn VisibilityChecker>
+}
+
+/// Register a virtual PkIndex on an INTEGER PRIMARY KEY column.
+/// This allows the optimizer to find the PK index via `get_index_by_column()`.
+fn register_pk_index(schema: &Schema, version_store: &Arc<VersionStore>) {
+    if let Some(pk_idx) = schema.pk_column_index() {
+        let pk_col = &schema.columns[pk_idx];
+        let index_name = format!("__pk_{}_{}", schema.table_name_lower, pk_col.name);
+        let pk_index = Arc::new(PkIndex::new(
+            index_name.clone(),
+            schema.table_name.clone(),
+            pk_col.id as i32,
+            pk_col.name.clone(),
+        ));
+        version_store.add_index(index_name, pk_index);
+    }
 }
 
 // ============================================================================
@@ -579,6 +596,9 @@ impl MVCCEngine {
             registry_as_visibility_checker(&self.registry),
         ));
 
+        // Register virtual PkIndex for INTEGER PRIMARY KEY
+        register_pk_index(&schema, &version_store);
+
         // Load all rows from the snapshot
         reader.for_each(|row_id, mut version| {
             // Snapshot versions have txn_id = -1, we need to use the recovery txn_id
@@ -661,6 +681,9 @@ impl MVCCEngine {
                         schema.clone(),
                         registry_as_visibility_checker(&self.registry),
                     ));
+
+                    // Register virtual PkIndex for INTEGER PRIMARY KEY
+                    register_pk_index(&schema, &version_store);
 
                     let table_name = schema.table_name_lower.clone();
 
@@ -755,6 +778,15 @@ impl MVCCEngine {
                     let name_lower = view_name.to_lowercase();
                     let mut views = self.views.write().unwrap();
                     views.remove(&name_lower);
+                }
+            }
+            WALOperationType::TruncateTable => {
+                // Clear all data from the table
+                // During WAL recovery there are no concurrent transactions,
+                // so truncate_all() will always succeed.
+                let table_name = entry.table_name.to_lowercase();
+                if let Ok(store) = self.get_version_store(&table_name) {
+                    let _ = store.truncate_all();
                 }
             }
         }
@@ -1208,17 +1240,16 @@ impl MVCCEngine {
     }
 
     /// Record a DDL operation to WAL
-    fn record_ddl(&self, table_name: &str, op: WALOperationType, schema_data: &[u8]) {
+    fn record_ddl(&self, table_name: &str, op: WALOperationType, schema_data: &[u8]) -> Result<()> {
         if self.should_skip_wal() {
-            return;
+            return Ok(());
         }
         if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
-                if let Err(e) = pm.record_ddl_operation(table_name, op, schema_data) {
-                    eprintln!("Warning: Failed to record DDL operation in WAL: {}", e);
-                }
+                pm.record_ddl_operation(table_name, op, schema_data)?;
             }
         }
+        Ok(())
     }
 
     /// Serialize a schema to binary format for WAL
@@ -1278,14 +1309,7 @@ impl MVCCEngine {
 
         let table_name = schema.table_name_lower.clone();
 
-        {
-            let schemas = self.schemas.read().unwrap();
-            if schemas.contains_key(&table_name) {
-                return Err(Error::TableAlreadyExists);
-            }
-        }
-
-        // Validate schema
+        // Validate schema before acquiring locks
         self.validate_schema(&schema)?;
 
         // Create version store for this table
@@ -1295,25 +1319,32 @@ impl MVCCEngine {
             registry_as_visibility_checker(&self.registry),
         ));
 
-        // Record DDL operation in WAL (before inserting into map)
-        let schema_data = Self::serialize_schema(&schema);
-        self.record_ddl(
-            &schema.table_name,
-            WALOperationType::CreateTable,
-            &schema_data,
-        );
+        // Register virtual PkIndex for INTEGER PRIMARY KEY
+        register_pk_index(&schema, &version_store);
 
-        // Store schema and version store
-        // Clone schema for return before wrapping in Arc (avoids failed try_unwrap clone)
+        // Prepare WAL data before locks (avoids holding lock during serialization)
+        let schema_data = Self::serialize_schema(&schema);
+
+        // Atomically check-and-insert under write lock to prevent TOCTOU race
         let return_schema = schema.clone();
         {
             let mut schemas = self.schemas.write().unwrap();
+            if schemas.contains_key(&table_name) {
+                return Err(Error::TableAlreadyExists);
+            }
             schemas.insert(table_name.clone(), CompactArc::new(schema));
         }
         {
             let mut stores = self.version_stores.write().unwrap();
             stores.insert(table_name, version_store);
         }
+
+        // Record DDL to WAL only after successful insertion
+        self.record_ddl(
+            &return_schema.table_name,
+            WALOperationType::CreateTable,
+            &schema_data,
+        )?;
 
         // Increment schema epoch for cache invalidation
         self.schema_epoch.fetch_add(1, Ordering::Release);
@@ -1329,16 +1360,14 @@ impl MVCCEngine {
 
         let table_name = name.to_lowercase();
 
-        // Check if table exists
+        // Atomically check-and-remove under write lock to prevent TOCTOU race
         {
-            let schemas = self.schemas.read().unwrap();
+            let mut schemas = self.schemas.write().unwrap();
             if !schemas.contains_key(&table_name) {
                 return Err(Error::TableNotFound);
             }
+            schemas.remove(&table_name);
         }
-
-        // Record DDL operation in WAL (before removing - use original name)
-        self.record_ddl(name, WALOperationType::DropTable, &[]);
 
         // Close and remove version store
         {
@@ -1348,11 +1377,8 @@ impl MVCCEngine {
             }
         }
 
-        // Remove schema
-        {
-            let mut schemas = self.schemas.write().unwrap();
-            schemas.remove(&table_name);
-        }
+        // Record DDL to WAL only after successful removal
+        self.record_ddl(name, WALOperationType::DropTable, &[])?;
 
         // Increment schema epoch for cache invalidation
         self.schema_epoch.fetch_add(1, Ordering::Release);
@@ -1389,41 +1415,45 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema (using CompactArc::make_mut for copy-on-write)
-        let mut schemas = self.schemas.write().unwrap();
-        let schema_arc = schemas
-            .get_mut(&table_name_lower)
-            .ok_or(Error::TableNotFound)?;
-
-        // Check if column already exists
-        if schema_arc.has_column(column_name) {
-            return Err(Error::DuplicateColumn);
+        // Validate under read lock first
+        {
+            let schemas = self.schemas.read().unwrap();
+            let schema_arc = schemas.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            if schema_arc.has_column(column_name) {
+                return Err(Error::DuplicateColumn);
+            }
         }
 
-        // Add column to schema (Arc::make_mut clones only if there are other refs)
-        let schema = CompactArc::make_mut(schema_arc);
-        let column = crate::core::SchemaColumn::new(
-            schema.columns.len(),
-            column_name,
-            data_type,
-            nullable,
-            false,
-        );
-        schema.add_column(column)?;
+        // Update version store schema first (source of truth) — if this fails,
+        // engine schema is still consistent
+        {
+            let stores = self.version_stores.read().unwrap();
+            if let Some(store) = stores.get(&table_name_lower) {
+                let mut vs_schema_guard = store.schema_mut();
+                let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                let col = crate::core::SchemaColumn::new(
+                    vs_schema.columns.len(),
+                    column_name,
+                    data_type,
+                    nullable,
+                    false,
+                );
+                vs_schema.add_column(col)?;
+            }
+        }
 
-        // Also update version store schema
-        let stores = self.version_stores.read().unwrap();
-        if let Some(store) = stores.get(&table_name_lower) {
-            let mut vs_schema_guard = store.schema_mut();
-            let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
-            let col = crate::core::SchemaColumn::new(
-                vs_schema.columns.len(),
-                column_name,
-                data_type,
-                nullable,
-                false,
-            );
-            vs_schema.add_column(col)?;
+        // Sync engine schema cache from version store
+        {
+            let vs_schema = {
+                let stores = self.version_stores.read().unwrap();
+                stores
+                    .get(&table_name_lower)
+                    .map(|store| store.schema().clone())
+            };
+            if let Some(schema) = vs_schema {
+                let mut schemas = self.schemas.write().unwrap();
+                schemas.insert(table_name_lower, schema);
+            }
         }
 
         // Increment schema epoch for cache invalidation
@@ -1447,43 +1477,46 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema (using CompactArc::make_mut for copy-on-write)
-        let mut schemas = self.schemas.write().unwrap();
-        let schema_arc = schemas
-            .get_mut(&table_name_lower)
-            .ok_or(Error::TableNotFound)?;
-
-        // Check if column already exists
-        if schema_arc.has_column(column_name) {
-            return Err(Error::DuplicateColumn);
+        // Validate under read lock first
+        {
+            let schemas = self.schemas.read().unwrap();
+            let schema_arc = schemas.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            if schema_arc.has_column(column_name) {
+                return Err(Error::DuplicateColumn);
+            }
         }
 
-        // Add column to schema with default expression (Arc::make_mut clones only if there are other refs)
-        let schema = CompactArc::make_mut(schema_arc);
-        let mut column = crate::core::SchemaColumn::new(
-            schema.columns.len(),
-            column_name,
-            data_type,
-            nullable,
-            false,
-        );
-        column.default_expr = default_expr.clone();
-        schema.add_column(column)?;
+        // Update version store schema first (source of truth) — if this fails,
+        // engine schema is still consistent
+        {
+            let stores = self.version_stores.read().unwrap();
+            if let Some(store) = stores.get(&table_name_lower) {
+                let mut vs_schema_guard = store.schema_mut();
+                let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                let mut col = crate::core::SchemaColumn::new(
+                    vs_schema.columns.len(),
+                    column_name,
+                    data_type,
+                    nullable,
+                    false,
+                );
+                col.default_expr = default_expr;
+                vs_schema.add_column(col)?;
+            }
+        }
 
-        // Also update version store schema
-        let stores = self.version_stores.read().unwrap();
-        if let Some(store) = stores.get(&table_name_lower) {
-            let mut vs_schema_guard = store.schema_mut();
-            let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
-            let mut col = crate::core::SchemaColumn::new(
-                vs_schema.columns.len(),
-                column_name,
-                data_type,
-                nullable,
-                false,
-            );
-            col.default_expr = default_expr;
-            vs_schema.add_column(col)?;
+        // Sync engine schema cache from version store
+        {
+            let vs_schema = {
+                let stores = self.version_stores.read().unwrap();
+                stores
+                    .get(&table_name_lower)
+                    .map(|store| store.schema().clone())
+            };
+            if let Some(schema) = vs_schema {
+                let mut schemas = self.schemas.write().unwrap();
+                schemas.insert(table_name_lower, schema);
+            }
         }
 
         // Increment schema epoch for cache invalidation
@@ -1501,14 +1534,18 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get the schema from the version store
-        let stores = self.version_stores.read().unwrap();
-        let store = stores.get(&table_name_lower).ok_or(Error::TableNotFound)?;
-        let vs_schema = store.schema();
+        // Get the schema from the version store, then release the lock
+        // LOCK ORDERING: Release version_stores(R) before acquiring schemas(W)
+        // to maintain consistent ordering with column DDL (schemas(W) -> version_stores(R))
+        let vs_schema = {
+            let stores = self.version_stores.read().unwrap();
+            let store = stores.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            store.schema().clone()
+        };
 
         // Update the engine's schema cache
         let mut schemas = self.schemas.write().unwrap();
-        schemas.insert(table_name_lower, vs_schema.clone());
+        schemas.insert(table_name_lower, vs_schema);
 
         Ok(())
     }
@@ -1521,29 +1558,40 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema (using CompactArc::make_mut for copy-on-write)
-        let mut schemas = self.schemas.write().unwrap();
-        let schema_arc = schemas
-            .get_mut(&table_name_lower)
-            .ok_or(Error::TableNotFound)?;
-
-        // Check if column is primary key
-        if let Some((_, col)) = schema_arc.find_column(column_name) {
-            if col.primary_key {
-                return Err(Error::CannotDropPrimaryKey);
+        // Validate under read lock first
+        {
+            let schemas = self.schemas.read().unwrap();
+            let schema_arc = schemas.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            if let Some((_, col)) = schema_arc.find_column(column_name) {
+                if col.primary_key {
+                    return Err(Error::CannotDropPrimaryKey);
+                }
+            } else {
+                return Err(Error::ColumnNotFound);
             }
-        } else {
-            return Err(Error::ColumnNotFound);
         }
 
-        // Remove column from schema (Arc::make_mut clones only if there are other refs)
-        CompactArc::make_mut(schema_arc).remove_column(column_name)?;
+        // Update version store schema first (source of truth)
+        {
+            let stores = self.version_stores.read().unwrap();
+            if let Some(store) = stores.get(&table_name_lower) {
+                let mut vs_schema_guard = store.schema_mut();
+                CompactArc::make_mut(&mut *vs_schema_guard).remove_column(column_name)?;
+            }
+        }
 
-        // Also update version store schema
-        let stores = self.version_stores.read().unwrap();
-        if let Some(store) = stores.get(&table_name_lower) {
-            let mut vs_schema_guard = store.schema_mut();
-            CompactArc::make_mut(&mut *vs_schema_guard).remove_column(column_name)?;
+        // Sync engine schema cache from version store
+        {
+            let vs_schema = {
+                let stores = self.version_stores.read().unwrap();
+                stores
+                    .get(&table_name_lower)
+                    .map(|store| store.schema().clone())
+            };
+            if let Some(schema) = vs_schema {
+                let mut schemas = self.schemas.write().unwrap();
+                schemas.insert(table_name_lower, schema);
+            }
         }
 
         // Increment schema epoch for cache invalidation
@@ -1560,30 +1608,39 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema (using CompactArc::make_mut for copy-on-write)
-        let mut schemas = self.schemas.write().unwrap();
-        let schema_arc = schemas
-            .get_mut(&table_name_lower)
-            .ok_or(Error::TableNotFound)?;
-
-        // Check if old column exists
-        if !schema_arc.has_column(old_name) {
-            return Err(Error::ColumnNotFound);
+        // Validate under read lock first
+        {
+            let schemas = self.schemas.read().unwrap();
+            let schema_arc = schemas.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            if !schema_arc.has_column(old_name) {
+                return Err(Error::ColumnNotFound);
+            }
+            if schema_arc.has_column(new_name) {
+                return Err(Error::DuplicateColumn);
+            }
         }
 
-        // Check if new column name already exists
-        if schema_arc.has_column(new_name) {
-            return Err(Error::DuplicateColumn);
+        // Update version store schema first (source of truth)
+        {
+            let stores = self.version_stores.read().unwrap();
+            if let Some(store) = stores.get(&table_name_lower) {
+                let mut vs_schema_guard = store.schema_mut();
+                CompactArc::make_mut(&mut *vs_schema_guard).rename_column(old_name, new_name)?;
+            }
         }
 
-        // Rename column in schema (Arc::make_mut clones only if there are other refs)
-        CompactArc::make_mut(schema_arc).rename_column(old_name, new_name)?;
-
-        // Also update version store schema
-        let stores = self.version_stores.read().unwrap();
-        if let Some(store) = stores.get(&table_name_lower) {
-            let mut vs_schema_guard = store.schema_mut();
-            CompactArc::make_mut(&mut *vs_schema_guard).rename_column(old_name, new_name)?;
+        // Sync engine schema cache from version store
+        {
+            let vs_schema = {
+                let stores = self.version_stores.read().unwrap();
+                stores
+                    .get(&table_name_lower)
+                    .map(|store| store.schema().clone())
+            };
+            if let Some(schema) = vs_schema {
+                let mut schemas = self.schemas.write().unwrap();
+                schemas.insert(table_name_lower, schema);
+            }
         }
 
         // Increment schema epoch for cache invalidation
@@ -1606,33 +1663,40 @@ impl MVCCEngine {
 
         let table_name_lower = table_name.to_lowercase();
 
-        // Get and modify schema (using CompactArc::make_mut for copy-on-write)
-        let mut schemas = self.schemas.write().unwrap();
-        let schema_arc = schemas
-            .get_mut(&table_name_lower)
-            .ok_or(Error::TableNotFound)?;
-
-        // Check if column exists
-        if !schema_arc.has_column(column_name) {
-            return Err(Error::ColumnNotFound);
+        // Validate under read lock first
+        {
+            let schemas = self.schemas.read().unwrap();
+            let schema_arc = schemas.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            if !schema_arc.has_column(column_name) {
+                return Err(Error::ColumnNotFound);
+            }
         }
 
-        // Modify column in schema (Arc::make_mut clones only if there are other refs)
-        CompactArc::make_mut(schema_arc).modify_column(
-            column_name,
-            Some(data_type),
-            Some(nullable),
-        )?;
+        // Update version store schema first (source of truth)
+        {
+            let stores = self.version_stores.read().unwrap();
+            if let Some(store) = stores.get(&table_name_lower) {
+                let mut vs_schema_guard = store.schema_mut();
+                CompactArc::make_mut(&mut *vs_schema_guard).modify_column(
+                    column_name,
+                    Some(data_type),
+                    Some(nullable),
+                )?;
+            }
+        }
 
-        // Also update version store schema
-        let stores = self.version_stores.read().unwrap();
-        if let Some(store) = stores.get(&table_name_lower) {
-            let mut vs_schema_guard = store.schema_mut();
-            CompactArc::make_mut(&mut *vs_schema_guard).modify_column(
-                column_name,
-                Some(data_type),
-                Some(nullable),
-            )?;
+        // Sync engine schema cache from version store
+        {
+            let vs_schema = {
+                let stores = self.version_stores.read().unwrap();
+                stores
+                    .get(&table_name_lower)
+                    .map(|store| store.schema().clone())
+            };
+            if let Some(schema) = vs_schema {
+                let mut schemas = self.schemas.write().unwrap();
+                schemas.insert(table_name_lower, schema);
+            }
         }
 
         // Increment schema epoch for cache invalidation
@@ -1650,22 +1714,19 @@ impl MVCCEngine {
         let old_name_lower = old_name.to_lowercase();
         let new_name_lower = new_name.to_lowercase();
 
-        // Check if old table exists
+        // Atomically check-and-rename under write lock to prevent TOCTOU race
         {
-            let schemas = self.schemas.read().unwrap();
+            let mut schemas = self.schemas.write().unwrap();
             if !schemas.contains_key(&old_name_lower) {
                 return Err(Error::TableNotFound);
             }
             if schemas.contains_key(&new_name_lower) {
                 return Err(Error::TableAlreadyExists);
             }
-        }
-
-        // Update schemas map
-        {
-            let mut schemas = self.schemas.write().unwrap();
             if let Some(mut schema_arc) = schemas.remove(&old_name_lower) {
-                CompactArc::make_mut(&mut schema_arc).table_name = new_name.to_string();
+                let schema = CompactArc::make_mut(&mut schema_arc);
+                schema.table_name = new_name.to_string();
+                schema.table_name_lower = new_name_lower.clone();
                 schemas.insert(new_name_lower.clone(), schema_arc);
             }
         }
@@ -1677,7 +1738,9 @@ impl MVCCEngine {
                 // Update the schema's table name within the store
                 {
                     let mut vs_schema_guard = store.schema_mut();
-                    CompactArc::make_mut(&mut *vs_schema_guard).table_name = new_name.to_string();
+                    let schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                    schema.table_name = new_name.to_string();
+                    schema.table_name_lower = new_name_lower.clone();
                 }
                 stores.insert(new_name_lower, store);
             }
@@ -1733,6 +1796,19 @@ impl MVCCEngine {
         }
 
         let name_lower = name.to_lowercase();
+
+        // Check if a table with the same name exists (acquire schemas before views
+        // to maintain consistent lock ordering and prevent deadlock)
+        {
+            let schemas = self.schemas.read().unwrap();
+            if schemas.contains_key(&name_lower) {
+                return Err(Error::internal(format!(
+                    "cannot create view '{}': a table with the same name exists",
+                    name
+                )));
+            }
+        }
+
         let mut views = self.views.write().unwrap();
 
         // Check if view already exists
@@ -1743,16 +1819,6 @@ impl MVCCEngine {
             return Err(Error::ViewAlreadyExists(name.to_string()));
         }
 
-        // Check if a table with the same name exists
-        let schemas = self.schemas.read().unwrap();
-        if schemas.contains_key(&name_lower) {
-            return Err(Error::internal(format!(
-                "cannot create view '{}': a table with the same name exists",
-                name
-            )));
-        }
-        drop(schemas);
-
         // Create the view definition wrapped in Arc for cheap cloning
         let view_def = Arc::new(ViewDefinition::new(name, query));
         views.insert(name_lower.clone(), Arc::clone(&view_def));
@@ -1762,7 +1828,7 @@ impl MVCCEngine {
 
         // Record to WAL for persistence
         let data = view_def.serialize();
-        self.record_ddl(&name_lower, WALOperationType::CreateView, &data);
+        self.record_ddl(&name_lower, WALOperationType::CreateView, &data)?;
 
         Ok(())
     }
@@ -1789,7 +1855,7 @@ impl MVCCEngine {
         drop(views);
 
         // Record to WAL for persistence (just the view name)
-        self.record_ddl(&name_lower, WALOperationType::DropView, name.as_bytes());
+        self.record_ddl(&name_lower, WALOperationType::DropView, name.as_bytes())?;
 
         Ok(())
     }
@@ -2003,22 +2069,18 @@ impl Engine for MVCCEngine {
             _ => return Ok(()), // No persistence, nothing to snapshot
         };
 
-        // CRITICAL: Create checkpoint and capture the LSN atomically.
-        // create_checkpoint() flushes and syncs all pending WAL entries, then returns
-        // the LSN at the exact checkpoint point. This prevents the race condition where:
-        // 1. We read LSN separately after checkpoint
-        // 2. New transaction commits between checkpoint and LSN read
-        // 3. Snapshot might capture inconsistent data
-        //
-        // By using the LSN returned from create_checkpoint(), we guarantee the LSN
-        // corresponds exactly to the data that was synced to disk.
-        let snapshot_lsn = pm.create_checkpoint(vec![])?;
-
-        // CRITICAL: Capture the commit sequence at the same point as the checkpoint.
-        // This ensures we only include transactions that were committed at the time
-        // of the checkpoint during the snapshot iteration. Without this, a transaction
-        // that commits during iteration would be incorrectly included in the snapshot.
+        // CRITICAL: Capture the commit sequence BEFORE the checkpoint.
+        // This ensures we only include transactions that were committed before this
+        // point during the snapshot iteration. If we captured it after checkpoint,
+        // a transaction committing between checkpoint and this read would be in the
+        // WAL (included by checkpoint) but not in the snapshot (filtered by commit_seq),
+        // causing inconsistency on recovery.
         let snapshot_commit_seq = self.registry.current_commit_sequence();
+
+        // Create checkpoint and capture the LSN atomically.
+        // create_checkpoint() flushes and syncs all pending WAL entries, then returns
+        // the LSN at the exact checkpoint point.
+        let snapshot_lsn = pm.create_checkpoint(vec![])?;
 
         // Create snapshot directory
         let snapshot_dir = pm.path().join("snapshots");
@@ -2253,16 +2315,13 @@ impl Engine for MVCCEngine {
         column_names: &[String],
         is_unique: bool,
         index_type: crate::core::IndexType,
-    ) {
+    ) -> Result<()> {
         if self.should_skip_wal() {
-            return;
+            return Ok(());
         }
 
         // Get table schema to look up column IDs and data types
-        let schema = match self.get_table_schema(table_name) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
+        let schema = self.get_table_schema(table_name)?;
 
         // Build column_ids and data_types from schema
         // Use schema's cached column_index_map for O(1) lookup instead of O(n) linear scan
@@ -2276,8 +2335,7 @@ impl Engine for MVCCEngine {
                 column_ids.push(idx as i32);
                 data_types.push(schema.columns[idx].data_type);
             } else {
-                // Column not found, skip recording
-                return;
+                return Ok(());
             }
         }
 
@@ -2294,12 +2352,12 @@ impl Engine for MVCCEngine {
 
         // Serialize and record to WAL
         let data = index_meta.serialize();
-        self.record_ddl(table_name, WALOperationType::CreateIndex, &data);
+        self.record_ddl(table_name, WALOperationType::CreateIndex, &data)
     }
 
-    fn record_drop_index(&self, table_name: &str, index_name: &str) {
+    fn record_drop_index(&self, table_name: &str, index_name: &str) -> Result<()> {
         if self.should_skip_wal() {
-            return;
+            return Ok(());
         }
 
         // For drop index, the entry.data is simply the index name as bytes
@@ -2307,7 +2365,7 @@ impl Engine for MVCCEngine {
             table_name,
             WALOperationType::DropIndex,
             index_name.as_bytes(),
-        );
+        )
     }
 
     fn record_alter_table_add_column(
@@ -2317,9 +2375,9 @@ impl Engine for MVCCEngine {
         data_type: crate::core::DataType,
         nullable: bool,
         default_expr: Option<&str>,
-    ) {
+    ) -> Result<()> {
         if self.should_skip_wal() {
-            return;
+            return Ok(());
         }
 
         // Serialize: operation_type(1) + table_name_len(2) + table_name + column_name_len(2) + column_name
@@ -2349,12 +2407,12 @@ impl Engine for MVCCEngine {
             data.extend_from_slice(&0u16.to_le_bytes());
         }
 
-        self.record_ddl(table_name, WALOperationType::AlterTable, &data);
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
 
-    fn record_alter_table_drop_column(&self, table_name: &str, column_name: &str) {
+    fn record_alter_table_drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
         if self.should_skip_wal() {
-            return;
+            return Ok(());
         }
 
         // Serialize: operation_type(1) + table_name_len(2) + table_name + column_name_len(2) + column_name
@@ -2369,7 +2427,7 @@ impl Engine for MVCCEngine {
         data.extend_from_slice(&(column_name.len() as u16).to_le_bytes());
         data.extend_from_slice(column_name.as_bytes());
 
-        self.record_ddl(table_name, WALOperationType::AlterTable, &data);
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
 
     fn record_alter_table_rename_column(
@@ -2377,9 +2435,9 @@ impl Engine for MVCCEngine {
         table_name: &str,
         old_column_name: &str,
         new_column_name: &str,
-    ) {
+    ) -> Result<()> {
         if self.should_skip_wal() {
-            return;
+            return Ok(());
         }
 
         // Serialize: operation_type(1) + table_name_len(2) + table_name
@@ -2399,7 +2457,7 @@ impl Engine for MVCCEngine {
         data.extend_from_slice(&(new_column_name.len() as u16).to_le_bytes());
         data.extend_from_slice(new_column_name.as_bytes());
 
-        self.record_ddl(table_name, WALOperationType::AlterTable, &data);
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
 
     fn record_alter_table_modify_column(
@@ -2408,9 +2466,9 @@ impl Engine for MVCCEngine {
         column_name: &str,
         data_type: crate::core::DataType,
         nullable: bool,
-    ) {
+    ) -> Result<()> {
         if self.should_skip_wal() {
-            return;
+            return Ok(());
         }
 
         // Serialize: operation_type(1) + table_name_len(2) + table_name
@@ -2432,12 +2490,12 @@ impl Engine for MVCCEngine {
         // Nullable
         data.push(if nullable { 1 } else { 0 });
 
-        self.record_ddl(table_name, WALOperationType::AlterTable, &data);
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
 
-    fn record_alter_table_rename(&self, old_table_name: &str, new_table_name: &str) {
+    fn record_alter_table_rename(&self, old_table_name: &str, new_table_name: &str) -> Result<()> {
         if self.should_skip_wal() {
-            return;
+            return Ok(());
         }
 
         // Serialize: operation_type(1) + old_name_len(2) + old_name + new_name_len(2) + new_name
@@ -2452,7 +2510,14 @@ impl Engine for MVCCEngine {
         data.extend_from_slice(&(new_table_name.len() as u16).to_le_bytes());
         data.extend_from_slice(new_table_name.as_bytes());
 
-        self.record_ddl(old_table_name, WALOperationType::AlterTable, &data);
+        self.record_ddl(old_table_name, WALOperationType::AlterTable, &data)
+    }
+
+    fn record_truncate_table(&self, table_name: &str) -> Result<()> {
+        if self.should_skip_wal() {
+            return Ok(());
+        }
+        self.record_ddl(table_name, WALOperationType::TruncateTable, &[])
     }
 
     fn fetch_rows_by_ids(&self, table_name: &str, row_ids: &[i64]) -> Result<crate::core::RowVec> {
@@ -2704,9 +2769,7 @@ impl EngineOperations {
                     WALOperationType::Insert
                 };
 
-                if let Err(e) = pm.record_dml_operation(txn_id, table_name, row_id, op, &version) {
-                    eprintln!("Warning: Failed to record DML in WAL: {}", e);
-                }
+                pm.record_dml_operation(txn_id, table_name, row_id, op, &version)?;
             }
         }
         Ok(())
@@ -2729,40 +2792,36 @@ impl TransactionEngineOperations for EngineOperations {
         // Check if we have a cached transaction version store for this (txn_id, table_name)
         let txn_versions = {
             let cache = self.txn_version_stores().read().unwrap();
-            if let Some(txn_tables) = cache.get(txn_id) {
+            let found = if let Some(txn_tables) = cache.get(txn_id) {
                 // Linear search on SmallVec (fast for 1-2 tables)
+                txn_tables
+                    .iter()
+                    .find(|(name, _)| name == &*table_name_lower)
+                    .map(|(_, cached)| Arc::clone(cached))
+            } else {
+                None
+            };
+            drop(cache);
+
+            if let Some(cached) = found {
+                cached
+            } else {
+                // Upgrade to write lock and re-check (another thread may have inserted)
+                let mut cache = self.txn_version_stores().write().unwrap();
+                let txn_tables = cache.entry(txn_id).or_default();
                 if let Some((_, cached)) = txn_tables
                     .iter()
                     .find(|(name, _)| name == &*table_name_lower)
                 {
                     Arc::clone(cached)
                 } else {
-                    drop(cache);
-                    // Create new transaction version store and cache it
                     let new_store = Arc::new(RwLock::new(TransactionVersionStore::new(
                         Arc::clone(&version_store),
                         txn_id,
                     )));
-                    let mut cache = self.txn_version_stores().write().unwrap();
-                    cache
-                        .entry(txn_id)
-                        .or_default()
-                        .push((table_name_lower.into_owned().into(), Arc::clone(&new_store)));
+                    txn_tables.push((table_name_lower.into_owned().into(), Arc::clone(&new_store)));
                     new_store
                 }
-            } else {
-                drop(cache);
-                // Create new transaction version store and cache it
-                let new_store = Arc::new(RwLock::new(TransactionVersionStore::new(
-                    Arc::clone(&version_store),
-                    txn_id,
-                )));
-                let mut cache = self.txn_version_stores().write().unwrap();
-                cache
-                    .entry(txn_id)
-                    .or_default()
-                    .push((table_name_lower.into_owned().into(), Arc::clone(&new_store)));
-                new_store
             }
         };
 
@@ -2775,24 +2834,22 @@ impl TransactionEngineOperations for EngineOperations {
     fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn Table>> {
         let table_name = name.to_lowercase();
 
-        // Check if table already exists
-        {
-            let schemas = self.schemas().read().unwrap();
-            if schemas.contains_key(&table_name) {
-                return Err(Error::TableAlreadyExists);
-            }
-        }
-
-        // Create version store for this table
+        // Create version store for this table (before acquiring locks)
         let version_store = Arc::new(VersionStore::with_visibility_checker(
             schema.table_name.clone(),
             schema.clone(),
             registry_as_visibility_checker(&self.registry),
         ));
 
-        // Store schema and version store
+        // Register PkIndex if table has a primary key
+        register_pk_index(&schema, &version_store);
+
+        // Atomically check-and-insert under write lock to prevent TOCTOU race
         {
             let mut schemas = self.schemas().write().unwrap();
+            if schemas.contains_key(&table_name) {
+                return Err(Error::TableAlreadyExists);
+            }
             schemas.insert(table_name.clone(), CompactArc::new(schema));
         }
         {
@@ -2838,22 +2895,19 @@ impl TransactionEngineOperations for EngineOperations {
         let old_name_lower = old_name.to_lowercase();
         let new_name_lower = new_name.to_lowercase();
 
-        // Check if old table exists and new name doesn't exist
+        // Atomically check-and-rename under write lock to prevent TOCTOU race
         {
-            let schemas = self.schemas().read().unwrap();
+            let mut schemas = self.schemas().write().unwrap();
             if !schemas.contains_key(&old_name_lower) {
                 return Err(Error::TableNotFound);
             }
             if schemas.contains_key(&new_name_lower) {
                 return Err(Error::TableAlreadyExists);
             }
-        }
-
-        // Rename in schemas
-        {
-            let mut schemas = self.schemas().write().unwrap();
             if let Some(mut schema_arc) = schemas.remove(&old_name_lower) {
-                CompactArc::make_mut(&mut schema_arc).table_name = new_name.to_string();
+                let schema = CompactArc::make_mut(&mut schema_arc);
+                schema.table_name = new_name.to_string();
+                schema.table_name_lower = new_name_lower.clone();
                 schemas.insert(new_name_lower.clone(), schema_arc);
             }
         }
@@ -2862,6 +2916,13 @@ impl TransactionEngineOperations for EngineOperations {
         {
             let mut stores = self.version_stores().write().unwrap();
             if let Some(store) = stores.remove(&old_name_lower) {
+                // Also update the version store's internal schema
+                {
+                    let mut vs_schema_guard = store.schema_mut();
+                    let schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                    schema.table_name = new_name.to_string();
+                    schema.table_name_lower = new_name_lower.clone();
+                }
                 stores.insert(new_name_lower, store);
             }
         }
@@ -2900,12 +2961,7 @@ impl TransactionEngineOperations for EngineOperations {
                         WALOperationType::Insert
                     };
 
-                    if let Err(e) =
-                        pm.record_dml_operation(txn_id, table_name, row_id, op, &version)
-                    {
-                        eprintln!("Warning: Failed to record DML in WAL: {}", e);
-                        // Continue with other operations
-                    }
+                    pm.record_dml_operation(txn_id, table_name, row_id, op, &version)?;
                 }
             }
         }
@@ -2925,12 +2981,11 @@ impl TransactionEngineOperations for EngineOperations {
             return Ok(());
         }
 
-        // Record commit in WAL
+        // Record commit in WAL — propagate errors since missing commit records
+        // means crash recovery won't replay this transaction's changes
         if let Some(ref pm) = self.persistence() {
             if pm.is_enabled() {
-                if let Err(e) = pm.record_commit(txn_id) {
-                    eprintln!("Warning: Failed to record commit in WAL: {}", e);
-                }
+                pm.record_commit(txn_id)?;
             }
         }
         Ok(())
@@ -3001,9 +3056,12 @@ impl TransactionEngineOperations for EngineOperations {
         false
     }
 
-    fn commit_all_tables(&self, txn_id: i64) -> Result<()> {
+    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>) {
         // O(1) lookup by txn_id using nested HashMap
         let cache = self.txn_version_stores().read().unwrap();
+
+        let mut commit_error: Option<crate::core::Error> = None;
+        let mut any_committed = false;
 
         if let Some(txn_tables) = cache.get(txn_id) {
             // Check if WAL recording is needed (persistence enabled and not in recovery)
@@ -3035,21 +3093,31 @@ impl TransactionEngineOperations for EngineOperations {
 
                         // Record to WAL BEFORE commit (while pending versions still exist)
                         if should_record_wal {
-                            self.record_table_to_wal(txn_id, &table)?;
+                            if let Err(e) = self.record_table_to_wal(txn_id, &table) {
+                                commit_error = Some(e);
+                                break;
+                            }
                         }
 
-                        table.commit()?;
+                        if let Err(e) = table.commit() {
+                            commit_error = Some(e);
+                            break;
+                        }
+
+                        any_committed = true;
                     }
                 }
             }
         }
 
-        // O(1) cleanup - remove entire transaction entry
+        // Always cleanup txn_version_stores to prevent memory leak,
+        // even if commit failed partway through
         drop(cache);
         let mut cache = self.txn_version_stores().write().unwrap();
         cache.remove(txn_id);
+        drop(cache);
 
-        Ok(())
+        (any_committed, commit_error)
     }
 
     fn rollback_all_tables(&self, txn_id: i64) {

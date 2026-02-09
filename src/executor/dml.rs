@@ -1782,7 +1782,16 @@ impl Executor {
     }
 
     /// Execute a TRUNCATE statement
-    /// TRUNCATE is equivalent to DELETE without WHERE clause, but more efficient
+    /// TRUNCATE is equivalent to DELETE without WHERE clause, but more efficient.
+    ///
+    /// **Non-rollbackable**: Like MySQL and Oracle, TRUNCATE physically destroys
+    /// versions, arena, and indexes immediately. ROLLBACK cannot undo it.
+    /// This is a deliberate trade-off: O(1) truncation vs rollback safety.
+    /// Use `DELETE FROM table` if transactional rollback is needed.
+    ///
+    /// Fails with `TableHasActiveTransactions` if:
+    /// - The current explicit transaction has already modified this table (INSERT/UPDATE/DELETE)
+    /// - Another transaction holds uncommitted UPDATE/DELETE claims on the table
     pub(crate) fn execute_truncate(
         &self,
         stmt: &TruncateStatement,
@@ -1796,16 +1805,21 @@ impl Executor {
 
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
+                // Block TRUNCATE if this transaction has already modified the table.
+                // Uncommitted INSERTs live in TransactionVersionStore.local_versions
+                // and would be silently destroyed by truncate_all().
+                if tx_state.tables.contains_key(table_name.as_str()) {
+                    return Err(Error::TableHasActiveTransactions);
+                }
+
                 // Use the active transaction
                 let table = tx_state.transaction.get_table(table_name)?;
 
-                // Store a reference to this table for commit/rollback
-                if !tx_state.tables.contains_key(table_name.as_str()) {
-                    tx_state.tables.insert(
-                        table_name.to_string(),
-                        tx_state.transaction.get_table(table_name)?,
-                    );
-                }
+                // Register this table for commit/rollback
+                tx_state.tables.insert(
+                    table_name.to_string(),
+                    tx_state.transaction.get_table(table_name)?,
+                );
 
                 (table, false, None)
             } else {
@@ -1818,8 +1832,14 @@ impl Executor {
         // Drop the lock before doing work
         drop(active_tx);
 
-        // Delete all rows (no WHERE clause)
-        let rows_affected = table.delete(None)?;
+        // Truncate all rows (fast path: drops storage directly)
+        // WAL is recorded AFTER success to prevent phantom records on failure.
+        // If a crash occurs between truncate and WAL write, recovery restores
+        // the pre-truncate state from the snapshot — the user simply retries.
+        let rows_affected = table.truncate()?;
+
+        // Record TRUNCATE to WAL for persistence (only after successful truncate)
+        self.engine.record_truncate_table(table_name)?;
 
         // Invalidate semantic cache for this table BEFORE commit
         // CRITICAL: Must invalidate before commit to prevent stale data window

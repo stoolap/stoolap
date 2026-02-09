@@ -131,15 +131,17 @@ pub trait Engine: Send + Sync {
         column_names: &[String],
         is_unique: bool,
         index_type: crate::core::IndexType,
-    ) {
+    ) -> Result<()> {
         // Default implementation does nothing (for in-memory engines)
         let _ = (table_name, index_name, column_names, is_unique, index_type);
+        Ok(())
     }
 
     /// Record an index drop operation to WAL for persistence
-    fn record_drop_index(&self, table_name: &str, index_name: &str) {
+    fn record_drop_index(&self, table_name: &str, index_name: &str) -> Result<()> {
         // Default implementation does nothing
         let _ = (table_name, index_name);
+        Ok(())
     }
 
     /// Record ALTER TABLE ADD COLUMN operation to WAL for persistence
@@ -150,15 +152,17 @@ pub trait Engine: Send + Sync {
         data_type: crate::core::DataType,
         nullable: bool,
         default_expr: Option<&str>,
-    ) {
+    ) -> Result<()> {
         // Default implementation does nothing (for in-memory engines)
         let _ = (table_name, column_name, data_type, nullable, default_expr);
+        Ok(())
     }
 
     /// Record ALTER TABLE DROP COLUMN operation to WAL for persistence
-    fn record_alter_table_drop_column(&self, table_name: &str, column_name: &str) {
+    fn record_alter_table_drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
         // Default implementation does nothing
         let _ = (table_name, column_name);
+        Ok(())
     }
 
     /// Record ALTER TABLE RENAME COLUMN operation to WAL for persistence
@@ -167,9 +171,10 @@ pub trait Engine: Send + Sync {
         table_name: &str,
         old_column_name: &str,
         new_column_name: &str,
-    ) {
+    ) -> Result<()> {
         // Default implementation does nothing
         let _ = (table_name, old_column_name, new_column_name);
+        Ok(())
     }
 
     /// Record ALTER TABLE MODIFY COLUMN operation to WAL for persistence
@@ -179,15 +184,24 @@ pub trait Engine: Send + Sync {
         column_name: &str,
         data_type: crate::core::DataType,
         nullable: bool,
-    ) {
+    ) -> Result<()> {
         // Default implementation does nothing
         let _ = (table_name, column_name, data_type, nullable);
+        Ok(())
     }
 
     /// Record ALTER TABLE RENAME TO operation to WAL for persistence
-    fn record_alter_table_rename(&self, old_table_name: &str, new_table_name: &str) {
+    fn record_alter_table_rename(&self, old_table_name: &str, new_table_name: &str) -> Result<()> {
         // Default implementation does nothing
         let _ = (old_table_name, new_table_name);
+        Ok(())
+    }
+
+    /// Record TRUNCATE TABLE operation to WAL for persistence
+    fn record_truncate_table(&self, table_name: &str) -> Result<()> {
+        // Default implementation does nothing (for in-memory engines)
+        let _ = table_name;
+        Ok(())
     }
 
     /// Fetch rows by IDs directly from storage without creating a full transaction.

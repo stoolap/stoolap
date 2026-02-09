@@ -780,9 +780,16 @@ impl Index for BitmapIndex {
         bitmaps.keys().map(|arc| (**arc).clone()).collect()
     }
 
+    fn clear(&self) -> Result<()> {
+        self.bitmaps.write().unwrap().clear();
+        self.row_to_value.write().unwrap().clear();
+        self.distinct_count.store(0, AtomicOrdering::Relaxed);
+        Ok(())
+    }
+
     fn close(&mut self) -> Result<()> {
         self.closed.store(true, AtomicOrdering::Release);
-        Ok(())
+        self.clear()
     }
 }
 

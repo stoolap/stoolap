@@ -50,6 +50,10 @@ pub enum Error {
     #[error("table columns don't match, expected {expected}, got {got}")]
     TableColumnsNotMatch { expected: usize, got: usize },
 
+    /// Cannot truncate table because other transactions hold uncommitted writes
+    #[error("cannot truncate table: active transactions have uncommitted changes")]
+    TableHasActiveTransactions,
+
     // =========================================================================
     // Column errors
     // =========================================================================

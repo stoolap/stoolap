@@ -25,6 +25,25 @@ use crate::storage::mvcc::{get_fast_timestamp, MvccError, TransactionRegistry};
 use crate::storage::traits::{QueryResult, Table, Transaction};
 use crate::storage::Expression;
 
+/// DDL state captured at savepoint creation time.
+/// Used to rollback CREATE/DROP TABLE operations when rolling back to a savepoint.
+#[derive(Debug, Clone, Copy)]
+struct SavepointDdlState {
+    /// Number of created_tables entries at savepoint time
+    created_tables_len: usize,
+    /// Number of dropped_tables entries at savepoint time
+    dropped_tables_len: usize,
+}
+
+/// State captured when a savepoint is created.
+#[derive(Debug, Clone, Copy)]
+struct SavepointState {
+    /// Timestamp for rolling back DML changes
+    timestamp: i64,
+    /// DDL state for rolling back CREATE/DROP TABLE operations
+    ddl_state: SavepointDdlState,
+}
+
 /// MVCC Transaction state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionState {
@@ -56,8 +75,8 @@ pub struct MvccTransaction {
     last_table_name: Option<String>,
     /// Engine reference for table operations (will be set by Engine)
     engine_operations: Option<Arc<dyn TransactionEngineOperations>>,
-    /// Savepoints: maps savepoint name to timestamp when created
-    savepoints: FxHashMap<String, i64>,
+    /// Savepoints: maps savepoint name to state (timestamp + DDL snapshot)
+    savepoints: FxHashMap<String, SavepointState>,
     /// Tables created in this transaction (for rollback)
     created_tables: Vec<String>,
     /// Tables dropped in this transaction (for rollback - stores name and schema)
@@ -102,8 +121,17 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// Check if transaction has any pending DML changes (without allocating)
     fn has_pending_dml_changes(&self, txn_id: i64) -> bool;
 
-    /// Commit all tables for a transaction at once (includes WAL recording)
-    fn commit_all_tables(&self, txn_id: i64) -> Result<()>;
+    /// Commit all tables for a transaction at once (includes WAL recording).
+    ///
+    /// Returns `(any_committed, optional_error)`:
+    /// - `(false, None)`: no tables had changes, nothing to do
+    /// - `(true, None)`: all tables committed successfully
+    /// - `(true, Some(e))`: partial commit - some tables committed before error
+    /// - `(false, Some(e))`: error before any table committed
+    ///
+    /// Callers MUST complete_commit if any_committed is true, even on error,
+    /// to avoid orphaning already-committed rows.
+    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>);
 
     /// Rollback all tables for a transaction at once
     /// This cleans up the transaction's entries in txn_version_stores
@@ -186,15 +214,39 @@ impl MvccTransaction {
         self.registry.remove_transaction_isolation_level(self.id);
     }
 
+    /// Roll back DDL operations (CREATE TABLE / DROP TABLE) in reverse order.
+    /// Used by both explicit rollback() and implicit Drop.
+    fn rollback_ddl(&self, ops: &dyn TransactionEngineOperations) {
+        // Drop tables that were created in this transaction
+        for table_name in self.created_tables.iter().rev() {
+            if let Err(e) = ops.drop_table(table_name) {
+                eprintln!(
+                    "Warning: Failed to drop table '{}' during DDL rollback: {}",
+                    table_name, e
+                );
+            }
+        }
+
+        // Recreate tables that were dropped in this transaction
+        for (table_name, schema) in self.dropped_tables.iter().rev() {
+            if let Err(e) = ops.create_table(table_name, schema.clone()) {
+                eprintln!(
+                    "Warning: Failed to recreate table '{}' during DDL rollback: {}",
+                    table_name, e
+                );
+            }
+        }
+    }
+
     /// Check if this is a read-only transaction
     fn is_read_only(&self) -> bool {
         // Check for DDL changes
         if !self.created_tables.is_empty() || !self.dropped_tables.is_empty() {
             return false;
         }
-        // Check if any tables have local modifications
-        for table in self.tables.values() {
-            if table.has_local_changes() {
+        // Check for DML changes via engine operations
+        if let Some(ops) = &self.engine_operations {
+            if ops.has_pending_dml_changes(self.id) {
                 return false;
             }
         }
@@ -203,12 +255,22 @@ impl MvccTransaction {
 
     /// Creates a savepoint with the given name
     ///
-    /// Records the current timestamp so we can rollback to this point later.
+    /// Records the current timestamp and DDL state so we can rollback to this point later.
     /// If a savepoint with this name already exists, it is overwritten.
     pub fn create_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
         let timestamp = get_fast_timestamp();
-        self.savepoints.insert(name.to_string(), timestamp);
+        let ddl_state = SavepointDdlState {
+            created_tables_len: self.created_tables.len(),
+            dropped_tables_len: self.dropped_tables.len(),
+        };
+        self.savepoints.insert(
+            name.to_string(),
+            SavepointState {
+                timestamp,
+                ddl_state,
+            },
+        );
         Ok(())
     }
 
@@ -229,22 +291,55 @@ impl MvccTransaction {
 
     /// Rolls back to a savepoint, discarding all changes made after it
     ///
-    /// All local changes with timestamps after the savepoint are discarded.
+    /// All local DML changes with timestamps after the savepoint are discarded.
+    /// DDL operations (CREATE/DROP TABLE) after the savepoint are also reversed.
     /// The savepoint itself is also removed (SQL standard behavior).
     pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
 
-        let savepoint_ts = self.savepoints.get(name).copied().ok_or_else(|| {
+        let sp_state = self.savepoints.get(name).copied().ok_or_else(|| {
             Error::invalid_argument(format!("savepoint '{}' does not exist", name))
         })?;
 
-        // Rollback each table's local changes that occurred after the savepoint
-        for table in self.tables.values() {
-            table.rollback_to_timestamp(savepoint_ts);
+        // Rollback DML changes via engine operations (not self.tables which is empty)
+        if let Some(ops) = &self.engine_operations {
+            if let Ok(tables) = ops.get_tables_with_pending_changes(self.id) {
+                for table in &tables {
+                    table.rollback_to_timestamp(sp_state.timestamp);
+                }
+            }
+        }
+
+        // Rollback DDL: undo CREATE TABLEs after savepoint
+        if let Some(ops) = &self.engine_operations {
+            // Tables created after savepoint need to be dropped
+            while self.created_tables.len() > sp_state.ddl_state.created_tables_len {
+                if let Some(table_name) = self.created_tables.pop() {
+                    if let Err(e) = ops.drop_table(&table_name) {
+                        eprintln!(
+                            "Warning: Failed to drop table '{}' during savepoint rollback: {}",
+                            table_name, e
+                        );
+                    }
+                }
+            }
+
+            // Tables dropped after savepoint need to be recreated
+            while self.dropped_tables.len() > sp_state.ddl_state.dropped_tables_len {
+                if let Some((table_name, schema)) = self.dropped_tables.pop() {
+                    if let Err(e) = ops.create_table(&table_name, schema) {
+                        eprintln!(
+                            "Warning: Failed to recreate table '{}' during savepoint rollback: {}",
+                            table_name, e
+                        );
+                    }
+                }
+            }
         }
 
         // Remove this savepoint and all savepoints created after it
-        self.savepoints.retain(|_, &mut ts| ts <= savepoint_ts);
+        self.savepoints
+            .retain(|_, sp| sp.timestamp <= sp_state.timestamp);
 
         Ok(())
     }
@@ -256,7 +351,7 @@ impl MvccTransaction {
 
     /// Gets the timestamp associated with a savepoint
     pub fn get_savepoint_ts(&self, name: &str) -> Option<i64> {
-        self.savepoints.get(name).copied()
+        self.savepoints.get(name).map(|sp| sp.timestamp)
     }
 }
 
@@ -294,12 +389,24 @@ impl Transaction for MvccTransaction {
             // Phase 2: Commit all tables - apply local changes to global store
             // This now includes WAL recording internally (before each table commit)
             if let Some(ops) = &self.engine_operations {
-                if let Err(e) = ops.commit_all_tables(self.id) {
-                    // Abort on failure
-                    self.registry.abort_transaction(self.id);
-                    self.state = TransactionState::RolledBack;
-                    self.cleanup();
-                    return Err(e);
+                let (any_committed, error) = ops.commit_all_tables(self.id);
+                if let Some(e) = error {
+                    if any_committed {
+                        // Partial commit: some tables already committed.
+                        // We MUST complete the commit to avoid orphaning those rows.
+                        self.registry.complete_commit(self.id);
+                        // Record commit marker so WAL recovery sees committed state
+                        ops.record_commit(self.id)?;
+                        self.state = TransactionState::Committed;
+                        self.cleanup();
+                        return Err(e);
+                    } else {
+                        // Nothing committed yet - safe to abort cleanly
+                        self.registry.abort_transaction(self.id);
+                        self.state = TransactionState::RolledBack;
+                        self.cleanup();
+                        return Err(e);
+                    }
                 }
             }
 
@@ -308,7 +415,7 @@ impl Transaction for MvccTransaction {
 
             // Record commit marker in WAL
             if let Some(ops) = &self.engine_operations {
-                let _ = ops.record_commit(self.id);
+                ops.record_commit(self.id)?;
             }
         } else {
             // Read-only transaction - just mark as committed in registry
@@ -331,50 +438,9 @@ impl Transaction for MvccTransaction {
         // Mark transaction as aborted in registry
         self.registry.abort_transaction(self.id);
 
-        // Rollback DDL operations in reverse order
-        // We attempt all rollbacks even if some fail, but track errors
-        let mut ddl_rollback_errors: Vec<String> = Vec::new();
-
+        // Rollback DDL operations (CREATE TABLE / DROP TABLE) in reverse order
         if let Some(ops) = &self.engine_operations {
-            // Drop tables that were created in this transaction
-            for table_name in self.created_tables.iter().rev() {
-                if let Err(e) = ops.drop_table(table_name) {
-                    ddl_rollback_errors.push(format!(
-                        "Failed to drop table '{}' during rollback: {}",
-                        table_name, e
-                    ));
-                }
-            }
-
-            // Recreate tables that were dropped in this transaction
-            // NOTE: This only recreates the table structure (schema), NOT the data.
-            // DROP TABLE within a transaction is a destructive operation - the data
-            // cannot be recovered on rollback. This is similar to PostgreSQL's behavior
-            // where certain DDL operations are not fully transactional.
-            for (table_name, schema) in self.dropped_tables.iter().rev() {
-                if let Err(e) = ops.create_table(table_name, schema.clone()) {
-                    ddl_rollback_errors.push(format!(
-                        "Failed to recreate table '{}' during rollback: {}",
-                        table_name, e
-                    ));
-                } else {
-                    // Warn that data was lost
-                    eprintln!(
-                        "Warning: Table '{}' was recreated during rollback but data was lost. \
-                         DROP TABLE is not fully transactional.",
-                        table_name
-                    );
-                }
-            }
-        }
-
-        // Log DDL rollback errors (but continue with rollback)
-        if !ddl_rollback_errors.is_empty() {
-            eprintln!(
-                "Warning: DDL rollback encountered {} error(s): {:?}",
-                ddl_rollback_errors.len(),
-                ddl_rollback_errors
-            );
+            self.rollback_ddl(ops.as_ref());
         }
 
         // Rollback all tables - discard local changes
@@ -667,10 +733,13 @@ impl Drop for MvccTransaction {
             // Silent rollback on drop
             self.registry.abort_transaction(self.id);
 
-            // Clean up txn_version_stores to prevent memory leak
-            // This is critical for read-only transactions that call get_table()
-            // but are dropped without explicit commit/rollback
             if let Some(ops) = &self.engine_operations {
+                // Roll back DDL operations (CREATE TABLE / DROP TABLE)
+                self.rollback_ddl(ops.as_ref());
+
+                // Clean up txn_version_stores to prevent memory leak
+                // This is critical for read-only transactions that call get_table()
+                // but are dropped without explicit commit/rollback
                 ops.rollback_all_tables(self.id);
             }
 

@@ -43,6 +43,7 @@ pub mod file_lock;
 pub mod hash_index;
 pub mod multi_column_index;
 pub mod persistence;
+pub mod pk_index;
 pub mod registry;
 pub mod scanner;
 pub mod snapshot;
@@ -68,6 +69,7 @@ pub use persistence::{
     IndexMetadata, PersistenceManager, PersistenceMeta, DEFAULT_KEEP_SNAPSHOTS,
     DEFAULT_SNAPSHOT_INTERVAL,
 };
+pub use pk_index::PkIndex;
 pub use registry::{TransactionRegistry, INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID};
 pub use scanner::{EmptyScanner, MVCCScanner, RangeScanner, SingleRowScanner};
 pub use snapshot::{DiskVersionStore, SnapshotReader, SnapshotWriter};

@@ -820,9 +820,16 @@ impl Index for HashIndex {
         Some(count)
     }
 
+    fn clear(&self) -> Result<()> {
+        self.hash_to_rows.write().unwrap().clear();
+        self.row_to_hash.write().unwrap().clear();
+        self.hash_to_values.write().unwrap().clear();
+        Ok(())
+    }
+
     fn close(&mut self) -> Result<()> {
         self.closed.store(true, AtomicOrdering::Release);
-        Ok(())
+        self.clear()
     }
 }
 

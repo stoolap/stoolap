@@ -37,7 +37,7 @@ use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
     BetweenExpression, BooleanLiteral, Expression, FloatLiteral, FunctionCall, Identifier,
     InExpression, InfixExpression, InfixOperator, IntegerLiteral, LikeExpression, ListExpression,
-    NullLiteral, PrefixExpression, QualifiedIdentifier, StringLiteral,
+    NullLiteral, PrefixExpression, QualifiedIdentifier, StringLiteral, WindowFrameBound,
 };
 use crate::parser::token::{Position, Token, TokenType};
 
@@ -715,9 +715,102 @@ pub fn expressions_equivalent(a: &Expression, b: &Expression) -> bool {
             pa.operator == pb.operator && expressions_equivalent(&pa.right, &pb.right)
         }
         (Expression::Between(ba), Expression::Between(bb)) => {
-            expressions_equivalent(&ba.expr, &bb.expr)
+            ba.not == bb.not
+                && expressions_equivalent(&ba.expr, &bb.expr)
                 && expressions_equivalent(&ba.lower, &bb.lower)
                 && expressions_equivalent(&ba.upper, &bb.upper)
+        }
+        (Expression::In(ia), Expression::In(ib)) => {
+            ia.not == ib.not
+                && expressions_equivalent(&ia.left, &ib.left)
+                && expressions_equivalent(&ia.right, &ib.right)
+        }
+        (Expression::ExpressionList(la), Expression::ExpressionList(lb)) => {
+            la.expressions.len() == lb.expressions.len()
+                && la
+                    .expressions
+                    .iter()
+                    .zip(lb.expressions.iter())
+                    .all(|(ae, be)| expressions_equivalent(ae, be))
+        }
+        (Expression::Like(la), Expression::Like(lb)) => {
+            la.operator == lb.operator
+                && expressions_equivalent(&la.left, &lb.left)
+                && expressions_equivalent(&la.pattern, &lb.pattern)
+                && match (&la.escape, &lb.escape) {
+                    (None, None) => true,
+                    (Some(ea), Some(eb)) => expressions_equivalent(ea, eb),
+                    _ => false,
+                }
+        }
+        (Expression::FunctionCall(fa), Expression::FunctionCall(fb)) => {
+            function_calls_equivalent(fa, fb)
+        }
+        (Expression::Window(wa), Expression::Window(wb)) => {
+            function_calls_equivalent(&wa.function, &wb.function)
+                && wa.window_ref == wb.window_ref
+                && wa.partition_by.len() == wb.partition_by.len()
+                && wa
+                    .partition_by
+                    .iter()
+                    .zip(wb.partition_by.iter())
+                    .all(|(ae, be)| expressions_equivalent(ae, be))
+                && wa.order_by.len() == wb.order_by.len()
+                && wa.order_by.iter().zip(wb.order_by.iter()).all(|(oa, ob)| {
+                    oa.ascending == ob.ascending
+                        && oa.nulls_first == ob.nulls_first
+                        && expressions_equivalent(&oa.expression, &ob.expression)
+                })
+                && match (&wa.frame, &wb.frame) {
+                    (None, None) => true,
+                    (Some(fa), Some(fb)) => {
+                        fa.unit == fb.unit
+                            && window_bounds_equivalent(&fa.start, &fb.start)
+                            && match (&fa.end, &fb.end) {
+                                (None, None) => true,
+                                (Some(ea), Some(eb)) => window_bounds_equivalent(ea, eb),
+                                _ => false,
+                            }
+                    }
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
+/// Compare two FunctionCall structs for structural equivalence.
+fn function_calls_equivalent(fa: &FunctionCall, fb: &FunctionCall) -> bool {
+    fa.function.eq_ignore_ascii_case(&fb.function)
+        && fa.is_distinct == fb.is_distinct
+        && fa.arguments.len() == fb.arguments.len()
+        && fa
+            .arguments
+            .iter()
+            .zip(fb.arguments.iter())
+            .all(|(ae, be)| expressions_equivalent(ae, be))
+        && fa.order_by.len() == fb.order_by.len()
+        && fa.order_by.iter().zip(fb.order_by.iter()).all(|(oa, ob)| {
+            oa.ascending == ob.ascending
+                && oa.nulls_first == ob.nulls_first
+                && expressions_equivalent(&oa.expression, &ob.expression)
+        })
+        && match (&fa.filter, &fb.filter) {
+            (None, None) => true,
+            (Some(ea), Some(eb)) => expressions_equivalent(ea, eb),
+            _ => false,
+        }
+}
+
+/// Compare two WindowFrameBound values for structural equivalence.
+fn window_bounds_equivalent(a: &WindowFrameBound, b: &WindowFrameBound) -> bool {
+    match (a, b) {
+        (WindowFrameBound::CurrentRow, WindowFrameBound::CurrentRow)
+        | (WindowFrameBound::UnboundedPreceding, WindowFrameBound::UnboundedPreceding)
+        | (WindowFrameBound::UnboundedFollowing, WindowFrameBound::UnboundedFollowing) => true,
+        (WindowFrameBound::Preceding(ea), WindowFrameBound::Preceding(eb))
+        | (WindowFrameBound::Following(ea), WindowFrameBound::Following(eb)) => {
+            expressions_equivalent(ea, eb)
         }
         _ => false,
     }

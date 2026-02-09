@@ -1489,11 +1489,50 @@ impl<V: Clone> CowBTree<V> {
             .flat_map(|(keys, values)| keys.iter().zip(values.iter()))
     }
 
+    /// Iterate over chunks in reverse order (rightmost leaf to leftmost)
+    pub fn iter_rev_chunks(&self) -> impl Iterator<Item = (&[i64], &[V])> {
+        CowBTreeRevChunkIter::new(self.root.as_ref())
+    }
+
+    /// Iterate over all key-value pairs in reverse sorted order (largest to smallest)
+    pub fn iter_rev(&self) -> impl Iterator<Item = (&i64, &V)> {
+        self.iter_rev_chunks()
+            .flat_map(|(keys, values)| keys.iter().zip(values.iter()).rev())
+    }
+
+    /// Yields chunks within the range in reverse order (rightmost matching leaf first).
+    /// Each chunk is a slice from a single leaf node, keys in ascending order within the chunk.
+    pub fn range_rev_chunks<R>(&self, range: R) -> impl Iterator<Item = (&[i64], &[V])>
+    where
+        R: std::ops::RangeBounds<i64>,
+    {
+        CowBTreeRevRangeChunkIter::new(self.root.as_ref(), range)
+    }
+
+    /// Iterator over a sub-range in reverse order (largest to smallest within range).
+    pub fn range_rev<R>(&self, range: R) -> impl Iterator<Item = (&i64, &V)>
+    where
+        R: std::ops::RangeBounds<i64>,
+    {
+        self.range_rev_chunks(range)
+            .flat_map(|(keys, values)| keys.iter().zip(values.iter()).rev())
+    }
+
     /// Clear all entries
     pub fn clear(&mut self) {
         self.root = None;
         self.max_key = 0;
         self.len = 0;
+    }
+
+    /// Returns the cached maximum key, or None if the tree is empty.
+    #[inline]
+    pub fn max_key(&self) -> Option<i64> {
+        if self.root.is_some() {
+            Some(self.max_key)
+        } else {
+            None
+        }
     }
 
     fn insert_rightmost_entry(&mut self, key: i64, value: V) -> *mut V {
@@ -1976,6 +2015,217 @@ impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> Iterator for CowBTreeRangeChun
 impl<V: Clone + std::fmt::Debug> std::fmt::Debug for CowBTree<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+/// Reverse iterator over a CowBTree yielding chunks from rightmost leaf to leftmost
+struct CowBTreeRevChunkIter<'a, V: Clone> {
+    /// Stack of (node, next_child_plus_one) for reverse traversal.
+    /// next_child_plus_one == 0 means no more children to visit at this level.
+    stack: Vec<(&'a NodePtr<V>, usize)>,
+    /// Current leaf node being yielded
+    current_leaf: Option<&'a NodePtr<V>>,
+}
+
+impl<'a, V: Clone> CowBTreeRevChunkIter<'a, V> {
+    fn new(root: Option<&'a NodePtr<V>>) -> Self {
+        let mut iter = Self {
+            stack: Vec::new(),
+            current_leaf: None,
+        };
+        if let Some(root) = root {
+            iter.descend_to_rightmost(root);
+        }
+        iter
+    }
+
+    /// Descend to the rightmost leaf, pushing internal nodes onto the stack
+    fn descend_to_rightmost(&mut self, mut node: &'a NodePtr<V>) {
+        while !node.is_leaf() {
+            let last_child = node.len(); // children indices: 0..=len
+                                         // After visiting child(last_child), next to visit going left is child(last_child-1)
+                                         // Store last_child as next_child_plus_one
+            self.stack.push((node, last_child));
+            node = node.child(last_child);
+        }
+        self.current_leaf = Some(node);
+    }
+}
+
+impl<'a, V: Clone> Iterator for CowBTreeRevChunkIter<'a, V> {
+    type Item = (&'a [i64], &'a [V]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(leaf) = self.current_leaf.take() {
+            return Some((leaf.keys(), leaf.values()));
+        }
+
+        loop {
+            let (node, next_plus_one) = self.stack.last_mut()?;
+
+            if *next_plus_one > 0 {
+                let child_idx = *next_plus_one - 1;
+                *next_plus_one = child_idx;
+                let child = node.child(child_idx);
+                self.descend_to_rightmost(child);
+
+                if let Some(leaf) = self.current_leaf.take() {
+                    return Some((leaf.keys(), leaf.values()));
+                }
+            } else {
+                self.stack.pop();
+            }
+        }
+    }
+}
+
+/// Reverse range iterator over a CowBTree yielding chunks from end bound to start bound.
+/// Each chunk contains keys in ascending order; the consumer should reverse within each chunk.
+struct CowBTreeRevRangeChunkIter<'a, V: Clone, R> {
+    stack: Vec<(&'a NodePtr<V>, usize)>,
+    range: R,
+    current_leaf: Option<&'a NodePtr<V>>,
+    /// End index (exclusive) within current leaf
+    current_end_idx: usize,
+    finished: bool,
+}
+
+impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> CowBTreeRevRangeChunkIter<'a, V, R> {
+    fn new(root: Option<&'a NodePtr<V>>, range: R) -> Self {
+        let mut iter = Self {
+            stack: Vec::new(),
+            range,
+            current_leaf: None,
+            current_end_idx: 0,
+            finished: false,
+        };
+        if let Some(root) = root {
+            iter.seek_to_end(root);
+        } else {
+            iter.finished = true;
+        }
+        iter
+    }
+
+    /// Descend to the rightmost leaf, setting current_end_idx to the full leaf length
+    fn descend_to_rightmost(&mut self, mut node: &'a NodePtr<V>) {
+        while !node.is_leaf() {
+            let last_child = node.len();
+            self.stack.push((node, last_child));
+            node = node.child(last_child);
+        }
+        self.current_leaf = Some(node);
+        self.current_end_idx = node.len();
+    }
+
+    /// Seek to the end bound of the range (the starting point for reverse iteration)
+    fn seek_to_end(&mut self, mut node: &'a NodePtr<V>) {
+        let end_key = match self.range.end_bound() {
+            Bound::Included(&k) | Bound::Excluded(&k) => Some(k),
+            Bound::Unbounded => None,
+        };
+
+        if end_key.is_none() {
+            // Unbounded upper: start from rightmost leaf
+            self.descend_to_rightmost(node);
+            return;
+        }
+
+        let k = end_key.unwrap();
+
+        loop {
+            if node.is_leaf() {
+                let keys = node.keys();
+                let idx = match keys.binary_search(&k) {
+                    Ok(i) => match self.range.end_bound() {
+                        Bound::Included(_) => i + 1,
+                        _ => i,
+                    },
+                    Err(i) => i,
+                };
+
+                if idx > 0 {
+                    self.current_leaf = Some(node);
+                    self.current_end_idx = idx;
+                }
+                // If idx == 0, no valid entries in this leaf for our range.
+                // The first next() call will navigate to the previous leaf.
+                break;
+            } else {
+                let child_idx = match node.search(k) {
+                    Ok(i) => i + 1,
+                    Err(i) => i,
+                };
+                // Store child_idx as next_child_plus_one: children before child_idx
+                self.stack.push((node, child_idx));
+                node = node.child(child_idx);
+            }
+        }
+    }
+}
+
+impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> Iterator for CowBTreeRevRangeChunkIter<'a, V, R> {
+    type Item = (&'a [i64], &'a [V]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        loop {
+            if let Some(leaf) = self.current_leaf {
+                let keys = leaf.keys();
+                let values = leaf.values();
+                let end = self.current_end_idx;
+
+                // Check start bound (lower bound) - trim from the left
+                let start = if end == 0 {
+                    end // Empty chunk, will be skipped
+                } else {
+                    match self.range.start_bound() {
+                        Bound::Unbounded => 0,
+                        Bound::Included(&k) => {
+                            if keys[0] >= k {
+                                0 // Entire chunk is within range
+                            } else {
+                                self.finished = true;
+                                keys[..end].partition_point(|&x| x < k)
+                            }
+                        }
+                        Bound::Excluded(&k) => {
+                            if keys[0] > k {
+                                0
+                            } else {
+                                self.finished = true;
+                                keys[..end].partition_point(|&x| x <= k)
+                            }
+                        }
+                    }
+                };
+
+                self.current_leaf = None;
+
+                if start < end {
+                    return Some((&keys[start..end], &values[start..end]));
+                }
+
+                if self.finished {
+                    return None;
+                }
+            }
+
+            // Navigate to previous leaf
+            let (node, next_plus_one) = self.stack.last_mut()?;
+
+            if *next_plus_one > 0 {
+                let child_idx = *next_plus_one - 1;
+                *next_plus_one = child_idx;
+                let child = node.child(child_idx);
+                self.descend_to_rightmost(child);
+            } else {
+                self.stack.pop();
+            }
+        }
     }
 }
 
@@ -3661,5 +3911,145 @@ mod tests {
         for i in (0..20_000).step_by(100) {
             assert_eq!(tree.get(i), Some(&i));
         }
+    }
+
+    #[test]
+    fn test_iter_rev() {
+        let mut tree: CowBTree<i64> = CowBTree::new();
+        for i in 0..500 {
+            tree.insert(i, i * 10);
+        }
+
+        // iter_rev should yield all entries in descending key order
+        let rev: Vec<(i64, i64)> = tree.iter_rev().map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(rev.len(), 500);
+        for (i, &(k, v)) in rev.iter().enumerate() {
+            assert_eq!(k, 499 - i as i64);
+            assert_eq!(v, k * 10);
+        }
+
+        // iter_rev on empty tree
+        let empty: CowBTree<i64> = CowBTree::new();
+        assert_eq!(empty.iter_rev().count(), 0);
+    }
+
+    #[test]
+    fn test_range_rev() {
+        let mut tree: CowBTree<i64> = CowBTree::new();
+        for i in 0..500 {
+            tree.insert(i, i * 10);
+        }
+
+        // range_rev with Excluded start, Unbounded end (keyset pagination pattern)
+        let result: Vec<(i64, i64)> = tree
+            .range_rev((std::ops::Bound::Excluded(100), std::ops::Bound::Unbounded))
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        assert_eq!(result.len(), 399); // 101..499 inclusive
+        assert_eq!(result[0], (499, 4990)); // Largest first
+        assert_eq!(result[398], (101, 1010)); // Smallest last
+
+        // range_rev with Included start, Unbounded end
+        let result: Vec<(i64, i64)> = tree
+            .range_rev((std::ops::Bound::Included(100), std::ops::Bound::Unbounded))
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        assert_eq!(result.len(), 400); // 100..499 inclusive
+        assert_eq!(result[0], (499, 4990));
+        assert_eq!(result[399], (100, 1000));
+
+        // range_rev with both bounds
+        let result: Vec<(i64, i64)> = tree
+            .range_rev((
+                std::ops::Bound::Included(200),
+                std::ops::Bound::Excluded(300),
+            ))
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        assert_eq!(result.len(), 100); // 200..299 inclusive
+        assert_eq!(result[0], (299, 2990));
+        assert_eq!(result[99], (200, 2000));
+
+        // range_rev with Included end
+        let result: Vec<(i64, i64)> = tree
+            .range_rev((
+                std::ops::Bound::Included(200),
+                std::ops::Bound::Included(300),
+            ))
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        assert_eq!(result.len(), 101); // 200..=300 inclusive
+        assert_eq!(result[0], (300, 3000));
+        assert_eq!(result[100], (200, 2000));
+
+        // range_rev unbounded both sides = iter_rev
+        let all_rev: Vec<i64> = tree
+            .range_rev((
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded::<i64>,
+            ))
+            .map(|(&k, _)| k)
+            .collect();
+        let iter_rev: Vec<i64> = tree.iter_rev().map(|(&k, _)| k).collect();
+        assert_eq!(all_rev, iter_rev);
+    }
+
+    #[test]
+    fn test_iter_rev_on_deep_tree() {
+        let mut tree: CowBTree<i64> = CowBTree::new();
+        for i in 0..20_000 {
+            tree.insert(i, i);
+        }
+
+        // iter_rev should return all keys in reverse order
+        let rev_keys: Vec<i64> = tree.iter_rev().map(|(&k, _)| k).collect();
+        assert_eq!(rev_keys.len(), 20_000);
+        for (i, &k) in rev_keys.iter().enumerate() {
+            assert_eq!(k, 19_999 - i as i64);
+        }
+
+        // Taking a small prefix is O(limit), not O(n)
+        let first_5: Vec<i64> = tree.iter_rev().map(|(&k, _)| k).take(5).collect();
+        assert_eq!(first_5, vec![19_999, 19_998, 19_997, 19_996, 19_995]);
+    }
+
+    #[test]
+    fn test_range_rev_on_deep_tree() {
+        let mut tree: CowBTree<i64> = CowBTree::new();
+        for i in 0..20_000 {
+            tree.insert(i, i);
+        }
+
+        // Keyset pagination pattern: WHERE id > 15000 ORDER BY id DESC LIMIT 5
+        let page: Vec<i64> = tree
+            .range_rev((
+                std::ops::Bound::Excluded(15_000),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(&k, _)| k)
+            .take(5)
+            .collect();
+        assert_eq!(page, vec![19_999, 19_998, 19_997, 19_996, 19_995]);
+
+        // Keyset pagination: WHERE id > 5000 ORDER BY id DESC LIMIT 5
+        let page: Vec<i64> = tree
+            .range_rev((std::ops::Bound::Excluded(5_000), std::ops::Bound::Unbounded))
+            .map(|(&k, _)| k)
+            .take(5)
+            .collect();
+        assert_eq!(page, vec![19_999, 19_998, 19_997, 19_996, 19_995]);
+
+        // Bounded range in reverse
+        let result: Vec<i64> = tree
+            .range_rev((
+                std::ops::Bound::Included(10_000),
+                std::ops::Bound::Excluded(10_010),
+            ))
+            .map(|(&k, _)| k)
+            .collect();
+        assert_eq!(
+            result,
+            vec![10_009, 10_008, 10_007, 10_006, 10_005, 10_004, 10_003, 10_002, 10_001, 10_000]
+        );
     }
 }

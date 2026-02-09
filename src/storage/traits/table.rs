@@ -308,6 +308,13 @@ pub trait Table: Send + Sync {
     /// The number of rows deleted
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32>;
 
+    /// Truncates the table, removing all rows efficiently.
+    /// Unlike DELETE, this drops storage directly instead of creating delete versions.
+    /// Default implementation falls back to delete(None).
+    fn truncate(&mut self) -> Result<i32> {
+        self.delete(None)
+    }
+
     /// Scans the table and returns a scanner over matching rows
     ///
     /// # Arguments

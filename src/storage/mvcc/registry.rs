@@ -857,6 +857,10 @@ impl VisibilityChecker for TransactionRegistry {
     fn is_committed_before(&self, txn_id: i64, cutoff_commit_seq: i64) -> bool {
         TransactionRegistry::is_committed_before(self, txn_id, cutoff_commit_seq)
     }
+
+    fn needs_snapshot_isolation(&self, txn_id: i64) -> bool {
+        TransactionRegistry::needs_snapshot_isolation(self, txn_id)
+    }
 }
 
 #[cfg(test)]

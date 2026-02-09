@@ -276,7 +276,8 @@ impl RowArena {
             if arena_idx < inner.meta.len() {
                 // Replace data with empty Arc to release memory
                 inner.data[arena_idx] = CompactArc::from(Vec::<Value>::new());
-                // Mark metadata as cleared (row_id = 0 indicates cleared slot)
+                // Mark metadata as cleared (txn_id = 0 is the cleared sentinel;
+                // row_id = 0 is a valid user PK, but txn_id is always > 0 for real rows)
                 inner.meta[arena_idx] = ArenaRowMeta {
                     row_id: 0,
                     txn_id: 0,
@@ -356,6 +357,16 @@ impl RowArena {
         } else {
             false
         }
+    }
+
+    /// Drop all data and recreate with default capacity.
+    /// This releases all memory immediately (O(1) memory release)
+    /// unlike clear_batch which only clears slots but retains Vec capacity.
+    pub fn clear_all(&self) {
+        let mut inner = self.inner.write();
+        inner.data = Vec::with_capacity(10_000);
+        inner.meta = Vec::with_capacity(10_000);
+        self.free_list.lock().clear();
     }
 
     /// Get the number of rows (including deleted)
