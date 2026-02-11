@@ -229,6 +229,95 @@ fn read_snapshot_lsn(snapshot_dir: &std::path::Path) -> u64 {
     0
 }
 
+/// Determine the safe WAL truncation LSN based on verified snapshots.
+/// Returns None if truncation is not safe (< 2 surviving snapshots for any table).
+/// Returns Some(lsn) where lsn is the minimum second-to-last verified snapshot's LSN
+/// across all tables. This ensures that if the latest snapshot is corrupted, the
+/// previous snapshot + WAL entries from that point can fully reconstruct the database.
+///
+/// `keep_count` is the number of snapshots that Phase 6 cleanup will retain.
+/// Only the `keep_count` newest snapshots per table will survive cleanup, so we must
+/// only consider those when computing the safe truncation point. If `keep_count < 2`
+/// (or 0 meaning "keep all"), the function adjusts accordingly.
+fn find_safe_truncation_lsn(
+    snapshot_dir: &std::path::Path,
+    keep_count: usize,
+    active_tables: &rustc_hash::FxHashSet<&str>,
+) -> Option<u64> {
+    // Enumerate table subdirectories, skipping orphaned directories from dropped tables.
+    // Without this filter, a dropped table's snapshot directory (with < 2 snapshots)
+    // would permanently block WAL truncation for the entire database.
+    let entries = match std::fs::read_dir(snapshot_dir) {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+
+    let mut table_dirs: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                if active_tables.contains(dir_name) {
+                    table_dirs.push(path);
+                }
+            }
+        }
+    }
+
+    if table_dirs.is_empty() {
+        return None;
+    }
+
+    let mut min_second_to_last_lsn: Option<u64> = None;
+
+    for table_dir in &table_dirs {
+        // Collect all snapshot-*.bin files sorted by name (timestamp)
+        let mut snap_files: Vec<std::path::PathBuf> = match std::fs::read_dir(table_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with("snapshot-") && name.ends_with(".bin") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            Err(_) => return None,
+        };
+        snap_files.sort();
+
+        // Only consider snapshots that will survive Phase 6 cleanup.
+        // keep_count == 0 means "no cleanup" (keep all), otherwise keep the newest N.
+        let surviving = if keep_count > 0 && snap_files.len() > keep_count {
+            &snap_files[snap_files.len() - keep_count..]
+        } else {
+            &snap_files[..]
+        };
+
+        // Need at least 2 surviving snapshots for safe truncation
+        if surviving.len() < 2 {
+            return None;
+        }
+
+        // CRC-verify the second-to-last surviving snapshot
+        let second_to_last = &surviving[surviving.len() - 2];
+        let lsn = match super::snapshot::verify_snapshot_integrity(second_to_last) {
+            Ok(lsn) => lsn,
+            Err(_) => return None, // Second-to-last fails CRC → skip truncation
+        };
+
+        // Track the minimum across all tables
+        min_second_to_last_lsn = Some(match min_second_to_last_lsn {
+            Some(current_min) => current_min.min(lsn),
+            None => lsn,
+        });
+    }
+
+    min_second_to_last_lsn
+}
+
 /// View definition storing the query that defines the view
 #[derive(Debug, Clone)]
 pub struct ViewDefinition {
@@ -511,8 +600,13 @@ impl MVCCEngine {
         // Read the snapshot LSN from metadata (supports both binary and JSON formats)
         let metadata_lsn = read_snapshot_lsn(&snapshot_dir);
 
-        // Track max source_lsn from snapshot headers for validation/fallback
-        let mut max_header_lsn: u64 = 0;
+        // Track min source_lsn from snapshot headers for crash-safe replay.
+        // We use MIN (not max) because after a crash during snapshot rename,
+        // some tables may have new snapshots (high LSN) while others still have
+        // old snapshots (low LSN). Using max would skip WAL entries needed by
+        // tables with old snapshots.
+        let mut min_header_lsn: u64 = u64::MAX;
+        let mut any_snapshot_loaded = false;
 
         // Find and load table snapshots
         let table_dirs = match std::fs::read_dir(&snapshot_dir) {
@@ -527,50 +621,78 @@ impl MVCCEngine {
 
             let table_name = entry.file_name().to_string_lossy().to_string();
 
-            // Find the most recent snapshot file in this directory
-            if let Some(snapshot_path) = self.find_latest_snapshot(&entry.path()) {
-                match self.load_table_snapshot(&table_name, &snapshot_path) {
+            // Find snapshot files newest-first and try each until one loads.
+            // This provides fallback: if the latest snapshot is corrupted,
+            // we can load the previous one and replay WAL from its LSN.
+            let snapshot_paths = Self::find_snapshots_newest_first(&entry.path());
+            for snapshot_path in &snapshot_paths {
+                match self.load_table_snapshot(&table_name, snapshot_path) {
                     Ok(source_lsn) => {
-                        // Track max source_lsn from snapshot headers (v3+ format)
-                        if source_lsn > max_header_lsn {
-                            max_header_lsn = source_lsn;
+                        any_snapshot_loaded = true;
+                        if source_lsn < min_header_lsn {
+                            min_header_lsn = source_lsn;
                         }
+                        break; // Successfully loaded, stop trying older snapshots
                     }
                     Err(e) => {
                         eprintln!("Warning: Failed to load snapshot for {}: {}", table_name, e);
+                        // Try the next (older) snapshot
                     }
                 }
             }
         }
 
-        // Use the larger of metadata LSN and max header LSN
-        // - If metadata file is missing, use header LSN (v3+ fallback)
-        // - If metadata exists and matches header, use metadata (normal case)
-        // - If metadata is smaller than header, prefer header (corruption recovery)
-        let snapshot_lsn = std::cmp::max(metadata_lsn, max_header_lsn);
+        // If no snapshot loaded successfully, replay WAL from the beginning.
+        // This handles the case where snapshot files are corrupted — we must NOT trust
+        // metadata_lsn because those entries are not in any loaded snapshot.
+        // Also remove checkpoint.meta, which was created alongside the snapshot —
+        // if the snapshot is gone, the checkpoint is invalid and would cause
+        // replay_two_phase to skip entries that need to be replayed.
+        if !any_snapshot_loaded {
+            let checkpoint_path = pm.path().join("wal").join("checkpoint.meta");
+            let _ = std::fs::remove_file(checkpoint_path);
+            return Ok(0);
+        }
+
+        // Use the SMALLER of metadata LSN and min header LSN for safety.
+        // - Normal case: metadata_lsn == header_lsn (consistent)
+        // - Crash during snapshot rename: metadata_lsn may be old (or 0),
+        //   header_lsn reflects the oldest snapshot — use the smaller to ensure
+        //   WAL replay covers all tables
+        // - If metadata is missing (0), header_lsn provides fallback
+        let snapshot_lsn = if metadata_lsn == 0 {
+            min_header_lsn
+        } else if min_header_lsn == u64::MAX {
+            metadata_lsn
+        } else {
+            std::cmp::min(metadata_lsn, min_header_lsn)
+        };
 
         Ok(snapshot_lsn)
     }
 
-    /// Find the most recent snapshot file in a directory
-    fn find_latest_snapshot(&self, dir: &std::path::Path) -> Option<std::path::PathBuf> {
-        let mut snapshots: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("snapshot-") && n.ends_with(".bin"))
-                    .unwrap_or(false)
-            })
-            .collect();
+    /// Find snapshot files in a directory, sorted newest-first.
+    /// Returns all snapshot-*.bin files so the caller can try fallbacks if the latest is corrupt.
+    fn find_snapshots_newest_first(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut snapshots: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("snapshot-") && n.ends_with(".bin"))
+                        .unwrap_or(false)
+                })
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
 
-        // Sort by name (timestamp in filename)
+        // Sort by name (timestamp in filename) then reverse for newest-first
         snapshots.sort();
+        snapshots.reverse();
 
-        // Return the latest one
-        snapshots.pop()
+        snapshots
     }
 
     /// Load a single table's snapshot from disk
@@ -2069,18 +2191,24 @@ impl Engine for MVCCEngine {
             _ => return Ok(()), // No persistence, nothing to snapshot
         };
 
-        // CRITICAL: Capture the commit sequence BEFORE the checkpoint.
-        // This ensures we only include transactions that were committed before this
-        // point during the snapshot iteration. If we captured it after checkpoint,
-        // a transaction committing between checkpoint and this read would be in the
-        // WAL (included by checkpoint) but not in the snapshot (filtered by commit_seq),
-        // causing inconsistency on recovery.
-        let snapshot_commit_seq = self.registry.current_commit_sequence();
-
         // Create checkpoint and capture the LSN atomically.
         // create_checkpoint() flushes and syncs all pending WAL entries, then returns
         // the LSN at the exact checkpoint point.
         let snapshot_lsn = pm.create_checkpoint(vec![])?;
+
+        // CRITICAL: Capture the commit sequence AFTER the checkpoint.
+        // This ensures any transaction that committed before checkpoint.lsn will
+        // have commit_seq <= snapshot_commit_seq, so its data IS in the snapshot.
+        // If we captured commit_seq BEFORE checkpoint, a transaction committing
+        // between the two would have its WAL entries included in the checkpoint
+        // range (LSN <= checkpoint.lsn) but NOT in the snapshot (commit_seq was
+        // too early), causing data loss after WAL truncation.
+        //
+        // With this order (checkpoint → commit_seq), a transaction committing
+        // between the two has: WAL entries with LSN > checkpoint.lsn (survive
+        // truncation) AND commit_seq <= snapshot_commit_seq (data in snapshot).
+        // The duplicate is harmless since WAL replay is idempotent.
+        let snapshot_commit_seq = self.registry.current_commit_sequence();
 
         // Create snapshot directory
         let snapshot_dir = pm.path().join("snapshots");
@@ -2263,7 +2391,7 @@ impl Engine for MVCCEngine {
         //
         // Note: Each snapshot file also embeds source_lsn in its header (v3 format),
         // providing a fallback if metadata file is corrupted. load_snapshots() uses
-        // max(metadata_lsn, max_header_lsn) to handle this case.
+        // min(metadata_lsn, min_header_lsn) to handle this case safely.
 
         // Phase 4: Write snapshot metadata BEFORE cleanup and truncation
         // Using binary format with magic number and checksum for data integrity
@@ -2273,12 +2401,21 @@ impl Engine for MVCCEngine {
             return Ok(()); // Don't truncate WAL or cleanup if metadata write failed
         }
 
-        // Phase 5: Truncate WAL to remove entries up to the snapshot LSN
-        // Safe because: metadata is durable, all data up to snapshot_lsn is in snapshot files
+        // Phase 5: Safe WAL truncation — only truncate to second-to-last verified snapshot
+        // that will SURVIVE Phase 6 cleanup. This ensures the previous snapshot + WAL can
+        // always recover if the latest snapshot is damaged.
+        // With keep_count=1, no truncation ever happens (only 1 snapshot survives cleanup).
+        // With keep_count=0 (no cleanup) or keep_count>=2, truncation uses the second-to-last
+        // of the surviving snapshots.
         if snapshot_lsn > 0 {
-            if let Err(e) = pm.truncate_wal(snapshot_lsn) {
-                eprintln!("Warning: Failed to truncate WAL after snapshot: {}", e);
-                // Continue to cleanup even if truncation fails - data is safe in snapshots
+            let keep_count = pm.keep_count();
+            let active_tables: FxHashSet<&str> = schemas.keys().map(|k| k.as_str()).collect();
+            if let Some(safe_lsn) =
+                find_safe_truncation_lsn(&snapshot_dir, keep_count, &active_tables)
+            {
+                if let Err(e) = pm.truncate_wal(safe_lsn) {
+                    eprintln!("Warning: Failed to truncate WAL after snapshot: {}", e);
+                }
             }
         }
 
@@ -2299,6 +2436,22 @@ impl Engine for MVCCEngine {
                                 "Warning: Failed to cleanup old snapshots for {}: {}",
                                 table_name, e
                             );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 7: Remove orphaned snapshot directories from dropped tables.
+        // Without this, a dropped table's directory would waste disk space and
+        // (before the active_tables filter in Phase 5) could block WAL truncation.
+        if let Ok(entries) = std::fs::read_dir(&snapshot_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                        if !schemas.contains_key(dir_name) {
+                            let _ = std::fs::remove_dir_all(&path);
                         }
                     }
                 }

@@ -5146,9 +5146,12 @@ impl VersionStore {
                 continue;
             }
 
-            // Find cutoff point - first version we can discard
+            // Check each previous version independently — do NOT assume monotonic
+            // visibility. With rapid updates, a newer prev version may be invisible
+            // to an active txn while an older one IS visible (e.g., HEAD seq=120,
+            // prev_0 seq=110, prev_1 seq=80, active txn snapshot at seq=100 needs prev_1).
             let mut keep_count = 0;
-            for prev_entry in &prev_versions {
+            for (i, prev_entry) in prev_versions.iter().enumerate() {
                 let mut keep = false;
 
                 // Rule 1: Keep if needed by any active transaction
@@ -5165,9 +5168,8 @@ impl VersionStore {
                 }
 
                 if keep {
-                    keep_count += 1;
-                } else {
-                    break;
+                    // Keep this version and all newer ones (indices 0..=i)
+                    keep_count = i + 1;
                 }
             }
 

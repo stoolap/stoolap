@@ -481,12 +481,32 @@ impl Cli {
         Ok(())
     }
 
+    fn output_explain_plan(&self, rows: &[Vec<Value>], row_count: usize) -> Result<(), String> {
+        println!();
+        for row in rows {
+            if let Some(Value::Text(line)) = row.first() {
+                println!("{}", colorize_plan_line(line));
+            }
+        }
+        println!();
+        let line_text = if row_count == 1 { "line" } else { "lines" };
+        println!("\x1b[2m({} {} in plan)\x1b[0m", row_count, line_text);
+        Ok(())
+    }
+
     fn output_table(
         &self,
         columns: &[String],
         rows: &[Vec<Value>],
         row_count: usize,
     ) -> Result<(), String> {
+        // Render EXPLAIN output without table borders, with color highlighting.
+        // Verify first row starts with a known statement keyword to avoid false positives
+        // from queries that alias a column as "plan".
+        if columns.len() == 1 && columns[0] == "plan" && is_explain_output(rows) {
+            return self.output_explain_plan(rows, row_count);
+        }
+
         let mut table = Table::new();
         table
             .load_preset(UTF8_FULL_CONDENSED)
@@ -1201,6 +1221,173 @@ fn output_table(
     }
 
     Ok(())
+}
+
+// ============================================================================
+// EXPLAIN Plan Colorization
+// ============================================================================
+
+// ANSI color codes for EXPLAIN plan output (256-color, high contrast)
+const C_HEADER: &str = "\x1b[1;4m"; // Bold + underline for headers
+const C_DIM: &str = "\x1b[38;5;245m"; // Medium gray for arrows
+const C_RESET: &str = "\x1b[0m";
+const C_INDEX: &str = "\x1b[1;38;5;46m"; // Bright green for index access
+const C_SEQ: &str = "\x1b[1;38;5;208m"; // Orange for seq scan warning
+const C_JOIN: &str = "\x1b[1;38;5;75m"; // Light blue for join operators
+const C_STATS: &str = "\x1b[1;38;5;196m"; // Bright pure red for timing/row stats
+const C_LABEL: &str = "\x1b[38;5;117m"; // Sky blue for labels
+const C_SUBIDX: &str = "\x1b[38;5;114m"; // Medium green for sub-index details
+const C_CTE: &str = "\x1b[38;5;183m"; // Lavender for CTE/subquery scans
+
+/// Check if rows look like EXPLAIN plan output (not a regular query with a "plan" column)
+fn is_explain_output(rows: &[Vec<Value>]) -> bool {
+    if let Some(first_row) = rows.first() {
+        if let Some(Value::Text(line)) = first_row.first() {
+            let trimmed = line.trim();
+            return trimmed.starts_with("SELECT")
+                || trimmed.starts_with("INSERT")
+                || trimmed.starts_with("UPDATE")
+                || trimmed.starts_with("DELETE")
+                || trimmed.starts_with("WITH ");
+        }
+    }
+    false
+}
+
+/// Colorize a single EXPLAIN plan line with ANSI escape codes
+fn colorize_plan_line(line: &str) -> String {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+
+    let mut result = String::with_capacity(line.len() + 80);
+    result.push_str(indent);
+
+    if trimmed.starts_with("-> ") {
+        colorize_node(trimmed, &mut result);
+    } else if trimmed.starts_with("SELECT")
+        || trimmed.starts_with("INSERT")
+        || trimmed.starts_with("UPDATE")
+        || trimmed.starts_with("DELETE")
+    {
+        colorize_header(trimmed, &mut result);
+    } else if trimmed.starts_with("WITH ") || trimmed.starts_with("Statement:") {
+        result.push_str(C_HEADER);
+        result.push_str(trimmed);
+        result.push_str(C_RESET);
+    } else {
+        colorize_detail(trimmed, &mut result);
+    }
+
+    result
+}
+
+/// Split a line into the main content and trailing stats parenthetical.
+/// Stats always start with "(actual " or "(cost=".
+fn split_stats(line: &str) -> (&str, Option<&str>) {
+    for marker in &["(actual ", "(cost="] {
+        if let Some(pos) = line.rfind(marker) {
+            return (line[..pos].trim_end(), Some(&line[pos..]));
+        }
+    }
+    (line, None)
+}
+
+/// Colorize a node line starting with "-> "
+fn colorize_node(line: &str, result: &mut String) {
+    let after_arrow = &line[3..]; // skip "-> "
+
+    // Dim arrow
+    result.push_str(C_DIM);
+    result.push_str("->");
+    result.push_str(C_RESET);
+    result.push(' ');
+
+    // Indexed access patterns (green)
+    let indexed = [
+        "Index Scan",
+        "PK Lookup",
+        "Multi-Index Scan",
+        "Composite Index Scan",
+        "Index Nested Loop",
+    ];
+    // Sequential scan patterns (orange warning)
+    let sequential = ["Seq Scan", "Parallel Seq Scan"];
+    // Join operator patterns (blue)
+    let joins = ["Hash Join", "Merge Join", "Nested Loop ("];
+
+    let color = if indexed.iter().any(|p| after_arrow.starts_with(p)) {
+        C_INDEX
+    } else if sequential.iter().any(|p| after_arrow.starts_with(p)) {
+        C_SEQ
+    } else if joins.iter().any(|p| after_arrow.starts_with(p)) {
+        C_JOIN
+    } else if after_arrow.starts_with("Subquery Scan") || after_arrow.starts_with("CTE Scan") {
+        C_CTE
+    } else {
+        // Sub-index detail lines like "idx_cat on category: = Electronics"
+        result.push_str(C_SUBIDX);
+        result.push_str(after_arrow);
+        result.push_str(C_RESET);
+        return;
+    };
+
+    let (scan_part, stats_part) = split_stats(after_arrow);
+    result.push_str(color);
+    result.push_str(scan_part);
+    result.push_str(C_RESET);
+    if let Some(stats) = stats_part {
+        result.push(' ');
+        result.push_str(C_STATS);
+        result.push_str(stats);
+        result.push_str(C_RESET);
+    }
+}
+
+/// Colorize a statement header line (SELECT, INSERT, UPDATE, DELETE)
+fn colorize_header(line: &str, result: &mut String) {
+    let (scan_part, stats_part) = split_stats(line);
+    result.push_str(C_HEADER);
+    result.push_str(scan_part);
+    result.push_str(C_RESET);
+    if let Some(stats) = stats_part {
+        result.push(' ');
+        result.push_str(C_STATS);
+        result.push_str(stats);
+        result.push_str(C_RESET);
+    }
+}
+
+/// Colorize a detail line (labels like Columns:, Filter:, Group By:, etc.)
+fn colorize_detail(line: &str, result: &mut String) {
+    let labels = [
+        "Columns:",
+        "Filter:",
+        "Index Cond:",
+        "Join Cond:",
+        "Group By:",
+        "Order By:",
+        "Having:",
+        "Limit:",
+        "Offset:",
+        "Using:",
+        "Alias:",
+        "Values:",
+        "Set:",
+        "Source:",
+    ];
+
+    for label in &labels {
+        if let Some(rest) = line.strip_prefix(label) {
+            result.push_str(C_LABEL);
+            result.push_str(label);
+            result.push_str(C_RESET);
+            result.push_str(rest);
+            return;
+        }
+    }
+
+    // No recognized label — render as-is
+    result.push_str(line);
 }
 
 fn format_value(value: &Value) -> String {

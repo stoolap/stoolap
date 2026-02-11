@@ -897,34 +897,37 @@ impl Index for MultiColumnIndex {
         };
 
         for (key, row_ids) in sorted_values.range((start, end)) {
-            // Verify bounds for partial keys
             let mut matches = true;
 
-            // Check min bounds
-            for (i, min_val) in min.iter().enumerate() {
-                if i >= key.0.len() {
-                    matches = false;
-                    break;
-                }
-                let cmp = key.0[i].cmp(min_val);
-                if min_inclusive {
-                    if cmp == std::cmp::Ordering::Less {
+            // Post-check for PARTIAL key bounds only.
+            // When bounds have fewer elements than the stored composite key,
+            // the BTree range over-includes keys that share the prefix but
+            // don't satisfy column-wise semantics. E.g., Excluded([1]) includes
+            // [1,5] (composite [1,5] > [1]), but for `col1 > 1` we need col1 strictly > 1.
+            //
+            // When bounds have the same number of elements as the key (full key),
+            // the BTree's CompositeKey::Ord already gives correct results and
+            // no post-filtering is needed.
+
+            // Check min bounds (only for partial key prefix)
+            if !min.is_empty() && min.len() < key.0.len() {
+                for (i, min_val) in min.iter().enumerate() {
+                    let cmp = key.0[i].cmp(min_val);
+                    if min_inclusive {
+                        if cmp == std::cmp::Ordering::Less {
+                            matches = false;
+                            break;
+                        }
+                    } else if cmp != std::cmp::Ordering::Greater {
                         matches = false;
                         break;
                     }
-                } else if cmp != std::cmp::Ordering::Greater {
-                    matches = false;
-                    break;
                 }
             }
 
-            // Check max bounds
-            if matches {
+            // Check max bounds (only for partial key prefix)
+            if matches && !max.is_empty() && max.len() < key.0.len() {
                 for (i, max_val) in max.iter().enumerate() {
-                    if i >= key.0.len() {
-                        matches = false;
-                        break;
-                    }
                     let cmp = key.0[i].cmp(max_val);
                     if max_inclusive {
                         if cmp == std::cmp::Ordering::Greater {

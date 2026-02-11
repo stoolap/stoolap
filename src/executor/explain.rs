@@ -172,9 +172,10 @@ impl Executor {
 
         match stmt {
             Statement::Select(select) => {
+                let distinct_str = if select.distinct { " DISTINCT" } else { "" };
                 lines.push(format!(
-                    "{}SELECT (actual time={}, rows={})",
-                    prefix, time_str, row_count
+                    "{}SELECT{} (actual time={}, rows={})",
+                    prefix, distinct_str, time_str, row_count
                 ));
                 self.explain_select_columns(select, lines, indent);
 
@@ -197,7 +198,7 @@ impl Executor {
                         .iter()
                         .map(|g| format!("{}", g))
                         .collect();
-                    lines.push(format!("{}  Group: {}", prefix, groups.join(", ")));
+                    lines.push(format!("{}  Group By: {}", prefix, groups.join(", ")));
                 }
 
                 // HAVING
@@ -207,15 +208,9 @@ impl Executor {
 
                 // ORDER BY
                 if !select.order_by.is_empty() {
-                    let orders: Vec<String> = select
-                        .order_by
-                        .iter()
-                        .map(|o| {
-                            let dir = if !o.ascending { " DESC" } else { "" };
-                            format!("{}{}", o.expression, dir)
-                        })
-                        .collect();
-                    lines.push(format!("{}  Order: {}", prefix, orders.join(", ")));
+                    let orders: Vec<String> =
+                        select.order_by.iter().map(|o| format!("{}", o)).collect();
+                    lines.push(format!("{}  Order By: {}", prefix, orders.join(", ")));
                 }
 
                 // LIMIT/OFFSET
@@ -417,10 +412,10 @@ impl Executor {
                         join.using_columns.iter().map(|c| c.to_string()).collect();
                     lines.push(format!("{}   Using: ({})", prefix, cols.join(", ")));
                 }
-                // Left side gets the WHERE clause for potential pushdown
-                self.explain_table_expr_with_where(&join.left, where_clause, lines, indent + 1);
-                // Right side typically doesn't get the outer WHERE
-                self.explain_table_expr_with_where(&join.right, None, lines, indent + 1);
+                // Child nodes: show plan structure without cost estimates
+                // (we don't have per-node actual rows in EXPLAIN ANALYZE)
+                self.explain_table_expr_plan_only(&join.left, where_clause, lines, indent + 1);
+                self.explain_table_expr_plan_only(&join.right, None, lines, indent + 1);
             }
             Expression::CteReference(cte_ref) => {
                 let mut cte_info = format!(
@@ -513,9 +508,9 @@ impl Executor {
             lines.push(format!("{}SELECT", prefix));
         }
 
-        // Columns
+        // Columns - use same threshold as EXPLAIN ANALYZE (5 columns)
         let col_count = select.columns.len();
-        if col_count <= 3 {
+        if col_count <= 5 {
             let cols: Vec<String> = select.columns.iter().map(|c| format!("{}", c)).collect();
             lines.push(format!("{}  Columns: {}", prefix, cols.join(", ")));
         } else {
@@ -572,12 +567,34 @@ impl Executor {
     }
 
     /// Generate EXPLAIN output for a table expression with WHERE clause analysis
+    /// Show plan structure without join cost estimates (for EXPLAIN ANALYZE child nodes)
+    fn explain_table_expr_plan_only(
+        &self,
+        expr: &Expression,
+        where_clause: Option<&Expression>,
+        lines: &mut Vec<String>,
+        indent: usize,
+    ) {
+        self.explain_table_expr_inner(expr, where_clause, lines, indent, false)
+    }
+
     fn explain_table_expr_with_where(
         &self,
         expr: &Expression,
         where_clause: Option<&Expression>,
         lines: &mut Vec<String>,
         indent: usize,
+    ) {
+        self.explain_table_expr_inner(expr, where_clause, lines, indent, true)
+    }
+
+    fn explain_table_expr_inner(
+        &self,
+        expr: &Expression,
+        where_clause: Option<&Expression>,
+        lines: &mut Vec<String>,
+        indent: usize,
+        show_join_cost: bool,
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -656,62 +673,71 @@ impl Executor {
                     &join.using_columns,
                 );
 
-                // Get cost estimate from query planner
-                let planner = self.get_query_planner();
-                let left_table_name = extract_table_name(&join.left);
-                let right_table_name = extract_table_name(&join.right);
+                if show_join_cost {
+                    // Get cost estimate from query planner
+                    let planner = self.get_query_planner();
+                    let left_table_name = extract_table_name(&join.left);
+                    let right_table_name = extract_table_name(&join.right);
 
-                // Get table statistics for cost estimation
-                let left_stats = left_table_name
-                    .as_ref()
-                    .and_then(|name| planner.get_table_stats(name));
-                let right_stats = right_table_name
-                    .as_ref()
-                    .and_then(|name| planner.get_table_stats(name));
+                    // Get table statistics for cost estimation
+                    let left_stats = left_table_name
+                        .as_ref()
+                        .and_then(|name| planner.get_table_stats(name));
+                    let right_stats = right_table_name
+                        .as_ref()
+                        .and_then(|name| planner.get_table_stats(name));
 
-                // Calculate estimated rows and cost
-                let (estimated_rows, estimated_cost) = match (left_stats, right_stats) {
-                    (Some(ls), Some(rs)) => {
-                        // Hash join cost estimation
-                        let left_rows = ls.row_count.max(1);
-                        let right_rows = rs.row_count.max(1);
-                        // Simplified join cardinality estimate
-                        let rows = if join_algorithm == "Nested Loop" && join.condition.is_none() {
-                            // Cross join: left * right
-                            left_rows * right_rows
-                        } else {
-                            // Equality join: estimate as smaller side (pessimistic)
-                            left_rows.min(right_rows)
-                        };
-                        // Cost = build cost + probe cost
-                        let cost = if join_algorithm == "Hash Join" {
-                            (left_rows.min(right_rows) as f64)
-                                + (left_rows.max(right_rows) as f64 * 0.1)
-                        } else {
-                            // Nested loop: O(n*m) but with early termination
-                            (left_rows as f64) * (right_rows as f64).sqrt()
-                        };
-                        (rows, cost)
-                    }
-                    (Some(ls), None) => {
-                        // Only left stats available
-                        (ls.row_count, ls.row_count as f64 * 10.0)
-                    }
-                    (None, Some(rs)) => {
-                        // Only right stats available
-                        (rs.row_count, rs.row_count as f64 * 10.0)
-                    }
-                    (None, None) => {
-                        // No stats - use default estimate
-                        (1000, 10000.0)
-                    }
-                };
+                    // Calculate estimated rows and cost
+                    let (estimated_rows, estimated_cost) = match (left_stats, right_stats) {
+                        (Some(ls), Some(rs)) => {
+                            // Hash join cost estimation
+                            let left_rows = ls.row_count.max(1);
+                            let right_rows = rs.row_count.max(1);
+                            // Simplified join cardinality estimate
+                            let rows =
+                                if join_algorithm == "Nested Loop" && join.condition.is_none() {
+                                    // Cross join: left * right
+                                    left_rows * right_rows
+                                } else {
+                                    // Equality join: estimate as smaller side (pessimistic)
+                                    left_rows.min(right_rows)
+                                };
+                            // Cost = build cost + probe cost
+                            let cost = if join_algorithm == "Hash Join" {
+                                (left_rows.min(right_rows) as f64)
+                                    + (left_rows.max(right_rows) as f64 * 0.1)
+                            } else {
+                                // Nested loop: O(n*m) but with early termination
+                                (left_rows as f64) * (right_rows as f64).sqrt()
+                            };
+                            (rows, cost)
+                        }
+                        (Some(ls), None) => {
+                            // Only left stats available
+                            (ls.row_count, ls.row_count as f64 * 10.0)
+                        }
+                        (None, Some(rs)) => {
+                            // Only right stats available
+                            (rs.row_count, rs.row_count as f64 * 10.0)
+                        }
+                        (None, None) => {
+                            // No stats - use default estimate
+                            (1000, 10000.0)
+                        }
+                    };
 
-                // Show join algorithm, type, cost and rows
-                lines.push(format!(
-                    "{}-> {} ({} Join) (cost={:.2} rows={})",
-                    prefix, join_algorithm, join.join_type, estimated_cost, estimated_rows
-                ));
+                    // Show join algorithm, type, cost and rows
+                    lines.push(format!(
+                        "{}-> {} ({} Join) (cost={:.2} rows={})",
+                        prefix, join_algorithm, join.join_type, estimated_cost, estimated_rows
+                    ));
+                } else {
+                    // Plan-only mode (EXPLAIN ANALYZE child nodes): no cost estimates
+                    lines.push(format!(
+                        "{}-> {} ({} Join)",
+                        prefix, join_algorithm, join.join_type
+                    ));
+                }
                 if let Some(ref condition) = join.condition {
                     lines.push(format!("{}   Join Cond: {}", prefix, condition));
                 }
@@ -721,9 +747,15 @@ impl Executor {
                     lines.push(format!("{}   Using: ({})", prefix, cols.join(", ")));
                 }
                 // Left side gets the WHERE clause for potential pushdown
-                self.explain_table_expr_with_where(&join.left, where_clause, lines, indent + 1);
+                self.explain_table_expr_inner(
+                    &join.left,
+                    where_clause,
+                    lines,
+                    indent + 1,
+                    show_join_cost,
+                );
                 // Right side typically doesn't get the outer WHERE
-                self.explain_table_expr_with_where(&join.right, None, lines, indent + 1);
+                self.explain_table_expr_inner(&join.right, None, lines, indent + 1, show_join_cost);
             }
             Expression::CteReference(cte_ref) => {
                 let mut cte_info = format!("{}-> CTE Scan on {}", prefix, cte_ref.name);

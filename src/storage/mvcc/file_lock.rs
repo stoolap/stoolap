@@ -68,19 +68,23 @@ impl FileLock {
         // Lock file path
         let lock_file_path = db_path.join("db.lock");
 
-        // Open the lock file (create if it doesn't exist)
+        // Open the lock file WITHOUT truncating — truncating before acquiring
+        // the lock would destroy another process's PID if it currently holds the lock.
         let mut file = OpenOptions::new()
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_file_path)
             .map_err(|e| Error::internal(format!("failed to open lock file: {}", e)))?;
 
-        // Try to acquire an exclusive lock (platform-specific)
+        // Try to acquire an exclusive lock (platform-specific).
+        // This must happen BEFORE any file content modification.
         acquire_lock(&file)?;
 
-        // Write the current process ID to the lock file for debugging
+        // Now that we hold the lock, clear and rewrite with our PID
+        file.set_len(0)
+            .map_err(|e| Error::internal(format!("failed to truncate lock file: {}", e)))?;
         let pid = std::process::id();
         write!(file, "{}", pid).ok();
         file.sync_all().ok();

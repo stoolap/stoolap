@@ -410,13 +410,25 @@ impl Transaction for MvccTransaction {
                 }
             }
 
-            // Phase 3: Complete commit - make changes visible
-            self.registry.complete_commit(self.id);
-
-            // Record commit marker in WAL
+            // Phase 3: Record commit marker in WAL BEFORE making changes visible.
+            // This ensures crash recovery sees the COMMIT marker even if we crash
+            // before complete_commit(). WAL is only read during recovery, so writing
+            // the marker before visibility doesn't affect normal operation.
             if let Some(ops) = &self.engine_operations {
-                ops.record_commit(self.id)?;
+                if let Err(e) = ops.record_commit(self.id) {
+                    // WAL commit marker failed. Phase 2 data is in the version store
+                    // but not yet visible (complete_commit hasn't run). Abort so GC
+                    // can reclaim the orphaned entries and active_txn_count is correct.
+                    // On recovery, WAL has no COMMIT marker → entries are discarded.
+                    self.registry.abort_transaction(self.id);
+                    self.state = TransactionState::RolledBack;
+                    self.cleanup();
+                    return Err(e);
+                }
             }
+
+            // Phase 4: Complete commit - make changes visible in registry
+            self.registry.complete_commit(self.id);
         } else {
             // Read-only transaction - just mark as committed in registry
             self.registry.complete_commit(self.id);

@@ -798,14 +798,19 @@ impl MVCCTable {
             return None;
         }
 
-        // If we have only one index, return its results
+        // If we have only one index, return its results (no sort needed)
         if all_row_ids.len() == 1 {
             return Some(all_row_ids.into_iter().next().unwrap());
         }
 
-        // Row IDs are already sorted by index (sorted insertion)
+        // Range query results from BTree are in VALUE order, not row_id order.
+        // intersect_sorted_ids requires row_id-sorted input (uses binary_search).
+        // Sort all sets before intersection.
+        for ids in &mut all_row_ids {
+            ids.sort_unstable();
+        }
+
         // Intersect all row ID sets for multi-column filtering
-        // This is the key optimization - we filter rows using multiple indexes
         let mut result = all_row_ids.swap_remove(0);
         for other in &all_row_ids {
             result = intersect_sorted_ids(&result, other);

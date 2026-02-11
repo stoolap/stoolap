@@ -214,22 +214,37 @@ impl Executor {
             }
             Expression::Parameter(param) => {
                 // Resolve parameter from context
-                // Note: Parameters are 1-indexed in SQL ($1, $2, ...) but array is 0-indexed
-                let params = ctx.params();
-                let param_idx = if param.index > 0 {
-                    param.index - 1
+                // Named parameters (e.g., :name) use get_named_param()
+                // Positional parameters ($1, $2, ...) are 1-indexed, array is 0-indexed
+                if param.name.starts_with(':') {
+                    let name = &param.name[1..];
+                    let value = ctx.get_named_param(name)?;
+                    let pk_value = match value {
+                        Value::Integer(i) => *i,
+                        Value::Float(f) => *f as i64,
+                        _ => return None,
+                    };
+                    (
+                        pk_value,
+                        PkValueSource::NamedParameter(SmartString::new(name)),
+                    )
                 } else {
-                    param.index
-                };
-                if param_idx >= params.len() {
-                    return None;
+                    let params = ctx.params();
+                    let param_idx = if param.index > 0 {
+                        param.index - 1
+                    } else {
+                        return None;
+                    };
+                    if param_idx >= params.len() {
+                        return None;
+                    }
+                    let pk_value = match &params[param_idx] {
+                        Value::Integer(i) => *i,
+                        Value::Float(f) => *f as i64,
+                        _ => return None,
+                    };
+                    (pk_value, PkValueSource::Parameter(param_idx))
                 }
-                let pk_value = match &params[param_idx] {
-                    Value::Integer(i) => *i,
-                    Value::Float(f) => *f as i64,
-                    _ => return None,
-                };
-                (pk_value, PkValueSource::Parameter(param_idx))
             }
             _ => return None,
         };
@@ -351,7 +366,14 @@ impl Executor {
 
     /// Extract PK value using pre-compiled source (very fast - just array access)
     fn extract_pk_value_fast(&self, source: &PkValueSource, ctx: &ExecutionContext) -> Option<i64> {
-        Self::extract_pk_value_from_slice(source, ctx.params())
+        match source {
+            PkValueSource::NamedParameter(name) => match ctx.get_named_param(name)? {
+                Value::Integer(i) => Some(*i),
+                Value::Float(f) => Some(*f as i64),
+                _ => None,
+            },
+            _ => Self::extract_pk_value_from_slice(source, ctx.params()),
+        }
     }
 
     /// Extract PK value from params slice directly (avoids ExecutionContext overhead)
@@ -369,6 +391,7 @@ impl Executor {
                     _ => None,
                 }
             }
+            PkValueSource::NamedParameter(_) => None, // No ctx available in slice path
         }
     }
 

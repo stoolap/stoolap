@@ -590,8 +590,16 @@ impl Transaction {
         self.check_active()?;
 
         if let Some(mut tx) = self.tx.take() {
-            tx.commit()?;
-            self.committed = true;
+            match tx.commit() {
+                Ok(()) => {
+                    self.committed = true;
+                }
+                Err(e) => {
+                    // Restore the transaction so rollback is still possible
+                    self.tx = Some(tx);
+                    return Err(e);
+                }
+            }
         }
 
         Ok(())

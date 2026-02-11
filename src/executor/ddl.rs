@@ -456,14 +456,20 @@ impl Executor {
             .map(|idx| idx.index_type())
             .unwrap_or(crate::core::IndexType::BTree);
 
-        // Record index creation to WAL for persistence
-        self.engine.record_create_index(
+        // Record index creation to WAL for persistence.
+        // If WAL write fails, rollback the in-memory index to prevent ghost state
+        // where the index exists in memory but won't survive restart.
+        if let Err(e) = self.engine.record_create_index(
             table_name,
             index_name,
             &column_names,
             is_unique,
             index_type,
-        )?;
+        ) {
+            // Rollback: remove the index we just created
+            let _ = table.drop_index(index_name);
+            return Err(e);
+        }
 
         Ok(Box::new(ExecResult::empty()))
     }
@@ -502,13 +508,15 @@ impl Executor {
             return Err(Error::IndexNotFoundByName(index_name.to_string()));
         }
 
-        // Get the table and drop the index
+        // Record index drop to WAL BEFORE applying in-memory change.
+        // This prevents ghost state where the index is removed from memory
+        // but still exists in WAL (would reappear after crash recovery).
+        self.engine.record_drop_index(&table_name, index_name)?;
+
+        // Now apply the in-memory change
         let tx = self.engine.begin_transaction()?;
         let table = tx.get_table(&table_name)?;
         table.drop_index(index_name)?;
-
-        // Record index drop to WAL for persistence
-        self.engine.record_drop_index(&table_name, index_name)?;
 
         Ok(Box::new(ExecResult::empty()))
     }

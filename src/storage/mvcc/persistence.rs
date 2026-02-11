@@ -389,6 +389,10 @@ impl PersistenceManager {
         // Write a commit marker so two-phase recovery will apply them
         wal.write_commit_marker(DDL_TXN_ID)?;
 
+        // Attempt WAL rotation if file exceeds max size.
+        // Failure is non-critical: the commit is already persisted.
+        let _ = wal.maybe_rotate();
+
         Ok(())
     }
 
@@ -418,6 +422,10 @@ impl PersistenceManager {
         // Index operations are auto-committed (like other DDL)
         // Write a commit marker so two-phase recovery will apply them
         wal.write_commit_marker(DDL_TXN_ID)?;
+
+        // Attempt WAL rotation if file exceeds max size.
+        // Failure is non-critical: the commit is already persisted.
+        let _ = wal.maybe_rotate();
 
         Ok(())
     }
@@ -459,6 +467,10 @@ impl PersistenceManager {
         // Use commit_marker to set COMMIT_MARKER flag for two-phase recovery
         wal.write_commit_marker(txn_id)?;
 
+        // Attempt WAL rotation if file exceeds max size.
+        // Failure is non-critical: the commit is already persisted.
+        let _ = wal.maybe_rotate();
+
         Ok(())
     }
 
@@ -474,6 +486,10 @@ impl PersistenceManager {
 
         // Use abort_marker to set ABORT_MARKER flag for two-phase recovery
         wal.write_abort_marker(txn_id)?;
+
+        // Attempt WAL rotation if file exceeds max size.
+        // Failure is non-critical: the abort is already persisted.
+        let _ = wal.maybe_rotate();
 
         Ok(())
     }

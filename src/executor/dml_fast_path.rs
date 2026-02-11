@@ -196,21 +196,37 @@ impl Executor {
                 (v, PkValueSource::Literal(v))
             }
             Expression::Parameter(param) => {
-                let params = ctx.params();
-                let param_idx = if param.index > 0 {
-                    param.index - 1
+                // Named parameters (e.g., :name) resolve via get_named_param() at execution time
+                // Positional parameters ($1, $2, ...) are 1-indexed, array is 0-indexed
+                if param.name.starts_with(':') {
+                    let name = &param.name[1..];
+                    let value = ctx.get_named_param(name)?;
+                    let pk_value = match value {
+                        Value::Integer(i) => *i,
+                        Value::Float(f) => *f as i64,
+                        _ => return None,
+                    };
+                    (
+                        pk_value,
+                        PkValueSource::NamedParameter(SmartString::new(name)),
+                    )
                 } else {
-                    param.index
-                };
-                if param_idx >= params.len() {
-                    return None;
+                    let params = ctx.params();
+                    let param_idx = if param.index > 0 {
+                        param.index - 1
+                    } else {
+                        return None;
+                    };
+                    if param_idx >= params.len() {
+                        return None;
+                    }
+                    let pk_value = match &params[param_idx] {
+                        Value::Integer(i) => *i,
+                        Value::Float(f) => *f as i64,
+                        _ => return None,
+                    };
+                    (pk_value, PkValueSource::Parameter(param_idx))
                 }
-                let pk_value = match &params[param_idx] {
-                    Value::Integer(i) => *i,
-                    Value::Float(f) => *f as i64,
-                    _ => return None,
-                };
-                (pk_value, PkValueSource::Parameter(param_idx))
             }
             _ => return None,
         };
@@ -224,7 +240,14 @@ impl Executor {
         source: &PkValueSource,
         ctx: &ExecutionContext,
     ) -> Option<i64> {
-        Self::extract_pk_value_from_params(source, ctx.params())
+        match source {
+            PkValueSource::NamedParameter(name) => match ctx.get_named_param(name)? {
+                Value::Integer(i) => Some(*i),
+                Value::Float(f) => Some(*f as i64),
+                _ => None,
+            },
+            _ => Self::extract_pk_value_from_params(source, ctx.params()),
+        }
     }
 
     /// Extract PK value from params slice directly (avoids ExecutionContext overhead)
@@ -242,6 +265,7 @@ impl Executor {
                     _ => None,
                 }
             }
+            PkValueSource::NamedParameter(_) => None, // No ctx available in slice path
         }
     }
 
@@ -254,6 +278,7 @@ impl Executor {
         match source {
             UpdateValueSource::Literal(v) => Some(v.clone()),
             UpdateValueSource::Parameter(idx) => params.get(*idx).cloned(),
+            UpdateValueSource::NamedParameter(_) => None, // No ctx available in slice path
         }
     }
 
@@ -447,6 +472,10 @@ impl Executor {
                         None => continue,
                     }
                 }
+                UpdateValueSource::NamedParameter(name) => match ctx.get_named_param(name) {
+                    Some(v) => v.clone(),
+                    None => continue,
+                },
             };
             updates.push((u.column_idx, value.coerce_to_type(u.column_type)));
         }
@@ -682,12 +711,17 @@ impl Executor {
                 _ => None,
             },
             Expression::Parameter(param) => {
-                let param_idx = if param.index > 0 {
-                    param.index - 1
+                if param.name.starts_with(':') {
+                    let name = &param.name[1..];
+                    Some(UpdateValueSource::NamedParameter(SmartString::new(name)))
                 } else {
-                    param.index
-                };
-                Some(UpdateValueSource::Parameter(param_idx))
+                    let param_idx = if param.index > 0 {
+                        param.index - 1
+                    } else {
+                        return None;
+                    };
+                    Some(UpdateValueSource::Parameter(param_idx))
+                }
             }
             _ => None, // Complex expression
         }

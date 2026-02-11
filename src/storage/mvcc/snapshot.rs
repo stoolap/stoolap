@@ -1263,6 +1263,102 @@ impl SnapshotReader {
     }
 }
 
+/// Verify a snapshot file's integrity by checking magic bytes, footer, and CRC32.
+/// Returns Ok(source_lsn) if valid, Err if corrupted.
+/// This does NOT load row data — only reads header, footer, and computes full-file CRC.
+pub fn verify_snapshot_integrity(file_path: &Path) -> Result<u64> {
+    let mut file = File::open(file_path)
+        .map_err(|e| Error::internal(format!("failed to open snapshot for verification: {}", e)))?;
+
+    let file_size = file
+        .metadata()
+        .map_err(|e| Error::internal(format!("failed to get file metadata: {}", e)))?
+        .len();
+
+    // Read minimum header (16 bytes) to get version
+    const MIN_HEADER_SIZE: usize = 16;
+    if file_size < MIN_HEADER_SIZE as u64 {
+        return Err(Error::internal("snapshot file too small for header"));
+    }
+
+    let mut min_header_data = [0u8; MIN_HEADER_SIZE];
+    file.read_exact(&mut min_header_data)
+        .map_err(|e| Error::internal(format!("failed to read header: {}", e)))?;
+
+    let version = u32::from_le_bytes(min_header_data[8..12].try_into().unwrap());
+
+    // Parse full header based on version
+    let header = if version <= 2 {
+        FileHeader::from_bytes(&min_header_data)?
+    } else {
+        if file_size < FILE_HEADER_SIZE as u64 {
+            return Err(Error::internal("snapshot file too small for v3 header"));
+        }
+        let mut header_data = [0u8; FILE_HEADER_SIZE];
+        header_data[..MIN_HEADER_SIZE].copy_from_slice(&min_header_data);
+        file.read_exact(&mut header_data[MIN_HEADER_SIZE..])
+            .map_err(|e| Error::internal(format!("failed to read full header: {}", e)))?;
+        FileHeader::from_bytes(&header_data)?
+    };
+
+    let footer_size = Footer::size_for_version(header.version);
+    let min_file_size = header.effective_header_size() + footer_size;
+    if file_size < min_file_size as u64 {
+        return Err(Error::internal("snapshot file too small"));
+    }
+
+    // For v2+ files, footer is followed by 4-byte CRC32
+    let has_crc = header.version >= 2;
+    let footer_offset = if has_crc {
+        file_size - footer_size as u64 - 4
+    } else {
+        file_size - footer_size as u64
+    };
+
+    // Read footer to validate magic
+    file.seek(SeekFrom::Start(footer_offset))
+        .map_err(|e| Error::internal(format!("failed to seek to footer: {}", e)))?;
+    let mut footer_data = vec![0u8; footer_size];
+    file.read_exact(&mut footer_data)
+        .map_err(|e| Error::internal(format!("failed to read footer: {}", e)))?;
+    let _footer = Footer::from_bytes(&footer_data, header.version)?;
+
+    // Verify CRC32
+    if has_crc {
+        let mut crc_buf = [0u8; 4];
+        file.read_exact(&mut crc_buf)
+            .map_err(|e| Error::internal(format!("failed to read CRC32: {}", e)))?;
+        let stored_crc = u32::from_le_bytes(crc_buf);
+
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::internal(format!("failed to seek for CRC verification: {}", e)))?;
+
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let data_len = footer_offset + footer_size as u64;
+        let mut remaining = data_len;
+
+        while remaining > 0 {
+            let to_read = std::cmp::min(remaining as usize, buf.len());
+            file.read_exact(&mut buf[..to_read]).map_err(|e| {
+                Error::internal(format!("failed to read for CRC verification: {}", e))
+            })?;
+            hasher.update(&buf[..to_read]);
+            remaining -= to_read as u64;
+        }
+
+        let computed_crc = hasher.finalize();
+        if stored_crc != computed_crc {
+            return Err(Error::internal(format!(
+                "snapshot CRC32 mismatch: stored={:#x}, computed={:#x}",
+                stored_crc, computed_crc
+            )));
+        }
+    }
+
+    Ok(header.source_lsn)
+}
+
 // ============================================================================
 // DiskVersionStore - Manages on-disk snapshots for a table
 // ============================================================================
@@ -1473,22 +1569,28 @@ impl DiskVersionStore {
             })
             .collect();
 
-        // If we have fewer snapshots than keep_count, nothing to do
-        if snapshot_files.len() <= keep_count {
-            return Ok(());
-        }
-
         // Sort by name (which includes timestamp), newest first
         snapshot_files.sort();
         snapshot_files.reverse();
 
-        // Keep the newest keep_count snapshots, delete the rest
-        for file_to_delete in snapshot_files.iter().skip(keep_count) {
-            if let Err(e) = fs::remove_file(file_to_delete) {
-                // Log warning but don't fail - old snapshots may already be removed
+        // Separate valid from corrupt snapshots. Keep `keep_count` valid snapshots
+        // and delete everything else (corrupt files + excess valid files).
+        // A corrupt file occupying a keep slot would permanently block WAL truncation.
+        let mut valid_kept = 0usize;
+        for snap_file in &snapshot_files {
+            if valid_kept < keep_count {
+                // Check if this file is valid (CRC-verified)
+                if verify_snapshot_integrity(snap_file).is_ok() {
+                    valid_kept += 1;
+                    continue; // Keep this valid snapshot
+                }
+                // Corrupt file — delete it, don't count toward keep_count
+            }
+            // Either past keep_count or corrupt: delete
+            if let Err(e) = fs::remove_file(snap_file) {
                 eprintln!(
                     "Warning: failed to delete old snapshot {:?}: {}",
-                    file_to_delete, e
+                    snap_file, e
                 );
             }
         }

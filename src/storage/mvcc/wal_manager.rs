@@ -743,8 +743,12 @@ impl CheckpointMetadata {
                     if pos + 8 <= section_end {
                         let count =
                             u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+                        // Cap allocation to what the section can actually hold to prevent
+                        // OOM from corrupt checkpoint data
+                        let max_entries = (section_end - pos - 8) / 8;
+                        let safe_count = count.min(max_entries);
                         let mut spos = pos + 8;
-                        active_transactions = Vec::with_capacity(count);
+                        active_transactions = Vec::with_capacity(safe_count);
                         for _ in 0..count {
                             if spos + 8 > section_end {
                                 break;
@@ -761,8 +765,12 @@ impl CheckpointMetadata {
                     if pos + 8 <= section_end {
                         let count =
                             u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+                        // Cap allocation to what the section can actually hold to prevent
+                        // OOM from corrupt checkpoint data
+                        let max_entries = (section_end - pos - 8) / 16;
+                        let safe_count = count.min(max_entries);
                         let mut spos = pos + 8;
-                        committed_transactions = Vec::with_capacity(count);
+                        committed_transactions = Vec::with_capacity(safe_count);
                         for _ in 0..count {
                             if spos + 16 > section_end {
                                 break;
@@ -1099,13 +1107,16 @@ impl WALManager {
             if let Ok(entries) = fs::read_dir(&path) {
                 for entry in entries.filter_map(|e| e.ok()) {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with("wal-") && name.ends_with(".log") {
+                    if (name.starts_with("wal-") || name.starts_with("wal_"))
+                        && name.ends_with(".log")
+                    {
                         wal_files.push(name);
                     }
                 }
             }
 
-            wal_files.sort();
+            // Sort by embedded LSN so we pick the file with the highest LSN
+            wal_files.sort_by_key(|name| Self::extract_lsn_from_filename(name).unwrap_or(0));
 
             if let Some(newest) = wal_files.last() {
                 wal_filename = newest.clone();
@@ -1559,11 +1570,16 @@ impl WALManager {
 
         let mut from_lsn = from_lsn;
 
-        // Check for checkpoint
-        let checkpoint_path = self.path.join("checkpoint.meta");
-        if let Ok(checkpoint) = CheckpointMetadata::read_from_file(&checkpoint_path) {
-            if checkpoint.lsn > from_lsn {
-                from_lsn = checkpoint.lsn;
+        // Check for checkpoint — only use checkpoint.lsn when no snapshots were loaded
+        // (from_lsn == 0). When snapshots exist, from_lsn already reflects the safe
+        // replay point. Using checkpoint.lsn to override would skip WAL entries needed
+        // by tables whose snapshots are older (e.g., after a crash during snapshot rename).
+        if from_lsn == 0 {
+            let checkpoint_path = self.path.join("checkpoint.meta");
+            if let Ok(checkpoint) = CheckpointMetadata::read_from_file(&checkpoint_path) {
+                if checkpoint.lsn > from_lsn {
+                    from_lsn = checkpoint.lsn;
+                }
             }
         }
 
@@ -1580,7 +1596,15 @@ impl WALManager {
             }
         }
 
-        wal_files.sort();
+        // Sort by embedded LSN for correct replay order.
+        // Lexicographic sort would misorder wal- (truncated) and wal_ (rotated)
+        // files when both coexist after a crash.
+        wal_files.sort_by_key(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(Self::extract_lsn_from_filename)
+                .unwrap_or(0)
+        });
 
         // =====================================================
         // Phase 1: Analysis - Identify transaction outcomes
@@ -1819,7 +1843,7 @@ impl WALManager {
                             aborted_txns.insert(txn_id);
                         }
                         // Skip rest of entry (entry_size - 8 + CRC 4)
-                        let remaining = total_data_size - 8;
+                        let remaining = total_data_size.saturating_sub(8);
                         if file.seek(SeekFrom::Current(remaining as i64)).is_err() {
                             break;
                         }
@@ -2015,6 +2039,80 @@ impl WALManager {
         &self.path
     }
 
+    /// Clean up old rotated WAL files fully covered by a snapshot.
+    ///
+    /// A WAL file named `lsn-N` contains entries with LSN > N. The file's upper
+    /// bound is the NEXT file's start LSN (sorted by embedded LSN). A file is safe
+    /// to delete only when ALL its entries are <= `up_to_lsn`, which means the next
+    /// file's start LSN must be <= `up_to_lsn`.
+    ///
+    /// Without this boundary check, files containing entries that straddle
+    /// `up_to_lsn` would be deleted, causing data loss if the latest snapshot is
+    /// corrupted and recovery falls back to the second-to-last snapshot + WAL.
+    fn cleanup_old_wal_files(wal_dir: &Path, current_wal_name: &str, up_to_lsn: u64) {
+        let dir_entries = match fs::read_dir(wal_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        // Collect all WAL files with their embedded LSN
+        let mut wal_files: Vec<(PathBuf, u64)> = Vec::new();
+        for entry in dir_entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !((name.starts_with("wal-") || name.starts_with("wal_")) && name.ends_with(".log")) {
+                continue;
+            }
+            if let Some(lsn) = Self::extract_lsn_from_filename(&name) {
+                wal_files.push((entry.path(), lsn));
+            }
+        }
+
+        // Sort by embedded LSN so we can determine each file's upper bound
+        wal_files.sort_by_key(|&(_, lsn)| lsn);
+
+        // Delete file[i] only if its upper bound (= file[i+1].lsn) <= up_to_lsn.
+        // The last file in the list is the current WAL — never delete it.
+        for i in 0..wal_files.len() {
+            let (ref path, _) = wal_files[i];
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+
+            // Never delete the current WAL file
+            if name == current_wal_name {
+                continue;
+            }
+
+            // Need a next file to determine upper bound
+            let next_lsn = if i + 1 < wal_files.len() {
+                wal_files[i + 1].1
+            } else {
+                // Last non-current file with no successor — keep it (can't prove coverage)
+                continue;
+            };
+
+            // The file's entries span (file_lsn, next_lsn]. Safe to delete only if
+            // all entries are covered: next_lsn <= up_to_lsn.
+            if next_lsn <= up_to_lsn {
+                if let Err(e) = fs::remove_file(path) {
+                    eprintln!(
+                        "Warning: Could not remove old rotated WAL file {:?}: {}",
+                        path, e
+                    );
+                }
+            }
+        }
+    }
+
+    /// Extract the LSN from a WAL filename containing the pattern `lsn-{N}`.
+    fn extract_lsn_from_filename(name: &str) -> Option<u64> {
+        let lsn_start = name.find("lsn-")?;
+        let lsn_str = &name[lsn_start + 4..];
+        let dot_pos = lsn_str.find('.')?;
+        lsn_str[..dot_pos].parse::<u64>().ok()
+    }
+
     /// Get maximum WAL file size before rotation
     pub fn max_wal_size(&self) -> u64 {
         self.max_wal_size
@@ -2064,6 +2162,11 @@ impl WALManager {
                 "WAL manager is not running or file is closed",
             ));
         }
+
+        // Clean up old rotated WAL files covered by the snapshot.
+        // This runs before the early-return check because even if the current WAL file
+        // doesn't need truncation, previously-rotated files may be fully covered.
+        Self::cleanup_old_wal_files(&self.path, &current_wal_name, up_to_lsn);
 
         // Extract LSN from current WAL filename to check if truncation is needed
         // If upToLSN <= currentFileLSN, there's nothing to truncate

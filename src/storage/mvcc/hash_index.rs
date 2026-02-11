@@ -795,6 +795,23 @@ impl Index for HashIndex {
         results
     }
 
+    fn get_all_values(&self) -> Vec<Value> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Vec::new();
+        }
+        let hash_to_values = self.hash_to_values.read().unwrap();
+        let mut result = Vec::with_capacity(hash_to_values.len());
+        for entries in hash_to_values.values() {
+            for (values, _row_ids) in entries {
+                // For single-column index, return the value directly
+                if values.len() == 1 {
+                    result.push((*values[0]).clone());
+                }
+            }
+        }
+        result
+    }
+
     fn get_distinct_count_excluding_null(&self) -> Option<usize> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return None;

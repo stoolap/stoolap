@@ -704,13 +704,17 @@ impl TransactionRegistry {
         // Step 4: Remove invalid isolation overrides (O(InvalidOverrides))
         if !invalid_overrides.is_empty() {
             let mut overrides = self.isolation_overrides.lock();
+            let mut actual_removals = 0usize;
             for txn_id in &invalid_overrides {
                 if overrides.remove(*txn_id).is_some() {
                     removed += 1;
+                    actual_removals += 1;
                 }
             }
-            self.override_count
-                .fetch_sub(invalid_overrides.len(), Ordering::Relaxed);
+            if actual_removals > 0 {
+                self.override_count
+                    .fetch_sub(actual_removals, Ordering::Relaxed);
+            }
         }
 
         removed

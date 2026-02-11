@@ -451,20 +451,31 @@ impl Executor {
             Expression::IntegerLiteral(lit) => Some(lit.value),
             Expression::FloatLiteral(lit) => Some(lit.value as i64),
             Expression::Parameter(param) => {
-                let params = ctx.params();
-                let param_idx = if param.index > 0 {
-                    param.index - 1
-                } else {
-                    param.index
-                };
-                if param_idx < params.len() {
-                    match &params[param_idx] {
-                        Value::Integer(i) => Some(*i),
-                        Value::Float(f) => Some(*f as i64),
+                // Named parameters (e.g., :name) use get_named_param()
+                // Positional parameters ($1, $2, ...) are 1-indexed, array is 0-indexed
+                if param.name.starts_with(':') {
+                    let name = &param.name[1..];
+                    match ctx.get_named_param(name) {
+                        Some(Value::Integer(i)) => Some(*i),
+                        Some(Value::Float(f)) => Some(*f as i64),
                         _ => None,
                     }
                 } else {
-                    None
+                    let params = ctx.params();
+                    let param_idx = if param.index > 0 {
+                        param.index - 1
+                    } else {
+                        return None;
+                    };
+                    if param_idx < params.len() {
+                        match &params[param_idx] {
+                            Value::Integer(i) => Some(*i),
+                            Value::Float(f) => Some(*f as i64),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
                 }
             }
             _ => {

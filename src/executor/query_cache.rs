@@ -60,10 +60,12 @@ fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
 /// How to extract the PK value for a compiled PK lookup
 #[derive(Debug, Clone)]
 pub enum PkValueSource {
-    /// Value comes from a parameter (0-indexed)
+    /// Value comes from a positional parameter (0-indexed)
     Parameter(usize),
     /// Value is a literal integer
     Literal(i64),
+    /// Value comes from a named parameter (e.g., :id)
+    NamedParameter(SmartString),
 }
 
 /// Pre-compiled state for PK lookup queries (SELECT * WHERE pk = value)
@@ -97,8 +99,10 @@ pub struct CompiledUpdateColumn {
 pub enum UpdateValueSource {
     /// Value is a literal
     Literal(crate::core::Value),
-    /// Value comes from a parameter (0-indexed)
+    /// Value comes from a positional parameter (0-indexed)
     Parameter(usize),
+    /// Value comes from a named parameter (e.g., :new_name)
+    NamedParameter(SmartString),
 }
 
 /// Pre-compiled state for PK-based UPDATE (UPDATE table SET col = val WHERE pk = value)
