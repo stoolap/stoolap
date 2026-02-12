@@ -369,7 +369,7 @@ impl Executor {
 
         // The recursive CTE query should have UNION ALL structure
         if stmt.set_operations.is_empty() {
-            return Err(Error::InvalidArgumentMessage(
+            return Err(Error::InvalidArgument(
                 "Recursive CTE must have UNION ALL between anchor and recursive members"
                     .to_string(),
             ));
@@ -378,7 +378,7 @@ impl Executor {
         // Check that all set operations are UNION ALL
         for set_op in &stmt.set_operations {
             if !matches!(set_op.operation, SetOperationType::UnionAll) {
-                return Err(Error::InvalidArgumentMessage(
+                return Err(Error::InvalidArgument(
                     "Recursive CTE only supports UNION ALL (not UNION)".to_string(),
                 ));
             }

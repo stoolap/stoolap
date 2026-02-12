@@ -254,7 +254,7 @@ impl Transaction {
                         let idx = columns
                             .iter()
                             .position(|c| c.eq_ignore_ascii_case(col_name))
-                            .ok_or_else(|| Error::ColumnNotFoundNamed(col_name.to_string()))?;
+                            .ok_or_else(|| Error::ColumnNotFound(col_name.to_string()))?;
                         let program = compile_expression(expr, &columns)?;
                         Ok((idx, program))
                     })
@@ -374,7 +374,7 @@ impl Transaction {
                     Expression::TableSource(ts) => &ts.name.value,
                     Expression::Identifier(id) => &id.value,
                     _ => {
-                        return Err(Error::NotSupportedMessage(
+                        return Err(Error::NotSupported(
                             "Complex FROM clauses not supported in transactions".to_string(),
                         ))
                     }
@@ -422,7 +422,7 @@ impl Transaction {
 
                 Ok(Box::new(ExecutorResult::new(result_columns, result_rows)))
             }
-            _ => Err(Error::NotSupportedMessage(
+            _ => Err(Error::NotSupported(
                 "Only DML statements are supported in transactions".to_string(),
             )),
         }
@@ -465,7 +465,7 @@ impl Transaction {
                     ">" => Operator::Gt,
                     ">=" => Operator::Gte,
                     _ => {
-                        return Err(Error::NotSupportedMessage(format!(
+                        return Err(Error::NotSupported(format!(
                             "Operator {} not supported in transaction WHERE clause",
                             infix.operator
                         )));
@@ -476,7 +476,7 @@ impl Transaction {
                 let column = match infix.left.as_ref() {
                     Expression::Identifier(id) => id.value.clone(),
                     _ => {
-                        return Err(Error::NotSupportedMessage(
+                        return Err(Error::NotSupported(
                             "Only column references supported on left side of comparison"
                                 .to_string(),
                         ));
@@ -493,7 +493,7 @@ impl Transaction {
                 storage_expr.prepare_for_schema(schema);
                 Ok(Box::new(storage_expr))
             }
-            _ => Err(Error::NotSupportedMessage(format!(
+            _ => Err(Error::NotSupported(format!(
                 "Expression type {:?} not supported in transaction WHERE clause",
                 expr
             ))),

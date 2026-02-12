@@ -247,7 +247,7 @@ impl Executor {
             {
                 Value::Integer(l) => {
                     if l < 0 {
-                        return Err(Error::ParseError(format!(
+                        return Err(Error::Parse(format!(
                             "LIMIT must be non-negative, got {}",
                             l
                         )));
@@ -257,7 +257,7 @@ impl Executor {
                 Value::Float(f) => {
                     let l = f as i64;
                     if l < 0 {
-                        return Err(Error::ParseError(format!(
+                        return Err(Error::Parse(format!(
                             "LIMIT must be non-negative, got {}",
                             l
                         )));
@@ -265,7 +265,7 @@ impl Executor {
                     Some(l as usize)
                 }
                 other => {
-                    return Err(Error::ParseError(format!(
+                    return Err(Error::Parse(format!(
                         "LIMIT must be an integer, got {:?}",
                         other
                     )));
@@ -282,7 +282,7 @@ impl Executor {
             {
                 Some(Value::Integer(o)) => {
                     if o < 0 {
-                        return Err(Error::ParseError(format!(
+                        return Err(Error::Parse(format!(
                             "OFFSET must be non-negative, got {}",
                             o
                         )));
@@ -292,7 +292,7 @@ impl Executor {
                 Some(Value::Float(f)) => {
                     let o = f as i64;
                     if o < 0 {
-                        return Err(Error::ParseError(format!(
+                        return Err(Error::Parse(format!(
                             "OFFSET must be non-negative, got {}",
                             o
                         )));
@@ -300,7 +300,7 @@ impl Executor {
                     o as usize
                 }
                 Some(other) => {
-                    return Err(Error::ParseError(format!(
+                    return Err(Error::Parse(format!(
                         "OFFSET must be an integer, got {:?}",
                         other
                     )));
@@ -881,7 +881,7 @@ impl Executor {
             Expression::ValuesSource(values_source) => {
                 self.execute_values_source(values_source, stmt, ctx, classification)
             }
-            _ => Err(Error::NotSupportedMessage(
+            _ => Err(Error::NotSupported(
                 "Unsupported FROM clause type".to_string(),
             )),
         }
@@ -1285,7 +1285,7 @@ impl Executor {
         let (table, _standalone_tx) = if let Some(ref tx_state) = *active_tx {
             // Use the active transaction - this allows seeing uncommitted changes
             let table = tx_state.transaction.get_table(table_name).map_err(|e| {
-                if matches!(e, Error::TableNotFound) {
+                if matches!(e, Error::TableNotFound(_)) {
                     Error::TableOrViewNotFound(table_name.to_string())
                 } else {
                     e
@@ -1311,7 +1311,7 @@ impl Executor {
             }
 
             let table = tx.get_table(table_name).map_err(|e| {
-                if matches!(e, Error::TableNotFound) {
+                if matches!(e, Error::TableNotFound(_)) {
                     Error::TableOrViewNotFound(table_name.to_string())
                 } else {
                     e
@@ -1751,14 +1751,14 @@ impl Executor {
                 {
                     Value::Integer(l) if l >= 0 => l as usize,
                     Value::Integer(l) => {
-                        return Err(Error::ParseError(format!(
+                        return Err(Error::Parse(format!(
                             "LIMIT must be non-negative, got {}",
                             l
                         )));
                     }
                     Value::Float(f) if f >= 0.0 => f as usize,
                     Value::Float(f) => {
-                        return Err(Error::ParseError(format!(
+                        return Err(Error::Parse(format!(
                             "LIMIT must be non-negative, got {}",
                             f
                         )));
@@ -1776,14 +1776,14 @@ impl Executor {
                 {
                     Value::Integer(o) if o >= 0 => o as usize,
                     Value::Integer(o) => {
-                        return Err(Error::ParseError(format!(
+                        return Err(Error::Parse(format!(
                             "OFFSET must be non-negative, got {}",
                             o
                         )));
                     }
                     Value::Float(f) if f >= 0.0 => f as usize,
                     Value::Float(f) => {
-                        return Err(Error::ParseError(format!(
+                        return Err(Error::Parse(format!(
                             "OFFSET must be non-negative, got {}",
                             f
                         )));
@@ -4248,7 +4248,7 @@ impl Executor {
         if let Some(cached) = self.query_cache.get(view_query) {
             // Validate it's a SELECT statement
             if !matches!(cached.statement.as_ref(), Statement::Select(_)) {
-                return Err(Error::InvalidArgumentMessage(
+                return Err(Error::InvalidArgument(
                     "View definition is not a SELECT statement".to_string(),
                 ));
             }
@@ -4256,20 +4256,19 @@ impl Executor {
         }
 
         // Parse the view's query
-        let statements = crate::parser::parse_sql(view_query).map_err(|e| {
-            Error::InvalidArgumentMessage(format!("Failed to parse view query: {}", e))
-        })?;
+        let statements = crate::parser::parse_sql(view_query)
+            .map_err(|e| Error::InvalidArgument(format!("Failed to parse view query: {}", e)))?;
 
         // The view query should be a single SELECT statement
         if statements.len() != 1 {
-            return Err(Error::InvalidArgumentMessage(
+            return Err(Error::InvalidArgument(
                 "View definition must contain exactly one statement".to_string(),
             ));
         }
 
         // Validate it's a SELECT statement
         if !matches!(&statements[0], Statement::Select(_)) {
-            return Err(Error::InvalidArgumentMessage(
+            return Err(Error::InvalidArgument(
                 "View definition is not a SELECT statement".to_string(),
             ));
         }
@@ -4297,7 +4296,7 @@ impl Executor {
         // Check view depth to prevent stack overflow from deeply nested views
         let depth = ctx.view_depth();
         if depth >= MAX_VIEW_DEPTH {
-            return Err(Error::InvalidArgumentMessage(format!(
+            return Err(Error::InvalidArgument(format!(
                 "Maximum view nesting depth ({}) exceeded",
                 MAX_VIEW_DEPTH
             )));
@@ -4402,7 +4401,7 @@ impl Executor {
                     {
                         column_indices.push(idx);
                     } else {
-                        return Err(Error::ColumnNotFoundNamed(id.value.to_string()));
+                        return Err(Error::ColumnNotFound(id.value.to_string()));
                     }
                 }
                 Expression::Aliased(aliased) => {
@@ -4416,7 +4415,7 @@ impl Executor {
                         {
                             column_indices.push(idx);
                         } else {
-                            return Err(Error::ColumnNotFoundNamed(id.value.to_string()));
+                            return Err(Error::ColumnNotFound(id.value.to_string()));
                         }
                     } else {
                         // Complex expression in alias - need ExprMappedResult
@@ -4921,7 +4920,7 @@ impl Executor {
                     // Check view depth to prevent stack overflow
                     let depth = ctx.view_depth();
                     if depth >= MAX_VIEW_DEPTH {
-                        return Err(Error::InvalidArgumentMessage(format!(
+                        return Err(Error::InvalidArgument(format!(
                             "Maximum view nesting depth ({}) exceeded",
                             MAX_VIEW_DEPTH
                         )));
@@ -5082,7 +5081,7 @@ impl Executor {
                     self.execute_values_source(vs, &select_all, ctx, &classification)?;
                 Ok((result, columns.to_vec()))
             }
-            _ => Err(Error::NotSupportedMessage(
+            _ => Err(Error::NotSupported(
                 "Unsupported table expression type".to_string(),
             )),
         }
@@ -6524,7 +6523,7 @@ impl Executor {
                 if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
                     Ok(row.get(idx).cloned().unwrap_or(Value::null_unknown()))
                 } else {
-                    Err(Error::ColumnNotFoundNamed(id.value.to_string()))
+                    Err(Error::ColumnNotFound(id.value.to_string()))
                 }
             }
             // Qualified identifier (table.column) - O(1) lookup
@@ -6538,7 +6537,7 @@ impl Executor {
                     // Fallback to unqualified name for single-table queries or aliases
                     Ok(row.get(idx).cloned().unwrap_or(Value::null_unknown()))
                 } else {
-                    Err(Error::ColumnNotFoundNamed(format!(
+                    Err(Error::ColumnNotFound(format!(
                         "{}.{}",
                         qid.qualifier.value, qid.name.value
                     )))

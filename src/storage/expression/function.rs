@@ -172,9 +172,7 @@ impl FunctionExpr {
                     Ok(row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
                 } else {
                     // Fallback: try to find column by name (shouldn't happen if prepared)
-                    Err(crate::core::Error::ColumnNotFoundNamed(
-                        col_name.to_string(),
-                    ))
+                    Err(crate::core::Error::ColumnNotFound(col_name.to_string()))
                 }
             }
             FunctionArg::Literal(value) => Ok(value.clone()),

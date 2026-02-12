@@ -1452,7 +1452,7 @@ impl MVCCEngine {
         {
             let mut schemas = self.schemas.write().unwrap();
             if schemas.contains_key(&table_name) {
-                return Err(Error::TableAlreadyExists);
+                return Err(Error::TableAlreadyExists(table_name.to_string()));
             }
             schemas.insert(table_name.clone(), CompactArc::new(schema));
         }
@@ -1486,7 +1486,7 @@ impl MVCCEngine {
         {
             let mut schemas = self.schemas.write().unwrap();
             if !schemas.contains_key(&table_name) {
-                return Err(Error::TableNotFound);
+                return Err(Error::TableNotFound(table_name.to_string()));
             }
             schemas.remove(&table_name);
         }
@@ -1520,7 +1520,7 @@ impl MVCCEngine {
         stores
             .get(table_name.as_ref())
             .cloned()
-            .ok_or(Error::TableNotFound)
+            .ok_or_else(|| Error::TableNotFound(table_name.as_ref().to_string()))
     }
 
     /// Creates a column in a table
@@ -1540,7 +1540,9 @@ impl MVCCEngine {
         // Validate under read lock first
         {
             let schemas = self.schemas.read().unwrap();
-            let schema_arc = schemas.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            let schema_arc = schemas
+                .get(&table_name_lower)
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
             if schema_arc.has_column(column_name) {
                 return Err(Error::DuplicateColumn);
             }
@@ -1602,7 +1604,9 @@ impl MVCCEngine {
         // Validate under read lock first
         {
             let schemas = self.schemas.read().unwrap();
-            let schema_arc = schemas.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            let schema_arc = schemas
+                .get(&table_name_lower)
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
             if schema_arc.has_column(column_name) {
                 return Err(Error::DuplicateColumn);
             }
@@ -1661,7 +1665,9 @@ impl MVCCEngine {
         // to maintain consistent ordering with column DDL (schemas(W) -> version_stores(R))
         let vs_schema = {
             let stores = self.version_stores.read().unwrap();
-            let store = stores.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            let store = stores
+                .get(&table_name_lower)
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
             store.schema().clone()
         };
 
@@ -1683,13 +1689,15 @@ impl MVCCEngine {
         // Validate under read lock first
         {
             let schemas = self.schemas.read().unwrap();
-            let schema_arc = schemas.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            let schema_arc = schemas
+                .get(&table_name_lower)
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
             if let Some((_, col)) = schema_arc.find_column(column_name) {
                 if col.primary_key {
                     return Err(Error::CannotDropPrimaryKey);
                 }
             } else {
-                return Err(Error::ColumnNotFound);
+                return Err(Error::ColumnNotFound(column_name.to_string()));
             }
         }
 
@@ -1733,9 +1741,11 @@ impl MVCCEngine {
         // Validate under read lock first
         {
             let schemas = self.schemas.read().unwrap();
-            let schema_arc = schemas.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            let schema_arc = schemas
+                .get(&table_name_lower)
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
             if !schema_arc.has_column(old_name) {
-                return Err(Error::ColumnNotFound);
+                return Err(Error::ColumnNotFound(old_name.to_string()));
             }
             if schema_arc.has_column(new_name) {
                 return Err(Error::DuplicateColumn);
@@ -1788,9 +1798,11 @@ impl MVCCEngine {
         // Validate under read lock first
         {
             let schemas = self.schemas.read().unwrap();
-            let schema_arc = schemas.get(&table_name_lower).ok_or(Error::TableNotFound)?;
+            let schema_arc = schemas
+                .get(&table_name_lower)
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
             if !schema_arc.has_column(column_name) {
-                return Err(Error::ColumnNotFound);
+                return Err(Error::ColumnNotFound(column_name.to_string()));
             }
         }
 
@@ -1840,10 +1852,10 @@ impl MVCCEngine {
         {
             let mut schemas = self.schemas.write().unwrap();
             if !schemas.contains_key(&old_name_lower) {
-                return Err(Error::TableNotFound);
+                return Err(Error::TableNotFound(old_name_lower.to_string()));
             }
             if schemas.contains_key(&new_name_lower) {
-                return Err(Error::TableAlreadyExists);
+                return Err(Error::TableAlreadyExists(new_name_lower.to_string()));
             }
             if let Some(mut schema_arc) = schemas.remove(&old_name_lower) {
                 let schema = CompactArc::make_mut(&mut schema_arc);
@@ -2127,7 +2139,7 @@ impl Engine for MVCCEngine {
         schemas
             .get(name.as_ref())
             .cloned()
-            .ok_or(Error::TableNotFound)
+            .ok_or_else(|| Error::TableNotFound(name.as_ref().to_string()))
     }
 
     #[inline]
@@ -2939,7 +2951,7 @@ impl TransactionEngineOperations for EngineOperations {
         let version_store = stores
             .get(&*table_name_lower)
             .cloned()
-            .ok_or(Error::TableNotFound)?;
+            .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
         drop(stores);
 
         // Check if we have a cached transaction version store for this (txn_id, table_name)
@@ -3001,7 +3013,7 @@ impl TransactionEngineOperations for EngineOperations {
         {
             let mut schemas = self.schemas().write().unwrap();
             if schemas.contains_key(&table_name) {
-                return Err(Error::TableAlreadyExists);
+                return Err(Error::TableAlreadyExists(table_name.to_string()));
             }
             schemas.insert(table_name.clone(), CompactArc::new(schema));
         }
@@ -3026,7 +3038,7 @@ impl TransactionEngineOperations for EngineOperations {
         {
             let mut schemas = self.schemas().write().unwrap();
             if schemas.remove(&table_name_lower).is_none() {
-                return Err(Error::TableNotFound);
+                return Err(Error::TableNotFound(table_name_lower.to_string()));
             }
         }
         {
@@ -3052,10 +3064,10 @@ impl TransactionEngineOperations for EngineOperations {
         {
             let mut schemas = self.schemas().write().unwrap();
             if !schemas.contains_key(&old_name_lower) {
-                return Err(Error::TableNotFound);
+                return Err(Error::TableNotFound(old_name_lower.to_string()));
             }
             if schemas.contains_key(&new_name_lower) {
-                return Err(Error::TableAlreadyExists);
+                return Err(Error::TableAlreadyExists(new_name_lower.to_string()));
             }
             if let Some(mut schema_arc) = schemas.remove(&old_name_lower) {
                 let schema = CompactArc::make_mut(&mut schema_arc);

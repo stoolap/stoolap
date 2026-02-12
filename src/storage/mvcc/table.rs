@@ -2492,7 +2492,7 @@ impl Table for MVCCTable {
         for col_name in columns {
             let (col_idx, col) = schema
                 .find_column(col_name)
-                .ok_or(Error::ColumnNotFoundNamed(col_name.to_string()))?;
+                .ok_or(Error::ColumnNotFound(col_name.to_string()))?;
             column_names.push(col.name.clone());
             column_ids.push(col.id as i32);
             data_types.push(col.data_type);
@@ -2509,7 +2509,7 @@ impl Table for MVCCTable {
 
         // Check if index with same name already exists
         if self.version_store.index_exists(name) {
-            return Err(Error::IndexAlreadyExistsByName(name.to_string()));
+            return Err(Error::IndexAlreadyExists(name.to_string()));
         }
 
         // Check if an index already exists on the same column(s)
@@ -2697,7 +2697,7 @@ impl Table for MVCCTable {
     fn drop_index(&self, name: &str) -> Result<()> {
         // Check if index exists
         if !self.version_store.index_exists(name) {
-            return Err(Error::IndexNotFoundByName(name.to_string()));
+            return Err(Error::IndexNotFound(name.to_string()));
         }
 
         // Remove from version store
@@ -2736,7 +2736,7 @@ impl Table for MVCCTable {
         let schema = self.version_store.schema();
         let (col_idx, col) = schema
             .find_column(column_name)
-            .ok_or(Error::ColumnNotFound)?;
+            .ok_or_else(|| Error::ColumnNotFound(column_name.to_string()))?;
 
         // Generate index name
         let index_name = custom_name
@@ -2846,7 +2846,7 @@ impl Table for MVCCTable {
         for col_name in columns {
             let (col_idx, col) = schema
                 .find_column(col_name)
-                .ok_or(Error::ColumnNotFoundNamed(col_name.to_string()))?;
+                .ok_or(Error::ColumnNotFound(col_name.to_string()))?;
             column_names.push(col.name.clone());
             column_ids.push(col.id as i32);
             data_types.push(col.data_type);
@@ -2855,7 +2855,7 @@ impl Table for MVCCTable {
 
         // Check if index with same name already exists
         if self.version_store.index_exists(name) {
-            return Err(Error::IndexAlreadyExistsByName(name.to_string()));
+            return Err(Error::IndexAlreadyExists(name.to_string()));
         }
 
         // Create the multi-column index with capacity hint

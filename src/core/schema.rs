@@ -596,7 +596,9 @@ impl Schema {
 
     /// Remove a column by name
     pub fn remove_column(&mut self, name: &str) -> Result<SchemaColumn> {
-        let idx = self.get_column_index(name).ok_or(Error::ColumnNotFound)?;
+        let idx = self
+            .get_column_index(name)
+            .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
         let column = self.columns.remove(idx);
 
         // Re-index remaining columns
@@ -620,7 +622,7 @@ impl Schema {
 
         let idx = self
             .get_column_index(old_name)
-            .ok_or(Error::ColumnNotFound)?;
+            .ok_or_else(|| Error::ColumnNotFound(old_name.to_string()))?;
 
         self.columns[idx].name_lower = new_name.to_lowercase();
         self.columns[idx].name = new_name;
@@ -636,7 +638,9 @@ impl Schema {
         data_type: Option<DataType>,
         nullable: Option<bool>,
     ) -> Result<()> {
-        let idx = self.get_column_index(name).ok_or(Error::ColumnNotFound)?;
+        let idx = self
+            .get_column_index(name)
+            .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
 
         if let Some(dt) = data_type {
             self.columns[idx].data_type = dt;

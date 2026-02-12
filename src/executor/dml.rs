@@ -290,7 +290,7 @@ impl Executor {
                         col_map
                             .get(id.value_lower.as_str())
                             .copied()
-                            .ok_or_else(|| Error::ColumnNotFoundNamed(id.value.to_string()))
+                            .ok_or_else(|| Error::ColumnNotFound(id.value.to_string()))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 // Get column types for the specified columns
@@ -344,7 +344,7 @@ impl Executor {
                 let select_row = select_result.row();
 
                 if select_row.len() != column_indices.len() {
-                    return Err(Error::InvalidArgumentMessage(format!(
+                    return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but SELECT returns {} columns",
                         column_indices.len(),
                         select_row.len()
@@ -426,7 +426,7 @@ impl Executor {
 
             for value_row in &stmt.values {
                 if value_row.len() != column_indices.len() {
-                    return Err(Error::InvalidArgumentMessage(format!(
+                    return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but {} values",
                         column_indices.len(),
                         value_row.len()
@@ -521,7 +521,7 @@ impl Executor {
             // Fast path: normal INSERT without clones
             for value_row in &stmt.values {
                 if value_row.len() != column_indices.len() {
-                    return Err(Error::InvalidArgumentMessage(format!(
+                    return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but {} values",
                         column_indices.len(),
                         value_row.len()
@@ -755,7 +755,7 @@ impl Executor {
                         col_map
                             .get(id.value_lower.as_str())
                             .copied()
-                            .ok_or_else(|| Error::ColumnNotFoundNamed(id.value.to_string()))
+                            .ok_or_else(|| Error::ColumnNotFound(id.value.to_string()))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let types: Vec<DataType> = indices
@@ -844,7 +844,7 @@ impl Executor {
                 let select_row = select_result.row();
 
                 if select_row.len() != column_indices.len() {
-                    return Err(Error::InvalidArgumentMessage(format!(
+                    return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but SELECT returns {} columns",
                         column_indices.len(),
                         select_row.len()
@@ -897,7 +897,7 @@ impl Executor {
             // Regular INSERT with VALUES
             for value_list in &stmt.values {
                 if value_list.len() != column_indices.len() {
-                    return Err(Error::InvalidArgumentMessage(format!(
+                    return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but {} values provided",
                         column_indices.len(),
                         value_list.len()

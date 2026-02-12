@@ -21,7 +21,7 @@ use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use crate::core::{Error, IsolationLevel, Result, Schema, SchemaColumn};
-use crate::storage::mvcc::{get_fast_timestamp, MvccError, TransactionRegistry};
+use crate::storage::mvcc::{get_fast_timestamp, TransactionRegistry};
 use crate::storage::traits::{QueryResult, Table, Transaction};
 use crate::storage::Expression;
 
@@ -186,7 +186,7 @@ impl MvccTransaction {
     /// Check if transaction is active
     fn check_active(&self) -> Result<()> {
         if self.state != TransactionState::Active {
-            return Err(MvccError::TransactionClosed.into());
+            return Err(Error::TransactionClosed);
         }
         Ok(())
     }

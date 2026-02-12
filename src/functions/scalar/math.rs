@@ -55,7 +55,10 @@ impl ScalarFunction for AbsFunction {
         // Try to preserve integer type if possible
         if let Some(i) = value_to_i64(&args[0]) {
             if matches!(args[0], Value::Integer(_)) {
-                return Ok(Value::Integer(i.abs()));
+                return match i.checked_abs() {
+                    Some(abs) => Ok(Value::Integer(abs)),
+                    None => Ok(Value::Null(crate::core::DataType::Integer)), // i64::MIN overflow
+                };
             }
         }
 

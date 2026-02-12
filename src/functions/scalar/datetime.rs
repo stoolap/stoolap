@@ -1348,14 +1348,24 @@ fn format_timestamp(ts: DateTime<Utc>, format: &str) -> String {
     result = result.replace("SS", &format!("{:02}", second));
     result = result.replace("MS", &format!("{:03}", millisecond));
 
-    // AM/PM
+    // AM/PM - use placeholders to avoid sequential replacement interference
     let meridiem = if hour < 12 { "AM" } else { "PM" };
-    result = result.replace("AM", meridiem);
-    result = result.replace("PM", meridiem);
-    result = result.replace("am", &meridiem.to_lowercase());
-    result = result.replace("pm", &meridiem.to_lowercase());
-    result = result.replace("A.M.", if hour < 12 { "A.M." } else { "P.M." });
-    result = result.replace("P.M.", if hour < 12 { "A.M." } else { "P.M." });
+    let meridiem_dotted = if hour < 12 { "A.M." } else { "P.M." };
+    // Replace dotted forms first (longer patterns before shorter)
+    result = result.replace("A.M.", "\x01MDDOT\x01");
+    result = result.replace("P.M.", "\x01MDDOT\x01");
+    result = result.replace("a.m.", "\x01mddot\x01");
+    result = result.replace("p.m.", "\x01mddot\x01");
+    // Then uppercase/lowercase AM/PM
+    result = result.replace("AM", "\x01MD\x01");
+    result = result.replace("PM", "\x01MD\x01");
+    result = result.replace("am", "\x01md\x01");
+    result = result.replace("pm", "\x01md\x01");
+    // Now replace placeholders with actual values
+    result = result.replace("\x01MDDOT\x01", meridiem_dotted);
+    result = result.replace("\x01mddot\x01", &meridiem_dotted.to_lowercase());
+    result = result.replace("\x01MD\x01", meridiem);
+    result = result.replace("\x01md\x01", &meridiem.to_lowercase());
 
     // Timezone
     result = result.replace("TZ", "UTC");

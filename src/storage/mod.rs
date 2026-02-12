@@ -49,7 +49,7 @@ pub use traits::{
 // Re-export MVCC types
 pub use mvcc::{
     get_fast_timestamp, BTreeIndex, EmptyScanner as MvccEmptyScanner, MVCCEngine, MVCCScanner,
-    MVCCTable, MvccError, MvccTransaction, RangeScanner, RowVersion, SingleRowScanner,
+    MVCCTable, MvccTransaction, RangeScanner, RowVersion, SingleRowScanner,
     TransactionEngineOperations, TransactionRegistry, TransactionState, TransactionVersionStore,
     VersionStore, VisibilityChecker, WriteSetEntry, INVALID_TRANSACTION_ID,
     RECOVERY_TRANSACTION_ID,

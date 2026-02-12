@@ -20,7 +20,7 @@
 //! - [`CollateFunction`] - COLLATE(string, collation) - Apply collation to string
 
 use crate::common::{CompactArc, SmartString};
-use crate::core::{Error, Result, Value};
+use crate::core::{DataType, Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
 };
@@ -69,15 +69,17 @@ impl ScalarFunction for CastFunction {
             }
         };
 
-        // Handle NULL values
+        // Handle NULL values - SQL standard: CAST(NULL AS type) returns NULL
         if value.is_null() {
-            return match target_type.as_str() {
-                "STRING" | "TEXT" | "VARCHAR" | "CHAR" => Ok(Value::Text(SmartString::from(""))),
-                "INT" | "INTEGER" => Ok(Value::Integer(0)),
-                "FLOAT" | "REAL" | "DOUBLE" => Ok(Value::Float(0.0)),
-                "BOOLEAN" | "BOOL" => Ok(Value::Boolean(false)),
-                _ => Ok(Value::null_unknown()),
-            };
+            return Ok(match target_type.as_str() {
+                "INT" | "INTEGER" => Value::Null(DataType::Integer),
+                "FLOAT" | "REAL" | "DOUBLE" => Value::Null(DataType::Float),
+                "STRING" | "TEXT" | "VARCHAR" | "CHAR" => Value::Null(DataType::Text),
+                "BOOLEAN" | "BOOL" => Value::Null(DataType::Boolean),
+                "TIMESTAMP" | "DATETIME" | "DATE" | "TIME" => Value::Null(DataType::Timestamp),
+                "JSON" => Value::Null(DataType::Json),
+                _ => Value::null_unknown(),
+            });
         }
 
         // Convert based on target type
@@ -104,7 +106,21 @@ impl ScalarFunction for CastFunction {
 fn cast_to_integer(value: &Value) -> Result<Value> {
     match value {
         Value::Integer(i) => Ok(Value::Integer(*i)),
-        Value::Float(f) => Ok(Value::Integer(*f as i64)),
+        Value::Float(f) => {
+            if !f.is_finite() {
+                return Err(Error::invalid_argument(format!(
+                    "Cannot cast {} to INTEGER",
+                    f
+                )));
+            }
+            if *f > i64::MAX as f64 || *f < i64::MIN as f64 {
+                return Err(Error::invalid_argument(format!(
+                    "Float value {} out of INTEGER range",
+                    f
+                )));
+            }
+            Ok(Value::Integer(*f as i64))
+        }
         Value::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
         Value::Text(s) => {
             if s.is_empty() {
@@ -116,14 +132,22 @@ fn cast_to_integer(value: &Value) -> Result<Value> {
             }
             // If that fails, try as float and truncate
             if let Ok(f) = s.parse::<f64>() {
+                if !f.is_finite() || f > i64::MAX as f64 || f < i64::MIN as f64 {
+                    return Err(Error::invalid_argument(format!(
+                        "Cannot convert '{}' to INTEGER",
+                        s
+                    )));
+                }
                 return Ok(Value::Integer(f as i64));
             }
-            // Return 0 for unparseable strings
-            Ok(Value::Integer(0))
+            Err(Error::invalid_argument(format!(
+                "Cannot convert '{}' to INTEGER",
+                s
+            )))
         }
         Value::Timestamp(t) => Ok(Value::Integer(t.timestamp())),
         Value::Json(_) => Ok(Value::Integer(0)),
-        Value::Null(_) => Ok(Value::Integer(0)),
+        Value::Null(dt) => Ok(Value::Null(*dt)),
     }
 }
 
@@ -147,7 +171,7 @@ fn cast_to_float(value: &Value) -> Result<Value> {
         }
         Value::Timestamp(t) => Ok(Value::Float(t.timestamp() as f64)),
         Value::Json(_) => Err(Error::invalid_argument("Cannot convert JSON to FLOAT")),
-        Value::Null(_) => Ok(Value::Float(0.0)),
+        Value::Null(dt) => Ok(Value::Null(*dt)),
     }
 }
 
@@ -163,7 +187,7 @@ fn cast_to_string(value: &Value) -> Result<Value> {
         Value::Boolean(b) => Ok(Value::Text(SmartString::from_string(b.to_string()))),
         Value::Timestamp(t) => Ok(Value::Text(SmartString::from_string(t.to_rfc3339()))),
         Value::Json(j) => Ok(Value::Text(SmartString::from(&**j))),
-        Value::Null(_) => Ok(Value::Text(SmartString::from(""))),
+        Value::Null(dt) => Ok(Value::Null(*dt)),
     }
 }
 
@@ -185,7 +209,7 @@ fn cast_to_boolean(value: &Value) -> Result<Value> {
             "Cannot convert TIMESTAMP to BOOLEAN",
         )),
         Value::Json(_) => Err(Error::invalid_argument("Cannot convert JSON to BOOLEAN")),
-        Value::Null(_) => Ok(Value::Boolean(false)),
+        Value::Null(dt) => Ok(Value::Null(*dt)),
     }
 }
 
@@ -409,6 +433,32 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_text_to_integer_edge_cases() {
+        let cast = CastFunction;
+
+        // "inf" → should error, not silently saturate to i64::MAX
+        assert!(cast
+            .evaluate(&[Value::text("inf"), Value::text("INTEGER")])
+            .is_err());
+        assert!(cast
+            .evaluate(&[Value::text("-inf"), Value::text("INTEGER")])
+            .is_err());
+        assert!(cast
+            .evaluate(&[Value::text("NaN"), Value::text("INTEGER")])
+            .is_err());
+        // Out of i64 range
+        assert!(cast
+            .evaluate(&[Value::text("1e30"), Value::text("INTEGER")])
+            .is_err());
+        // Valid float string truncates to integer
+        assert_eq!(
+            cast.evaluate(&[Value::text("3.14"), Value::text("INTEGER")])
+                .unwrap(),
+            Value::Integer(3)
+        );
+    }
+
+    #[test]
     fn test_cast_to_float() {
         let cast = CastFunction;
 
@@ -498,19 +548,26 @@ mod tests {
     fn test_cast_null_handling() {
         let cast = CastFunction;
 
-        // NULL to integer
-        assert_eq!(
-            cast.evaluate(&[Value::null_unknown(), Value::text("INTEGER")])
-                .unwrap(),
-            Value::Integer(0)
-        );
+        // SQL standard: CAST(NULL AS type) returns NULL with the target type
+        let result = cast
+            .evaluate(&[Value::null_unknown(), Value::text("INTEGER")])
+            .unwrap();
+        assert!(result.is_null(), "CAST(NULL AS INTEGER) should return NULL");
 
-        // NULL to string
-        assert_eq!(
-            cast.evaluate(&[Value::null_unknown(), Value::text("TEXT")])
-                .unwrap(),
-            Value::text("")
-        );
+        let result = cast
+            .evaluate(&[Value::null_unknown(), Value::text("TEXT")])
+            .unwrap();
+        assert!(result.is_null(), "CAST(NULL AS TEXT) should return NULL");
+
+        let result = cast
+            .evaluate(&[Value::null_unknown(), Value::text("FLOAT")])
+            .unwrap();
+        assert!(result.is_null(), "CAST(NULL AS FLOAT) should return NULL");
+
+        let result = cast
+            .evaluate(&[Value::null_unknown(), Value::text("BOOLEAN")])
+            .unwrap();
+        assert!(result.is_null(), "CAST(NULL AS BOOLEAN) should return NULL");
     }
 
     // COLLATE tests

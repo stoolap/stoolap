@@ -179,7 +179,7 @@ mod integration_tests {
         assert!(!err.is_not_found());
 
         // Not found errors
-        let err = Error::TableNotFound;
+        let err = Error::TableNotFound(String::new());
         assert!(err.is_not_found());
         assert!(!err.is_constraint_violation());
 

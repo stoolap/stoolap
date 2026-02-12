@@ -844,7 +844,10 @@ impl ExprVM {
                 Op::Neg => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let result = match v {
-                        Value::Integer(i) => Value::Integer(-i),
+                        Value::Integer(i) => match i.checked_neg() {
+                            Some(neg) => Value::Integer(neg),
+                            None => Value::Null(DataType::Integer), // i64::MIN overflow
+                        },
                         Value::Float(f) => Value::Float(-f),
                         Value::Null(dt) => Value::Null(dt),
                         _ => Value::Null(DataType::Null),
@@ -2221,7 +2224,7 @@ impl ExprVM {
 
                 Op::JumpIfTrue(target) => {
                     if let Some(top) = stack.last() {
-                        if matches!(&**top, Value::Boolean(true)) {
+                        if Self::to_bool(top) {
                             pc = *target as usize;
                             continue;
                         }
@@ -2231,13 +2234,14 @@ impl ExprVM {
 
                 Op::JumpIfFalse(target) => {
                     if let Some(top) = stack.last() {
-                        match &**top {
-                            Value::Boolean(false) | Value::Null(_) => {
-                                pc = *target as usize;
-                                continue;
-                            }
-                            _ => {}
+                        if !Self::to_bool(top) {
+                            pc = *target as usize;
+                            continue;
                         }
+                    } else {
+                        // Empty stack → treat as NULL → falsy → jump
+                        pc = *target as usize;
+                        continue;
                     }
                     pc += 1;
                 }
@@ -2254,21 +2258,19 @@ impl ExprVM {
 
                 Op::PopJumpIfFalse(target) => {
                     let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    match &*v {
-                        Value::Boolean(false) | Value::Null(_) => {
-                            pc = *target as usize;
-                        }
-                        _ => pc += 1,
+                    if !Self::to_bool(&v) {
+                        pc = *target as usize;
+                    } else {
+                        pc += 1;
                     }
                 }
 
                 Op::PopJumpIfTrue(target) => {
                     let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    match &*v {
-                        Value::Boolean(true) => {
-                            pc = *target as usize;
-                        }
-                        _ => pc += 1,
+                    if Self::to_bool(&v) {
+                        pc = *target as usize;
+                    } else {
+                        pc += 1;
                     }
                 }
 

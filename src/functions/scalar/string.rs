@@ -1002,7 +1002,14 @@ impl ScalarFunction for LocateFunction {
             if args[2].is_null() {
                 return Ok(Value::null_unknown());
             }
-            let pos = value_to_i64(&args[2]).unwrap_or(1);
+            let pos = match value_to_i64(&args[2]) {
+                Some(p) => p,
+                None => {
+                    return Err(Error::invalid_argument(
+                        "LOCATE start position must be an integer",
+                    ))
+                }
+            };
             if pos < 1 {
                 1usize
             } else {

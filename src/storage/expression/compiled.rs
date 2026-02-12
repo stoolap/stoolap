@@ -228,7 +228,8 @@ impl CompiledPattern {
                 let prefix_ref = prefix.as_ref();
                 if case_insensitive {
                     s.len() >= prefix_ref.len()
-                        && s[..prefix_ref.len()].eq_ignore_ascii_case(prefix_ref)
+                        && s.as_bytes()[..prefix_ref.len()]
+                            .eq_ignore_ascii_case(prefix_ref.as_bytes())
                 } else {
                     s.starts_with(prefix_ref)
                 }
@@ -237,7 +238,8 @@ impl CompiledPattern {
                 let suffix_ref = suffix.as_ref();
                 if case_insensitive {
                     s.len() >= suffix_ref.len()
-                        && s[s.len() - suffix_ref.len()..].eq_ignore_ascii_case(suffix_ref)
+                        && s.as_bytes()[s.len() - suffix_ref.len()..]
+                            .eq_ignore_ascii_case(suffix_ref.as_bytes())
                 } else {
                     s.ends_with(suffix_ref)
                 }
@@ -254,9 +256,13 @@ impl CompiledPattern {
                     if s.len() < substr_len {
                         return false;
                     }
-                    // Check each starting position
-                    for i in 0..=(s.len() - substr_len) {
-                        if s[i..i + substr_len].eq_ignore_ascii_case(substr_ref) {
+                    // Check each starting position using byte slices to avoid
+                    // panics on multi-byte UTF-8 characters (str slicing requires
+                    // char boundary alignment, but byte slices don't)
+                    let s_bytes = s.as_bytes();
+                    let substr_bytes = substr_ref.as_bytes();
+                    for i in 0..=(s_bytes.len() - substr_len) {
+                        if s_bytes[i..i + substr_len].eq_ignore_ascii_case(substr_bytes) {
                             return true;
                         }
                     }

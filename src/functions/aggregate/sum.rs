@@ -79,7 +79,13 @@ impl AggregateFunction for SumFunction {
         match value {
             Value::Integer(i) => match &mut self.state {
                 SumState::Empty => self.state = SumState::Integer(*i),
-                SumState::Integer(sum) => *sum += i,
+                SumState::Integer(sum) => match sum.checked_add(*i) {
+                    Some(new_sum) => *sum = new_sum,
+                    None => {
+                        // Overflow: promote to float
+                        self.state = SumState::Float(*sum as f64 + *i as f64);
+                    }
+                },
                 SumState::Float(sum) => *sum += *i as f64,
             },
             Value::Float(f) => match &mut self.state {

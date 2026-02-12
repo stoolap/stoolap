@@ -1289,7 +1289,7 @@ impl Executor {
                     // e.g., SUM(COUNT(*)) or AVG(SUM(x)) should return an error
                     for arg in &func.arguments {
                         if expression_contains_aggregate(arg) {
-                            return Err(crate::core::Error::InvalidArgumentMessage(format!(
+                            return Err(crate::core::Error::InvalidArgument(format!(
                                 "aggregate function calls cannot be nested: {}",
                                 func.function
                             )));
@@ -1373,7 +1373,7 @@ impl Executor {
                     // e.g., SUM(COUNT(*)) AS total should return an error
                     for arg in &func.arguments {
                         if expression_contains_aggregate(arg) {
-                            return Err(crate::core::Error::InvalidArgumentMessage(format!(
+                            return Err(crate::core::Error::InvalidArgument(format!(
                                 "aggregate function calls cannot be nested: {}",
                                 func.function
                             )));

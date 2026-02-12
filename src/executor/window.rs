@@ -619,7 +619,7 @@ impl Executor {
             .function_registry
             .get_window(&wf_info.name)
             .ok_or_else(|| {
-                Error::NotSupportedMessage(format!("Unknown window function: {}", wf_info.name))
+                Error::NotSupported(format!("Unknown window function: {}", wf_info.name))
             })?;
 
         // Build partition map: group rows by partition key
@@ -794,7 +794,7 @@ impl Executor {
             .function_registry
             .get_window(&wf_info.name)
             .ok_or_else(|| {
-                Error::NotSupportedMessage(format!("Unknown window function: {}", wf_info.name))
+                Error::NotSupported(format!("Unknown window function: {}", wf_info.name))
             })?;
 
         // Build result columns from SELECT list
@@ -1321,27 +1321,26 @@ impl Executor {
         let func = &window_expr.function;
 
         // Resolve named window reference if present
-        let (partition_by_exprs, order_by, frame) =
-            if let Some(ref win_ref) = window_expr.window_ref {
-                // Look up the named window definition
-                let win_def = window_defs
-                    .iter()
-                    .find(|wd| wd.name.eq_ignore_ascii_case(win_ref))
-                    .ok_or_else(|| {
-                        Error::NotSupportedMessage(format!("Unknown window name: {}", win_ref))
-                    })?;
-                (
-                    win_def.partition_by.clone(),
-                    win_def.order_by.clone(),
-                    win_def.frame.clone(),
-                )
-            } else {
-                (
-                    window_expr.partition_by.clone(),
-                    window_expr.order_by.clone(),
-                    window_expr.frame.clone(),
-                )
-            };
+        let (partition_by_exprs, order_by, frame) = if let Some(ref win_ref) =
+            window_expr.window_ref
+        {
+            // Look up the named window definition
+            let win_def = window_defs
+                .iter()
+                .find(|wd| wd.name.eq_ignore_ascii_case(win_ref))
+                .ok_or_else(|| Error::NotSupported(format!("Unknown window name: {}", win_ref)))?;
+            (
+                win_def.partition_by.clone(),
+                win_def.order_by.clone(),
+                win_def.frame.clone(),
+            )
+        } else {
+            (
+                window_expr.partition_by.clone(),
+                window_expr.order_by.clone(),
+                window_expr.frame.clone(),
+            )
+        };
 
         // Extract partition by column names
         // For qualified identifiers (e.g., l.grp), keep the full qualified name
@@ -1432,7 +1431,7 @@ impl Executor {
             .function_registry
             .get_window(&wf_info.name)
             .ok_or_else(|| {
-                Error::NotSupportedMessage(format!("Unknown window function: {}", wf_info.name))
+                Error::NotSupported(format!("Unknown window function: {}", wf_info.name))
             })?;
 
         // Look up precomputed ORDER BY values from cache using semantic key
@@ -2969,10 +2968,7 @@ impl Executor {
                     .function_registry
                     .get_aggregate(&wf_info.name)
                     .ok_or_else(|| {
-                        Error::NotSupportedMessage(format!(
-                            "Unknown aggregate function: {}",
-                            wf_info.name
-                        ))
+                        Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name))
                     })?;
 
                 for (i, &row_idx) in row_indices.iter().enumerate() {
@@ -3205,10 +3201,7 @@ impl Executor {
                     .function_registry
                     .get_aggregate(&wf_info.name)
                     .ok_or_else(|| {
-                        Error::NotSupportedMessage(format!(
-                            "Unknown aggregate function: {}",
-                            wf_info.name
-                        ))
+                        Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name))
                     })?;
 
                 // Accumulate all values in the partition

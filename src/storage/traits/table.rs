@@ -561,7 +561,7 @@ pub trait Table: Send + Sync {
         is_unique: bool,
     ) -> Result<()> {
         let _ = (name, columns, is_unique);
-        Err(Error::NotSupportedMessage(
+        Err(Error::NotSupported(
             "Multi-column indexes not supported by this table type".to_string(),
         ))
     }

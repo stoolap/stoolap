@@ -49,7 +49,7 @@ impl Executor {
             if stmt.if_not_exists {
                 return Ok(Box::new(ExecResult::empty()));
             }
-            return Err(Error::TableExists(table_name.to_string()));
+            return Err(Error::TableAlreadyExists(table_name.to_string()));
         }
 
         // Check if a view with the same name exists
@@ -90,7 +90,7 @@ impl Executor {
 
             // Validate PRIMARY KEY type - only INTEGER is supported
             if is_primary_key && data_type != DataType::Integer {
-                return Err(Error::ParseError(format!(
+                return Err(Error::Parse(format!(
                     "PRIMARY KEY column '{}' must be INTEGER type, got {:?}. Only INTEGER PRIMARY KEY is supported.",
                     col_name, data_type
                 )));
@@ -346,7 +346,7 @@ impl Executor {
             if stmt.if_exists {
                 return Ok(Box::new(ExecResult::empty()));
             }
-            return Err(Error::TableNotFoundByName(table_name.to_string()));
+            return Err(Error::TableNotFound(table_name.to_string()));
         }
 
         // Check if there's an active transaction
@@ -387,7 +387,7 @@ impl Executor {
 
         // Check if table exists
         if !self.engine.table_exists(table_name)? {
-            return Err(Error::TableNotFoundByName(table_name.to_string()));
+            return Err(Error::TableNotFound(table_name.to_string()));
         }
 
         // Check if index already exists
@@ -416,7 +416,7 @@ impl Executor {
                 .column_index_map()
                 .contains_key(col_id.value_lower.as_str())
             {
-                return Err(Error::ColumnNotFoundNamed(col_name.to_string()));
+                return Err(Error::ColumnNotFound(col_name.to_string()));
             }
         }
 
@@ -486,7 +486,7 @@ impl Executor {
         let table_name = match &stmt.table_name {
             Some(t) => t.value.to_string(),
             None => {
-                return Err(Error::InvalidArgumentMessage(
+                return Err(Error::InvalidArgument(
                     "DROP INDEX requires table name".to_string(),
                 ))
             }
@@ -497,7 +497,7 @@ impl Executor {
             if stmt.if_exists {
                 return Ok(Box::new(ExecResult::empty()));
             }
-            return Err(Error::TableNotFoundByName(table_name));
+            return Err(Error::TableNotFound(table_name));
         }
 
         // Check if index exists
@@ -505,7 +505,7 @@ impl Executor {
             if stmt.if_exists {
                 return Ok(Box::new(ExecResult::empty()));
             }
-            return Err(Error::IndexNotFoundByName(index_name.to_string()));
+            return Err(Error::IndexNotFound(index_name.to_string()));
         }
 
         // Record index drop to WAL BEFORE applying in-memory change.
@@ -531,7 +531,7 @@ impl Executor {
 
         // Check if table exists
         if !self.engine.table_exists(table_name)? {
-            return Err(Error::TableNotFoundByName(table_name.to_string()));
+            return Err(Error::TableNotFound(table_name.to_string()));
         }
 
         // Get the table for modifications
@@ -591,7 +591,7 @@ impl Executor {
                         default_expr.as_deref(),
                     )?;
                 } else {
-                    return Err(Error::InvalidArgumentMessage(
+                    return Err(Error::InvalidArgument(
                         "ADD COLUMN requires column definition".to_string(),
                     ));
                 }
@@ -607,7 +607,7 @@ impl Executor {
                     self.engine
                         .record_alter_table_drop_column(table_name, &col_name.value)?;
                 } else {
-                    return Err(Error::InvalidArgumentMessage(
+                    return Err(Error::InvalidArgument(
                         "DROP COLUMN requires column name".to_string(),
                     ));
                 }
@@ -627,7 +627,7 @@ impl Executor {
                     )?;
                 }
                 _ => {
-                    return Err(Error::InvalidArgumentMessage(
+                    return Err(Error::InvalidArgument(
                         "RENAME COLUMN requires old and new column names".to_string(),
                     ));
                 }
@@ -653,7 +653,7 @@ impl Executor {
                         nullable,
                     )?;
                 } else {
-                    return Err(Error::InvalidArgumentMessage(
+                    return Err(Error::InvalidArgument(
                         "MODIFY COLUMN requires column definition".to_string(),
                     ));
                 }
@@ -666,7 +666,7 @@ impl Executor {
                     self.engine
                         .record_alter_table_rename(table_name, &new_name.value)?;
                 } else {
-                    return Err(Error::InvalidArgumentMessage(
+                    return Err(Error::InvalidArgument(
                         "RENAME TABLE requires new table name".to_string(),
                     ));
                 }
@@ -694,7 +694,7 @@ impl Executor {
 
         // Check if a table with the same name exists
         if self.engine.table_exists(view_name)? {
-            return Err(Error::TableAlreadyExists);
+            return Err(Error::TableAlreadyExists(view_name.to_string()));
         }
 
         // Convert the query to SQL string

@@ -187,9 +187,7 @@ impl ResultRow {
         self.columns
             .iter()
             .position(|c| c.to_lowercase() == name_lower)
-            .ok_or_else(|| Error::ColumnNotFoundByName {
-                name: name.to_string(),
-            })
+            .ok_or_else(|| Error::ColumnNotFound(name.to_string()))
     }
 }
 
