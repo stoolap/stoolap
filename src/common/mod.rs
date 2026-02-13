@@ -34,7 +34,7 @@ pub mod version;
 
 // Re-export main types for convenience
 pub use buffer_pool::{BufferPool, PoolStats};
-pub use compact_arc::CompactArc;
+pub use compact_arc::{CompactArc, CompactArcDrop};
 pub use compact_vec::CompactVec;
 pub use cow_btree::CowBTree;
 pub use cow_hashmap::CowHashMap;

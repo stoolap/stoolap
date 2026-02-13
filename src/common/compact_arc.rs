@@ -21,27 +21,24 @@
 //!
 //! **Use for DSTs** (`str`, `[T]`) when you have many clones sharing one allocation:
 //! - Stack pointer: 8 bytes (thin) vs std::Arc's 16 bytes (fat)
-//! - Heap header: 24 bytes vs std::Arc's 16 bytes
-//! - Net savings: 8 bytes per clone minus 8 bytes per allocation
-//! - Break-even: 2+ clones per allocation
+//! - Heap header: 16 bytes vs std::Arc's 16 bytes
+//! - Net savings: 8 bytes per clone (thin pointer)
 //!
 //! **Avoid for sized types** (`i64`, `String`, structs):
 //! - Stack pointer: 8 bytes (same as std::Arc)
-//! - Heap header: 24 bytes vs std::Arc's 16 bytes
-//! - Net cost: 8 bytes MORE per allocation
+//! - Heap header: 16 bytes (same as std::Arc)
+//! - No advantage over std::Arc
 //!
 //! ## Memory Layout
 //!
-//! All types use a unified header with a stored dropper function:
+//! All types use a compact 16-byte header. Type-specific drop logic is resolved
+//! at compile time via monomorphization (no stored function pointer needed):
 //!
 //! ```text
 //! Stack:  [ptr: 8 bytes] ──────────────────┐
 //!                                          ▼
-//! Heap:   [refcount: 8][dropper: 8][len: 8][data...]
+//! Heap:   [refcount: 8][len: 8][data...]
 //! ```
-//!
-//! The dropper function pointer captures type-specific drop and dealloc logic,
-//! enabling a single generic Drop impl for all types including DSTs.
 //!
 //! ## Pointer Sizes (All Thin!)
 //!
@@ -65,19 +62,16 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use super::CompactVec;
 
 // ============================================================================
-// Unified Header - The Magic Trick!
+// Unified Header - 16 bytes (no stored function pointer!)
 // ============================================================================
 
 /// Unified header for all CompactArc allocations.
-/// The dropper function pointer captures type-specific behavior,
-/// allowing a single Drop impl to work for all types.
+/// Drop logic is resolved at compile time via the CompactArcDrop trait,
+/// so no function pointer needs to be stored.
 #[repr(C)]
 struct Header {
     count: AtomicUsize,
-    /// Type-erased dropper that handles both element drops and deallocation.
-    /// This is the key trick that enables thin pointers with a single Drop impl!
-    dropper: unsafe fn(*mut Header),
-    /// Length of data. For sized types: 0. For str: byte length. For [T]: element count.
+    /// Length of data. For sized types: 0 (or metadata). For str: byte length. For [T]: element count.
     len: usize,
     // Data follows immediately after, aligned appropriately
 }
@@ -89,6 +83,87 @@ const fn data_offset_for<T>() -> usize {
     let header_size = mem::size_of::<Header>();
     let align = mem::align_of::<T>();
     (header_size + align - 1) & !(align - 1)
+}
+
+// ============================================================================
+// CompactArcDrop - Compile-time drop dispatch (replaces stored fn pointer)
+// ============================================================================
+
+/// Trait for type-specific drop and deallocation logic.
+///
+/// This trait enables compile-time dispatch for dropping CompactArc contents,
+/// replacing the previous runtime function pointer approach. Since Rust
+/// monomorphizes generics, the compiler resolves the correct implementation
+/// at compile time - making this both smaller (no stored pointer) and faster
+/// (direct call instead of indirect).
+///
+/// # Safety
+///
+/// Implementations must correctly drop T's data and deallocate the
+/// header+data allocation using the correct Layout. This trait is
+/// auto-implemented for all types used with CompactArc.
+pub unsafe trait CompactArcDrop {
+    /// Drop the contained data and deallocate the header+data allocation.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to a valid, exclusively-owned CompactArc allocation
+    /// (starting at the Header) that was created by CompactArc's constructors.
+    unsafe fn drop_and_dealloc(ptr: *mut u8);
+}
+
+// SAFETY: Correctly drops a single T at the computed data offset, then deallocates
+// the header+data allocation with the matching Layout.
+unsafe impl<T> CompactArcDrop for T {
+    #[inline]
+    unsafe fn drop_and_dealloc(ptr: *mut u8) {
+        let data_offset = data_offset_for::<T>();
+        let align = mem::align_of::<T>().max(mem::align_of::<Header>());
+
+        // Drop the data
+        let data_ptr = ptr.add(data_offset) as *mut T;
+        ptr::drop_in_place(data_ptr);
+
+        // Deallocate
+        let layout = Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>(), align);
+        dealloc(ptr, layout);
+    }
+}
+
+// SAFETY: str bytes (u8) don't need dropping. Reads len from header to compute
+// the correct deallocation Layout, then deallocates.
+unsafe impl CompactArcDrop for str {
+    #[inline]
+    unsafe fn drop_and_dealloc(ptr: *mut u8) {
+        let header = ptr as *mut Header;
+        let len = (*header).len;
+        let data_offset = data_offset_for::<u8>(); // str has align 1
+        let total_size = data_offset + len;
+        let layout = Layout::from_size_align_unchecked(total_size, mem::align_of::<Header>());
+        dealloc(ptr, layout);
+    }
+}
+
+#[allow(clippy::manual_slice_size_calculation)]
+// SAFETY: Reads len from header to reconstruct the slice, drops all len elements
+// via drop_in_place, then deallocates the header+data allocation with the matching Layout.
+unsafe impl<T> CompactArcDrop for [T] {
+    #[inline]
+    unsafe fn drop_and_dealloc(ptr: *mut u8) {
+        let header = ptr as *mut Header;
+        let len = (*header).len;
+        let data_offset = data_offset_for::<T>();
+        let align = mem::align_of::<T>().max(mem::align_of::<Header>());
+
+        // Drop elements
+        let data_ptr = ptr.add(data_offset) as *mut T;
+        ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(data_ptr, len));
+
+        // Deallocate
+        let layout =
+            Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>() * len, align);
+        dealloc(ptr, layout);
+    }
 }
 
 // ============================================================================
@@ -109,7 +184,7 @@ const fn data_offset_for<T>() -> usize {
 /// | `CompactArc<i64>` | 8 bytes |
 /// | `CompactArc<str>` | 8 bytes (thin!) |
 /// | `CompactArc<[T]>` | 8 bytes (thin!) |
-pub struct CompactArc<T: ?Sized> {
+pub struct CompactArc<T: ?Sized + CompactArcDrop> {
     /// Thin pointer to Header (always 8 bytes, even for DSTs!)
     ptr: NonNull<Header>,
     _marker: PhantomData<T>,
@@ -118,15 +193,15 @@ pub struct CompactArc<T: ?Sized> {
 // SAFETY: CompactArc can be sent between threads if T can be sent and shared.
 // The refcount is atomic (AtomicUsize) ensuring thread-safe increment/decrement.
 // T: Send + Sync ensures the data itself can be safely shared across threads.
-unsafe impl<T: ?Sized + Send + Sync> Send for CompactArc<T> {}
+unsafe impl<T: ?Sized + CompactArcDrop + Send + Sync> Send for CompactArc<T> {}
 // SAFETY: Same reasoning as Send - atomic refcount and T: Send + Sync.
-unsafe impl<T: ?Sized + Send + Sync> Sync for CompactArc<T> {}
+unsafe impl<T: ?Sized + CompactArcDrop + Send + Sync> Sync for CompactArc<T> {}
 
 // ============================================================================
-// THE SINGLE DROP IMPL - Works for ALL types!
+// THE SINGLE DROP IMPL - Compile-time dispatch via CompactArcDrop!
 // ============================================================================
 
-impl<T: ?Sized> Drop for CompactArc<T> {
+impl<T: ?Sized + CompactArcDrop> Drop for CompactArc<T> {
     #[inline]
     fn drop(&mut self) {
         let header = self.ptr.as_ptr();
@@ -139,11 +214,9 @@ impl<T: ?Sized> Drop for CompactArc<T> {
             std::sync::atomic::fence(AtomicOrdering::Acquire);
             // SAFETY: old_count == 1 means we had the last reference. The Acquire fence
             // synchronizes with Release in other drops, ensuring we see all their writes.
-            // The dropper function pointer was set during allocation and handles type-specific
-            // drop logic and deallocation.
+            // T::drop_and_dealloc is resolved at compile time via monomorphization.
             unsafe {
-                let dropper = (*header).dropper;
-                dropper(header);
+                T::drop_and_dealloc(header as *mut u8);
             }
         }
     }
@@ -153,7 +226,7 @@ impl<T: ?Sized> Drop for CompactArc<T> {
 // THE SINGLE CLONE IMPL - Works for ALL types!
 // ============================================================================
 
-impl<T: ?Sized> Clone for CompactArc<T> {
+impl<T: ?Sized + CompactArcDrop> Clone for CompactArc<T> {
     #[inline]
     fn clone(&self) -> Self {
         let header = self.ptr.as_ptr();
@@ -177,7 +250,7 @@ impl<T: ?Sized> Clone for CompactArc<T> {
 // Common methods
 // ============================================================================
 
-impl<T: ?Sized> CompactArc<T> {
+impl<T: ?Sized + CompactArcDrop> CompactArc<T> {
     /// Returns `true` if the two `CompactArc`s point to the same allocation.
     #[inline]
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
@@ -215,38 +288,13 @@ impl<T: ?Sized> CompactArc<T> {
         // safely read (for sized types using it as metadata).
         unsafe { (*this.ptr.as_ptr()).len }
     }
-
-    /// Sets the metadata in the header.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure exclusive access to this Arc (i.e., after `make_mut`
-    /// or when `is_unique` returns true). Writing to shared metadata is UB.
-    #[inline]
-    pub unsafe fn set_meta(this: &mut Self, meta: usize) {
-        (*this.ptr.as_ptr()).len = meta;
-    }
 }
 
 // ============================================================================
 // Sized type implementations
 // ============================================================================
 
-/// Dropper for sized types - drops data and deallocates
-unsafe fn drop_sized<T>(header: *mut Header) {
-    let data_offset = data_offset_for::<T>();
-    let align = mem::align_of::<T>().max(mem::align_of::<Header>());
-
-    // Drop the data
-    let data_ptr = (header as *mut u8).add(data_offset) as *mut T;
-    ptr::drop_in_place(data_ptr);
-
-    // Deallocate
-    let layout = Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>(), align);
-    dealloc(header as *mut u8, layout);
-}
-
-impl<T> CompactArc<T> {
+impl<T: CompactArcDrop> CompactArc<T> {
     /// Creates a new `CompactArc<T>` containing the given value.
     #[inline]
     #[must_use]
@@ -280,8 +328,7 @@ impl<T> CompactArc<T> {
                 header,
                 Header {
                     count: AtomicUsize::new(1),
-                    dropper: drop_sized::<T>, // Store type-specific dropper!
-                    len: meta,                // Store metadata (count) here!
+                    len: meta,
                 },
             );
 
@@ -322,7 +369,7 @@ impl<T> CompactArc<T> {
                 let data_ptr = (header as *const u8).add(data_offset) as *const T;
                 let data = ptr::read(data_ptr);
 
-                // Deallocate (without calling dropper since we took the data)
+                // Deallocate (without dropping since we took the data)
                 let align = mem::align_of::<T>().max(mem::align_of::<Header>());
                 let layout =
                     Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>(), align);
@@ -401,7 +448,7 @@ impl<T> CompactArc<T> {
     }
 }
 
-impl<T> Deref for CompactArc<T> {
+impl<T: CompactArcDrop> Deref for CompactArc<T> {
     type Target = T;
 
     #[inline]
@@ -416,26 +463,26 @@ impl<T> Deref for CompactArc<T> {
     }
 }
 
-impl<T: Default> Default for CompactArc<T> {
+impl<T: CompactArcDrop + Default> Default for CompactArc<T> {
     #[inline]
     fn default() -> Self {
         CompactArc::new(T::default())
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for CompactArc<T> {
+impl<T: CompactArcDrop + fmt::Debug> fmt::Debug for CompactArc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<T: fmt::Display> fmt::Display for CompactArc<T> {
+impl<T: CompactArcDrop + fmt::Display> fmt::Display for CompactArc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
     }
 }
 
-impl<T: PartialEq> PartialEq for CompactArc<T> {
+impl<T: CompactArcDrop + PartialEq> PartialEq for CompactArc<T> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         if CompactArc::ptr_eq(self, other) {
@@ -445,41 +492,41 @@ impl<T: PartialEq> PartialEq for CompactArc<T> {
     }
 }
 
-impl<T: Eq> Eq for CompactArc<T> {}
+impl<T: CompactArcDrop + Eq> Eq for CompactArc<T> {}
 
-impl<T: PartialOrd> PartialOrd for CompactArc<T> {
+impl<T: CompactArcDrop + PartialOrd> PartialOrd for CompactArc<T> {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         (**self).partial_cmp(&**other)
     }
 }
 
-impl<T: Ord> Ord for CompactArc<T> {
+impl<T: CompactArcDrop + Ord> Ord for CompactArc<T> {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         (**self).cmp(&**other)
     }
 }
 
-impl<T: Hash> Hash for CompactArc<T> {
+impl<T: CompactArcDrop + Hash> Hash for CompactArc<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (**self).hash(state)
     }
 }
 
-impl<T> Borrow<T> for CompactArc<T> {
+impl<T: CompactArcDrop> Borrow<T> for CompactArc<T> {
     fn borrow(&self) -> &T {
         self
     }
 }
 
-impl<T> AsRef<T> for CompactArc<T> {
+impl<T: CompactArcDrop> AsRef<T> for CompactArc<T> {
     fn as_ref(&self) -> &T {
         self
     }
 }
 
-impl<T> From<T> for CompactArc<T> {
+impl<T: CompactArcDrop> From<T> for CompactArc<T> {
     #[inline]
     fn from(value: T) -> Self {
         CompactArc::new(value)
@@ -489,15 +536,6 @@ impl<T> From<T> for CompactArc<T> {
 // ============================================================================
 // DST Support: str (Thin Pointer!)
 // ============================================================================
-
-/// Dropper for str - just deallocates (no element drops needed)
-unsafe fn drop_str(header: *mut Header) {
-    let len = (*header).len;
-    let data_offset = data_offset_for::<u8>(); // str has align 1
-    let total_size = data_offset + len;
-    let layout = Layout::from_size_align_unchecked(total_size, mem::align_of::<Header>());
-    dealloc(header as *mut u8, layout);
-}
 
 impl CompactArc<str> {
     /// Creates a new `CompactArc<str>` from a string slice.
@@ -526,7 +564,6 @@ impl CompactArc<str> {
                 header,
                 Header {
                     count: AtomicUsize::new(1),
-                    dropper: drop_str, // Store str-specific dropper!
                     len,
                 },
             );
@@ -649,22 +686,6 @@ impl AsRef<str> for CompactArc<str> {
 // DST Support: [T] (Thin Pointer!)
 // ============================================================================
 
-/// Dropper for slices - drops each element then deallocates
-#[allow(clippy::manual_slice_size_calculation)] // We don't have a slice ref, only length from header
-unsafe fn drop_slice<T>(header: *mut Header) {
-    let len = (*header).len;
-    let data_offset = data_offset_for::<T>();
-    let align = mem::align_of::<T>().max(mem::align_of::<Header>());
-
-    // Drop elements
-    let data_ptr = (header as *mut u8).add(data_offset) as *mut T;
-    ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(data_ptr, len));
-
-    // Deallocate
-    let layout = Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>() * len, align);
-    dealloc(header as *mut u8, layout);
-}
-
 impl<T> CompactArc<[T]> {
     /// Creates a new `CompactArc<[T]>` by moving elements from a Vec.
     ///
@@ -694,7 +715,6 @@ impl<T> CompactArc<[T]> {
                 header,
                 Header {
                     count: AtomicUsize::new(1),
-                    dropper: drop_slice::<T>,
                     len,
                 },
             );
@@ -742,7 +762,6 @@ impl<T> CompactArc<[T]> {
                 header,
                 Header {
                     count: AtomicUsize::new(1),
-                    dropper: drop_slice::<T>,
                     len,
                 },
             );
@@ -795,7 +814,6 @@ impl<T: Clone> CompactArc<[T]> {
                 header,
                 Header {
                     count: AtomicUsize::new(1),
-                    dropper: drop_slice::<T>,
                     len,
                 },
             );
@@ -1079,6 +1097,12 @@ mod tests {
         assert_eq!(std::mem::size_of::<CompactArc<i32>>(), 8);
         assert_eq!(std::mem::size_of::<CompactArc<i64>>(), 8);
         assert_eq!(std::mem::size_of::<CompactArc<String>>(), 8);
+    }
+
+    #[test]
+    fn test_header_size() {
+        // Header should be exactly 16 bytes (refcount + len, no dropper)
+        assert_eq!(std::mem::size_of::<Header>(), 16);
     }
 
     #[test]
