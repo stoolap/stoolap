@@ -3246,22 +3246,32 @@ impl Table for MVCCTable {
         Some(rows)
     }
 
-    fn rename_column(&self, old_name: &str, new_name: &str) -> Result<()> {
-        // This would need mutable access to schema
-        // For now, return error - this operation should go through the engine
-        Err(Error::internal(format!(
-            "rename column not yet implemented: {} -> {}",
-            old_name, new_name
-        )))
+    fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        // Rename column in both version store and cached schema
+        {
+            let mut schema_guard = self.version_store.schema_mut();
+            CompactArc::make_mut(&mut *schema_guard).rename_column(old_name, new_name)?;
+        }
+        CompactArc::make_mut(&mut self.cached_schema).rename_column(old_name, new_name)?;
+        Ok(())
     }
 
-    fn modify_column(&self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
-        // This would need mutable access to schema
-        // For now, return error - this operation should go through the engine
-        Err(Error::internal(format!(
-            "modify column not yet implemented: {} {:?} (nullable: {})",
-            name, column_type, nullable
-        )))
+    fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
+        // Modify column in both version store and cached schema
+        {
+            let mut schema_guard = self.version_store.schema_mut();
+            CompactArc::make_mut(&mut *schema_guard).modify_column(
+                name,
+                Some(column_type),
+                Some(nullable),
+            )?;
+        }
+        CompactArc::make_mut(&mut self.cached_schema).modify_column(
+            name,
+            Some(column_type),
+            Some(nullable),
+        )?;
+        Ok(())
     }
 
     fn select(

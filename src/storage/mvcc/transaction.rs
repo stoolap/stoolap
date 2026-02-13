@@ -671,14 +671,14 @@ impl Transaction for MvccTransaction {
     ) -> Result<()> {
         self.check_active()?;
 
-        let table = self.get_table(table_name)?;
+        let mut table = self.get_table(table_name)?;
         table.rename_column(old_name, new_name)
     }
 
     fn modify_table_column(&mut self, table_name: &str, column: SchemaColumn) -> Result<()> {
         self.check_active()?;
 
-        let table = self.get_table(table_name)?;
+        let mut table = self.get_table(table_name)?;
         table.modify_column(&column.name, column.data_type, column.nullable)
     }
 

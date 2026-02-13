@@ -7155,3 +7155,1469 @@ fn test_drop_index_durability() {
         .unwrap();
     assert_eq!(count3, 4);
 }
+
+// ============================================================================
+// TRUNCATE TABLE durability
+// ============================================================================
+
+#[test]
+fn test_truncate_table_survives_close_reopen() {
+    // TRUNCATE TABLE has its own WAL operation type (TruncateTable=13).
+    // After close/reopen, the table should exist but be empty.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE trunc_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=50 {
+            db.execute(
+                &format!(
+                    "INSERT INTO trunc_test (id, value) VALUES ({}, 'row_{}')",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM trunc_test", ()).unwrap();
+        assert_eq!(count, 50);
+
+        db.execute("TRUNCATE TABLE trunc_test", ()).unwrap();
+
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM trunc_test", ()).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    remove_lock_file(&db_path);
+
+    // Reopen — table should exist but be empty
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM trunc_test", ()).unwrap();
+    assert_eq!(count, 0, "TRUNCATE should persist — table must be empty");
+
+    // Table is usable — can insert new data
+    db.execute(
+        "INSERT INTO trunc_test (id, value) VALUES (1, 'after_truncate')",
+        (),
+    )
+    .unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM trunc_test", ()).unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn test_truncate_table_then_insert_survives_close_reopen() {
+    // TRUNCATE followed by new inserts — both operations must persist.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE trunc_ins (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=20 {
+            db.execute(
+                &format!(
+                    "INSERT INTO trunc_ins (id, value) VALUES ({}, 'old_{}')",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        db.execute("TRUNCATE TABLE trunc_ins", ()).unwrap();
+
+        // Insert new data after truncate
+        for i in 100..=105 {
+            db.execute(
+                &format!(
+                    "INSERT INTO trunc_ins (id, value) VALUES ({}, 'new_{}')",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM trunc_ins", ()).unwrap();
+        assert_eq!(count, 6);
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM trunc_ins", ()).unwrap();
+    assert_eq!(count, 6, "Only post-truncate rows should exist");
+
+    // Verify old data is gone
+    let old: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM trunc_ins WHERE value LIKE 'old_%'",
+            (),
+        )
+        .unwrap();
+    assert_eq!(old, 0, "Pre-truncate rows must not reappear");
+
+    let new: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM trunc_ins WHERE value LIKE 'new_%'",
+            (),
+        )
+        .unwrap();
+    assert_eq!(new, 6, "Post-truncate rows must all survive");
+}
+
+#[test]
+fn test_truncate_table_with_snapshot_recovery() {
+    // Snapshot taken before TRUNCATE, then TRUNCATE, then close/reopen.
+    // WAL replay of TRUNCATE must override snapshot data.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE trunc_snap (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=30 {
+            db.execute(
+                &format!(
+                    "INSERT INTO trunc_snap (id, value) VALUES ({}, 'snap_row_{}')",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        // Snapshot captures all 30 rows
+        let _ = db.execute("PRAGMA SNAPSHOT", ());
+
+        // TRUNCATE after snapshot
+        db.execute("TRUNCATE TABLE trunc_snap", ()).unwrap();
+
+        // Insert a few new rows
+        for i in 100..=102 {
+            db.execute(
+                &format!(
+                    "INSERT INTO trunc_snap (id, value) VALUES ({}, 'post_trunc_{}')",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM trunc_snap", ()).unwrap();
+        assert_eq!(count, 3);
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM trunc_snap", ()).unwrap();
+    assert_eq!(
+        count, 3,
+        "Only post-truncate rows should exist after snapshot + WAL replay"
+    );
+
+    // Snapshot data must NOT reappear
+    let old: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM trunc_snap WHERE value LIKE 'snap_row_%'",
+            (),
+        )
+        .unwrap();
+    assert_eq!(old, 0, "Snapshot data must not survive TRUNCATE in WAL");
+}
+
+#[test]
+fn test_truncate_with_index_recovery() {
+    // TRUNCATE should clear index state too. After recovery, index queries must
+    // return correct (empty or post-truncate) results.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE trunc_idx (id INTEGER PRIMARY KEY, category TEXT NOT NULL, val INTEGER)",
+            (),
+        )
+        .unwrap();
+
+        db.execute("CREATE INDEX idx_trunc_cat ON trunc_idx(category)", ())
+            .unwrap();
+
+        for i in 1..=40 {
+            db.execute(
+                &format!(
+                    "INSERT INTO trunc_idx (id, category, val) VALUES ({}, 'cat_{}', {})",
+                    i,
+                    i % 4,
+                    i * 10
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        db.execute("TRUNCATE TABLE trunc_idx", ()).unwrap();
+
+        // Insert a few rows after truncate
+        db.execute(
+            "INSERT INTO trunc_idx (id, category, val) VALUES (100, 'cat_0', 999)",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let total: i64 = db.query_one("SELECT COUNT(*) FROM trunc_idx", ()).unwrap();
+    assert_eq!(total, 1, "Only the post-truncate row should exist");
+
+    let cat0: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM trunc_idx WHERE category = 'cat_0'",
+            (),
+        )
+        .unwrap();
+    assert_eq!(
+        cat0, 1,
+        "Index query should find only the post-truncate row"
+    );
+
+    let cat1: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM trunc_idx WHERE category = 'cat_1'",
+            (),
+        )
+        .unwrap();
+    assert_eq!(cat1, 0, "Pre-truncate index entries must be gone");
+}
+
+// ============================================================================
+// ALTER TABLE durability
+// ============================================================================
+
+#[test]
+fn test_alter_table_add_column_durability() {
+    // ALTER TABLE ADD COLUMN is recorded in WAL. Must survive close/reopen.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE alter_add (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=10 {
+            db.execute(
+                &format!(
+                    "INSERT INTO alter_add (id, name) VALUES ({}, 'row_{}')",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        // Add a new column
+        db.execute("ALTER TABLE alter_add ADD COLUMN score INTEGER", ())
+            .unwrap();
+
+        // Insert row using the new column
+        db.execute(
+            "INSERT INTO alter_add (id, name, score) VALUES (11, 'with_score', 100)",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM alter_add", ()).unwrap();
+    assert_eq!(count, 11, "All 11 rows should survive");
+
+    // The new column must exist — query it
+    let score: i64 = db
+        .query_one("SELECT score FROM alter_add WHERE id = 11", ())
+        .unwrap();
+    assert_eq!(score, 100, "New column value must survive recovery");
+
+    // Old rows should have NULL for the new column
+    let null_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM alter_add WHERE score IS NULL", ())
+        .unwrap();
+    assert_eq!(
+        null_count, 10,
+        "Old rows should have NULL in the new column"
+    );
+
+    // Can insert using the new schema
+    db.execute(
+        "INSERT INTO alter_add (id, name, score) VALUES (12, 'post_recovery', 200)",
+        (),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_alter_table_drop_column_durability() {
+    // ALTER TABLE DROP COLUMN must persist across close/reopen.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE alter_drop (id INTEGER PRIMARY KEY, name TEXT NOT NULL, extra TEXT)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=10 {
+            db.execute(
+                &format!(
+                    "INSERT INTO alter_drop (id, name, extra) VALUES ({}, 'row_{}', 'extra_{}')",
+                    i, i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        db.execute("ALTER TABLE alter_drop DROP COLUMN extra", ())
+            .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM alter_drop", ()).unwrap();
+    assert_eq!(count, 10, "All rows should survive");
+
+    // 'extra' column must not exist
+    let result: Result<i64, _> = db.query_one(
+        "SELECT COUNT(*) FROM alter_drop WHERE extra IS NOT NULL",
+        (),
+    );
+    assert!(
+        result.is_err(),
+        "Column 'extra' should not exist after DROP COLUMN recovery"
+    );
+
+    // Can insert using the reduced schema
+    db.execute(
+        "INSERT INTO alter_drop (id, name) VALUES (11, 'post_recovery')",
+        (),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_alter_table_rename_column_durability() {
+    // ALTER TABLE RENAME COLUMN must persist across close/reopen.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE alter_rename (id INTEGER PRIMARY KEY, old_name TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=5 {
+            db.execute(
+                &format!(
+                    "INSERT INTO alter_rename (id, old_name) VALUES ({}, 'val_{}')",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        db.execute(
+            "ALTER TABLE alter_rename RENAME COLUMN old_name TO new_name",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    // New column name must work
+    let count: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM alter_rename WHERE new_name IS NOT NULL",
+            (),
+        )
+        .unwrap();
+    assert_eq!(count, 5, "All rows accessible via renamed column");
+
+    // Old column name must not work
+    let result: Result<i64, _> = db.query_one(
+        "SELECT COUNT(*) FROM alter_rename WHERE old_name IS NOT NULL",
+        (),
+    );
+    assert!(
+        result.is_err(),
+        "Old column name 'old_name' should not exist after RENAME recovery"
+    );
+
+    // Can insert using new column name
+    db.execute(
+        "INSERT INTO alter_rename (id, new_name) VALUES (6, 'post_recovery')",
+        (),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_alter_table_rename_table_durability() {
+    // ALTER TABLE RENAME TO must persist across close/reopen.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE old_tbl (id INTEGER PRIMARY KEY, data TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=10 {
+            db.execute(
+                &format!("INSERT INTO old_tbl (id, data) VALUES ({}, 'row_{}')", i, i),
+                (),
+            )
+            .unwrap();
+        }
+
+        db.execute("ALTER TABLE old_tbl RENAME TO new_tbl", ())
+            .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    // New name must work
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM new_tbl", ()).unwrap();
+    assert_eq!(
+        count, 10,
+        "All rows should be accessible via new table name"
+    );
+
+    // Old name must not work
+    let result: Result<i64, _> = db.query_one("SELECT COUNT(*) FROM old_tbl", ());
+    assert!(
+        result.is_err(),
+        "Old table name 'old_tbl' should not exist after RENAME recovery"
+    );
+
+    // Can insert via new name
+    db.execute(
+        "INSERT INTO new_tbl (id, data) VALUES (11, 'post_recovery')",
+        (),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_alter_table_with_snapshot_recovery() {
+    // ALTER TABLE after snapshot — WAL replay must apply schema changes on top of snapshot state.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE alter_snap (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=10 {
+            db.execute(
+                &format!(
+                    "INSERT INTO alter_snap (id, name) VALUES ({}, 'row_{}')",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        // Snapshot captures the original 2-column schema
+        let _ = db.execute("PRAGMA SNAPSHOT", ());
+
+        // ALTER after snapshot
+        db.execute("ALTER TABLE alter_snap ADD COLUMN status TEXT", ())
+            .unwrap();
+
+        db.execute(
+            "INSERT INTO alter_snap (id, name, status) VALUES (11, 'new_row', 'active')",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM alter_snap", ()).unwrap();
+    assert_eq!(count, 11, "All 11 rows should survive");
+
+    // New column must exist
+    let status: String = db
+        .query_one("SELECT status FROM alter_snap WHERE id = 11", ())
+        .unwrap();
+    assert_eq!(status, "active", "New column value must survive");
+
+    // Old rows have NULL for the new column
+    let null_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM alter_snap WHERE status IS NULL", ())
+        .unwrap();
+    assert_eq!(null_count, 10);
+}
+
+#[test]
+fn test_alter_table_multiple_operations_durability() {
+    // Multiple ALTER operations on the same table in sequence.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE alter_multi (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=5 {
+            db.execute(
+                &format!(
+                    "INSERT INTO alter_multi (id, a, b, c) VALUES ({}, 'a{}', 'b{}', 'c{}')",
+                    i, i, i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        // Chain of ALTER operations
+        db.execute("ALTER TABLE alter_multi DROP COLUMN c", ())
+            .unwrap();
+        db.execute("ALTER TABLE alter_multi ADD COLUMN d INTEGER", ())
+            .unwrap();
+        db.execute("ALTER TABLE alter_multi RENAME COLUMN b TO beta", ())
+            .unwrap();
+
+        db.execute(
+            "INSERT INTO alter_multi (id, a, beta, d) VALUES (6, 'a6', 'beta6', 42)",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db
+        .query_one("SELECT COUNT(*) FROM alter_multi", ())
+        .unwrap();
+    assert_eq!(count, 6, "All rows should survive");
+
+    // Column 'c' must not exist
+    let result: Result<i64, _> =
+        db.query_one("SELECT COUNT(*) FROM alter_multi WHERE c IS NOT NULL", ());
+    assert!(result.is_err(), "Column 'c' should be dropped");
+
+    // Column 'beta' must exist (renamed from 'b')
+    let beta_count: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM alter_multi WHERE beta IS NOT NULL",
+            (),
+        )
+        .unwrap();
+    assert_eq!(beta_count, 6, "Column 'beta' (renamed from 'b') must exist");
+
+    // Column 'd' must exist
+    let d_val: i64 = db
+        .query_one("SELECT d FROM alter_multi WHERE id = 6", ())
+        .unwrap();
+    assert_eq!(d_val, 42, "New column 'd' must have correct value");
+}
+
+// ============================================================================
+// Empty table recovery
+// ============================================================================
+
+#[test]
+fn test_empty_table_survives_close_reopen() {
+    // CREATE TABLE with zero data rows. DDL must persist even without data entries.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE empty_tbl (id INTEGER PRIMARY KEY, value TEXT)",
+            (),
+        )
+        .unwrap();
+        // No inserts — table is empty
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM empty_tbl", ()).unwrap();
+    assert_eq!(count, 0, "Empty table should exist with 0 rows");
+
+    // Can insert into the recovered empty table
+    db.execute(
+        "INSERT INTO empty_tbl (id, value) VALUES (1, 'first_row')",
+        (),
+    )
+    .unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM empty_tbl", ()).unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn test_multiple_empty_tables_survive() {
+    // Multiple empty tables created in sequence — all must survive.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE empty_a (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute(
+            "CREATE TABLE empty_b (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE empty_c (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    for tbl in &["empty_a", "empty_b", "empty_c"] {
+        let count: i64 = db
+            .query_one(&format!("SELECT COUNT(*) FROM {}", tbl), ())
+            .unwrap();
+        assert_eq!(count, 0, "Table '{}' should exist and be empty", tbl);
+    }
+
+    // All tables usable
+    db.execute("INSERT INTO empty_a (id) VALUES (1)", ())
+        .unwrap();
+    db.execute("INSERT INTO empty_b (id, name) VALUES (1, 'test')", ())
+        .unwrap();
+    db.execute("INSERT INTO empty_c (id, x, y) VALUES (1, 10, 20)", ())
+        .unwrap();
+}
+
+#[test]
+fn test_empty_table_with_index_survives() {
+    // CREATE TABLE + CREATE INDEX with zero data. Both must survive.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE empty_idx (id INTEGER PRIMARY KEY, category TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute("CREATE INDEX idx_empty_cat ON empty_idx(category)", ())
+            .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM empty_idx", ()).unwrap();
+    assert_eq!(count, 0);
+
+    // Insert and query via index
+    db.execute("INSERT INTO empty_idx (id, category) VALUES (1, 'A')", ())
+        .unwrap();
+
+    let cat_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM empty_idx WHERE category = 'A'", ())
+        .unwrap();
+    assert_eq!(
+        cat_count, 1,
+        "Index should work after recovery of empty table"
+    );
+}
+
+// ============================================================================
+// NULL value durability
+// ============================================================================
+
+#[test]
+fn test_null_values_survive_wal_recovery() {
+    // Insert rows with NULL in nullable columns. NULL must not become a default value.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE null_test (id INTEGER PRIMARY KEY, name TEXT, score INTEGER, active BOOLEAN)",
+            (),
+        )
+        .unwrap();
+
+        // Mix of NULL and non-NULL values
+        db.execute(
+            "INSERT INTO null_test (id, name, score, active) VALUES (1, 'alice', 100, TRUE)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO null_test (id, name, score, active) VALUES (2, NULL, NULL, NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO null_test (id, name, score, active) VALUES (3, 'charlie', NULL, TRUE)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO null_test (id, name, score, active) VALUES (4, NULL, 50, NULL)",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let total: i64 = db.query_one("SELECT COUNT(*) FROM null_test", ()).unwrap();
+    assert_eq!(total, 4, "All 4 rows must survive");
+
+    // Verify NULLs are preserved, not coerced to defaults
+    let null_names: i64 = db
+        .query_one("SELECT COUNT(*) FROM null_test WHERE name IS NULL", ())
+        .unwrap();
+    assert_eq!(null_names, 2, "Rows 2 and 4 should have NULL name");
+
+    let null_scores: i64 = db
+        .query_one("SELECT COUNT(*) FROM null_test WHERE score IS NULL", ())
+        .unwrap();
+    assert_eq!(null_scores, 2, "Rows 2 and 3 should have NULL score");
+
+    let null_active: i64 = db
+        .query_one("SELECT COUNT(*) FROM null_test WHERE active IS NULL", ())
+        .unwrap();
+    assert_eq!(null_active, 2, "Rows 2 and 4 should have NULL active");
+
+    // Non-NULL values are correct
+    let alice_score: i64 = db
+        .query_one("SELECT score FROM null_test WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(alice_score, 100);
+
+    let charlie_active: bool = db
+        .query_one("SELECT active FROM null_test WHERE id = 3", ())
+        .unwrap();
+    assert!(charlie_active);
+}
+
+#[test]
+fn test_null_values_survive_snapshot_recovery() {
+    // NULLs must survive through snapshot (not just WAL).
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE null_snap (id INTEGER PRIMARY KEY, val TEXT, num FLOAT)",
+            (),
+        )
+        .unwrap();
+
+        db.execute(
+            "INSERT INTO null_snap (id, val, num) VALUES (1, 'hello', 3.14)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO null_snap (id, val, num) VALUES (2, NULL, NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO null_snap (id, val, num) VALUES (3, NULL, 2.71)",
+            (),
+        )
+        .unwrap();
+
+        let _ = db.execute("PRAGMA SNAPSHOT", ());
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let total: i64 = db.query_one("SELECT COUNT(*) FROM null_snap", ()).unwrap();
+    assert_eq!(total, 3);
+
+    let null_vals: i64 = db
+        .query_one("SELECT COUNT(*) FROM null_snap WHERE val IS NULL", ())
+        .unwrap();
+    assert_eq!(null_vals, 2, "NULLs must survive snapshot serialization");
+
+    let null_nums: i64 = db
+        .query_one("SELECT COUNT(*) FROM null_snap WHERE num IS NULL", ())
+        .unwrap();
+    assert_eq!(null_nums, 1, "Row 2 should have NULL num");
+
+    let val: f64 = db
+        .query_one("SELECT num FROM null_snap WHERE id = 3", ())
+        .unwrap();
+    assert!(
+        (val - 2.71).abs() < 0.001,
+        "Non-NULL float must be preserved"
+    );
+}
+
+// ============================================================================
+// Multiple consecutive crash-recovery cycles
+// ============================================================================
+
+#[test]
+fn test_multiple_crash_recovery_cycles() {
+    // Simulate: write data → corrupt WAL → recover → write more → close → reopen → verify
+    // Tests that recovery writes valid WAL that can itself be recovered.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    // Cycle 1: Create table and insert initial data, then corrupt
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE cycle_test (id INTEGER PRIMARY KEY, cycle INTEGER NOT NULL, value TEXT)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=10 {
+            db.execute(
+                &format!(
+                    "INSERT INTO cycle_test (id, cycle, value) VALUES ({}, 1, 'cycle1_row_{}')",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+    }
+    remove_lock_file(&db_path);
+
+    // Corrupt: truncate last WAL entry
+    let wal_files = find_wal_files(&db_path);
+    if !wal_files.is_empty() {
+        let wal_path = &wal_files[wal_files.len() - 1];
+        let data = fs::read(wal_path).unwrap();
+        let entries = find_entry_boundaries(&data);
+        if entries.len() >= 2 {
+            let last = &entries[entries.len() - 1];
+            let truncated = &data[..last.offset];
+            fs::write(wal_path, truncated).unwrap();
+        }
+    }
+
+    // Cycle 2: Recover from corruption, write more data
+    let cycle1_count: i64;
+    {
+        let db = Database::open(&dsn).unwrap();
+        cycle1_count = db.query_one("SELECT COUNT(*) FROM cycle_test", ()).unwrap();
+        assert!(
+            cycle1_count > 0,
+            "Should recover at least some cycle 1 data"
+        );
+
+        for i in 100..=110 {
+            db.execute(
+                &format!(
+                    "INSERT INTO cycle_test (id, cycle, value) VALUES ({}, 2, 'cycle2_row_{}')",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+    }
+    remove_lock_file(&db_path);
+
+    // Corrupt again: flip a bit in the WAL
+    let wal_files = find_wal_files(&db_path);
+    if !wal_files.is_empty() {
+        let wal_path = &wal_files[wal_files.len() - 1];
+        let mut data = fs::read(wal_path).unwrap();
+        let entries = find_entry_boundaries(&data);
+        if entries.len() >= 3 {
+            // Flip a bit in a middle entry's data
+            let mid = &entries[entries.len() / 2];
+            if mid.data_offset + 5 < data.len() {
+                flip_bit(&mut data, mid.data_offset + 5, 3);
+                fs::write(wal_path, &data).unwrap();
+            }
+        }
+    }
+
+    // Cycle 3: Recover from second corruption, write more data
+    let cycle2_count: i64;
+    {
+        let db = Database::open(&dsn).unwrap();
+        cycle2_count = db.query_one("SELECT COUNT(*) FROM cycle_test", ()).unwrap();
+        assert!(
+            cycle2_count >= cycle1_count,
+            "Cycle 3 recovery ({}) should have at least cycle 1 data ({})",
+            cycle2_count,
+            cycle1_count
+        );
+
+        for i in 200..=205 {
+            db.execute(
+                &format!(
+                    "INSERT INTO cycle_test (id, cycle, value) VALUES ({}, 3, 'cycle3_row_{}')",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+    }
+    remove_lock_file(&db_path);
+
+    // Cycle 4: Clean recovery — no corruption. Everything from cycle 3 must survive.
+    {
+        let db = Database::open(&dsn).unwrap();
+        let final_count: i64 = db.query_one("SELECT COUNT(*) FROM cycle_test", ()).unwrap();
+        assert!(
+            final_count >= cycle2_count + 6,
+            "Final count ({}) should include cycle 3 inserts (>= {})",
+            final_count,
+            cycle2_count + 6
+        );
+
+        // Verify cycle 3 data is intact (no corruption was applied)
+        let c3: i64 = db
+            .query_one("SELECT COUNT(*) FROM cycle_test WHERE cycle = 3", ())
+            .unwrap();
+        assert_eq!(
+            c3, 6,
+            "All 6 cycle 3 rows must survive (no corruption applied)"
+        );
+
+        // DB is usable
+        db.execute(
+            "INSERT INTO cycle_test (id, cycle, value) VALUES (999, 4, 'final')",
+            (),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn test_crash_recovery_with_snapshot_between_cycles() {
+    // Cycle 1: insert → snapshot → close
+    // Cycle 2: corrupt WAL → recover from snapshot → insert more → close
+    // Cycle 3: reopen → all data from both cycles present
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    // Cycle 1
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE snap_cycle (id INTEGER PRIMARY KEY, phase INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=20 {
+            db.execute(
+                &format!("INSERT INTO snap_cycle (id, phase) VALUES ({}, 1)", i),
+                (),
+            )
+            .unwrap();
+        }
+
+        let _ = db.execute("PRAGMA SNAPSHOT", ());
+    }
+    remove_lock_file(&db_path);
+
+    // Corrupt WAL after snapshot
+    let wal_files = find_wal_files(&db_path);
+    if !wal_files.is_empty() {
+        let wal_path = &wal_files[wal_files.len() - 1];
+        let mut data = fs::read(wal_path).unwrap();
+        // Zero last 4KB page
+        let file_len = data.len();
+        if file_len > 4096 {
+            let last_page = (file_len - 1) / 4096;
+            zero_page(&mut data, last_page);
+            fs::write(wal_path, &data).unwrap();
+        }
+    }
+
+    // Cycle 2: recover (snapshot provides base), insert more
+    {
+        let db = Database::open(&dsn).unwrap();
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM snap_cycle", ()).unwrap();
+        // Snapshot had 20 rows; WAL may have partial additional data
+        assert!(
+            count >= 20,
+            "Snapshot should guarantee at least 20 rows, got {}",
+            count
+        );
+
+        for i in 100..=110 {
+            db.execute(
+                &format!("INSERT INTO snap_cycle (id, phase) VALUES ({}, 2)", i),
+                (),
+            )
+            .unwrap();
+        }
+    }
+    remove_lock_file(&db_path);
+
+    // Cycle 3: clean recovery
+    {
+        let db = Database::open(&dsn).unwrap();
+        let total: i64 = db.query_one("SELECT COUNT(*) FROM snap_cycle", ()).unwrap();
+        assert!(
+            total >= 31,
+            "Should have at least 20 (snapshot) + 11 (cycle 2) = 31 rows, got {}",
+            total
+        );
+
+        let phase2: i64 = db
+            .query_one("SELECT COUNT(*) FROM snap_cycle WHERE phase = 2", ())
+            .unwrap();
+        assert_eq!(
+            phase2, 11,
+            "All cycle 2 inserts must survive clean recovery"
+        );
+    }
+}
+
+// ============================================================================
+// DEFAULT constraint enforcement after recovery
+// ============================================================================
+
+#[test]
+fn test_default_constraint_after_recovery() {
+    // DEFAULT values must be applied correctly after recovery.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE def_test (id INTEGER PRIMARY KEY, name TEXT NOT NULL, status TEXT DEFAULT 'pending', priority INTEGER DEFAULT 0)",
+            (),
+        )
+        .unwrap();
+
+        // Insert without specifying default columns
+        db.execute("INSERT INTO def_test (id, name) VALUES (1, 'task_1')", ())
+            .unwrap();
+        // Insert with explicit values overriding defaults
+        db.execute(
+            "INSERT INTO def_test (id, name, status, priority) VALUES (2, 'task_2', 'active', 5)",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM def_test", ()).unwrap();
+    assert_eq!(count, 2);
+
+    // After recovery, inserting should still apply defaults
+    db.execute("INSERT INTO def_test (id, name) VALUES (3, 'task_3')", ())
+        .unwrap();
+
+    let status: String = db
+        .query_one("SELECT status FROM def_test WHERE id = 3", ())
+        .unwrap();
+    assert_eq!(
+        status, "pending",
+        "DEFAULT value must be applied after recovery"
+    );
+
+    let priority: i64 = db
+        .query_one("SELECT priority FROM def_test WHERE id = 3", ())
+        .unwrap();
+    assert_eq!(
+        priority, 0,
+        "DEFAULT integer value must be applied after recovery"
+    );
+}
+
+// ============================================================================
+// BOOLEAN and TIMESTAMP column types durability
+// ============================================================================
+
+#[test]
+fn test_boolean_column_durability() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE bool_test (id INTEGER PRIMARY KEY, flag BOOLEAN NOT NULL, optional_flag BOOLEAN)",
+            (),
+        )
+        .unwrap();
+
+        db.execute(
+            "INSERT INTO bool_test (id, flag, optional_flag) VALUES (1, TRUE, FALSE)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO bool_test (id, flag, optional_flag) VALUES (2, FALSE, TRUE)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO bool_test (id, flag, optional_flag) VALUES (3, TRUE, NULL)",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM bool_test", ()).unwrap();
+    assert_eq!(count, 3);
+
+    let true_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM bool_test WHERE flag = TRUE", ())
+        .unwrap();
+    assert_eq!(true_count, 2, "TRUE values must survive recovery");
+
+    let false_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM bool_test WHERE flag = FALSE", ())
+        .unwrap();
+    assert_eq!(false_count, 1, "FALSE values must survive recovery");
+
+    let null_opt: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM bool_test WHERE optional_flag IS NULL",
+            (),
+        )
+        .unwrap();
+    assert_eq!(null_opt, 1, "NULL boolean must survive recovery");
+}
+
+#[test]
+fn test_timestamp_column_durability() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE ts_test (id INTEGER PRIMARY KEY, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP)",
+            (),
+        )
+        .unwrap();
+
+        db.execute(
+            "INSERT INTO ts_test (id, created_at, updated_at) VALUES (1, '2024-01-15 10:30:00', '2024-06-20 14:00:00')",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO ts_test (id, created_at, updated_at) VALUES (2, '2024-12-31 23:59:59', NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO ts_test (id, created_at, updated_at) VALUES (3, '2020-01-01 00:00:00', '2020-01-01 00:00:01')",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM ts_test", ()).unwrap();
+    assert_eq!(count, 3);
+
+    // Verify timestamps are not corrupted by checking ordering
+    let ordered_count: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM ts_test WHERE created_at >= '2024-01-01 00:00:00'",
+            (),
+        )
+        .unwrap();
+    assert_eq!(
+        ordered_count, 2,
+        "Timestamp comparison must work after recovery"
+    );
+
+    let null_updated: i64 = db
+        .query_one("SELECT COUNT(*) FROM ts_test WHERE updated_at IS NULL", ())
+        .unwrap();
+    assert_eq!(null_updated, 1, "NULL timestamp must survive recovery");
+
+    // Verify EXTRACT works on recovered timestamps
+    let year: i64 = db
+        .query_one(
+            "SELECT EXTRACT(YEAR FROM created_at) FROM ts_test WHERE id = 2",
+            (),
+        )
+        .unwrap();
+    assert_eq!(year, 2024, "EXTRACT from recovered timestamp must work");
+}
+
+// ============================================================================
+// Snapshot with UPDATE/DELETE then snapshot corrupted (WAL-only re-derivation)
+// ============================================================================
+
+#[test]
+fn test_update_after_snapshot_then_snapshot_corrupt() {
+    // Snapshot contains original rows. WAL has UPDATEs. Corrupt snapshot → WAL must
+    // replay both INSERT and UPDATE to produce correct final state.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE upd_snap (id INTEGER PRIMARY KEY, value TEXT NOT NULL, version INTEGER)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=10 {
+            db.execute(
+                &format!(
+                    "INSERT INTO upd_snap (id, value, version) VALUES ({}, 'original_{}', 1)",
+                    i, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        // Take snapshot with original data
+        let _ = db.execute("PRAGMA SNAPSHOT", ());
+
+        // UPDATE some rows after snapshot
+        db.execute(
+            "UPDATE upd_snap SET value = 'updated_5', version = 2 WHERE id = 5",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE upd_snap SET value = 'updated_10', version = 2 WHERE id = 10",
+            (),
+        )
+        .unwrap();
+
+        // DELETE a row after snapshot
+        db.execute("DELETE FROM upd_snap WHERE id = 3", ()).unwrap();
+    }
+    remove_lock_file(&db_path);
+
+    // Corrupt the snapshot
+    let snap_files = find_snapshot_files(&db_path, "upd_snap");
+    for snap_file in &snap_files {
+        let mut data = fs::read(snap_file).unwrap();
+        if data.len() > 10 {
+            // Zero the first 64 bytes (header) to make it unreadable
+            zero_range(&mut data, 0, 64);
+            fs::write(snap_file, &data).unwrap();
+        }
+    }
+
+    // Also remove checkpoint.meta to force full WAL replay
+    if let Some(cp) = find_checkpoint_file(&db_path) {
+        let _ = fs::remove_file(cp);
+    }
+
+    let db = Database::open(&dsn).unwrap();
+
+    let total: i64 = db.query_one("SELECT COUNT(*) FROM upd_snap", ()).unwrap();
+    assert_eq!(total, 9, "10 inserted - 1 deleted = 9 rows");
+
+    // Updated rows have new values
+    let v5: String = db
+        .query_one("SELECT value FROM upd_snap WHERE id = 5", ())
+        .unwrap();
+    assert_eq!(v5, "updated_5", "UPDATE must be replayed from WAL");
+
+    let v10: String = db
+        .query_one("SELECT value FROM upd_snap WHERE id = 10", ())
+        .unwrap();
+    assert_eq!(v10, "updated_10");
+
+    // Deleted row must not exist
+    let deleted: i64 = db
+        .query_one("SELECT COUNT(*) FROM upd_snap WHERE id = 3", ())
+        .unwrap();
+    assert_eq!(deleted, 0, "DELETE must be replayed from WAL");
+
+    // Unmodified rows still have original values
+    let v1: String = db
+        .query_one("SELECT value FROM upd_snap WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(v1, "original_1");
+}
+
+// ============================================================================
+// Multi-column UNIQUE index enforcement after recovery
+// ============================================================================
+
+#[test]
+fn test_multi_column_unique_index_enforced_after_recovery() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE mc_unique (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b TEXT NOT NULL, data TEXT)",
+            (),
+        )
+        .unwrap();
+
+        db.execute("CREATE UNIQUE INDEX idx_mc_ab ON mc_unique(a, b)", ())
+            .unwrap();
+
+        db.execute(
+            "INSERT INTO mc_unique (id, a, b, data) VALUES (1, 'x', 'y', 'first')",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO mc_unique (id, a, b, data) VALUES (2, 'x', 'z', 'second')",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO mc_unique (id, a, b, data) VALUES (3, 'w', 'y', 'third')",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM mc_unique", ()).unwrap();
+    assert_eq!(count, 3);
+
+    // Duplicate (a='x', b='y') must be rejected after recovery
+    let result = db.execute(
+        "INSERT INTO mc_unique (id, a, b, data) VALUES (4, 'x', 'y', 'duplicate')",
+        (),
+    );
+    assert!(
+        result.is_err(),
+        "Multi-column UNIQUE constraint must be enforced after recovery"
+    );
+
+    // Different combination is allowed
+    db.execute(
+        "INSERT INTO mc_unique (id, a, b, data) VALUES (4, 'x', 'w', 'allowed')",
+        (),
+    )
+    .unwrap();
+}

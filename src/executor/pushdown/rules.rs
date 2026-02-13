@@ -63,6 +63,7 @@ fn extract_literal_with_ctx(expr: &ast::Expression, ctx: &PushdownContext<'_>) -
 }
 
 /// Extract column and value from a comparison (handles both col op val and val op col)
+/// Returns None if column doesn't exist in schema (forces fallback to memory filter which errors)
 fn extract_comparison_parts(
     left: &ast::Expression,
     right: &ast::Expression,
@@ -70,17 +71,21 @@ fn extract_comparison_parts(
 ) -> Option<(String, Value, bool)> {
     // Try column on left, value on right
     if let Some(column) = extract_column_name(left) {
-        if let Some(value) = extract_literal_with_ctx(right, ctx) {
-            let coerced = ctx.coerce_to_column_type(&column, value);
-            return Some((column, coerced, false)); // false = not flipped
+        if ctx.has_column(&column) {
+            if let Some(value) = extract_literal_with_ctx(right, ctx) {
+                let coerced = ctx.coerce_to_column_type(&column, value);
+                return Some((column, coerced, false)); // false = not flipped
+            }
         }
     }
 
     // Try value on left, column on right (will need to flip operator)
     if let Some(column) = extract_column_name(right) {
-        if let Some(value) = extract_literal_with_ctx(left, ctx) {
-            let coerced = ctx.coerce_to_column_type(&column, value);
-            return Some((column, coerced, true)); // true = flipped
+        if ctx.has_column(&column) {
+            if let Some(value) = extract_literal_with_ctx(left, ctx) {
+                let coerced = ctx.coerce_to_column_type(&column, value);
+                return Some((column, coerced, true)); // true = flipped
+            }
         }
     }
 
@@ -325,6 +330,11 @@ impl PushdownRule for BetweenRule {
             None => return PushdownResult::CannotPush,
         };
 
+        // Validate column exists in schema
+        if !ctx.has_column(&column) {
+            return PushdownResult::CannotPush;
+        }
+
         let lower = match extract_literal_with_ctx(&between.lower, ctx) {
             Some(v) => ctx.coerce_to_column_type(&column, v),
             None => return PushdownResult::CannotPush,
@@ -366,6 +376,11 @@ impl PushdownRule for InListRule {
             Some(c) => c,
             None => return PushdownResult::CannotPush,
         };
+
+        // Validate column exists in schema
+        if !ctx.has_column(&column) {
+            return PushdownResult::CannotPush;
+        }
 
         let values = match extract_in_list_values(&in_expr.right, ctx) {
             Some(v) if !v.is_empty() => v,
@@ -433,6 +448,11 @@ impl LikeRule {
             return PushdownResult::CannotPush;
         };
 
+        // Validate column exists in schema
+        if !ctx.has_column(&column) {
+            return PushdownResult::CannotPush;
+        }
+
         let pattern = match &*like.pattern {
             ast::Expression::StringLiteral(s) => s.value.clone(),
             _ => return PushdownResult::CannotPush,
@@ -489,6 +509,11 @@ impl LikeRule {
         } else {
             return PushdownResult::CannotPush;
         };
+
+        // Validate column exists in schema
+        if !ctx.has_column(&column) {
+            return PushdownResult::CannotPush;
+        }
 
         let pattern = match extract_pattern(&infix.right) {
             Some(p) => p,
@@ -554,6 +579,12 @@ impl PushdownRule for NullCheckRule {
                     None => return PushdownResult::CannotPush,
                 };
 
+                // Validate column exists in schema - unknown columns must fall through
+                // to memory filter where the expression compiler will properly error
+                if !ctx.has_column(&column) {
+                    return PushdownResult::CannotPush;
+                }
+
                 let mut expr = if infix.op_type == InfixOperator::IsNot {
                     NullCheckExpr::is_not_null(column)
                 } else {
@@ -597,6 +628,11 @@ impl PushdownRule for BooleanCheckRule {
                     None => return PushdownResult::CannotPush,
                 };
 
+                // Validate column exists in schema
+                if !ctx.has_column(&column) {
+                    return PushdownResult::CannotPush;
+                }
+
                 let mut expr = ComparisonExpr::eq(column, Value::Boolean(bool_val));
                 expr.prepare_for_schema(ctx.schema);
                 PushdownResult::Converted(Box::new(expr))
@@ -613,6 +649,11 @@ impl PushdownRule for BooleanCheckRule {
                     Some(c) => c,
                     None => return PushdownResult::CannotPush,
                 };
+
+                // Validate column exists in schema
+                if !ctx.has_column(&column) {
+                    return PushdownResult::CannotPush;
+                }
 
                 let mut ne_expr = ComparisonExpr::ne(&column, Value::Boolean(bool_val));
                 ne_expr.prepare_for_schema(ctx.schema);

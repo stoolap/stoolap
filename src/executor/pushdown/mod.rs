@@ -84,6 +84,11 @@ impl<'a> PushdownContext<'a> {
             .and_then(|&idx| self.schema.columns.get(idx).map(|c| c.data_type))
     }
 
+    /// Check if a column exists in the schema
+    pub fn has_column(&self, name: &str) -> bool {
+        self.schema.has_column(name)
+    }
+
     /// Coerce value to column type if known
     pub fn coerce_to_column_type(&self, column: &str, value: Value) -> Value {
         if let Some(col_type) = self.column_type(column) {

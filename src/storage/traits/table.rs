@@ -816,7 +816,7 @@ pub trait Table: Send + Sync {
     /// # Arguments
     /// * `old_name` - Current column name
     /// * `new_name` - New column name
-    fn rename_column(&self, old_name: &str, new_name: &str) -> Result<()>;
+    fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()>;
 
     /// Modifies a column's definition
     ///
@@ -824,7 +824,7 @@ pub trait Table: Send + Sync {
     /// * `name` - The column name
     /// * `column_type` - The new data type
     /// * `nullable` - Whether the column can contain NULL values
-    fn modify_column(&self, name: &str, column_type: DataType, nullable: bool) -> Result<()>;
+    fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()>;
 
     // ---- Query Operations ----
 
