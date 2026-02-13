@@ -8621,3 +8621,391 @@ fn test_multi_column_unique_index_enforced_after_recovery() {
     )
     .unwrap();
 }
+
+// ============================================================================
+// ALTER TABLE MODIFY COLUMN durability
+// ============================================================================
+
+/// ALTER TABLE MODIFY COLUMN must persist type and nullability changes
+/// across close/reopen. The WAL records this as AlterTable op_type=4.
+#[test]
+fn test_alter_table_modify_column_durability() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE modify_test (id INTEGER PRIMARY KEY, score INTEGER NOT NULL, label TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=10 {
+            db.execute(
+                &format!(
+                    "INSERT INTO modify_test (id, score, label) VALUES ({}, {}, 'item_{}')",
+                    i,
+                    i * 10,
+                    i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        // Change score from NOT NULL to nullable
+        db.execute("ALTER TABLE modify_test MODIFY COLUMN score INTEGER", ())
+            .unwrap();
+
+        // Insert a row with NULL score to prove the change took effect
+        db.execute(
+            "INSERT INTO modify_test (id, score, label) VALUES (11, NULL, 'null_score')",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    // All rows must survive
+    let count: i64 = db
+        .query_one("SELECT COUNT(*) FROM modify_test", ())
+        .unwrap();
+    assert_eq!(count, 11, "All 11 rows should survive after recovery");
+
+    // Original data intact
+    let score: i64 = db
+        .query_one("SELECT score FROM modify_test WHERE id = 5", ())
+        .unwrap();
+    assert_eq!(score, 50, "Original score values must be preserved");
+
+    // NULL score must survive (proves MODIFY to nullable persisted)
+    let null_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM modify_test WHERE score IS NULL", ())
+        .unwrap();
+    assert_eq!(
+        null_count, 1,
+        "NULL score row must survive — MODIFY COLUMN nullable change must persist"
+    );
+
+    // Can still insert NULL after recovery (proves schema change persisted)
+    db.execute(
+        "INSERT INTO modify_test (id, score, label) VALUES (12, NULL, 'post_recovery_null')",
+        (),
+    )
+    .unwrap();
+
+    let null_count2: i64 = db
+        .query_one("SELECT COUNT(*) FROM modify_test WHERE score IS NULL", ())
+        .unwrap();
+    assert_eq!(
+        null_count2, 2,
+        "Post-recovery NULL insert must work after MODIFY COLUMN"
+    );
+}
+
+/// ALTER TABLE MODIFY COLUMN with snapshot — WAL replay must apply
+/// the type change on top of snapshot state.
+#[test]
+fn test_alter_table_modify_column_with_snapshot() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE modify_snap (id INTEGER PRIMARY KEY, value TEXT NOT NULL, flag BOOLEAN NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=20 {
+            db.execute(
+                &format!(
+                    "INSERT INTO modify_snap (id, value, flag) VALUES ({}, 'v_{}', {})",
+                    i,
+                    i,
+                    if i % 2 == 0 { "TRUE" } else { "FALSE" }
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        // Snapshot captures current schema (value NOT NULL, flag NOT NULL)
+        db.execute("PRAGMA snapshot", ()).unwrap();
+
+        // MODIFY after snapshot — must be replayed from WAL on recovery
+        db.execute("ALTER TABLE modify_snap MODIFY COLUMN value TEXT", ())
+            .unwrap();
+
+        db.execute("ALTER TABLE modify_snap MODIFY COLUMN flag BOOLEAN", ())
+            .unwrap();
+
+        // Insert rows using new nullable schema
+        db.execute(
+            "INSERT INTO modify_snap (id, value, flag) VALUES (21, NULL, NULL)",
+            (),
+        )
+        .unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db
+        .query_one("SELECT COUNT(*) FROM modify_snap", ())
+        .unwrap();
+    assert_eq!(count, 21, "All 21 rows must survive snapshot + WAL replay");
+
+    // NULL values from post-MODIFY insert must survive
+    let null_value_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM modify_snap WHERE value IS NULL", ())
+        .unwrap();
+    assert_eq!(
+        null_value_count, 1,
+        "NULL value row must survive — MODIFY COLUMN must replay over snapshot"
+    );
+
+    let null_flag_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM modify_snap WHERE flag IS NULL", ())
+        .unwrap();
+    assert_eq!(
+        null_flag_count, 1,
+        "NULL flag row must survive — MODIFY COLUMN must replay over snapshot"
+    );
+
+    // Post-recovery inserts with NULLs must work
+    db.execute(
+        "INSERT INTO modify_snap (id, value, flag) VALUES (22, NULL, TRUE)",
+        (),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO modify_snap (id, value, flag) VALUES (23, 'hello', NULL)",
+        (),
+    )
+    .unwrap();
+}
+
+// ============================================================================
+// Bitmap index durability
+// ============================================================================
+
+/// Bitmap index created with USING BITMAP must survive close/reopen.
+/// This exercises the bitmap-specific WAL serialization (index_type byte = 2)
+/// and the BitmapIndex reconstruction path in create_index_from_metadata.
+#[test]
+fn test_bitmap_index_durability() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE bitmap_test (id INTEGER PRIMARY KEY, active BOOLEAN NOT NULL, category TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=50 {
+            db.execute(
+                &format!(
+                    "INSERT INTO bitmap_test (id, active, category) VALUES ({}, {}, '{}')",
+                    i,
+                    if i % 3 == 0 { "TRUE" } else { "FALSE" },
+                    if i % 4 == 0 {
+                        "A"
+                    } else if i % 4 == 1 {
+                        "B"
+                    } else if i % 4 == 2 {
+                        "C"
+                    } else {
+                        "D"
+                    }
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        // Create explicit bitmap indexes
+        db.execute(
+            "CREATE INDEX idx_active_bitmap ON bitmap_test(active) USING BITMAP",
+            (),
+        )
+        .unwrap();
+
+        db.execute(
+            "CREATE INDEX idx_cat_bitmap ON bitmap_test(category) USING BITMAP",
+            (),
+        )
+        .unwrap();
+
+        // Verify indexes work before close
+        let active_count: i64 = db
+            .query_one("SELECT COUNT(*) FROM bitmap_test WHERE active = TRUE", ())
+            .unwrap();
+        assert_eq!(active_count, 16); // 3,6,9,...,48 → 16 values
+
+        let cat_a_count: i64 = db
+            .query_one("SELECT COUNT(*) FROM bitmap_test WHERE category = 'A'", ())
+            .unwrap();
+        assert_eq!(cat_a_count, 12); // 4,8,12,...,48 → 12 values
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    // All data must survive
+    let count: i64 = db
+        .query_one("SELECT COUNT(*) FROM bitmap_test", ())
+        .unwrap();
+    assert_eq!(count, 50, "All 50 rows must survive recovery");
+
+    // Bitmap index on active must work after recovery
+    let active_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM bitmap_test WHERE active = TRUE", ())
+        .unwrap();
+    assert_eq!(
+        active_count, 16,
+        "Bitmap index on active must return correct results after recovery"
+    );
+
+    let inactive_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM bitmap_test WHERE active = FALSE", ())
+        .unwrap();
+    assert_eq!(
+        inactive_count, 34,
+        "Bitmap index on active=FALSE must return correct results after recovery"
+    );
+
+    // Bitmap index on category must work after recovery
+    let cat_b_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM bitmap_test WHERE category = 'B'", ())
+        .unwrap();
+    assert_eq!(
+        cat_b_count, 13,
+        "Bitmap index on category must return correct results after recovery"
+    );
+
+    // Inserts after recovery must update the bitmap index
+    db.execute(
+        "INSERT INTO bitmap_test (id, active, category) VALUES (51, TRUE, 'A')",
+        (),
+    )
+    .unwrap();
+
+    let new_active_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM bitmap_test WHERE active = TRUE", ())
+        .unwrap();
+    assert_eq!(
+        new_active_count, 17,
+        "Bitmap index must handle post-recovery inserts"
+    );
+
+    let new_cat_a_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM bitmap_test WHERE category = 'A'", ())
+        .unwrap();
+    assert_eq!(
+        new_cat_a_count, 13,
+        "Bitmap index on category must handle post-recovery inserts"
+    );
+}
+
+/// Bitmap index with snapshot — the index definition must survive snapshot + WAL replay.
+#[test]
+fn test_bitmap_index_with_snapshot_recovery() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE bitmap_snap (id INTEGER PRIMARY KEY, status BOOLEAN NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+        for i in 1..=30 {
+            db.execute(
+                &format!(
+                    "INSERT INTO bitmap_snap (id, status) VALUES ({}, {})",
+                    i,
+                    if i % 2 == 0 { "TRUE" } else { "FALSE" }
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        // Snapshot before index creation
+        db.execute("PRAGMA snapshot", ()).unwrap();
+
+        // Create bitmap index after snapshot — must be replayed from WAL
+        db.execute(
+            "CREATE INDEX idx_status_bm ON bitmap_snap(status) USING BITMAP",
+            (),
+        )
+        .unwrap();
+
+        // Insert more data after index creation
+        for i in 31..=40 {
+            db.execute(
+                &format!("INSERT INTO bitmap_snap (id, status) VALUES ({}, TRUE)", i),
+                (),
+            )
+            .unwrap();
+        }
+    }
+
+    remove_lock_file(&db_path);
+
+    let db = Database::open(&dsn).unwrap();
+
+    let count: i64 = db
+        .query_one("SELECT COUNT(*) FROM bitmap_snap", ())
+        .unwrap();
+    assert_eq!(count, 40, "All 40 rows must survive snapshot + WAL replay");
+
+    // Bitmap index must work — 15 TRUE from first batch + 10 TRUE from second
+    let true_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM bitmap_snap WHERE status = TRUE", ())
+        .unwrap();
+    assert_eq!(
+        true_count, 25,
+        "Bitmap index must return correct results after snapshot + WAL replay"
+    );
+
+    let false_count: i64 = db
+        .query_one("SELECT COUNT(*) FROM bitmap_snap WHERE status = FALSE", ())
+        .unwrap();
+    assert_eq!(
+        false_count, 15,
+        "Bitmap index must return correct FALSE count after recovery"
+    );
+
+    // Dropping and recreating the bitmap index should work (proves it was recovered)
+    db.execute("DROP INDEX idx_status_bm ON bitmap_snap", ())
+        .unwrap();
+    db.execute(
+        "CREATE INDEX idx_status_bm ON bitmap_snap(status) USING BITMAP",
+        (),
+    )
+    .unwrap();
+
+    let recheck: i64 = db
+        .query_one("SELECT COUNT(*) FROM bitmap_snap WHERE status = TRUE", ())
+        .unwrap();
+    assert_eq!(recheck, 25, "Recreated bitmap index must work correctly");
+}
