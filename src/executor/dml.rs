@@ -306,6 +306,13 @@ impl Executor {
             }
         }
 
+        // Pre-compute FK info for parent validation (CompactArc ref-count bump, not deep clone)
+        let fk_schema = if !table.schema().foreign_keys.is_empty() {
+            Some(self.engine.get_table_schema(table_name)?)
+        } else {
+            None
+        };
+
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{compile_expression, ExecuteContext, ExprVM};
         let mut vm = ExprVM::new();
@@ -377,6 +384,17 @@ impl Executor {
 
                 // Create row and insert
                 let row = Row::from_values(row_values);
+
+                // FK parent validation (zero-cost if no FKs)
+                if let Some(ref fks) = fk_schema {
+                    super::foreign_key::check_parent_exists(
+                        &self.engine,
+                        table.txn_id(),
+                        fks,
+                        &row,
+                    )?;
+                }
+
                 if has_returning {
                     // Use insert() which returns row (for RETURNING clause)
                     let inserted_row = table.insert(row)?;
@@ -421,8 +439,8 @@ impl Executor {
 
         // Process each row of values - use fast path for normal INSERT, slow path for ON DUPLICATE KEY
         if stmt.on_duplicate {
-            // ON DUPLICATE KEY UPDATE requires schema clone for potential updates
-            let schema = table.schema().clone();
+            // ON DUPLICATE KEY UPDATE requires schema (CompactArc ref-count bump, not deep clone)
+            let schema = self.engine.get_table_schema(table_name)?;
 
             for value_row in &stmt.values {
                 if value_row.len() != column_indices.len() {
@@ -470,6 +488,17 @@ impl Executor {
 
                 // Create row from values (ON DUPLICATE KEY needs values for error handling)
                 let row = Row::from_values(row_values.clone());
+
+                // FK parent validation (zero-cost if no FKs)
+                if let Some(ref fks) = fk_schema {
+                    super::foreign_key::check_parent_exists(
+                        &self.engine,
+                        table.txn_id(),
+                        fks,
+                        &row,
+                    )?;
+                }
+
                 match table.insert_discard(row) {
                     Ok(()) => {
                         rows_affected += 1;
@@ -578,6 +607,17 @@ impl Executor {
 
                 // Insert row
                 let row = Row::from_values(row_values);
+
+                // FK parent validation (zero-cost if no FKs)
+                if let Some(ref fks) = fk_schema {
+                    super::foreign_key::check_parent_exists(
+                        &self.engine,
+                        table.txn_id(),
+                        fks,
+                        &row,
+                    )?;
+                }
+
                 if has_returning {
                     // Use insert() which returns row (for RETURNING clause)
                     let inserted_row = table.insert(row)?;
@@ -796,6 +836,13 @@ impl Executor {
             )
         };
 
+        // Pre-compute FK info for parent validation (CompactArc ref-count bump, not deep clone)
+        let fk_schema = if !table.schema().foreign_keys.is_empty() {
+            Some(self.engine.get_table_schema(table_name)?)
+        } else {
+            None
+        };
+
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{compile_expression, ExecuteContext, ExprVM};
         let mut vm = ExprVM::new();
@@ -885,6 +932,17 @@ impl Executor {
 
                 // Insert row
                 let row = Row::from_values(row_values);
+
+                // FK parent validation (zero-cost if no FKs)
+                if let Some(ref fks) = fk_schema {
+                    super::foreign_key::check_parent_exists(
+                        &self.engine,
+                        table.txn_id(),
+                        fks,
+                        &row,
+                    )?;
+                }
+
                 if has_returning {
                     let inserted_row = table.insert(row)?;
                     returning_rows.push(inserted_row);
@@ -953,6 +1011,17 @@ impl Executor {
 
                 // Insert row
                 let row = Row::from_values(row_values);
+
+                // FK parent validation (zero-cost if no FKs)
+                if let Some(ref fks) = fk_schema {
+                    super::foreign_key::check_parent_exists(
+                        &self.engine,
+                        table.txn_id(),
+                        fks,
+                        &row,
+                    )?;
+                }
+
                 if has_returning {
                     let inserted_row = table.insert(row)?;
                     returning_rows.push(inserted_row);
@@ -1035,6 +1104,81 @@ impl Executor {
         let schema = table.schema();
         // OPTIMIZATION: Use CompactArc<Vec<String>> to share column names without cloning
         let column_names = schema.column_names_arc();
+
+        // Pre-compute FK info for UPDATE validation
+        // Determine which FK columns are being updated (for parent validation)
+        let fk_cols_in_update: Vec<(usize, crate::core::ForeignKeyConstraint)> = {
+            let col_map = schema.column_index_map();
+            let updated_col_indices: Vec<usize> = stmt
+                .updates
+                .iter()
+                .filter_map(|(col_name, _)| {
+                    let col_lower = col_name.to_lowercase();
+                    col_map.get(col_lower.as_str()).copied()
+                })
+                .collect();
+            schema
+                .foreign_keys
+                .iter()
+                .filter(|fk| updated_col_indices.contains(&fk.column_index))
+                .map(|fk| (fk.column_index, fk.clone()))
+                .collect()
+        };
+        let has_fk_updates = !fk_cols_in_update.is_empty();
+
+        // Check if this table is referenced by child tables (for PK update enforcement)
+        let referencing_fks_for_update = if schema.pk_column_index().is_some() {
+            let col_map = schema.column_index_map();
+            let pk_idx = schema.pk_column_index().unwrap();
+            let pk_being_updated = stmt.updates.iter().any(|(col_name, _)| {
+                let col_lower = col_name.to_lowercase();
+                col_map.get(col_lower.as_str()).copied() == Some(pk_idx)
+            });
+            if pk_being_updated {
+                super::foreign_key::find_referencing_fks(&self.engine, table_name)
+            } else {
+                Arc::new(Vec::new())
+            }
+        } else {
+            Arc::new(Vec::new())
+        };
+
+        // Get FK schema via engine (CompactArc ref-count bump, no deep clone)
+        let fk_update_schema = if has_fk_updates {
+            Some(self.engine.get_table_schema(table_name)?)
+        } else {
+            None
+        };
+
+        // Pre-validate constant FK values in explicit transactions to prevent dirty state.
+        // When SET parent_id = <literal>, we can check the parent exists BEFORE modifying rows.
+        // This ensures statement-level atomicity for the most common FK update pattern.
+        // For row-dependent expressions (SET fk = other_col), post-validation is still used.
+        if has_fk_updates && !should_auto_commit {
+            let col_map = schema.column_index_map();
+            for (col_name, expr) in &stmt.updates {
+                let col_lower = col_name.to_lowercase();
+                if let Some(&col_idx) = col_map.get(col_lower.as_str()) {
+                    if let Some(fk) = schema
+                        .foreign_keys
+                        .iter()
+                        .find(|f| f.column_index == col_idx)
+                    {
+                        if let Some(value) = Self::try_extract_constant_fk_value(expr, ctx) {
+                            if !value.is_null() {
+                                super::foreign_key::validate_fk_value(
+                                    &self.engine,
+                                    table.txn_id(),
+                                    fk,
+                                    &value,
+                                    table_name,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Check if any update expressions contain subqueries
         let has_update_subqueries = stmt
@@ -1162,9 +1306,12 @@ impl Executor {
         let mut evaluator = CompiledEvaluator::new(function_registry).with_context(ctx);
         evaluator.init_columns_arc(CompactArc::clone(&column_names));
 
-        // Use RefCell to collect updated rows for RETURNING clause
+        // Use RefCell to collect updated rows for RETURNING clause and FK validation
         use std::cell::RefCell;
         let returning_rows: RefCell<Vec<Row>> = RefCell::new(Vec::new());
+        // Collect new FK values and PK old/new pairs from setter for post-update validation
+        let fk_new_values: RefCell<Vec<Row>> = RefCell::new(Vec::new());
+        let pk_changes: RefCell<Vec<(Value, Value)>> = RefCell::new(Vec::new());
 
         // Create a setter function that applies updates using pre-computed indices
         // If we need memory filtering, include the WHERE check in the setter
@@ -1335,6 +1482,8 @@ impl Executor {
             // Extract params before the closure so they can be captured
             let params = ctx.params();
             let named_params = ctx.named_params();
+            // Pre-compute PK column index for FK enforcement inside closure
+            let pk_col_idx_for_fk = schema.pk_column_index();
 
             let mut setter = |mut row: Row| -> (Row, bool) {
                 // If we need in-memory WHERE filtering, check the condition first
@@ -1366,8 +1515,32 @@ impl Executor {
 
                 // Now apply all the computed values to the row
                 let changed = !updates_to_apply.is_empty();
+
+                // Track PK old value before applying changes (for FK enforcement)
+                let pk_old = if changed && !referencing_fks_for_update.is_empty() {
+                    pk_col_idx_for_fk.and_then(|pk_idx| row.get(pk_idx).cloned())
+                } else {
+                    None
+                };
+
                 for (idx, new_value) in updates_to_apply {
                     let _ = row.set(idx, new_value);
+                }
+
+                // Collect FK values for post-update validation
+                if changed && has_fk_updates {
+                    fk_new_values.borrow_mut().push(row.clone());
+                }
+
+                // Track PK changes for referencing FK enforcement
+                if let Some(old_pk) = pk_old {
+                    if let Some(pk_idx) = pk_col_idx_for_fk {
+                        if let Some(new_pk) = row.get(pk_idx) {
+                            if &old_pk != new_pk {
+                                pk_changes.borrow_mut().push((old_pk, new_pk.clone()));
+                            }
+                        }
+                    }
                 }
 
                 // Collect row for RETURNING clause
@@ -1398,6 +1571,36 @@ impl Executor {
             }
         };
 
+        // Post-update FK validation: check new FK values reference existing parent rows
+        if has_fk_updates {
+            let fk_rows = fk_new_values.into_inner();
+            if let Some(ref fk_schema) = fk_update_schema {
+                for row in &fk_rows {
+                    super::foreign_key::check_parent_exists(
+                        &self.engine,
+                        table.txn_id(),
+                        fk_schema,
+                        row,
+                    )?;
+                }
+            }
+        }
+
+        // Post-update PK change enforcement: enforce referencing FK actions
+        if !referencing_fks_for_update.is_empty() {
+            let changes = pk_changes.into_inner();
+            for (old_pk, new_pk) in &changes {
+                super::foreign_key::enforce_update_actions(
+                    &self.engine,
+                    table.txn_id(),
+                    table_name,
+                    old_pk,
+                    new_pk,
+                    &referencing_fks_for_update,
+                )?;
+            }
+        }
+
         // Invalidate semantic cache for this table BEFORE commit
         // CRITICAL: Must invalidate before commit to prevent stale data window
         if rows_affected > 0 {
@@ -1424,6 +1627,34 @@ impl Executor {
         Ok(Box::new(ExecResult::with_rows_affected(
             rows_affected as i64,
         )))
+    }
+
+    /// Try to extract a constant value from a SET expression for FK pre-validation.
+    /// Returns Some(value) for literals, parameters, and negated literals.
+    /// Returns None for column references, functions, subqueries, etc.
+    fn try_extract_constant_fk_value(expr: &Expression, ctx: &ExecutionContext) -> Option<Value> {
+        match expr {
+            Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
+            Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
+            Expression::StringLiteral(lit) => Some(Value::text(lit.value.as_str())),
+            Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
+            Expression::NullLiteral(_) => Some(Value::null_unknown()),
+            Expression::Prefix(prefix) if prefix.operator == "-" => match prefix.right.as_ref() {
+                Expression::IntegerLiteral(lit) => Some(Value::Integer(-lit.value)),
+                Expression::FloatLiteral(lit) => Some(Value::Float(-lit.value)),
+                _ => None,
+            },
+            Expression::Parameter(param) => {
+                if param.name.starts_with(':') {
+                    ctx.get_named_param(&param.name[1..]).cloned()
+                } else if param.index > 0 {
+                    ctx.params().get(param.index - 1).cloned()
+                } else {
+                    None
+                }
+            }
+            _ => None, // Column reference, function, subquery, etc. — can't pre-validate
+        }
     }
 
     /// Execute a DELETE statement
@@ -1560,6 +1791,9 @@ impl Executor {
             (None, false, None)
         };
 
+        // Check if this table is referenced by child tables (for FK enforcement)
+        let referencing_fks = super::foreign_key::find_referencing_fks(&self.engine, table_name);
+
         // Get schema info for RETURNING clause processing
         let column_names_owned = schema.column_names_owned().to_vec();
         let column_count = schema.columns.len();
@@ -1567,12 +1801,14 @@ impl Executor {
         let pk_col_idx = schema.pk_column_index();
         let pk_col_name = pk_col_idx.map(|idx| schema.columns[idx].name.clone());
 
+        let has_referencing_fks = !referencing_fks.is_empty();
+
         // Delete rows
-        let rows_affected = if needs_memory_filter || has_returning {
-            // Complex WHERE expression OR RETURNING - need to scan rows first
+        let rows_affected = if needs_memory_filter || has_returning || has_referencing_fks {
+            // Complex WHERE expression, RETURNING, or FK enforcement - need to scan rows first
             // Scan all rows, filter with evaluator, collect for RETURNING, delete matching ones by primary key
-            // Clone schema for later use to avoid borrow conflict
-            let schema_clone = schema.clone();
+            // Get schema via engine (CompactArc ref-count bump, no deep clone)
+            let schema_arc = self.engine.get_table_schema(table_name)?;
 
             // Build column names with effective prefix (alias or table name)
             // This allows WHERE clauses to reference columns using the alias
@@ -1710,13 +1946,24 @@ impl Executor {
             // Drop scanner to release borrow
             drop(scanner);
 
+            // FK enforcement: check/cascade referencing child tables before deleting
+            if has_referencing_fks && !rows_to_delete.is_empty() {
+                super::foreign_key::enforce_delete_actions_iter(
+                    &self.engine,
+                    table.txn_id(),
+                    table_name,
+                    rows_to_delete.iter().map(|(pk, _)| pk),
+                    &referencing_fks,
+                )?;
+            }
+
             // Delete matching rows by primary key
             let mut delete_count = 0;
             if let Some(ref pk_name) = pk_col_name {
                 for (pk_value, row_data) in rows_to_delete {
                     let mut pk_expr =
                         ComparisonExpr::new(pk_name, crate::core::Operator::Eq, pk_value);
-                    pk_expr.prepare_for_schema(&schema_clone);
+                    pk_expr.prepare_for_schema(&schema_arc);
                     let deleted = table.delete(Some(&pk_expr))?;
                     if deleted > 0 {
                         if let Some(row) = row_data {
@@ -1831,6 +2078,14 @@ impl Executor {
 
         // Drop the lock before doing work
         drop(active_tx);
+
+        // FK enforcement: block truncate if child tables reference this table
+        // Uses the table's transaction for visibility (sees uncommitted child deletes)
+        super::foreign_key::check_no_referencing_rows(
+            &self.engine,
+            table_name,
+            Some(table.txn_id()),
+        )?;
 
         // Truncate all rows (fast path: drops storage directly)
         // WAL is recorded AFTER success to prevent phantom records on failure.

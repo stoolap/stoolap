@@ -17,7 +17,7 @@
 //! Provides the main MVCC storage engine implementation.
 //!
 
-use crate::common::{CompactArc, I64Map, SmartString};
+use crate::common::{CompactArc, I64Map, SmartString, StringMap};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -41,7 +41,7 @@ fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
 
 use super::file_lock::FileLock;
 
-use crate::core::{DataType, Error, IsolationLevel, Result, Schema};
+use crate::core::{DataType, Error, ForeignKeyConstraint, IsolationLevel, Result, Schema};
 use crate::storage::config::Config;
 use crate::storage::mvcc::wal_manager::WALOperationType;
 #[cfg(test)]
@@ -76,6 +76,55 @@ fn registry_as_visibility_checker(
     registry: &Arc<TransactionRegistry>,
 ) -> Arc<dyn VisibilityChecker> {
     Arc::clone(registry) as Arc<dyn VisibilityChecker>
+}
+
+/// Remove FK constraints referencing `parent_table_lower` from all child schemas.
+/// Updates both the schemas map and each affected VersionStore's schema.
+/// Caller must hold schemas as write-locked and version_stores as read-locked.
+fn strip_fk_references(
+    schemas: &mut FxHashMap<String, CompactArc<Schema>>,
+    version_stores: &FxHashMap<String, Arc<VersionStore>>,
+    parent_table_lower: &str,
+) {
+    let children_to_update: Vec<String> = schemas
+        .iter()
+        .filter(|(_, schema)| {
+            schema
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.referenced_table == parent_table_lower)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    for child_name in &children_to_update {
+        if let Some(old_schema_arc) = schemas.get(child_name) {
+            let old_schema: &Schema = old_schema_arc;
+            let mut new_fks: Vec<ForeignKeyConstraint> = old_schema
+                .foreign_keys
+                .iter()
+                .filter(|fk| fk.referenced_table != parent_table_lower)
+                .cloned()
+                .collect();
+            if new_fks.len() < old_schema.foreign_keys.len() {
+                let mut new_schema = Schema::with_timestamps_and_foreign_keys(
+                    old_schema.table_name.clone(),
+                    old_schema.columns.clone(),
+                    Vec::new(),
+                    old_schema.created_at,
+                    old_schema.updated_at,
+                );
+                std::mem::swap(&mut new_schema.foreign_keys, &mut new_fks);
+                let new_arc = CompactArc::new(new_schema);
+
+                if let Some(vs) = version_stores.get(child_name.as_str()) {
+                    *vs.schema_mut() = new_arc.clone();
+                }
+
+                schemas.insert(child_name.clone(), new_arc);
+            }
+        }
+    }
 }
 
 /// Register a virtual PkIndex on an INTEGER PRIMARY KEY column.
@@ -393,6 +442,10 @@ impl ViewDefinition {
     }
 }
 
+/// Cached reverse FK mapping: (schema_epoch, parent_table → Arc<Vec<(child_table, constraint)>>)
+/// Arc-wrapped so lookups are a ref-count bump (no Vec clone on every FK check).
+type FkReverseCache = (u64, StringMap<Arc<Vec<(String, ForeignKeyConstraint)>>>);
+
 /// MVCC Storage Engine
 ///
 /// Provides multi-version concurrency control with snapshot isolation.
@@ -427,6 +480,9 @@ pub struct MVCCEngine {
     schema_epoch: AtomicU64,
     /// Handle for the background cleanup thread (None if not started)
     cleanup_handle: Mutex<Option<CleanupHandle>>,
+    /// Cached reverse FK mapping: parent_table → Vec<(child_table, FK constraint)>
+    /// Rebuilt lazily on schema_epoch change. Zero cost for non-FK databases.
+    fk_reverse_cache: RwLock<FkReverseCache>,
 }
 
 impl MVCCEngine {
@@ -465,6 +521,7 @@ impl MVCCEngine {
             file_lock: Mutex::new(None),
             schema_epoch: AtomicU64::new(0),
             cleanup_handle: Mutex::new(None),
+            fk_reverse_cache: RwLock::new((u64::MAX, StringMap::default())),
         }
     }
 
@@ -822,10 +879,13 @@ impl MVCCEngine {
             WALOperationType::DropTable => {
                 let table_name = entry.table_name.to_lowercase();
 
-                // Remove schema and version store
+                // Remove schema, strip FK references from child tables, and remove version store.
+                // Must strip FK references before removing schema, same as drop_table_internal.
                 {
                     let mut schemas = self.schemas.write().unwrap();
                     schemas.remove(&table_name);
+                    let stores = self.version_stores.read().unwrap();
+                    strip_fk_references(&mut schemas, &stores, &table_name);
                 }
                 {
                     let mut stores = self.version_stores.write().unwrap();
@@ -1040,7 +1100,100 @@ impl MVCCEngine {
             ));
         }
 
-        Ok(Schema::new(&table_name, columns))
+        // Foreign key constraints (optional for backwards compatibility)
+        let mut foreign_keys = Vec::new();
+        if pos + 2 <= data.len() {
+            let fk_count = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            for _ in 0..fk_count {
+                // Once fk_count is declared, truncation mid-constraint is corruption
+                if pos + 2 > data.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: truncated foreign key constraint data",
+                    ));
+                }
+                let col_idx = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+                pos += 2;
+
+                if pos + 2 > data.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: truncated foreign key constraint data",
+                    ));
+                }
+                let col_name_len =
+                    u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+                pos += 2;
+                if pos + col_name_len > data.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: truncated foreign key constraint data",
+                    ));
+                }
+                let col_name =
+                    String::from_utf8(data[pos..pos + col_name_len].to_vec()).unwrap_or_default();
+                pos += col_name_len;
+
+                if pos + 2 > data.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: truncated foreign key constraint data",
+                    ));
+                }
+                let ref_table_len =
+                    u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+                pos += 2;
+                if pos + ref_table_len > data.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: truncated foreign key constraint data",
+                    ));
+                }
+                let ref_table =
+                    String::from_utf8(data[pos..pos + ref_table_len].to_vec()).unwrap_or_default();
+                pos += ref_table_len;
+
+                if pos + 2 > data.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: truncated foreign key constraint data",
+                    ));
+                }
+                let ref_col_len =
+                    u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+                pos += 2;
+                if pos + ref_col_len > data.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: truncated foreign key constraint data",
+                    ));
+                }
+                let ref_col =
+                    String::from_utf8(data[pos..pos + ref_col_len].to_vec()).unwrap_or_default();
+                pos += ref_col_len;
+
+                if pos + 2 > data.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: truncated foreign key constraint data",
+                    ));
+                }
+                let on_delete = crate::core::ForeignKeyAction::from_u8(data[pos])
+                    .unwrap_or(crate::core::ForeignKeyAction::Restrict);
+                pos += 1;
+                let on_update = crate::core::ForeignKeyAction::from_u8(data[pos])
+                    .unwrap_or(crate::core::ForeignKeyAction::Restrict);
+                pos += 1;
+
+                foreign_keys.push(crate::core::ForeignKeyConstraint {
+                    column_index: col_idx,
+                    column_name: col_name,
+                    referenced_table: ref_table,
+                    referenced_column: ref_col,
+                    on_delete,
+                    on_update,
+                });
+            }
+        }
+
+        Ok(Schema::with_foreign_keys(
+            &table_name,
+            columns,
+            foreign_keys,
+        ))
     }
 
     /// Closes the engine (inherent method)
@@ -1420,7 +1573,100 @@ impl MVCCEngine {
             }
         }
 
+        // Foreign key constraints
+        buf.extend_from_slice(&(schema.foreign_keys.len() as u16).to_le_bytes());
+        for fk in &schema.foreign_keys {
+            buf.extend_from_slice(&(fk.column_index as u16).to_le_bytes());
+            buf.extend_from_slice(&(fk.column_name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(fk.column_name.as_bytes());
+            buf.extend_from_slice(&(fk.referenced_table.len() as u16).to_le_bytes());
+            buf.extend_from_slice(fk.referenced_table.as_bytes());
+            buf.extend_from_slice(&(fk.referenced_column.len() as u16).to_le_bytes());
+            buf.extend_from_slice(fk.referenced_column.as_bytes());
+            buf.push(fk.on_delete.as_u8());
+            buf.push(fk.on_update.as_u8());
+        }
+
         buf
+    }
+
+    /// Returns all table names (lowercase) currently in the engine
+    pub fn get_all_table_names(&self) -> Vec<String> {
+        self.schemas.read().unwrap().keys().cloned().collect()
+    }
+
+    /// Returns all schemas currently in the engine (CompactArc ref-count bump only)
+    pub fn get_all_schemas(&self) -> Vec<crate::common::CompactArc<Schema>> {
+        self.schemas.read().unwrap().values().cloned().collect()
+    }
+
+    /// Get a table handle for an existing transaction by txn_id.
+    /// This allows FK enforcement to participate in the caller's transaction,
+    /// ensuring CASCADE effects are atomic and uncommitted rows are visible.
+    pub fn get_table_for_txn(
+        &self,
+        txn_id: i64,
+        table_name: &str,
+    ) -> Result<Box<dyn crate::storage::traits::Table>> {
+        EngineOperations::new(self).get_table_for_transaction(txn_id, table_name)
+    }
+
+    /// Find all FK constraints in other tables that reference the given parent table.
+    /// Uses a cached reverse mapping that is rebuilt only when schema_epoch changes.
+    /// Returns Arc-wrapped Vec for zero-copy sharing (ref-count bump only).
+    /// Zero cost for databases without FK constraints.
+    pub fn find_referencing_fks(
+        &self,
+        parent_table: &str,
+    ) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
+        static EMPTY: std::sync::LazyLock<Arc<Vec<(String, ForeignKeyConstraint)>>> =
+            std::sync::LazyLock::new(|| Arc::new(Vec::new()));
+
+        let current_epoch = self.schema_epoch.load(Ordering::Acquire);
+
+        // Fast path: check if cache is valid (read lock only)
+        {
+            let cache = self.fk_reverse_cache.read().unwrap();
+            if cache.0 == current_epoch {
+                return cache
+                    .1
+                    .get(parent_table)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::clone(&EMPTY));
+            }
+        }
+
+        // Cache miss: rebuild under write lock
+        let mut cache = self.fk_reverse_cache.write().unwrap();
+        // Double-check after acquiring write lock (another thread may have rebuilt)
+        if cache.0 == current_epoch {
+            return cache
+                .1
+                .get(parent_table)
+                .cloned()
+                .unwrap_or_else(|| Arc::clone(&EMPTY));
+        }
+
+        // Rebuild the full reverse mapping
+        let schemas = self.schemas.read().unwrap();
+        let mut map: StringMap<Vec<(String, ForeignKeyConstraint)>> = StringMap::default();
+        for schema in schemas.values() {
+            for fk in &schema.foreign_keys {
+                map.entry(fk.referenced_table.clone())
+                    .or_default()
+                    .push((schema.table_name_lower.clone(), fk.clone()));
+            }
+        }
+        // Wrap each Vec in Arc before storing in cache
+        let arc_map: StringMap<Arc<Vec<(String, ForeignKeyConstraint)>>> =
+            map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        *cache = (current_epoch, arc_map);
+
+        cache
+            .1
+            .get(parent_table)
+            .cloned()
+            .unwrap_or_else(|| Arc::clone(&EMPTY))
     }
 
     /// Creates a new table
@@ -1482,13 +1728,20 @@ impl MVCCEngine {
 
         let table_name = name.to_lowercase();
 
-        // Atomically check-and-remove under write lock to prevent TOCTOU race
+        // Atomically remove schema AND strip FK references under single write lock.
+        // This prevents a race where find_referencing_fks reads stale state between
+        // schema removal and FK stripping.
         {
             let mut schemas = self.schemas.write().unwrap();
             if !schemas.contains_key(&table_name) {
                 return Err(Error::TableNotFound(table_name.to_string()));
             }
             schemas.remove(&table_name);
+
+            // Strip FK constraints from child tables that referenced the dropped table.
+            // Done under the same schemas write lock for atomicity.
+            let version_stores = self.version_stores.read().unwrap();
+            strip_fk_references(&mut schemas, &version_stores, &table_name);
         }
 
         // Close and remove version store
@@ -3034,13 +3287,16 @@ impl TransactionEngineOperations for EngineOperations {
     fn drop_table(&self, name: &str) -> Result<()> {
         let table_name_lower = name.to_lowercase();
 
-        // Remove schema and version store
+        // Remove schema and clean up FK references in child tables
         {
             let mut schemas = self.schemas().write().unwrap();
             if schemas.remove(&table_name_lower).is_none() {
                 return Err(Error::TableNotFound(table_name_lower.to_string()));
             }
+            let version_stores = self.version_stores().read().unwrap();
+            strip_fk_references(&mut schemas, &version_stores, &table_name_lower);
         }
+        // Close and remove version store
         {
             let mut stores = self.version_stores().write().unwrap();
             if let Some(store) = stores.remove(&table_name_lower) {

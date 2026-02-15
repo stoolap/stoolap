@@ -347,6 +347,55 @@ impl FromStr for IsolationLevel {
     }
 }
 
+/// Foreign key referential actions
+///
+/// Defines what happens to child rows when the referenced parent row is
+/// deleted or updated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ForeignKeyAction {
+    /// Block the operation if child rows exist (default)
+    Restrict = 0,
+
+    /// Propagate the operation to child rows
+    Cascade = 1,
+
+    /// Set the FK column to NULL in child rows
+    SetNull = 2,
+
+    /// Same as Restrict for immediate constraint checking
+    NoAction = 3,
+}
+
+impl ForeignKeyAction {
+    /// Returns the type ID as u8 for serialization
+    pub fn as_u8(&self) -> u8 {
+        *self as u8
+    }
+
+    /// Create ForeignKeyAction from u8
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(ForeignKeyAction::Restrict),
+            1 => Some(ForeignKeyAction::Cascade),
+            2 => Some(ForeignKeyAction::SetNull),
+            3 => Some(ForeignKeyAction::NoAction),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ForeignKeyAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ForeignKeyAction::Restrict => write!(f, "RESTRICT"),
+            ForeignKeyAction::Cascade => write!(f, "CASCADE"),
+            ForeignKeyAction::SetNull => write!(f, "SET NULL"),
+            ForeignKeyAction::NoAction => write!(f, "NO ACTION"),
+        }
+    }
+}
+
 /// Index entry representing a result from an index lookup
 ///
 

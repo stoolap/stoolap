@@ -192,8 +192,8 @@ pub enum CompiledExecution {
     /// Not analyzed yet
     #[default]
     Unknown,
-    /// Analyzed but doesn't qualify for any fast path
-    NotOptimizable,
+    /// Analyzed but doesn't qualify for any fast path (at the recorded schema epoch)
+    NotOptimizable(u64),
     /// PK lookup fast path (SELECT)
     PkLookup(CompiledPkLookup),
     /// PK-based UPDATE fast path

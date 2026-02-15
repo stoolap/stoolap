@@ -107,6 +107,16 @@ pub enum Error {
     #[error("CHECK constraint failed for column {column}: {expression}")]
     CheckConstraintViolation { column: String, expression: String },
 
+    /// Foreign key constraint violation
+    #[error("foreign key constraint violation: column '{column}' in table '{table}' references '{ref_table}({ref_column})' — {detail}")]
+    ForeignKeyViolation {
+        table: String,
+        column: String,
+        ref_table: String,
+        ref_column: String,
+        detail: String,
+    },
+
     // =========================================================================
     // Transaction errors
     // =========================================================================
@@ -329,6 +339,23 @@ impl Error {
         }
     }
 
+    /// Create a new ForeignKeyViolation error
+    pub fn foreign_key_violation(
+        table: impl Into<String>,
+        column: impl Into<String>,
+        ref_table: impl Into<String>,
+        ref_column: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Error::ForeignKeyViolation {
+            table: table.into(),
+            column: column.into(),
+            ref_table: ref_table.into(),
+            ref_column: ref_column.into(),
+            detail: detail.into(),
+        }
+    }
+
     /// Create a new TypeConversion error
     pub fn type_conversion(from: impl Into<String>, to: impl Into<String>) -> Self {
         Error::TypeConversion {
@@ -389,6 +416,7 @@ impl Error {
             Error::NotNullConstraint { .. }
                 | Error::PrimaryKeyConstraint { .. }
                 | Error::UniqueConstraint { .. }
+                | Error::ForeignKeyViolation { .. }
         )
     }
 

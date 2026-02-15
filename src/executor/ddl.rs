@@ -23,9 +23,115 @@
 //! - CREATE VIEW
 //! - DROP VIEW
 
-use crate::core::{DataType, Error, Result, Row, SchemaBuilder, Value};
+use crate::core::{
+    DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, Row, SchemaBuilder, Value,
+};
 use crate::parser::ast::*;
 use crate::storage::traits::{Engine, QueryResult};
+
+/// Validate a foreign key reference and build a `ForeignKeyConstraint`.
+///
+/// Checks: parent table exists, referenced column exists and is PK/UNIQUE,
+/// FK column exists in the schema being built.
+#[allow(clippy::too_many_arguments)]
+fn validate_fk_reference(
+    engine: &dyn Engine,
+    schema_builder: &SchemaBuilder,
+    fk_col_name: &str,
+    fk_col_display: &str,
+    ref_table_lower: &str,
+    ref_table_display: &str,
+    ref_col_opt: Option<&str>,
+    on_delete: ForeignKeyAction,
+    on_update: ForeignKeyAction,
+) -> Result<ForeignKeyConstraint> {
+    // Validate parent table exists
+    if !engine.table_exists(ref_table_lower)? {
+        return Err(Error::internal(format!(
+            "foreign key on column '{}' references non-existent table '{}'",
+            fk_col_display, ref_table_display
+        )));
+    }
+
+    let parent_schema = engine.get_table_schema(ref_table_lower)?;
+
+    // Resolve referenced column (defaults to PK if not specified)
+    let ref_col_name = if let Some(rc) = ref_col_opt {
+        rc.to_string()
+    } else {
+        parent_schema
+            .pk_column_index()
+            .and_then(|idx| parent_schema.columns.get(idx))
+            .map(|c| c.name.to_lowercase())
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "table '{}' has no primary key for FK reference default",
+                    ref_table_display
+                ))
+            })?
+    };
+
+    // Validate referenced column exists and is PK or has unique index
+    let (ref_col_idx, ref_col_def) = parent_schema.find_column(&ref_col_name).ok_or_else(|| {
+        Error::internal(format!(
+            "foreign key references non-existent column '{}' in table '{}'",
+            ref_col_name, ref_table_display
+        ))
+    })?;
+
+    if !ref_col_def.primary_key {
+        let has_unique = engine
+            .get_all_indexes(ref_table_lower)
+            .map(|indexes| {
+                indexes.iter().any(|idx| {
+                    idx.is_unique()
+                        && idx.column_ids().len() == 1
+                        && idx.column_ids()[0] as usize == ref_col_idx
+                })
+            })
+            .unwrap_or(false);
+
+        if !has_unique {
+            return Err(Error::internal(format!(
+                "foreign key on '{}' references column '{}' in '{}' which is neither PRIMARY KEY nor UNIQUE",
+                fk_col_display, ref_col_name, ref_table_display
+            )));
+        }
+    }
+
+    // Find FK column index in the schema being built
+    let fk_col_idx = schema_builder.column_index(fk_col_name).ok_or_else(|| {
+        Error::internal(format!(
+            "foreign key column '{}' not found in table definition",
+            fk_col_display
+        ))
+    })?;
+
+    // Reject SET NULL action on NOT NULL columns (would always fail at runtime)
+    if (matches!(on_delete, ForeignKeyAction::SetNull)
+        || matches!(on_update, ForeignKeyAction::SetNull))
+        && !schema_builder.is_column_nullable(fk_col_idx)
+    {
+        return Err(Error::internal(format!(
+            "foreign key column '{}' has ON {} SET NULL but is NOT NULL",
+            fk_col_display,
+            if matches!(on_delete, ForeignKeyAction::SetNull) {
+                "DELETE"
+            } else {
+                "UPDATE"
+            }
+        )));
+    }
+
+    Ok(ForeignKeyConstraint {
+        column_index: fk_col_idx,
+        column_name: fk_col_name.to_string(),
+        referenced_table: ref_table_lower.to_string(),
+        referenced_column: ref_col_name,
+        on_delete,
+        on_update,
+    })
+}
 
 use super::context::{
     invalidate_in_subquery_cache_for_table, invalidate_scalar_subquery_cache_for_table,
@@ -141,17 +247,73 @@ impl Executor {
             }
         }
 
-        let schema = schema_builder.build();
+        // Collect foreign key constraints from column-level REFERENCES
+        for col_def in &stmt.columns {
+            for constraint in &col_def.constraints {
+                if let ColumnConstraint::References {
+                    table: ref ref_table,
+                    column: ref ref_col,
+                    on_delete,
+                    on_update,
+                } = constraint
+                {
+                    let fk = validate_fk_reference(
+                        &*self.engine,
+                        &schema_builder,
+                        col_def.name.value_lower.as_str(),
+                        &col_def.name.value,
+                        &ref_table.value_lower,
+                        &ref_table.value,
+                        ref_col.as_ref().map(|rc| rc.value_lower.as_str()),
+                        *on_delete,
+                        *on_update,
+                    )?;
+                    schema_builder = schema_builder.add_foreign_key(fk);
+                }
+            }
+        }
 
-        // Collect table-level UNIQUE constraints (multi-column unique indexes)
+        // Collect table-level UNIQUE and FOREIGN KEY constraints
         let mut table_unique_constraints: Vec<Vec<String>> = Vec::new();
         for constraint in &stmt.table_constraints {
-            if let TableConstraint::Unique(cols) = constraint {
-                let col_names: Vec<String> = cols.iter().map(|c| c.value.to_string()).collect();
-                table_unique_constraints.push(col_names);
+            match constraint {
+                TableConstraint::Unique(cols) => {
+                    let col_names: Vec<String> = cols.iter().map(|c| c.value.to_string()).collect();
+                    table_unique_constraints.push(col_names);
+                }
+                TableConstraint::ForeignKey(fk) => {
+                    let fk_constraint = validate_fk_reference(
+                        &*self.engine,
+                        &schema_builder,
+                        fk.column.value_lower.as_str(),
+                        &fk.column.value,
+                        &fk.ref_table.value_lower,
+                        &fk.ref_table.value,
+                        fk.ref_column.as_ref().map(|rc| rc.value_lower.as_str()),
+                        fk.on_delete,
+                        fk.on_update,
+                    )?;
+                    schema_builder = schema_builder.add_foreign_key(fk_constraint);
+                }
+                _ => {}
             }
-            // Note: TableConstraint::Check is not yet supported at schema level
-            // Note: TableConstraint::PrimaryKey for composite keys is not yet supported
+        }
+
+        let schema = schema_builder.build();
+
+        // Collect FK columns that need auto-created indexes (skip PK and UNIQUE columns)
+        let mut fk_index_columns: Vec<String> = Vec::new();
+        for fk in &schema.foreign_keys {
+            let col = &schema.columns[fk.column_index];
+            // Skip if the column is already a PK (has PkIndex) or UNIQUE (gets a unique index above)
+            if col.primary_key {
+                continue;
+            }
+            let col_lower = col.name.to_lowercase();
+            if unique_columns.iter().any(|u| u.to_lowercase() == col_lower) {
+                continue;
+            }
+            fk_index_columns.push(col.name.clone());
         }
 
         // Check if there's an active transaction
@@ -199,12 +361,31 @@ impl Executor {
                     idx_type,
                 )?;
             }
+
+            // Auto-create indexes on FK columns for efficient referential integrity checks
+            for col_name in &fk_index_columns {
+                let index_name = format!("fk_{}_{}", table_name, col_name);
+                table.create_index(&index_name, &[col_name.as_str()], false)?;
+                let idx_type = table
+                    .get_index(&index_name)
+                    .map(|idx| idx.index_type())
+                    .unwrap_or(crate::core::IndexType::BTree);
+                self.engine.record_create_index(
+                    table_name,
+                    &index_name,
+                    std::slice::from_ref(col_name),
+                    false,
+                    idx_type,
+                )?;
+            }
         } else {
             // No active transaction - use direct engine call (auto-committed)
             self.engine.create_table(schema)?;
 
-            // Create unique indexes for columns with UNIQUE constraint
-            let needs_indexes = !unique_columns.is_empty() || !table_unique_constraints.is_empty();
+            // Create unique indexes and FK indexes
+            let needs_indexes = !unique_columns.is_empty()
+                || !table_unique_constraints.is_empty()
+                || !fk_index_columns.is_empty();
             if needs_indexes {
                 let tx = self.engine.begin_transaction()?;
                 let table = tx.get_table(table_name)?;
@@ -212,12 +393,10 @@ impl Executor {
                 for col_name in &unique_columns {
                     let index_name = format!("unique_{}_{}", table_name, col_name);
                     table.create_index(&index_name, &[col_name.as_str()], true)?;
-                    // Get index type for WAL persistence
                     let idx_type = table
                         .get_index(&index_name)
                         .map(|idx| idx.index_type())
                         .unwrap_or(crate::core::IndexType::BTree);
-                    // Record index creation to WAL for persistence
                     self.engine.record_create_index(
                         table_name,
                         &index_name,
@@ -232,17 +411,32 @@ impl Executor {
                     let index_name = format!("unique_{}_{}", table_name, i);
                     let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
                     table.create_index(&index_name, &col_refs, true)?;
-                    // Get index type for WAL persistence
                     let idx_type = table
                         .get_index(&index_name)
                         .map(|idx| idx.index_type())
                         .unwrap_or(crate::core::IndexType::BTree);
-                    // Record index creation to WAL for persistence
                     self.engine.record_create_index(
                         table_name,
                         &index_name,
                         col_names,
                         true,
+                        idx_type,
+                    )?;
+                }
+
+                // Auto-create indexes on FK columns for efficient referential integrity checks
+                for col_name in &fk_index_columns {
+                    let index_name = format!("fk_{}_{}", table_name, col_name);
+                    table.create_index(&index_name, &[col_name.as_str()], false)?;
+                    let idx_type = table
+                        .get_index(&index_name)
+                        .map(|idx| idx.index_type())
+                        .unwrap_or(crate::core::IndexType::BTree);
+                    self.engine.record_create_index(
+                        table_name,
+                        &index_name,
+                        std::slice::from_ref(col_name),
+                        false,
                         idx_type,
                     )?;
                 }
@@ -349,8 +543,13 @@ impl Executor {
             return Err(Error::TableNotFound(table_name.to_string()));
         }
 
-        // Check if there's an active transaction
+        // Check if there's an active transaction (peek at txn_id for FK visibility)
         let mut active_tx = self.active_transaction.lock().unwrap();
+        let txn_id = active_tx.as_ref().map(|s| s.transaction.id());
+
+        // Check FK constraints: block DROP if child tables reference this table
+        // Uses the caller's transaction (if any) so uncommitted child deletes are visible
+        super::foreign_key::check_no_referencing_rows(&self.engine, table_name, txn_id)?;
 
         if let Some(ref mut tx_state) = *active_tx {
             // WARNING: DROP TABLE within a transaction has limited rollback support.

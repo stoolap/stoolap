@@ -1299,8 +1299,16 @@ impl MVCCTable {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
                 let txn_versions = self.txn_versions.read().unwrap();
-                let row = if let Some(row) = txn_versions.get(pk_id) {
-                    Some((pk_id, row))
+                // Check local versions first via get_local_version (preserves
+                // delete signal). txn_versions.get() swallows deletes as None,
+                // which would cause a fallback to the committed store and miss
+                // uncommitted deletes in the current transaction.
+                let row = if let Some(local) = txn_versions.get_local_version(pk_id) {
+                    if local.is_deleted() {
+                        None // Locally deleted in this transaction
+                    } else {
+                        Some((pk_id, local.data.clone()))
+                    }
                 } else if let Some(version) =
                     self.version_store.get_visible_version(pk_id, self.txn_id)
                 {
@@ -1444,8 +1452,16 @@ impl MVCCTable {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
                 let txn_versions = self.txn_versions.read().unwrap();
-                let row = if let Some(row) = txn_versions.get(pk_id) {
-                    Some((pk_id, row))
+                // Check local versions first via get_local_version (preserves
+                // delete signal). txn_versions.get() swallows deletes as None,
+                // which would cause a fallback to the committed store and miss
+                // uncommitted deletes in the current transaction.
+                let row = if let Some(local) = txn_versions.get_local_version(pk_id) {
+                    if local.is_deleted() {
+                        None // Locally deleted in this transaction
+                    } else {
+                        Some((pk_id, local.data.clone()))
+                    }
                 } else if let Some(version) =
                     self.version_store.get_visible_version(pk_id, self.txn_id)
                 {
@@ -1522,6 +1538,10 @@ impl Table for MVCCTable {
 
     fn schema(&self) -> &Schema {
         &self.cached_schema
+    }
+
+    fn txn_id(&self) -> i64 {
+        self.txn_id
     }
 
     /// Fetch rows by their IDs, applying filter
@@ -1669,12 +1689,18 @@ impl Table for MVCCTable {
         if let Some(expr) = where_expr {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
-                // OPTIMIZATION: Track original version to avoid redundant lookup in put()
+                // Use get_local_version to preserve delete signal. txn_versions.get()
+                // swallows deletes as None, causing fallback to committed store and
+                // missing uncommitted deletes in the current transaction.
                 let row_with_original = {
                     let txn_versions = self.txn_versions.read().unwrap();
-                    if let Some(row) = txn_versions.get(pk_id) {
-                        // Local version - no need to track original (already in write-set)
-                        Some((row, None))
+                    if let Some(local) = txn_versions.get_local_version(pk_id) {
+                        if local.is_deleted() {
+                            None // Locally deleted — can't update
+                        } else {
+                            // Local version - no need to track original (already in write-set)
+                            Some((local.data.clone(), None))
+                        }
                     } else if let Some(version) =
                         self.version_store.get_visible_version(pk_id, self.txn_id)
                     {
@@ -1721,15 +1747,18 @@ impl Table for MVCCTable {
                     Vec::with_capacity(pk_range_ids.len());
 
                 // Step 1: Check local versions first (single lock acquisition)
+                // Use get_local_version to distinguish "no local version" from "locally deleted"
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
                     for row_id in pk_range_ids {
-                        if let Some(row) = txn_versions.get(row_id) {
-                            // Local version
-                            let row = self.normalize_row_to_schema(row, schema);
-                            let (updated_row, _) = setter(row);
-                            local_rows.push((row_id, updated_row));
+                        if let Some(local) = txn_versions.get_local_version(row_id) {
+                            if !local.is_deleted() {
+                                let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                                let (updated_row, _) = setter(row);
+                                local_rows.push((row_id, updated_row));
+                            }
+                            // Locally deleted — skip, don't fall through
                         } else {
                             remaining_row_ids.push(row_id);
                         }
@@ -1764,20 +1793,22 @@ impl Table for MVCCTable {
             // Try index lookup for non-PK columns
             if let Some(filtered_row_ids) = self.try_index_lookup(expr, schema) {
                 // Step 1: Check local versions first (these don't need write-set tracking)
-                // OPTIMIZATION: Pre-allocate with estimated capacity
+                // Use get_local_version to distinguish "no local version" from "locally deleted"
                 let mut local_rows_to_update = RowVec::with_capacity(filtered_row_ids.len() / 4);
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
 
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
                     for &row_id in &filtered_row_ids {
-                        if let Some(row) = txn_versions.get(row_id) {
-                            // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                            let row = self.normalize_row_to_schema(row, schema);
-                            // Re-apply filter
-                            if expr.evaluate(&row).unwrap_or(false) {
-                                local_rows_to_update.push((row_id, row));
+                        if let Some(local) = txn_versions.get_local_version(row_id) {
+                            if !local.is_deleted() {
+                                let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                                // Re-apply filter
+                                if expr.evaluate(&row).unwrap_or(false) {
+                                    local_rows_to_update.push((row_id, row));
+                                }
                             }
+                            // Locally deleted — skip, don't fall through
                         } else {
                             remaining_row_ids.push(row_id);
                         }
@@ -1941,17 +1972,20 @@ impl Table for MVCCTable {
         let schema = &self.cached_schema;
 
         // Step 1: Check local versions first (single lock acquisition)
+        // Use get_local_version to distinguish "no local version" from "locally deleted"
         let mut local_rows = RowVec::with_capacity(row_ids.len() / 4);
         let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
 
         {
             let txn_versions = self.txn_versions.read().unwrap();
             for &row_id in row_ids {
-                if let Some(row) = txn_versions.get(row_id) {
-                    // Local version - normalize and apply setter
-                    let row = self.normalize_row_to_schema(row, schema);
-                    let (updated_row, _) = setter(row);
-                    local_rows.push((row_id, updated_row));
+                if let Some(local) = txn_versions.get_local_version(row_id) {
+                    if !local.is_deleted() {
+                        let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                        let (updated_row, _) = setter(row);
+                        local_rows.push((row_id, updated_row));
+                    }
+                    // Locally deleted — skip, don't fall through
                 } else {
                     remaining_row_ids.push(row_id);
                 }
@@ -1991,16 +2025,19 @@ impl Table for MVCCTable {
         let schema = &self.cached_schema;
 
         // Step 1: Check local versions first
+        // Use get_local_version to distinguish "no local version" from "locally deleted"
         let mut local_deletes = RowVec::with_capacity(row_ids.len() / 4);
         let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
 
         {
             let txn_versions = self.txn_versions.read().unwrap();
             for &row_id in row_ids {
-                if let Some(row) = txn_versions.get(row_id) {
-                    // Local version - mark for deletion
-                    let row = self.normalize_row_to_schema(row, schema);
-                    local_deletes.push((row_id, row));
+                if let Some(local) = txn_versions.get_local_version(row_id) {
+                    if !local.is_deleted() {
+                        let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                        local_deletes.push((row_id, row));
+                    }
+                    // Already locally deleted — skip, don't fall through
                 } else {
                     remaining_row_ids.push(row_id);
                 }
@@ -2049,12 +2086,18 @@ impl Table for MVCCTable {
         if let Some(expr) = where_expr {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
-                // OPTIMIZATION: Track original version to avoid redundant lookup in put()
+                // Use get_local_version to preserve delete signal. txn_versions.get()
+                // swallows deletes as None, causing fallback to committed store and
+                // missing uncommitted deletes in the current transaction.
                 let row_with_original = {
                     let txn_versions = self.txn_versions.read().unwrap();
-                    if let Some(row) = txn_versions.get(pk_id) {
-                        // Local version - no need to track original (already in write-set)
-                        Some((row, None))
+                    if let Some(local) = txn_versions.get_local_version(pk_id) {
+                        if local.is_deleted() {
+                            None // Already locally deleted — don't double-count
+                        } else {
+                            // Local version - no need to track original (already in write-set)
+                            Some((local.data.clone(), None))
+                        }
                     } else if let Some(version) =
                         self.version_store.get_visible_version(pk_id, self.txn_id)
                     {
@@ -2094,13 +2137,16 @@ impl Table for MVCCTable {
                     Vec::with_capacity(pk_range_ids.len());
 
                 // Step 1: Check local versions first (single lock acquisition)
+                // Use get_local_version to distinguish "no local version" from "locally deleted"
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
                     for row_id in pk_range_ids {
-                        if let Some(row) = txn_versions.get(row_id) {
-                            // Local version
-                            local_rows.push((row_id, row));
+                        if let Some(local) = txn_versions.get_local_version(row_id) {
+                            if !local.is_deleted() {
+                                local_rows.push((row_id, local.data.clone()));
+                            }
+                            // Already locally deleted — skip, don't fall through
                         } else {
                             remaining_row_ids.push(row_id);
                         }
@@ -2137,15 +2183,20 @@ impl Table for MVCCTable {
                 let mut rows_to_delete = RowVec::with_capacity(filtered_row_ids.len());
 
                 // Step 1: Check local versions first (single lock acquisition)
+                // Use get_local_version to distinguish "no local version" from "locally deleted"
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
                     for row_id in filtered_row_ids {
-                        if let Some(row) = txn_versions.get(row_id) {
-                            // Re-apply filter (index may be partial match)
-                            if expr.evaluate(&row).unwrap_or(false) {
-                                rows_to_delete.push((row_id, row));
+                        if let Some(local) = txn_versions.get_local_version(row_id) {
+                            if !local.is_deleted() {
+                                let row = local.data.clone();
+                                // Re-apply filter (index may be partial match)
+                                if expr.evaluate(&row).unwrap_or(false) {
+                                    rows_to_delete.push((row_id, row));
+                                }
                             }
+                            // Already locally deleted — skip, don't fall through
                         } else {
                             remaining_row_ids.push(row_id);
                         }
@@ -2187,14 +2238,20 @@ impl Table for MVCCTable {
             // OPTIMIZATION: Check filter BEFORE cloning to avoid wasted allocations
             // For DELETE with selective WHERE, this can save 90%+ of clones
 
-            // First, check local versions (already cloned, no extra cost)
-            let local_row = {
+            // First, check local versions
+            // Use get_local_version to distinguish "no local version" from "locally deleted"
+            let local_version = {
                 let txn_versions = self.txn_versions.read().unwrap();
-                txn_versions.get(row_id)
+                txn_versions
+                    .get_local_version(row_id)
+                    .map(|v| (v.is_deleted(), v.data.clone()))
             };
 
-            if let Some(row) = local_row {
-                // Apply filter on local row (no clone needed - already have it)
+            if let Some((is_deleted, row)) = local_version {
+                if is_deleted {
+                    continue; // Already locally deleted — skip
+                }
+                // Apply filter on local row
                 if let Some(expr) = where_expr {
                     match expr.evaluate(&row) {
                         Ok(true) => {}
@@ -2283,11 +2340,17 @@ impl Table for MVCCTable {
         if let Some(expr) = where_expr {
             if let Some(pk_lookup) = self.try_pk_lookup(expr, &schema) {
                 // Direct O(1) lookup by primary key
-                // First check local transaction changes, then committed data
+                // Use get_local_version to preserve delete signal. txn_versions.get()
+                // swallows deletes as None, causing fallback to committed store and
+                // missing uncommitted deletes in the current transaction.
                 let row = {
                     let txn_versions = self.txn_versions.read().unwrap();
-                    if let Some(row) = txn_versions.get(pk_lookup) {
-                        Some(row)
+                    if let Some(local) = txn_versions.get_local_version(pk_lookup) {
+                        if local.is_deleted() {
+                            None // Locally deleted in this transaction
+                        } else {
+                            Some(local.data.clone())
+                        }
                     } else if let Some(version) = self
                         .version_store
                         .get_visible_version(pk_lookup, self.txn_id)

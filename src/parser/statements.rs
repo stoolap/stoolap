@@ -15,6 +15,7 @@
 //! Statement parsing methods for the SQL Parser
 
 use crate::common::SmartString;
+use crate::core::ForeignKeyAction;
 use rustc_hash::FxHashMap;
 
 use super::ast::*;
@@ -1439,6 +1440,55 @@ impl Parser {
             )));
         }
 
+        if self.cur_token_is_keyword("FOREIGN") {
+            // FOREIGN KEY(col) REFERENCES parent(col) [ON DELETE ...] [ON UPDATE ...]
+            if !self.expect_keyword("KEY") {
+                return None;
+            }
+            if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
+                return None;
+            }
+            // Parse single FK column
+            if !self.expect_peek(TokenType::Identifier) {
+                return None;
+            }
+            let fk_column = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
+            if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+                return None;
+            }
+            // Expect REFERENCES
+            if !self.expect_keyword("REFERENCES") {
+                return None;
+            }
+            if !self.expect_peek(TokenType::Identifier) {
+                return None;
+            }
+            let ref_table = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
+            let ref_column = if self.peek_token_is_punctuator("(") {
+                self.next_token();
+                if !self.expect_peek(TokenType::Identifier) {
+                    return None;
+                }
+                let col = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
+                if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+                    return None;
+                }
+                Some(col)
+            } else {
+                None
+            };
+            let (on_delete, on_update) = self.parse_fk_actions();
+            return Some(ColumnOrConstraint::Constraint(TableConstraint::ForeignKey(
+                Box::new(ForeignKeyTableConstraint {
+                    column: fk_column,
+                    ref_table,
+                    ref_column,
+                    on_delete,
+                    on_update,
+                }),
+            )));
+        }
+
         // Otherwise, parse as a column definition
         self.parse_column_definition()
             .map(ColumnOrConstraint::Column)
@@ -1478,6 +1528,68 @@ impl Parser {
         }
 
         Some(identifiers)
+    }
+
+    /// Parse ON DELETE / ON UPDATE foreign key actions.
+    /// Returns (on_delete, on_update) with Restrict as default.
+    fn parse_fk_actions(&mut self) -> (ForeignKeyAction, ForeignKeyAction) {
+        let mut on_delete = ForeignKeyAction::Restrict;
+        let mut on_update = ForeignKeyAction::Restrict;
+
+        // Parse up to two clauses (ON DELETE and/or ON UPDATE in any order)
+        for _ in 0..2 {
+            if !self.peek_token_is_keyword("ON") {
+                break;
+            }
+            self.next_token(); // consume ON
+            self.next_token(); // move to DELETE or UPDATE
+            let upper = self.cur_token.literal.to_uppercase();
+            match upper.as_str() {
+                "DELETE" => {
+                    self.next_token(); // move to action
+                    on_delete = self.parse_fk_action_value();
+                }
+                "UPDATE" => {
+                    self.next_token(); // move to action
+                    on_update = self.parse_fk_action_value();
+                }
+                _ => break,
+            }
+        }
+
+        (on_delete, on_update)
+    }
+
+    /// Parse a single FK action value: RESTRICT | CASCADE | SET NULL | NO ACTION
+    fn parse_fk_action_value(&mut self) -> ForeignKeyAction {
+        let upper = self.cur_token.literal.to_uppercase();
+        match upper.as_str() {
+            "RESTRICT" => ForeignKeyAction::Restrict,
+            "CASCADE" => ForeignKeyAction::Cascade,
+            "SET" => {
+                // SET NULL — validate the next token is actually "NULL"
+                self.next_token();
+                if self.cur_token.literal.to_uppercase() != "NULL" {
+                    self.add_error(format!(
+                        "expected NULL after SET in foreign key action, got '{}'",
+                        self.cur_token.literal
+                    ));
+                }
+                ForeignKeyAction::SetNull
+            }
+            "NO" => {
+                // NO ACTION — validate the next token is actually "ACTION"
+                self.next_token();
+                if self.cur_token.literal.to_uppercase() != "ACTION" {
+                    self.add_error(format!(
+                        "expected ACTION after NO in foreign key action, got '{}'",
+                        self.cur_token.literal
+                    ));
+                }
+                ForeignKeyAction::NoAction
+            }
+            _ => ForeignKeyAction::Restrict,
+        }
     }
 
     /// Parse a single column definition
@@ -1596,7 +1708,13 @@ impl Parser {
                     } else {
                         None
                     };
-                    constraints.push(ColumnConstraint::References(ref_table, ref_column));
+                    let (on_delete, on_update) = self.parse_fk_actions();
+                    constraints.push(ColumnConstraint::References {
+                        table: ref_table,
+                        column: ref_column,
+                        on_delete,
+                        on_update,
+                    });
                 }
                 "AUTO_INCREMENT" | "AUTOINCREMENT" => {
                     constraints.push(ColumnConstraint::AutoIncrement);

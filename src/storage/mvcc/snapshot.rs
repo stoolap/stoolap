@@ -404,6 +404,20 @@ fn serialize_snapshot_schema(schema: &Schema) -> Vec<u8> {
     let updated_nanos = schema.updated_at.timestamp_nanos_opt().unwrap_or(0);
     buf.extend_from_slice(&updated_nanos.to_le_bytes());
 
+    // Foreign key constraints
+    buf.extend_from_slice(&(schema.foreign_keys.len() as u16).to_le_bytes());
+    for fk in &schema.foreign_keys {
+        buf.extend_from_slice(&(fk.column_index as u16).to_le_bytes());
+        buf.extend_from_slice(&(fk.column_name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(fk.column_name.as_bytes());
+        buf.extend_from_slice(&(fk.referenced_table.len() as u16).to_le_bytes());
+        buf.extend_from_slice(fk.referenced_table.as_bytes());
+        buf.extend_from_slice(&(fk.referenced_column.len() as u16).to_le_bytes());
+        buf.extend_from_slice(fk.referenced_column.as_bytes());
+        buf.push(fk.on_delete.as_u8());
+        buf.push(fk.on_update.as_u8());
+    }
+
     buf
 }
 
@@ -579,6 +593,7 @@ fn deserialize_snapshot_schema(data: &[u8]) -> Result<Schema> {
 
     let updated_at = if pos + 8 <= data.len() {
         let nanos = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
         if nanos > 0 {
             chrono::DateTime::from_timestamp_nanos(nanos)
         } else {
@@ -588,8 +603,98 @@ fn deserialize_snapshot_schema(data: &[u8]) -> Result<Schema> {
         chrono::Utc::now()
     };
 
-    Ok(Schema::with_timestamps(
-        table_name, columns, created_at, updated_at,
+    // Foreign key constraints (optional for backwards compatibility with older snapshots)
+    let mut foreign_keys = Vec::new();
+    if pos + 2 <= data.len() {
+        let fk_count = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        for _ in 0..fk_count {
+            // Once fk_count is declared, truncation mid-constraint is corruption
+            if pos + 2 > data.len() {
+                return Err(crate::core::Error::internal(
+                    "corrupted schema: truncated foreign key constraint data",
+                ));
+            }
+            let col_idx = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+
+            if pos + 2 > data.len() {
+                return Err(crate::core::Error::internal(
+                    "corrupted schema: truncated foreign key constraint data",
+                ));
+            }
+            let col_name_len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            if pos + col_name_len > data.len() {
+                return Err(crate::core::Error::internal(
+                    "corrupted schema: truncated foreign key constraint data",
+                ));
+            }
+            let col_name =
+                String::from_utf8(data[pos..pos + col_name_len].to_vec()).unwrap_or_default();
+            pos += col_name_len;
+
+            if pos + 2 > data.len() {
+                return Err(crate::core::Error::internal(
+                    "corrupted schema: truncated foreign key constraint data",
+                ));
+            }
+            let ref_table_len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            if pos + ref_table_len > data.len() {
+                return Err(crate::core::Error::internal(
+                    "corrupted schema: truncated foreign key constraint data",
+                ));
+            }
+            let ref_table =
+                String::from_utf8(data[pos..pos + ref_table_len].to_vec()).unwrap_or_default();
+            pos += ref_table_len;
+
+            if pos + 2 > data.len() {
+                return Err(crate::core::Error::internal(
+                    "corrupted schema: truncated foreign key constraint data",
+                ));
+            }
+            let ref_col_len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            if pos + ref_col_len > data.len() {
+                return Err(crate::core::Error::internal(
+                    "corrupted schema: truncated foreign key constraint data",
+                ));
+            }
+            let ref_col =
+                String::from_utf8(data[pos..pos + ref_col_len].to_vec()).unwrap_or_default();
+            pos += ref_col_len;
+
+            if pos + 2 > data.len() {
+                return Err(crate::core::Error::internal(
+                    "corrupted schema: truncated foreign key constraint data",
+                ));
+            }
+            let on_delete = crate::core::ForeignKeyAction::from_u8(data[pos])
+                .unwrap_or(crate::core::ForeignKeyAction::Restrict);
+            pos += 1;
+            let on_update = crate::core::ForeignKeyAction::from_u8(data[pos])
+                .unwrap_or(crate::core::ForeignKeyAction::Restrict);
+            pos += 1;
+
+            foreign_keys.push(crate::core::ForeignKeyConstraint {
+                column_index: col_idx,
+                column_name: col_name,
+                referenced_table: ref_table,
+                referenced_column: ref_col,
+                on_delete,
+                on_update,
+            });
+        }
+    }
+
+    Ok(Schema::with_timestamps_and_foreign_keys(
+        table_name,
+        columns,
+        foreign_keys,
+        created_at,
+        updated_at,
     ))
 }
 

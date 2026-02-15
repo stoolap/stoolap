@@ -338,7 +338,11 @@ impl Executor {
                 Err(_) => return None,
             };
             match &*compiled_guard {
-                CompiledExecution::NotOptimizable => return None,
+                CompiledExecution::NotOptimizable(epoch)
+                    if self.engine.schema_epoch() == *epoch =>
+                {
+                    return None
+                }
                 CompiledExecution::PkLookup(lookup) => {
                     // Fast validation using schema epoch (~1ns vs ~7ns for HashMap lookup)
                     // If epoch matches, no DDL has occurred since compilation
@@ -350,7 +354,7 @@ impl Executor {
                     // Epoch changed - some DDL occurred, need to recompile
                     // Fall through to recompile path
                 }
-                CompiledExecution::Unknown => {} // Fall through to compile
+                CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - fall through to recompile
                 // These variants are for UPDATE/DELETE/INSERT/COUNT DISTINCT/COUNT(*) - not PK lookups
                 CompiledExecution::PkUpdate(_)
                 | CompiledExecution::PkDelete(_)
@@ -405,7 +409,7 @@ impl Executor {
         // Try read lock first - check if already compiled
         let compiled_guard = compiled.read().ok()?;
         match &*compiled_guard {
-            CompiledExecution::NotOptimizable => None,
+            CompiledExecution::NotOptimizable(_) => None,
             CompiledExecution::PkLookup(lookup) => {
                 // Fast validation using schema epoch
                 if self.engine.schema_epoch() == lookup.cached_epoch {
@@ -464,12 +468,14 @@ impl Executor {
         // Double-check (another thread may have compiled while we waited)
         // But also re-validate schema version to handle schema changes
         match &*compiled_guard {
-            CompiledExecution::NotOptimizable => return None,
+            CompiledExecution::NotOptimizable(epoch) if self.engine.schema_epoch() == *epoch => {
+                return None
+            }
             CompiledExecution::PkLookup(lookup) => {
                 let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
                 return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
             }
-            CompiledExecution::Unknown => {} // Continue with compilation
+            CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
             // These variants are for UPDATE/DELETE/INSERT/COUNT DISTINCT/COUNT(*) - not PK lookups
             CompiledExecution::PkUpdate(_)
             | CompiledExecution::PkDelete(_)
@@ -489,13 +495,13 @@ impl Executor {
             || stmt.with.is_some()
             || stmt.distinct
         {
-            *compiled_guard = CompiledExecution::NotOptimizable;
+            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
             return None;
         }
 
         // Quick reject: no ORDER BY
         if !stmt.order_by.is_empty() {
-            *compiled_guard = CompiledExecution::NotOptimizable;
+            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
             return None;
         }
 
@@ -509,7 +515,7 @@ impl Executor {
         let table_name: &str = match table_expr.as_ref() {
             Expression::TableSource(ts) => ts.name.value_lower.as_str(),
             _ => {
-                *compiled_guard = CompiledExecution::NotOptimizable;
+                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
             }
         };
@@ -535,7 +541,7 @@ impl Executor {
                 Some(self.execute_pk_lookup(info))
             }
             None => {
-                *compiled_guard = CompiledExecution::NotOptimizable;
+                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 None
             }
         }

@@ -9009,3 +9009,162 @@ fn test_bitmap_index_with_snapshot_recovery() {
         .unwrap();
     assert_eq!(recheck, 25, "Recreated bitmap index must work correctly");
 }
+
+/// FK constraints must survive snapshot + WAL truncation recovery.
+/// Tests that the snapshot serializer preserves FK metadata so enforcement
+/// works after the WAL entries that created the table are truncated away.
+#[test]
+fn test_foreign_key_with_snapshot_recovery() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    {
+        let db = Database::open(&dsn).unwrap();
+
+        // Create parent + child with FK constraints
+        db.execute(
+            "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE fk_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fk_parent(id) ON DELETE CASCADE, val TEXT)",
+            (),
+        )
+        .unwrap();
+
+        // Insert parent rows
+        for i in 1..=5 {
+            db.execute(
+                &format!("INSERT INTO fk_parent (id, name) VALUES ({}, 'p{}')", i, i),
+                (),
+            )
+            .unwrap();
+        }
+        // Insert child rows referencing parents
+        for i in 1..=10 {
+            let parent_id = (i % 5) + 1;
+            db.execute(
+                &format!(
+                    "INSERT INTO fk_child (id, parent_id, val) VALUES ({}, {}, 'c{}')",
+                    i, parent_id, i
+                ),
+                (),
+            )
+            .unwrap();
+        }
+
+        // Take TWO snapshots so WAL truncation can happen
+        db.execute("PRAGMA snapshot", ()).unwrap();
+        // Insert one more row to force a WAL entry after the first snapshot
+        db.execute("INSERT INTO fk_parent (id, name) VALUES (100, 'extra')", ())
+            .unwrap();
+        db.execute("PRAGMA snapshot", ()).unwrap();
+    }
+
+    remove_lock_file(&db_path);
+
+    // Reopen — schema should be loaded from snapshot (WAL may be truncated)
+    let db = Database::open(&dsn).unwrap();
+
+    // Verify data survived
+    let parent_count: i64 = db.query_one("SELECT COUNT(*) FROM fk_parent", ()).unwrap();
+    assert_eq!(parent_count, 6, "All 6 parent rows must survive");
+
+    let child_count: i64 = db.query_one("SELECT COUNT(*) FROM fk_child", ()).unwrap();
+    assert_eq!(child_count, 10, "All 10 child rows must survive");
+
+    // FK enforcement must still work — insert with invalid parent must fail
+    let err = db.execute(
+        "INSERT INTO fk_child (id, parent_id, val) VALUES (99, 999, 'bad')",
+        (),
+    );
+    assert!(
+        err.is_err(),
+        "FK constraint must be enforced after snapshot recovery"
+    );
+
+    // CASCADE must still work — delete parent 1, children referencing it should be deleted
+    db.execute("DELETE FROM fk_child WHERE parent_id = 100", ())
+        .unwrap_or_default(); // clean up extra parent's potential children
+    db.execute("DELETE FROM fk_parent WHERE id = 1", ())
+        .unwrap();
+
+    let remaining: i64 = db
+        .query_one("SELECT COUNT(*) FROM fk_child WHERE parent_id = 1", ())
+        .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "CASCADE DELETE must work after snapshot recovery"
+    );
+
+    // Valid inserts must still work
+    db.execute(
+        "INSERT INTO fk_child (id, parent_id, val) VALUES (50, 2, 'valid')",
+        (),
+    )
+    .unwrap();
+}
+
+/// Verify that DROP TABLE correctly strips FK references from child tables on WAL replay.
+/// Without the fix, child tables retain orphaned FK constraints after recovery,
+/// causing INSERT failures with "table not found" for the dropped parent.
+#[test]
+fn test_drop_parent_strips_child_fk_on_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("fk_drop_recovery.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    // Phase 1: create parent + child, then drop parent
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE parent_drop (id INTEGER PRIMARY KEY, name TEXT)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE child_drop (
+                id INTEGER PRIMARY KEY,
+                pid INTEGER REFERENCES parent_drop(id),
+                val TEXT
+            )",
+            (),
+        )
+        .unwrap();
+
+        // Insert data into parent and child with NULL FK (so drop isn't blocked)
+        db.execute("INSERT INTO parent_drop VALUES (1, 'Alice')", ())
+            .unwrap();
+        db.execute("INSERT INTO child_drop VALUES (1, NULL, 'x')", ())
+            .unwrap();
+
+        // Drop parent — in-memory, child FK is stripped
+        db.execute("DROP TABLE parent_drop", ()).unwrap();
+
+        // Verify child FK is gone in memory: insert with any pid should work
+        db.execute("INSERT INTO child_drop VALUES (2, 999, 'y')", ())
+            .unwrap();
+    }
+
+    // Phase 2: reopen — WAL replay must strip child FK
+    {
+        let db = Database::open(&dsn).unwrap();
+
+        // parent_drop must not exist
+        let err = db.execute("SELECT * FROM parent_drop", ());
+        assert!(err.is_err(), "parent_drop should not exist after recovery");
+
+        // child_drop must exist and FK must be gone
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM child_drop", ()).unwrap();
+        assert_eq!(count, 2, "child_drop should have 2 rows");
+
+        // Insert with arbitrary pid must succeed (no FK constraint)
+        db.execute("INSERT INTO child_drop VALUES (3, 12345, 'z')", ())
+            .unwrap();
+
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM child_drop", ()).unwrap();
+        assert_eq!(count, 3);
+    }
+}

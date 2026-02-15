@@ -67,7 +67,11 @@ impl Executor {
                 Err(_) => return None,
             };
             match &*compiled_guard {
-                CompiledExecution::NotOptimizable => return None,
+                CompiledExecution::NotOptimizable(epoch)
+                    if self.engine.schema_epoch() == *epoch =>
+                {
+                    return None
+                }
                 CompiledExecution::PkUpdate(update) => {
                     // Fast validation using schema epoch (~1ns vs ~7ns for HashMap lookup)
                     if self.engine.schema_epoch() == update.cached_epoch {
@@ -78,8 +82,8 @@ impl Executor {
                     }
                     // Epoch changed - fall through to recompile
                 }
-                CompiledExecution::Unknown => {} // Fall through to compile
-                _ => return None,                // Different type of compiled execution
+                CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - fall through to recompile
+                _ => return None, // Different type of compiled execution
             }
         }
 
@@ -112,7 +116,11 @@ impl Executor {
                 Err(_) => return None,
             };
             match &*compiled_guard {
-                CompiledExecution::NotOptimizable => return None,
+                CompiledExecution::NotOptimizable(epoch)
+                    if self.engine.schema_epoch() == *epoch =>
+                {
+                    return None
+                }
                 CompiledExecution::PkDelete(delete) => {
                     // Fast validation using schema epoch (~1ns vs ~7ns for HashMap lookup)
                     if self.engine.schema_epoch() == delete.cached_epoch {
@@ -123,8 +131,8 @@ impl Executor {
                     }
                     // Epoch changed - fall through to recompile
                 }
-                CompiledExecution::Unknown => {} // Fall through to compile
-                _ => return None,                // Different type of compiled execution
+                CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - fall through to recompile
+                _ => return None, // Different type of compiled execution
             }
         }
 
@@ -292,7 +300,7 @@ impl Executor {
         // Try read lock first - check if already compiled
         let compiled_guard = compiled.read().ok()?;
         match &*compiled_guard {
-            CompiledExecution::NotOptimizable => None,
+            CompiledExecution::NotOptimizable(_) => None,
             CompiledExecution::PkUpdate(update) => {
                 // Fast validation using schema epoch
                 if self.engine.schema_epoch() == update.cached_epoch {
@@ -334,7 +342,7 @@ impl Executor {
         // Try read lock first - check if already compiled
         let compiled_guard = compiled.read().ok()?;
         match &*compiled_guard {
-            CompiledExecution::NotOptimizable => None,
+            CompiledExecution::NotOptimizable(_) => None,
             CompiledExecution::PkDelete(delete) => {
                 // Fast validation using schema epoch
                 if self.engine.schema_epoch() == delete.cached_epoch {
@@ -522,19 +530,21 @@ impl Executor {
 
         // Double-check after acquiring lock
         match &*compiled_guard {
-            CompiledExecution::NotOptimizable => return None,
+            CompiledExecution::NotOptimizable(epoch) if self.engine.schema_epoch() == *epoch => {
+                return None
+            }
             CompiledExecution::PkUpdate(update) => {
                 let pk_value = self.extract_pk_value_from_source(&update.pk_value_source, ctx)?;
                 return Some(self.execute_compiled_pk_update(update, pk_value, ctx));
             }
-            CompiledExecution::Unknown => {} // Continue with compilation
+            CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
             _ => return None,
         }
 
         // Validate pattern
         let where_clause = stmt.where_clause.as_ref()?;
         if !stmt.returning.is_empty() {
-            *compiled_guard = CompiledExecution::NotOptimizable;
+            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
             return None;
         }
 
@@ -542,25 +552,34 @@ impl Executor {
         let schema = match self.engine.get_table_schema(table_name) {
             Ok(s) => s,
             Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable;
+                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
             }
         };
 
         let pk_indices = schema.primary_key_indices();
         if pk_indices.len() != 1 {
-            *compiled_guard = CompiledExecution::NotOptimizable;
+            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
             return None;
         }
         let pk_idx = pk_indices[0];
         let pk_column = &schema.columns[pk_idx].name;
+
+        // Bail if table has FK constraints (child table) or is referenced by other tables (parent table)
+        // FK enforcement requires cross-table lookups — fall back to normal path
+        if !schema.foreign_keys.is_empty()
+            || !super::foreign_key::find_referencing_fks(&self.engine, table_name).is_empty()
+        {
+            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            return None;
+        }
 
         // Extract PK value source
         let (pk_value, pk_source) =
             match self.extract_pk_equality_value(where_clause, pk_column, ctx) {
                 Some(v) => v,
                 None => {
-                    *compiled_guard = CompiledExecution::NotOptimizable;
+                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                     return None;
                 }
             };
@@ -573,7 +592,7 @@ impl Executor {
             let col_idx = match col_map.get(col_lower.as_str()) {
                 Some(&idx) => idx,
                 None => {
-                    *compiled_guard = CompiledExecution::NotOptimizable;
+                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                     return None;
                 }
             };
@@ -582,7 +601,7 @@ impl Executor {
             let value_source = match self.extract_value_source(expr) {
                 Some(s) => s,
                 None => {
-                    *compiled_guard = CompiledExecution::NotOptimizable;
+                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                     return None;
                 }
             };
@@ -626,19 +645,21 @@ impl Executor {
 
         // Double-check after acquiring lock
         match &*compiled_guard {
-            CompiledExecution::NotOptimizable => return None,
+            CompiledExecution::NotOptimizable(epoch) if self.engine.schema_epoch() == *epoch => {
+                return None
+            }
             CompiledExecution::PkDelete(delete) => {
                 let pk_value = self.extract_pk_value_from_source(&delete.pk_value_source, ctx)?;
                 return Some(self.execute_compiled_pk_delete(delete, pk_value));
             }
-            CompiledExecution::Unknown => {} // Continue with compilation
+            CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
             _ => return None,
         }
 
         // Validate pattern
         let where_clause = stmt.where_clause.as_ref()?;
         if !stmt.returning.is_empty() {
-            *compiled_guard = CompiledExecution::NotOptimizable;
+            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
             return None;
         }
 
@@ -646,25 +667,31 @@ impl Executor {
         let schema = match self.engine.get_table_schema(table_name) {
             Ok(s) => s,
             Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable;
+                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
             }
         };
 
         let pk_indices = schema.primary_key_indices();
         if pk_indices.len() != 1 {
-            *compiled_guard = CompiledExecution::NotOptimizable;
+            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
             return None;
         }
         let pk_idx = pk_indices[0];
         let pk_column = &schema.columns[pk_idx].name;
+
+        // Bail if this table is referenced by child tables (FK enforcement needed)
+        if !super::foreign_key::find_referencing_fks(&self.engine, table_name).is_empty() {
+            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            return None;
+        }
 
         // Extract PK value source
         let (pk_value, pk_source) =
             match self.extract_pk_equality_value(where_clause, pk_column, ctx) {
                 Some(v) => v,
                 None => {
-                    *compiled_guard = CompiledExecution::NotOptimizable;
+                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                     return None;
                 }
             };

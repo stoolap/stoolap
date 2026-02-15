@@ -23,7 +23,7 @@ use rustc_hash::FxHashMap;
 use std::fmt;
 
 use crate::common::CompactArc;
-use crate::core::ValueSet;
+use crate::core::{ForeignKeyAction, ValueSet};
 
 // ============================================================================
 // Core Traits
@@ -1673,7 +1673,12 @@ pub enum ColumnConstraint {
     AutoIncrement,
     Default(Expression),
     Check(Expression),
-    References(Identifier, Option<Identifier>),
+    References {
+        table: Identifier,
+        column: Option<Identifier>,
+        on_delete: ForeignKeyAction,
+        on_update: ForeignKeyAction,
+    },
 }
 
 impl fmt::Display for ColumnConstraint {
@@ -1685,12 +1690,23 @@ impl fmt::Display for ColumnConstraint {
             ColumnConstraint::AutoIncrement => write!(f, "AUTO_INCREMENT"),
             ColumnConstraint::Default(expr) => write!(f, "DEFAULT {}", expr),
             ColumnConstraint::Check(expr) => write!(f, "CHECK ({})", expr),
-            ColumnConstraint::References(table, col) => {
-                if let Some(col) = col {
-                    write!(f, "REFERENCES {}({})", table, col)
-                } else {
-                    write!(f, "REFERENCES {}", table)
+            ColumnConstraint::References {
+                table,
+                column,
+                on_delete,
+                on_update,
+            } => {
+                write!(f, "REFERENCES {}", table)?;
+                if let Some(col) = column {
+                    write!(f, "({})", col)?;
                 }
+                if *on_delete != ForeignKeyAction::Restrict {
+                    write!(f, " ON DELETE {}", on_delete)?;
+                }
+                if *on_update != ForeignKeyAction::Restrict {
+                    write!(f, " ON UPDATE {}", on_update)?;
+                }
+                Ok(())
             }
         }
     }
@@ -1705,6 +1721,19 @@ pub enum TableConstraint {
     Check(Box<Expression>),
     /// PRIMARY KEY(col1, col2, ...) - composite primary key (not yet fully supported)
     PrimaryKey(Vec<Identifier>),
+    /// FOREIGN KEY(col) REFERENCES table(col) ON DELETE ... ON UPDATE ...
+    /// Boxed to reduce enum size (Identifier is large)
+    ForeignKey(Box<ForeignKeyTableConstraint>),
+}
+
+/// Fields for a table-level FOREIGN KEY constraint (boxed to reduce TableConstraint enum size)
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKeyTableConstraint {
+    pub column: Identifier,
+    pub ref_table: Identifier,
+    pub ref_column: Option<Identifier>,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
 }
 
 impl fmt::Display for TableConstraint {
@@ -1718,6 +1747,19 @@ impl fmt::Display for TableConstraint {
             TableConstraint::PrimaryKey(cols) => {
                 let col_names: Vec<&str> = cols.iter().map(|c| c.value.as_str()).collect();
                 write!(f, "PRIMARY KEY({})", col_names.join(", "))
+            }
+            TableConstraint::ForeignKey(fk) => {
+                write!(f, "FOREIGN KEY({}) REFERENCES {}", fk.column, fk.ref_table)?;
+                if let Some(ref col) = fk.ref_column {
+                    write!(f, "({})", col)?;
+                }
+                if fk.on_delete != ForeignKeyAction::Restrict {
+                    write!(f, " ON DELETE {}", fk.on_delete)?;
+                }
+                if fk.on_update != ForeignKeyAction::Restrict {
+                    write!(f, " ON UPDATE {}", fk.on_update)?;
+                }
+                Ok(())
             }
         }
     }

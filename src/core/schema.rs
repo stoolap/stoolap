@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use crate::common::{CompactArc, StringMap};
 
 use super::error::{Error, Result};
-use super::types::DataType;
+use super::types::{DataType, ForeignKeyAction};
 
 /// A column definition in a table schema
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +171,23 @@ impl fmt::Display for SchemaColumn {
     }
 }
 
+/// Foreign key constraint metadata
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyConstraint {
+    /// Index of the FK column in this table's schema
+    pub column_index: usize,
+    /// FK column name (for error messages)
+    pub column_name: String,
+    /// Referenced parent table name (lowercase)
+    pub referenced_table: String,
+    /// Referenced parent column name (lowercase)
+    pub referenced_column: String,
+    /// Action when parent row is deleted
+    pub on_delete: ForeignKeyAction,
+    /// Action when parent PK is updated
+    pub on_update: ForeignKeyAction,
+}
+
 /// Table schema definition
 ///
 
@@ -184,6 +201,9 @@ pub struct Schema {
 
     /// Column definitions
     pub columns: Vec<SchemaColumn>,
+
+    /// Foreign key constraints
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
 
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
@@ -241,6 +261,7 @@ impl Clone for Schema {
             table_name: self.table_name.clone(),
             table_name_lower: self.table_name_lower.clone(),
             columns: self.columns.clone(),
+            foreign_keys: self.foreign_keys.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             column_names_cache,
@@ -256,6 +277,7 @@ impl PartialEq for Schema {
     fn eq(&self, other: &Self) -> bool {
         self.table_name == other.table_name
             && self.columns == other.columns
+            && self.foreign_keys == other.foreign_keys
             && self.created_at == other.created_at
             && self.updated_at == other.updated_at
     }
@@ -266,6 +288,15 @@ impl Eq for Schema {}
 impl Schema {
     /// Create a new schema with the given table name and columns
     pub fn new(table_name: impl Into<String>, columns: Vec<SchemaColumn>) -> Self {
+        Self::with_foreign_keys(table_name, columns, Vec::new())
+    }
+
+    /// Create a new schema with columns and foreign key constraints
+    pub fn with_foreign_keys(
+        table_name: impl Into<String>,
+        columns: Vec<SchemaColumn>,
+        foreign_keys: Vec<ForeignKeyConstraint>,
+    ) -> Self {
         let now = Utc::now();
         let name = table_name.into();
         let name_lower = name.to_lowercase();
@@ -312,6 +343,7 @@ impl Schema {
             table_name: name,
             table_name_lower: name_lower,
             columns,
+            foreign_keys,
             created_at: now,
             updated_at: now,
             column_names_cache,
@@ -326,6 +358,23 @@ impl Schema {
     pub fn with_timestamps(
         table_name: impl Into<String>,
         columns: Vec<SchemaColumn>,
+        created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    ) -> Self {
+        Self::with_timestamps_and_foreign_keys(
+            table_name,
+            columns,
+            Vec::new(),
+            created_at,
+            updated_at,
+        )
+    }
+
+    /// Create a new schema with explicit timestamps and foreign key constraints
+    pub fn with_timestamps_and_foreign_keys(
+        table_name: impl Into<String>,
+        columns: Vec<SchemaColumn>,
+        foreign_keys: Vec<ForeignKeyConstraint>,
         created_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
     ) -> Self {
@@ -374,6 +423,7 @@ impl Schema {
             table_name: name,
             table_name_lower: name_lower,
             columns,
+            foreign_keys,
             created_at,
             updated_at,
             column_names_cache,
@@ -678,6 +728,7 @@ impl fmt::Display for Schema {
 pub struct SchemaBuilder {
     table_name: String,
     columns: Vec<SchemaColumn>,
+    foreign_keys: Vec<ForeignKeyConstraint>,
 }
 
 impl SchemaBuilder {
@@ -686,6 +737,7 @@ impl SchemaBuilder {
         Self {
             table_name: table_name.into(),
             columns: Vec::new(),
+            foreign_keys: Vec::new(),
         }
     }
 
@@ -749,9 +801,28 @@ impl SchemaBuilder {
         self
     }
 
+    /// Find column index by name (case-insensitive)
+    pub fn column_index(&self, name: &str) -> Option<usize> {
+        let lower = name.to_lowercase();
+        self.columns
+            .iter()
+            .position(|c| c.name.to_lowercase() == lower)
+    }
+
+    /// Check if a column is nullable by index
+    pub fn is_column_nullable(&self, idx: usize) -> bool {
+        self.columns.get(idx).is_some_and(|c| c.nullable)
+    }
+
+    /// Add a foreign key constraint
+    pub fn add_foreign_key(mut self, fk: ForeignKeyConstraint) -> Self {
+        self.foreign_keys.push(fk);
+        self
+    }
+
     /// Build the schema
     pub fn build(self) -> Schema {
-        Schema::new(self.table_name, self.columns)
+        Schema::with_foreign_keys(self.table_name, self.columns, self.foreign_keys)
     }
 }
 

@@ -169,6 +169,10 @@ pub trait Table: Send + Sync {
     /// Returns the schema of the table
     fn schema(&self) -> &Schema;
 
+    /// Returns the transaction ID this table handle belongs to.
+    /// Used by FK enforcement to participate in the caller's transaction.
+    fn txn_id(&self) -> i64;
+
     /// Creates a new column in the table
     ///
     /// # Arguments

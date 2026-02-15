@@ -33,8 +33,26 @@ When creating tables, you can specify the following constraints:
 
 - **PRIMARY KEY** - Define a primary key constraint on one or more columns
 - **NOT NULL** - Enforce that a column cannot contain NULL values
+- **UNIQUE** - Enforce uniqueness on a column (also available via `CREATE UNIQUE INDEX`)
+- **DEFAULT** - Specify a default value for a column
+- **CHECK** - Define a check constraint expression
+- **REFERENCES** - Define a foreign key constraint referencing another table (see [Foreign Keys](../sql-features/foreign-keys))
 
-**Note**: For uniqueness constraints, use `CREATE UNIQUE INDEX` after table creation.
+```sql
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE,
+    amount FLOAT NOT NULL,
+    status TEXT DEFAULT 'pending'
+);
+
+-- Table-level FOREIGN KEY constraint
+CREATE TABLE order_items (
+    id INTEGER PRIMARY KEY,
+    order_id INTEGER,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+);
+```
 
 ### Altering Tables
 

@@ -36,8 +36,8 @@ pub mod value_interner;
 pub use error::{Error, Result};
 pub use row::Row;
 pub use row_vec::{RowIdVec, RowVec};
-pub use schema::{Schema, SchemaBuilder, SchemaColumn};
-pub use types::{DataType, IndexEntry, IndexType, IsolationLevel, Operator};
+pub use schema::{ForeignKeyConstraint, Schema, SchemaBuilder, SchemaColumn};
+pub use types::{DataType, ForeignKeyAction, IndexEntry, IndexType, IsolationLevel, Operator};
 pub use value::{parse_timestamp, Value, NULL_VALUE};
 pub use value_interner::{intern_value, interned_bool, interned_int, interned_null};
 
