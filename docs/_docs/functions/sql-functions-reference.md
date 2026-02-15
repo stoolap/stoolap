@@ -119,7 +119,7 @@ Aggregate functions operate on a set of rows and return a single value. Used wit
 | Function | Syntax | Description |
 |----------|--------|-------------|
 | `JSON_EXTRACT` | `JSON_EXTRACT(json, path)` | Extract value at JSON path |
-| `JSON_ARRAY_LENGTH` | `JSON_ARRAY_LENGTH(json)` | Length of JSON array |
+| `JSON_ARRAY_LENGTH` | `JSON_ARRAY_LENGTH(json [, path])` | Length of JSON array |
 | `JSON_ARRAY` | `JSON_ARRAY(val1, val2, ...)` | Create JSON array |
 | `JSON_OBJECT` | `JSON_OBJECT(key1, val1, ...)` | Create JSON object |
 | `JSON_TYPE` | `JSON_TYPE(json)` | Type of JSON value |

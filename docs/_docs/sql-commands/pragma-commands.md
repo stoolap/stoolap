@@ -39,7 +39,8 @@ Stoolap currently supports the following PRAGMA commands:
 | `sync_mode` | WAL sync mode (0=None, 1=Normal, 2=Full) | 1 |
 | `keep_snapshots` | Number of snapshots to retain per table | 5 |
 | `wal_flush_trigger` | Operations before WAL flush | 32768 |
-| `create_snapshot` | Manually create a snapshot (no value) | - |
+| `snapshot` | Manually create a snapshot (no value) | - |
+| `checkpoint` | Alias for `snapshot` (SQLite-compatible) | - |
 
 #### snapshot_interval
 
@@ -84,13 +85,16 @@ PRAGMA wal_flush_trigger;       -- read current value
 
 ### Manual Snapshot Control
 
-#### create_snapshot
+#### snapshot
 
 Creates an immediate snapshot of all tables in the database:
 
 ```sql
 -- Create a snapshot immediately
-PRAGMA create_snapshot;
+PRAGMA snapshot;
+
+-- SQLite-compatible alias
+PRAGMA checkpoint;
 ```
 
 This command is useful for:
@@ -132,13 +136,13 @@ PRAGMA wal_flush_trigger = 1000;
 INSERT INTO users (id, name) VALUES (1, 'John');
 
 -- Create a snapshot immediately to ensure data is persisted
-PRAGMA create_snapshot;
+PRAGMA snapshot;
 
 -- Continue with more operations
 UPDATE users SET name = 'Jane' WHERE id = 1;
 
 -- Create another snapshot after the update
-PRAGMA create_snapshot;
+PRAGMA snapshot;
 ```
 
 ## PRAGMA Persistence

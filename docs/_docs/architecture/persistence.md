@@ -121,7 +121,7 @@ PRAGMA snapshot_interval = 300;
 PRAGMA keep_snapshots = 5;
 
 -- Manually create a snapshot
-PRAGMA create_snapshot;
+PRAGMA snapshot;
 ```
 
 ### Snapshot Files
@@ -188,7 +188,7 @@ PRAGMA keep_snapshots = 3;
 PRAGMA wal_flush_trigger = 10000;
 
 -- Manually trigger snapshot
-PRAGMA create_snapshot;
+PRAGMA snapshot;
 ```
 
 ## Best Practices
@@ -220,7 +220,7 @@ Monitor disk usage:
 ### Backup Strategy
 
 For backups:
-1. Create a manual snapshot: `PRAGMA create_snapshot;`
+1. Create a manual snapshot: `PRAGMA snapshot;`
 2. Copy the entire database directory while the database is idle
 3. For hot backups, use filesystem snapshots (ZFS, LVM)
 
@@ -278,7 +278,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY AUTO_INCREMENT, data JSON)", ())?;
 
     // Force a snapshot before maintenance
-    db.execute("PRAGMA create_snapshot", ())?;
+    db.execute("PRAGMA snapshot", ())?;
 
     Ok(())
 }

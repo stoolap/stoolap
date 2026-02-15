@@ -817,9 +817,10 @@ PRAGMA name;
 |--------|-------------|---------|
 | sync_mode | WAL sync mode (0=None, 1=Normal, 2=Full) | 1 |
 | snapshot_interval | Snapshot interval in seconds | 300 |
-| keep_snapshots | Number of snapshots to retain | 3 |
-| wal_flush_trigger | Operations before WAL flush | 1000 |
-| create_snapshot | Manually create a snapshot | - |
+| keep_snapshots | Number of snapshots to retain | 5 |
+| wal_flush_trigger | Operations before WAL flush | 32768 |
+| snapshot | Manually create a snapshot | - |
+| checkpoint | Alias for snapshot (SQLite-compatible) | - |
 
 See [PRAGMA Commands](pragma-commands) for detailed documentation.
 

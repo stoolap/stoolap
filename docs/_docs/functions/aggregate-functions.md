@@ -142,15 +142,14 @@ Concatenates values into a single string with a separator:
 SELECT STRING_AGG(name, ', ') FROM employees;
 -- Returns: "Alice, Bob, Charlie, Diana"
 
+-- With ORDER BY clause
+SELECT STRING_AGG(name, ', ' ORDER BY name) FROM employees;
+-- Returns: "Alice, Bob, Charlie, Diana" (alphabetically ordered)
+
 -- With grouping
-SELECT department, STRING_AGG(name, ', ') as team_members
+SELECT department, STRING_AGG(name, ', ' ORDER BY salary DESC) as team_members
 FROM employees
 GROUP BY department;
-
--- With ORDER BY in subquery for ordered results
-SELECT STRING_AGG(name, ' | ') FROM (
-    SELECT name FROM employees ORDER BY name
-) sub;
 ```
 
 ### GROUP_CONCAT

@@ -205,8 +205,7 @@ SELECT n, fib_n as fibonacci FROM fib;
 
 1. **Termination Condition**: Always include a WHERE clause in the recursive part to prevent infinite loops
 2. **UNION ALL**: Required between the anchor and recursive members
-3. **Single Reference**: The recursive member can only reference the CTE once
-4. **No Aggregates**: Aggregate functions are not allowed in the recursive member
+3. **Iteration Limit**: Recursive CTEs are limited to 10,000 iterations to prevent runaway queries
 
 ## Performance Considerations
 

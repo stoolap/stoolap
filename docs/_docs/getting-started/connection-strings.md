@@ -71,6 +71,14 @@ file:///path/to/data?sync_mode=normal&snapshot_interval=60
 | `snapshot_interval` | Integer (seconds) | 300 | Time between automatic snapshots |
 | `keep_snapshots` | Integer | 5 | Number of snapshots to retain |
 | `wal_flush_trigger` | Integer (bytes) | 32768 | Size in bytes before WAL flush |
+| `wal_buffer_size` | Integer (bytes) | 65536 | WAL write buffer size |
+| `wal_max_size` | Integer (bytes) | 67108864 | Maximum WAL file size (64MB) |
+| `commit_batch_size` | Integer | 100 | Operations batched per commit flush |
+| `sync_interval_ms` | Integer (ms) | 10 | Background sync interval |
+| `wal_compression` | on/off | on | Enable WAL compression |
+| `snapshot_compression` | on/off | on | Enable snapshot compression |
+| `compression` | on/off | on | Enable both WAL and snapshot compression |
+| `compression_threshold` | Integer (bytes) | 64 | Minimum size for compression |
 
 ### Sync Mode Details
 
@@ -147,7 +155,7 @@ PRAGMA sync_mode;
 PRAGMA snapshot_interval;
 
 -- Create a snapshot manually
-PRAGMA create_snapshot;
+PRAGMA snapshot;
 ```
 
 See the [PRAGMA Commands](pragma-commands) documentation for details.
@@ -157,5 +165,5 @@ See the [PRAGMA Commands](pragma-commands) documentation for details.
 1. **Development**: Use `memory://` for fast iteration and testing
 2. **Production**: Use `file://` with appropriate `sync_mode`
 3. **Critical data**: Set `sync_mode=full` for maximum durability
-4. **High throughput**: Use `sync_mode=normal` with periodic `PRAGMA create_snapshot`
+4. **High throughput**: Use `sync_mode=normal` with periodic `PRAGMA snapshot`
 5. **Limited disk space**: Reduce `keep_snapshots` to retain fewer snapshots
