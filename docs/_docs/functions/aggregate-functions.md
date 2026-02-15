@@ -80,28 +80,55 @@ SELECT category, MAX(price) FROM products GROUP BY category;
 
 ## Statistical Functions
 
-### STDDEV
+### MEDIAN
+
+Returns the median (middle value) of all non-NULL values. For an even number of values, returns the average of the two middle values.
+
+```sql
+SELECT MEDIAN(salary) FROM employees;
+
+-- Odd count: values 1, 3, 5, 7, 9 → median = 5
+-- Even count: values 1, 3, 5, 7 → median = (3+5)/2 = 4
+```
+
+### STDDEV / STDDEV_SAMP
 
 Calculates the sample standard deviation:
 
 ```sql
 SELECT STDDEV(value) FROM measurements;
+SELECT STDDEV_SAMP(value) FROM measurements;  -- same as STDDEV
 
--- Example with data
 -- For values: 10, 20, 30, 40, 50
 SELECT STDDEV(value) FROM data;  -- Returns ~15.81
 ```
 
-### VARIANCE
+### STDDEV_POP
+
+Calculates the population standard deviation (divides by N instead of N-1):
+
+```sql
+SELECT STDDEV_POP(value) FROM measurements;
+```
+
+### VARIANCE / VAR_SAMP
 
 Calculates the sample variance:
 
 ```sql
 SELECT VARIANCE(value) FROM measurements;
+SELECT VAR_SAMP(value) FROM measurements;  -- same as VARIANCE
 
--- Example with data
 -- For values: 10, 20, 30, 40, 50
 SELECT VARIANCE(value) FROM data;  -- Returns ~250
+```
+
+### VAR_POP
+
+Calculates the population variance (divides by N instead of N-1):
+
+```sql
+SELECT VAR_POP(value) FROM measurements;
 ```
 
 ## String and Array Aggregation

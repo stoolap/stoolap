@@ -26,7 +26,16 @@ Stoolap supports a comprehensive set of SQL operators for building expressions i
 |----------|-------------|---------|
 | `AND` | Both conditions true | `WHERE a > 1 AND b < 10` |
 | `OR` | Either condition true | `WHERE status = 'active' OR status = 'pending'` |
+| `XOR` | Exactly one condition true | `WHERE a XOR b` |
 | `NOT` | Negates a condition | `WHERE NOT deleted` |
+
+`XOR` returns true when exactly one operand is true:
+
+```sql
+SELECT true XOR false;   -- true
+SELECT true XOR true;    -- false
+SELECT false XOR false;  -- false
+```
 
 ## Arithmetic Operators
 
@@ -139,6 +148,29 @@ SELECT * FROM products WHERE category NOT IN ('Discontinued', 'Archived');
 SELECT * FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE total > 1000);
 ```
 
+## JSON Operators
+
+| Operator | Description | Example |
+|----------|-------------|---------|
+| `->` | JSON access (returns JSON) | `data -> 'key'` |
+| `->>` | JSON access (returns TEXT) | `data ->> 'key'` |
+
+```sql
+-- Extract as JSON (preserves JSON type)
+SELECT data -> 'address' FROM users;
+
+-- Extract as text (always returns a string)
+SELECT data ->> 'name' FROM users;
+
+-- Nested access
+SELECT data -> 'address' ->> 'city' FROM users;
+
+-- In WHERE clause
+SELECT * FROM products WHERE attributes ->> 'color' = 'red';
+```
+
+These are shorthand for `JSON_EXTRACT`. See [JSON Support](../data-types/json-support) for more JSON functions.
+
 ## NULL Operators
 
 ```sql
@@ -152,6 +184,29 @@ SELECT * FROM users WHERE email IS NOT NULL;
 SELECT * FROM users WHERE value = NULL;    -- Always returns no rows!
 SELECT * FROM users WHERE value IS NULL;   -- Correct way
 ```
+
+### IS DISTINCT FROM / IS NOT DISTINCT FROM
+
+NULL-safe comparison operators that treat NULL as a comparable value:
+
+```sql
+-- IS DISTINCT FROM: returns true when values differ (treats NULLs as equal)
+SELECT * FROM t WHERE a IS DISTINCT FROM b;
+
+-- NULL IS DISTINCT FROM NULL → false (they are "the same")
+-- NULL IS DISTINCT FROM 1   → true  (they differ)
+-- 1 IS DISTINCT FROM 1      → false (they are equal)
+-- 1 IS DISTINCT FROM 2      → true  (they differ)
+
+-- IS NOT DISTINCT FROM: NULL-safe equality
+SELECT * FROM t WHERE a IS NOT DISTINCT FROM b;
+
+-- NULL IS NOT DISTINCT FROM NULL → true
+-- NULL IS NOT DISTINCT FROM 1   → false
+-- 1 IS NOT DISTINCT FROM 1      → true
+```
+
+Unlike `=` and `<>`, these operators never return NULL. They always produce true or false.
 
 ## CASE Expression
 

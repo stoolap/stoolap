@@ -15,11 +15,13 @@ Window functions perform calculations across a set of table rows that are relate
 function_name([expression]) OVER (
     [PARTITION BY partition_expression [, ...]]
     [ORDER BY sort_expression [ASC | DESC] [, ...]]
+    [frame_clause]
 )
 ```
 
 - **PARTITION BY**: Divides rows into groups (partitions) that share the same values
 - **ORDER BY**: Defines the order of rows within each partition
+- **frame_clause**: Defines which rows within the partition to include (see [Window Frames](#window-frames))
 
 ## Available Window Functions
 
@@ -250,6 +252,117 @@ SELECT * FROM (
     FROM employees
 ) ranked
 WHERE pct <= 0.10;
+```
+
+## Window Frames
+
+Window frames control exactly which rows within a partition are included in the calculation. There are two frame types: `ROWS` (physical row offsets) and `RANGE` (logical value ranges).
+
+### Syntax
+
+```sql
+{ ROWS | RANGE } BETWEEN frame_start AND frame_end
+{ ROWS | RANGE } frame_start
+```
+
+### Frame Bounds
+
+| Bound | Description |
+|-------|-------------|
+| `UNBOUNDED PRECEDING` | Start of the partition |
+| `n PRECEDING` | n rows/values before the current row |
+| `CURRENT ROW` | The current row |
+| `n FOLLOWING` | n rows/values after the current row |
+| `UNBOUNDED FOLLOWING` | End of the partition |
+
+### Default Frame
+
+When ORDER BY is specified without an explicit frame, the default is:
+
+```sql
+RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+```
+
+When ORDER BY is omitted, the entire partition is used.
+
+### Examples
+
+```sql
+-- Running total (default frame with ORDER BY)
+SELECT name, salary,
+       SUM(salary) OVER (ORDER BY salary) as running_total
+FROM employees;
+
+-- 3-row moving average
+SELECT name, salary,
+       AVG(salary) OVER (
+           ORDER BY salary
+           ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+       ) as moving_avg
+FROM employees;
+
+-- Cumulative sum across entire partition
+SELECT name, dept, salary,
+       SUM(salary) OVER (
+           PARTITION BY dept
+           ORDER BY salary
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+       ) as dept_running_total
+FROM employees;
+
+-- Total of current and all following rows
+SELECT name, salary,
+       SUM(salary) OVER (
+           ORDER BY salary
+           ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+       ) as remaining_total
+FROM employees;
+```
+
+### ROWS vs RANGE
+
+- **ROWS**: Counts physical rows. `1 PRECEDING` means exactly one row before.
+- **RANGE**: Uses logical value ranges. `1 PRECEDING` means all rows whose ORDER BY value is within 1 of the current row's value.
+
+```sql
+-- ROWS: exactly 2 preceding physical rows
+SUM(salary) OVER (ORDER BY salary ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+
+-- RANGE: all rows with value within the preceding range
+SUM(salary) OVER (ORDER BY salary RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+```
+
+## Named Windows (WINDOW Clause)
+
+The WINDOW clause defines reusable window specifications to avoid repetition when multiple window functions share the same partitioning and ordering.
+
+### Syntax
+
+```sql
+SELECT
+    function1() OVER w,
+    function2() OVER w
+FROM table_name
+WINDOW w AS (PARTITION BY col ORDER BY col2);
+```
+
+### Example
+
+```sql
+-- Without WINDOW clause (repetitive)
+SELECT name, dept, salary,
+       ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) as rn,
+       RANK() OVER (PARTITION BY dept ORDER BY salary DESC) as rnk,
+       SUM(salary) OVER (PARTITION BY dept ORDER BY salary DESC) as running
+FROM employees;
+
+-- With WINDOW clause (cleaner)
+SELECT name, dept, salary,
+       ROW_NUMBER() OVER w as rn,
+       RANK() OVER w as rnk,
+       SUM(salary) OVER w as running
+FROM employees
+WINDOW w AS (PARTITION BY dept ORDER BY salary DESC);
 ```
 
 ## Notes

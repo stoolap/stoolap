@@ -67,6 +67,27 @@ FROM products AS p
 CROSS JOIN colors AS c;
 ```
 
+### NATURAL JOIN
+
+A NATURAL JOIN automatically matches on all columns with the same name in both tables. Common columns appear once in the result (not duplicated).
+
+```sql
+-- Automatically joins on all columns shared between t1 and t2
+SELECT * FROM employees NATURAL JOIN departments;
+```
+
+Variants:
+
+```sql
+-- NATURAL LEFT JOIN (preserves all rows from left table)
+SELECT * FROM employees NATURAL LEFT JOIN departments;
+
+-- NATURAL RIGHT JOIN (preserves all rows from right table)
+SELECT * FROM employees NATURAL RIGHT JOIN departments;
+```
+
+No `ON` or `USING` clause is needed. If both tables have columns `id` and `dept_id`, the join matches on both.
+
 ## JOIN Syntax
 
 The basic syntax for JOIN operations in Stoolap is:
@@ -81,6 +102,27 @@ ON table1.column_name = table2.column_name;
 Where:
 - `JOIN_TYPE` is the type of join (INNER, LEFT, RIGHT, FULL OUTER, CROSS)
 - The `ON` clause specifies the join condition (not used for CROSS JOIN)
+
+### USING Clause
+
+The `USING` clause is shorthand for joining on columns with the same name. The joined column appears once in the result.
+
+```sql
+-- Instead of: ON t1.dept_id = t2.dept_id
+SELECT emp_name, dept_name
+FROM employees
+JOIN departments USING (dept_id);
+
+-- Works with LEFT and RIGHT joins
+SELECT emp_name, dept_name
+FROM employees
+LEFT JOIN departments USING (dept_id);
+
+-- Multiple columns
+SELECT *
+FROM orders
+JOIN returns USING (order_id, product_id);
+```
 
 ## Examples
 
@@ -232,7 +274,6 @@ Based on the implementation and test files:
 
 - Large joins can be memory-intensive, especially without proper filtering
 - Complex joins with many tables may require careful optimization
-- NATURAL JOIN is supported but converts to explicit column matching internally
 - Implicit CROSS JOIN (comma syntax: `FROM a, b`) is supported
 
 ## Join Algorithm Selection

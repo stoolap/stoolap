@@ -112,6 +112,31 @@ And these examples of invalid JSON:
 [1,2,3,}             -- Mismatched brackets
 ```
 
+## JSON Operators
+
+Stoolap supports PostgreSQL-style JSON access operators:
+
+| Operator | Returns | Description |
+|----------|---------|-------------|
+| `->` | JSON | Extracts a JSON value by key or index |
+| `->>` | TEXT | Extracts a value as text |
+
+```sql
+-- Extract as JSON (preserves type)
+SELECT attributes -> 'specs' FROM products;
+
+-- Extract as text
+SELECT attributes ->> 'brand' FROM products;
+
+-- Nested access
+SELECT attributes -> 'specs' ->> 'ram' FROM products;
+
+-- Filter by extracted value
+SELECT * FROM products WHERE attributes ->> 'brand' = 'Example';
+```
+
+These operators are shorthand for `JSON_EXTRACT`. Use `->` when you need to chain further JSON access; use `->>` when you need the final text value.
+
 ## JSON Functions
 
 Stoolap provides several functions for working with JSON data:

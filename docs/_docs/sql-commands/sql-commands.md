@@ -196,6 +196,29 @@ EXCEPT
 SELECT id FROM table2;
 ```
 
+#### VALUES as Table Source
+
+The VALUES clause can be used as an inline table in queries:
+
+```sql
+-- Basic usage with column aliases
+SELECT * FROM (VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')) AS t(id, name);
+
+-- With filtering
+SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(id, val)
+WHERE val >= 20;
+
+-- With expressions
+SELECT id, val * 2 AS doubled
+FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(id, val);
+
+-- With aggregation
+SELECT SUM(x) FROM (VALUES (1), (2), (3), (4), (5)) AS t(x);
+
+-- Without column aliases (uses column1, column2, ...)
+SELECT * FROM (VALUES (10, 20), (30, 40)) AS t;
+```
+
 #### Temporal Queries (AS OF)
 
 Query historical data at a specific point in time:
@@ -262,6 +285,44 @@ ON DUPLICATE KEY UPDATE
 ```
 
 See [ON DUPLICATE KEY UPDATE](../sql-features/on-duplicate-key-update) for detailed documentation.
+
+#### INSERT INTO ... SELECT
+
+Inserts rows from a query result into a table:
+
+```sql
+-- Copy rows from another table
+INSERT INTO archive (id, name, amount)
+SELECT id, name, amount FROM orders WHERE status = 'completed';
+
+-- With expressions and aggregation
+INSERT INTO summary (category, total)
+SELECT category, SUM(amount) FROM sales GROUP BY category;
+
+-- With JOIN
+INSERT INTO user_totals (user_name, total_amount)
+SELECT u.name, SUM(o.amount)
+FROM users u
+JOIN orders o ON u.id = o.user_id
+GROUP BY u.name;
+
+-- With UNION
+INSERT INTO combined (val)
+SELECT val FROM table1
+UNION ALL
+SELECT val FROM table2;
+
+-- With CTE
+INSERT INTO results (id, value)
+WITH doubled AS (SELECT id, val * 2 AS val FROM source)
+SELECT id, val FROM doubled;
+
+-- With LIMIT
+INSERT INTO top_items (name, price)
+SELECT name, price FROM products ORDER BY price DESC LIMIT 10;
+```
+
+Columns not specified in the INSERT column list receive their DEFAULT values.
 
 ### UPDATE
 

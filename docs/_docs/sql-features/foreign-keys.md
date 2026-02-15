@@ -13,12 +13,13 @@ This document explains foreign key constraints in Stoolap, including syntax, ref
 
 Stoolap supports foreign key (FK) constraints that enforce referential integrity between tables. A foreign key ensures that values in a child table column always reference an existing row in a parent table. This prevents orphaned records and maintains data consistency.
 
-Key characteristics:
-- **Zero cost for non-FK tables** — all checks short-circuit when no FK constraints exist
-- **Index-based lookups** — parent existence checks use PK or secondary indexes (O(1) or O(log N))
-- **Transaction-aware** — FK checks see uncommitted rows within the same transaction
-- **Automatic FK indexes** — indexes are auto-created on FK columns for efficient cascade operations
-- **WAL and snapshot durable** — FK metadata survives restart and WAL truncation
+| Feature | Description |
+|---------|-------------|
+| **Zero cost for non-FK tables** | All checks short-circuit when no FK constraints exist |
+| **Index-based lookups** | Parent existence checks use PK or secondary indexes (O(1) or O(log N)) |
+| **Transaction-aware** | FK checks see uncommitted rows within the same transaction |
+| **Automatic FK indexes** | Indexes are auto-created on FK columns for efficient cascade operations |
+| **WAL and snapshot durable** | FK metadata survives restart and WAL truncation |
 
 ## Syntax
 
