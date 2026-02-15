@@ -7,15 +7,16 @@ order: 21
 
 # Collation
 
-Stoolap provides the `COLLATE()` function for controlling string comparison and sorting behavior. Three collation modes are supported.
+Stoolap provides the `COLLATE()` function for controlling string comparison and sorting behavior. Four collation modes are supported.
 
 ## Collation Modes
 
-| Mode | Behavior |
-|------|----------|
-| `BINARY` | Exact byte-level comparison (case-sensitive) |
-| `NOCASE` | Case-insensitive comparison |
-| `NOACCENT` | Accent-insensitive comparison (strips diacritical marks) |
+| Mode | Aliases | Behavior |
+|------|---------|----------|
+| `BINARY` | | Exact byte-level comparison (case-sensitive) |
+| `NOCASE` | `CASE_INSENSITIVE` | Case-insensitive comparison |
+| `NOACCENT` | `ACCENT_INSENSITIVE` | Accent-insensitive comparison (strips diacritical marks) |
+| `NUMERIC` | | Numeric-aware string comparison |
 
 ## Syntax
 

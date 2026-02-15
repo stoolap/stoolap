@@ -114,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ./stoolap --db "file:///var/lib/stoolap/data"
 
 # Execute query directly
-./stoolap -q "SELECT version()"
+./stoolap -e "SELECT version()"
 
 # Execute SQL file
 ./stoolap --db "file://./mydb" < schema.sql

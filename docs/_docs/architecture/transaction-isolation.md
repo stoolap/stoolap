@@ -17,21 +17,33 @@ Stoolap currently supports two isolation levels:
 
 2. **SNAPSHOT** (also known as REPEATABLE READ) - Provides a consistent view of the database as it was when the transaction started. All queries within the transaction see the same snapshot of data, regardless of concurrent commits by other transactions.
 
+### Isolation Level Aliases
+
+The following SQL-standard isolation level names are accepted as aliases:
+
+| Alias | Maps To |
+|-------|---------|
+| `REPEATABLE READ` | `SNAPSHOT` |
+| `SERIALIZABLE` | `SNAPSHOT` |
+| `READ UNCOMMITTED` | `READ COMMITTED` |
+
 ## Setting Isolation Levels
 
 Stoolap provides multiple ways to control transaction isolation levels:
 
 ### Connection-level Default Isolation Level
 
-Set the default isolation level for the current connection using `SET ISOLATIONLEVEL`:
+Set the default isolation level for the current connection using `SET isolation_level`:
 
 ```sql
 -- Set connection default to READ COMMITTED (default)
-SET ISOLATIONLEVEL = 'READ COMMITTED';
+SET isolation_level = 'READ COMMITTED';
 
 -- Set connection default to SNAPSHOT
-SET ISOLATIONLEVEL = 'SNAPSHOT';
+SET isolation_level = 'SNAPSHOT';
 ```
+
+Both `isolation_level` and `transaction_isolation` are accepted as variable names.
 
 This setting affects:
 - **Auto-commit transactions** - Queries executed without an explicit transaction
@@ -49,21 +61,25 @@ BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
 BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT;
 ```
 
-### Programmatic Transaction Control
+### Programmatic Transaction Control (Rust API)
 
-When using the Stoolap driver programmatically:
+When using the Stoolap library programmatically:
 
-```go
-// Use connection default (affected by SET ISOLATIONLEVEL)
-tx, err := db.Begin()
+```rust
+use stoolap::api::Database;
+use stoolap::IsolationLevel;
 
-// Explicitly specify isolation level (ignores SET ISOLATIONLEVEL)
-tx, err := db.BeginTx(context.Background(), &sql.TxOptions{
-    Isolation: sql.LevelSnapshot,
-})
+// Use connection default
+let tx = db.begin()?;
+
+// Explicitly specify isolation level
+let tx = db.begin_with_isolation(IsolationLevel::SnapshotIsolation)?;
+
+// Set default isolation level for all future transactions
+db.set_default_isolation_level(IsolationLevel::SnapshotIsolation)?;
 ```
 
-**Important**: Transaction-specific isolation levels always take precedence over the connection default set by `SET ISOLATIONLEVEL`.
+**Important**: Transaction-specific isolation levels always take precedence over the connection default.
 
 ## MVCC Implementation
 
@@ -233,7 +249,7 @@ COMMIT;
 
 ```sql
 -- Set session to use SNAPSHOT isolation by default
-SET ISOLATIONLEVEL = 'SNAPSHOT';
+SET isolation_level = 'SNAPSHOT';
 
 -- All subsequent transactions will use SNAPSHOT isolation
 BEGIN;
@@ -242,7 +258,7 @@ UPDATE inventory SET quantity = quantity - 1 WHERE product_id = 123;
 COMMIT;
 
 -- Reset to default
-SET ISOLATIONLEVEL = 'READ COMMITTED';
+SET isolation_level = 'READ COMMITTED';
 ```
 
 ### Transaction with Rollback
@@ -258,13 +274,11 @@ ROLLBACK;
 
 ```sql
 -- Connection 1
-SET ISOLATIONLEVEL = 'SNAPSHOT';
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT;
 SELECT balance FROM accounts WHERE id = 1; -- Returns 1000
 
 -- Connection 2
-SET ISOLATIONLEVEL = 'SNAPSHOT';
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT;
 SELECT balance FROM accounts WHERE id = 1; -- Returns 1000
 
 -- Connection 1
@@ -297,5 +311,4 @@ In this example, both transactions read the same initial value (1000) but Connec
 
 - Long-running transactions prevent garbage collection of old versions
 - Extremely high concurrency on the same rows may lead to frequent conflicts in SNAPSHOT isolation
-- Savepoints are not currently supported
-- Each connection maintains its own default isolation level set by `SET ISOLATIONLEVEL`
+- Each connection maintains its own default isolation level set by `SET isolation_level`

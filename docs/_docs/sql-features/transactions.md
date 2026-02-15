@@ -73,7 +73,6 @@ Stoolap supports two isolation levels:
 Each statement sees data committed before the statement began. Different statements within the same transaction may see different snapshots:
 
 ```sql
-SET ISOLATION LEVEL READ COMMITTED;
 BEGIN;
 SELECT * FROM accounts; -- Sees data as of this moment
 -- Another transaction commits changes here
@@ -86,12 +85,28 @@ COMMIT;
 The entire transaction sees a consistent snapshot from when it began. No changes from other transactions are visible:
 
 ```sql
-SET ISOLATION LEVEL SNAPSHOT;
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT;
 SELECT * FROM accounts; -- Sees data as of BEGIN
 -- Another transaction commits changes here
 SELECT * FROM accounts; -- Still sees data as of BEGIN
 COMMIT;
+```
+
+#### Isolation Level Aliases
+
+The following SQL-standard isolation levels are accepted as aliases:
+
+| Alias | Maps To |
+|-------|---------|
+| `REPEATABLE READ` | `SNAPSHOT` |
+| `SERIALIZABLE` | `SNAPSHOT` |
+| `READ UNCOMMITTED` | `READ COMMITTED` |
+
+```sql
+-- All equivalent - start a snapshot isolation transaction
+BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT;
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 ```
 
 ## Transaction Behavior with DDL
@@ -106,17 +121,32 @@ INSERT INTO temp_results VALUES (1, 'result');
 COMMIT;
 ```
 
+### Setting Default Isolation Level
+
+Use `SET` to change the default isolation level for the session:
+
+```sql
+-- Set default to SNAPSHOT for all subsequent transactions
+SET isolation_level = 'SNAPSHOT';
+
+-- Reset to default
+SET isolation_level = 'READ COMMITTED';
+```
+
+Both `isolation_level` and `transaction_isolation` are accepted as variable names. If called within an active transaction, the isolation level is changed for that transaction only.
+
 ## Transaction Behavior Summary
 
 | Statement | Behavior |
 |-----------|----------|
-| `BEGIN` | Starts an explicit transaction |
+| `BEGIN` | Starts an explicit transaction with default isolation |
+| `BEGIN TRANSACTION ISOLATION LEVEL ...` | Starts a transaction with specified isolation level |
 | `COMMIT` | Commits all pending changes |
 | `ROLLBACK` | Discards all pending changes |
 | `SAVEPOINT name` | Creates a named savepoint |
 | `ROLLBACK TO SAVEPOINT name` | Rolls back to the savepoint |
 | `RELEASE SAVEPOINT name` | Removes a savepoint |
-| `SET ISOLATION LEVEL ...` | Sets isolation level for subsequent transactions |
+| `SET isolation_level = '...'` | Sets default isolation level for the session |
 
 ## Concurrency
 

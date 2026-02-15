@@ -467,7 +467,9 @@ impl Clone for SmartString {
         if self.tag.is_heap() {
             // Heap: increment Arc refcount to balance the new owner's Drop
             // SAFETY: get_arc_ptr() returns a valid Arc<String> pointer
-            unsafe { Arc::increment_strong_count(self.get_arc_ptr()); }
+            unsafe {
+                Arc::increment_strong_count(self.get_arc_ptr());
+            }
         }
         // Data bytes already contain the correct content (inline bytes or pointer)
         SmartString {

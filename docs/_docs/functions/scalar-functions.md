@@ -119,7 +119,7 @@ Finds the position of a substring within a string.
 ```sql
 -- LOCATE(substring, string [, start_position])
 SELECT LOCATE('l', 'hello');               -- Returns 3 (1-based)
-SELECT LOCATE('o', 'hello world', 5);      -- Returns 8 (starting from position 5)
+SELECT LOCATE('o', 'hello world', 6);      -- Returns 8 (second 'o', starting from position 6)
 ```
 
 Returns 0 if not found.

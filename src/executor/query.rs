@@ -6775,7 +6775,7 @@ impl Executor {
     /// Note: Nested BEGIN is a no-op when a transaction is already active
     pub(crate) fn execute_begin(
         &self,
-        _stmt: &BeginStatement,
+        stmt: &BeginStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         use super::ActiveTransaction;
@@ -6787,8 +6787,13 @@ impl Executor {
             return Ok(Box::new(ExecResult::empty()));
         }
 
-        // Start a new transaction
-        let transaction = self.engine.begin_transaction()?;
+        // Start a new transaction, with isolation level if specified
+        let transaction = if let Some(ref level) = stmt.isolation_level {
+            let isolation = Self::parse_isolation_level(level)?;
+            self.engine.begin_transaction_with_level(isolation)?
+        } else {
+            self.engine.begin_transaction()?
+        };
 
         *active_tx = Some(ActiveTransaction {
             transaction,
@@ -6874,10 +6879,61 @@ impl Executor {
     /// Execute SET statement
     pub(crate) fn execute_set(
         &self,
-        _stmt: &SetStatement,
+        stmt: &SetStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        Ok(Box::new(ExecResult::empty()))
+        let name = stmt.name.value.to_uppercase();
+
+        match name.as_str() {
+            "ISOLATION_LEVEL" | "TRANSACTION_ISOLATION" => {
+                // Extract the value as a string
+                let level_str = match &stmt.value {
+                    Expression::StringLiteral(lit) => lit.value.to_uppercase(),
+                    Expression::Identifier(id) => id.value.to_uppercase(),
+                    _ => {
+                        return Err(Error::internal(
+                            "SET isolation_level requires a string value (e.g., 'READ COMMITTED', 'SNAPSHOT')",
+                        ));
+                    }
+                };
+
+                let isolation = Self::parse_isolation_level(&level_str)?;
+
+                // If there's an active transaction, set on the transaction
+                let mut active_tx = self.active_transaction.lock().unwrap();
+                if let Some(ref mut tx_state) = *active_tx {
+                    tx_state.transaction.set_isolation_level(isolation)?;
+                } else {
+                    // No active transaction: set the engine's default isolation level
+                    self.engine.registry().set_global_isolation_level(isolation);
+                }
+
+                Ok(Box::new(ExecResult::empty()))
+            }
+            _ => {
+                // Silently accept unknown SET variables for compatibility
+                Ok(Box::new(ExecResult::empty()))
+            }
+        }
+    }
+
+    /// Parse an isolation level string into an IsolationLevel enum
+    fn parse_isolation_level(level: &str) -> Result<crate::core::IsolationLevel> {
+        use crate::core::IsolationLevel;
+        match level {
+            "READ COMMITTED" => Ok(IsolationLevel::ReadCommitted),
+            "SNAPSHOT" | "SERIALIZABLE" | "REPEATABLE READ" => {
+                Ok(IsolationLevel::SnapshotIsolation)
+            }
+            "READ UNCOMMITTED" => {
+                // Treat as READ COMMITTED (closest supported level)
+                Ok(IsolationLevel::ReadCommitted)
+            }
+            _ => Err(Error::internal(format!(
+                "unsupported isolation level: '{}'. Supported: READ COMMITTED, SNAPSHOT, REPEATABLE READ, SERIALIZABLE",
+                level
+            ))),
+        }
     }
 
     /// Execute PRAGMA statement

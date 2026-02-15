@@ -153,6 +153,15 @@ SELECT STRING_AGG(name, ' | ') FROM (
 ) sub;
 ```
 
+### GROUP_CONCAT
+
+Alias for STRING_AGG. Concatenates values with a separator:
+
+```sql
+SELECT GROUP_CONCAT(name, ', ') FROM employees;
+-- Returns: "Alice, Bob, Charlie, Diana"
+```
+
 ### ARRAY_AGG
 
 Aggregates values into a JSON array:

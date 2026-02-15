@@ -37,7 +37,7 @@ Stoolap currently supports the following PRAGMA commands:
 |--------|-------------|---------|
 | `snapshot_interval` | Seconds between automatic snapshots | 300 |
 | `sync_mode` | WAL sync mode (0=None, 1=Normal, 2=Full) | 1 |
-| `keep_snapshots` | Number of snapshots to retain per table | 3 |
+| `keep_snapshots` | Number of snapshots to retain per table | 5 |
 | `wal_flush_trigger` | Operations before WAL flush | 32768 |
 | `create_snapshot` | Manually create a snapshot (no value) | - |
 
@@ -66,7 +66,7 @@ Supported values:
 
 #### keep_snapshots
 
-Controls how many snapshots to retain for each table. Default: 3.
+Controls how many snapshots to retain for each table. Default: 5.
 
 ```sql
 PRAGMA keep_snapshots = 5;

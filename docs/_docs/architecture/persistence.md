@@ -117,8 +117,8 @@ After a snapshot is created, older WAL entries can be safely deleted.
 -- Interval between automatic snapshots (in seconds, default: 300)
 PRAGMA snapshot_interval = 300;
 
--- Number of snapshots to retain (default: 3)
-PRAGMA keep_snapshots = 3;
+-- Number of snapshots to retain (default: 5)
+PRAGMA keep_snapshots = 5;
 
 -- Manually create a snapshot
 PRAGMA create_snapshot;
@@ -163,14 +163,14 @@ let results = db.query("SELECT * FROM users")?;
 ### Connection String Parameters
 
 ```
-file:///path/to/database?sync_mode=2&snapshot_interval=60&keep_snapshots=3
+file:///path/to/database?sync_mode=2&snapshot_interval=60&keep_snapshots=5
 ```
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | sync_mode | WAL sync mode (0, 1, 2) | 1 |
 | snapshot_interval | Seconds between snapshots | 300 |
-| keep_snapshots | Number of snapshots to keep | 3 |
+| keep_snapshots | Number of snapshots to keep | 5 |
 
 ### PRAGMA Commands
 

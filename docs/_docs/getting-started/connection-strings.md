@@ -69,8 +69,8 @@ file:///path/to/data?sync_mode=normal&snapshot_interval=60
 |--------|--------|---------|-------------|
 | `sync_mode` | none, normal, full (or 0, 1, 2) | normal | WAL synchronization mode |
 | `snapshot_interval` | Integer (seconds) | 300 | Time between automatic snapshots |
-| `keep_snapshots` | Integer | 3 | Number of snapshots to retain |
-| `wal_flush_trigger` | Integer | 1000 | Operations before WAL flush |
+| `keep_snapshots` | Integer | 5 | Number of snapshots to retain |
+| `wal_flush_trigger` | Integer (bytes) | 32768 | Size in bytes before WAL flush |
 
 ### Sync Mode Details
 
