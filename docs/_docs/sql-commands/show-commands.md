@@ -84,7 +84,7 @@ Output columns:
 | **table_name** | The table name | `products` |
 | **index_name** | The index name | `idx_price`, `pk_products` |
 | **column_name** | Indexed column(s) | `price`, `(customer_id, order_date)` |
-| **index_type** | Index type | `BTREE`, `HASH`, `BITMAP`, `PRIMARYKEY` |
+| **index_type** | Index type | `BTREE`, `HASH`, `BITMAP`, `MULTICOLUMN`, `PRIMARYKEY` |
 | **is_unique** | Whether the index enforces uniqueness | `true`, `false` |
 
 Multi-column indexes show column names in parentheses: `(col1, col2, col3)`.

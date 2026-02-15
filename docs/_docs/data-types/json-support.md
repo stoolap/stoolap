@@ -287,7 +287,7 @@ db.execute(
 // Query and parse JSON data
 for row in db.query("SELECT attributes FROM products WHERE id = $1", (6,))? {
     let row = row?;
-    let attributes: String = row.get("attributes")?;
+    let attributes: String = row.get_by_name("attributes")?;
     let parsed_product: Product = serde_json::from_str(&attributes)?;
 }
 ```

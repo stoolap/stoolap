@@ -75,7 +75,7 @@ Execute a SELECT query and iterate over results.
 for row in db.query("SELECT * FROM users", ())? {
     let row = row?;
     let id: i64 = row.get(0)?;           // By index
-    let name: String = row.get("name")?; // By column name
+    let name: String = row.get_by_name("name")?; // By column name
     println!("User {}: {}", id, name);
 }
 
@@ -259,10 +259,10 @@ for row in db.query("SELECT id, name, active FROM users", ())? {
     let id: i64 = row.get(0)?;
 
     // By column name
-    let name: String = row.get("name")?;
+    let name: String = row.get_by_name("name")?;
 
     // Optional values (for nullable columns)
-    let active: Option<bool> = row.get("active")?;
+    let active: Option<bool> = row.get_by_name("active")?;
 }
 ```
 
@@ -374,8 +374,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         FROM users
     ", ())? {
         let row = row?;
-        let name: String = row.get("name")?;
-        let row_num: i64 = row.get("row_num")?;
+        let name: String = row.get_by_name("name")?;
+        let row_num: i64 = row.get_by_name("row_num")?;
         println!("{}: {}", row_num, name);
     }
 

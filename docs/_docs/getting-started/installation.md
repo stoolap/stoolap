@@ -109,8 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Query data
     for row in db.query("SELECT * FROM users", ())? {
         let row = row?;
-        let id: i64 = row.get("id")?;
-        let name: String = row.get("name")?;
+        let id: i64 = row.get_by_name("id")?;
+        let name: String = row.get_by_name("name")?;
         println!("User {}: {}", id, name);
     }
 

@@ -57,7 +57,6 @@ Based on the implementation, Stoolap recognizes various date and time formats:
 14:30:45.123                  -- Time with milliseconds
 14:30:45                      -- Standard time
 14:30                         -- Hours and minutes only
-2:30:45 PM                    -- 12-hour format
 ```
 
 ## Date and Time Functions

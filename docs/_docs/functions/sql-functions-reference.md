@@ -109,8 +109,8 @@ Aggregate functions operate on a set of rows and return a single value. Used wit
 | `SECOND` | `SECOND(timestamp)` | Extract second |
 | `DATE_ADD` | `DATE_ADD(timestamp, INTERVAL n unit)` | Add interval to date |
 | `DATE_SUB` | `DATE_SUB(timestamp, INTERVAL n unit)` | Subtract interval from date |
-| `DATEDIFF` | `DATEDIFF(unit, start, end)` | Difference between dates |
-| `DATE_DIFF` | `DATE_DIFF(unit, start, end)` | Alias for DATEDIFF |
+| `DATEDIFF` | `DATEDIFF(date1, date2)` | Difference between dates in days |
+| `DATE_DIFF` | `DATE_DIFF(date1, date2)` | Alias for DATEDIFF |
 | `TO_CHAR` | `TO_CHAR(timestamp, format)` | Format timestamp as string |
 | `VERSION` | `VERSION()` | Database version string |
 

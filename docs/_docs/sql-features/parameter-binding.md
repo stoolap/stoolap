@@ -60,7 +60,7 @@ db.execute("INSERT INTO users VALUES ($1, $2, $3)", (1, "Alice", 30))?;
 // Query with parameters
 for row in db.query("SELECT * FROM users WHERE age > $1", (25,))? {
     let row = row?;
-    let name: String = row.get("name")?;
+    let name: String = row.get_by_name("name")?;
     println!("Name: {}", name);
 }
 ```
@@ -139,8 +139,8 @@ db.execute("COMMIT", ())?;
 ```rust
 for row in db.query("SELECT * FROM users WHERE age > $1", (18,))? {
     let row = row?;
-    let id: i64 = row.get("id")?;
-    let name: String = row.get("name")?;
+    let id: i64 = row.get_by_name("id")?;
+    let name: String = row.get_by_name("name")?;
 }
 ```
 

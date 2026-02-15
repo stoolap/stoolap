@@ -274,17 +274,6 @@ impl SmartString {
         usize::from_ne_bytes(ptr_bytes) as *const String
     }
 
-    /// Clone the Arc for heap strings (increments refcount)
-    #[inline]
-    fn clone_arc(&self) -> Arc<String> {
-        let ptr = self.get_arc_ptr();
-        // SAFETY: We only store valid Arc<String> pointers
-        unsafe {
-            Arc::increment_strong_count(ptr);
-            Arc::from_raw(ptr)
-        }
-    }
-
     /// Convert to a version that will use Arc for future clones (no-op now, kept for API compat)
     #[inline]
     pub fn into_shared(self) -> Self {
@@ -475,23 +464,15 @@ impl SmartString {
 impl Clone for SmartString {
     #[inline]
     fn clone(&self) -> Self {
-        if self.tag.is_inline() {
-            // Inline: just copy the bytes
-            SmartString {
-                tag: self.tag,
-                data: self.data,
-            }
-        } else {
-            // Heap: increment Arc refcount
-            let arc = self.clone_arc();
-            let ptr = Arc::into_raw(arc) as usize;
-            let mut data = [0u8; 15];
-            let end = ptr_layout::OFFSET + ptr_layout::SIZE;
-            data[ptr_layout::OFFSET..end].copy_from_slice(&ptr.to_ne_bytes());
-            SmartString {
-                tag: self.tag,
-                data,
-            }
+        if self.tag.is_heap() {
+            // Heap: increment Arc refcount to balance the new owner's Drop
+            // SAFETY: get_arc_ptr() returns a valid Arc<String> pointer
+            unsafe { Arc::increment_strong_count(self.get_arc_ptr()); }
+        }
+        // Data bytes already contain the correct content (inline bytes or pointer)
+        SmartString {
+            tag: self.tag,
+            data: self.data,
         }
     }
 }

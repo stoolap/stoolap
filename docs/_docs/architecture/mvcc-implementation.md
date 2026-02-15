@@ -54,13 +54,17 @@ struct RowVersion {
     txn_id: i64,           // Transaction that created this version
     deleted_at_txn_id: i64, // Transaction that deleted this version (0 if not deleted)
     data: Row,             // Complete row data
-    row_id: i64,           // Row identifier
     create_time: i64,      // Timestamp when created
-    prev: Option<Box<RowVersion>>, // Previous version in the chain
+}
+
+struct VersionChainEntry {
+    version: RowVersion,
+    prev: Option<Arc<VersionChainEntry>>, // Previous version in the chain
+    arena_idx: Option<NonZeroU64>,        // Index into arena for zero-copy access
 }
 ```
 
-The `prev` pointer creates a backward-linked chain from newest to oldest version.
+The `prev` pointer on `VersionChainEntry` creates a backward-linked chain from newest to oldest version. `Arc` allows cheap cloning of version chains across concurrent readers.
 
 ## Transaction IDs and Timestamps
 

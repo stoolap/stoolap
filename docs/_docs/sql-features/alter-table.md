@@ -80,5 +80,5 @@ This means ALTER TABLE changes persist correctly even if the database crashes im
 ## Limitations
 
 - ALTER TABLE operations may temporarily block concurrent writes
-- Adding constraints to existing columns (e.g., adding NOT NULL to a column with NULL values) is not supported
+- MODIFY COLUMN can change nullability (add or remove NOT NULL), but does not validate that existing data satisfies the new constraint
 - Composite primary key modifications are not supported
