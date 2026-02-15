@@ -52,7 +52,7 @@ Output columns:
 | **Table** | The table name |
 | **Create Table** | Full CREATE TABLE statement |
 
-The generated statement includes column types, PRIMARY KEY, NOT NULL, UNIQUE, AUTO_INCREMENT, DEFAULT, and CHECK constraints.
+The generated statement includes column types, PRIMARY KEY, NOT NULL, UNIQUE, AUTO_INCREMENT, DEFAULT, CHECK, and FOREIGN KEY constraints.
 
 ## SHOW CREATE VIEW
 

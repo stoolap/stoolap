@@ -29,7 +29,7 @@ Stoolap automatically parallelizes operations based on data size:
 | Operation | Threshold | Description |
 |-----------|-----------|-------------|
 | **Filter (WHERE)** | 10,000 rows | Parallel predicate evaluation |
-| **Hash Join** | 5,000 rows | Parallel hash build and probe |
+| **Hash Join** | 10,000 rows | Parallel hash build and probe |
 | **ORDER BY** | 50,000 rows | Parallel sorting |
 | **DISTINCT** | 10,000 rows | Two-phase parallel deduplication |
 

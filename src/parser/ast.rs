@@ -1231,6 +1231,7 @@ pub enum Statement {
     Commit(CommitStatement),
     Rollback(RollbackStatement),
     Savepoint(SavepointStatement),
+    ReleaseSavepoint(ReleaseSavepointStatement),
     /// Boxed to reduce enum size (424 bytes unboxed)
     Set(Box<SetStatement>),
     Pragma(PragmaStatement),
@@ -1264,6 +1265,7 @@ impl fmt::Display for Statement {
             Statement::Commit(s) => write!(f, "{}", s),
             Statement::Rollback(s) => write!(f, "{}", s),
             Statement::Savepoint(s) => write!(f, "{}", s),
+            Statement::ReleaseSavepoint(s) => write!(f, "{}", s),
             Statement::Set(s) => write!(f, "{}", s),
             Statement::Pragma(s) => write!(f, "{}", s),
             Statement::ShowTables(s) => write!(f, "{}", s),
@@ -2033,6 +2035,19 @@ pub struct SavepointStatement {
 impl fmt::Display for SavepointStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SAVEPOINT {}", self.savepoint_name)
+    }
+}
+
+/// RELEASE SAVEPOINT statement
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReleaseSavepointStatement {
+    pub token: Token,
+    pub savepoint_name: Identifier,
+}
+
+impl fmt::Display for ReleaseSavepointStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RELEASE SAVEPOINT {}", self.savepoint_name)
     }
 }
 

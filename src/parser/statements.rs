@@ -53,6 +53,9 @@ impl Parser {
                 "COMMIT" => self.parse_commit_statement().map(Statement::Commit),
                 "ROLLBACK" => self.parse_rollback_statement().map(Statement::Rollback),
                 "SAVEPOINT" => self.parse_savepoint_statement().map(Statement::Savepoint),
+                "RELEASE" => self
+                    .parse_release_savepoint_statement()
+                    .map(Statement::ReleaseSavepoint),
                 "SET" => self
                     .parse_set_statement()
                     .map(|s| Statement::Set(Box::new(s))),
@@ -2250,6 +2253,28 @@ impl Parser {
             Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
         Some(SavepointStatement {
+            token,
+            savepoint_name,
+        })
+    }
+
+    /// Parse a RELEASE SAVEPOINT statement
+    fn parse_release_savepoint_statement(&mut self) -> Option<ReleaseSavepointStatement> {
+        let token = self.cur_token.clone();
+
+        // Optional SAVEPOINT keyword
+        if self.peek_token_is_keyword("SAVEPOINT") {
+            self.next_token();
+        }
+
+        if !self.expect_peek(TokenType::Identifier) {
+            return None;
+        }
+
+        let savepoint_name =
+            Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
+
+        Some(ReleaseSavepointStatement {
             token,
             savepoint_name,
         })

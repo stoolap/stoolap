@@ -7118,6 +7118,26 @@ impl Executor {
         }
     }
 
+    /// Execute RELEASE SAVEPOINT statement
+    pub(crate) fn execute_release_savepoint(
+        &self,
+        stmt: &ReleaseSavepointStatement,
+        _ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        let mut active_tx = self.active_transaction.lock().unwrap();
+
+        if let Some(ref mut tx_state) = *active_tx {
+            tx_state
+                .transaction
+                .release_savepoint(&stmt.savepoint_name.value)?;
+            Ok(Box::new(ExecResult::empty()))
+        } else {
+            Err(Error::internal(
+                "RELEASE SAVEPOINT can only be used within a transaction (after BEGIN)",
+            ))
+        }
+    }
+
     /// Execute an expression statement (SELECT 1+1)
     pub(crate) fn execute_expression_stmt(
         &self,

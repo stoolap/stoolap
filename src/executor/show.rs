@@ -134,6 +134,22 @@ impl Executor {
             })
             .collect();
         create_sql.push_str(&col_defs.join(", "));
+
+        // Add foreign key constraints
+        for fk in &schema.foreign_keys {
+            use std::fmt::Write;
+            write!(
+                create_sql,
+                ", FOREIGN KEY ({}) REFERENCES {}({}) ON DELETE {} ON UPDATE {}",
+                fk.column_name,
+                fk.referenced_table,
+                fk.referenced_column,
+                fk.on_delete,
+                fk.on_update
+            )
+            .unwrap();
+        }
+
         create_sql.push(')');
 
         let columns = vec!["Table".to_string(), "Create Table".to_string()];

@@ -116,11 +116,11 @@ SELECT CAST(NULL AS BOOLEAN);                  -- Returns FALSE
 
 ### To INTEGER
 
-- **From FLOAT**: Truncates decimal portion (123.45 → 123)
+- **From FLOAT**: Truncates decimal portion (123.45 → 123). Returns error for NaN, Infinity, or values outside i64 range
 - **From TEXT**: Parses numeric string ("123" → 123), non-numeric strings become 0
 - **From BOOLEAN**: TRUE → 1, FALSE → 0
 - **From TIMESTAMP**: Converts to Unix timestamp (seconds since epoch)
-- **From NULL**: Returns 0
+- **From NULL**: Returns NULL (typed as INTEGER)
 
 ### To FLOAT
 
@@ -128,7 +128,7 @@ SELECT CAST(NULL AS BOOLEAN);                  -- Returns FALSE
 - **From TEXT**: Parses numeric string ("123.45" → 123.45), non-numeric strings become 0.0
 - **From BOOLEAN**: TRUE → 1.0, FALSE → 0.0
 - **From TIMESTAMP**: Converts to Unix timestamp with fractional seconds
-- **From NULL**: Returns 0.0
+- **From NULL**: Returns NULL (typed as FLOAT)
 
 ### To TEXT
 
@@ -136,7 +136,7 @@ SELECT CAST(NULL AS BOOLEAN);                  -- Returns FALSE
 - **From FLOAT**: String representation (123.45 → "123.45")
 - **From BOOLEAN**: "true" or "false"
 - **From TIMESTAMP**: ISO 8601 format ("2023-05-15T14:30:00Z")
-- **From NULL**: Returns empty string ("")
+- **From NULL**: Returns NULL (typed as TEXT)
 
 ### To BOOLEAN
 
@@ -144,14 +144,14 @@ SELECT CAST(NULL AS BOOLEAN);                  -- Returns FALSE
 - **From FLOAT**: 0.0 → FALSE, non-zero → TRUE
 - **From TEXT**: "true", "t", "yes", "y", "1" → TRUE (case-insensitive)
                 "false", "f", "no", "n", "0", "" → FALSE (case-insensitive)
-- **From NULL**: Returns FALSE
+- **From NULL**: Returns NULL (typed as BOOLEAN)
 
 ### To TIMESTAMP
 
 - **From INTEGER**: Interpreted as Unix timestamp
 - **From FLOAT**: Interpreted as Unix timestamp with fractional seconds
 - **From TEXT**: Parses date/time string in various formats
-- **From NULL**: Returns zero time value
+- **From NULL**: Returns NULL (typed as TIMESTAMP)
 
 ### To JSON
 
@@ -179,17 +179,20 @@ Stoolap performs implicit type conversion in these contexts:
 
 ## NULL Handling in CAST Operations
 
-Stoolap converts NULL to a type-specific default value when cast. This differs from standard SQL which returns NULL:
+Following the SQL standard, casting NULL preserves NULL with the target type:
 
-| CAST(NULL AS ...) | Result |
-|-------------------|--------|
-| INTEGER | 0 |
-| FLOAT | 0.0 |
-| TEXT | "" (empty string) |
-| BOOLEAN | FALSE |
-| TIMESTAMP | zero time |
+```sql
+SELECT CAST(NULL AS INTEGER);    -- NULL (typed as INTEGER)
+SELECT CAST(NULL AS TEXT);       -- NULL (typed as TEXT)
+SELECT CAST(NULL AS BOOLEAN);    -- NULL (typed as BOOLEAN)
+SELECT CAST(NULL AS TIMESTAMP);  -- NULL (typed as TIMESTAMP)
+```
 
-Note: This is Stoolap-specific behavior. Use `COALESCE` or `NULLIF` to handle NULLs explicitly if you need standard NULL preservation.
+Use `COALESCE` to provide default values when NULL is not desired:
+
+```sql
+SELECT COALESCE(CAST(NULL AS INTEGER), 0);  -- 0
+```
 
 ## Best Practices
 

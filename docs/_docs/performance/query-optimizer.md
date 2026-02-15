@@ -285,6 +285,6 @@ The optimizer uses these tunable constants:
 | cpu_operator_cost | Cost to evaluate one predicate | 0.0025 |
 | seq_page_cost | Cost for sequential I/O | 1.0 |
 | random_page_cost | Cost for random I/O | 2.0 |
-| pk_lookup_cost | Cost for primary key lookup | 0.1 |
+| pk_lookup_cost | Cost for primary key lookup | 1.0 |
 
 These values are tuned for in-memory operation and may differ from disk-based databases.

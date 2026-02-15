@@ -638,6 +638,7 @@ impl Executor {
             Statement::Commit(stmt) => self.execute_commit_stmt(stmt, &ctx),
             Statement::Rollback(stmt) => self.execute_rollback_stmt(stmt, &ctx),
             Statement::Savepoint(stmt) => self.execute_savepoint(stmt, &ctx),
+            Statement::ReleaseSavepoint(stmt) => self.execute_release_savepoint(stmt, &ctx),
 
             // Utility statements
             Statement::Set(stmt) => self.execute_set(stmt, &ctx),

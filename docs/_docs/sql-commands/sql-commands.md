@@ -420,7 +420,11 @@ TRUNCATE TABLE table_name;
 TRUNCATE TABLE logs;
 ```
 
-Note: TRUNCATE is faster than DELETE for removing all rows because it doesn't log individual row deletions.
+**Important notes:**
+- TRUNCATE is faster than DELETE because it doesn't log individual row deletions
+- Unlike DELETE, TRUNCATE **cannot be rolled back** — ROLLBACK will not restore truncated rows
+- TRUNCATE will fail if another transaction has uncommitted changes on the table
+- TRUNCATE will fail if the table is referenced by foreign key constraints with existing child rows
 
 ## Data Definition Language (DDL)
 
