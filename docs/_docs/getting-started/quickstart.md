@@ -35,7 +35,7 @@ Stoolap includes a command-line interface (CLI) for interactive use:
 ./target/release/stoolap --db "file:///path/to/data"
 
 # Execute a query directly
-./target/release/stoolap -q "SELECT 1 + 1"
+./target/release/stoolap -e "SELECT 1 + 1"
 ```
 
 ## Creating a Table

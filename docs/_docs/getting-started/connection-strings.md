@@ -136,7 +136,7 @@ stoolap --db "file:///data/mydb"
 stoolap --db "file:///data/mydb?sync_mode=full"
 
 # Execute a query directly
-stoolap --db "file:///data/mydb" -q "SELECT * FROM users"
+stoolap --db "file:///data/mydb" -e "SELECT * FROM users"
 ```
 
 ## PRAGMA Configuration
