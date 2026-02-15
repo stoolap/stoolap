@@ -179,13 +179,17 @@ Stoolap performs implicit type conversion in these contexts:
 
 ## NULL Handling in CAST Operations
 
-As shown in the test files, casting NULL values follows these rules:
+Stoolap converts NULL to a type-specific default value when cast. This differs from standard SQL which returns NULL:
 
-- NULL cast to INTEGER becomes 0
-- NULL cast to FLOAT becomes 0.0
-- NULL cast to TEXT becomes empty string ("")
-- NULL cast to BOOLEAN becomes FALSE
-- NULL cast to TIMESTAMP becomes zero time
+| CAST(NULL AS ...) | Result |
+|-------------------|--------|
+| INTEGER | 0 |
+| FLOAT | 0.0 |
+| TEXT | "" (empty string) |
+| BOOLEAN | FALSE |
+| TIMESTAMP | zero time |
+
+Note: This is Stoolap-specific behavior. Use `COALESCE` or `NULLIF` to handle NULLs explicitly if you need standard NULL preservation.
 
 ## Best Practices
 

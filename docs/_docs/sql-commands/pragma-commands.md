@@ -33,28 +33,30 @@ Stoolap currently supports the following PRAGMA commands:
 
 ### Snapshot and WAL Configuration
 
+| PRAGMA | Description | Default |
+|--------|-------------|---------|
+| `snapshot_interval` | Seconds between automatic snapshots | 300 |
+| `sync_mode` | WAL sync mode (0=None, 1=Normal, 2=Full) | 1 |
+| `keep_snapshots` | Number of snapshots to retain per table | 3 |
+| `wal_flush_trigger` | Operations before WAL flush | 32768 |
+| `create_snapshot` | Manually create a snapshot (no value) | - |
+
 #### snapshot_interval
 
-Controls how often the database creates snapshots of the data (in seconds).
+Controls how often the database creates snapshots of the data (in seconds). Default: 300.
 
 ```sql
--- Set snapshot interval to 60 seconds
 PRAGMA snapshot_interval = 60;
-
--- Get current snapshot interval
-PRAGMA snapshot_interval;
+PRAGMA snapshot_interval;       -- read current value
 ```
 
 #### sync_mode
 
-Controls the synchronization mode for the Write-Ahead Log (WAL):
+Controls the synchronization mode for the Write-Ahead Log (WAL). Default: 1 (Normal).
 
 ```sql
--- Set sync mode to 1 (normal)
 PRAGMA sync_mode = 1;
-
--- Get current sync mode
-PRAGMA sync_mode;
+PRAGMA sync_mode;               -- read current value
 ```
 
 Supported values:
@@ -64,26 +66,20 @@ Supported values:
 
 #### keep_snapshots
 
-Controls how many snapshots to retain for each table:
+Controls how many snapshots to retain for each table. Default: 3.
 
 ```sql
--- Keep 5 snapshots per table
 PRAGMA keep_snapshots = 5;
-
--- Get current number of snapshots kept
-PRAGMA keep_snapshots;
+PRAGMA keep_snapshots;          -- read current value
 ```
 
 #### wal_flush_trigger
 
-Controls the number of operations before the WAL is flushed to disk:
+Controls the number of operations before the WAL is flushed to disk. Default: 32768.
 
 ```sql
--- Set WAL flush trigger to 1000 operations
 PRAGMA wal_flush_trigger = 1000;
-
--- Get current WAL flush trigger
-PRAGMA wal_flush_trigger;
+PRAGMA wal_flush_trigger;       -- read current value
 ```
 
 ### Manual Snapshot Control

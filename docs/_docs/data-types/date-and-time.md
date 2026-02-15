@@ -62,17 +62,42 @@ Based on the implementation, Stoolap recognizes various date and time formats:
 
 ## Date and Time Functions
 
-### NOW()
-
-Returns the current date and time:
+### NOW() / CURRENT_TIMESTAMP / CURRENT_DATE
 
 ```sql
--- Insert the current timestamp
-INSERT INTO events (id, event_name, created_at)
-VALUES (1, 'Meeting', NOW());
+SELECT NOW();                -- Current timestamp
+SELECT CURRENT_TIMESTAMP;    -- Same as NOW()
+SELECT CURRENT_DATE;         -- Current date (at midnight UTC)
+```
 
--- Filter for records created today
-SELECT * FROM events WHERE created_at >= NOW();
+### EXTRACT(field FROM timestamp)
+
+Extracts a date/time component using SQL standard syntax:
+
+```sql
+SELECT EXTRACT(YEAR FROM '2024-03-15');              -- 2024
+SELECT EXTRACT(MONTH FROM '2024-03-15');             -- 3
+SELECT EXTRACT(DAY FROM '2024-03-15');               -- 15
+SELECT EXTRACT(HOUR FROM '2024-03-15 14:30:00');     -- 14
+SELECT EXTRACT(MINUTE FROM '2024-03-15 14:30:00');   -- 30
+SELECT EXTRACT(SECOND FROM '2024-03-15 14:30:45');   -- 45
+SELECT EXTRACT(DOW FROM '2024-03-15');               -- 5 (day of week, 0=Sunday)
+SELECT EXTRACT(DOY FROM '2024-03-15');               -- 75 (day of year)
+SELECT EXTRACT(WEEK FROM '2024-03-15');              -- 11 (ISO week)
+SELECT EXTRACT(QUARTER FROM '2024-05-15');           -- 2
+```
+
+### YEAR / MONTH / DAY / HOUR / MINUTE / SECOND
+
+Shorthand functions for extracting date/time parts:
+
+```sql
+SELECT YEAR('2024-03-15');                 -- 2024
+SELECT MONTH('2024-03-15');                -- 3
+SELECT DAY('2024-03-15');                  -- 15
+SELECT HOUR('2024-03-15 14:30:45');        -- 14
+SELECT MINUTE('2024-03-15 14:30:45');      -- 30
+SELECT SECOND('2024-03-15 14:30:45');      -- 45
 ```
 
 ### DATE_TRUNC(unit, timestamp)
@@ -80,39 +105,55 @@ SELECT * FROM events WHERE created_at >= NOW();
 Truncates a timestamp to the specified precision:
 
 ```sql
--- Truncate to day (removes time component)
 SELECT DATE_TRUNC('day', event_date) FROM events;
-
--- Truncate to month (sets day to 1 and time to 00:00:00)
 SELECT DATE_TRUNC('month', event_date) FROM events;
 ```
 
-Supported units:
-- `year` - Truncates to the beginning of the year
-- `month` - Truncates to the beginning of the month
-- `day` - Truncates to the beginning of the day
-- `hour` - Truncates to the beginning of the hour
-- `minute` - Truncates to the beginning of the minute
-- `second` - Truncates to the beginning of the second
+Supported units: `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`
 
 ### TIME_TRUNC(interval, timestamp)
 
 Truncates a timestamp to a specific time interval, useful for time series data:
 
 ```sql
--- Truncate to 15-minute intervals
 SELECT TIME_TRUNC('15m', event_time) FROM events;
-
--- Truncate to 1-hour intervals
 SELECT TIME_TRUNC('1h', event_time) FROM events;
 ```
 
-The interval parameter accepts duration strings like:
-- `15m` - 15 minutes
-- `30m` - 30 minutes
-- `1h` - 1 hour
-- `4h` - 4 hours
-- `1d` - 1 day
+The interval parameter accepts duration strings like `15m`, `30m`, `1h`, `4h`, `1d`.
+
+### DATE_ADD / DATE_SUB
+
+Add or subtract intervals from a timestamp:
+
+```sql
+SELECT DATE_ADD('2024-03-15', 10);                -- Add 10 days (default)
+SELECT DATE_ADD('2024-03-15', 2, 'month');        -- Add 2 months
+SELECT DATE_SUB('2024-03-15', 1, 'month');        -- Subtract 1 month
+```
+
+Supported units: `year`, `month`, `week`, `day`, `hour`, `minute`, `second`
+
+### DATEDIFF / DATE_DIFF
+
+Returns the difference between two dates in days:
+
+```sql
+SELECT DATEDIFF('2024-03-15', '2024-03-01');      -- 14
+SELECT DATE_DIFF('2024-03-15', '2024-03-01');     -- 14 (alias)
+```
+
+### TO_CHAR(timestamp, format)
+
+Formats a timestamp as a string:
+
+```sql
+SELECT TO_CHAR('2024-03-15 14:30:45', 'YYYY-MM-DD');     -- '2024-03-15'
+SELECT TO_CHAR('2024-03-15 14:30:45', 'DD MON YYYY');    -- '15 MAR 2024'
+SELECT TO_CHAR('2024-03-15 14:30:45', 'HH24:MI:SS');     -- '14:30:45'
+```
+
+Format patterns: `YYYY`, `YY`, `MM`, `MON`, `MONTH`, `DD`, `DY`, `DAY`, `HH24`, `HH`/`HH12`, `MI`, `SS`
 
 ## Date and Time Arithmetic with INTERVAL
 
@@ -255,15 +296,9 @@ SELECT * FROM events WHERE event_date >= '2023-05-01';
 
 ## Limitations
 
-Based on the implementation, Stoolap has the following limitations for date and time handling:
+1. **Limited Time Zone Support**: Timestamps are normalized to UTC internally. There are no explicit functions for time zone conversion.
 
-1. **Limited Time Zone Support**: While timestamps are normalized to UTC internally, there are no explicit functions for time zone conversion.
-
-2. **No Date/Time Extraction**: Functions to extract parts from dates (like EXTRACT(YEAR FROM date)) are not implemented.
-
-3. **No Custom Formatting**: No functions to format timestamps in custom output formats.
-
-4. **Approximate Month and Year Intervals**: INTERVAL calculations for months and years use approximations (30 days for months, 365 days for years) rather than calendar-aware calculations.
+2. **Approximate Month and Year Intervals**: INTERVAL calculations for months and years use approximations (30 days for months, 365 days for years) rather than calendar-aware calculations.
 
 ## Best Practices
 

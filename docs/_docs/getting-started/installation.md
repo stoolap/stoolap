@@ -33,7 +33,7 @@ To use Stoolap as a library in your Rust project:
 
 ```toml
 [dependencies]
-stoolap = "0.1"
+stoolap = "0.3"
 ```
 
 ### Method 3: Building from Source
@@ -88,7 +88,7 @@ To use Stoolap in your Rust application:
 
 ```toml
 [dependencies]
-stoolap = "0.1"
+stoolap = "0.3"
 ```
 
 Then use it in your code:

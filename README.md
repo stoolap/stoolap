@@ -56,7 +56,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-stoolap = "0.2"
+stoolap = "0.3"
 ```
 
 Or build from source:
@@ -296,36 +296,36 @@ WHERE c.country = 'US';
 
 ---
 
-## Built-in Functions (100+)
+## Built-in Functions (110)
 
 <details>
 <summary><b>String Functions</b></summary>
 
-`UPPER`, `LOWER`, `LENGTH`, `TRIM`, `LTRIM`, `RTRIM`, `CONCAT`, `SUBSTRING`, `REPLACE`, `REVERSE`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `POSITION`, `LOCATE`, `INSTR`, `SPLIT_PART`, `INITCAP`, `ASCII`, `CHR`, `TRANSLATE`
+`UPPER`, `LOWER`, `LENGTH`, `CHAR_LENGTH`, `CHAR`, `TRIM`, `LTRIM`, `RTRIM`, `CONCAT`, `CONCAT_WS`, `SUBSTRING`, `SUBSTR`, `REPLACE`, `REVERSE`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `POSITION`, `STRPOS`, `LOCATE`, `INSTR`, `SPLIT_PART`
 </details>
 
 <details>
 <summary><b>Math Functions</b></summary>
 
-`ABS`, `CEIL`, `FLOOR`, `ROUND`, `TRUNC`, `SQRT`, `POWER`, `MOD`, `SIGN`, `GREATEST`, `LEAST`, `EXP`, `LN`, `LOG`, `LOG10`, `LOG2`, `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `ATAN2`, `DEGREES`, `RADIANS`, `PI`, `RAND`, `RANDOM`
+`ABS`, `CEIL`, `CEILING`, `FLOOR`, `ROUND`, `TRUNCATE`, `TRUNC`, `SQRT`, `POWER`, `POW`, `MOD`, `SIGN`, `GREATEST`, `LEAST`, `EXP`, `LN`, `LOG`, `LOG10`, `LOG2`, `SIN`, `COS`, `TAN`, `PI`, `RANDOM`
 </details>
 
 <details>
 <summary><b>Date/Time Functions</b></summary>
 
-`NOW`, `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP`, `EXTRACT`, `DATE_TRUNC`, `DATE_ADD`, `DATE_SUB`, `DATEDIFF`, `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `DAYOFWEEK`, `DAYOFYEAR`, `WEEK`, `QUARTER`, `TO_CHAR`, `TO_DATE`, `TO_TIMESTAMP`
+`NOW`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `EXTRACT`, `DATE_TRUNC`, `TIME_TRUNC`, `DATE_ADD`, `DATE_SUB`, `DATEDIFF`, `DATE_DIFF`, `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `TO_CHAR`, `VERSION`
 </details>
 
 <details>
 <summary><b>JSON Functions</b></summary>
 
-`JSON_EXTRACT`, `JSON_EXTRACT_PATH`, `JSON_TYPE`, `JSON_TYPEOF`, `JSON_VALID`, `JSON_KEYS`, `JSON_ARRAY_LENGTH`
+`JSON_EXTRACT`, `JSON_TYPE`, `JSON_TYPEOF`, `JSON_VALID`, `JSON_KEYS`, `JSON_ARRAY`, `JSON_ARRAY_LENGTH`, `JSON_OBJECT`
 </details>
 
 <details>
 <summary><b>Aggregate Functions</b></summary>
 
-`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP`, `VARIANCE`, `VAR_POP`, `VAR_SAMP`, `STRING_AGG`, `ARRAY_AGG`, `FIRST`, `LAST`, `BIT_AND`, `BIT_OR`, `BIT_XOR`, `BOOL_AND`, `BOOL_OR`
+`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `MEDIAN`, `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP`, `VARIANCE`, `VAR_POP`, `VAR_SAMP`, `STRING_AGG`, `GROUP_CONCAT`, `ARRAY_AGG`, `FIRST`, `LAST`
 </details>
 
 <details>
@@ -337,7 +337,7 @@ WHERE c.country = 'US';
 <details>
 <summary><b>Utility Functions</b></summary>
 
-`COALESCE`, `NULLIF`, `CAST`, `CASE`, `IF`, `IIF`, `NVL`, `NVL2`, `DECODE`, `GENERATE_SERIES`
+`COALESCE`, `NULLIF`, `IFNULL`, `CAST`, `IIF`, `TYPEOF`, `COLLATE`, `SLEEP`
 </details>
 
 ---
@@ -375,7 +375,7 @@ src/
 │   ├── operators/     # Volcano-style operators
 │   ├── parallel.rs    # Parallel execution (Rayon)
 │   └── expression/    # Expression VM
-├── functions/     # 100+ built-in functions
+├── functions/     # 110 built-in functions
 │   ├── scalar/        # String, math, date, JSON
 │   ├── aggregate/     # COUNT, SUM, AVG, etc.
 │   └── window/        # ROW_NUMBER, RANK, LAG, etc.

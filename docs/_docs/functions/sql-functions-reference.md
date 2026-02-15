@@ -7,284 +7,241 @@ order: 1
 
 # SQL Functions Reference
 
-This document provides a comprehensive reference for the SQL functions supported by Stoolap, categorized by function type.
+Quick reference for all 110 built-in SQL functions in Stoolap, organized by category. For detailed documentation with examples, see [Scalar Functions]({% link _docs/functions/scalar-functions.md %}), [Aggregate Functions]({% link _docs/functions/aggregate-functions.md %}), and [Window Functions]({% link _docs/functions/window-functions.md %}).
 
-## Aggregate Functions
+## Aggregate Functions (17)
 
-Aggregate functions perform a calculation on a set of values and return a single value.
+Aggregate functions operate on a set of rows and return a single value. Used with `GROUP BY` or over entire result sets.
 
-### AVG
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `COUNT` | `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT expr)` | Count rows or non-NULL values |
+| `SUM` | `SUM(expr)`, `SUM(DISTINCT expr)` | Sum of numeric values |
+| `AVG` | `AVG(expr)`, `AVG(DISTINCT expr)` | Average of numeric values |
+| `MIN` | `MIN(expr)` | Minimum value |
+| `MAX` | `MAX(expr)` | Maximum value |
+| `FIRST` | `FIRST(expr)` | First value in a group |
+| `LAST` | `LAST(expr)` | Last value in a group |
+| `MEDIAN` | `MEDIAN(expr)` | Median value (50th percentile) |
+| `STRING_AGG` | `STRING_AGG(expr, delimiter)` | Concatenate values with delimiter |
+| `GROUP_CONCAT` | `GROUP_CONCAT(expr, delimiter)` | Alias for STRING_AGG |
+| `ARRAY_AGG` | `ARRAY_AGG(expr)` | Collect values into a JSON array |
+| `STDDEV` | `STDDEV(expr)` | Sample standard deviation (alias for STDDEV_SAMP) |
+| `STDDEV_SAMP` | `STDDEV_SAMP(expr)` | Sample standard deviation |
+| `STDDEV_POP` | `STDDEV_POP(expr)` | Population standard deviation |
+| `VARIANCE` | `VARIANCE(expr)` | Sample variance (alias for VAR_SAMP) |
+| `VAR_SAMP` | `VAR_SAMP(expr)` | Sample variance |
+| `VAR_POP` | `VAR_POP(expr)` | Population variance |
 
-Calculates the average of a numeric column.
+## Scalar Functions (82)
+
+### String Functions (24)
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `UPPER` | `UPPER(str)` | Convert to uppercase |
+| `LOWER` | `LOWER(str)` | Convert to lowercase |
+| `LENGTH` | `LENGTH(str)` | String length in characters |
+| `CHAR_LENGTH` | `CHAR_LENGTH(str)` | String length in characters (alias for LENGTH) |
+| `CHAR` | `CHAR(code)` | Character from Unicode code point |
+| `CONCAT` | `CONCAT(str1, str2, ...)` | Concatenate strings |
+| `CONCAT_WS` | `CONCAT_WS(sep, str1, str2, ...)` | Concatenate with separator |
+| `SUBSTRING` | `SUBSTRING(str, pos, len)` | Extract substring |
+| `SUBSTR` | `SUBSTR(str, pos, len)` | Alias for SUBSTRING |
+| `TRIM` | `TRIM(str)` | Remove leading/trailing whitespace |
+| `LTRIM` | `LTRIM(str)` | Remove leading whitespace |
+| `RTRIM` | `RTRIM(str)` | Remove trailing whitespace |
+| `REPLACE` | `REPLACE(str, from, to)` | Replace occurrences |
+| `REVERSE` | `REVERSE(str)` | Reverse a string |
+| `LEFT` | `LEFT(str, n)` | First n characters |
+| `RIGHT` | `RIGHT(str, n)` | Last n characters |
+| `REPEAT` | `REPEAT(str, n)` | Repeat string n times |
+| `SPLIT_PART` | `SPLIT_PART(str, delim, n)` | Extract nth part after splitting |
+| `POSITION` | `POSITION(substr IN str)` | Position of substring (1-based) |
+| `STRPOS` | `STRPOS(str, substr)` | Position of substring (1-based) |
+| `INSTR` | `INSTR(str, substr)` | Position of substring (1-based) |
+| `LOCATE` | `LOCATE(substr, str)` | Position of substring (1-based) |
+| `LPAD` | `LPAD(str, len, pad)` | Left-pad to length |
+| `RPAD` | `RPAD(str, len, pad)` | Right-pad to length |
+
+### Math Functions (22)
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `ABS` | `ABS(n)` | Absolute value |
+| `ROUND` | `ROUND(n)`, `ROUND(n, decimals)` | Round to nearest integer or decimal places |
+| `FLOOR` | `FLOOR(n)` | Round down to nearest integer |
+| `CEILING` | `CEILING(n)` | Round up to nearest integer |
+| `CEIL` | `CEIL(n)` | Alias for CEILING |
+| `MOD` | `MOD(a, b)` | Modulo (remainder) |
+| `POWER` | `POWER(base, exp)` | Exponentiation |
+| `POW` | `POW(base, exp)` | Alias for POWER |
+| `SQRT` | `SQRT(n)` | Square root |
+| `LOG` | `LOG(n)`, `LOG(base, n)` | Natural log or log with base |
+| `LOG10` | `LOG10(n)` | Base-10 logarithm |
+| `LOG2` | `LOG2(n)` | Base-2 logarithm |
+| `LN` | `LN(n)` | Natural logarithm |
+| `EXP` | `EXP(n)` | e raised to the power n |
+| `SIGN` | `SIGN(n)` | Sign of number (-1, 0, or 1) |
+| `TRUNCATE` | `TRUNCATE(n, decimals)` | Truncate to decimal places |
+| `TRUNC` | `TRUNC(n, decimals)` | Alias for TRUNCATE |
+| `PI` | `PI()` | Value of Pi (3.14159...) |
+| `RANDOM` | `RANDOM()` | Random float between 0 and 1 |
+| `SIN` | `SIN(n)` | Sine (radians) |
+| `COS` | `COS(n)` | Cosine (radians) |
+| `TAN` | `TAN(n)` | Tangent (radians) |
+
+### Date/Time Functions (18)
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `NOW` | `NOW()` | Current date and time |
+| `CURRENT_DATE` | `CURRENT_DATE` | Current date |
+| `CURRENT_TIMESTAMP` | `CURRENT_TIMESTAMP` | Current date and time (alias for NOW) |
+| `DATE_TRUNC` | `DATE_TRUNC(unit, timestamp)` | Truncate timestamp to unit |
+| `TIME_TRUNC` | `TIME_TRUNC(unit, timestamp)` | Truncate time to unit |
+| `EXTRACT` | `EXTRACT(field FROM timestamp)` | Extract date/time field |
+| `YEAR` | `YEAR(timestamp)` | Extract year |
+| `MONTH` | `MONTH(timestamp)` | Extract month |
+| `DAY` | `DAY(timestamp)` | Extract day |
+| `HOUR` | `HOUR(timestamp)` | Extract hour |
+| `MINUTE` | `MINUTE(timestamp)` | Extract minute |
+| `SECOND` | `SECOND(timestamp)` | Extract second |
+| `DATE_ADD` | `DATE_ADD(timestamp, INTERVAL n unit)` | Add interval to date |
+| `DATE_SUB` | `DATE_SUB(timestamp, INTERVAL n unit)` | Subtract interval from date |
+| `DATEDIFF` | `DATEDIFF(unit, start, end)` | Difference between dates |
+| `DATE_DIFF` | `DATE_DIFF(unit, start, end)` | Alias for DATEDIFF |
+| `TO_CHAR` | `TO_CHAR(timestamp, format)` | Format timestamp as string |
+| `VERSION` | `VERSION()` | Database version string |
+
+### JSON Functions (8)
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `JSON_EXTRACT` | `JSON_EXTRACT(json, path)` | Extract value at JSON path |
+| `JSON_ARRAY_LENGTH` | `JSON_ARRAY_LENGTH(json)` | Length of JSON array |
+| `JSON_ARRAY` | `JSON_ARRAY(val1, val2, ...)` | Create JSON array |
+| `JSON_OBJECT` | `JSON_OBJECT(key1, val1, ...)` | Create JSON object |
+| `JSON_TYPE` | `JSON_TYPE(json)` | Type of JSON value |
+| `JSON_TYPEOF` | `JSON_TYPEOF(json)` | Alias for JSON_TYPE |
+| `JSON_VALID` | `JSON_VALID(str)` | Check if string is valid JSON |
+| `JSON_KEYS` | `JSON_KEYS(json)` | Get keys of JSON object |
+
+JSON shorthand operators are also supported:
+
+| Operator | Description | Example |
+|----------|-------------|---------|
+| `->` | Extract JSON value (returns JSON) | `col -> 'key'` |
+| `->>` | Extract JSON value (returns TEXT) | `col ->> 'key'` |
+
+### Conditional Functions (4)
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `COALESCE` | `COALESCE(expr1, expr2, ...)` | First non-NULL value |
+| `NULLIF` | `NULLIF(expr1, expr2)` | NULL if expr1 = expr2 |
+| `IFNULL` | `IFNULL(expr, default)` | Default value if NULL |
+| `IIF` | `IIF(condition, true_val, false_val)` | Inline conditional |
+
+### Type and Comparison Functions (5)
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `CAST` | `CAST(expr AS type)` | Convert to another data type |
+| `TYPEOF` | `TYPEOF(expr)` | Return the data type name |
+| `COLLATE` | `expr COLLATE collation` | Apply collation for comparison |
+| `GREATEST` | `GREATEST(val1, val2, ...)` | Largest value from list |
+| `LEAST` | `LEAST(val1, val2, ...)` | Smallest value from list |
+
+### System Functions (1)
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `SLEEP` | `SLEEP(seconds)` | Pause execution (for testing) |
+
+## Window Functions (11)
+
+Window functions perform calculations across a set of rows related to the current row. Used with the `OVER` clause.
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `ROW_NUMBER` | `ROW_NUMBER() OVER (...)` | Sequential row number |
+| `RANK` | `RANK() OVER (...)` | Rank with gaps for ties |
+| `DENSE_RANK` | `DENSE_RANK() OVER (...)` | Rank without gaps for ties |
+| `NTILE` | `NTILE(n) OVER (...)` | Distribute rows into n groups |
+| `LEAD` | `LEAD(expr, offset, default) OVER (...)` | Value from following row |
+| `LAG` | `LAG(expr, offset, default) OVER (...)` | Value from preceding row |
+| `FIRST_VALUE` | `FIRST_VALUE(expr) OVER (...)` | First value in window frame |
+| `LAST_VALUE` | `LAST_VALUE(expr) OVER (...)` | Last value in window frame |
+| `NTH_VALUE` | `NTH_VALUE(expr, n) OVER (...)` | Nth value in window frame |
+| `PERCENT_RANK` | `PERCENT_RANK() OVER (...)` | Relative rank (0 to 1) |
+| `CUME_DIST` | `CUME_DIST() OVER (...)` | Cumulative distribution (0 to 1) |
+
+### Window Frame Syntax
 
 ```sql
-SELECT AVG(price) FROM products;
+function OVER (
+    [PARTITION BY col1, col2, ...]
+    [ORDER BY col1 [ASC|DESC], ...]
+    [frame_clause]
+)
 ```
 
-### COUNT
+Frame clause options:
 
-Counts the number of rows or non-NULL values.
+| Frame | Description |
+|-------|-------------|
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` | Default frame |
+| `ROWS BETWEEN n PRECEDING AND n FOLLOWING` | Fixed-size sliding window |
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` | Entire partition |
+| `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` | Range-based frame |
+
+### Named Windows
 
 ```sql
--- Count all rows
-SELECT COUNT(*) FROM users;
-
--- Count non-NULL values in a column
-SELECT COUNT(email) FROM users;
+SELECT
+    ROW_NUMBER() OVER w,
+    SUM(amount) OVER w
+FROM orders
+WINDOW w AS (PARTITION BY customer_id ORDER BY order_date);
 ```
 
-### FIRST
+## CASE Expression
 
-Returns the first value in a group.
+While not a function, `CASE` is commonly used alongside functions:
 
 ```sql
-SELECT category, FIRST(name) FROM products GROUP BY category;
+-- Simple CASE
+CASE status WHEN 'A' THEN 'Active' WHEN 'I' THEN 'Inactive' END
+
+-- Searched CASE
+CASE WHEN age >= 18 THEN 'Adult' ELSE 'Minor' END
 ```
 
-### LAST
+## Common Patterns
 
-Returns the last value in a group.
-
-```sql
-SELECT category, LAST(name) FROM products GROUP BY category;
-```
-
-### MAX
-
-Returns the maximum value from a column.
-
-```sql
-SELECT MAX(price) FROM products;
-```
-
-### MIN
-
-Returns the minimum value from a column.
-
-```sql
-SELECT MIN(price) FROM products;
-```
-
-### SUM
-
-Calculates the sum of values in a numeric column.
-
-```sql
-SELECT SUM(quantity * price) FROM order_items;
-```
-
-## Scalar Functions
-
-Scalar functions operate on a single value and return a single value.
-
-### String Functions
-
-#### CONCAT
-
-Concatenates two or more strings.
-
-```sql
-SELECT CONCAT(first_name, ' ', last_name) FROM users;
-```
-
-#### LENGTH
-
-Returns the length of a string.
-
-```sql
-SELECT name, LENGTH(name) FROM products;
-```
-
-#### LOWER
-
-Converts a string to lowercase.
-
-```sql
-SELECT LOWER(email) FROM users;
-```
-
-#### UPPER
-
-Converts a string to uppercase.
-
-```sql
-SELECT UPPER(country_code) FROM locations;
-```
-
-#### SUBSTRING
-
-Extracts a portion of a string.
-
-```sql
--- Syntax: SUBSTRING(string, start_position, length)
-SELECT SUBSTRING(description, 1, 100) FROM products;
-```
-
-#### COLLATE
-
-Compares strings using specific collation rules.
-
-```sql
-SELECT * FROM users ORDER BY name COLLATE NOCASE;
-```
-
-### Numeric Functions
-
-#### ABS
-
-Returns the absolute value of a number.
-
-```sql
-SELECT ABS(temperature) FROM weather_data;
-```
-
-#### CEILING
-
-Rounds a number up to the nearest integer.
-
-```sql
-SELECT CEILING(price) FROM products;
-```
-
-#### FLOOR
-
-Rounds a number down to the nearest integer.
-
-```sql
-SELECT FLOOR(price) FROM products;
-```
-
-#### ROUND
-
-Rounds a number to a specified number of decimal places.
-
-```sql
--- Round to nearest integer
-SELECT ROUND(price) FROM products;
-
--- Round to 2 decimal places
-SELECT ROUND(price, 2) FROM products;
-```
-
-### Date and Time Functions
-
-#### NOW
-
-Returns the current date and time.
-
-```sql
-SELECT NOW();
-```
-
-#### DATE_TRUNC
-
-Truncates a timestamp to a specified precision.
-
-```sql
--- Truncate to day (removes time component)
-SELECT DATE_TRUNC('day', timestamp) FROM events;
-
--- Truncate to month
-SELECT DATE_TRUNC('month', timestamp) FROM events;
-```
-
-#### TIME_TRUNC
-
-Truncates a time or timestamp to a specified precision.
-
-```sql
--- Truncate to hour
-SELECT TIME_TRUNC('hour', timestamp) FROM events;
-
--- Truncate to minute
-SELECT TIME_TRUNC('minute', timestamp) FROM events;
-```
-
-### Type Conversion Functions
-
-#### CAST
-
-Converts a value from one data type to another.
-
-```sql
--- Convert string to integer
-SELECT CAST(value AS INT) FROM data;
-
--- Convert string to timestamp
-SELECT CAST(date_string AS TIMESTAMP) FROM events;
-```
-
-### Conditional Functions
-
-#### COALESCE
-
-Returns the first non-NULL value from a list of expressions.
-
-```sql
-SELECT COALESCE(preferred_name, first_name, 'Unknown') FROM users;
-```
-
-## Window Functions
-
-Window functions perform calculations across a set of rows related to the current row.
-
-### ROW_NUMBER
-
-Assigns a unique sequential integer to each row within a partition.
-
-```sql
-SELECT name, department, salary,
-       ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary DESC) as rank
-FROM employees;
-```
-
-## Advanced Usage
-
-### Function Chaining
-
-Functions can be nested to perform complex operations:
+### Nesting Functions
 
 ```sql
 SELECT ROUND(AVG(price), 2) FROM products;
+SELECT UPPER(TRIM(name)) FROM users;
+SELECT COALESCE(NULLIF(value, ''), 'default') FROM config;
 ```
 
-### Functions in WHERE Clauses
-
-Functions can be used in WHERE clauses to filter data:
+### Functions in WHERE
 
 ```sql
+SELECT * FROM events WHERE YEAR(created_at) = 2024;
 SELECT * FROM products WHERE LOWER(name) LIKE '%organic%';
 ```
 
-### Functions in GROUP BY and HAVING
-
-Functions can be used in GROUP BY and HAVING clauses:
+### Functions with GROUP BY
 
 ```sql
-SELECT DATE_TRUNC('month', order_date) as month, SUM(total) as monthly_sales
+SELECT DATE_TRUNC('month', order_date) AS month,
+       COUNT(*) AS orders,
+       ROUND(AVG(total), 2) AS avg_total
 FROM orders
 GROUP BY DATE_TRUNC('month', order_date)
 HAVING SUM(total) > 10000;
 ```
-
-## Implementation Details
-
-Stoolap's function implementation is modular and extensible:
-
-- **Function Registry** - Central registry of all available functions
-- **Type Checking** - Functions validate argument types at parse time
-- **Function Categories** - Organized into scalar, aggregate, and window functions
-- **Custom Implementations** - Each function has a specialized implementation for performance
-
-Functions are defined in:
-- `src/functions/aggregate/` - Aggregate function implementations
-- `src/functions/scalar/` - Scalar function implementations
-- `src/functions/window/` - Window function implementations
-- `src/functions/registry.rs` - Function registration system
-
-## Performance Considerations
-
-- Avoid using functions on indexed columns in WHERE clauses, as this may prevent index usage
-- Some functions can be pushed down to the storage layer for better performance
-- Window functions may require multiple passes over the data
-- Complex function chains may impact query performance

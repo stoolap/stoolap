@@ -302,7 +302,7 @@ Stoolap provides comprehensive support for Common Table Expressions (CTEs) with 
 - CTEs with scalar subqueries in SELECT expressions
 
 ### Current Limitations
-1. **DML Operations**: CTEs in UPDATE, DELETE, or INSERT statements are not yet supported
+1. **DML Operations**: CTEs in UPDATE and DELETE statements are not yet supported. CTEs in INSERT...SELECT are supported.
 2. **Performance**: CTE results are materialized in memory, which may impact performance for very large datasets
 
 ### Performance Considerations

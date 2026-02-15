@@ -11,6 +11,8 @@ Stoolap supports parameterized queries using positional parameters (`$1`, `$2`, 
 
 ## Syntax
 
+### Positional Parameters ($N)
+
 Parameters use the `$N` syntax where N is the 1-based position:
 
 ```sql
@@ -26,6 +28,19 @@ INSERT INTO users (id, name, age) VALUES ($1, $2, $3);
 -- Parameters in UPDATE
 UPDATE products SET price = $1 WHERE id = $2;
 ```
+
+### Question Mark Parameters (?)
+
+The `?` placeholder style is also supported. Parameters are bound in order of appearance:
+
+```sql
+-- Question mark placeholders
+SELECT * FROM users WHERE id = ?;
+INSERT INTO users (id, name) VALUES (?, ?);
+UPDATE products SET price = ? WHERE id = ?;
+```
+
+Both styles work identically. Use whichever is more natural for your application.
 
 ## Using Parameters in Rust
 

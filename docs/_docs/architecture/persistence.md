@@ -61,10 +61,13 @@ The WAL records these operations:
 - **INSERT**: New row insertions
 - **UPDATE**: Row modifications
 - **DELETE**: Row deletions
+- **TRUNCATE**: Bulk row removal
 - **CREATE TABLE**: Table creation (DDL)
 - **DROP TABLE**: Table deletion (DDL)
 - **CREATE INDEX**: Index creation (DDL)
 - **DROP INDEX**: Index deletion (DDL)
+- **ALTER TABLE**: Schema modifications (ADD/DROP/RENAME/MODIFY COLUMN, RENAME TABLE)
+- **CREATE VIEW / DROP VIEW**: View management (DDL)
 
 ### WAL Configuration
 
@@ -114,8 +117,8 @@ After a snapshot is created, older WAL entries can be safely deleted.
 -- Interval between automatic snapshots (in seconds, default: 300)
 PRAGMA snapshot_interval = 300;
 
--- Number of snapshots to retain (default: 5)
-PRAGMA keep_snapshots = 5;
+-- Number of snapshots to retain (default: 3)
+PRAGMA keep_snapshots = 3;
 
 -- Manually create a snapshot
 PRAGMA create_snapshot;
@@ -167,7 +170,7 @@ file:///path/to/database?sync_mode=2&snapshot_interval=60&keep_snapshots=3
 |-----------|-------------|---------|
 | sync_mode | WAL sync mode (0, 1, 2) | 1 |
 | snapshot_interval | Seconds between snapshots | 300 |
-| keep_snapshots | Number of snapshots to keep | 5 |
+| keep_snapshots | Number of snapshots to keep | 3 |
 
 ### PRAGMA Commands
 
@@ -268,14 +271,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // Fine-tune at runtime
-    db.execute("PRAGMA wal_flush_trigger = 5000")?;
-    db.execute("PRAGMA keep_snapshots = 7")?;
+    db.execute("PRAGMA wal_flush_trigger = 5000", ())?;
+    db.execute("PRAGMA keep_snapshots = 7", ())?;
 
     // Your application logic...
-    db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY AUTO_INCREMENT, data JSON)")?;
+    db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY AUTO_INCREMENT, data JSON)", ())?;
 
     // Force a snapshot before maintenance
-    db.execute("PRAGMA create_snapshot")?;
+    db.execute("PRAGMA create_snapshot", ())?;
 
     Ok(())
 }
