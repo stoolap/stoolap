@@ -1,0 +1,32 @@
+{
+  "name": "stoolap",
+  "type": "module",
+  "collaborators": [
+    "Stoolap Contributors"
+  ],
+  "description": "High-performance embedded SQL database with MVCC, time-travel queries, and full ACID compliance",
+  "version": "0.3.0",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stoolap/stoolap"
+  },
+  "files": [
+    "stoolap_bg.wasm",
+    "stoolap.js",
+    "stoolap.d.ts"
+  ],
+  "main": "stoolap.js",
+  "homepage": "https://stoolap.io",
+  "types": "stoolap.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ],
+  "keywords": [
+    "database",
+    "sql",
+    "embedded",
+    "mvcc",
+    "acid"
+  ]
+}
