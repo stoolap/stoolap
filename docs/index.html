@@ -3,61 +3,28 @@ layout: default
 title: Stoolap - High-performance embedded SQL database in Rust
 ---
 
-<!-- Hero — Split layout: text left, terminal preview right -->
+<!-- Hero — Immersive Terminal -->
 <section class="hero">
   <div class="hero-bg"></div>
   <div class="container hero-inner">
-    <div class="hero-split">
-      <div class="hero-text">
-        <p class="hero-badge">Open Source &middot; Apache 2.0</p>
-        <h1 class="hero-heading">Embed a Full SQL Database<br><span class="hero-accent">In Your Application</span></h1>
-        <p class="hero-desc">ACID transactions, cost-based optimizer, parallel execution, and 110 built-in functions. Pure Rust, zero C dependencies.</p>
-        <div class="hero-actions">
-          <a href="{{ '/docs/getting-started/installation/' | relative_url }}" class="btn-hero-primary">Get Started</a>
-          <a href="{{ '/playground' | relative_url }}" class="btn-hero-playground">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-            Try in Browser
-          </a>
-          <a href="{{ site.github.repository_url }}" class="btn-hero-ghost" target="_blank" rel="noopener">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
-            GitHub
-          </a>
-        </div>
-        <div class="hero-metrics">
-          <div class="hero-metric"><strong>173K+</strong><span>Lines of Rust</span></div>
-          <div class="hero-metric"><strong>4,100+</strong><span>Tests</span></div>
-          <div class="hero-metric"><strong>110</strong><span>Functions</span></div>
-          <div class="hero-metric"><strong>0</strong><span>C Deps</span></div>
-        </div>
+    <h1 class="hero-heading">The SQL Database That<br><span class="hero-accent">Ships With Your App</span></h1>
+    <p class="hero-tagline">Pure Rust. Zero C dependencies. ACID transactions, cost-based optimizer, parallel execution, and 110+ built-in functions. Compiles to WebAssembly.</p>
+    <div class="hero-terminal" id="heroTerminal" aria-hidden="true">
+      <div class="hero-term-output" id="heroTermOutput"></div>
+      <div class="hero-term-input">
+        <span class="hero-prompt">stoolap&gt;&nbsp;</span><span class="hero-typed" id="heroTyped"></span><span class="hero-cursor"></span>
       </div>
-      <div class="hero-visual">
-        <div class="hero-term">
-          <div class="hero-term-chrome">
-            <span class="term-dot" style="background:#ff5f56"></span>
-            <span class="term-dot" style="background:#ffbd2e"></span>
-            <span class="term-dot" style="background:#27c93f"></span>
-          </div>
-          <pre class="hero-term-body"><span class="t-muted">stoolap&gt;</span> <span class="t-purple">SELECT</span> u.name, <span class="t-fn">COUNT</span>(o.id) <span class="t-purple">AS</span> orders
-         <span class="t-purple">FROM</span> users u
-         <span class="t-purple">JOIN</span> orders o <span class="t-purple">ON</span> u.id = o.user_id
-         <span class="t-purple">GROUP BY</span> u.name
-         <span class="t-purple">ORDER BY</span> orders <span class="t-purple">DESC</span>;
-<span class="t-dim">+---------+--------+
-| name    | orders |
-+---------+--------+
-| Alice   |      3 |
-| Charlie |      2 |
-| Bob     |      2 |
-| Diana   |      2 |
-| Eve     |      1 |
-+---------+--------+
-5 rows in set (0.4ms)</span>
-
-<span class="t-muted">stoolap&gt;</span> <span class="t-purple">SELECT</span> * <span class="t-purple">FROM</span> users
-         <span class="t-purple">AS OF</span> <span class="t-green-str">'2024-01-15 10:30:00'</span>;
-<span class="t-dim">-- Time-travel: see data as it was</span></pre>
-        </div>
-      </div>
+    </div>
+    <div class="hero-actions">
+      <a href="{{ '/docs/getting-started/installation/' | relative_url }}" class="btn-hero-primary">Get Started</a>
+      <a href="{{ '/playground' | relative_url }}" class="btn-hero-playground">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        Try in Browser
+      </a>
+      <a href="{{ site.github.repository_url }}" class="btn-hero-ghost" target="_blank" rel="noopener">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+        GitHub
+      </a>
     </div>
   </div>
 </section>
