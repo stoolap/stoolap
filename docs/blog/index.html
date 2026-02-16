@@ -15,19 +15,25 @@ title: Blog - Stoolap
   <div class="container">
     <div class="blog-posts">
       {% assign posts = site.posts | sort: 'date' | reverse %}
-      {% for post in posts %}
-      <article class="blog-post-card">
-        <div class="post-date">{{ post.date | date: "%B %d, %Y" }}</div>
-        <h2 class="post-title">
-          <a href="{{ post.url | relative_url }}">{{ post.title }}</a>
-        </h2>
-        <p class="post-excerpt">{{ post.excerpt | strip_html | truncate: 200 }}</p>
-        <div class="post-meta">
-          <span class="post-author">By {{ post.author }}</span>
-          <a href="{{ post.url | relative_url }}" class="read-more">Read more →</a>
+      {% if posts.size > 0 %}
+        {% for post in posts %}
+        <article class="blog-post-card">
+          <div class="post-date">{{ post.date | date: "%B %d, %Y" }}</div>
+          <h2 class="post-title">
+            <a href="{{ post.url | relative_url }}">{{ post.title }}</a>
+          </h2>
+          <p class="post-excerpt">{{ post.excerpt | strip_html | truncate: 200 }}</p>
+          <div class="post-meta">
+            <span class="post-author">By {{ post.author }}</span>
+            <a href="{{ post.url | relative_url }}" class="read-more">Read more →</a>
+          </div>
+        </article>
+        {% endfor %}
+      {% else %}
+        <div class="blog-empty">
+          <p>No posts yet. Check back soon for technical insights and updates.</p>
         </div>
-      </article>
-      {% endfor %}
+      {% endif %}
     </div>
   </div>
 </section>

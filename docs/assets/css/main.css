@@ -1000,6 +1000,13 @@ img {
   margin: 0 auto;
 }
 
+.blog-empty {
+  text-align: center;
+  padding: 4rem 1rem;
+  color: var(--color-text-muted);
+  font-size: 1.05rem;
+}
+
 .blog-post-card {
   background: var(--color-bg);
   border-radius: var(--radius-lg);

@@ -1,5 +1,5 @@
 /**
- * Stoolap SQL Playground
+ * Stoolap Playground
  *
  * Terminal-style interface that loads Stoolap via WebAssembly.
  * Mirrors the CLI experience: command history, multi-line input,

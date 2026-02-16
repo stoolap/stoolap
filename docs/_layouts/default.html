@@ -76,7 +76,7 @@
         <nav class="main-nav" id="main-nav" aria-label="Main">
           <ul>
             <li><a href="{{ '/docs/' | relative_url }}" {% if page.url contains '/docs/' %}aria-current="page"{% endif %}>Docs</a></li>
-            <li><a href="{{ '/playground' | relative_url }}" {% if page.url == '/playground' or page.url == '/playground.html' %}aria-current="page"{% endif %}>Playground</a></li>
+            <li><a href="{{ '/playground' | relative_url }}" {% if page.url contains '/playground' %}aria-current="page"{% endif %}>Playground</a></li>
             <li><a href="{{ '/blog/' | relative_url }}" {% if page.url contains '/blog/' %}aria-current="page"{% endif %}>Blog</a></li>
             <li>
               <a href="{{ site.github.repository_url }}" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub repository">
