@@ -290,7 +290,13 @@ impl Executor {
             let null_str = if col.nullable { "YES" } else { "NO" };
 
             // Determine key type
-            let key_str = if col.primary_key { "PRI" } else { "" };
+            let key_str = if col.primary_key {
+                "PRI"
+            } else if schema.foreign_keys.iter().any(|fk| fk.column_index == i) {
+                "MUL"
+            } else {
+                ""
+            };
 
             // Get default value if any
             let default_str = col
@@ -300,12 +306,11 @@ impl Executor {
                 .unwrap_or_default();
 
             // Extra info (e.g., auto_increment equivalent)
-            let extra_str =
-                if col.primary_key && col.data_type == crate::core::types::DataType::Integer {
-                    "auto_increment"
-                } else {
-                    ""
-                };
+            let extra_str = if col.auto_increment {
+                "auto_increment"
+            } else {
+                ""
+            };
 
             rows.push((
                 i as i64,

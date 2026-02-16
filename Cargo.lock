@@ -2604,8 +2604,11 @@ dependencies = [
  "dhat",
  "dirs",
  "duckdb",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "hashbrown 0.16.1",
  "indexmap",
+ "js-sys",
  "libc",
  "lru",
  "lz4_flex",
@@ -2629,6 +2632,9 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
+ "wasm-bindgen",
+ "web-sys",
+ "web-time",
  "windows-sys 0.61.2",
 ]
 

@@ -33,10 +33,11 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use crate::common::time_compat::Instant;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Maximum number of query fingerprints to store
 /// This prevents unbounded memory growth in workload learner

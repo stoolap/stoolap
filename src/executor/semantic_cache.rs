@@ -74,12 +74,13 @@
 //!
 //! Future enhancement: Per-transaction cache scoping with timestamp-based invalidation
 
+use crate::common::time_compat::Instant;
 use rustc_hash::FxHasher;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::common::{CompactArc, StringMap};
 use crate::core::{Result, Row};

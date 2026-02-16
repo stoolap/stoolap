@@ -37,6 +37,7 @@
 //! - ORDER BY: 50,000+ rows
 //! - Hash join: 10,000+ build rows
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,8 +48,23 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::Expression;
 
-use super::expression::{ExpressionEval, RowFilter};
+use super::expression::ExpressionEval;
+#[cfg(feature = "parallel")]
+use super::expression::RowFilter;
 use super::utils::{hash_composite_key, hash_row, rows_equal, verify_composite_key_equality};
+
+/// Get number of parallel threads (1 when parallel feature is disabled)
+#[inline]
+fn num_threads() -> usize {
+    #[cfg(feature = "parallel")]
+    {
+        rayon::current_num_threads()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        1
+    }
+}
 
 // Re-export JoinType from operators::hash_join - single source of truth
 pub use super::operators::hash_join::JoinType;
@@ -162,41 +178,43 @@ pub fn parallel_filter(
     _function_registry: &FunctionRegistry,
     config: &ParallelConfig,
 ) -> Result<RowVec> {
-    let row_count = rows.len();
+    #[cfg(feature = "parallel")]
+    {
+        let row_count = rows.len();
+        if config.should_parallel_filter(row_count) {
+            // Calculate optimal chunk size based on available parallelism
+            // Goal: Create ~2-4 chunks per thread for good load balancing
+            let n_threads = num_threads();
+            let target_chunks = n_threads * 4;
+            let chunk_size = (row_count / target_chunks).max(config.chunk_size).max(512);
 
-    // Check if parallel execution is beneficial
-    if !config.should_parallel_filter(row_count) {
-        // Fall back to sequential filtering
-        return sequential_filter(rows, filter_expr, columns);
+            // Pre-compile the filter expression once (RowFilter is Send+Sync)
+            let columns_vec: Vec<String> = columns.to_vec();
+            let filter = RowFilter::new(filter_expr, &columns_vec)?;
+
+            // Process chunks in parallel, using plain Vec inside workers to avoid
+            // thread-local cache churn (each Rayon worker has its own cache)
+            let row_vec: Vec<(i64, Row)> = rows.into_vec();
+            let filtered: Vec<(i64, Row)> = row_vec
+                .into_par_iter()
+                .chunks(chunk_size)
+                .flat_map(|chunk| {
+                    // Use plain Vec, not RowVec - avoids worker thread cache allocations
+                    chunk
+                        .into_iter()
+                        .filter(|(_, row)| filter.matches(row))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+
+            // Wrap final result in RowVec (uses main thread's cache)
+            return Ok(RowVec::from_vec(filtered));
+        }
     }
 
-    // Calculate optimal chunk size based on available parallelism
-    // Goal: Create ~2-4 chunks per thread for good load balancing
-    let num_threads = rayon::current_num_threads();
-    let target_chunks = num_threads * 4;
-    let chunk_size = (row_count / target_chunks).max(config.chunk_size).max(512);
-
-    // Pre-compile the filter expression once (RowFilter is Send+Sync)
-    let columns_vec: Vec<String> = columns.to_vec();
-    let filter = RowFilter::new(filter_expr, &columns_vec)?;
-
-    // Process chunks in parallel, using plain Vec inside workers to avoid
-    // thread-local cache churn (each Rayon worker has its own cache)
-    let row_vec: Vec<(i64, Row)> = rows.into_vec();
-    let filtered: Vec<(i64, Row)> = row_vec
-        .into_par_iter()
-        .chunks(chunk_size)
-        .flat_map(|chunk| {
-            // Use plain Vec, not RowVec - avoids worker thread cache allocations
-            chunk
-                .into_iter()
-                .filter(|(_, row)| filter.matches(row))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    // Wrap final result in RowVec (uses main thread's cache)
-    Ok(RowVec::from_vec(filtered))
+    // Sequential fallback (always compiled)
+    let _ = config; // suppress unused warning when parallel feature is disabled
+    sequential_filter(rows, filter_expr, columns)
 }
 
 /// Sequential filter for small datasets or when parallel is disabled
@@ -219,37 +237,40 @@ pub fn parallel_filter_owned(
     predicate: impl Fn(&Row) -> bool + Sync + Send,
     config: &ParallelConfig,
 ) -> RowVec {
-    let row_count = rows.len();
+    #[cfg(feature = "parallel")]
+    {
+        let row_count = rows.len();
+        if config.should_parallel_filter(row_count) {
+            // Phase 1: Parallel marking - each thread marks matching rows
+            // Uses Vec<bool> which is 1 byte per row (could use bitvec for 1 bit)
+            let chunk_size = (row_count / num_threads()).max(1000);
+            let marks: Vec<bool> = rows
+                .par_chunks(chunk_size)
+                .flat_map(|chunk| {
+                    chunk
+                        .iter()
+                        .map(|(_, row)| predicate(row))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
 
-    if !config.should_parallel_filter(row_count) {
-        // Sequential fallback - efficient, uses RowVec cache
-        return rows.into_iter().filter(|(_, r)| predicate(r)).collect();
-    }
+            // Count matches for pre-allocation
+            let match_count = marks.iter().filter(|&&b| b).count();
 
-    // Phase 1: Parallel marking - each thread marks matching rows
-    // Uses Vec<bool> which is 1 byte per row (could use bitvec for 1 bit)
-    let chunk_size = (row_count / rayon::current_num_threads()).max(1000);
-    let marks: Vec<bool> = rows
-        .par_chunks(chunk_size)
-        .flat_map(|chunk| {
-            chunk
-                .iter()
-                .map(|(_, row)| predicate(row))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    // Count matches for pre-allocation
-    let match_count = marks.iter().filter(|&&b| b).count();
-
-    // Phase 2: Sequential extraction into RowVec (from cache)
-    let mut result = RowVec::with_capacity(match_count);
-    for ((id, row), keep) in rows.into_iter().zip(marks) {
-        if keep {
-            result.push((id, row));
+            // Phase 2: Sequential extraction into RowVec (from cache)
+            let mut result = RowVec::with_capacity(match_count);
+            for ((id, row), keep) in rows.into_iter().zip(marks) {
+                if keep {
+                    result.push((id, row));
+                }
+            }
+            return result;
         }
     }
-    result
+
+    // Sequential fallback (always compiled)
+    let _ = config; // suppress unused warning when parallel feature is disabled
+    rows.into_iter().filter(|(_, r)| predicate(r)).collect()
 }
 
 /// Parallel sort using rayon's par_sort_unstable_by
@@ -260,11 +281,13 @@ pub fn parallel_sort<F>(rows: &mut [(i64, Row)], compare: F, config: &ParallelCo
 where
     F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
 {
+    #[cfg(feature = "parallel")]
     if config.should_parallel_sort(rows.len()) {
         rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-    } else {
-        rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
+        return;
     }
+    let _ = config; // suppress unused warning when parallel feature is disabled
+    rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
 }
 
 /// Parallel sort that's unstable (faster but doesn't preserve order of equal elements)
@@ -272,11 +295,13 @@ pub fn parallel_sort_unstable<F>(rows: &mut [(i64, Row)], compare: F, config: &P
 where
     F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
 {
+    #[cfg(feature = "parallel")]
     if config.should_parallel_sort(rows.len()) {
         rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-    } else {
-        rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
+        return;
     }
+    let _ = config; // suppress unused warning when parallel feature is disabled
+    rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
 }
 
 /// Parallel DISTINCT processing using hash map with proper equality checking
@@ -289,73 +314,77 @@ where
 /// This implementation correctly handles hash collisions by storing actual rows
 /// and comparing them for equality, not just their hashes.
 pub fn parallel_distinct(rows: RowVec, config: &ParallelConfig) -> RowVec {
-    let row_count = rows.len();
+    #[cfg(feature = "parallel")]
+    {
+        let row_count = rows.len();
+        if config.should_parallel_filter(row_count) {
+            // For parallel distinct, we use a two-phase approach:
+            // Phase 1: Filter locally within chunks (parallel) - uses hash map with collision lists
+            // Phase 2: Final dedup across chunks (sequential) - verifies equality for hash matches
 
-    if !config.should_parallel_filter(row_count) {
-        // Sequential distinct with proper equality checking
-        return sequential_distinct(rows);
-    }
+            let n_threads = num_threads();
+            let chunk_size = config.chunk_size.max(row_count / n_threads).max(1000);
 
-    // For parallel distinct, we use a two-phase approach:
-    // Phase 1: Filter locally within chunks (parallel) - uses hash map with collision lists
-    // Phase 2: Final dedup across chunks (sequential) - verifies equality for hash matches
+            // Phase 1: Parallel local dedup within chunks
+            // Note: We must convert to Vec for into_par_iter (RowVec doesn't impl IntoParallelIterator)
+            // Each chunk produces unique rows (within that chunk) along with their hashes
+            let row_vec: Vec<(i64, Row)> = rows.into_vec();
+            let deduped_chunks: Vec<Vec<(u64, i64, Row)>> = row_vec
+                .into_par_iter()
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    // Use hash map: hash -> list of indices into unique_with_hashes
+                    let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+                    // Store (hash, row_id, row) tuples
+                    let mut unique_with_hashes: Vec<(u64, i64, Row)> =
+                        Vec::with_capacity(chunk.len());
 
-    let num_threads = rayon::current_num_threads();
-    let chunk_size = config.chunk_size.max(row_count / num_threads).max(1000);
+                    for (row_id, row) in chunk {
+                        let hash = hash_row(&row);
+                        let indices = hash_to_indices.entry(hash).or_default();
 
-    // Phase 1: Parallel local dedup within chunks
-    // Note: We must convert to Vec for into_par_iter (RowVec doesn't impl IntoParallelIterator)
-    // Each chunk produces unique rows (within that chunk) along with their hashes
-    let row_vec: Vec<(i64, Row)> = rows.into_vec();
-    let deduped_chunks: Vec<Vec<(u64, i64, Row)>> = row_vec
-        .into_par_iter()
-        .chunks(chunk_size)
-        .map(|chunk| {
-            // Use hash map: hash -> list of indices into unique_with_hashes
+                        // Check if this exact row already exists (handle hash collisions)
+                        let is_duplicate = indices
+                            .iter()
+                            .any(|&idx| rows_equal(&unique_with_hashes[idx].2, &row));
+
+                        if !is_duplicate {
+                            indices.push(unique_with_hashes.len());
+                            unique_with_hashes.push((hash, row_id, row));
+                        }
+                    }
+
+                    unique_with_hashes
+                })
+                .collect();
+
+            // Phase 2: Sequential final dedup across chunks with full equality verification
+            let total_size: usize = deduped_chunks.iter().map(|chunk| chunk.len()).sum();
+            let estimated_size = (total_size * 3) / 4;
+            let mut result = RowVec::with_capacity(estimated_size);
             let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-            // Store (hash, row_id, row) tuples
-            let mut unique_with_hashes: Vec<(u64, i64, Row)> = Vec::with_capacity(chunk.len());
 
-            for (row_id, row) in chunk {
-                let hash = hash_row(&row);
-                let indices = hash_to_indices.entry(hash).or_default();
+            for chunk in deduped_chunks {
+                for (hash, row_id, row) in chunk {
+                    let indices = hash_to_indices.entry(hash).or_default();
 
-                // Check if this exact row already exists (handle hash collisions)
-                let is_duplicate = indices
-                    .iter()
-                    .any(|&idx| rows_equal(&unique_with_hashes[idx].2, &row));
+                    // Check if this exact row already exists globally (handle hash collisions)
+                    let is_duplicate = indices.iter().any(|&idx| rows_equal(&result[idx].1, &row));
 
-                if !is_duplicate {
-                    indices.push(unique_with_hashes.len());
-                    unique_with_hashes.push((hash, row_id, row));
+                    if !is_duplicate {
+                        indices.push(result.len());
+                        result.push((row_id, row));
+                    }
                 }
             }
 
-            unique_with_hashes
-        })
-        .collect();
-
-    // Phase 2: Sequential final dedup across chunks with full equality verification
-    let total_size: usize = deduped_chunks.iter().map(|chunk| chunk.len()).sum();
-    let estimated_size = (total_size * 3) / 4;
-    let mut result = RowVec::with_capacity(estimated_size);
-    let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-
-    for chunk in deduped_chunks {
-        for (hash, row_id, row) in chunk {
-            let indices = hash_to_indices.entry(hash).or_default();
-
-            // Check if this exact row already exists globally (handle hash collisions)
-            let is_duplicate = indices.iter().any(|&idx| rows_equal(&result[idx].1, &row));
-
-            if !is_duplicate {
-                indices.push(result.len());
-                result.push((row_id, row));
-            }
+            return result;
         }
     }
 
-    result
+    // Sequential fallback (always compiled)
+    let _ = config; // suppress unused warning when parallel feature is disabled
+    sequential_distinct(rows)
 }
 
 /// Sequential DISTINCT with proper equality checking for hash collisions
@@ -388,28 +417,31 @@ pub fn parallel_project<F>(rows: RowVec, project_fn: F, config: &ParallelConfig)
 where
     F: Fn(&Row) -> Row + Sync + Send,
 {
+    #[cfg(feature = "parallel")]
     let row_count = rows.len();
 
-    if !config.should_parallel_filter(row_count) {
-        return rows
-            .into_iter()
-            .map(|(id, r)| (id, project_fn(&r)))
+    #[cfg(feature = "parallel")]
+    if config.should_parallel_filter(row_count) {
+        // Parallel projection using par_chunks for better cache locality
+        let chunk_size = (row_count / num_threads()).max(1000);
+        let projected: Vec<(i64, Row)> = rows
+            .par_chunks(chunk_size)
+            .flat_map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|(id, row)| (*id, project_fn(row)))
+                    .collect::<Vec<_>>()
+            })
             .collect();
+
+        return RowVec::from_vec(projected);
     }
 
-    // Parallel projection using par_chunks for better cache locality
-    let chunk_size = (row_count / rayon::current_num_threads()).max(1000);
-    let projected: Vec<(i64, Row)> = rows
-        .par_chunks(chunk_size)
-        .flat_map(|chunk| {
-            chunk
-                .iter()
-                .map(|(id, row)| (*id, project_fn(row)))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    RowVec::from_vec(projected)
+    // Sequential fallback (always compiled)
+    let _ = config; // suppress unused warning when parallel feature is disabled
+    rows.into_iter()
+        .map(|(id, r)| (id, project_fn(&r)))
+        .collect()
 }
 
 /// Statistics about parallel execution for monitoring/debugging
@@ -434,6 +466,7 @@ enum HashTableStorage {
     /// Sequential execution using FxHashMap (optimized for trusted keys)
     Sequential(FxHashMap<u64, Vec<usize>>),
     /// Parallel execution using DashMap (concurrent, lock-free)
+    #[cfg(feature = "parallel")]
     Parallel(dashmap::DashMap<u64, Vec<usize>>),
 }
 
@@ -479,6 +512,7 @@ impl HashTableStorage {
     fn get(&self, key: &u64) -> Option<Vec<usize>> {
         match self {
             HashTableStorage::Sequential(map) => map.get(key).cloned(),
+            #[cfg(feature = "parallel")]
             HashTableStorage::Parallel(map) => map.get(key).map(|v| v.clone()),
         }
     }
@@ -517,53 +551,56 @@ pub fn parallel_hash_build(
     key_indices: &[usize],
     config: &ParallelConfig,
 ) -> ParallelHashTable {
-    use dashmap::DashMap;
-
     let row_count = build_rows.len();
 
-    if !config.should_parallel_join(row_count) {
-        // OPTIMIZATION: Sequential build uses FxHashMap for best performance with trusted keys
-        // FxHashMap is optimized for non-adversarial use cases (embedded database)
-        let mut table: FxHashMap<u64, Vec<usize>> =
-            FxHashMap::with_capacity_and_hasher(row_count, Default::default());
-        for (idx, row) in build_rows.iter().enumerate() {
-            let hash = hash_composite_key(row, key_indices);
-            table.entry(hash).or_default().push(idx);
-        }
+    #[cfg(feature = "parallel")]
+    if config.should_parallel_join(row_count) {
+        use dashmap::DashMap;
+
+        // Parallel build using DashMap's concurrent access
+        let table: DashMap<u64, Vec<usize>> = DashMap::with_capacity(row_count);
+        let n_threads = num_threads();
+        let chunk_size = config.chunk_size.max(row_count / n_threads).max(1000);
+
+        // Process chunks in parallel, each inserting directly into the concurrent hash table
+        build_rows
+            .par_chunks(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base_idx = chunk_idx * chunk_size;
+                for (local_idx, row) in chunk.iter().enumerate() {
+                    // SAFETY: Check for index overflow (would require ~18 quintillion rows on 64-bit)
+                    // Use debug_assert for zero runtime cost in release builds
+                    debug_assert!(
+                        base_idx.checked_add(local_idx).is_some(),
+                        "Index overflow in parallel hash build: base_idx={} + local_idx={}",
+                        base_idx,
+                        local_idx
+                    );
+                    let global_idx = base_idx + local_idx;
+                    let hash = hash_composite_key(row, key_indices);
+                    table.entry(hash).or_default().push(global_idx);
+                }
+            });
+
         return ParallelHashTable {
-            storage: HashTableStorage::Sequential(table),
+            storage: HashTableStorage::Parallel(table),
             row_count,
         };
     }
 
-    // Parallel build using DashMap's concurrent access
-    let table: DashMap<u64, Vec<usize>> = DashMap::with_capacity(row_count);
-    let num_threads = rayon::current_num_threads();
-    let chunk_size = config.chunk_size.max(row_count / num_threads).max(1000);
-
-    // Process chunks in parallel, each inserting directly into the concurrent hash table
-    build_rows
-        .par_chunks(chunk_size)
-        .enumerate()
-        .for_each(|(chunk_idx, chunk)| {
-            let base_idx = chunk_idx * chunk_size;
-            for (local_idx, row) in chunk.iter().enumerate() {
-                // SAFETY: Check for index overflow (would require ~18 quintillion rows on 64-bit)
-                // Use debug_assert for zero runtime cost in release builds
-                debug_assert!(
-                    base_idx.checked_add(local_idx).is_some(),
-                    "Index overflow in parallel hash build: base_idx={} + local_idx={}",
-                    base_idx,
-                    local_idx
-                );
-                let global_idx = base_idx + local_idx;
-                let hash = hash_composite_key(row, key_indices);
-                table.entry(hash).or_default().push(global_idx);
-            }
-        });
-
+    // Sequential fallback (always compiled)
+    // OPTIMIZATION: Sequential build uses FxHashMap for best performance with trusted keys
+    // FxHashMap is optimized for non-adversarial use cases (embedded database)
+    let _ = config; // suppress unused warning when parallel feature is disabled
+    let mut table: FxHashMap<u64, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(row_count, Default::default());
+    for (idx, row) in build_rows.iter().enumerate() {
+        let hash = hash_composite_key(row, key_indices);
+        table.entry(hash).or_default().push(idx);
+    }
     ParallelHashTable {
-        storage: HashTableStorage::Parallel(table),
+        storage: HashTableStorage::Sequential(table),
         row_count,
     }
 }
@@ -589,51 +626,54 @@ pub fn parallel_hash_probe<F>(
 where
     F: Fn(&Row, &Row) -> bool + Sync + Send,
 {
+    #[cfg(feature = "parallel")]
     let probe_count = probe_rows.len();
 
-    if !config.should_parallel_join(probe_count) {
-        // Sequential probe
-        let mut matches = Vec::new();
-        for (probe_idx, probe_row) in probe_rows.iter().enumerate() {
-            let hash = hash_composite_key(probe_row, probe_key_indices);
-            if let Some(build_indices) = hash_table.get(&hash) {
-                for build_idx in build_indices {
-                    if verify_match(probe_row, &build_rows[build_idx]) {
-                        matches.push((probe_idx, build_idx));
-                    }
-                }
-            }
-        }
-        return matches;
-    }
+    #[cfg(feature = "parallel")]
+    if config.should_parallel_join(probe_count) {
+        // Parallel probe
+        let n_threads = num_threads();
+        let chunk_size = config.chunk_size.max(probe_count / n_threads).max(1000);
 
-    // Parallel probe
-    let num_threads = rayon::current_num_threads();
-    let chunk_size = config.chunk_size.max(probe_count / num_threads).max(1000);
+        return probe_rows
+            .par_chunks(chunk_size)
+            .enumerate()
+            .flat_map(|(chunk_idx, chunk)| {
+                let base_idx = chunk_idx * chunk_size;
+                let mut local_matches = Vec::new();
 
-    probe_rows
-        .par_chunks(chunk_size)
-        .enumerate()
-        .flat_map(|(chunk_idx, chunk)| {
-            let base_idx = chunk_idx * chunk_size;
-            let mut local_matches = Vec::new();
+                for (local_idx, probe_row) in chunk.iter().enumerate() {
+                    let probe_idx = base_idx + local_idx;
+                    let hash = hash_composite_key(probe_row, probe_key_indices);
 
-            for (local_idx, probe_row) in chunk.iter().enumerate() {
-                let probe_idx = base_idx + local_idx;
-                let hash = hash_composite_key(probe_row, probe_key_indices);
-
-                if let Some(build_indices) = hash_table.get(&hash) {
-                    for build_idx in build_indices {
-                        if verify_match(probe_row, &build_rows[build_idx]) {
-                            local_matches.push((probe_idx, build_idx));
+                    if let Some(build_indices) = hash_table.get(&hash) {
+                        for build_idx in build_indices {
+                            if verify_match(probe_row, &build_rows[build_idx]) {
+                                local_matches.push((probe_idx, build_idx));
+                            }
                         }
                     }
                 }
-            }
 
-            local_matches
-        })
-        .collect()
+                local_matches
+            })
+            .collect();
+    }
+
+    // Sequential fallback (always compiled)
+    let _ = config; // suppress unused warning when parallel feature is disabled
+    let mut matches = Vec::new();
+    for (probe_idx, probe_row) in probe_rows.iter().enumerate() {
+        let hash = hash_composite_key(probe_row, probe_key_indices);
+        if let Some(build_indices) = hash_table.get(&hash) {
+            for build_idx in build_indices {
+                if verify_match(probe_row, &build_rows[build_idx]) {
+                    matches.push((probe_idx, build_idx));
+                }
+            }
+        }
+    }
+    matches
 }
 
 /// Hash a row using specific key column indices.
@@ -671,6 +711,56 @@ pub struct ParallelJoinResult {
     pub matches_found: usize,
 }
 
+/// Sequential probe phase for hash join (used when parallel is disabled or dataset is small)
+#[allow(clippy::too_many_arguments)]
+fn sequential_probe(
+    probe_rows: &[Row],
+    build_rows: &[Row],
+    hash_table: &ParallelHashTable,
+    probe_key_indices: &[usize],
+    build_key_indices: &[usize],
+    join_type: &JoinType,
+    probe_col_count: usize,
+    build_col_count: usize,
+    swapped: bool,
+    build_matched: &Option<BuildMatchedTracker>,
+) -> (Vec<Row>, Vec<Row>) {
+    let mut matched_rows = Vec::new();
+    let needs_unmatched_probe = join_type.needs_unmatched_probe(swapped);
+
+    for probe_row in probe_rows.iter() {
+        let hash = hash_row_by_keys(probe_row, probe_key_indices);
+        let mut matched = false;
+
+        if let Some(build_indices) = hash_table.get(&hash) {
+            for build_idx in build_indices {
+                let build_row = &build_rows[build_idx];
+                if verify_key_match(probe_row, build_row, probe_key_indices, build_key_indices) {
+                    matched = true;
+                    if let Some(ref tracker) = build_matched {
+                        tracker.mark_matched(build_idx);
+                    }
+                    let combined = combine_join_rows(
+                        probe_row,
+                        build_row,
+                        probe_col_count,
+                        build_col_count,
+                        swapped,
+                    );
+                    matched_rows.push(Row::from_compact_vec(combined));
+                }
+            }
+        }
+
+        if !matched && needs_unmatched_probe {
+            let values = combine_with_nulls(probe_row, probe_col_count, build_col_count, swapped);
+            matched_rows.push(Row::from_compact_vec(values));
+        }
+    }
+
+    (matched_rows, Vec::new())
+}
+
 /// Execute a complete parallel hash join
 ///
 /// This is the main entry point for parallel hash join execution. It handles:
@@ -705,8 +795,11 @@ pub fn parallel_hash_join(
     let build_count = build_rows.len();
 
     // Determine if we should use parallel execution
+    #[cfg(feature = "parallel")]
     let use_parallel =
         config.should_parallel_join(build_count) || config.should_parallel_join(probe_count);
+    #[cfg(not(feature = "parallel"))]
+    let use_parallel = false;
 
     // Build phase: Create hash table (parallel if large enough)
     let hash_table = parallel_hash_build(build_rows, build_key_indices, config);
@@ -720,167 +813,147 @@ pub fn parallel_hash_join(
     };
 
     // Probe phase
-    let (matched_rows, unmatched_probe_rows) = if use_parallel && join_type == JoinType::Inner {
-        // For INNER joins, we can fully parallelize the probe phase
-        let matches: Vec<Row> = probe_rows
-            .par_chunks(config.chunk_size.max(1000))
-            .flat_map(|chunk| {
-                let mut local_results = Vec::new();
-                for probe_row in chunk {
-                    let hash = hash_row_by_keys(probe_row, probe_key_indices);
-                    if let Some(build_indices) = hash_table.get(&hash) {
-                        for build_idx in build_indices {
-                            let build_row = &build_rows[build_idx];
-                            if verify_key_match(
-                                probe_row,
-                                build_row,
-                                probe_key_indices,
-                                build_key_indices,
-                            ) {
-                                let combined = combine_join_rows(
-                                    probe_row,
-                                    build_row,
-                                    probe_col_count,
-                                    build_col_count,
-                                    swapped,
-                                );
-                                local_results.push(Row::from_compact_vec(combined));
-                            }
-                        }
-                    }
-                }
-                local_results
-            })
-            .collect();
-        (matches, Vec::new())
-    } else if use_parallel {
-        // For OUTER joins with parallel execution, use atomic tracking for build side
-        // and collect unmatched probe rows directly in parallel
-        let needs_unmatched_probe = join_type.needs_unmatched_probe(swapped);
-
-        // Each chunk returns: (matched_rows, unmatched_probe_rows)
-        let chunk_results: Vec<(Vec<Row>, Vec<Row>)> = probe_rows
-            .par_chunks(config.chunk_size.max(1000))
-            .map(|chunk| {
-                let mut matched_results = Vec::new();
-                let mut unmatched_results = Vec::new();
-
-                for probe_row in chunk.iter() {
-                    let mut matched = false;
-                    let hash = hash_row_by_keys(probe_row, probe_key_indices);
-
-                    if let Some(build_indices) = hash_table.get(&hash) {
-                        for build_idx in build_indices {
-                            let build_row = &build_rows[build_idx];
-                            if verify_key_match(
-                                probe_row,
-                                build_row,
-                                probe_key_indices,
-                                build_key_indices,
-                            ) {
-                                matched = true;
-                                // Mark build row as matched (uses atomic Release in parallel mode)
-                                if let Some(ref tracker) = build_matched {
-                                    tracker.mark_matched(build_idx);
+    #[allow(unused_variables)]
+    let (matched_rows, unmatched_probe_rows) = {
+        #[cfg(feature = "parallel")]
+        {
+            if use_parallel && join_type == JoinType::Inner {
+                // For INNER joins, we can fully parallelize the probe phase
+                let matches: Vec<Row> = probe_rows
+                    .par_chunks(config.chunk_size.max(1000))
+                    .flat_map(|chunk| {
+                        let mut local_results = Vec::new();
+                        for probe_row in chunk {
+                            let hash = hash_row_by_keys(probe_row, probe_key_indices);
+                            if let Some(build_indices) = hash_table.get(&hash) {
+                                for build_idx in build_indices {
+                                    let build_row = &build_rows[build_idx];
+                                    if verify_key_match(
+                                        probe_row,
+                                        build_row,
+                                        probe_key_indices,
+                                        build_key_indices,
+                                    ) {
+                                        let combined = combine_join_rows(
+                                            probe_row,
+                                            build_row,
+                                            probe_col_count,
+                                            build_col_count,
+                                            swapped,
+                                        );
+                                        local_results.push(Row::from_compact_vec(combined));
+                                    }
                                 }
-                                let combined = combine_join_rows(
+                            }
+                        }
+                        local_results
+                    })
+                    .collect();
+                (matches, Vec::new())
+            } else if use_parallel {
+                // For OUTER joins with parallel execution, use atomic tracking for build side
+                // and collect unmatched probe rows directly in parallel
+                let needs_unmatched_probe = join_type.needs_unmatched_probe(swapped);
+
+                // Each chunk returns: (matched_rows, unmatched_probe_rows)
+                let chunk_results: Vec<(Vec<Row>, Vec<Row>)> = probe_rows
+                    .par_chunks(config.chunk_size.max(1000))
+                    .map(|chunk| {
+                        let mut matched_results = Vec::new();
+                        let mut unmatched_results = Vec::new();
+
+                        for probe_row in chunk.iter() {
+                            let mut matched = false;
+                            let hash = hash_row_by_keys(probe_row, probe_key_indices);
+
+                            if let Some(build_indices) = hash_table.get(&hash) {
+                                for build_idx in build_indices {
+                                    let build_row = &build_rows[build_idx];
+                                    if verify_key_match(
+                                        probe_row,
+                                        build_row,
+                                        probe_key_indices,
+                                        build_key_indices,
+                                    ) {
+                                        matched = true;
+                                        if let Some(ref tracker) = build_matched {
+                                            tracker.mark_matched(build_idx);
+                                        }
+                                        let combined = combine_join_rows(
+                                            probe_row,
+                                            build_row,
+                                            probe_col_count,
+                                            build_col_count,
+                                            swapped,
+                                        );
+                                        matched_results.push(Row::from_compact_vec(combined));
+                                    }
+                                }
+                            }
+
+                            if !matched && needs_unmatched_probe {
+                                let values = combine_with_nulls(
                                     probe_row,
-                                    build_row,
                                     probe_col_count,
                                     build_col_count,
                                     swapped,
                                 );
-                                matched_results.push(Row::from_compact_vec(combined));
+                                unmatched_results.push(Row::from_compact_vec(values));
                             }
                         }
-                    }
 
-                    // Add unmatched probe row directly (no need for second pass)
-                    if !matched && needs_unmatched_probe {
-                        let values = combine_with_nulls(
-                            probe_row,
-                            probe_col_count,
-                            build_col_count,
-                            swapped,
-                        );
-                        unmatched_results.push(Row::from_compact_vec(values));
-                    }
+                        (matched_results, unmatched_results)
+                    })
+                    .collect();
+
+                let total_matched: usize = chunk_results.iter().map(|(m, _)| m.len()).sum();
+                let total_unmatched: usize = chunk_results.iter().map(|(_, u)| u.len()).sum();
+
+                let mut matched_rows = Vec::with_capacity(total_matched);
+                let mut unmatched_rows = Vec::with_capacity(total_unmatched);
+
+                for (matched, unmatched) in chunk_results {
+                    matched_rows.extend(matched);
+                    unmatched_rows.extend(unmatched);
                 }
 
-                (matched_results, unmatched_results)
-            })
-            .collect();
+                // CRITICAL: Acquire fence for cross-thread visibility of build_matched[] writes.
+                // Parallel probe stores use Release ordering; this fence ensures all stores
+                // are visible before the sequential scan of unmatched build rows below.
+                std::sync::atomic::fence(Ordering::Acquire);
 
-        // Merge results from all chunks
-        let total_matched: usize = chunk_results.iter().map(|(m, _)| m.len()).sum();
-        let total_unmatched: usize = chunk_results.iter().map(|(_, u)| u.len()).sum();
-
-        let mut matched_rows = Vec::with_capacity(total_matched);
-        let mut unmatched_rows = Vec::with_capacity(total_unmatched);
-
-        for (matched, unmatched) in chunk_results {
-            matched_rows.extend(matched);
-            unmatched_rows.extend(unmatched);
-        }
-
-        // SYNCHRONIZATION NOTE:
-        // CRITICAL: This Acquire fence is REQUIRED for correctness, not optional.
-        //
-        // Memory Ordering Justification:
-        // 1. Parallel probe writes to build_matched[] use Release ordering (line 737)
-        // 2. This Acquire fence establishes a happens-before relationship
-        // 3. All Release stores in parallel threads are visible after this fence
-        //
-        // Why we can't rely solely on Rayon's barrier:
-        // - While Rayon's collect() does join all threads, this is an implementation detail
-        // - Rayon's API does not formally guarantee memory ordering semantics
-        // - The fence makes the synchronization contract explicit and compiler-verifiable
-        //
-        // Without this fence: The sequential scan below might read stale values from
-        // build_matched[], causing incorrect LEFT/FULL JOIN results (missing rows).
-        std::sync::atomic::fence(Ordering::Acquire);
-
-        (matched_rows, unmatched_rows)
-    } else {
-        // Sequential execution for small datasets
-        let mut matched_rows = Vec::new();
-        let needs_unmatched_probe = join_type.needs_unmatched_probe(swapped);
-
-        for probe_row in probe_rows.iter() {
-            let hash = hash_row_by_keys(probe_row, probe_key_indices);
-            let mut matched = false;
-
-            if let Some(build_indices) = hash_table.get(&hash) {
-                for build_idx in build_indices {
-                    let build_row = &build_rows[build_idx];
-                    if verify_key_match(probe_row, build_row, probe_key_indices, build_key_indices)
-                    {
-                        matched = true;
-                        // Mark build row as matched (uses plain bool in sequential mode)
-                        if let Some(ref tracker) = build_matched {
-                            tracker.mark_matched(build_idx);
-                        }
-                        let combined = combine_join_rows(
-                            probe_row,
-                            build_row,
-                            probe_col_count,
-                            build_col_count,
-                            swapped,
-                        );
-                        matched_rows.push(Row::from_compact_vec(combined));
-                    }
-                }
-            }
-
-            // Handle unmatched probe row for OUTER joins
-            if !matched && needs_unmatched_probe {
-                let values =
-                    combine_with_nulls(probe_row, probe_col_count, build_col_count, swapped);
-                matched_rows.push(Row::from_compact_vec(values));
+                (matched_rows, unmatched_rows)
+            } else {
+                // Sequential execution for small datasets
+                sequential_probe(
+                    probe_rows,
+                    build_rows,
+                    &hash_table,
+                    probe_key_indices,
+                    build_key_indices,
+                    &join_type,
+                    probe_col_count,
+                    build_col_count,
+                    swapped,
+                    &build_matched,
+                )
             }
         }
-
-        (matched_rows, Vec::new())
+        #[cfg(not(feature = "parallel"))]
+        {
+            sequential_probe(
+                probe_rows,
+                build_rows,
+                &hash_table,
+                probe_key_indices,
+                build_key_indices,
+                &join_type,
+                probe_col_count,
+                build_col_count,
+                swapped,
+                &build_matched,
+            )
+        }
     };
 
     let mut result_rows = matched_rows;
@@ -1078,11 +1151,13 @@ pub fn parallel_order_by(
         std::cmp::Ordering::Equal
     };
 
+    #[cfg(feature = "parallel")]
     if config.should_parallel_sort(rows.len()) {
         rows.par_sort_unstable_by(compare);
-    } else {
-        rows.sort_unstable_by(compare);
+        return;
     }
+    let _ = config; // suppress unused warning when parallel feature is disabled
+    rows.sort_unstable_by(compare);
 }
 
 /// Parallel ORDER BY with a custom comparator function
@@ -1093,11 +1168,13 @@ pub fn parallel_order_by_fn<F>(rows: &mut [(i64, Row)], compare: F, config: &Par
 where
     F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
 {
+    #[cfg(feature = "parallel")]
     if config.should_parallel_sort(rows.len()) {
         rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-    } else {
-        rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
+        return;
     }
+    let _ = config; // suppress unused warning when parallel feature is disabled
+    rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
 }
 
 /// Parallel ORDER BY with unstable sort (faster, but doesn't preserve order of equal elements)
@@ -1105,11 +1182,13 @@ pub fn parallel_order_by_unstable<F>(rows: &mut [(i64, Row)], compare: F, config
 where
     F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
 {
+    #[cfg(feature = "parallel")]
     if config.should_parallel_sort(rows.len()) {
         rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-    } else {
-        rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
+        return;
     }
+    let _ = config; // suppress unused warning when parallel feature is disabled
+    rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
 }
 
 /// Parallel filter with statistics collection
@@ -1125,12 +1204,9 @@ pub fn parallel_filter_with_stats(
     let row_count = rows.len();
     let parallel_used = config.should_parallel_filter(row_count);
 
-    let num_threads = rayon::current_num_threads();
+    let n_threads = num_threads();
     let chunk_size = if parallel_used {
-        config
-            .chunk_size
-            .max(row_count / (num_threads * 4))
-            .max(512)
+        config.chunk_size.max(row_count / (n_threads * 4)).max(512)
     } else {
         row_count // Single chunk for sequential
     };

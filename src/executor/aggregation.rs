@@ -25,6 +25,7 @@ use std::sync::RwLock;
 
 use ahash::AHasher;
 use hashbrown::hash_map::RawEntryMut;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 // SmallVec removed - Vec is faster due to spilled() check overhead in hot loops
@@ -1774,6 +1775,7 @@ impl Executor {
         }
 
         // Check if any aggregation uses DISTINCT (can't parallelize easily)
+        #[cfg(feature = "parallel")]
         let has_distinct = aggregations.iter().any(|a| a.distinct);
 
         // Pre-compile filter, expression, and ORDER BY programs for VM-based evaluation
@@ -1827,16 +1829,71 @@ impl Executor {
         };
 
         // Use parallel processing for large datasets without DISTINCT
+        #[cfg(feature = "parallel")]
         let use_parallel = rows.len() >= 100_000 && !has_distinct && !has_expression;
+        #[cfg(not(feature = "parallel"))]
+        let use_parallel = false;
 
         let result_values: Vec<Value> = if use_parallel {
             // PARALLEL: Split into chunks and process in parallel
+            #[cfg(feature = "parallel")]
             let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
+            #[cfg(not(feature = "parallel"))]
+            let chunk_size = rows.len();
             let function_registry = &self.function_registry;
 
             // Process chunks in parallel, each producing partial aggregates
+            #[cfg(feature = "parallel")]
             let partial_results: Vec<Vec<Value>> = rows
                 .par_chunks(chunk_size)
+                .map(|chunk| {
+                    let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
+                        .iter()
+                        .map(|agg| function_registry.get_aggregate(&agg.name))
+                        .collect();
+
+                    // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
+                    for (i, agg) in aggregations.iter().enumerate() {
+                        if !agg.extra_args.is_empty() {
+                            if let Some(ref mut func) = agg_funcs[i] {
+                                func.configure(&agg.extra_args);
+                            }
+                        }
+                    }
+
+                    // Pre-create static Value for COUNT(*)
+                    let count_star_value = Value::Integer(1);
+                    for (_, row) in chunk {
+                        for (i, _agg) in aggregations.iter().enumerate() {
+                            if let Some(ref mut func) = agg_funcs[i] {
+                                // OPTIMIZATION: Avoid cloning by using reference directly
+                                let value_ref = if let Some(col_idx) = agg_col_indices[i] {
+                                    row.get(col_idx)
+                                } else {
+                                    Some(&count_star_value) // COUNT(*)
+                                };
+                                if let Some(v) = value_ref {
+                                    func.accumulate(v, false);
+                                }
+                                // Skip if None (missing column) - this is effectively null
+                            }
+                        }
+                    }
+
+                    // Return partial results
+                    agg_funcs
+                        .iter()
+                        .map(|f| {
+                            f.as_ref()
+                                .map(|func| func.result())
+                                .unwrap_or_else(Value::null_unknown)
+                        })
+                        .collect()
+                })
+                .collect();
+            #[cfg(not(feature = "parallel"))]
+            let partial_results: Vec<Vec<Value>> = rows
+                .chunks(chunk_size)
                 .map(|chunk| {
                     let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
                         .iter()
@@ -3759,20 +3816,85 @@ impl Executor {
         // Key insight: parallel creates aggregate functions PER GROUP, so for many small groups
         // (e.g., 10k groups with 3 rows each), the allocation overhead dominates.
         // Only parallelize when groups are large enough to amortize the allocation cost.
+        #[cfg(feature = "parallel")]
         let total_rows: usize = groups_vec.iter().map(|g| g.row_indices.len()).sum();
+        #[cfg(feature = "parallel")]
         let avg_rows_per_group = total_rows / groups_vec.len().max(1);
+        #[cfg(feature = "parallel")]
         let use_parallel = groups_vec.len() >= 4
             && total_rows >= 10_000
             && avg_rows_per_group >= 50
             && !has_agg_expression;
+        #[cfg(not(feature = "parallel"))]
+        let use_parallel = false;
 
         // Process groups (parallel or sequential based on data size)
         let result_rows: RowVec = if use_parallel {
             // PARALLEL: Process each group independently using Rayon
             let function_registry = &self.function_registry;
 
+            #[cfg(feature = "parallel")]
             let rows_vec: Vec<Row> = groups_vec
                 .into_par_iter()
+                .map(|group| {
+                    // Each thread creates its own aggregate functions
+                    let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
+                        .iter()
+                        .map(|agg| function_registry.get_aggregate(&agg.name))
+                        .collect();
+
+                    // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
+                    for (i, agg) in aggregations.iter().enumerate() {
+                        if !agg.extra_args.is_empty() {
+                            if let Some(ref mut func) = agg_funcs[i] {
+                                func.configure(&agg.extra_args);
+                            }
+                        }
+                    }
+
+                    // Accumulate values for this group
+                    // Pre-create static Value for COUNT(*)
+                    let count_star_value = Value::Integer(1);
+                    for &row_idx in &group.row_indices {
+                        let (_, row) = &rows[row_idx];
+                        for (i, agg) in aggregations.iter().enumerate() {
+                            if let Some(ref mut func) = agg_funcs[i] {
+                                // OPTIMIZATION: Avoid cloning by using reference directly
+                                let value_ref = if let Some(col_idx) = agg_col_indices[i] {
+                                    row.get(col_idx)
+                                } else {
+                                    Some(&count_star_value)
+                                };
+                                if let Some(v) = value_ref {
+                                    func.accumulate(v, agg.distinct);
+                                }
+                            }
+                        }
+                    }
+
+                    // Build result row
+                    // Use CompactVec directly to avoid Vec→CompactVec conversion
+                    let mut row_values: CompactVec<Value> =
+                        CompactVec::with_capacity(group_by_items.len() + aggregations.len());
+                    row_values.extend(group.key_values);
+
+                    for (i, agg) in aggregations.iter().enumerate() {
+                        let value = if let Some(ref func) = agg_funcs[i] {
+                            func.result()
+                        } else if agg.name == "COUNT" && agg.column == "*" {
+                            Value::Integer(group.row_indices.len() as i64)
+                        } else {
+                            Value::null_unknown()
+                        };
+                        row_values.push(value);
+                    }
+
+                    Row::from_compact_vec(row_values)
+                })
+                .collect();
+            #[cfg(not(feature = "parallel"))]
+            let rows_vec: Vec<Row> = groups_vec
+                .into_iter()
                 .map(|group| {
                     // Each thread creates its own aggregate functions
                     let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
@@ -4599,6 +4721,7 @@ impl Executor {
         }
 
         // Use parallel processing for large datasets
+        #[cfg(feature = "parallel")]
         if rows.len() >= 10_000 {
             return self.fast_sum_column_parallel(rows, col_idx);
         }
@@ -4673,6 +4796,7 @@ impl Executor {
     }
 
     /// Parallel SUM implementation using Rayon
+    #[cfg(feature = "parallel")]
     #[inline]
     fn fast_sum_column_parallel(&self, rows: &[(i64, Row)], col_idx: usize) -> Value {
         let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
@@ -4758,6 +4882,7 @@ impl Executor {
         }
 
         // Use parallel processing for large datasets
+        #[cfg(feature = "parallel")]
         if rows.len() >= 10_000 {
             return self.fast_avg_column_parallel(rows, col_idx);
         }
@@ -4789,6 +4914,7 @@ impl Executor {
     }
 
     /// Parallel AVG implementation
+    #[cfg(feature = "parallel")]
     #[inline]
     fn fast_avg_column_parallel(&self, rows: &[(i64, Row)], col_idx: usize) -> Value {
         let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);

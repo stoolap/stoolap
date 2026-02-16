@@ -55,7 +55,13 @@ pub enum CompileError {
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CompileError::ColumnNotFound(name) => write!(f, "Column not found: {}", name),
+            CompileError::ColumnNotFound(name) => {
+                write!(
+                    f,
+                    "Column '{}' not found. If you meant a string value, use single quotes: '{}'",
+                    name, name
+                )
+            }
             CompileError::FunctionNotFound(name) => write!(f, "Function not found: {}", name),
             CompileError::InvalidExpression(msg) => write!(f, "Invalid expression: {}", msg),
             CompileError::UnsupportedExpression(msg) => {

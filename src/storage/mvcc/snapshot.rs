@@ -129,9 +129,8 @@ struct FileHeader {
 
 impl FileHeader {
     fn new() -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let creation_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        let creation_time = crate::common::time_compat::SystemTime::now()
+            .duration_since(crate::common::time_compat::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
 

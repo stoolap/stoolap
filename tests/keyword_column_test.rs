@@ -191,26 +191,23 @@ fn test_create_index_on_keyword_column() {
     assert_eq!(count, 1);
 }
 
-/// Test case sensitivity with quoted identifiers
+/// Test case sensitivity with quoted identifiers (backtick quoting)
 #[test]
 fn test_case_sensitivity() {
     let db = Database::open("memory://keyword_case").expect("Failed to create database");
 
     db.execute(
-        r#"CREATE TABLE case_test ("MyColumn" INTEGER, id INTEGER)"#,
+        "CREATE TABLE case_test (`MyColumn` INTEGER, id INTEGER)",
         (),
     )
     .expect("Failed to create table with mixed case column");
 
-    db.execute(
-        r#"INSERT INTO case_test ("MyColumn", id) VALUES (1, 1)"#,
-        (),
-    )
-    .expect("Failed to insert with mixed case column");
+    db.execute("INSERT INTO case_test (`MyColumn`, id) VALUES (1, 1)", ())
+        .expect("Failed to insert with mixed case column");
 
     // Query returns lowercase column names (Stoolap normalizes internally)
     let result = db
-        .query(r#"SELECT "MyColumn" FROM case_test"#, ())
+        .query("SELECT `MyColumn` FROM case_test", ())
         .expect("Failed to query");
 
     let mut count = 0;

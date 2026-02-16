@@ -1,0 +1,399 @@
+/*
+ * Stoolap — Code & Syntax Highlighting
+ * Consolidated from: syntax-highlighting.css, enhanced-code-highlighting.css,
+ * code-interactions.css, and JS-injected copy button styles.
+ */
+
+/* === Syntax Token Variables (Light) === */
+:root {
+  --syntax-bg: #f6f8fa;
+  --syntax-border: #e1e4e8;
+  --syntax-comment: #6c7680;
+  --syntax-keyword: #7636c3;
+  --syntax-function: #0a6aba;
+  --syntax-string: #03822d;
+  --syntax-number: #c74026;
+  --syntax-class: #b96601;
+  --syntax-variable: #0a6aba;
+  --syntax-operator: #676b79;
+  --syntax-punctuation: #4c566a;
+  --syntax-property: #b96601;
+  --syntax-builtin: #7636c3;
+  --syntax-namespace: #b96601;
+  --syntax-definition: #7636c3;
+  /* SQL-specific */
+  --sql-keyword: #0033b3;
+  --sql-function: #7a3e9d;
+  --sql-table: #008800;
+  --sql-number: #1750eb;
+  --sql-string: #067d17;
+  --sql-comment: #8d8d8d;
+  --sql-operator: #0033b3;
+  --sql-identifier: #000000;
+  /* Go-specific */
+  --go-keyword: #0033b3;
+  --go-function: #7a3e9d;
+  --go-type: #00627a;
+  --go-string: #067d17;
+  --go-number: #1750eb;
+  --go-comment: #8d8d8d;
+  --go-builtin: #0033b3;
+  --go-package: #00627a;
+  --go-identifier: #000000;
+}
+
+/* === Syntax Token Variables (Dark) === */
+[data-theme="dark"] {
+  --syntax-bg: #111720;
+  --syntax-border: #1e293b;
+  --syntax-comment: #6a6c70;
+  --syntax-keyword: #c792ea;
+  --syntax-function: #82aaff;
+  --syntax-string: #c3e88d;
+  --syntax-number: #f78c6c;
+  --syntax-class: #ffcb6b;
+  --syntax-variable: #82aaff;
+  --syntax-operator: #89ddff;
+  --syntax-punctuation: #89ddff;
+  --syntax-property: #ffcb6b;
+  --syntax-builtin: #c792ea;
+  --syntax-namespace: #ffcb6b;
+  --syntax-definition: #c792ea;
+  /* SQL-specific */
+  --sql-keyword: #cc7832;
+  --sql-function: #ffc66d;
+  --sql-table: #6a8759;
+  --sql-number: #6897bb;
+  --sql-string: #6a8759;
+  --sql-comment: #808080;
+  --sql-operator: #cc7832;
+  --sql-identifier: #a9b7c6;
+  /* Go-specific */
+  --go-keyword: #cc7832;
+  --go-function: #ffc66d;
+  --go-type: #a9b7c6;
+  --go-string: #6a8759;
+  --go-number: #6897bb;
+  --go-comment: #808080;
+  --go-builtin: #cc7832;
+  --go-package: #9876aa;
+  --go-identifier: #a9b7c6;
+}
+
+/* === Base Code Styles === */
+code, pre {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+pre {
+  tab-size: 2;
+  -moz-tab-size: 2;
+}
+
+/* Standalone pre blocks */
+pre:not(.highlight) {
+  padding: 1em;
+  overflow-x: auto;
+  line-height: 1.5;
+  background-color: var(--syntax-bg);
+  border: 1px solid var(--syntax-border);
+  border-radius: 6px;
+}
+
+/* Inline code */
+:not(pre) > code {
+  padding: 0.15em 0.4em;
+  background-color: var(--color-bg-code);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  font-size: 0.875em;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+p code, li code, td code {
+  color: var(--color-text);
+}
+
+/* === Code Block Container === */
+div.highlighter-rouge {
+  position: relative;
+  margin-bottom: 1.5em;
+  border-radius: 6px;
+  border: 1px solid var(--syntax-border);
+  background-color: var(--syntax-bg);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+div.highlighter-rouge > div.highlight {
+  background: transparent;
+  border: none;
+  margin: 0;
+  padding: 0;
+}
+
+div.highlighter-rouge pre.highlight,
+div.highlight pre {
+  background: transparent;
+  border: none;
+  margin: 0;
+  padding: 1em;
+  overflow-x: auto;
+  line-height: 1.55;
+}
+
+div.highlighter-rouge code,
+div.highlight code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+.highlight, div.highlighter-rouge, pre.highlight {
+  background-color: var(--syntax-bg);
+  margin: 0;
+  border-radius: 6px;
+}
+
+.highlight pre code {
+  display: block;
+  overflow-x: auto;
+  color: var(--color-text);
+  -webkit-text-size-adjust: none;
+}
+
+/* === Language Badges === */
+div.highlighter-rouge::before {
+  content: attr(data-lang);
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 0.25em 0.6em;
+  font-size: 0.7em;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  border-radius: 0 5px 0 5px;
+  background-color: var(--color-primary);
+  color: white;
+  z-index: 1;
+  opacity: 0.85;
+}
+
+div.language-sql::before { content: "SQL"; background-color: #e76f00; }
+div.language-go::before { content: "Go"; background-color: #00add8; }
+div.language-rust::before { content: "Rust"; background-color: #a72145; }
+div.language-json::before { content: "JSON"; background-color: #5b5ea6; }
+div.language-bash::before { content: "Bash"; background-color: #3e474a; }
+div.language-shell::before { content: "Shell"; background-color: #3e474a; }
+div.language-toml::before { content: "TOML"; background-color: #9c4221; }
+div.language-yaml::before { content: "YAML"; background-color: #cb171e; }
+
+/* === Base Token Colors === */
+.highlight .c,
+.highlight .c1,
+.highlight .cm { color: var(--syntax-comment); font-style: italic; }
+
+.highlight .k,
+.highlight .kc,
+.highlight .kd,
+.highlight .kn,
+.highlight .kp,
+.highlight .kr,
+.highlight .kt { color: var(--syntax-keyword); font-weight: bold; }
+
+.highlight .o,
+.highlight .ow { color: var(--syntax-operator); }
+
+.highlight .p { color: var(--syntax-punctuation); }
+
+.highlight .err { color: inherit; background-color: transparent; }
+
+/* Literals */
+.highlight .s,
+.highlight .sb,
+.highlight .sc,
+.highlight .sd,
+.highlight .s2,
+.highlight .se,
+.highlight .sh,
+.highlight .si,
+.highlight .sx,
+.highlight .sr,
+.highlight .s1,
+.highlight .ss { color: var(--syntax-string); }
+
+.highlight .m,
+.highlight .mf,
+.highlight .mh,
+.highlight .mi,
+.highlight .il,
+.highlight .mo { color: var(--syntax-number); }
+
+/* Names */
+.highlight .n { color: inherit; }
+.highlight .na,
+.highlight .nb { color: var(--syntax-builtin); }
+.highlight .nc { color: var(--syntax-class); font-weight: bold; }
+.highlight .no { color: var(--syntax-namespace); }
+.highlight .nd { color: var(--syntax-definition); }
+.highlight .ni { color: var(--syntax-variable); font-weight: bold; }
+.highlight .ne { color: var(--syntax-function); font-weight: bold; }
+.highlight .nf,
+.highlight .fm { color: var(--syntax-function); }
+.highlight .nl { color: var(--syntax-property); }
+.highlight .nn { color: var(--syntax-namespace); }
+.highlight .nt { color: var(--syntax-keyword); }
+.highlight .nv,
+.highlight .vc,
+.highlight .vg,
+.highlight .vi,
+.highlight .vm { color: var(--syntax-variable); }
+
+/* === SQL-Specific Overrides === */
+.language-sql .highlight .k,
+.language-sql .highlight .kc,
+.language-sql .highlight .kd,
+.language-sql .highlight .kn,
+.language-sql .highlight .kp,
+.language-sql .highlight .kr,
+.language-sql .highlight .kt { color: var(--sql-keyword); font-weight: bold; }
+
+.language-sql .highlight .k { text-transform: uppercase; }
+
+.language-sql .highlight .n,
+.language-sql .highlight .mi { color: var(--sql-identifier); }
+
+.language-sql .highlight .nf,
+.language-sql .highlight .nb { color: var(--sql-function); font-weight: normal; }
+
+.language-sql .highlight .s,
+.language-sql .highlight .s1,
+.language-sql .highlight .s2 { color: var(--sql-string); }
+
+.language-sql .highlight .mi,
+.language-sql .highlight .mf { color: var(--sql-number); }
+
+.language-sql .highlight .o,
+.language-sql .highlight .ow { color: var(--sql-operator); }
+
+.language-sql .highlight .c,
+.language-sql .highlight .c1,
+.language-sql .highlight .cm { color: var(--sql-comment); font-style: italic; }
+
+.language-sql .highlight .nv { color: var(--syntax-variable); }
+
+/* === Go-Specific Overrides === */
+.language-go .highlight .kd,
+.language-go .highlight .k { color: var(--go-keyword); font-weight: bold; }
+
+.language-go .highlight .nf,
+.language-go .highlight .nx { color: var(--go-function); }
+
+.language-go .highlight .kt { color: var(--go-type); }
+
+.language-go .highlight .s,
+.language-go .highlight .s1,
+.language-go .highlight .s2 { color: var(--go-string); }
+
+.language-go .highlight .mi,
+.language-go .highlight .mf { color: var(--go-number); }
+
+.language-go .highlight .c,
+.language-go .highlight .c1,
+.language-go .highlight .cm { color: var(--go-comment); font-style: italic; }
+
+.language-go .highlight .nb { color: var(--go-builtin); }
+.language-go .highlight .nn { color: var(--go-package); }
+.language-go .highlight .n { color: var(--go-identifier); }
+
+/* === JSON-Specific === */
+.language-json .highlight .p { color: var(--syntax-punctuation); }
+.language-json .highlight .s2 { color: var(--syntax-property); }
+.language-json .highlight .s1 { color: var(--syntax-string); }
+.language-json .highlight .mi { color: var(--syntax-number); }
+
+/* === Bash-Specific === */
+.language-bash .highlight .nb { color: var(--syntax-keyword); }
+.language-bash .highlight .nv { color: var(--syntax-variable); }
+.language-bash .highlight .s1,
+.language-bash .highlight .s2 { color: var(--syntax-string); }
+
+/* === Line Numbers === */
+.highlight .lineno {
+  color: var(--syntax-comment);
+  display: inline-block;
+  padding: 0 0.75em 0 0;
+  border-right: 1px solid var(--syntax-border);
+  margin-right: 0.5em;
+  text-align: right;
+  min-width: 1.5em;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* === Copy Button === */
+pre {
+  position: relative;
+}
+
+.copy-button {
+  position: absolute;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 24px;
+  background-color: rgba(var(--color-text-muted-rgb), 0.15);
+  border: none;
+  border-radius: 0 0 0 5px;
+  opacity: 0;
+  transition: opacity 0.2s, background-color 0.2s;
+  cursor: pointer;
+  color: var(--color-text-muted);
+  z-index: 2;
+}
+
+pre:hover .copy-button,
+div.highlighter-rouge:hover > .copy-button {
+  opacity: 0.7;
+}
+
+.copy-button:hover {
+  opacity: 1;
+  color: var(--color-primary);
+}
+
+.copy-button:active {
+  opacity: 1;
+}
+
+.copy-button svg {
+  fill: currentColor;
+}
+
+/* === Scrollbar === */
+.highlight pre::-webkit-scrollbar {
+  height: 6px;
+}
+
+.highlight pre::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 3px;
+}
+
+.highlight pre::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.12);
+  border-radius: 3px;
+}
+
+[data-theme="dark"] .highlight pre::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+[data-theme="dark"] .highlight pre::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+}

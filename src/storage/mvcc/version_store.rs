@@ -48,6 +48,7 @@ use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::mvcc::streaming_result::{StreamingResult, VisibleRowInfo};
 use crate::storage::Index;
 use ahash::AHashMap;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{smallvec, SmallVec};
@@ -1465,8 +1466,10 @@ impl VersionStore {
         };
 
         /// Minimum batch size before enabling parallel processing
+        #[cfg(feature = "parallel")]
         const PARALLEL_THRESHOLD: usize = 1000;
         /// Chunk size for parallel processing
+        #[cfg(feature = "parallel")]
         const PARALLEL_CHUNK_SIZE: usize = 512;
 
         // Lock ordering: versions first, then arena (matches commit path)
@@ -1475,8 +1478,9 @@ impl VersionStore {
         let arena_guard = self.arena.read_guard();
         let arena_meta = arena_guard.meta();
 
+        #[cfg(feature = "parallel")]
         if row_ids.len() >= PARALLEL_THRESHOLD {
-            row_ids
+            return row_ids
                 .par_chunks(PARALLEL_CHUNK_SIZE)
                 .map(|chunk| {
                     let mut chunk_count = 0;
@@ -1529,56 +1533,56 @@ impl VersionStore {
                     }
                     chunk_count
                 })
-                .sum()
-        } else {
-            // Sequential path for small batches
-            let mut count = 0;
-            for &row_id in row_ids {
-                // Speculative arena probe: O(1) for auto-increment PKs
-                if row_id > 0 {
-                    let probe_idx = (row_id - 1) as usize;
-                    if probe_idx < arena_meta.len() {
-                        let meta = arena_meta[probe_idx];
-                        if meta.row_id == row_id && checker.is_visible(meta.txn_id, txn_id) {
-                            if meta.deleted_at_txn_id == 0
-                                || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
-                            {
-                                count += 1;
-                            }
-                            continue;
-                        }
-                    }
-                }
+                .sum();
+        }
 
-                // CowBTree fallback: O(log n)
-                if let Some(chain) = versions.get(row_id) {
-                    let head_txn_id = chain.version.txn_id;
-                    let head_deleted_at = chain.version.deleted_at_txn_id;
-
-                    if checker.is_visible(head_txn_id, txn_id) {
-                        if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+        // Sequential path for small batches (or when parallel feature is disabled)
+        let mut count = 0;
+        for &row_id in row_ids {
+            // Speculative arena probe: O(1) for auto-increment PKs
+            if row_id > 0 {
+                let probe_idx = (row_id - 1) as usize;
+                if probe_idx < arena_meta.len() {
+                    let meta = arena_meta[probe_idx];
+                    if meta.row_id == row_id && checker.is_visible(meta.txn_id, txn_id) {
+                        if meta.deleted_at_txn_id == 0
+                            || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                        {
                             count += 1;
                         }
                         continue;
                     }
-
-                    let mut current: Option<&VersionChainEntry> =
-                        chain.prev.as_ref().map(|b| b.as_ref());
-                    while let Some(e) = current {
-                        if checker.is_visible(e.version.txn_id, txn_id) {
-                            if e.version.deleted_at_txn_id == 0
-                                || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
-                            {
-                                count += 1;
-                            }
-                            break;
-                        }
-                        current = e.prev.as_ref().map(|b| b.as_ref());
-                    }
                 }
             }
-            count
+
+            // CowBTree fallback: O(log n)
+            if let Some(chain) = versions.get(row_id) {
+                let head_txn_id = chain.version.txn_id;
+                let head_deleted_at = chain.version.deleted_at_txn_id;
+
+                if checker.is_visible(head_txn_id, txn_id) {
+                    if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+                        count += 1;
+                    }
+                    continue;
+                }
+
+                let mut current: Option<&VersionChainEntry> =
+                    chain.prev.as_ref().map(|b| b.as_ref());
+                while let Some(e) = current {
+                    if checker.is_visible(e.version.txn_id, txn_id) {
+                        if e.version.deleted_at_txn_id == 0
+                            || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
+                        {
+                            count += 1;
+                        }
+                        break;
+                    }
+                    current = e.prev.as_ref().map(|b| b.as_ref());
+                }
+            }
         }
+        count
     }
 
     /// Gets visible versions for batch update operations
@@ -4623,8 +4627,8 @@ impl VersionStore {
             txn_id,
             deleted_at_txn_id: txn_id,
             data: Row::new(),
-            create_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            create_time: crate::common::time_compat::SystemTime::now()
+                .duration_since(crate::common::time_compat::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0),
         };

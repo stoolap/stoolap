@@ -597,7 +597,14 @@ impl CostEstimator {
     /// Get number of parallel workers (auto-detect if 0)
     fn parallel_workers(&self) -> usize {
         if self.constants.parallel_workers == 0 {
-            rayon::current_num_threads()
+            #[cfg(feature = "parallel")]
+            {
+                rayon::current_num_threads()
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                1
+            }
         } else {
             self.constants.parallel_workers
         }
@@ -2853,6 +2860,7 @@ mod tests {
         let large_stats = make_table_stats(100_000, 1_000);
         let (cost_large, is_parallel_large) = estimator.choose_scan_method(&large_stats, 0.5);
         // On multi-core systems, parallel should be cheaper
+        #[cfg(feature = "parallel")]
         if rayon::current_num_threads() > 1 {
             assert!(
                 is_parallel_large,
@@ -2871,6 +2879,7 @@ mod tests {
         let parallel = estimator.estimate_parallel_seq_scan_with_filter(&stats, 0.1);
 
         // Parallel should have lower total cost on multi-core (due to speedup)
+        #[cfg(feature = "parallel")]
         if rayon::current_num_threads() > 1 {
             assert!(
                 parallel.total < sequential.total,

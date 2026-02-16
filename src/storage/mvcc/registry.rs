@@ -727,10 +727,10 @@ impl TransactionRegistry {
 
     /// Waits for active transactions to complete with timeout.
     pub fn wait_for_active_transactions(&self, timeout: std::time::Duration) -> i32 {
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = crate::common::time_compat::Instant::now() + timeout;
 
         loop {
-            if std::time::Instant::now() > deadline {
+            if crate::common::time_compat::Instant::now() > deadline {
                 break;
             }
 
@@ -739,7 +739,10 @@ impl TransactionRegistry {
                 return 0;
             }
 
+            #[cfg(not(target_arch = "wasm32"))]
             std::thread::sleep(std::time::Duration::from_millis(10));
+            #[cfg(target_arch = "wasm32")]
+            break;
         }
 
         self.active_count() as i32

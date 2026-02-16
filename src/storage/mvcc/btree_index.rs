@@ -35,6 +35,7 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use crate::common::{CompactArc, CompactVec, I64Map};
@@ -43,6 +44,7 @@ use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
 
 /// Threshold for parallel filtering (number of unique values)
+#[cfg(feature = "parallel")]
 const PARALLEL_FILTER_THRESHOLD: usize = 10_000;
 
 /// CompactVec for row IDs per value (16 bytes vs SmallVec's 48 bytes)
@@ -954,6 +956,7 @@ impl Index for BTreeIndex {
         // Use parallel processing for large datasets
         let row_to_value = self.row_to_value.read().unwrap();
 
+        #[cfg(feature = "parallel")]
         if row_to_value.len() >= PARALLEL_FILTER_THRESHOLD {
             // Parallel filtering with Rayon
             let pairs: Vec<_> = row_to_value.iter().collect();
@@ -969,9 +972,11 @@ impl Index for BTreeIndex {
                     }
                 })
                 .collect();
-            RowIdVec::from_vec(collected)
-        } else {
-            // Sequential for small datasets
+            return RowIdVec::from_vec(collected);
+        }
+
+        // Sequential for small datasets (or when parallel feature is disabled)
+        {
             let mut results = RowIdVec::with_capacity(row_to_value.len() / 4);
             for (row_id, arc_value) in row_to_value.iter() {
                 // Dereference Arc to get the Value

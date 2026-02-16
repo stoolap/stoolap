@@ -276,7 +276,7 @@ pub enum Error {
     Io { message: String },
 
     /// Internal error for unexpected conditions
-    #[error("internal error: {message}")]
+    #[error("{message}")]
     Internal { message: String },
 
     // =========================================================================

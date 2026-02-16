@@ -960,28 +960,37 @@ impl ScalarFunction for SleepFunction {
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
         validate_arg_count!(args, "SLEEP", 1);
 
-        if args[0].is_null() {
-            return Ok(Value::null_unknown());
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = &args[0];
+            return Err(Error::internal("SLEEP is not supported in WASM mode"));
         }
 
-        // Get seconds to sleep (can be fractional)
-        let seconds = match &args[0] {
-            Value::Integer(i) => *i as f64,
-            Value::Float(f) => *f,
-            _ => return Err(Error::invalid_argument("SLEEP argument must be a number")),
-        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if args[0].is_null() {
+                return Ok(Value::null_unknown());
+            }
 
-        if seconds < 0.0 {
-            return Err(Error::invalid_argument("SLEEP duration cannot be negative"));
+            // Get seconds to sleep (can be fractional)
+            let seconds = match &args[0] {
+                Value::Integer(i) => *i as f64,
+                Value::Float(f) => *f,
+                _ => return Err(Error::invalid_argument("SLEEP argument must be a number")),
+            };
+
+            if seconds < 0.0 {
+                return Err(Error::invalid_argument("SLEEP duration cannot be negative"));
+            }
+
+            // Limit to reasonable duration (max 300 seconds = 5 minutes)
+            let seconds = seconds.min(300.0);
+
+            // Sleep for the specified duration
+            std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+
+            Ok(Value::Integer(0))
         }
-
-        // Limit to reasonable duration (max 300 seconds = 5 minutes)
-        let seconds = seconds.min(300.0);
-
-        // Sleep for the specified duration
-        std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
-
-        Ok(Value::Integer(0))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {

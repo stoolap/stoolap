@@ -1,299 +1,198 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg width="100%" height="100%" viewBox="0 0 1000 750" fill="none" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
+<svg width="100%" height="100%" viewBox="0 0 900 620" fill="none" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
   <style>
-    text {
-      font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
-    }
-    .title {
-      font-size: 24px;
-      font-weight: 600;
-      fill: #1e293b;
-    }
-    .layer-title {
-      font-size: 13px;
-      font-weight: 600;
-      fill: #ffffff;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-    }
-    .component-title {
-      font-size: 13px;
-      font-weight: 600;
-      fill: #e2e8f0;
-    }
-    .sub-label {
-      font-size: 10px;
-      fill: #94a3b8;
-    }
-    .layer-box {
-      fill: #1e293b;
-      stroke: none;
-      stroke-width: 0;
-    }
-    .component-box {
-      fill: #334155;
-      stroke: #475569;
-      stroke-width: 1;
-    }
-    .sub-box {
-      fill: #1e293b;
-      stroke: #475569;
-      stroke-width: 1;
-    }
-    .accent-green {
-      fill: #1e293b;
-      stroke: #22c55e;
-      stroke-width: 2;
-    }
-    .accent-blue {
-      fill: #1e293b;
-      stroke: #3b82f6;
-      stroke-width: 2;
-    }
-    .accent-purple {
-      fill: #1e293b;
-      stroke: #8b5cf6;
-      stroke-width: 2;
-    }
-    .accent-orange {
-      fill: #1e293b;
-      stroke: #f59e0b;
-      stroke-width: 2;
-    }
-    .connector {
-      stroke: #64748b;
-      stroke-width: 2;
-      fill: none;
-    }
-    .flow-line {
-      stroke: #22c55e;
-      stroke-width: 2;
-      stroke-dasharray: 6 3;
-      fill: none;
-    }
-    .flow-label {
-      font-size: 11px;
-      fill: #22c55e;
-      font-weight: 500;
-    }
+    text { font-family: 'Rubik', 'Segoe UI', system-ui, sans-serif; }
 
-    /* Light mode overrides */
-    @media (prefers-color-scheme: light) {
-      .title { fill: #1e293b; }
-    }
-    [data-theme="light"] .title { fill: #1e293b; }
+    /* ── Light mode (default) ── */
+    .title { font-size: 22px; font-weight: 700; fill: #0f172a; }
+    .layer-title { font-size: 12px; font-weight: 700; fill: #ffffff; letter-spacing: 1.5px; text-transform: uppercase; }
+    .comp-title { font-size: 12.5px; font-weight: 600; fill: #1e293b; }
+    .tag { font-size: 10px; fill: #475569; font-weight: 500; }
+    .feature-label { font-size: 10px; fill: #64748b; font-weight: 500; }
+    .feature-val { font-size: 10px; fill: #0f7d3c; font-weight: 600; }
 
-    /* Dark mode is default, these ensure consistency */
-    @media (prefers-color-scheme: dark) {
-      .title { fill: #f1f5f9; }
-    }
-    [data-theme="dark"] .title { fill: #f1f5f9; }
+    .layer-bar-green { fill: #16a34a; }
+    .layer-bar-blue { fill: #2563eb; }
+    .layer-bar-purple { fill: #7c3aed; }
+    .layer-bar-orange { fill: #d97706; }
+
+    .layer-bg { fill: #f8fafc; stroke: #e2e8f0; stroke-width: 1; }
+    .comp-bg { fill: #ffffff; stroke: #e2e8f0; stroke-width: 1; }
+    .tag-bg { fill: #f1f5f9; stroke: #e2e8f0; stroke-width: 1; }
+
+    .arrow-line { stroke: #94a3b8; stroke-width: 1.5; fill: none; }
+    .arrow-head { fill: #94a3b8; }
+    .flow-line { stroke: #16a34a; stroke-width: 1.5; stroke-dasharray: 5 3; fill: none; }
+    .flow-head { fill: #16a34a; }
+    .flow-label { font-size: 10px; fill: #16a34a; font-weight: 600; letter-spacing: 0.5px; }
+
+    /* ── Dark mode ── */
+    .dark-theme .title, [data-theme="dark"] .title { fill: #f1f5f9; }
+    .dark-theme .comp-title, [data-theme="dark"] .comp-title { fill: #e2e8f0; }
+    .dark-theme .tag, [data-theme="dark"] .tag { fill: #94a3b8; }
+    .dark-theme .feature-label, [data-theme="dark"] .feature-label { fill: #64748b; }
+    .dark-theme .feature-val, [data-theme="dark"] .feature-val { fill: #4ade80; }
+
+    .dark-theme .layer-bg, [data-theme="dark"] .layer-bg { fill: #0f172a; stroke: #1e293b; }
+    .dark-theme .comp-bg, [data-theme="dark"] .comp-bg { fill: #1e293b; stroke: #334155; }
+    .dark-theme .tag-bg, [data-theme="dark"] .tag-bg { fill: #0f172a; stroke: #334155; }
+
+    .dark-theme .arrow-line, [data-theme="dark"] .arrow-line { stroke: #475569; }
+    .dark-theme .arrow-head, [data-theme="dark"] .arrow-head { fill: #475569; }
+    .dark-theme .flow-line, [data-theme="dark"] .flow-line { stroke: #22c55e; }
+    .dark-theme .flow-head, [data-theme="dark"] .flow-head { fill: #22c55e; }
+    .dark-theme .flow-label, [data-theme="dark"] .flow-label { fill: #22c55e; }
   </style>
 
   <defs>
-    <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-      <polygon points="0 0, 8 3, 0 6" fill="#64748b" />
+    <marker id="arr" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+      <polygon points="0 0, 7 2.5, 0 5" class="arrow-head" />
     </marker>
-    <marker id="arrow-green" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-      <polygon points="0 0, 8 3, 0 6" fill="#22c55e" />
+    <marker id="arr-g" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+      <polygon points="0 0, 7 2.5, 0 5" class="flow-head" />
     </marker>
   </defs>
 
-  <!-- Title -->
-  <text x="500" y="40" text-anchor="middle" class="title">Stoolap Architecture</text>
+  <!-- ════════════ TITLE ════════════ -->
+  <text x="420" y="36" text-anchor="middle" class="title">Stoolap Architecture</text>
 
-  <!-- ═══════════════════════════════════════════════════════════════════ -->
-  <!-- API LAYER -->
-  <!-- ═══════════════════════════════════════════════════════════════════ -->
-  <g transform="translate(30, 65)">
-    <rect x="0" y="0" width="880" height="90" rx="8" class="layer-box accent-green" />
-    <text x="20" y="25" class="layer-title">API Layer</text>
+  <!-- ════════════ API LAYER ════════════ -->
+  <g transform="translate(20, 56)">
+    <rect x="0" y="0" width="800" height="80" rx="8" class="layer-bg" />
+    <rect x="0" y="0" width="800" height="26" rx="8" class="layer-bar-green" />
+    <rect x="0" y="14" width="800" height="12" class="layer-bar-green" />
+    <text x="400" y="18" text-anchor="middle" class="layer-title">API Layer</text>
 
-    <!-- Database API -->
-    <rect x="20" y="40" width="180" height="40" rx="6" class="component-box" />
-    <text x="110" y="65" text-anchor="middle" class="component-title">Database API</text>
+    <rect x="16" y="38" width="185" height="30" rx="5" class="comp-bg" />
+    <text x="108" y="58" text-anchor="middle" class="comp-title">Database API</text>
 
-    <!-- SQL Parser -->
-    <rect x="220" y="40" width="180" height="40" rx="6" class="component-box" />
-    <text x="310" y="65" text-anchor="middle" class="component-title">SQL Parser</text>
+    <rect x="213" y="38" width="185" height="30" rx="5" class="comp-bg" />
+    <text x="305" y="58" text-anchor="middle" class="comp-title">SQL Parser</text>
 
-    <!-- CLI -->
-    <rect x="420" y="40" width="180" height="40" rx="6" class="component-box" />
-    <text x="510" y="65" text-anchor="middle" class="component-title">CLI Interface</text>
+    <rect x="410" y="38" width="185" height="30" rx="5" class="comp-bg" />
+    <text x="502" y="58" text-anchor="middle" class="comp-title">CLI Interface</text>
 
-    <!-- Connection Manager -->
-    <rect x="620" y="40" width="240" height="40" rx="6" class="component-box" />
-    <text x="740" y="65" text-anchor="middle" class="component-title">Connection Manager</text>
+    <rect x="607" y="38" width="177" height="30" rx="5" class="comp-bg" />
+    <text x="695" y="58" text-anchor="middle" class="comp-title">Connection Mgr</text>
   </g>
 
-  <!-- ═══════════════════════════════════════════════════════════════════ -->
-  <!-- QUERY PROCESSING LAYER -->
-  <!-- ═══════════════════════════════════════════════════════════════════ -->
-  <g transform="translate(30, 175)">
-    <rect x="0" y="0" width="880" height="140" rx="8" class="layer-box accent-blue" />
-    <text x="20" y="25" class="layer-title">Query Processing</text>
+  <!-- Arrow: API → Query -->
+  <path d="M420 136 L420 150" class="arrow-line" marker-end="url(#arr)" />
 
-    <!-- Query Optimizer -->
-    <g transform="translate(20, 40)">
-      <rect x="0" y="0" width="260" height="90" rx="6" class="component-box" />
-      <text x="130" y="22" text-anchor="middle" class="component-title">Cost-Based Optimizer</text>
-      <rect x="10" y="32" width="72" height="28" rx="4" class="sub-box" />
-      <text x="46" y="50" text-anchor="middle" class="sub-label">Statistics</text>
-      <rect x="92" y="32" width="72" height="28" rx="4" class="sub-box" />
-      <text x="128" y="50" text-anchor="middle" class="sub-label">Join Order</text>
-      <rect x="174" y="32" width="72" height="28" rx="4" class="sub-box" />
-      <text x="210" y="50" text-anchor="middle" class="sub-label">Adaptive</text>
-      <rect x="50" y="65" width="72" height="22" rx="4" class="sub-box" />
-      <text x="86" y="80" text-anchor="middle" class="sub-label">Cardinality</text>
-      <rect x="132" y="65" width="78" height="22" rx="4" class="sub-box" />
-      <text x="171" y="80" text-anchor="middle" class="sub-label">Bloom Filter</text>
-    </g>
+  <!-- ════════════ QUERY PROCESSING ════════════ -->
+  <g transform="translate(20, 156)">
+    <rect x="0" y="0" width="800" height="130" rx="8" class="layer-bg" />
+    <rect x="0" y="0" width="800" height="26" rx="8" class="layer-bar-blue" />
+    <rect x="0" y="14" width="800" height="12" class="layer-bar-blue" />
+    <text x="400" y="18" text-anchor="middle" class="layer-title">Query Processing</text>
+
+    <!-- Cost-Based Optimizer -->
+    <rect x="16" y="36" width="248" height="82" rx="5" class="comp-bg" />
+    <text x="140" y="54" text-anchor="middle" class="comp-title">Cost-Based Optimizer</text>
+    <rect x="26" y="62" width="68" height="20" rx="3" class="tag-bg" /><text x="60" y="76" text-anchor="middle" class="tag">Statistics</text>
+    <rect x="100" y="62" width="68" height="20" rx="3" class="tag-bg" /><text x="134" y="76" text-anchor="middle" class="tag">Join Order</text>
+    <rect x="174" y="62" width="68" height="20" rx="3" class="tag-bg" /><text x="208" y="76" text-anchor="middle" class="tag">Adaptive</text>
+    <rect x="26" y="86" width="68" height="20" rx="3" class="tag-bg" /><text x="60" y="100" text-anchor="middle" class="tag">Cardinality</text>
+    <rect x="100" y="86" width="80" height="20" rx="3" class="tag-bg" /><text x="140" y="100" text-anchor="middle" class="tag">Bloom Filter</text>
 
     <!-- Query Executor -->
-    <g transform="translate(300, 40)">
-      <rect x="0" y="0" width="260" height="90" rx="6" class="component-box" />
-      <text x="130" y="22" text-anchor="middle" class="component-title">Query Executor</text>
-      <rect x="10" y="32" width="72" height="28" rx="4" class="sub-box" />
-      <text x="46" y="50" text-anchor="middle" class="sub-label">DML</text>
-      <rect x="92" y="32" width="72" height="28" rx="4" class="sub-box" />
-      <text x="128" y="50" text-anchor="middle" class="sub-label">DDL</text>
-      <rect x="174" y="32" width="72" height="28" rx="4" class="sub-box" />
-      <text x="210" y="50" text-anchor="middle" class="sub-label">Parallel</text>
-      <rect x="50" y="65" width="72" height="22" rx="4" class="sub-box" />
-      <text x="86" y="80" text-anchor="middle" class="sub-label">Aggregate</text>
-      <rect x="132" y="65" width="78" height="22" rx="4" class="sub-box" />
-      <text x="171" y="80" text-anchor="middle" class="sub-label">Window Fn</text>
-    </g>
+    <rect x="280" y="36" width="248" height="82" rx="5" class="comp-bg" />
+    <text x="404" y="54" text-anchor="middle" class="comp-title">Query Executor</text>
+    <rect x="290" y="62" width="50" height="20" rx="3" class="tag-bg" /><text x="315" y="76" text-anchor="middle" class="tag">DML</text>
+    <rect x="346" y="62" width="50" height="20" rx="3" class="tag-bg" /><text x="371" y="76" text-anchor="middle" class="tag">DDL</text>
+    <rect x="402" y="62" width="58" height="20" rx="3" class="tag-bg" /><text x="431" y="76" text-anchor="middle" class="tag">Parallel</text>
+    <rect x="466" y="62" width="50" height="20" rx="3" class="tag-bg" /><text x="491" y="76" text-anchor="middle" class="tag">Joins</text>
+    <rect x="290" y="86" width="72" height="20" rx="3" class="tag-bg" /><text x="326" y="100" text-anchor="middle" class="tag">Aggregate</text>
+    <rect x="368" y="86" width="72" height="20" rx="3" class="tag-bg" /><text x="404" y="100" text-anchor="middle" class="tag">Window Fn</text>
+    <rect x="446" y="86" width="72" height="20" rx="3" class="tag-bg" /><text x="482" y="100" text-anchor="middle" class="tag">Subquery</text>
 
     <!-- Semantic Cache -->
-    <g transform="translate(580, 40)">
-      <rect x="0" y="0" width="280" height="90" rx="6" class="component-box" />
-      <text x="140" y="22" text-anchor="middle" class="component-title">Semantic Cache</text>
-      <rect x="10" y="32" width="120" height="28" rx="4" class="sub-box" />
-      <text x="70" y="50" text-anchor="middle" class="sub-label">Predicate Match</text>
-      <rect x="140" y="32" width="130" height="28" rx="4" class="sub-box" />
-      <text x="205" y="50" text-anchor="middle" class="sub-label">Result Subsumption</text>
-      <rect x="50" y="65" width="70" height="22" rx="4" class="sub-box" />
-      <text x="85" y="80" text-anchor="middle" class="sub-label">LRU</text>
-      <rect x="130" y="65" width="100" height="22" rx="4" class="sub-box" />
-      <text x="180" y="80" text-anchor="middle" class="sub-label">Invalidation</text>
-    </g>
+    <rect x="544" y="36" width="240" height="82" rx="5" class="comp-bg" />
+    <text x="664" y="54" text-anchor="middle" class="comp-title">Semantic Cache</text>
+    <rect x="554" y="62" width="100" height="20" rx="3" class="tag-bg" /><text x="604" y="76" text-anchor="middle" class="tag">Predicate Match</text>
+    <rect x="660" y="62" width="112" height="20" rx="3" class="tag-bg" /><text x="716" y="76" text-anchor="middle" class="tag">Subsumption</text>
+    <rect x="554" y="86" width="56" height="20" rx="3" class="tag-bg" /><text x="582" y="100" text-anchor="middle" class="tag">LRU</text>
+    <rect x="616" y="86" width="84" height="20" rx="3" class="tag-bg" /><text x="658" y="100" text-anchor="middle" class="tag">Invalidation</text>
   </g>
 
-  <!-- ═══════════════════════════════════════════════════════════════════ -->
-  <!-- STORAGE ENGINE LAYER -->
-  <!-- ═══════════════════════════════════════════════════════════════════ -->
-  <g transform="translate(30, 335)">
-    <rect x="0" y="0" width="880" height="140" rx="8" class="layer-box accent-purple" />
-    <text x="20" y="25" class="layer-title">Storage Engine</text>
+  <!-- Arrow: Query → Storage -->
+  <path d="M420 286 L420 300" class="arrow-line" marker-end="url(#arr)" />
 
-    <!-- MVCC -->
-    <g transform="translate(20, 40)">
-      <rect x="0" y="0" width="195" height="90" rx="6" class="component-box" />
-      <text x="97" y="22" text-anchor="middle" class="component-title">MVCC Engine</text>
-      <rect x="10" y="32" width="82" height="28" rx="4" class="sub-box" />
-      <text x="51" y="50" text-anchor="middle" class="sub-label">Transaction</text>
-      <rect x="102" y="32" width="82" height="28" rx="4" class="sub-box" />
-      <text x="143" y="50" text-anchor="middle" class="sub-label">Version Store</text>
-      <rect x="25" y="65" width="65" height="22" rx="4" class="sub-box" />
-      <text x="57" y="80" text-anchor="middle" class="sub-label">Snapshot</text>
-      <rect x="100" y="65" width="65" height="22" rx="4" class="sub-box" />
-      <text x="132" y="80" text-anchor="middle" class="sub-label">Registry</text>
-    </g>
+  <!-- ════════════ STORAGE ENGINE ════════════ -->
+  <g transform="translate(20, 306)">
+    <rect x="0" y="0" width="800" height="130" rx="8" class="layer-bg" />
+    <rect x="0" y="0" width="800" height="26" rx="8" class="layer-bar-purple" />
+    <rect x="0" y="14" width="800" height="12" class="layer-bar-purple" />
+    <text x="400" y="18" text-anchor="middle" class="layer-title">Storage Engine</text>
+
+    <!-- MVCC Engine -->
+    <rect x="16" y="36" width="185" height="82" rx="5" class="comp-bg" />
+    <text x="108" y="54" text-anchor="middle" class="comp-title">MVCC Engine</text>
+    <rect x="26" y="62" width="78" height="20" rx="3" class="tag-bg" /><text x="65" y="76" text-anchor="middle" class="tag">Transaction</text>
+    <rect x="110" y="62" width="78" height="20" rx="3" class="tag-bg" /><text x="149" y="76" text-anchor="middle" class="tag">Version Store</text>
+    <rect x="26" y="86" width="78" height="20" rx="3" class="tag-bg" /><text x="65" y="100" text-anchor="middle" class="tag">Snapshot</text>
+    <rect x="110" y="86" width="78" height="20" rx="3" class="tag-bg" /><text x="149" y="100" text-anchor="middle" class="tag">Registry</text>
 
     <!-- Row Storage -->
-    <g transform="translate(235, 40)">
-      <rect x="0" y="0" width="195" height="90" rx="6" class="component-box" />
-      <text x="97" y="22" text-anchor="middle" class="component-title">Row Storage</text>
-      <rect x="10" y="32" width="82" height="28" rx="4" class="sub-box" />
-      <text x="51" y="50" text-anchor="middle" class="sub-label">Table</text>
-      <rect x="102" y="32" width="82" height="28" rx="4" class="sub-box" />
-      <text x="143" y="50" text-anchor="middle" class="sub-label">Schema</text>
-      <rect x="25" y="65" width="65" height="22" rx="4" class="sub-box" />
-      <text x="57" y="80" text-anchor="middle" class="sub-label">Scanner</text>
-      <rect x="100" y="65" width="75" height="22" rx="4" class="sub-box" />
-      <text x="137" y="80" text-anchor="middle" class="sub-label">Expression</text>
-    </g>
+    <rect x="213" y="36" width="185" height="82" rx="5" class="comp-bg" />
+    <text x="305" y="54" text-anchor="middle" class="comp-title">Row Storage</text>
+    <rect x="223" y="62" width="78" height="20" rx="3" class="tag-bg" /><text x="262" y="76" text-anchor="middle" class="tag">Table</text>
+    <rect x="307" y="62" width="78" height="20" rx="3" class="tag-bg" /><text x="346" y="76" text-anchor="middle" class="tag">Schema</text>
+    <rect x="223" y="86" width="78" height="20" rx="3" class="tag-bg" /><text x="262" y="100" text-anchor="middle" class="tag">Scanner</text>
+    <rect x="307" y="86" width="78" height="20" rx="3" class="tag-bg" /><text x="346" y="100" text-anchor="middle" class="tag">Expression</text>
 
-    <!-- Indexes -->
-    <g transform="translate(450, 40)">
-      <rect x="0" y="0" width="195" height="90" rx="6" class="component-box" />
-      <text x="97" y="22" text-anchor="middle" class="component-title">Index Manager</text>
-      <rect x="10" y="32" width="55" height="28" rx="4" class="sub-box" />
-      <text x="37" y="50" text-anchor="middle" class="sub-label">B-tree</text>
-      <rect x="72" y="32" width="55" height="28" rx="4" class="sub-box" />
-      <text x="99" y="50" text-anchor="middle" class="sub-label">Hash</text>
-      <rect x="134" y="32" width="55" height="28" rx="4" class="sub-box" />
-      <text x="161" y="50" text-anchor="middle" class="sub-label">Bitmap</text>
-      <rect x="50" y="65" width="95" height="22" rx="4" class="sub-box" />
-      <text x="97" y="80" text-anchor="middle" class="sub-label">Multi-Column</text>
-    </g>
+    <!-- Index Manager -->
+    <rect x="410" y="36" width="185" height="82" rx="5" class="comp-bg" />
+    <text x="502" y="54" text-anchor="middle" class="comp-title">Index Manager</text>
+    <rect x="420" y="62" width="52" height="20" rx="3" class="tag-bg" /><text x="446" y="76" text-anchor="middle" class="tag">B-tree</text>
+    <rect x="478" y="62" width="52" height="20" rx="3" class="tag-bg" /><text x="504" y="76" text-anchor="middle" class="tag">Hash</text>
+    <rect x="536" y="62" width="52" height="20" rx="3" class="tag-bg" /><text x="562" y="76" text-anchor="middle" class="tag">Bitmap</text>
+    <rect x="440" y="86" width="100" height="20" rx="3" class="tag-bg" /><text x="490" y="100" text-anchor="middle" class="tag">Multi-Column</text>
 
     <!-- Functions -->
-    <g transform="translate(665, 40)">
-      <rect x="0" y="0" width="195" height="90" rx="6" class="component-box" />
-      <text x="97" y="22" text-anchor="middle" class="component-title">Functions (101+)</text>
-      <rect x="10" y="32" width="82" height="28" rx="4" class="sub-box" />
-      <text x="51" y="50" text-anchor="middle" class="sub-label">Scalar</text>
-      <rect x="102" y="32" width="82" height="28" rx="4" class="sub-box" />
-      <text x="143" y="50" text-anchor="middle" class="sub-label">Aggregate</text>
-      <rect x="25" y="65" width="65" height="22" rx="4" class="sub-box" />
-      <text x="57" y="80" text-anchor="middle" class="sub-label">Window</text>
-      <rect x="100" y="65" width="65" height="22" rx="4" class="sub-box" />
-      <text x="132" y="80" text-anchor="middle" class="sub-label">JSON</text>
-    </g>
+    <rect x="607" y="36" width="177" height="82" rx="5" class="comp-bg" />
+    <text x="695" y="54" text-anchor="middle" class="comp-title">Functions (110)</text>
+    <rect x="617" y="62" width="74" height="20" rx="3" class="tag-bg" /><text x="654" y="76" text-anchor="middle" class="tag">Scalar</text>
+    <rect x="697" y="62" width="74" height="20" rx="3" class="tag-bg" /><text x="734" y="76" text-anchor="middle" class="tag">Aggregate</text>
+    <rect x="617" y="86" width="74" height="20" rx="3" class="tag-bg" /><text x="654" y="100" text-anchor="middle" class="tag">Window</text>
+    <rect x="697" y="86" width="74" height="20" rx="3" class="tag-bg" /><text x="734" y="100" text-anchor="middle" class="tag">JSON</text>
   </g>
 
-  <!-- ═══════════════════════════════════════════════════════════════════ -->
-  <!-- PERSISTENCE LAYER -->
-  <!-- ═══════════════════════════════════════════════════════════════════ -->
-  <g transform="translate(30, 495)">
-    <rect x="0" y="0" width="880" height="90" rx="8" class="layer-box accent-orange" />
-    <text x="20" y="25" class="layer-title">Persistence</text>
+  <!-- Arrow: Storage → Persistence -->
+  <path d="M420 436 L420 450" class="arrow-line" marker-end="url(#arr)" />
 
-    <!-- WAL -->
-    <rect x="20" y="40" width="195" height="40" rx="6" class="component-box" />
-    <text x="117" y="65" text-anchor="middle" class="component-title">Write-Ahead Log</text>
+  <!-- ════════════ PERSISTENCE ════════════ -->
+  <g transform="translate(20, 456)">
+    <rect x="0" y="0" width="800" height="72" rx="8" class="layer-bg" />
+    <rect x="0" y="0" width="800" height="26" rx="8" class="layer-bar-orange" />
+    <rect x="0" y="14" width="800" height="12" class="layer-bar-orange" />
+    <text x="400" y="18" text-anchor="middle" class="layer-title">Persistence</text>
 
-    <!-- Snapshots -->
-    <rect x="235" y="40" width="195" height="40" rx="6" class="component-box" />
-    <text x="332" y="65" text-anchor="middle" class="component-title">Snapshots</text>
+    <rect x="16" y="34" width="185" height="28" rx="5" class="comp-bg" />
+    <text x="108" y="53" text-anchor="middle" class="comp-title">Write-Ahead Log</text>
 
-    <!-- Recovery -->
-    <rect x="450" y="40" width="195" height="40" rx="6" class="component-box" />
-    <text x="547" y="65" text-anchor="middle" class="component-title">Crash Recovery</text>
+    <rect x="213" y="34" width="185" height="28" rx="5" class="comp-bg" />
+    <text x="305" y="53" text-anchor="middle" class="comp-title">Snapshots</text>
 
-    <!-- File Lock -->
-    <rect x="665" y="40" width="195" height="40" rx="6" class="component-box" />
-    <text x="762" y="65" text-anchor="middle" class="component-title">File Lock</text>
+    <rect x="410" y="34" width="185" height="28" rx="5" class="comp-bg" />
+    <text x="502" y="53" text-anchor="middle" class="comp-title">Crash Recovery</text>
+
+    <rect x="607" y="34" width="177" height="28" rx="5" class="comp-bg" />
+    <text x="695" y="53" text-anchor="middle" class="comp-title">File Lock</text>
   </g>
 
-  <!-- ═══════════════════════════════════════════════════════════════════ -->
-  <!-- CONNECTION ARROWS -->
-  <!-- ═══════════════════════════════════════════════════════════════════ -->
-  <!-- API to Query Processing -->
-  <path d="M470 155 L470 175" class="connector" marker-end="url(#arrow)" />
+  <!-- ════════════ RETURN FLOW ════════════ -->
+  <path d="M820 492 L850 492 L850 96 L820 96" class="flow-line" marker-end="url(#arr-g)" />
+  <text x="862" y="298" class="flow-label" transform="rotate(90 862 298)">Results</text>
 
-  <!-- Query Processing to Storage -->
-  <path d="M470 315 L470 335" class="connector" marker-end="url(#arrow)" />
-
-  <!-- Storage to Persistence -->
-  <path d="M470 475 L470 495" class="connector" marker-end="url(#arrow)" />
-
-  <!-- Data flow return path (inside viewBox now) -->
-  <path d="M910 540 L930 540 L930 110 L910 110" class="flow-line" marker-end="url(#arrow-green)" />
-
-  <!-- Results label -->
-  <text x="945" y="330" class="flow-label" transform="rotate(90 945 330)">Results</text>
-
-  <!-- Feature highlights -->
-  <g transform="translate(30, 615)">
-    <text x="0" y="20" class="sub-label" style="font-weight: 600; fill: #475569;">Key Features:</text>
-    <text x="95" y="20" class="sub-label">ACID Transactions</text>
-    <text x="220" y="20" class="sub-label">MVCC Isolation</text>
-    <text x="340" y="20" class="sub-label">Cost-Based Optimizer</text>
-    <text x="495" y="20" class="sub-label">Parallel Execution</text>
-    <text x="635" y="20" class="sub-label">Semantic Caching</text>
-    <text x="775" y="20" class="sub-label">Time-Travel (AS OF)</text>
+  <!-- ════════════ KEY FEATURES ════════════ -->
+  <g transform="translate(20, 555)">
+    <text x="0" y="14" class="feature-val">Key Features:</text>
+    <text x="100" y="14" class="feature-label">ACID Transactions</text>
+    <text x="225" y="14" class="feature-label">MVCC Isolation</text>
+    <text x="340" y="14" class="feature-label">Cost-Based Optimizer</text>
+    <text x="490" y="14" class="feature-label">Parallel Execution</text>
+    <text x="625" y="14" class="feature-label">Semantic Caching</text>
+    <text x="750" y="14" class="feature-label">Time-Travel (AS OF)</text>
   </g>
 </svg>

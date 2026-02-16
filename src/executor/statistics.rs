@@ -17,7 +17,7 @@
 //! This module implements the ANALYZE command which collects statistics
 //! about tables and stores them in system tables for query optimization.
 
-use std::time::SystemTime;
+use crate::common::time_compat::SystemTime;
 
 use rand::Rng;
 use rustc_hash::FxHashSet;

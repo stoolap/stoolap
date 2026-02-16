@@ -58,7 +58,7 @@ impl Executor {
 
         if stmt.analyze {
             // EXPLAIN ANALYZE: Execute the query and collect statistics
-            let start = std::time::Instant::now();
+            let start = crate::common::time_compat::Instant::now();
             let mut result = self.execute_statement(&stmt.statement, ctx)?;
 
             // Count rows by iterating through the result
@@ -334,7 +334,16 @@ impl Executor {
                                     ScanPlan::ParallelSeqScan {
                                         table: tbl,
                                         filter: filter_str,
-                                        workers: rayon::current_num_threads(),
+                                        workers: {
+                                            #[cfg(feature = "parallel")]
+                                            {
+                                                rayon::current_num_threads()
+                                            }
+                                            #[cfg(not(feature = "parallel"))]
+                                            {
+                                                1
+                                            }
+                                        },
                                     }
                                 } else {
                                     ScanPlan::SeqScan {

@@ -36,9 +36,9 @@
 //! let plan = cache.get("SELECT * FROM users").unwrap();
 //! ```
 
+use crate::common::time_compat::Instant;
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
 
 use crate::common::SmartString;
 use rustc_hash::FxHashMap;

@@ -36,10 +36,10 @@
 //! SELECT * FROM users WHERE status = 'pending';
 //! ```
 
+use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
 use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::parser::ast::Expression;
 

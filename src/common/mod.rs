@@ -30,6 +30,7 @@ pub mod cow_hashmap;
 pub mod i64_map;
 pub mod maps;
 pub mod smart_string;
+pub mod time_compat;
 pub mod version;
 
 // Re-export main types for convenience

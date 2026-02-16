@@ -18,12 +18,12 @@
 //! Implements the WAL protocol with configurable sync modes.
 //!
 
+use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::I64Set;
 use crate::core::{Error, Result};
@@ -1942,10 +1942,12 @@ impl WALManager {
     ///
     /// Uses exponential backoff to avoid busy-waiting while still being responsive.
     fn wait_for_in_flight_writes_timeout(&self, timeout: std::time::Duration) -> Result<()> {
-        use std::time::Instant;
+        use crate::common::time_compat::Instant;
 
         let deadline = Instant::now() + timeout;
+        #[cfg(not(target_arch = "wasm32"))]
         let mut sleep_duration = std::time::Duration::from_micros(10);
+        #[cfg(not(target_arch = "wasm32"))]
         const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
 
         while self.in_flight_writes.load(Ordering::SeqCst) > 0 {
@@ -1957,8 +1959,11 @@ impl WALManager {
             }
 
             // Exponential backoff with cap
-            std::thread::sleep(sleep_duration);
-            sleep_duration = std::cmp::min(sleep_duration * 2, MAX_SLEEP);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::thread::sleep(sleep_duration);
+                sleep_duration = std::cmp::min(sleep_duration * 2, MAX_SLEEP);
+            }
         }
 
         Ok(())

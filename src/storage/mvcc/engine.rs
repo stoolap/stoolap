@@ -171,8 +171,8 @@ fn write_snapshot_metadata(path: &std::path::Path, lsn: u64) -> Result<()> {
     buf.extend_from_slice(&lsn.to_le_bytes());
 
     // Timestamp in milliseconds since epoch (8 bytes)
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let timestamp = crate::common::time_compat::SystemTime::now()
+        .duration_since(crate::common::time_compat::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     buf.extend_from_slice(&timestamp.to_le_bytes());
@@ -600,6 +600,7 @@ impl MVCCEngine {
     }
 
     /// Internal method to start periodic cleanup with configurable parameters
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_periodic_cleanup_internal(
         self: &Arc<Self>,
         interval: std::time::Duration,
@@ -637,6 +638,19 @@ impl MVCCEngine {
         CleanupHandle {
             stop_flag,
             thread: Some(handle),
+        }
+    }
+
+    /// No-op cleanup on WASM (no background threads available)
+    #[cfg(target_arch = "wasm32")]
+    fn start_periodic_cleanup_internal(
+        self: &Arc<Self>,
+        _interval: std::time::Duration,
+        _deleted_row_retention: std::time::Duration,
+        _txn_retention: std::time::Duration,
+    ) -> CleanupHandle {
+        CleanupHandle {
+            stop_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3044,6 +3058,7 @@ impl MVCCEngine {
     /// Start periodic cleanup of old transactions and deleted rows
     ///
     /// Returns a handle that can be used to stop the cleanup thread.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn start_periodic_cleanup(
         self: &Arc<Self>,
         interval: std::time::Duration,
@@ -3074,14 +3089,6 @@ impl MVCCEngine {
                 let _txn_count = engine.cleanup_old_transactions(max_age);
                 let _row_count = engine.cleanup_deleted_rows(max_age);
                 let _prev_version_count = engine.cleanup_old_previous_versions();
-
-                // Uncomment for debugging:
-                // if txn_count > 0 || row_count > 0 || prev_version_count > 0 {
-                //     eprintln!(
-                //         "Cleanup: {} transactions, {} deleted rows, {} previous versions",
-                //         txn_count, row_count, prev_version_count
-                //     );
-                // }
             }
         });
 
@@ -3095,6 +3102,7 @@ impl MVCCEngine {
 /// Handle for stopping the cleanup thread
 pub struct CleanupHandle {
     stop_flag: Arc<AtomicBool>,
+    #[cfg(not(target_arch = "wasm32"))]
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -3102,6 +3110,7 @@ impl CleanupHandle {
     /// Stop the cleanup thread
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Release);
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }

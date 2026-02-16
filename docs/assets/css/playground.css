@@ -1,0 +1,452 @@
+/*
+ * Stoolap Playground — Terminal-style SQL sandbox
+ * Theme-aware: light terminal in light mode, dark in dark mode.
+ */
+
+/* ── Remove wrapper padding on playground ── */
+.site-content:has(.playground-hero) { padding: 0; }
+.site-content:has(.playground-hero) ~ .site-footer { margin-top: 0; }
+
+/* ============================================
+   HERO — Compact version of homepage hero
+   ============================================ */
+.playground-hero {
+  position: relative;
+  margin-top: calc(-1 * var(--header-height));
+  padding: calc(var(--header-height) + 1.5rem) 0 1rem;
+  text-align: center;
+  color: var(--color-text);
+  overflow: hidden;
+}
+
+[data-theme="dark"] .playground-hero {
+  color: #fff;
+}
+
+.playground-hero-bg {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, #94a3b8 0%, #b0bcc9 35%, #cdd5de 65%, #eef1f5 100%);
+  z-index: 0;
+}
+
+[data-theme="dark"] .playground-hero-bg {
+  background: linear-gradient(180deg, #0a1a28 0%, #0f2535 35%, #163348 65%, #1a3b50 100%);
+}
+
+.playground-hero-inner {
+  position: relative;
+  z-index: 2;
+}
+
+.playground-title {
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin: 0 0 0.4rem;
+  color: var(--color-text);
+  line-height: 1.1;
+  animation: fadeUp 0.7s ease both;
+}
+
+[data-theme="dark"] .playground-title {
+  color: #fff;
+}
+
+.playground-desc {
+  font-size: 0.92rem;
+  color: var(--color-text-muted);
+  max-width: 600px;
+  margin: 0 auto;
+  line-height: 1.5;
+  animation: fadeUp 0.7s ease 0.1s both;
+}
+
+[data-theme="dark"] .playground-desc {
+  color: rgba(255,255,255,0.55);
+}
+
+/* ============================================
+   PLAYGROUND SECTION
+   ============================================ */
+.playground-section {
+  padding: 0 0 4rem;
+  background: linear-gradient(180deg, #edf0f4 0%, #edf0f4 2%, var(--color-bg) 12%);
+  margin-top: -1px;
+}
+
+[data-theme="dark"] .playground-section {
+  background: linear-gradient(180deg, #1a3b50 0%, #1a3b50 3%, var(--color-bg) 40%);
+}
+
+/* ============================================
+   TERMINAL — Theme-aware
+   ============================================ */
+.playground-terminal {
+  max-width: 1200px;
+  height: 70vh;
+  margin: 0 auto;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  box-shadow:
+    0 30px 100px rgba(0,0,0,0.1),
+    0 10px 30px rgba(0,0,0,0.08);
+  display: flex;
+  flex-direction: column;
+  animation: fadeUp 0.8s ease 0.2s both;
+}
+
+[data-theme="dark"] .playground-terminal {
+  background: #0b1018;
+  border-color: rgba(255,255,255,0.06);
+  box-shadow:
+    0 30px 100px rgba(0,0,0,0.4),
+    0 10px 30px rgba(0,0,0,0.3),
+    0 0 0 1px rgba(255,255,255,0.06);
+}
+
+/* ── Chrome bar ── */
+.pg-chrome {
+  display: flex;
+  align-items: center;
+  padding: 0.7rem 1rem;
+  background: var(--color-bg-alt);
+  border-bottom: 1px solid var(--color-border);
+  gap: 7px;
+}
+
+[data-theme="dark"] .pg-chrome {
+  background: #0f1520;
+  border-bottom-color: rgba(255,255,255,0.04);
+}
+
+.pg-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+}
+
+.pg-label {
+  margin-left: 0.6rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--color-text-light);
+  letter-spacing: 0.02em;
+  flex: 1;
+}
+
+[data-theme="dark"] .pg-label {
+  color: rgba(255,255,255,0.3);
+}
+
+.pg-chrome-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.pg-btn {
+  padding: 0.25rem 0.65rem;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--color-text-muted);
+  background: rgba(var(--color-text-rgb), 0.05);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.pg-btn:hover {
+  background: rgba(var(--color-text-rgb), 0.1);
+  color: var(--color-text);
+  border-color: rgba(var(--color-text-rgb), 0.2);
+}
+
+[data-theme="dark"] .pg-btn {
+  color: rgba(255,255,255,0.4);
+  background: rgba(255,255,255,0.05);
+  border-color: rgba(255,255,255,0.08);
+}
+
+[data-theme="dark"] .pg-btn:hover {
+  background: rgba(255,255,255,0.1);
+  color: rgba(255,255,255,0.7);
+  border-color: rgba(255,255,255,0.15);
+}
+
+/* ── Output area ── */
+.pg-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 1rem 1.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: var(--color-text);
+  scroll-behavior: smooth;
+}
+
+[data-theme="dark"] .pg-body {
+  color: #c9d1d9;
+}
+
+/* Scrollbar */
+.pg-body::-webkit-scrollbar { width: 6px; }
+.pg-body::-webkit-scrollbar-track { background: transparent; }
+.pg-body::-webkit-scrollbar-thumb { background: rgba(var(--color-text-rgb), 0.12); border-radius: 3px; }
+.pg-body::-webkit-scrollbar-thumb:hover { background: rgba(var(--color-text-rgb), 0.2); }
+
+[data-theme="dark"] .pg-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); }
+[data-theme="dark"] .pg-body::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); }
+
+/* ── Loading state ── */
+.pg-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 4rem 0;
+  color: var(--color-text-muted);
+  font-size: 0.9rem;
+  flex-direction: column;
+}
+
+[data-theme="dark"] .pg-loading {
+  color: rgba(255,255,255,0.45);
+}
+
+.pg-spinner {
+  width: 24px;
+  height: 24px;
+  border: 2px solid var(--color-border);
+  border-top-color: var(--color-primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+[data-theme="dark"] .pg-spinner {
+  border-color: rgba(255,255,255,0.1);
+  border-top-color: #4dd98a;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Output lines ── */
+.pg-line {
+  margin-bottom: 0.35rem;
+  word-wrap: break-word;
+}
+
+.pg-command {
+  color: var(--color-text);
+}
+
+[data-theme="dark"] .pg-command {
+  color: #e6edf3;
+}
+
+.pg-cmd-prompt {
+  color: var(--color-primary);
+  user-select: none;
+}
+
+[data-theme="dark"] .pg-cmd-prompt {
+  color: #7ee787;
+}
+
+pre.pg-table-pre {
+  margin: 0.25rem 0;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--color-text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  overflow-x: auto;
+  box-shadow: none;
+}
+
+[data-theme="dark"] pre.pg-table-pre {
+  color: #8b949e;
+}
+
+.pg-info {
+  color: var(--color-primary);
+  font-size: 0.82rem;
+}
+
+[data-theme="dark"] .pg-info {
+  color: #7ee787;
+}
+
+.pg-error {
+  color: #d32f2f;
+}
+
+[data-theme="dark"] .pg-error {
+  color: #f85149;
+}
+
+.pg-welcome {
+  color: var(--color-text-muted);
+  white-space: pre-wrap;
+}
+
+[data-theme="dark"] .pg-welcome {
+  color: rgba(255,255,255,0.45);
+}
+
+/* ── Input area ── */
+.pg-input-area {
+  display: flex;
+  align-items: flex-start;
+  padding: 0.65rem 1.4rem;
+  background: var(--color-bg-alt);
+  border-top: 1px solid var(--color-border);
+  gap: 0.5rem;
+}
+
+[data-theme="dark"] .pg-input-area {
+  background: #0d1320;
+  border-top-color: rgba(255,255,255,0.04);
+}
+
+.pg-prompt {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--color-primary);
+  line-height: 1.6;
+  user-select: none;
+  flex-shrink: 0;
+  padding-top: 1px;
+}
+
+[data-theme="dark"] .pg-prompt {
+  color: #7ee787;
+}
+
+.pg-input {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: var(--color-text);
+  background: transparent;
+  border: none;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  padding: 0;
+  caret-color: var(--color-primary);
+}
+
+[data-theme="dark"] .pg-input {
+  color: #e6edf3;
+  caret-color: #7ee787;
+}
+
+.pg-input::placeholder {
+  color: var(--color-text-light);
+}
+
+[data-theme="dark"] .pg-input::placeholder {
+  color: rgba(255,255,255,0.2);
+}
+
+.pg-input:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* ============================================
+   HINTS — Query chip buttons
+   ============================================ */
+.playground-hints {
+  padding: 0.5rem 1.4rem 0.65rem;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg);
+}
+
+[data-theme="dark"] .playground-hints {
+  border-top-color: rgba(255,255,255,0.04);
+  background: #0b1018;
+}
+
+.hint-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.hint-chip {
+  padding: 0.3rem 0.7rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: var(--color-text-muted);
+  background: rgba(var(--color-text-rgb), 0.04);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.hint-chip:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: rgba(var(--color-primary-rgb), 0.06);
+}
+
+[data-theme="dark"] .hint-chip {
+  color: rgba(255,255,255,0.35);
+  background: rgba(255,255,255,0.04);
+  border-color: rgba(255,255,255,0.08);
+}
+
+[data-theme="dark"] .hint-chip:hover {
+  border-color: #7ee787;
+  color: #7ee787;
+  background: rgba(126,231,135,0.08);
+}
+
+/* ============================================
+   RESPONSIVE
+   ============================================ */
+@media (max-width: 768px) {
+  .playground-hero {
+    padding: calc(var(--header-height) + 1.5rem) 0 1.5rem;
+  }
+  .playground-title { font-size: 1.8rem; }
+  .playground-desc { font-size: 0.92rem; }
+  .playground-terminal { border-radius: 8px; }
+  .pg-body {
+    height: 50vh;
+    font-size: 0.78rem;
+    padding: 0.75rem 1rem;
+  }
+  pre.pg-table-pre { font-size: 0.72rem; }
+  .pg-input-area { padding: 0.5rem 1rem; }
+  .pg-input, .pg-prompt { font-size: 0.78rem; }
+  .hint-chip { font-size: 0.68rem; padding: 0.25rem 0.6rem; }
+  .playground-hints { padding: 0.4rem 1rem 0.5rem; }
+}
+
+@media (max-width: 480px) {
+  .playground-title { font-size: 1.5rem; }
+  .pg-body { height: 45vh; }
+  .pg-chrome-actions { display: none; }
+}
+
+/* ── Reuse homepage keyframes ── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(24px); }
+  to { opacity: 1; transform: translateY(0); }
+}

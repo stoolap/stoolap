@@ -17,6 +17,7 @@
 //! This module provides the execution context for SQL queries, including
 //! parameter handling, transaction state, and query options.
 
+use crate::common::time_compat::Instant;
 use lru::LruCache;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
@@ -24,7 +25,7 @@ use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // Cache size limits for subquery caches to prevent unbounded memory growth.
 // These are per-thread limits since the caches are thread-local.

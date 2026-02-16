@@ -64,9 +64,9 @@ struct CachedStats {
     #[allow(dead_code)]
     zone_maps: Option<TableZoneMap>,
     /// Timestamp when this cache entry was created
-    cached_at: std::time::Instant,
+    cached_at: crate::common::time_compat::Instant,
     /// Timestamp of last access (for LRU eviction)
-    last_accessed: std::time::Instant,
+    last_accessed: crate::common::time_compat::Instant,
 }
 
 impl CachedStats {
@@ -77,7 +77,7 @@ impl CachedStats {
 
     /// Update last accessed time
     fn touch(&mut self) {
-        self.last_accessed = std::time::Instant::now();
+        self.last_accessed = crate::common::time_compat::Instant::now();
     }
 }
 
@@ -291,7 +291,7 @@ impl QueryPlanner {
                 }
             }
 
-            let now = std::time::Instant::now();
+            let now = crate::common::time_compat::Instant::now();
             cache.insert(
                 table_name.to_lowercase(),
                 CachedStats {

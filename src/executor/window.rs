@@ -29,6 +29,7 @@
 //! - OVER (PARTITION BY col) - Partition by column values
 //! - OVER (ORDER BY col) - Order within partition
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -1532,22 +1533,43 @@ impl Executor {
             let parallel_results = ParallelVec::new(&mut results);
 
             let partitions_vec: Vec<_> = partitions.into_iter().collect();
-            partitions_vec
-                .par_iter()
-                .try_for_each(|(_key, row_indices)| -> Result<()> {
-                    // Direct writing: each partition writes to its own indices
-                    self.compute_window_for_partition_parallel(
-                        &*window_func,
-                        wf_info,
-                        rows,
-                        row_indices.clone(),
-                        precomputed_order_by,
-                        columns,
-                        col_index_map,
-                        ctx,
-                        &parallel_results,
-                    )
-                })?;
+            #[cfg(feature = "parallel")]
+            let iter_result =
+                partitions_vec
+                    .par_iter()
+                    .try_for_each(|(_key, row_indices)| -> Result<()> {
+                        // Direct writing: each partition writes to its own indices
+                        self.compute_window_for_partition_parallel(
+                            &*window_func,
+                            wf_info,
+                            rows,
+                            row_indices.clone(),
+                            precomputed_order_by,
+                            columns,
+                            col_index_map,
+                            ctx,
+                            &parallel_results,
+                        )
+                    });
+            #[cfg(not(feature = "parallel"))]
+            let iter_result =
+                partitions_vec
+                    .iter()
+                    .try_for_each(|(_key, row_indices)| -> Result<()> {
+                        // Direct writing: each partition writes to its own indices
+                        self.compute_window_for_partition_parallel(
+                            &*window_func,
+                            wf_info,
+                            rows,
+                            row_indices.clone(),
+                            precomputed_order_by,
+                            columns,
+                            col_index_map,
+                            ctx,
+                            &parallel_results,
+                        )
+                    });
+            iter_result?;
 
             // ParallelVec is done, results are written in place
             Ok(results)
@@ -2631,7 +2653,12 @@ impl Executor {
         const PARALLEL_THRESHOLD: usize = 10_000;
 
         if row_indices.len() >= PARALLEL_THRESHOLD {
+            #[cfg(feature = "parallel")]
             row_indices.par_sort_unstable_by(|&a, &b| {
+                Self::compare_order_values_columnar(order_by_values, a, b)
+            });
+            #[cfg(not(feature = "parallel"))]
+            row_indices.sort_unstable_by(|&a, &b| {
                 Self::compare_order_values_columnar(order_by_values, a, b)
             });
         } else {
@@ -2720,9 +2747,15 @@ impl Executor {
         // Sort by pre-extracted key - no bounds checking in comparison!
         if n >= PARALLEL_THRESHOLD {
             if ascending {
+                #[cfg(feature = "parallel")]
                 keyed.par_sort_unstable_by_key(|&(_, key)| key);
+                #[cfg(not(feature = "parallel"))]
+                keyed.sort_unstable_by_key(|&(_, key)| key);
             } else {
+                #[cfg(feature = "parallel")]
                 keyed.par_sort_unstable_by_key(|&(_, key)| std::cmp::Reverse(key));
+                #[cfg(not(feature = "parallel"))]
+                keyed.sort_unstable_by_key(|&(_, key)| std::cmp::Reverse(key));
             }
         } else if ascending {
             keyed.sort_unstable_by_key(|&(_, key)| key);
@@ -2777,9 +2810,15 @@ impl Executor {
         // Sort by pre-extracted key - no bounds checking, pure integer comparison!
         if n >= PARALLEL_THRESHOLD {
             if ascending {
+                #[cfg(feature = "parallel")]
                 keyed.par_sort_unstable_by_key(|&(_, key)| key);
+                #[cfg(not(feature = "parallel"))]
+                keyed.sort_unstable_by_key(|&(_, key)| key);
             } else {
+                #[cfg(feature = "parallel")]
                 keyed.par_sort_unstable_by_key(|&(_, key)| std::cmp::Reverse(key));
+                #[cfg(not(feature = "parallel"))]
+                keyed.sort_unstable_by_key(|&(_, key)| std::cmp::Reverse(key));
             }
         } else if ascending {
             keyed.sort_unstable_by_key(|&(_, key)| key);
@@ -2815,7 +2854,10 @@ impl Executor {
         };
 
         if row_indices.len() >= PARALLEL_THRESHOLD {
+            #[cfg(feature = "parallel")]
             row_indices.par_sort_unstable_by(compare);
+            #[cfg(not(feature = "parallel"))]
+            row_indices.sort_unstable_by(compare);
         } else {
             row_indices.sort_unstable_by(compare);
         }

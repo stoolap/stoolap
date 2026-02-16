@@ -15,6 +15,7 @@ categories = ["database", "database-implementations"]
 [lib]
 name = "stoolap"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "stoolap"
@@ -36,7 +37,7 @@ anyhow = "1.0"
 parking_lot = "0.12"
 dashmap = "6"
 crossbeam = "0.8"
-rayon = "1.8"
+rayon = { version = "1.8", optional = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -90,6 +91,15 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
+# WASM dependencies
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console", "Performance", "Window"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+web-time = "1.1"
+
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.4"
@@ -97,7 +107,9 @@ tempfile = "3.9"
 dhat = "0.3"
 
 [features]
-default = ["cli"]
+default = ["cli", "parallel"]
+parallel = ["dep:rayon"]
+wasm = []  # Excludes parallel + persistence; for wasm32 builds
 cli = ["clap", "rustyline", "comfy-table", "dirs"]
 dhat-heap = []
 sqlite = ["dep:rusqlite"]

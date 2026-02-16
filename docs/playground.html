@@ -1,0 +1,54 @@
+---
+layout: default
+title: SQL Playground - Try Stoolap in Your Browser
+description: Interactive SQL playground running Stoolap entirely in your browser via WebAssembly. No server, no installation.
+---
+
+<link rel="stylesheet" href="{{ '/assets/css/playground.css' | relative_url }}">
+
+<section class="playground-hero">
+  <div class="playground-hero-bg"></div>
+  <div class="container playground-hero-inner">
+    <h1 class="playground-title">Stoolap Playground</h1>
+    <p class="playground-desc">Run real SQL queries in your browser. Stoolap compiles to WebAssembly &mdash; everything runs locally, nothing leaves your machine.</p>
+  </div>
+</section>
+
+<section class="playground-section">
+  <div class="container">
+    <div class="playground-terminal" id="playground">
+      <div class="pg-chrome">
+        <span class="pg-dot" style="background:#ff5f56"></span>
+        <span class="pg-dot" style="background:#ffbd2e"></span>
+        <span class="pg-dot" style="background:#27c93f"></span>
+        <span class="pg-label">stoolap &mdash; Playground</span>
+        <div class="pg-chrome-actions">
+          <button class="pg-btn" id="btn-clear" title="Clear output (Ctrl+L)">Clear</button>
+          <button class="pg-btn" id="btn-reset" title="Reset database">Reset</button>
+        </div>
+      </div>
+      <div class="pg-body" id="pg-output">
+        <div class="pg-loading" id="pg-loading">
+          <div class="pg-spinner"></div>
+          <span>Loading Stoolap WASM&hellip;</span>
+        </div>
+      </div>
+      <div class="pg-input-area">
+        <span class="pg-prompt" id="pg-prompt">stoolap&gt;</span>
+        <textarea class="pg-input" id="pg-input" rows="1" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Enter SQL..." disabled></textarea>
+      </div>
+      <div class="playground-hints">
+        <div class="hint-grid">
+          <button class="hint-chip" data-sql="SHOW TABLES;">SHOW TABLES</button>
+          <button class="hint-chip" data-sql="SELECT * FROM users;">SELECT * FROM users</button>
+          <button class="hint-chip" data-sql="SELECT name, email, ROW_NUMBER() OVER (ORDER BY age DESC) AS rank FROM users;">Window Functions</button>
+          <button class="hint-chip" data-sql="SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name ORDER BY total DESC;">JOINs + Aggregation</button>
+          <button class="hint-chip" data-sql="SELECT category, ROUND(AVG(price), 2) AS avg_price, COUNT(*) AS count FROM products GROUP BY category HAVING COUNT(*) > 2 ORDER BY avg_price DESC;">GROUP BY + HAVING</button>
+          <button class="hint-chip" data-sql="WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 10) SELECT n, n*n AS square FROM seq;">Recursive CTE</button>
+          <button class="hint-chip" data-sql="EXPLAIN SELECT u.name, SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 50 GROUP BY u.name;">EXPLAIN</button>
+        </div>
+      </div>
+  </div>
+</section>
+
+<script type="module" src="{{ '/assets/js/playground.js' | relative_url }}"></script>

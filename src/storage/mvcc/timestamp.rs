@@ -19,7 +19,8 @@
 //!
 
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
 
 /// Global state for timestamp generation - tracks last issued timestamp
 static LAST_TIMESTAMP: AtomicI64 = AtomicI64::new(0);

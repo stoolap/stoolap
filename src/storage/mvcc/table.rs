@@ -1045,13 +1045,13 @@ impl MVCCTable {
             if let Some(value) = row.get(pk_idx) {
                 if value.is_null() {
                     if is_auto_increment {
-                        // Generate new ID for NULL primary key (only with AUTO_INCREMENT)
+                        // Generate new ID for NULL primary key
                         let next_id = self.version_store.get_next_auto_increment_id();
                         let _ = row.set(pk_idx, Value::Integer(next_id));
                     } else {
-                        // PRIMARY KEY without AUTO_INCREMENT cannot be NULL
+                        // Non-INTEGER PRIMARY KEY without AUTO_INCREMENT cannot be NULL
                         return Err(Error::internal(format!(
-                            "NULL value not allowed for PRIMARY KEY column '{}'. Use AUTO_INCREMENT for auto-generated IDs.",
+                            "NULL value not allowed for PRIMARY KEY column '{}'.",
                             pk_col.name
                         )));
                     }

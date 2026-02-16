@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
 
 use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Error, IndexType, Result, Row, Schema, Value};
