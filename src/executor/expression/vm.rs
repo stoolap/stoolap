@@ -503,7 +503,11 @@ impl ExprVM {
                             if col_val.is_null() || val.is_null() {
                                 Value::Null(DataType::Boolean)
                             } else {
-                                Value::Boolean(col_val == val)
+                                match col_val.compare(val) {
+                                    Ok(std::cmp::Ordering::Equal) => Value::Boolean(true),
+                                    Ok(_) => Value::Boolean(false),
+                                    Err(_) => Value::Boolean(col_val == val),
+                                }
                             }
                         }
                     };
@@ -524,7 +528,11 @@ impl ExprVM {
                             if col_val.is_null() || val.is_null() {
                                 Value::Null(DataType::Boolean)
                             } else {
-                                Value::Boolean(col_val != val)
+                                match col_val.compare(val) {
+                                    Ok(std::cmp::Ordering::Equal) => Value::Boolean(false),
+                                    Ok(_) => Value::Boolean(true),
+                                    Err(_) => Value::Boolean(col_val != val),
+                                }
                             }
                         }
                     };
@@ -2086,7 +2094,11 @@ impl ExprVM {
                             if col_val.is_null() || val.is_null() {
                                 Value::Null(DataType::Boolean)
                             } else {
-                                Value::Boolean(col_val == val)
+                                match col_val.compare(val) {
+                                    Ok(std::cmp::Ordering::Equal) => Value::Boolean(true),
+                                    Ok(_) => Value::Boolean(false),
+                                    Err(_) => Value::Boolean(col_val == val),
+                                }
                             }
                         }
                     };
@@ -2613,6 +2625,21 @@ impl ExprVM {
                     _ => false,
                 }
             }
+            Op::BetweenColumnConst(idx, low, high) => match ctx.row.get(*idx as usize) {
+                Some(col_val) if col_val.is_null() => false,
+                Some(col_val) => {
+                    let ge_low = col_val
+                        .compare(low)
+                        .map(|o| o != std::cmp::Ordering::Less)
+                        .unwrap_or(false);
+                    let le_high = col_val
+                        .compare(high)
+                        .map(|o| o != std::cmp::Ordering::Greater)
+                        .unwrap_or(false);
+                    ge_low && le_high
+                }
+                _ => false,
+            },
             Op::InSetColumn(idx, set, has_null) => {
                 match ctx.row.get(*idx as usize) {
                     Some(v) if v.is_null() => false, // NULL IN set -> NULL -> false in bool context
@@ -2751,6 +2778,25 @@ impl ExprVM {
                     _ => Some(false),
                 }
             }
+            Op::BetweenColumnConst(idx, low, high) => match ctx.row.get(*idx as usize) {
+                Some(col_val) if col_val.is_null() => None,
+                Some(col_val) => {
+                    let ge_low = col_val
+                        .compare(low)
+                        .map(|o| o != std::cmp::Ordering::Less)
+                        .ok();
+                    let le_high = col_val
+                        .compare(high)
+                        .map(|o| o != std::cmp::Ordering::Greater)
+                        .ok();
+                    match (ge_low, le_high) {
+                        (Some(true), Some(true)) => Some(true),
+                        (Some(false), _) | (_, Some(false)) => Some(false),
+                        _ => None,
+                    }
+                }
+                None => None,
+            },
             Op::InSetColumn(idx, set, has_null) => {
                 match ctx.row.get(*idx as usize) {
                     Some(v) if v.is_null() => None, // NULL IN set -> NULL
@@ -2768,18 +2814,74 @@ impl ExprVM {
             Op::EqColumnConst(idx, Value::Text(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Text(v)) => Some(v == val),
                 Some(Value::Null(_)) | None => None,
-                _ => Some(false),
+                Some(col_val) => match col_val.compare(&Value::Text(val.clone())) {
+                    Ok(std::cmp::Ordering::Equal) => Some(true),
+                    Ok(_) => Some(false),
+                    Err(_) => Some(false),
+                },
             },
             Op::NeColumnConst(idx, Value::Text(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Text(v)) => Some(v != val),
                 Some(Value::Null(_)) | None => None,
-                _ => Some(true),
+                Some(col_val) => match col_val.compare(&Value::Text(val.clone())) {
+                    Ok(std::cmp::Ordering::Equal) => Some(false),
+                    Ok(_) => Some(true),
+                    Err(_) => Some(true),
+                },
             },
             // Handle LIKE pattern matching (e.g., fruit LIKE 'a%')
             Op::LikeColumn(idx, pattern, case_insensitive) => match ctx.row.get(*idx as usize) {
                 Some(Value::Text(s)) => Some(pattern.matches(s, *case_insensitive)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
+            },
+            // Generic comparison for non-numeric fused ops (e.g., Timestamp < Text)
+            // Uses Value::compare() which handles cross-type comparison via string fallback
+            Op::LtColumnConst(idx, val)
+            | Op::LeColumnConst(idx, val)
+            | Op::GtColumnConst(idx, val)
+            | Op::GeColumnConst(idx, val) => match ctx.row.get(*idx as usize) {
+                Some(col_val) if col_val.is_null() => None,
+                Some(col_val) => {
+                    let expected = match op {
+                        Op::LtColumnConst(..) => std::cmp::Ordering::Less,
+                        Op::LeColumnConst(..) => std::cmp::Ordering::Less, // handled below
+                        Op::GtColumnConst(..) => std::cmp::Ordering::Greater,
+                        Op::GeColumnConst(..) => std::cmp::Ordering::Greater, // handled below
+                        _ => unreachable!(),
+                    };
+                    match col_val.compare(val) {
+                        Ok(ord) => {
+                            let result = match op {
+                                Op::LeColumnConst(..) | Op::GeColumnConst(..) => {
+                                    ord == expected || ord == std::cmp::Ordering::Equal
+                                }
+                                _ => ord == expected,
+                            };
+                            Some(result)
+                        }
+                        Err(_) => None,
+                    }
+                }
+                None => None,
+            },
+            Op::EqColumnConst(idx, val) => match ctx.row.get(*idx as usize) {
+                Some(col_val) if col_val.is_null() => None,
+                Some(col_val) => match col_val.compare(val) {
+                    Ok(std::cmp::Ordering::Equal) => Some(true),
+                    Ok(_) => Some(false),
+                    Err(_) => None,
+                },
+                None => None,
+            },
+            Op::NeColumnConst(idx, val) => match ctx.row.get(*idx as usize) {
+                Some(col_val) if col_val.is_null() => None,
+                Some(col_val) => match col_val.compare(val) {
+                    Ok(std::cmp::Ordering::Equal) => Some(false),
+                    Ok(_) => Some(true),
+                    Err(_) => None,
+                },
+                None => None,
             },
             // For other comparisons, return None to fall back to full VM
             _ => None,

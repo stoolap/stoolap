@@ -2955,13 +2955,6 @@ impl Executor {
                         (None, None, c) => c,
                     };
 
-                    #[cfg(debug_assertions)]
-                    eprintln!(
-                        "[FILTER_RESULT] safe_left={}, safe_right={}, remaining={}",
-                        safe_left.is_some(),
-                        safe_right.is_some(),
-                        remaining.is_some()
-                    );
                     (safe_left, safe_right, remaining)
                 } else {
                     (None, None, Some((**where_clause).clone()))
@@ -2987,11 +2980,6 @@ impl Executor {
             right_key_col,
         )) = semijoin_limit
         {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[SEMIJOIN_PATH] limit={}, left_key={}, right_key={}",
-                limit_n, left_key_col, right_key_col
-            );
             // Semi-join reduction for INNER/LEFT JOIN + GROUP BY
             // Step 1: Execute and materialize left side with limit (pushdown for efficiency)
             let (left_result, left_cols) = self.execute_table_expression_with_filter_limit(
@@ -3114,11 +3102,6 @@ impl Executor {
                     && left_filter.is_none()
             // Left side doesn't have a filter
             {
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "[SWAP_CHECK] Checking swap for right_filter={:?}",
-                    right_filter.as_ref().map(|f| f.to_string())
-                );
                 // Check if swapping gives Index NL opportunity with PK lookup
                 // (which is more efficient than secondary index lookup)
                 let swapped_info = self.check_index_nested_loop_opportunity(
@@ -3133,14 +3116,6 @@ impl Executor {
                 let prefer_swap = matches!(
                     &swapped_info,
                     Some((_, IndexLookupStrategy::PrimaryKey, _, _))
-                );
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "[SWAP_CHECK] swapped_info={:?}, prefer_swap={}",
-                    swapped_info
-                        .as_ref()
-                        .map(|(t, _, i, o)| format!("{},{},{}", t, i, o)),
-                    prefer_swap
                 );
 
                 if prefer_swap {
@@ -5108,11 +5083,6 @@ impl Executor {
         }
 
         // Fall back to standard execution for other cases
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[EXEC_EXPR_LIMIT_FALLBACK] calling execute_table_expression_with_filter, filter={:?}",
-            filter.map(|f| f.to_string())
-        );
         self.execute_table_expression_with_filter(expr, ctx, filter)
     }
 

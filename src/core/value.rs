@@ -334,6 +334,31 @@ impl Value {
             return Ok(compare_floats(v1, v2));
         }
 
+        // Timestamp ↔ Text: try parsing the text side as a timestamp
+        match (self, other) {
+            (Value::Timestamp(ts), Value::Text(s)) => {
+                if let Ok(parsed) = parse_timestamp(s) {
+                    return Ok(ts.cmp(&parsed));
+                }
+            }
+            (Value::Timestamp(ts), Value::Json(s)) => {
+                if let Ok(parsed) = parse_timestamp(s) {
+                    return Ok(ts.cmp(&parsed));
+                }
+            }
+            (Value::Text(s), Value::Timestamp(ts)) => {
+                if let Ok(parsed) = parse_timestamp(s) {
+                    return Ok(parsed.cmp(ts));
+                }
+            }
+            (Value::Json(s), Value::Timestamp(ts)) => {
+                if let Ok(parsed) = parse_timestamp(s) {
+                    return Ok(parsed.cmp(ts));
+                }
+            }
+            _ => {}
+        }
+
         // Fall back to string comparison for mixed types
         let s1 = self.as_string().unwrap_or_default();
         let s2 = other.as_string().unwrap_or_default();

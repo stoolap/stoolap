@@ -117,7 +117,7 @@ pub struct Token {
     pub literal: SmartString,
     /// The position in the source
     pub position: Position,
-    /// Whether this token was double-quoted (for SQLite-style string fallback)
+    /// Whether this token was double-quoted (identifier with string fallback)
     pub quoted: bool,
 }
 
@@ -133,7 +133,7 @@ impl Token {
         }
     }
 
-    /// Create a new double-quoted token (SQLite-style: identifier with string fallback)
+    /// Create a new double-quoted token (identifier with string fallback)
     #[inline]
     pub fn new_quoted(token_type: TokenType, literal: impl AsRef<str>, position: Position) -> Self {
         Self {

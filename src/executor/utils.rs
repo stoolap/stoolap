@@ -579,6 +579,10 @@ pub fn extract_column_name(expr: &Expression) -> Option<String> {
 
 /// Extract a literal value from an expression.
 /// Converts AST literal expressions to runtime Values.
+/// Note: double-quoted identifiers are NOT treated as literals here.
+/// They may refer to actual column names, so pushdown should not assume
+/// they are string constants. The VM/compiler handles them correctly via
+/// column-resolution-first-then-string-fallback.
 #[inline]
 pub fn extract_literal_value(expr: &Expression) -> Option<Value> {
     match expr {

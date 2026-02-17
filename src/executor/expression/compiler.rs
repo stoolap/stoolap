@@ -413,7 +413,7 @@ impl<'a> ExprCompiler<'a> {
                     } else if let Some(name) = self.ctx.resolve_outer_column(column) {
                         builder.emit(Op::LoadOuterColumn(name));
                     } else if id.token.quoted {
-                        // SQLite-style: double-quoted identifier falls back to string literal
+                        // Double-quoted identifier falls back to string literal
                         builder.emit(Op::LoadConst(Value::text(id.value.as_str())));
                     } else {
                         return Err(CompileError::ColumnNotFound(id.value.to_string()));
@@ -426,7 +426,7 @@ impl<'a> ExprCompiler<'a> {
                 } else if let Some(name) = self.ctx.resolve_outer_column(&id.value_lower) {
                     builder.emit(Op::LoadOuterColumn(name));
                 } else if id.token.quoted {
-                    // SQLite-style: double-quoted identifier falls back to string literal
+                    // Double-quoted identifier falls back to string literal
                     builder.emit(Op::LoadConst(Value::text(id.value.as_str())));
                 } else {
                     return Err(CompileError::ColumnNotFound(id.value.to_string()));
@@ -859,13 +859,11 @@ impl<'a> ExprCompiler<'a> {
             // Pattern matching via infix
             InfixOperator::Like => {
                 self.compile_expr(&infix.left, builder)?;
-                if let Expression::StringLiteral(lit) = &*infix.right {
-                    let pattern = CompiledPattern::compile(&lit.value, false);
+                let pattern_str = Self::extract_pattern_string(&infix.right);
+                if let Some(s) = pattern_str {
+                    let pattern = CompiledPattern::compile(&s, false);
                     builder.emit(Op::Like(Arc::new(pattern), false));
                 } else {
-                    // Dynamic pattern - less optimal
-                    self.compile_expr(&infix.right, builder)?;
-                    // Would need runtime pattern compilation
                     return Err(CompileError::UnsupportedExpression(
                         "Dynamic LIKE patterns not yet supported in VM".to_string(),
                     ));
@@ -874,8 +872,9 @@ impl<'a> ExprCompiler<'a> {
 
             InfixOperator::ILike => {
                 self.compile_expr(&infix.left, builder)?;
-                if let Expression::StringLiteral(lit) = &*infix.right {
-                    let pattern = CompiledPattern::compile(&lit.value, true);
+                let pattern_str = Self::extract_pattern_string(&infix.right);
+                if let Some(s) = pattern_str {
+                    let pattern = CompiledPattern::compile(&s, true);
                     builder.emit(Op::Like(Arc::new(pattern), true));
                 } else {
                     return Err(CompileError::UnsupportedExpression(
@@ -886,8 +885,9 @@ impl<'a> ExprCompiler<'a> {
 
             InfixOperator::NotLike => {
                 self.compile_expr(&infix.left, builder)?;
-                if let Expression::StringLiteral(lit) = &*infix.right {
-                    let pattern = CompiledPattern::compile(&lit.value, false);
+                let pattern_str = Self::extract_pattern_string(&infix.right);
+                if let Some(s) = pattern_str {
+                    let pattern = CompiledPattern::compile(&s, false);
                     builder.emit(Op::Like(Arc::new(pattern), false));
                     builder.emit(Op::Not);
                 } else {
@@ -899,8 +899,9 @@ impl<'a> ExprCompiler<'a> {
 
             InfixOperator::NotILike => {
                 self.compile_expr(&infix.left, builder)?;
-                if let Expression::StringLiteral(lit) = &*infix.right {
-                    let pattern = CompiledPattern::compile(&lit.value, true);
+                let pattern_str = Self::extract_pattern_string(&infix.right);
+                if let Some(s) = pattern_str {
+                    let pattern = CompiledPattern::compile(&s, true);
                     builder.emit(Op::Like(Arc::new(pattern), true));
                     builder.emit(Op::Not);
                 } else {
@@ -912,9 +913,9 @@ impl<'a> ExprCompiler<'a> {
 
             InfixOperator::Glob | InfixOperator::NotGlob => {
                 self.compile_expr(&infix.left, builder)?;
-                if let Expression::StringLiteral(lit) = &*infix.right {
-                    // Use compile_glob for GLOB patterns (uses * and ? wildcards)
-                    let pattern = CompiledPattern::compile_glob(&lit.value);
+                let pattern_str = Self::extract_pattern_string(&infix.right);
+                if let Some(s) = pattern_str {
+                    let pattern = CompiledPattern::compile_glob(&s);
                     builder.emit(Op::Glob(Arc::new(pattern)));
                     if matches!(infix.op_type, InfixOperator::NotGlob) {
                         builder.emit(Op::Not);
@@ -928,8 +929,9 @@ impl<'a> ExprCompiler<'a> {
 
             InfixOperator::Regexp | InfixOperator::NotRegexp => {
                 self.compile_expr(&infix.left, builder)?;
-                if let Expression::StringLiteral(lit) = &*infix.right {
-                    let regex = regex::Regex::new(&lit.value).map_err(|e| {
+                let pattern_str = Self::extract_pattern_string(&infix.right);
+                if let Some(s) = pattern_str {
+                    let regex = regex::Regex::new(&s).map_err(|e| {
                         CompileError::InvalidExpression(format!("Invalid regex: {}", e))
                     })?;
                     builder.emit(Op::Regexp(Arc::new(regex)));
@@ -1203,23 +1205,24 @@ impl<'a> ExprCompiler<'a> {
         };
 
         // Try to compile pattern at compile time
-        if let Expression::StringLiteral(lit) = &*like.pattern {
+        let pattern_str = Self::extract_pattern_string(&like.pattern);
+        if let Some(s) = pattern_str {
             if is_regexp {
-                let regex = regex::Regex::new(&lit.value).map_err(|e| {
+                let regex = regex::Regex::new(&s).map_err(|e| {
                     CompileError::InvalidExpression(format!("Invalid regex: {}", e))
                 })?;
                 builder.emit(Op::Regexp(Arc::new(regex)));
             } else if is_glob {
                 // Use compile_glob for GLOB patterns (uses * and ? wildcards)
-                let pattern = CompiledPattern::compile_glob(&lit.value);
+                let pattern = CompiledPattern::compile_glob(&s);
                 builder.emit(Op::Glob(Arc::new(pattern)));
             } else if let Some(esc) = escape_char {
                 // LIKE with ESCAPE - pre-process pattern to handle escape character
-                let processed_pattern = self.process_like_escape(&lit.value, esc);
+                let processed_pattern = self.process_like_escape(&s, esc);
                 let pattern = CompiledPattern::compile(&processed_pattern, case_insensitive);
                 builder.emit(Op::LikeEscape(Arc::new(pattern), case_insensitive, esc));
             } else {
-                let pattern = CompiledPattern::compile(&lit.value, case_insensitive);
+                let pattern = CompiledPattern::compile(&s, case_insensitive);
                 builder.emit(Op::Like(Arc::new(pattern), case_insensitive));
             }
 
@@ -1233,6 +1236,16 @@ impl<'a> ExprCompiler<'a> {
         }
 
         Ok(())
+    }
+
+    /// Extract a static pattern string from a StringLiteral or a double-quoted Identifier.
+    /// Returns None for dynamic expressions (column references, function calls, etc.).
+    fn extract_pattern_string(expr: &Expression) -> Option<SmartString> {
+        match expr {
+            Expression::StringLiteral(lit) => Some(lit.value.clone()),
+            Expression::Identifier(id) if id.token.quoted => Some(id.value.clone()),
+            _ => None,
+        }
     }
 
     /// Process LIKE pattern with escape character
@@ -1459,6 +1472,7 @@ fn try_eval_constant(expr: &Expression) -> Option<Value> {
         Expression::StringLiteral(lit) => Some(Value::Text(lit.value.clone())),
         Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
         Expression::NullLiteral(_) => Some(Value::null_unknown()),
+        Expression::Identifier(id) if id.token.quoted => Some(Value::Text(id.value.clone())),
         _ => None,
     }
 }

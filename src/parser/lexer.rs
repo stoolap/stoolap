@@ -171,7 +171,7 @@ impl Lexer {
                 Token::new(TokenType::String, literal, pos)
             }
 
-            // Double-quoted identifier (SQLite-style: identifier with string fallback)
+            // Double-quoted identifier (identifier with string fallback)
             '"' => {
                 let literal = self.read_quoted_identifier('"');
                 if let Some(err) = self.last_error.take() {
