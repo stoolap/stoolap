@@ -2032,9 +2032,6 @@ impl Executor {
                         let use_anti_join = is_pure_not_exists && !has_limit;
 
                         if use_anti_join {
-                            #[cfg(debug_assertions)]
-                            eprintln!("[ANTI_JOIN] Using anti-join optimization for NOT EXISTS");
-
                             // Materialize outer table rows
                             let mut outer_rows = table.collect_all_rows(storage_expr.as_deref())?;
 
@@ -2921,68 +2918,57 @@ impl Executor {
         // - LEFT JOIN: Can push filters to left (preserved), but NOT to right (may have NULLs)
         // - RIGHT JOIN: Can push filters to right (preserved), but NOT to left
         // - FULL OUTER JOIN: Cannot push filters to either side
-        let (left_filter, right_filter, cross_filter) = if let Some(ref where_clause) =
-            stmt.where_clause
-        {
-            if let (Some(left_a), Some(right_a)) = (&left_alias, &right_alias) {
-                let (l, r, c) = partition_where_for_join(where_clause, left_a, right_a);
-                #[cfg(debug_assertions)]
-                eprintln!("[FILTER_PARTITION] left_alias={}, right_alias={}, left_filter={:?}, right_filter={:?}, cross_filter={:?}",
-                        left_a, right_a, l.as_ref().map(|_| "Some"), r.as_ref().map(|_| "Some"), c.as_ref().map(|_| "Some"));
+        let (left_filter, right_filter, cross_filter) =
+            if let Some(ref where_clause) = stmt.where_clause {
+                if let (Some(left_a), Some(right_a)) = (&left_alias, &right_alias) {
+                    let (l, r, c) = partition_where_for_join(where_clause, left_a, right_a);
 
-                // For OUTER JOINs, we can't push filters to the NULL-padded side
-                // because rows that don't match need to appear with NULLs
-                let can_push_left = !join_type.contains("RIGHT") && !join_type.contains("FULL");
-                let can_push_right = !join_type.contains("LEFT") && !join_type.contains("FULL");
+                    // For OUTER JOINs, we can't push filters to the NULL-padded side
+                    // because rows that don't match need to appear with NULLs
+                    let can_push_left = !join_type.contains("RIGHT") && !join_type.contains("FULL");
+                    let can_push_right = !join_type.contains("LEFT") && !join_type.contains("FULL");
 
-                let safe_left = if can_push_left {
-                    l.as_ref().map(|f| strip_table_qualifier(f, left_a))
+                    let safe_left = if can_push_left {
+                        l.as_ref().map(|f| strip_table_qualifier(f, left_a))
+                    } else {
+                        None
+                    };
+
+                    let safe_right = if can_push_right {
+                        r.as_ref().map(|f| strip_table_qualifier(f, right_a))
+                    } else {
+                        None
+                    };
+
+                    // Any filters we couldn't push need to be applied post-join
+                    // If we pushed a filter, don't include it in remaining; otherwise include it
+                    let unpushed_left = if !can_push_left { l } else { None };
+                    let unpushed_right = if !can_push_right { r } else { None };
+
+                    let remaining = match (unpushed_left, unpushed_right, c) {
+                        (Some(l), Some(r), Some(c)) => combine_predicates_with_and(vec![l, r, c]),
+                        (Some(l), Some(r), None) => combine_predicates_with_and(vec![l, r]),
+                        (Some(l), None, Some(c)) => combine_predicates_with_and(vec![l, c]),
+                        (None, Some(r), Some(c)) => combine_predicates_with_and(vec![r, c]),
+                        (Some(l), None, None) => Some(l),
+                        (None, Some(r), None) => Some(r),
+                        (None, None, c) => c,
+                    };
+
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[FILTER_RESULT] safe_left={}, safe_right={}, remaining={}",
+                        safe_left.is_some(),
+                        safe_right.is_some(),
+                        remaining.is_some()
+                    );
+                    (safe_left, safe_right, remaining)
                 } else {
-                    None
-                };
-
-                let safe_right = if can_push_right {
-                    r.as_ref().map(|f| strip_table_qualifier(f, right_a))
-                } else {
-                    None
-                };
-
-                // Any filters we couldn't push need to be applied post-join
-                // If we pushed a filter, don't include it in remaining; otherwise include it
-                let unpushed_left = if !can_push_left { l } else { None };
-                let unpushed_right = if !can_push_right { r } else { None };
-
-                let remaining = match (unpushed_left, unpushed_right, c) {
-                    (Some(l), Some(r), Some(c)) => combine_predicates_with_and(vec![l, r, c]),
-                    (Some(l), Some(r), None) => combine_predicates_with_and(vec![l, r]),
-                    (Some(l), None, Some(c)) => combine_predicates_with_and(vec![l, c]),
-                    (None, Some(r), Some(c)) => combine_predicates_with_and(vec![r, c]),
-                    (Some(l), None, None) => Some(l),
-                    (None, Some(r), None) => Some(r),
-                    (None, None, c) => c,
-                };
-
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "[FILTER_RESULT] safe_left={}, safe_right={}, remaining={}",
-                    safe_left.is_some(),
-                    safe_right.is_some(),
-                    remaining.is_some()
-                );
-                (safe_left, safe_right, remaining)
+                    (None, None, Some((**where_clause).clone()))
+                }
             } else {
-                (None, None, Some((**where_clause).clone()))
-            }
-        } else {
-            (None, None, None)
-        };
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[FILTERS_FINAL] left_filter={}, right_filter={}, cross_filter={}",
-            left_filter.is_some(),
-            right_filter.is_some(),
-            cross_filter.is_some()
-        );
+                (None, None, None)
+            };
 
         // Semi-join reduction optimization for LEFT JOIN + GROUP BY + LIMIT
         // Pattern: LEFT JOIN + GROUP BY on left columns only + LIMIT N + no ORDER BY
@@ -2993,11 +2979,6 @@ impl Executor {
             stmt,
             left_alias.as_deref(),
             &join_source.condition,
-        );
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[SEMIJOIN_CHECK] semijoin_limit={}",
-            semijoin_limit.is_some()
         );
 
         let (left_rows, left_columns, right_rows, right_columns) = if let Some((
@@ -3118,9 +3099,6 @@ impl Executor {
             // When one side has a filter, prefer putting filtered side as outer (left)
             // This reduces the number of probes into the inner table.
             // Swap if: right has filter, left doesn't, and swapped order gives Index NL on PK
-            #[cfg(debug_assertions)]
-            eprintln!("[JOIN_REORDER_PRE] force_swap={}, has_agg={}, has_window={}, join_type={}, right_filter={}, left_filter={}",
-                force_swap, has_agg, has_window, join_type, right_filter.is_some(), left_filter.is_some());
             let (index_nl_info, nl_left_filter, nl_right_filter, swapped) = if force_swap {
                 // Subquery join optimization: swap is forced (right is subquery, left is table)
                 (
@@ -3141,9 +3119,6 @@ impl Executor {
                     "[SWAP_CHECK] Checking swap for right_filter={:?}",
                     right_filter.as_ref().map(|f| f.to_string())
                 );
-                #[cfg(debug_assertions)]
-                eprintln!("[SWAP_CONDITIONS] has_agg={}, has_window={}, join_type={}, right_filter={}, left_filter={}",
-                    has_agg, has_window, join_type, right_filter.is_some(), left_filter.is_none());
                 // Check if swapping gives Index NL opportunity with PK lookup
                 // (which is more efficient than secondary index lookup)
                 let swapped_info = self.check_index_nested_loop_opportunity(
@@ -3193,15 +3168,6 @@ impl Executor {
                 )
             };
 
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[INDEX_NL_CHECK] index_nl_info={:?}, nl_left_filter={:?}, nl_right_filter={:?}",
-                index_nl_info
-                    .as_ref()
-                    .map(|(t, _, i, o)| format!("table={},inner={},outer={}", t, i, o)),
-                nl_left_filter.as_ref().map(|_| "Some"),
-                nl_right_filter.as_ref().map(|_| "Some")
-            );
             if let Some((table_name, lookup_strategy, inner_col, outer_col)) = index_nl_info {
                 // Index Nested Loop path: stream outer side for early termination
                 // When swapped, execute right side as outer (with original right filter, now in nl_left_filter)
@@ -3225,19 +3191,11 @@ impl Executor {
                 let nl_left_filter = if let Some(ref right_f) = nl_right_filter {
                     // Check if right filter references the inner join key column
                     let references = filter_references_column(right_f, &inner_col);
-                    #[cfg(debug_assertions)]
-                    eprintln!("[JOIN_KEY_EQUIV] inner_col={:?}, outer_col={:?}, filter_references={}, right_filter={:?}",
-                        inner_col, outer_col, references, right_f);
                     if references {
                         // Create equivalent filter for outer side by substituting the column
                         if let Some(outer_filter) =
                             substitute_filter_column(right_f, &inner_col, &outer_col)
                         {
-                            #[cfg(debug_assertions)]
-                            eprintln!(
-                                "[JOIN_KEY_EQUIV] SUCCESS! Created outer filter: {:?}",
-                                outer_filter
-                            );
                             // Combine with existing left filter if any
                             match nl_left_filter {
                                 Some(existing) => Some(Expression::Infix(InfixExpression::new(
@@ -3249,10 +3207,6 @@ impl Executor {
                                 None => Some(outer_filter),
                             }
                         } else {
-                            #[cfg(debug_assertions)]
-                            eprintln!(
-                                "[JOIN_KEY_EQUIV] FAILED: substitute_filter_column returned None"
-                            );
                             nl_left_filter
                         }
                     } else {
@@ -4856,12 +4810,6 @@ impl Executor {
         ctx: &ExecutionContext,
         filter: Option<&Expression>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[EXEC_TABLE_EXPR_FILTER] expr_type={:?}, filter={:?}",
-            std::mem::discriminant(expr),
-            filter.map(|f| f.to_string())
-        );
         match expr {
             Expression::TableSource(ts) => {
                 // Check if this is a CTE from context (for subqueries referencing outer CTEs)
@@ -4884,11 +4832,6 @@ impl Executor {
                         // Must apply execution context for parameter support
                         // Use qualified_columns for filter column resolution since WHERE clause
                         // has qualified names like "ds.avg_salary" not just "avg_salary"
-                        #[cfg(debug_assertions)]
-                        eprintln!(
-                            "[CTE_FILTER] table={}, filter={:?}, columns={:?}, qualified={:?}, rows_before={}",
-                            table_name, filter_expr.to_string(), columns, qualified_columns, rows.len()
-                        );
                         let row_filter =
                             RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
                         // CTE stores CompactArc<Vec<(i64, Row)>>, filter on the Row part
@@ -4897,8 +4840,6 @@ impl Executor {
                             .filter(|(_, row)| row_filter.matches(row))
                             .cloned()
                             .collect();
-                        #[cfg(debug_assertions)]
-                        eprintln!("[CTE_FILTER] rows_after={}", filtered_rows.len());
                         Box::new(super::result::ExecutorResult::new(
                             columns.to_vec(),
                             filtered_rows,
@@ -5033,13 +4974,6 @@ impl Executor {
                 // Apply filter to subquery result if present
                 // This is needed when WHERE clause conditions are pushed down to subquery sources
                 if let Some(filter_expr) = filter {
-                    #[cfg(debug_assertions)]
-                    eprintln!(
-                        "[SUBQUERY_FILTER] filter={:?}, columns={:?}, qualified={:?}",
-                        filter_expr.to_string(),
-                        columns,
-                        qualified_columns
-                    );
                     // Use qualified_columns for filter column resolution since WHERE clause
                     // has qualified names like "ds.avg_salary" not just "avg_salary"
                     let row_filter =
@@ -5047,8 +4981,6 @@ impl Executor {
                     // Materialize and filter - materialized is RowVec = Vec<(i64, Row)>
                     let mut materialized = Self::materialize_result(result)?;
                     materialized.retain(|(_, row)| row_filter.matches(row));
-                    #[cfg(debug_assertions)]
-                    eprintln!("[SUBQUERY_FILTER] rows_after={}", materialized.len());
                     let filtered_result: Box<dyn QueryResult> =
                         Box::new(super::result::ExecutorResult::new(columns, materialized));
                     return Ok((filtered_result, qualified_columns));

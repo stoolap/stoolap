@@ -412,6 +412,7 @@ fn test_compiler_simple_expression() {
                 line: 1,
                 column: 1,
             },
+            quoted: false,
         }
     }
 

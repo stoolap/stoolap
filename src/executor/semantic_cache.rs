@@ -1209,6 +1209,7 @@ mod tests {
             token_type: TokenType::Integer,
             literal: "".into(),
             position: Position::new(0, 1, 1),
+            quoted: false,
         }
     }
 

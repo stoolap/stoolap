@@ -117,6 +117,8 @@ pub struct Token {
     pub literal: SmartString,
     /// The position in the source
     pub position: Position,
+    /// Whether this token was double-quoted (for SQLite-style string fallback)
+    pub quoted: bool,
 }
 
 impl Token {
@@ -127,6 +129,18 @@ impl Token {
             token_type,
             literal: SmartString::from(literal.as_ref()),
             position,
+            quoted: false,
+        }
+    }
+
+    /// Create a new double-quoted token (SQLite-style: identifier with string fallback)
+    #[inline]
+    pub fn new_quoted(token_type: TokenType, literal: impl AsRef<str>, position: Position) -> Self {
+        Self {
+            token_type,
+            literal: SmartString::from(literal.as_ref()),
+            position,
+            quoted: true,
         }
     }
 
@@ -136,6 +150,7 @@ impl Token {
             token_type: TokenType::Error,
             literal: SmartString::from(message.as_ref()),
             position,
+            quoted: false,
         }
     }
 
@@ -146,6 +161,7 @@ impl Token {
             token_type: TokenType::Eof,
             literal: SmartString::const_new(""),
             position,
+            quoted: false,
         }
     }
 

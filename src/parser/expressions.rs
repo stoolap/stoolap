@@ -88,10 +88,21 @@ impl Parser {
                 None
             }
             _ => {
-                self.add_error(format!(
-                    "no prefix parse function for {:?} at {}",
-                    self.cur_token.token_type, self.cur_token.position
-                ));
+                if self.cur_token.token_type == TokenType::Eof {
+                    if self.current_clause.is_empty() {
+                        self.add_error("unexpected end of input, expected expression".to_string());
+                    } else {
+                        self.add_error(format!(
+                            "expected expression after {}",
+                            self.current_clause
+                        ));
+                    }
+                } else {
+                    self.add_error(format!(
+                        "unexpected '{}', expected expression",
+                        self.cur_token.literal
+                    ));
+                }
                 None
             }
         }
@@ -99,6 +110,25 @@ impl Parser {
 
     /// Parse an identifier
     fn parse_identifier(&self) -> Expression {
+        // SQL standard: CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP are
+        // niladic functions (zero-argument, no parentheses required).
+        // When NOT followed by '(', emit as FunctionCall directly so they
+        // flow through the function evaluation path in all contexts
+        // (SELECT, WHERE, pushdown, etc.). When followed by '(', let the
+        // normal identifier→function-call infix parsing handle it.
+        if !self.cur_token.quoted && !self.peek_token_is_punctuator("(") {
+            let upper = self.cur_token.literal.to_uppercase();
+            if upper == "CURRENT_DATE" || upper == "CURRENT_TIME" || upper == "CURRENT_TIMESTAMP" {
+                return Expression::FunctionCall(Box::new(FunctionCall {
+                    token: self.cur_token.clone(),
+                    function: SmartString::new(&upper),
+                    arguments: vec![],
+                    is_distinct: false,
+                    order_by: vec![],
+                    filter: None,
+                }));
+            }
+        }
         Expression::Identifier(Identifier::new(
             self.cur_token.clone(),
             self.cur_token.literal.clone(),
@@ -302,10 +332,17 @@ impl Parser {
                 Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone()),
             )),
             _ => {
-                self.add_error(format!(
-                    "unexpected keyword: {} at {}",
-                    keyword, self.cur_token.position
-                ));
+                if self.current_clause.is_empty() {
+                    self.add_error(format!(
+                        "'{}' cannot be used here, expected expression",
+                        keyword
+                    ));
+                } else {
+                    self.add_error(format!(
+                        "'{}' cannot be used in {} clause, expected expression",
+                        keyword, self.current_clause
+                    ));
+                }
                 None
             }
         }
@@ -405,13 +442,14 @@ impl Parser {
             self.next_token(); // Move to SELECT
             let subquery = self.parse_select_statement()?;
 
-            if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+            if !self.peek_token_is_punctuator(")") {
                 self.add_error(format!(
-                    "expected ')' after scalar subquery at {}",
-                    self.cur_token.position
+                    "expected ')' after scalar subquery, got {}",
+                    Self::format_token_for_error(&self.peek_token)
                 ));
                 return None;
             }
+            self.next_token();
 
             return Some(Expression::ScalarSubquery(ScalarSubquery {
                 token,
@@ -444,10 +482,14 @@ impl Parser {
                 }
             }
 
-            if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
-                self.add_error(format!("expected ')' at {}", self.cur_token.position));
+            if !self.peek_token_is_punctuator(")") {
+                self.add_error(format!(
+                    "expected ')', got {}",
+                    Self::format_token_for_error(&self.peek_token)
+                ));
                 return None;
             }
+            self.next_token();
 
             // Return as ExpressionList (tuple)
             return Some(Expression::ExpressionList(Box::new(ExpressionList {
@@ -456,10 +498,14 @@ impl Parser {
             })));
         }
 
-        if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
-            self.add_error(format!("expected ')' at {}", self.cur_token.position));
+        if !self.peek_token_is_punctuator(")") {
+            self.add_error(format!(
+                "expected ')', got {}",
+                Self::format_token_for_error(&self.peek_token)
+            ));
             return None;
         }
+        self.next_token();
 
         Some(first_expr)
     }
@@ -1200,13 +1246,14 @@ impl Parser {
     fn parse_in_expression(&mut self, left: Expression, not: bool) -> Option<Expression> {
         let token = self.cur_token.clone();
 
-        if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
+        if !self.peek_token_is_punctuator("(") {
             self.add_error(format!(
-                "expected '(' after IN at {}",
-                self.cur_token.position
+                "expected '(' after IN, got {}",
+                Self::format_token_for_error(&self.peek_token)
             ));
             return None;
         }
+        self.next_token();
 
         // Check for subquery
         if self.peek_token_is_keyword("SELECT") {
@@ -1560,6 +1607,7 @@ impl Parser {
                     token_type: TokenType::String,
                     literal: field.to_lowercase(),
                     position: token.position,
+                    quoted: false,
                 },
                 value: field.to_lowercase(),
                 type_hint: None,

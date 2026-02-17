@@ -1140,9 +1140,14 @@ impl Parser {
         // Parse column-value pairs
         let mut updates = FxHashMap::default();
         loop {
-            if !self.expect_peek(TokenType::Identifier) {
+            if !self.peek_token_is(TokenType::Identifier) {
+                self.add_error(format!(
+                    "expected column name in SET clause, got {}",
+                    Self::format_token_for_error(&self.peek_token)
+                ));
                 return None;
             }
+            self.next_token();
             let column_name = self.cur_token.literal.clone();
 
             if !self.expect_peek(TokenType::Operator) || self.cur_token.literal != "=" {
@@ -1195,9 +1200,14 @@ impl Parser {
         }
 
         // Parse table name
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.peek_token_is(TokenType::Identifier) {
+            self.add_error(format!(
+                "expected table name after DELETE FROM, got {}",
+                Self::format_token_for_error(&self.peek_token)
+            ));
             return None;
         }
+        self.next_token();
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
         // Parse optional alias (AS alias or just alias)
@@ -1753,9 +1763,14 @@ impl Parser {
         };
 
         // Parse index name
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.peek_token_is(TokenType::Identifier) {
+            self.add_error(format!(
+                "expected index name after CREATE INDEX, got {}",
+                Self::format_token_for_error(&self.peek_token)
+            ));
             return None;
         }
+        self.next_token();
         let index_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
         // Expect ON
@@ -2015,9 +2030,13 @@ impl Parser {
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
         // Parse operation
-        if !self.expect_peek(TokenType::Keyword) {
+        if !self.peek_token_is(TokenType::Keyword) {
+            self.add_error(
+                "expected ALTER action (ADD, DROP, RENAME) after table name".to_string(),
+            );
             return None;
         }
+        self.next_token();
 
         let operation_keyword = self.cur_token.literal.to_uppercase();
         let (operation, column_def, column_name, new_column_name, new_table_name) =

@@ -257,8 +257,10 @@ impl Parser {
             true
         } else {
             self.add_error(format!(
-                "expected keyword {}, got {} at {}",
-                keyword, self.peek_token.literal, self.peek_token.position
+                "expected {} after {}, got {}",
+                keyword,
+                self.cur_token.literal,
+                Self::format_token_for_error(&self.peek_token)
             ));
             false
         }
@@ -306,21 +308,53 @@ impl Parser {
 
     /// Add an error for unexpected peek token type
     pub(crate) fn peek_error(&mut self, expected: TokenType) {
-        // Give a better error message when expecting an identifier but got a reserved keyword
-        if expected == TokenType::Identifier
+        let expected_desc = match expected {
+            TokenType::Identifier => "identifier (name)",
+            TokenType::Keyword => "keyword",
+            TokenType::Punctuator => "'(' or ')'",
+            TokenType::String => "string literal",
+            TokenType::Integer => "integer",
+            TokenType::Float => "number",
+            _ => "token",
+        };
+
+        if self.peek_token.token_type == TokenType::Eof {
+            if !self.current_clause.is_empty() {
+                self.add_error(format!(
+                    "expected {} after {}",
+                    expected_desc, self.current_clause
+                ));
+            } else {
+                self.add_error(format!(
+                    "unexpected end of input, expected {}",
+                    expected_desc
+                ));
+            }
+        } else if expected == TokenType::Identifier
             && self.peek_token.token_type == TokenType::Keyword
             && Self::is_reserved_keyword(&self.peek_token.literal)
         {
             self.add_error(format!(
-                "'{}' is a reserved keyword and cannot be used as an identifier. Use double quotes to escape it: \"{}\"",
+                "'{}' is a reserved keyword and cannot be used as an identifier. \
+                 Use double quotes to escape it: \"{}\"",
                 self.peek_token.literal.to_uppercase(),
                 self.peek_token.literal
             ));
         } else {
             self.add_error(format!(
-                "expected {:?}, got {:?} at {}",
-                expected, self.peek_token.token_type, self.peek_token.position
+                "expected {}, got {}",
+                expected_desc,
+                Self::format_token_for_error(&self.peek_token)
             ));
+        }
+    }
+
+    /// Format a token for display in error messages (shows "end of input" for EOF)
+    pub(crate) fn format_token_for_error(token: &Token) -> String {
+        if token.token_type == TokenType::Eof {
+            "end of input".to_string()
+        } else {
+            format!("'{}'", token.literal)
         }
     }
 

@@ -1139,6 +1139,41 @@ impl ScalarFunction for CurrentTimestampFunction {
     }
 }
 
+/// CURRENT_TIME function - returns the current time as "HH:MM:SS"
+#[derive(Default)]
+pub struct CurrentTimeFunction;
+
+impl ScalarFunction for CurrentTimeFunction {
+    fn name(&self) -> &str {
+        "CURRENT_TIME"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "CURRENT_TIME",
+            FunctionType::Scalar,
+            "Returns the current time as HH:MM:SS",
+            FunctionSignature::new(FunctionDataType::String, vec![], 0, 0),
+        )
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        if !args.is_empty() {
+            return Err(Error::invalid_argument(format!(
+                "CURRENT_TIME takes no arguments, got {}",
+                args.len()
+            )));
+        }
+
+        let time_str = Utc::now().format("%H:%M:%S").to_string();
+        Ok(Value::Text(SmartString::from_string(time_str)))
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(CurrentTimeFunction)
+    }
+}
+
 // ============================================================================
 // Helper functions
 // ============================================================================

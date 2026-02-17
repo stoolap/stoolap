@@ -39,10 +39,10 @@ use super::aggregate::{
 use super::scalar::{
     AbsFunction, CastFunction, CeilFunction, CeilingFunction, CharFunction, CharLengthFunction,
     CoalesceFunction, CollateFunction, ConcatFunction, ConcatWsFunction, CosFunction,
-    CurrentDateFunction, CurrentTimestampFunction, DateAddFunction, DateDiffAliasFunction,
-    DateDiffFunction, DateSubFunction, DateTruncFunction, DayFunction, ExpFunction,
-    ExtractFunction, FloorFunction, GreatestFunction, HourFunction, IfNullFunction, IifFunction,
-    InstrFunction, JsonArrayFunction, JsonArrayLengthFunction, JsonExtractFunction,
+    CurrentDateFunction, CurrentTimeFunction, CurrentTimestampFunction, DateAddFunction,
+    DateDiffAliasFunction, DateDiffFunction, DateSubFunction, DateTruncFunction, DayFunction,
+    ExpFunction, ExtractFunction, FloorFunction, GreatestFunction, HourFunction, IfNullFunction,
+    IifFunction, InstrFunction, JsonArrayFunction, JsonArrayLengthFunction, JsonExtractFunction,
     JsonKeysFunction, JsonObjectFunction, JsonTypeFunction, JsonTypeOfFunction, JsonValidFunction,
     LeastFunction, LeftFunction, LengthFunction, LnFunction, LocateFunction, Log10Function,
     Log2Function, LogFunction, LowerFunction, LpadFunction, LtrimFunction, MinuteFunction,
@@ -168,6 +168,7 @@ impl FunctionRegistry {
         // Date/Time functions
         registry.register_scalar::<NowFunction>();
         registry.register_scalar::<CurrentDateFunction>();
+        registry.register_scalar::<CurrentTimeFunction>();
         registry.register_scalar::<CurrentTimestampFunction>();
         registry.register_scalar::<DateTruncFunction>();
         registry.register_scalar::<TimeTruncFunction>();

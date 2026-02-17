@@ -56,11 +56,7 @@ impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CompileError::ColumnNotFound(name) => {
-                write!(
-                    f,
-                    "Column '{}' not found. If you meant a string value, use single quotes: '{}'",
-                    name, name
-                )
+                write!(f, "Column '{}' not found", name)
             }
             CompileError::FunctionNotFound(name) => write!(f, "Function not found: {}", name),
             CompileError::InvalidExpression(msg) => write!(f, "Invalid expression: {}", msg),
@@ -389,37 +385,9 @@ impl<'a> ExprCompiler<'a> {
 
             // === IDENTIFIERS ===
             Expression::Identifier(id) => {
-                // Check if it's a special keyword like CURRENT_DATE
+                // CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP are now parsed as
+                // FunctionCall by the parser, so they no longer reach this path.
                 match id.value_lower.as_str() {
-                    "current_date" => {
-                        let now = chrono::Utc::now();
-                        let date = chrono::TimeZone::with_ymd_and_hms(
-                            &chrono::Utc,
-                            now.year(),
-                            now.month(),
-                            now.day(),
-                            0,
-                            0,
-                            0,
-                        )
-                        .single()
-                        .unwrap_or(now);
-                        builder.emit(Op::LoadConst(Value::Timestamp(date)));
-                        return Ok(());
-                    }
-                    "current_timestamp" => {
-                        builder.emit(Op::LoadConst(Value::Timestamp(chrono::Utc::now())));
-                        return Ok(());
-                    }
-                    "current_time" => {
-                        // Return current time as text "HH:MM:SS"
-                        let now = chrono::Utc::now();
-                        let time_str = now.format("%H:%M:%S").to_string();
-                        builder.emit(Op::LoadConst(Value::Text(SmartString::from_string(
-                            time_str,
-                        ))));
-                        return Ok(());
-                    }
                     "true" => {
                         builder.emit(Op::LoadConst(Value::Boolean(true)));
                         return Ok(());
@@ -444,6 +412,9 @@ impl<'a> ExprCompiler<'a> {
                         }
                     } else if let Some(name) = self.ctx.resolve_outer_column(column) {
                         builder.emit(Op::LoadOuterColumn(name));
+                    } else if id.token.quoted {
+                        // SQLite-style: double-quoted identifier falls back to string literal
+                        builder.emit(Op::LoadConst(Value::text(id.value.as_str())));
                     } else {
                         return Err(CompileError::ColumnNotFound(id.value.to_string()));
                     }
@@ -454,6 +425,9 @@ impl<'a> ExprCompiler<'a> {
                     }
                 } else if let Some(name) = self.ctx.resolve_outer_column(&id.value_lower) {
                     builder.emit(Op::LoadOuterColumn(name));
+                } else if id.token.quoted {
+                    // SQLite-style: double-quoted identifier falls back to string literal
+                    builder.emit(Op::LoadConst(Value::text(id.value.as_str())));
                 } else {
                     return Err(CompileError::ColumnNotFound(id.value.to_string()));
                 }
@@ -637,7 +611,7 @@ impl<'a> ExprCompiler<'a> {
             | Expression::QualifiedStar(_)
             | Expression::Default(_) => {
                 return Err(CompileError::InvalidExpression(
-                    "Table sources and special expressions cannot be compiled".to_string(),
+                    "unexpected table reference or '*' in expression context".to_string(),
                 ));
             }
         }
@@ -1491,8 +1465,6 @@ fn try_eval_constant(expr: &Expression) -> Option<Value> {
 
 // Note: string_to_datatype and expression_to_string are now imported from utils
 
-use chrono::Datelike;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,6 +1480,7 @@ mod tests {
                 line: 1,
                 column: 1,
             },
+            quoted: false,
         }
     }
 

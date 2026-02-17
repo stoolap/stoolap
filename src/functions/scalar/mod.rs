@@ -50,10 +50,10 @@ mod utility;
 
 pub use conversion::{CastFunction, CollateFunction};
 pub use datetime::{
-    CurrentDateFunction, CurrentTimestampFunction, DateAddFunction, DateDiffAliasFunction,
-    DateDiffFunction, DateSubFunction, DateTruncFunction, DayFunction, ExtractFunction,
-    HourFunction, MinuteFunction, MonthFunction, SecondFunction, TimeTruncFunction, ToCharFunction,
-    VersionFunction, YearFunction,
+    CurrentDateFunction, CurrentTimeFunction, CurrentTimestampFunction, DateAddFunction,
+    DateDiffAliasFunction, DateDiffFunction, DateSubFunction, DateTruncFunction, DayFunction,
+    ExtractFunction, HourFunction, MinuteFunction, MonthFunction, SecondFunction,
+    TimeTruncFunction, ToCharFunction, VersionFunction, YearFunction,
 };
 pub use math::{
     AbsFunction, CeilFunction, CeilingFunction, CosFunction, ExpFunction, FloorFunction,

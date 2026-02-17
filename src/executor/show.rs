@@ -281,6 +281,19 @@ impl Executor {
             "Extra".to_string(),
         ];
 
+        // Build unique column set from indexes (matching MySQL's UNI key type)
+        let mut unique_columns: FxHashSet<String> = FxHashSet::default();
+        if let Ok(indexes) = self.engine.list_table_indexes(table_name) {
+            for index_name in indexes.keys() {
+                if let Some(index) = table.get_index(index_name) {
+                    let col_names = index.column_names();
+                    if index.is_unique() && col_names.len() == 1 {
+                        unique_columns.insert(col_names[0].to_lowercase());
+                    }
+                }
+            }
+        }
+
         let mut rows = RowVec::with_capacity(schema.columns.len());
         for (i, col) in schema.columns.iter().enumerate() {
             // Determine type string
@@ -289,9 +302,11 @@ impl Executor {
             // Determine nullability
             let null_str = if col.nullable { "YES" } else { "NO" };
 
-            // Determine key type
+            // Determine key type (MySQL convention: PRI > UNI > MUL)
             let key_str = if col.primary_key {
                 "PRI"
+            } else if unique_columns.contains(&col.name_lower) {
+                "UNI"
             } else if schema.foreign_keys.iter().any(|fk| fk.column_index == i) {
                 "MUL"
             } else {
