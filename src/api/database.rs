@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::core::{Error, IsolationLevel, Result, Value};
 use crate::executor::context::ExecutionContextBuilder;
-use crate::executor::Executor;
+use crate::executor::{CachedPlanRef, ExecutionContext, Executor};
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::Engine;
 use crate::storage::{Config, SyncMode};
@@ -878,6 +878,77 @@ impl Database {
         Ok(())
     }
 
+    /// Get a cached plan for a SQL statement (parse once, execute many times).
+    ///
+    /// Returns a `CachedPlanRef` that can be stored and passed to
+    /// `execute_plan()` / `query_plan()` for zero-lookup execution.
+    pub fn cached_plan(&self, sql: &str) -> Result<CachedPlanRef> {
+        let executor = self
+            .inner
+            .executor
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        executor.get_or_create_plan(sql)
+    }
+
+    /// Execute a pre-cached plan with positional parameters (no parsing, no cache lookup).
+    pub fn execute_plan<P: Params>(&self, plan: &CachedPlanRef, params: P) -> Result<i64> {
+        let executor = self
+            .inner
+            .executor
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let param_values = params.into_params();
+        let ctx = if param_values.is_empty() {
+            ExecutionContext::new()
+        } else {
+            ExecutionContext::with_params(param_values)
+        };
+        let result = executor.execute_with_cached_plan(plan, &ctx)?;
+        Ok(result.rows_affected())
+    }
+
+    /// Query using a pre-cached plan with positional parameters (no parsing, no cache lookup).
+    pub fn query_plan<P: Params>(&self, plan: &CachedPlanRef, params: P) -> Result<Rows> {
+        let executor = self
+            .inner
+            .executor
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let param_values = params.into_params();
+        let ctx = if param_values.is_empty() {
+            ExecutionContext::new()
+        } else {
+            ExecutionContext::with_params(param_values)
+        };
+        let result = executor.execute_with_cached_plan(plan, &ctx)?;
+        Ok(Rows::new(result))
+    }
+
+    /// Execute a pre-cached plan with named parameters (no parsing, no cache lookup).
+    pub fn execute_named_plan(&self, plan: &CachedPlanRef, params: NamedParams) -> Result<i64> {
+        let executor = self
+            .inner
+            .executor
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let ctx = ExecutionContext::with_named_params(params.into_inner());
+        let result = executor.execute_with_cached_plan(plan, &ctx)?;
+        Ok(result.rows_affected())
+    }
+
+    /// Query using a pre-cached plan with named parameters (no parsing, no cache lookup).
+    pub fn query_named_plan(&self, plan: &CachedPlanRef, params: NamedParams) -> Result<Rows> {
+        let executor = self
+            .inner
+            .executor
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let ctx = ExecutionContext::with_named_params(params.into_inner());
+        let result = executor.execute_with_cached_plan(plan, &ctx)?;
+        Ok(Rows::new(result))
+    }
+
     /// Check if a table exists
     pub fn table_exists(&self, name: &str) -> Result<bool> {
         let engine = &self.inner.engine;
@@ -1052,6 +1123,7 @@ impl<T: FromValue> FromValue for Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::named_params;
 
     #[test]
     fn test_open_memory() {
@@ -1202,5 +1274,137 @@ mod tests {
             Option::<i64>::from_value(&Value::null_unknown()).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn test_cached_plan_insert_and_query() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, score FLOAT)",
+            (),
+        )
+        .unwrap();
+
+        let insert_plan = db
+            .cached_plan("INSERT INTO test VALUES ($1, $2, $3)")
+            .unwrap();
+
+        // Batch insert using cached plan
+        db.execute_plan(&insert_plan, (1, "Alice", 95.5)).unwrap();
+        db.execute_plan(&insert_plan, (2, "Bob", 82.0)).unwrap();
+        db.execute_plan(&insert_plan, (3, "Charlie", 91.0)).unwrap();
+
+        // Query using cached plan
+        let query_plan = db
+            .cached_plan("SELECT name FROM test WHERE id = $1")
+            .unwrap();
+        let mut rows = db.query_plan(&query_plan, (2,)).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "Bob");
+    }
+
+    #[test]
+    fn test_cached_plan_reuse() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, value INTEGER)",
+            (),
+        )
+        .unwrap();
+
+        // Get the same plan twice — second call should hit the cache
+        let plan1 = db.cached_plan("INSERT INTO test VALUES ($1, $2)").unwrap();
+        let plan2 = db.cached_plan("INSERT INTO test VALUES ($1, $2)").unwrap();
+
+        // Both should work independently
+        db.execute_plan(&plan1, (1, 100)).unwrap();
+        db.execute_plan(&plan2, (2, 200)).unwrap();
+
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM test", ()).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_cached_plan_update_delete() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, value INTEGER)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO test VALUES (1, 100)", ()).unwrap();
+        db.execute("INSERT INTO test VALUES (2, 200)", ()).unwrap();
+
+        // Update via cached plan
+        let update_plan = db
+            .cached_plan("UPDATE test SET value = $1 WHERE id = $2")
+            .unwrap();
+        let affected = db.execute_plan(&update_plan, (999, 1)).unwrap();
+        assert_eq!(affected, 1);
+
+        let val: i64 = db
+            .query_one("SELECT value FROM test WHERE id = 1", ())
+            .unwrap();
+        assert_eq!(val, 999);
+
+        // Delete via cached plan
+        let delete_plan = db.cached_plan("DELETE FROM test WHERE id = $1").unwrap();
+        let affected = db.execute_plan(&delete_plan, (2,)).unwrap();
+        assert_eq!(affected, 1);
+
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM test", ()).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_cached_plan_no_params() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, value INTEGER)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO test VALUES (1, 10)", ()).unwrap();
+        db.execute("INSERT INTO test VALUES (2, 20)", ()).unwrap();
+
+        let plan = db.cached_plan("SELECT COUNT(*) FROM test").unwrap();
+        let mut rows = db.query_plan(&plan, ()).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_cached_plan_named_params() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)", ())
+            .unwrap();
+
+        let plan = db
+            .cached_plan("INSERT INTO test VALUES (:id, :name)")
+            .unwrap();
+        db.execute_named_plan(&plan, named_params! { id: 1, name: "Alice" })
+            .unwrap();
+        db.execute_named_plan(&plan, named_params! { id: 2, name: "Bob" })
+            .unwrap();
+
+        let query_plan = db
+            .cached_plan("SELECT name FROM test WHERE id = :id")
+            .unwrap();
+        let mut rows = db
+            .query_named_plan(&query_plan, named_params! { id: 1 })
+            .unwrap();
+        let row = rows.next().unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "Alice");
+    }
+
+    #[test]
+    fn test_cached_plan_multi_statement_error() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+
+        // Multiple statements should fail
+        let result = db.cached_plan("INSERT INTO test VALUES (1); INSERT INTO test VALUES (2)");
+        assert!(result.is_err());
     }
 }

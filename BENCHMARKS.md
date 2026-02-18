@@ -1,4 +1,4 @@
-# Stoolap v0.3.0 Benchmark Results
+# Stoolap v0.3.1 Benchmark Results
 
 Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using identical workloads.
 

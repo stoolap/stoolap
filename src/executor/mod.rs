@@ -128,7 +128,7 @@ pub use parallel::{
 pub use planner::{
     ColumnStatsCache, QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision, StatsHealth,
 };
-pub use query_cache::{CacheStats, CachedQueryPlan, QueryCache, DEFAULT_CACHE_SIZE};
+pub use query_cache::{CacheStats, CachedPlanRef, CachedQueryPlan, QueryCache, DEFAULT_CACHE_SIZE};
 pub use query_classification::clear_classification_cache;
 pub use result::{ColumnarResult, ExecResult, ExecutorResult};
 pub use semantic_cache::{
@@ -668,6 +668,85 @@ impl Executor {
         let mut tx = self.engine.begin_transaction()?;
         let _ = tx.set_isolation_level(isolation);
         Ok(tx)
+    }
+
+    /// Get or create a cached plan for a SQL statement.
+    ///
+    /// Parses the SQL and caches the plan if not already cached.
+    /// Returns a lightweight CachedPlanRef that can be stored and reused
+    /// for repeated execution without re-parsing or cache lookup overhead.
+    pub fn get_or_create_plan(&self, sql: &str) -> Result<CachedPlanRef> {
+        if let Some(plan) = self.query_cache.get(sql) {
+            return Ok(plan);
+        }
+        let mut parser = Parser::new(sql);
+        let mut program = parser
+            .parse_program()
+            .map_err(|e| Error::parse(e.to_string()))?;
+        if program.statements.len() != 1 {
+            return Err(Error::parse(
+                "Prepared statements must contain exactly one statement",
+            ));
+        }
+        let stmt = program.statements.pop().unwrap();
+        let (has_params, param_count) = count_parameters(&stmt);
+        Ok(self
+            .query_cache
+            .put(sql, Arc::new(stmt), has_params, param_count))
+    }
+
+    /// Execute a pre-cached plan directly, skipping cache lookup.
+    ///
+    /// This is the fast path for prepared statements: the caller holds a
+    /// `CachedPlanRef` obtained from `get_or_create_plan()` and passes it
+    /// here on every execution, avoiding normalize + hash + RwLock read
+    /// per call.
+    pub fn execute_with_cached_plan(
+        &self,
+        plan: &CachedPlanRef,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        // Validate parameter count
+        if plan.has_params {
+            let provided = ctx.params().len();
+            if provided < plan.param_count {
+                return Err(Error::internal(format!(
+                    "Query requires {} parameters but only {} provided",
+                    plan.param_count, provided
+                )));
+            }
+        }
+
+        // Try compiled fast paths based on statement type
+        match plan.statement.as_ref() {
+            Statement::Select(stmt) => {
+                if let Some(result) = self.try_fast_pk_lookup_compiled(stmt, ctx, &plan.compiled) {
+                    return result;
+                }
+                if let Some(result) = self.try_fast_count_distinct_compiled(stmt, &plan.compiled) {
+                    return result;
+                }
+                if let Some(result) = self.try_fast_count_star_compiled(stmt, &plan.compiled) {
+                    return result;
+                }
+            }
+            Statement::Update(stmt) => {
+                if let Some(result) = self.try_fast_pk_update_compiled(stmt, ctx, &plan.compiled) {
+                    return result;
+                }
+            }
+            Statement::Delete(stmt) => {
+                if let Some(result) = self.try_fast_pk_delete_compiled(stmt, ctx, &plan.compiled) {
+                    return result;
+                }
+            }
+            Statement::Insert(stmt) => {
+                return self.execute_insert_with_compiled_cache(stmt, ctx, &plan.compiled);
+            }
+            _ => {}
+        }
+
+        self.execute_statement(&plan.statement, ctx)
     }
 }
 

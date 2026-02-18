@@ -78,7 +78,7 @@ export class StoolapDB {
         return this;
     }
     /**
-     * Return the Stoolap version string (e.g. "0.3.0-abc1234").
+     * Return the Stoolap version string (e.g. "0.3.1-abc1234").
      * @returns {string}
      */
     version() {

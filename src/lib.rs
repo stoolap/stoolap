@@ -146,8 +146,8 @@ pub use functions::{
 
 // Re-export executor types
 pub use executor::{
-    CacheStats, CachedQueryPlan, ColumnStatsCache, ExecResult, ExecutionContext, Executor,
-    ExecutorResult, QueryCache, QueryPlanner, StatsHealth,
+    CacheStats, CachedPlanRef, CachedQueryPlan, ColumnStatsCache, ExecResult, ExecutionContext,
+    Executor, ExecutorResult, QueryCache, QueryPlanner, StatsHealth,
 };
 
 // Re-export API types

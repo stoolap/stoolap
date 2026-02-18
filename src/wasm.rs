@@ -62,7 +62,7 @@ impl StoolapDB {
         })
     }
 
-    /// Return the Stoolap version string (e.g. "0.3.0-abc1234").
+    /// Return the Stoolap version string (e.g. "0.3.1-abc1234").
     pub fn version(&self) -> String {
         if GIT_COMMIT != "unknown" {
             let short = if GIT_COMMIT.len() > 7 {
