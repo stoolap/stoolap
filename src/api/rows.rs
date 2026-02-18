@@ -257,6 +257,29 @@ impl Rows {
         self.result.rows_affected()
     }
 
+    /// Advance the cursor to the next row.
+    ///
+    /// Returns `true` if a row is available, `false` when exhausted.
+    /// Use `current_row()` to access the row by reference (no clone).
+    ///
+    /// This is faster than the Iterator interface for bulk serialization
+    /// because it avoids `take_row()` which clones the row.
+    #[inline]
+    pub fn advance(&mut self) -> bool {
+        if self.closed {
+            return false;
+        }
+        self.result.next()
+    }
+
+    /// Get a reference to the current row (after a successful `advance()`).
+    ///
+    /// Returns `&Row` directly — no clone, no ResultRow wrapper.
+    #[inline]
+    pub fn current_row(&self) -> &Row {
+        self.result.row()
+    }
+
     /// Collect all rows into a Vec
     ///
     /// # Example
@@ -448,5 +471,43 @@ mod tests {
         let row = rows.into_iter().next().unwrap().unwrap();
 
         assert!(row.get_by_name::<String>("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_advance_and_current_row() {
+        let mut rows = create_test_rows();
+
+        // First row
+        assert!(rows.advance());
+        let row = rows.current_row();
+        assert_eq!(row.get(0), Some(&Value::Integer(1)));
+        assert_eq!(row.get(1), Some(&Value::text("Alice")));
+
+        // Second row
+        assert!(rows.advance());
+        let row = rows.current_row();
+        assert_eq!(row.get(0), Some(&Value::Integer(2)));
+        assert_eq!(row.get(1), Some(&Value::text("Bob")));
+
+        // Exhausted
+        assert!(!rows.advance());
+    }
+
+    #[test]
+    fn test_advance_on_closed_rows() {
+        let mut rows = create_test_rows();
+        rows.close();
+        assert!(!rows.advance());
+    }
+
+    #[test]
+    fn test_advance_full_scan() {
+        let mut rows = create_test_rows();
+        let mut count = 0;
+        while rows.advance() {
+            let _row = rows.current_row();
+            count += 1;
+        }
+        assert_eq!(count, 2);
     }
 }

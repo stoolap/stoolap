@@ -1,83 +1,86 @@
-# Stoolap Documentation Website
+# stoolap.io
 
-This directory contains the GitHub Pages website for Stoolap, hosted at [stoolap.io](https://stoolap.io). It includes comprehensive documentation migrated from the project's GitHub Wiki.
+The [stoolap.io](https://stoolap.io) website — documentation, interactive playground, and blog for the Stoolap database engine.
+
+Built with [Jekyll](https://jekyllrb.com/) 4.4 and deployed automatically via GitHub Pages.
 
 ## Local Development
 
-To run the website locally:
+```bash
+cd docs
+gem install jekyll bundler   # one-time setup
+bundle install               # install dependencies
+bundle exec jekyll serve     # http://localhost:4000
+```
 
-1. Install Jekyll and Bundler:
-   ```
-   gem install jekyll bundler
-   ```
+## Structure
 
-2. Navigate to the `docs` directory:
-   ```
-   cd docs
-   ```
-
-3. Install dependencies:
-   ```
-   bundle install
-   ```
-
-4. Start the local server:
-   ```
-   bundle exec jekyll serve
-   ```
-
-5. Open your browser to `http://localhost:4000`
-
-## Site Structure
-
-- `_config.yml` - Jekyll configuration
-- `index.html` - Homepage
-- `assets/` - CSS, JavaScript, and images
-- `_layouts/` - Page layouts
-- `_includes/` - Reusable components
-- `_docs/` - Documentation pages organized by category:
-  - `architecture/` - Design and implementation of Stoolap components
-  - `data-types/` - Information about supported data types
-  - `functions/` - SQL function reference
-  - `getting-started/` - Installation and quick start guides
-  - `performance/` - Performance optimization techniques
-  - `sql-commands/` - SQL command reference
-  - `sql-features/` - Detailed information about SQL features
-
-## Deployment
-
-The site is automatically deployed when changes are pushed to the main branch.
-
-## Migration from Wiki
-
-Most of the content in this documentation was migrated from the project's GitHub Wiki using the `migrate_wiki.sh` script in the repository root. If you need to migrate additional wiki content, you can modify and run this script.
+```
+docs/
+├── index.html               # Homepage (hero, features, comparison table)
+├── playground.html           # Interactive SQL playground (WebAssembly)
+├── blog/index.html           # Blog listing
+├── docs/index.html           # Documentation hub
+├── 404.html                  # Custom error page
+├── _config.yml               # Jekyll configuration (domain, collections, plugins)
+├── _data/
+│   └── doc_categories.yml    # Documentation category definitions
+├── _layouts/
+│   ├── default.html          # Base layout (nav, footer, theme toggle)
+│   ├── doc.html              # Documentation page (sidebar, prev/next nav)
+│   └── post.html             # Blog post
+├── _docs/                    # 51 documentation pages in 7 categories
+│   ├── getting-started/      # Installation, quickstart, API reference
+│   ├── architecture/         # MVCC, storage engine, indexes, persistence
+│   ├── data-types/           # Types overview, date/time, JSON
+│   ├── sql-commands/         # SQL reference, SHOW, PRAGMA, DESCRIBE
+│   ├── functions/            # Scalar, aggregate, window functions
+│   ├── sql-features/         # Transactions, CTEs, joins, window funcs, etc.
+│   └── performance/          # Optimizer, parallel execution, semantic cache
+├── assets/
+│   ├── css/                  # main.css, home.css, code.css, playground.css
+│   ├── js/                   # main.js, playground.js
+│   ├── img/                  # logo.svg, stoolap_logo.png, architecture-diagram.svg
+│   └── wasm/                 # WebAssembly build (stoolap_bg.wasm, JS bindings)
+├── Gemfile                   # Ruby dependencies
+└── CNAME                     # stoolap.io domain
+```
 
 ## Adding Documentation
 
-1. Create a new Markdown file in the appropriate category folder in `_docs/`
-2. Add front matter to the file:
-   ```yaml
-   ---
-   title: Title of the Document
-   category: Category Name
-   order: 1 (or appropriate number)
-   ---
-   ```
-3. Add your content using Markdown
+1. Create a Markdown file in the appropriate `_docs/<category>/` folder.
+2. Add front matter:
 
-## Style Guidelines
+```yaml
+---
+title: Your Page Title
+category: Category Name    # must match a name in _data/doc_categories.yml
+order: 5                   # controls sort order within the category
+---
+```
 
-- Use ATX-style headers (`# Header` not `Header\n===`)
-- Use backticks for code snippets and triple backticks for code blocks
-- Add language identifiers to code blocks when possible (```go, ```sql, etc.)
-- Use relative links for internal documentation references
-- Use meaningful image alt text
+3. Write content in Markdown. Use `sql` fenced code blocks for SQL examples.
 
-## Theme Customization
+Categories are defined in `_data/doc_categories.yml`. The sidebar and prev/next navigation are generated automatically from the category and order fields.
 
-The website uses a custom theme based on Jekyll's minimal theme with support for:
+## Updating the Playground
 
-- Light and dark mode (automatically detects system preference with manual toggle)
-- Responsive design for all device sizes
-- Encode Sans font
-- Stoolap brand colors
+The playground runs Stoolap compiled to WebAssembly entirely in the browser. To update the WASM build:
+
+1. Build the WASM package from the project root (requires `wasm-pack`).
+2. Copy the output into `assets/wasm/`.
+
+## Deployment
+
+Pushing to the `main` branch triggers automatic deployment via GitHub Pages. The `CNAME` file maps to [stoolap.io](https://stoolap.io).
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Static site generator | Jekyll 4.4 |
+| Hosting | GitHub Pages |
+| Fonts | Rubik (body), JetBrains Mono (code) |
+| Theme | Light/dark mode with system preference detection |
+| Playground | WebAssembly (Rust compiled via `wasm-pack`) |
+| Plugins | jekyll-sitemap, jekyll-seo-tag |

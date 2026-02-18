@@ -203,6 +203,13 @@ impl Params for Vec<Value> {
     }
 }
 
+// ParamVec (SmallVec) — zero-cost passthrough, no conversion needed
+impl Params for ParamVec {
+    fn into_params(self) -> ParamVec {
+        self
+    }
+}
+
 // Array of Value
 impl<const N: usize> Params for [Value; N] {
     fn into_params(self) -> ParamVec {
@@ -465,5 +472,27 @@ mod tests {
         assert_eq!(params[0], Value::Integer(1));
         assert_eq!(params[1], Value::text("Alice"));
         assert!(params[2].is_null());
+    }
+
+    #[test]
+    fn test_params_from_param_vec() {
+        // ParamVec -> ParamVec should be zero-cost identity
+        let mut pv = ParamVec::new();
+        pv.push(Value::Integer(1));
+        pv.push(Value::text("hello"));
+        pv.push(Value::Float(3.5));
+
+        let result = pv.into_params();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Value::Integer(1));
+        assert_eq!(result[1], Value::text("hello"));
+        assert_eq!(result[2], Value::Float(3.5));
+    }
+
+    #[test]
+    fn test_params_from_empty_param_vec() {
+        let pv = ParamVec::new();
+        let result = pv.into_params();
+        assert!(result.is_empty());
     }
 }

@@ -152,8 +152,8 @@ pub use executor::{
 
 // Re-export API types
 pub use api::{
-    Database, FromRow, FromValue, NamedParams, Params, ResultRow, Rows, Statement, ToParam,
-    Transaction as ApiTransaction,
+    Database, FromRow, FromValue, NamedParams, ParamVec, Params, ResultRow, Rows, Statement,
+    ToParam, Transaction as ApiTransaction,
 };
 
 #[cfg(test)]

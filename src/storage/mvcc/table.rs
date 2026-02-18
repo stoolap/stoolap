@@ -933,11 +933,27 @@ impl MVCCTable {
             if !value.is_null() {
                 let actual_type = value.data_type();
                 if actual_type != col.data_type {
-                    // Allow Text to Json coercion (JSON strings come in as Text)
+                    // Allow implicit type coercions (standard SQL behavior)
                     if actual_type == DataType::Text && col.data_type == DataType::Json {
                         // Coerce Text to Json
                         if let Some(text_str) = value.as_str() {
                             let _ = row.set(i, Value::json(text_str));
+                        }
+                    } else if actual_type == DataType::Integer && col.data_type == DataType::Float {
+                        // Coerce Integer to Float
+                        if let Value::Integer(n) = value {
+                            let _ = row.set(i, Value::Float(*n as f64));
+                        }
+                    } else if actual_type == DataType::Float && col.data_type == DataType::Integer {
+                        // Coerce Float to Integer (truncate)
+                        if let Value::Float(f) = value {
+                            let _ = row.set(i, Value::Integer(*f as i64));
+                        }
+                    } else if actual_type == DataType::Integer && col.data_type == DataType::Boolean
+                    {
+                        // Coerce Integer to Boolean (0 = false, non-zero = true)
+                        if let Value::Integer(n) = value {
+                            let _ = row.set(i, Value::Boolean(*n != 0));
                         }
                     } else {
                         return Err(Error::internal(format!(
@@ -3944,5 +3960,105 @@ mod tests {
             .unwrap();
 
         assert_eq!(table.row_count(), 2);
+    }
+
+    #[test]
+    fn test_validate_coerce_integer_to_float() {
+        let schema = SchemaBuilder::new("test_table")
+            .column("id", DataType::Integer, false, true)
+            .column("score", DataType::Float, true, false)
+            .build();
+
+        let version_store = Arc::new(VersionStore::new("test_table".to_string(), schema));
+        let txn_id = 1;
+        let txn_versions = TransactionVersionStore::new(Arc::clone(&version_store), txn_id);
+        let mut table = MVCCTable::new(txn_id, version_store, txn_versions);
+
+        // Insert Integer into Float column — should coerce
+        let row = Row::from_values(vec![Value::Integer(1), Value::Integer(42)]);
+        table.insert(row).unwrap();
+
+        let mut scanner = table.scan(&[0, 1], None).unwrap();
+        assert!(scanner.next());
+        assert_eq!(scanner.row().get(1), Some(&Value::Float(42.0)));
+        scanner.close().unwrap();
+    }
+
+    #[test]
+    fn test_validate_coerce_float_to_integer() {
+        let schema = SchemaBuilder::new("test_table")
+            .column("id", DataType::Integer, false, true)
+            .column("count", DataType::Integer, true, false)
+            .build();
+
+        let version_store = Arc::new(VersionStore::new("test_table".to_string(), schema));
+        let txn_id = 1;
+        let txn_versions = TransactionVersionStore::new(Arc::clone(&version_store), txn_id);
+        let mut table = MVCCTable::new(txn_id, version_store, txn_versions);
+
+        // Insert Float into Integer column — should truncate
+        let row = Row::from_values(vec![Value::Integer(1), Value::Float(9.7)]);
+        table.insert(row).unwrap();
+
+        let mut scanner = table.scan(&[0, 1], None).unwrap();
+        assert!(scanner.next());
+        assert_eq!(scanner.row().get(1), Some(&Value::Integer(9)));
+        scanner.close().unwrap();
+    }
+
+    #[test]
+    fn test_validate_coerce_integer_to_boolean() {
+        let schema = SchemaBuilder::new("test_table")
+            .column("id", DataType::Integer, false, true)
+            .column("active", DataType::Boolean, true, false)
+            .build();
+
+        let version_store = Arc::new(VersionStore::new("test_table".to_string(), schema));
+        let txn_id = 1;
+        let txn_versions = TransactionVersionStore::new(Arc::clone(&version_store), txn_id);
+        let mut table = MVCCTable::new(txn_id, version_store, txn_versions);
+
+        // 0 -> false
+        let row = Row::from_values(vec![Value::Integer(1), Value::Integer(0)]);
+        table.insert(row).unwrap();
+
+        // non-zero -> true
+        let row = Row::from_values(vec![Value::Integer(2), Value::Integer(5)]);
+        table.insert(row).unwrap();
+
+        let mut results: Vec<(i64, bool)> = Vec::new();
+        let mut scanner = table.scan(&[0, 1], None).unwrap();
+        while scanner.next() {
+            let id = match scanner.row().get(0) {
+                Some(Value::Integer(v)) => *v,
+                _ => panic!("expected integer id"),
+            };
+            let active = match scanner.row().get(1) {
+                Some(Value::Boolean(v)) => *v,
+                _ => panic!("expected boolean active"),
+            };
+            results.push((id, active));
+        }
+        scanner.close().unwrap();
+
+        results.sort_by_key(|(id, _)| *id);
+        assert_eq!(results, vec![(1, false), (2, true)]);
+    }
+
+    #[test]
+    fn test_validate_coerce_type_mismatch_error() {
+        let schema = SchemaBuilder::new("test_table")
+            .column("id", DataType::Integer, false, true)
+            .column("name", DataType::Text, true, false)
+            .build();
+
+        let version_store = Arc::new(VersionStore::new("test_table".to_string(), schema));
+        let txn_id = 1;
+        let txn_versions = TransactionVersionStore::new(Arc::clone(&version_store), txn_id);
+        let mut table = MVCCTable::new(txn_id, version_store, txn_versions);
+
+        // Boolean into Text column — not a supported coercion, should error
+        let row = Row::from_values(vec![Value::Integer(1), Value::Boolean(true)]);
+        assert!(table.insert(row).is_err());
     }
 }

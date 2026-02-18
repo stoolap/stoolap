@@ -110,6 +110,25 @@ impl Transaction {
         Ok(result.rows_affected())
     }
 
+    /// Execute a pre-parsed statement with parameters.
+    ///
+    /// Avoids re-parsing SQL on every call — ideal for batch operations
+    /// where the same statement is executed many times with different params.
+    ///
+    /// Use `Parser::new(sql).parse_program()` to pre-parse the SQL once.
+    pub fn execute_prepared<P: Params>(&mut self, statement: &Statement, params: P) -> Result<i64> {
+        self.check_active()?;
+
+        let param_values = params.into_params();
+        let ctx = if param_values.is_empty() {
+            ExecutionContext::new()
+        } else {
+            ExecutionContext::with_params(param_values)
+        };
+        let result = self.execute_statement(statement, &ctx)?;
+        Ok(result.rows_affected())
+    }
+
     /// Execute a query within the transaction
     ///
     /// # Examples
@@ -764,5 +783,93 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let tx = db.begin().unwrap();
         assert!(tx.id() > 0);
+    }
+
+    #[test]
+    fn test_execute_prepared_insert() {
+        use crate::parser::Parser;
+
+        let db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, value FLOAT)",
+            (),
+        )
+        .unwrap();
+
+        // Pre-parse the statement once
+        let stmt = Parser::new("INSERT INTO test VALUES ($1, $2, $3)")
+            .parse_program()
+            .unwrap()
+            .statements
+            .into_iter()
+            .next()
+            .unwrap();
+
+        // Execute multiple times with different params
+        let mut tx = db.begin().unwrap();
+        tx.execute_prepared(&stmt, (1, "Alice", 10.5)).unwrap();
+        tx.execute_prepared(&stmt, (2, "Bob", 20.0)).unwrap();
+        tx.execute_prepared(&stmt, (3, "Charlie", 30.0)).unwrap();
+        tx.commit().unwrap();
+
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM test", ()).unwrap();
+        assert_eq!(count, 3);
+
+        let name: String = db
+            .query_one("SELECT name FROM test WHERE id = $1", (2,))
+            .unwrap();
+        assert_eq!(name, "Bob");
+    }
+
+    #[test]
+    fn test_execute_prepared_no_params() {
+        use crate::parser::Parser;
+
+        let db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, value INTEGER DEFAULT 0)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO test VALUES (1, 100)", ()).unwrap();
+
+        let stmt = Parser::new("UPDATE test SET value = 999")
+            .parse_program()
+            .unwrap()
+            .statements
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut tx = db.begin().unwrap();
+        let affected = tx.execute_prepared(&stmt, ()).unwrap();
+        assert_eq!(affected, 1);
+        tx.commit().unwrap();
+
+        let value: i64 = db
+            .query_one("SELECT value FROM test WHERE id = 1", ())
+            .unwrap();
+        assert_eq!(value, 999);
+    }
+
+    #[test]
+    fn test_execute_prepared_on_committed_tx_errors() {
+        use crate::parser::Parser;
+
+        let db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+
+        let stmt = Parser::new("INSERT INTO test VALUES ($1)")
+            .parse_program()
+            .unwrap()
+            .statements
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut tx = db.begin().unwrap();
+        tx.commit().unwrap();
+        assert!(tx.execute_prepared(&stmt, (1,)).is_err());
     }
 }
