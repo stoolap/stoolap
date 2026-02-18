@@ -395,7 +395,7 @@ try {
 
 Requires:
 - [Rust](https://rustup.rs) (stable)
-- [Node.js](https://nodejs.org) >= 18 (with development headers)
+- [Node.js](https://nodejs.org) >= 22 (with development headers)
 - C++ compiler (for V8 helpers)
 
 ```bash
