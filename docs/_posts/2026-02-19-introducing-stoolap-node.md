@@ -5,15 +5,15 @@ author: Semih Alev
 date: 2026-02-19
 ---
 
-I've been working on Stoolap for a while now -- an embedded SQL database written in pure Rust. It started as a Go project, grew into something much bigger, and recently hit a point where I thought: okay, this thing is fast, but how do people actually *use* it outside of Rust?
+I've been working on Stoolap for a while now, an embedded SQL database written in pure Rust. It started as a Go project, grew into something much bigger, and recently hit a point where I thought: okay, this thing is fast, but how do people actually *use* it outside of Rust?
 
-The answer, for a lot of developers, is Node.js. So I built **[@stoolap/node](https://www.npmjs.com/package/@stoolap/node)** -- a native driver powered by [NAPI-RS](https://napi.rs) that gives you direct access to Stoolap from JavaScript and TypeScript.
+The answer, for a lot of developers, is Node.js. So I built **[@stoolap/node](https://www.npmjs.com/package/@stoolap/node)**, a native driver powered by [NAPI-RS](https://napi.rs) that gives you direct access to Stoolap from JavaScript and TypeScript.
 
 No HTTP server in between. No serialization overhead. Just your Node.js process talking directly to the database engine through native bindings.
 
 ## Why Not Just Use SQLite?
 
-Look, SQLite is great. I use it myself. It's battle-tested, well-documented, and everywhere. But there are things it doesn't do well -- or doesn't do at all.
+Look, SQLite is great. I use it myself. It's battle-tested, well-documented, and everywhere. But there are things it doesn't do well, or doesn't do at all.
 
 Stoolap has MVCC transactions, a cost-based query optimizer, parallel execution, semantic query caching, and temporal queries with `AS OF`. These aren't checkbox features; they actually show up in real workloads.
 
@@ -55,7 +55,7 @@ The differences aren't small. Some of these numbers surprised me:
 
 The `COUNT DISTINCT` result at 138x faster is probably the most dramatic. Stoolap maintains internal data structures that make distinct counting nearly free, while SQLite has to scan and deduplicate every time.
 
-The subquery performance (EXISTS, NOT EXISTS, IN, NOT IN) comes from Stoolap's semi-join optimization -- it builds a HashSet from the subquery result and probes it, rather than running correlated subqueries row by row.
+The subquery performance (EXISTS, NOT EXISTS, IN, NOT IN) comes from Stoolap's semi-join optimization. It builds a HashSet from the subquery result and probes it, rather than running correlated subqueries row by row.
 
 ## Where SQLite Still Wins
 
@@ -70,7 +70,7 @@ Let's be honest about where SQLite is faster:
 | INNER JOIN | 0.10 ms | 0.11 ms | 1.13x |
 | Self JOIN | 0.11 ms | 0.11 ms | 1.02x |
 
-These are all small margins -- mostly in the 1.0x to 1.6x range. SQLite's single-row operations benefit from decades of optimization on that specific path. The B-tree page cache is incredibly well-tuned for point lookups.
+These are all small margins, mostly in the 1.0x to 1.6x range. SQLite's single-row operations benefit from decades of optimization on that specific path. The B-tree page cache is incredibly well-tuned for point lookups.
 
 But notice the pattern: SQLite's wins are on simple, single-row operations where both databases are already sub-millisecond. Stoolap's wins are on the analytical and complex queries where the difference is 10x to 100x+.
 
@@ -153,13 +153,13 @@ try {
 In-memory is great for benchmarks, but real applications need persistence. Stoolap uses WAL (Write-Ahead Logging) with configurable durability:
 
 ```js
-// Maximum durability -- fsync on every write
+// Maximum durability (fsync on every write)
 const db = await Database.open('./mydata?sync=full');
 
-// Balanced (default) -- fsync on commit batches
+// Balanced (default, fsync on commit batches)
 const db = await Database.open('./mydata');
 
-// Maximum throughput -- no fsync
+// Maximum throughput (no fsync)
 const db = await Database.open('./mydata?sync=none');
 ```
 
@@ -186,7 +186,7 @@ The full API documentation is in the [driver docs](/docs/drivers/nodejs/).
 
 ## What's Next
 
-The Node.js driver is at v0.3.1 right now. It covers the full Stoolap API -- databases, transactions, prepared statements, batch operations, and all the query methods.
+The Node.js driver is at v0.3.1 right now. It covers the full Stoolap API: databases, transactions, prepared statements, batch operations, and all the query methods.
 
 I'm planning to add connection pooling helpers and streaming query support in upcoming releases. If you run into issues or have feature requests, [open an issue on GitHub](https://github.com/stoolap/stoolap-node/issues).
 

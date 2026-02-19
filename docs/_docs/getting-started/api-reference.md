@@ -467,7 +467,7 @@ let inner: &Row = row.as_row();
 let owned: Row = row.into_inner();
 ```
 
-### Type Conversions (FromValue -- reading)
+### Type Conversions (FromValue, reading)
 
 Types you can use with `row.get::<T>()`:
 
@@ -481,7 +481,7 @@ Types you can use with `row.get::<T>()`:
 | JSON | `String`, `Value` |
 | NULL | `Option<T>` for any supported `T` |
 
-### Parameter Types (ToParam -- writing)
+### Parameter Types (ToParam, writing)
 
 Types you can pass as SQL parameters:
 

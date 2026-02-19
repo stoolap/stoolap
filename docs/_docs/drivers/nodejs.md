@@ -95,7 +95,7 @@ const db = await Database.open('file:///absolute/path/to/db');
 
 ## Sync Methods
 
-Sync methods run on the main thread -- faster for simple operations but block the event loop.
+Sync methods run on the main thread. Faster for simple operations but blocks the event loop.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
@@ -125,7 +125,7 @@ await db.exec('CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)');
 await db.execute('INSERT INTO kv VALUES ($1, $2)', ['hello', 'world']);
 await db.close();
 
-// Reopen -- data is still there
+// Reopen: data is still there
 const db2 = await Database.open('./mydata');
 const row = await db2.queryOne('SELECT * FROM kv WHERE key = $1', ['hello']);
 // { key: 'hello', value: 'world' }
@@ -137,10 +137,10 @@ await db2.close();
 Pass configuration as query parameters in the path:
 
 ```js
-// Maximum durability -- fsync on every WAL write
+// Maximum durability (fsync on every WAL write)
 const db = await Database.open('./mydata?sync=full');
 
-// High throughput -- no fsync, larger buffers
+// High throughput (no fsync, larger buffers)
 const db = await Database.open('./mydata?sync=none&wal_buffer_size=131072');
 
 // Custom snapshot interval with compression
@@ -158,9 +158,9 @@ Controls the durability vs. performance trade-off:
 
 | Mode | Value | Description |
 |------|-------|-------------|
-| `none` | `sync=none` | No fsync -- fastest, data may be lost on crash |
-| `normal` | `sync=normal` | Fsync on commit batches -- good balance (default) |
-| `full` | `sync=full` | Fsync on every WAL write -- slowest, maximum durability |
+| `none` | `sync=none` | No fsync. Fastest, but data may be lost on crash |
+| `normal` | `sync=normal` | Fsync on commit batches. Good balance (default) |
+| `full` | `sync=full` | Fsync on every WAL write. Slowest, maximum durability |
 
 ### All Configuration Parameters
 
@@ -207,7 +207,7 @@ console.log(result.changes); // 3
 
 ## Prepared Statements
 
-Prepared statements parse SQL once and reuse the cached execution plan on every call -- no parsing or cache lookup overhead per execution.
+Prepared statements parse SQL once and reuse the cached execution plan on every call. No parsing or cache lookup overhead per execution.
 
 ```js
 const insert = db.prepare('INSERT INTO users VALUES ($1, $2, $3)');
@@ -231,7 +231,7 @@ All methods mirror `Database` but without the `sql` parameter (it's bound at pre
 | `queryRaw(params?)` | `queryRawSync(params?)` | Query in columnar format |
 | | `executeBatchSync(paramsArray)` | Execute with multiple param sets |
 
-Property: `sql` -- returns the SQL text of this prepared statement.
+Property: `sql` returns the SQL text of this prepared statement.
 
 ### Async Usage
 
@@ -369,7 +369,7 @@ try {
   console.error(err.message);
 }
 
-// Prepared statement -- errors at prepare time for invalid SQL
+// Invalid SQL raises at prepare time
 try {
   db.prepare('INVALID SQL HERE');
 } catch (err) {
