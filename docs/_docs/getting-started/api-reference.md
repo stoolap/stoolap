@@ -318,6 +318,20 @@ let count: i64 = tx.query_one("SELECT COUNT(*) FROM users", ())?;
 // Optional value query
 let name: Option<String> = tx.query_opt("SELECT name FROM users WHERE id = $1", (999,))?;
 
+// Named parameters
+tx.execute_named(
+    "INSERT INTO users VALUES (:id, :name, :age)",
+    named_params!{ id: 3, name: "Charlie", age: 35 }
+)?;
+
+for row in tx.query_named(
+    "SELECT * FROM users WHERE age > :min_age",
+    named_params!{ min_age: 25 }
+)? {
+    let row = row?;
+    // ...
+}
+
 // Commit or rollback
 tx.commit()?;
 // Or: tx.rollback()?;
@@ -652,6 +666,8 @@ fn main() -> Result<()> {
 | `query(sql, params)` | `Result<Rows>` | Query rows |
 | `query_one(sql, params)` | `Result<T>` | Single value |
 | `query_opt(sql, params)` | `Result<Option<T>>` | Optional value |
+| `execute_named(sql, params)` | `Result<i64>` | Execute with named params |
+| `query_named(sql, params)` | `Result<Rows>` | Query with named params |
 | `execute_prepared(stmt, params)` | `Result<i64>` | Execute pre-parsed statement |
 | `commit()` | `Result<()>` | Commit |
 | `rollback()` | `Result<()>` | Rollback |
