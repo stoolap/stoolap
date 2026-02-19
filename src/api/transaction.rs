@@ -32,7 +32,7 @@
 //! tx.commit()?;
 //! ```
 
-use crate::api::params::ParamVec;
+use crate::api::params::{NamedParams, ParamVec};
 use crate::core::{Error, Result, Row, RowVec, Schema, Value};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::ExpressionEval;
@@ -186,28 +186,60 @@ impl Transaction {
         }
     }
 
+    /// Execute a SQL statement with named parameters within the transaction
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use stoolap::named_params;
+    ///
+    /// let mut tx = db.begin()?;
+    /// tx.execute_named(
+    ///     "INSERT INTO users VALUES (:id, :name)",
+    ///     named_params!{ id: 1, name: "Alice" }
+    /// )?;
+    /// tx.commit()?;
+    /// ```
+    pub fn execute_named(&mut self, sql: &str, params: NamedParams) -> Result<i64> {
+        self.check_active()?;
+        let ctx = ExecutionContext::with_named_params(params.into_inner());
+        let result = self.execute_sql_with_ctx(sql, ctx)?;
+        Ok(result.rows_affected())
+    }
+
+    /// Execute a query with named parameters within the transaction
+    pub fn query_named(&mut self, sql: &str, params: NamedParams) -> Result<Rows> {
+        self.check_active()?;
+        let ctx = ExecutionContext::with_named_params(params.into_inner());
+        let result = self.execute_sql_with_ctx(sql, ctx)?;
+        Ok(Rows::new(result))
+    }
+
     /// Internal SQL execution
     fn execute_sql(&mut self, sql: &str, params: ParamVec) -> Result<Box<dyn QueryResult>> {
-        // Parse the SQL
-        let mut parser = Parser::new(sql);
-        let program = parser
-            .parse_program()
-            .map_err(|e| Error::parse(e.to_string()))?;
-
-        // Create execution context with parameters
         let ctx = if params.is_empty() {
             ExecutionContext::new()
         } else {
             ExecutionContext::with_params(params)
         };
+        self.execute_sql_with_ctx(sql, ctx)
+    }
 
-        // Execute each statement
+    /// Internal SQL execution with a pre-built execution context
+    fn execute_sql_with_ctx(
+        &mut self,
+        sql: &str,
+        ctx: ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        let mut parser = Parser::new(sql);
+        let program = parser
+            .parse_program()
+            .map_err(|e| Error::parse(e.to_string()))?;
+
         let mut last_result: Option<Box<dyn QueryResult>> = None;
-
         for statement in &program.statements {
             last_result = Some(self.execute_statement(statement, &ctx)?);
         }
-
         last_result.ok_or(Error::NoStatementsToExecute)
     }
 
@@ -282,6 +314,10 @@ impl Transaction {
                 // Create VM for expression execution (reused for all rows)
                 let mut vm = ExprVM::new();
 
+                // Arc-clone params for the setter closure (O(1) refcount bump, no deep copy)
+                let positional_params = ctx.params_arc().clone();
+                let named_params = ctx.named_params_arc().clone();
+
                 // CRITICAL: Capture errors from setter since closure can't return Result
                 use std::cell::RefCell;
                 let update_error: RefCell<Option<Error>> = RefCell::new(None);
@@ -300,7 +336,14 @@ impl Transaction {
                     }
 
                     // Evaluate all expressions first (while we can still borrow row)
-                    let exec_ctx = ExecuteContext::new(&row);
+                    // CRITICAL: Include positional and named params for parameter resolution
+                    let mut exec_ctx = ExecuteContext::new(&row);
+                    if !positional_params.is_empty() {
+                        exec_ctx = exec_ctx.with_params(&positional_params);
+                    }
+                    if !named_params.is_empty() {
+                        exec_ctx = exec_ctx.with_named_params(&named_params);
+                    }
 
                     // CRITICAL: Collect evaluated values, capturing any errors
                     let mut updates_to_apply: Vec<(usize, Value)> =
