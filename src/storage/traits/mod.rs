@@ -24,17 +24,21 @@
 //! - [`Scanner`] - Row scanning interface
 //!
 
+pub mod aggregation;
 pub mod engine;
 pub mod index_trait;
 pub mod result;
 pub mod scanner;
 pub mod table;
 pub mod transaction;
+pub mod view;
 
 // Re-export main traits
+pub use aggregation::{AggregateOp, GroupedAggregateResult};
 pub use engine::Engine;
 pub use index_trait::Index;
 pub use result::{EmptyResult, MemoryResult, QueryResult};
 pub use scanner::{EmptyScanner, Scanner, VecScanner};
 pub use table::{ScanPlan, Table};
 pub use transaction::{TemporalType, Transaction};
+pub use view::ViewDefinition;

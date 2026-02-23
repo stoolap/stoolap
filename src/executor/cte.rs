@@ -36,7 +36,7 @@ use crate::common::{CompactArc, CompactVec, StringMap};
 use crate::core::{Error, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
-use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
+use crate::storage::traits::{QueryResult, Table, Transaction};
 
 use super::context::ExecutionContext;
 use super::expression::ExpressionEval;

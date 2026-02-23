@@ -32,7 +32,6 @@ use std::sync::Arc;
 
 use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema, Value};
 use crate::storage::expression::Expression as StorageExpression;
-use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::Engine;
 
 /// Check that all FK values in a row reference existing parent rows.
@@ -43,7 +42,7 @@ use crate::storage::traits::Engine;
 ///
 /// Short-circuits immediately if schema has no FKs (zero cost for non-FK tables).
 pub(crate) fn check_parent_exists(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     txn_id: i64,
     schema: &Schema,
     row: &crate::core::Row,
@@ -82,7 +81,7 @@ pub(crate) fn check_parent_exists(
 ///
 /// NULL values are allowed (no reference) and should be skipped by the caller.
 pub(crate) fn validate_fk_value(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     txn_id: i64,
     fk: &ForeignKeyConstraint,
     value: &Value,
@@ -118,7 +117,7 @@ pub(crate) fn validate_fk_value(
 /// - Falls back to filtered scan with early termination otherwise
 /// - Always txn-aware: sees uncommitted INSERTs, respects uncommitted DELETEs
 fn parent_row_exists(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     txn_id: i64,
     parent_table: &str,
     parent_column: &str,
@@ -156,7 +155,7 @@ fn parent_row_exists(
 /// Delegates to the engine's cached reverse mapping (rebuilt only on schema_epoch change).
 /// Returns Arc-wrapped Vec (ref-count bump only, no cloning).
 pub(crate) fn find_referencing_fks(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     parent_table: &str,
 ) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
     engine.find_referencing_fks(parent_table)
@@ -175,7 +174,7 @@ pub(crate) fn find_referencing_fks(
 ///
 /// Returns the total count of cascaded/affected child rows.
 pub(crate) fn enforce_delete_actions_iter<'a>(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     txn_id: i64,
     parent_table: &str,
     deleted_pk_values: impl Iterator<Item = &'a Value>,
@@ -228,7 +227,7 @@ pub(crate) fn enforce_delete_actions_iter<'a>(
 /// Enforce referential actions for UPDATE of a parent PK.
 /// All operations participate in the caller's transaction via `txn_id`.
 pub(crate) fn enforce_update_actions(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     txn_id: i64,
     parent_table: &str,
     old_pk_value: &Value,
@@ -289,7 +288,7 @@ pub(crate) fn enforce_update_actions(
 /// - Falls back to filtered scan with early termination otherwise
 /// - Always txn-aware: sees uncommitted INSERTs, respects uncommitted DELETEs
 fn child_rows_exist(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     txn_id: i64,
     child_table: &str,
     fk: &ForeignKeyConstraint,
@@ -318,7 +317,7 @@ const MAX_CASCADE_DEPTH: usize = 16;
 /// Operates within the caller's transaction (no independent commit).
 /// Recursively cascades to grandchild tables (up to MAX_CASCADE_DEPTH).
 fn cascade_delete(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     txn_id: i64,
     child_table: &str,
     fk: &ForeignKeyConstraint,
@@ -328,7 +327,7 @@ fn cascade_delete(
 }
 
 fn cascade_delete_recursive(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     txn_id: i64,
     child_table: &str,
     fk: &ForeignKeyConstraint,
@@ -452,7 +451,7 @@ fn cascade_delete_recursive(
 /// CASCADE UPDATE: update FK column in all child rows from old to new value.
 /// Operates within the caller's transaction (no independent commit).
 fn cascade_update(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     txn_id: i64,
     child_table: &str,
     fk: &ForeignKeyConstraint,
@@ -486,7 +485,7 @@ fn cascade_update(
 /// SET NULL: set FK column to NULL in all child rows referencing the given parent PK value.
 /// Operates within the caller's transaction (no independent commit).
 fn set_null_on_delete(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     txn_id: i64,
     child_table: &str,
     fk: &ForeignKeyConstraint,
@@ -541,7 +540,7 @@ fn set_null_on_delete(
 /// uncommitted deletes within an explicit transaction). Otherwise creates a fresh
 /// read-only transaction.
 pub(crate) fn check_no_referencing_rows(
-    engine: &MVCCEngine,
+    engine: &dyn Engine,
     parent_table: &str,
     txn_id: Option<i64>,
 ) -> Result<()> {

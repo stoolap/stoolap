@@ -367,27 +367,11 @@ fn find_safe_truncation_lsn(
     min_second_to_last_lsn
 }
 
-/// View definition storing the query that defines the view
-#[derive(Debug, Clone)]
-pub struct ViewDefinition {
-    /// View name (lowercase for case-insensitive lookup)
-    pub name: String,
-    /// Original view name (preserves case)
-    pub original_name: String,
-    /// The SQL query string that defines the view
-    pub query: String,
-}
+/// Re-export ViewDefinition from the traits module
+pub use crate::storage::traits::view::ViewDefinition;
 
+/// Extension methods for ViewDefinition used by the MVCC engine (WAL serialization)
 impl ViewDefinition {
-    /// Create a new view definition
-    pub fn new(name: &str, query: String) -> Self {
-        Self {
-            name: name.to_lowercase(),
-            original_name: name.to_string(),
-            query,
-        }
-    }
-
     /// Serialize view definition to binary format for WAL
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -2308,11 +2292,11 @@ impl MVCCEngine {
 }
 
 impl Engine for MVCCEngine {
-    fn open(&mut self) -> Result<()> {
+    fn open(&self) -> Result<()> {
         MVCCEngine::open_engine(self)
     }
 
-    fn close(&mut self) -> Result<()> {
+    fn close(&self) -> Result<()> {
         MVCCEngine::close_engine(self)
     }
 
@@ -2442,7 +2426,7 @@ impl Engine for MVCCEngine {
         self.registry.get_global_isolation_level()
     }
 
-    fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()> {
+    fn set_isolation_level(&self, level: IsolationLevel) -> Result<()> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2455,7 +2439,7 @@ impl Engine for MVCCEngine {
         self.config.read().expect("config lock poisoned").clone()
     }
 
-    fn update_config(&mut self, config: Config) -> Result<()> {
+    fn update_config(&self, config: Config) -> Result<()> {
         self.update_engine_config(config)
     }
 
@@ -3007,6 +2991,72 @@ impl Engine for MVCCEngine {
         Ok(Box::new(move |row_ids: &[i64]| {
             store.count_visible_versions_batch(row_ids, read_txn_id)
         }))
+    }
+
+    // --- View operations ---
+
+    fn get_view_lowercase(&self, name_lower: &str) -> Result<Option<Arc<ViewDefinition>>> {
+        MVCCEngine::get_view_lowercase(self, name_lower)
+    }
+
+    fn get_view(&self, name: &str) -> Result<Option<Arc<ViewDefinition>>> {
+        MVCCEngine::get_view(self, name)
+    }
+
+    fn list_views(&self) -> Result<Vec<String>> {
+        MVCCEngine::list_views(self)
+    }
+
+    fn create_view(&self, name: &str, query: &str, or_replace: bool) -> Result<()> {
+        MVCCEngine::create_view(self, name, query.to_string(), or_replace)
+    }
+
+    fn drop_view(&self, name: &str) -> Result<()> {
+        MVCCEngine::drop_view(self, name, false)
+    }
+
+    // --- Foreign key operations ---
+
+    fn get_table_for_txn(&self, txn_id: i64, table_name: &str) -> Result<Box<dyn Table>> {
+        MVCCEngine::get_table_for_txn(self, txn_id, table_name)
+    }
+
+    fn find_referencing_fks(
+        &self,
+        parent_table: &str,
+    ) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
+        MVCCEngine::find_referencing_fks(self, parent_table)
+    }
+
+    fn get_all_schemas(&self) -> Vec<CompactArc<Schema>> {
+        MVCCEngine::get_all_schemas(self)
+    }
+
+    fn set_global_isolation_level(&self, level: IsolationLevel) {
+        self.registry.set_global_isolation_level(level);
+    }
+
+    fn start_background_tasks(&self) -> Result<()> {
+        // Note: start_cleanup() requires &Arc<Self>, so it must be called
+        // externally after wrapping the engine in Arc. This is a no-op here;
+        // callers should use Arc<MVCCEngine>::start_cleanup() directly.
+        Ok(())
+    }
+
+    fn view_exists(&self, name: &str) -> Result<bool> {
+        MVCCEngine::view_exists(self, name)
+    }
+
+    fn create_table_direct(&self, schema: Schema) -> Result<Schema> {
+        MVCCEngine::create_table(self, schema)
+    }
+
+    fn drop_table_direct(&self, name: &str) -> Result<()> {
+        MVCCEngine::drop_table_internal(self, name)
+    }
+
+    fn refresh_schema_cache(&self, table_name: &str) -> Result<()> {
+        MVCCEngine::refresh_schema_cache(self, table_name)
     }
 }
 

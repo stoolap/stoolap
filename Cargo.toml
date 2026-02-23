@@ -84,6 +84,10 @@ duckdb = { version = "1.4.3", features = ["bundled"], optional = true }
 # Optional allocators
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
+# TiKV distributed backend (optional)
+tikv-client = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+
 # Platform-specific file locking
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -115,6 +119,7 @@ dhat-heap = []
 sqlite = ["dep:rusqlite"]
 duckdb = ["dep:duckdb"]
 mimalloc = ["dep:mimalloc"]
+tikv = ["dep:tikv-client", "dep:tokio"]
 
 [[example]]
 name = "benchmark_sqlite"
@@ -154,6 +159,11 @@ harness = false
 [[bench]]
 name = "delete_complex"
 harness = false
+
+[[bench]]
+name = "tikv_comparison"
+harness = false
+required-features = ["tikv"]
 
 [profile.bench]
 lto = true

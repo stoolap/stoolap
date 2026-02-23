@@ -21,7 +21,7 @@ use crate::common::SmartString;
 use crate::core::{Result, Row, RowVec, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::parser::ast::*;
-use crate::storage::traits::{Engine, QueryResult, ScanPlan};
+use crate::storage::traits::{QueryResult, ScanPlan};
 
 use super::context::ExecutionContext;
 use super::operators::index_nested_loop::IndexLookupStrategy;

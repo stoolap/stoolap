@@ -28,7 +28,7 @@ use crate::common::{CompactArc, SmartString};
 use crate::core::{Result, Row, Schema, Value};
 use crate::parser::ast::{DeleteStatement, Expression, UpdateStatement};
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpression};
-use crate::storage::traits::{Engine, QueryResult};
+use crate::storage::traits::QueryResult;
 
 use super::context::{
     invalidate_in_subquery_cache_for_table, invalidate_scalar_subquery_cache_for_table,
@@ -568,7 +568,7 @@ impl Executor {
         // Bail if table has FK constraints (child table) or is referenced by other tables (parent table)
         // FK enforcement requires cross-table lookups — fall back to normal path
         if !schema.foreign_keys.is_empty()
-            || !super::foreign_key::find_referencing_fks(&self.engine, table_name).is_empty()
+            || !super::foreign_key::find_referencing_fks(self.engine.as_ref(), table_name).is_empty()
         {
             *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
             return None;
@@ -681,7 +681,7 @@ impl Executor {
         let pk_column = &schema.columns[pk_idx].name;
 
         // Bail if this table is referenced by child tables (FK enforcement needed)
-        if !super::foreign_key::find_referencing_fks(&self.engine, table_name).is_empty() {
+        if !super::foreign_key::find_referencing_fks(self.engine.as_ref(), table_name).is_empty() {
             *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
             return None;
         }

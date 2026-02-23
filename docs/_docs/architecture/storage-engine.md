@@ -192,6 +192,98 @@ src/storage/
     └── persistence.rs  # WAL and snapshots
 ```
 
+## TiKV Distributed Backend
+
+Stoolap also supports a distributed TiKV backend behind the `tikv` feature flag.
+
+### Summary
+
+- **Status** - Implemented and tested end-to-end
+- **DSN format** - `tikv://pd1:2379,pd2:2379`
+- **Architecture** - Executor stays backend-agnostic via storage traits (`Engine`, `Transaction`, `Table`, `Scanner`, `QueryResult`)
+- **Bridge model** - TiKV async client is bridged to Stoolap sync traits via an internal Tokio runtime
+
+### What Is Implemented
+
+#### Phase 0: Trait Decoupling
+
+- Moved backend-shared types into `src/storage/traits/` (`aggregation.rs`, `view.rs`)
+- Removed direct MVCC coupling from the executor and database engine wiring
+- Unified backend lifecycle on trait methods (`open`, `close`, background task hooks)
+
+#### Phase 1: Basic TiKV Engine
+
+Implemented TiKV backend modules in `src/storage/tikv/`:
+
+- `engine.rs` - engine implementation and schema/index metadata management
+- `transaction.rs` - transaction lifecycle and savepoint metadata
+- `table.rs` - CRUD and scan logic
+- `scanner.rs` - scanner implementation
+- `result.rs` - query result adapter
+- `encoding.rs` - key/value and schema encoding
+- `error.rs` - TiKV error mapping
+- `index.rs` - secondary index implementation
+
+Core features:
+
+- CREATE/DROP TABLE
+- INSERT/SELECT/UPDATE/DELETE
+- CREATE/DROP VIEW
+- AUTO_INCREMENT via persisted row ID counters
+- TiKV transaction cleanup guarantees on success and error paths
+- Custom `Value`/`Schema` serialization and order-preserving key encoding
+
+#### Phase 2: Secondary Indexes
+
+- CREATE INDEX and DROP INDEX support
+- Unique and non-unique index encodings in TiKV keyspace
+- Index maintenance on INSERT/UPDATE/DELETE
+- Index metadata persistence and reload on engine open
+- Executor integration for index existence and lookup methods
+
+#### Phase 3: Savepoints and READ COMMITTED
+
+- Savepoints implemented with DDL-state emulation
+- `rollback_to_savepoint` undoes tracked CREATE/DROP TABLE operations
+- READ COMMITTED implemented using fresh TiKV snapshots for SELECT operations
+
+#### Phase 4: Temporal Queries and Optimizations
+
+- `AS OF TIMESTAMP` support through historical TiKV snapshots
+- Batch row ID allocation to reduce network round-trips
+- Paginated scans and LIMIT-aware row collection
+- ORDER BY/index-assisted row collection and row fetch helpers
+- Fast row counting via key scans where possible
+
+#### Phase 5: Integration and CI
+
+- Dedicated TiKV integration tests in:
+  - `tests/tikv_test.rs`
+  - `tests/tikv_complex_test.rs`
+- Coverage includes joins, subqueries, GROUP BY/HAVING, DISTINCT, ORDER BY, savepoints, indexes, window functions, CTEs, temporal queries, and concurrent transactions
+- CI workflow for TiKV test runs in `.github/workflows/tikv.yml`
+- Local TiKV test environment via `docker-compose.tikv.yml` and `Makefile` targets
+
+### Current Limitations
+
+- TiKV has no native savepoints; Stoolap emulates DDL savepoint behavior
+- `AS OF` reads depend on TiKV GC safe point retention window
+- TiKV transaction IDs are not interchangeable with Stoolap transaction IDs (`AS OF TRANSACTION` is not supported)
+
+### Run TiKV Tests
+
+```bash
+# Build with TiKV support
+cargo build --features tikv
+
+# Start local TiKV cluster
+make tikv-up
+
+# Run TiKV integration tests
+make test-tikv
+make test-tikv-complex
+make test-tikv-all
+```
 ## Performance Characteristics
 
 ### Read Performance
