@@ -7,7 +7,7 @@ order: 9
 
 # NULL Handling
 
-This document explains how NULL values are handled in Stoolap based on test files and implementation details.
+Stoolap follows standard SQL semantics for NULL values, representing the absence of a value.
 
 ## Overview
 

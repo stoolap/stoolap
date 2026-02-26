@@ -158,7 +158,7 @@ Recovery is transparent to the application.
 let db = Database::open("file:///path/to/database")?;
 
 // Database is ready with all committed data restored
-let results = db.query("SELECT * FROM users")?;
+let results = db.query("SELECT * FROM users", ())?;
 ```
 
 ## Configuration Options

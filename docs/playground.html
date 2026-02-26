@@ -10,7 +10,7 @@ description: Interactive SQL playground running Stoolap entirely in your browser
   <div class="playground-hero-bg"></div>
   <div class="container playground-hero-inner">
     <h1 class="playground-title">Stoolap Playground</h1>
-    <p class="playground-desc">Run real SQL queries in your browser. Stoolap compiles to WebAssembly &mdash; everything runs locally, nothing leaves your machine.</p>
+    <p class="playground-desc">Run real SQL queries in your browser. Stoolap compiles to WebAssembly. Everything runs locally, nothing leaves your machine.</p>
   </div>
 </section>
 
@@ -21,7 +21,7 @@ description: Interactive SQL playground running Stoolap entirely in your browser
         <span class="pg-dot" style="background:#ff5f56"></span>
         <span class="pg-dot" style="background:#ffbd2e"></span>
         <span class="pg-dot" style="background:#27c93f"></span>
-        <span class="pg-label">stoolap &mdash; Playground</span>
+        <span class="pg-label">stoolap / Playground</span>
         <div class="pg-chrome-actions">
           <button class="pg-btn" id="btn-clear" title="Clear output (Ctrl+L)">Clear</button>
           <button class="pg-btn" id="btn-reset" title="Reset database">Reset</button>
@@ -35,7 +35,7 @@ description: Interactive SQL playground running Stoolap entirely in your browser
       </div>
       <div class="pg-input-area">
         <span class="pg-prompt" id="pg-prompt">stoolap&gt;</span>
-        <textarea class="pg-input" id="pg-input" rows="1" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Enter SQL..." disabled></textarea>
+        <textarea class="pg-input" id="pg-input" rows="1" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Enter SQL..." aria-label="SQL input" disabled></textarea>
       </div>
       <div class="playground-hints">
         <div class="hint-grid">
@@ -48,6 +48,7 @@ description: Interactive SQL playground running Stoolap entirely in your browser
           <button class="hint-chip" data-sql="EXPLAIN SELECT u.name, SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 50 GROUP BY u.name;">EXPLAIN</button>
         </div>
       </div>
+    </div>
   </div>
 </section>
 

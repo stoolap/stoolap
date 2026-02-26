@@ -177,6 +177,11 @@
   border-color: rgba(255,255,255,0.15);
 }
 
+.pg-btn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
 /* ── Output area ── */
 .pg-body {
   flex: 1;
@@ -314,9 +319,17 @@ pre.pg-table-pre {
   gap: 0.5rem;
 }
 
+[data-theme="light"] .pg-input-area:focus-within {
+  box-shadow: inset 0 0 0 2px rgba(var(--color-primary-rgb), 0.35);
+}
+
 [data-theme="dark"] .pg-input-area {
   background: #0d1320;
   border-top-color: rgba(255,255,255,0.04);
+}
+
+[data-theme="dark"] .pg-input-area:focus-within {
+  box-shadow: inset 0 0 0 2px rgba(126,231,135,0.35);
 }
 
 .pg-prompt {
@@ -417,6 +430,11 @@ pre.pg-table-pre {
   background: rgba(126,231,135,0.08);
 }
 
+.hint-chip:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
 /* ============================================
    RESPONSIVE
    ============================================ */
@@ -445,8 +463,15 @@ pre.pg-table-pre {
   .pg-chrome-actions { display: none; }
 }
 
-/* ── Reuse homepage keyframes ── */
-@keyframes fadeUp {
-  from { opacity: 0; transform: translateY(24px); }
-  to { opacity: 1; transform: translateY(0); }
+@media (prefers-reduced-motion: reduce) {
+  .playground-title,
+  .playground-desc,
+  .playground-terminal {
+    animation: none !important;
+  }
+  .pg-spinner {
+    animation: none !important;
+  }
 }
+
+/* fadeUp keyframes defined in main.css */

@@ -390,7 +390,7 @@ SELECT EXTRACT(WEEK FROM '2024-03-15');              -- 11 (ISO week)
 SELECT EXTRACT(QUARTER FROM '2024-05-15');           -- 2
 ```
 
-Supported fields: `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `DOW` (day of week), `DOY` (day of year), `WEEK`, `QUARTER`
+Supported fields: `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `MILLISECOND`, `MICROSECOND`, `DOW` (day of week, 0=Sunday), `ISODOW` (ISO day of week, 1=Monday), `DOY` (day of year), `WEEK`, `QUARTER`, `EPOCH`
 
 ### YEAR / MONTH / DAY
 Shorthand functions to extract date parts.

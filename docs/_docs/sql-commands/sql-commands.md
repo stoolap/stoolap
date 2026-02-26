@@ -21,7 +21,7 @@ The SELECT statement retrieves data from one or more tables.
 SELECT [DISTINCT] column1, column2, ...
 FROM table_name
 [WHERE condition]
-[GROUP BY column1, ... | ROLLUP(column1, ...) | CUBE(column1, ...)]
+[GROUP BY column1, ... | ROLLUP(column1, ...) | CUBE(column1, ...) | GROUPING SETS((col1), (col2), ...)]
 [HAVING condition]
 [ORDER BY column1 [ASC|DESC] [NULLS FIRST|NULLS LAST], ...]
 [LIMIT count [OFFSET offset]]
@@ -34,7 +34,7 @@ FROM table_name
 - **table_name**: The table to query
 - **WHERE condition**: Filter condition
 - **GROUP BY**: Groups rows by specified columns
-- **ROLLUP/CUBE**: Multi-dimensional aggregation (see [ROLLUP and CUBE]({% link _docs/sql-features/rollup-cube.md %}))
+- **ROLLUP/CUBE/GROUPING SETS**: Multi-dimensional aggregation (see [ROLLUP, CUBE, and GROUPING SETS]({% link _docs/sql-features/rollup-cube.md %}))
 - **HAVING**: Filter applied to groups
 - **ORDER BY**: Sorting of results (`NULLS FIRST` or `NULLS LAST` to control NULL placement)
 - **LIMIT**: Maximum rows to return
@@ -99,6 +99,11 @@ FULL OUTER JOIN orders o ON c.id = o.customer_id;
 SELECT p.name, c.name
 FROM products p
 CROSS JOIN colors c;
+
+-- NATURAL JOIN (auto-matches common column names)
+SELECT *
+FROM orders
+NATURAL JOIN customers;
 ```
 
 See [JOIN Operations]({% link _docs/sql-features/join-operations.md %}) for detailed documentation.
@@ -190,9 +195,19 @@ SELECT id FROM table1
 INTERSECT
 SELECT id FROM table2;
 
+-- INTERSECT ALL (keeps duplicates)
+SELECT id FROM table1
+INTERSECT ALL
+SELECT id FROM table2;
+
 -- EXCEPT
 SELECT id FROM table1
 EXCEPT
+SELECT id FROM table2;
+
+-- EXCEPT ALL (keeps duplicates)
+SELECT id FROM table1
+EXCEPT ALL
 SELECT id FROM table2;
 ```
 

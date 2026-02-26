@@ -112,7 +112,7 @@ Stoolap's parallel execution engine processes data using Rayon's work-stealing s
 
 - **Automatic Parallelization** - Operations exceeding thresholds are automatically parallelized
 - **Work-Stealing** - Optimal load balancing across CPU cores
-- **Configurable Thresholds** - Filter (10K rows), Hash Join (5K), ORDER BY (50K), DISTINCT (10K)
+- **Configurable Thresholds** - Filter (10K rows), Hash Join (10K), ORDER BY (50K), DISTINCT (10K)
 
 ## Transaction Management
 
@@ -183,7 +183,7 @@ Stoolap uses Rayon for parallel query execution:
 Stoolap uses specialized data structures for better performance:
 
 - **DashMap** - Concurrent hash tables for parallel operations
-- **Efficient Index Structures** - B-tree, Hash, and Bitmap indexes
+- **Efficient Index Structures** - B-tree, Hash, Bitmap, and HNSW indexes
 - **Row Version Chains** - MVCC implementation with version chains
 
 ## Advanced Optimization Techniques

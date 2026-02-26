@@ -137,6 +137,27 @@ Stoolap supports multiple index implementations:
 4. **HNSW Indexes** - For vector columns, approximate nearest neighbor search (see [Vector Search]({% link _docs/data-types/vector-search.md %}))
 5. **Multi-column Indexes** - For queries that filter on multiple columns together
 
+### ALTER TABLE
+
+Modify an existing table's structure:
+
+```sql
+-- Add a new column
+ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active';
+
+-- Drop a column
+ALTER TABLE users DROP COLUMN status;
+
+-- Rename a column
+ALTER TABLE users RENAME COLUMN name TO full_name;
+
+-- Modify a column's type
+ALTER TABLE users MODIFY COLUMN age FLOAT;
+
+-- Rename a table
+ALTER TABLE users RENAME TO app_users;
+```
+
 ### Dropping Indexes
 
 ```sql

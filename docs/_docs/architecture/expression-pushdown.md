@@ -38,7 +38,7 @@ Depending on selectivity and index coverage, expression pushdown can provide:
 Stoolap implements expression pushdown at multiple levels:
 
 1. **Storage Level Pushdown** - Expressions pushed directly to storage
-2. **Index Level Pushdown** - Expressions leveraging indexes (B-tree, Hash, Bitmap)
+2. **Index Level Pushdown** - Expressions leveraging indexes (B-tree, Hash, Bitmap, HNSW)
 3. **Scan Level Pushdown** - Expressions applied during table scanning
 4. **Join Level Pushdown** - Expressions pushed before or into joins
 
@@ -137,7 +137,7 @@ These expression types are implemented in `src/storage/expression/`.
 
 At the storage level, Stoolap implements optimized filtering:
 
-- **Index-Based Filtering** - Filter operations using B-tree, Hash, and Bitmap indexes
+- **Index-Based Filtering** - Filter operations using B-tree, Hash, Bitmap, and HNSW indexes
 - **Parallel Evaluation** - Multi-threaded predicate evaluation using Rayon
 - **Bitmap Results** - Bitmap representation of matching positions
 - **Efficient Traversal** - Row-based filtering with MVCC visibility checks
@@ -245,7 +245,7 @@ SELECT * FROM products
 WHERE LOWER(name) LIKE '%organic%';
 ```
 
-## Implementation Details
+## Key Source Files
 
 Stoolap's expression pushdown is implemented in several components:
 
@@ -286,11 +286,12 @@ SELECT * FROM orders
 WHERE status = 'shipped' AND order_date > '2022-01-01';
 ```
 
-### Function Index Pushdown
+### Function Expressions in Filters
 
-When functions are used in filtering:
+When functions are used in filtering, the expression is evaluated at the filter level rather than pushed down to the index:
 
 ```sql
--- If an index exists on LOWER(email), this pushdown is efficient
+-- The LOWER() function is evaluated during row filtering
+-- For best performance, store normalized values and index them directly
 SELECT * FROM users WHERE LOWER(email) = 'user@example.com';
 ```

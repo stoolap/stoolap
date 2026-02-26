@@ -44,6 +44,7 @@ Stoolap is designed around practical embedded database needs:
 | Adaptive Query Execution | ✅ | ❌ | ❌ | ❌ |
 | Semantic Query Caching | ✅ | ❌ | ❌ | ❌ |
 | Parallel Query Execution | ✅ | ❌ | ✅ | ✅ |
+| Native Vector / HNSW Search | ✅ | ❌ | ❌ | ❌ |
 | Pure Rust (Memory Safe) | ✅ | ❌ | ❌ | ❌ |
 
 *PostgreSQL typically needs extensions for temporal query workflows.

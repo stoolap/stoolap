@@ -7,7 +7,7 @@ order: 2
 
 # JOIN Operations
 
-This document explains JOIN operations in Stoolap, their syntax, and how to use them effectively based on the implementation and test files.
+Stoolap supports SQL JOIN operations to combine data from multiple tables based on related columns.
 
 ## Overview
 
@@ -284,6 +284,7 @@ Stoolap automatically selects the optimal join algorithm based on data character
 |-----------|-----------|------------|
 | **Hash Join** | Equality conditions, larger tables | O(N+M) |
 | **Merge Join** | Pre-sorted inputs on join keys | O(N+M) |
+| **Index Nested Loop** | PK/index lookups, especially with LIMIT | O(N*log M) |
 | **Nested Loop** | Non-equality conditions, CROSS JOIN, small tables | O(N*M) |
 
-The query optimizer considers table sizes, available indexes, and sort order when choosing algorithms.
+The query optimizer considers table sizes, available indexes, and sort order when choosing algorithms. Index Nested Loop is preferred when one side can use an index lookup, and a batch variant is used when no LIMIT is present.

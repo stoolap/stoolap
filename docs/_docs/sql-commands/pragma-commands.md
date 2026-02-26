@@ -38,7 +38,7 @@ Stoolap currently supports the following PRAGMA commands:
 | `snapshot_interval` | Seconds between automatic snapshots | 300 |
 | `sync_mode` | WAL sync mode (0=None, 1=Normal, 2=Full) | 1 |
 | `keep_snapshots` | Number of snapshots to retain per table | 5 |
-| `wal_flush_trigger` | Operations before WAL flush | 32768 |
+| `wal_flush_trigger` | Buffer size in bytes before WAL flush | 32768 |
 | `snapshot` | Manually create a snapshot (no value) | - |
 | `checkpoint` | Alias for `snapshot` (SQLite-compatible) | - |
 | `vacuum` | Manual cleanup of deleted rows and index compaction | - |
@@ -195,7 +195,7 @@ PRAGMA vacuum;
 
 ## PRAGMA Persistence
 
-PRAGMA settings are persisted for file-based and db:// connections, but reset for each new connection. If you want settings to persist across database restarts, you should execute PRAGMA commands after opening the connection.
+PRAGMA settings affect the current engine instance in memory. They are not saved to disk, so they reset when the database is closed and reopened. To apply custom settings consistently, execute PRAGMA commands after opening the connection.
 
 ## Best Practices
 

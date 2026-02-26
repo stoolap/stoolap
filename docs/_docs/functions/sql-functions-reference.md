@@ -7,7 +7,7 @@ order: 1
 
 # SQL Functions Reference
 
-Quick reference for all 117 built-in SQL functions in Stoolap, organized by category. For detailed documentation with examples, see [Scalar Functions]({% link _docs/functions/scalar-functions.md %}), [Aggregate Functions]({% link _docs/functions/aggregate-functions.md %}), and [Window Functions]({% link _docs/functions/window-functions.md %}).
+Quick reference for all built-in SQL functions in Stoolap (117 in the default build, 118 with the `semantic` feature), organized by category. For detailed documentation with examples, see [Scalar Functions]({% link _docs/functions/scalar-functions.md %}), [Aggregate Functions]({% link _docs/functions/aggregate-functions.md %}), and [Window Functions]({% link _docs/functions/window-functions.md %}).
 
 ## Aggregate Functions (17)
 
@@ -153,7 +153,7 @@ JSON shorthand operators are also supported:
 | `GREATEST` | `GREATEST(val1, val2, ...)` | Largest value from list |
 | `LEAST` | `LEAST(val1, val2, ...)` | Smallest value from list |
 
-### Vector Functions (7)
+### Vector Functions (6)
 
 | Function | Syntax | Description |
 |----------|--------|-------------|

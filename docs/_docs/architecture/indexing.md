@@ -319,4 +319,5 @@ Stoolap's indexes are implemented in:
 - `src/storage/index/bitmap.rs` - Bitmap index implementation
 - `src/storage/index/multi_column.rs` - Multi-column index
 - `src/storage/index/hnsw.rs` - HNSW vector index implementation
+- `src/storage/index/pk.rs` - Primary key index (auto-created, hybrid bitset + overflow design)
 - `src/storage/traits/index_trait.rs` - Common index trait

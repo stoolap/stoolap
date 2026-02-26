@@ -188,8 +188,8 @@ FROM products;
 Checks if a string is valid JSON:
 
 ```sql
-SELECT JSON_VALID('{"name": "John"}');  -- Returns: true
-SELECT JSON_VALID('{invalid}');         -- Returns: false
+SELECT JSON_VALID('{"name": "John"}');  -- Returns: 1
+SELECT JSON_VALID('{invalid}');         -- Returns: 0
 ```
 
 ### JSON_KEYS

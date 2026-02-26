@@ -7,7 +7,7 @@ order: 7
 
 # CAST Operations
 
-This document explains type casting in Stoolap based on the implementation and test files.
+Stoolap supports both explicit type casting using the CAST function and implicit type conversion.
 
 ## Overview
 
@@ -106,10 +106,10 @@ SELECT CAST(CAST(123.45 AS INTEGER) AS TEXT);  -- Returns '123'
 -- CAST with expressions
 SELECT CAST(int_val * 2 AS TEXT) FROM cast_test;
 
--- CAST with NULL values
-SELECT CAST(NULL AS INTEGER);                  -- Returns 0
-SELECT CAST(NULL AS TEXT);                     -- Returns '' (empty string)
-SELECT CAST(NULL AS BOOLEAN);                  -- Returns FALSE
+-- CAST with NULL values (preserves NULL with target type)
+SELECT CAST(NULL AS INTEGER);                  -- Returns NULL (typed as INTEGER)
+SELECT CAST(NULL AS TEXT);                     -- Returns NULL (typed as TEXT)
+SELECT CAST(NULL AS BOOLEAN);                  -- Returns NULL (typed as BOOLEAN)
 ```
 
 ## Type Conversion Rules

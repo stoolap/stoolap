@@ -48,7 +48,7 @@ WHERE NOT EXISTS (
 
 - EXISTS stops scanning as soon as it finds the first matching row
 - The SELECT list in the EXISTS subquery is ignored - you can use `SELECT 1` or `SELECT *`
-- EXISTS returns NULL (treated as false) if the subquery returns no rows
+- EXISTS returns FALSE if the subquery returns no rows
 
 #### Common Use Cases
 
@@ -108,7 +108,7 @@ WHERE id NOT IN (
 DELETE FROM users 
 WHERE id NOT IN (
     SELECT user_id FROM login_history 
-    WHERE login_date > DATE('now', '-30 days')
+    WHERE login_date > DATE_SUB(NOW(), 30, 'day')
 );
 ```
 
@@ -485,7 +485,7 @@ UPDATE customers
 SET status = 'active'
 WHERE EXISTS (
     SELECT 1 FROM orders 
-    WHERE order_date > DATE('now', '-30 days')
+    WHERE order_date > DATE_SUB(NOW(), 30, 'day')
 );
 ```
 

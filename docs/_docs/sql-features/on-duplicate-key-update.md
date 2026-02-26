@@ -7,7 +7,7 @@ order: 11
 
 # ON DUPLICATE KEY UPDATE
 
-This document explains the ON DUPLICATE KEY UPDATE feature in Stoolap based on the implementation and test files.
+Stoolap supports the ON DUPLICATE KEY UPDATE clause for upsert operations.
 
 ## Overview
 

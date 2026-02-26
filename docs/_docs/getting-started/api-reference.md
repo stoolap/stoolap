@@ -244,7 +244,7 @@ let dsn = db.dsn();  // "memory://" or "file:///path"
 
 // Set default isolation level for new transactions
 use stoolap::IsolationLevel;
-db.set_default_isolation_level(IsolationLevel::Snapshot)?;
+db.set_default_isolation_level(IsolationLevel::SnapshotIsolation)?;
 
 // Create a point-in-time snapshot (for file-based databases)
 db.create_snapshot()?;
@@ -300,7 +300,7 @@ let mut tx = db.begin()?;
 
 // Begin with specific isolation level
 use stoolap::IsolationLevel;
-let mut tx = db.begin_with_isolation(IsolationLevel::Snapshot)?;
+let mut tx = db.begin_with_isolation(IsolationLevel::SnapshotIsolation)?;
 
 // Execute within transaction
 tx.execute("INSERT INTO users VALUES ($1, $2, $3)", (1, "Alice", 30))?;
@@ -385,16 +385,16 @@ db.execute("COMMIT", ())?;  // Only Alice is inserted
 
 ```rust
 // Programmatic
-let mut tx = db.begin_with_isolation(IsolationLevel::Snapshot)?;
+let mut tx = db.begin_with_isolation(IsolationLevel::SnapshotIsolation)?;
 
 // SQL-based
 db.execute("BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", ())?;
 
 // Set default for all new transactions
-db.set_default_isolation_level(IsolationLevel::Snapshot)?;
+db.set_default_isolation_level(IsolationLevel::SnapshotIsolation)?;
 ```
 
-Available levels: `ReadCommitted` (default), `Snapshot`, `RepeatableRead`, `Serializable`, `ReadUncommitted`.
+The Rust API has two enum variants: `ReadCommitted` (default) and `SnapshotIsolation`. At the SQL level, `SNAPSHOT`, `SERIALIZABLE`, `REPEATABLE READ` all map to `SnapshotIsolation`, and `READ UNCOMMITTED` maps to `ReadCommitted`.
 
 ## Working with Rows
 

@@ -2,7 +2,7 @@ title: Stoolap
 description: High-performance embedded SQL database written in pure Rust
 theme: jekyll-theme-minimal
 url: https://stoolap.io
-baseurl: "/"
+baseurl: ""
 permalink: pretty
 logo: /assets/img/logo.svg
 github:

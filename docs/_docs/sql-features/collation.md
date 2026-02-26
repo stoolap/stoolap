@@ -72,6 +72,21 @@ WHERE COLLATE(COLLATE(name, 'NOCASE'), 'NOACCENT')
     = COLLATE(COLLATE('nacao', 'NOCASE'), 'NOACCENT');
 ```
 
+## NUMERIC (Numeric-Aware)
+
+Compares strings by extracting and comparing their numeric content. This is useful for sorting version numbers, file names with numbers, or any strings where numeric ordering matters:
+
+```sql
+-- Without NUMERIC collation: 'file10' sorts before 'file2' (lexicographic)
+-- With NUMERIC collation: 'file2' sorts before 'file10' (numeric-aware)
+SELECT * FROM files ORDER BY COLLATE(name, 'NUMERIC');
+
+-- Comparing version strings
+SELECT * FROM packages
+WHERE COLLATE(version, 'NUMERIC') > COLLATE('1.9', 'NUMERIC');
+-- Matches '1.10', '2.0', etc. (would miss '1.10' with lexicographic comparison)
+```
+
 ## Collation in ORDER BY
 
 Use collation to control sort order:
@@ -79,4 +94,7 @@ Use collation to control sort order:
 ```sql
 -- Case-insensitive sort: 'Apple', 'apple', 'APPLE' sort together
 SELECT * FROM items ORDER BY COLLATE(name, 'NOCASE');
+
+-- Numeric-aware sort for natural ordering
+SELECT * FROM items ORDER BY COLLATE(name, 'NUMERIC');
 ```

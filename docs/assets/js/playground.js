@@ -66,6 +66,8 @@ CREATE INDEX idx_orders_user ON orders(user_id);
 CREATE INDEX idx_products_category ON products(category);
 `;
 
+const MAX_HISTORY = 200;
+
 class Playground {
   constructor() {
     this.db = null;
@@ -73,6 +75,7 @@ class Playground {
     this.historyIndex = -1;
     this.currentInput = '';
     this.multiLineBuffer = '';
+    this.executing = false;
 
     this.output = document.getElementById('pg-output');
     this.input = document.getElementById('pg-input');
@@ -81,14 +84,15 @@ class Playground {
     this.btnClear = document.getElementById('btn-clear');
     this.btnReset = document.getElementById('btn-reset');
 
+    if (!this.output || !this.input || !this.prompt || !this.loading) return;
+
     this.bindEvents();
   }
 
   bindEvents() {
     this.input.addEventListener('keydown', (e) => this.handleKeydown(e));
-    this.input.addEventListener('input', () => this.autoResize());
-    this.btnClear.addEventListener('click', () => this.clearOutput());
-    this.btnReset.addEventListener('click', () => this.resetDatabase());
+    if (this.btnClear) this.btnClear.addEventListener('click', () => this.clearOutput());
+    if (this.btnReset) this.btnReset.addEventListener('click', () => this.resetDatabase());
 
     // Hint chips
     document.querySelectorAll('.hint-chip').forEach(chip => {
@@ -96,7 +100,6 @@ class Playground {
         const sql = chip.dataset.sql;
         this.input.value = sql;
         this.input.focus();
-        this.autoResize();
       });
     });
 
@@ -126,18 +129,30 @@ class Playground {
         ''
       ].join('\n'));
     } catch (err) {
-      this.loading.innerHTML = `<span class="pg-error">Failed to load WASM: ${err.message}</span>
-        <p style="color:rgba(255,255,255,0.4);font-size:0.85rem;margin-top:0.5rem;">
-          Make sure the WASM build exists at /assets/wasm/stoolap_bg.wasm<br>
-          Build with: <code>wasm-pack build --target web --out-dir docs/assets/wasm</code>
-        </p>`;
+      if (this.loading) {
+        this.loading.textContent = '';
+        const errorSpan = document.createElement('span');
+        errorSpan.className = 'pg-error';
+        errorSpan.textContent = 'Failed to load WASM: ' + err.message;
+        const helpP = document.createElement('p');
+        helpP.style.cssText = 'color:var(--color-text-muted);font-size:0.85rem;margin-top:0.5rem;';
+        helpP.textContent = 'Make sure the WASM build exists at /assets/wasm/stoolap_bg.wasm. Build with: wasm-pack build --target web --out-dir docs/assets/wasm';
+        this.loading.appendChild(errorSpan);
+        this.loading.appendChild(helpP);
+      }
     }
   }
 
   loadSampleData() {
     if (!this.db) return;
     const result = this.db.execute_batch(SAMPLE_SCHEMA);
-    const parsed = JSON.parse(result);
+    let parsed;
+    try {
+      parsed = JSON.parse(result);
+    } catch {
+      this.appendOutput('error', `Error loading sample data: ${result}`);
+      return;
+    }
     if (parsed.type === 'error') {
       this.appendOutput('error', `Error loading sample data: ${parsed.message}`);
     }
@@ -162,7 +177,6 @@ class Playground {
           this.historyIndex--;
         }
         this.input.value = this.history[this.historyIndex];
-        this.autoResize();
       }
       return;
     }
@@ -178,7 +192,6 @@ class Playground {
         } else {
           this.input.value = this.history[this.historyIndex];
         }
-        this.autoResize();
       }
       return;
     }
@@ -205,7 +218,6 @@ class Playground {
         this.input.value = '';
         this.multiLineBuffer = '';
         this.prompt.textContent = 'stoolap>';
-        this.autoResize();
 
         if (full) {
           this.executeCommand(full);
@@ -214,16 +226,21 @@ class Playground {
         // Multi-line continuation
         this.input.value = '';
         this.prompt.textContent = '     ->';
-        this.autoResize();
       }
       return;
     }
   }
 
   executeCommand(sql) {
-    // Add to history (avoid duplicates)
+    if (this.executing) return;
+    this.executing = true;
+
+    // Add to history (avoid duplicates), cap at MAX_HISTORY
     if (this.history.length === 0 || this.history[this.history.length - 1] !== sql) {
       this.history.push(sql);
+      if (this.history.length > MAX_HISTORY) {
+        this.history.shift();
+      }
     }
     this.historyIndex = -1;
     this.currentInput = '';
@@ -233,6 +250,7 @@ class Playground {
 
     if (!this.db) {
       this.appendOutput('error', 'Database not loaded');
+      this.executing = false;
       return;
     }
 
@@ -245,6 +263,7 @@ class Playground {
       parsed = JSON.parse(result);
     } catch {
       this.appendOutput('error', `Invalid response: ${result}`);
+      this.executing = false;
       return;
     }
 
@@ -259,6 +278,7 @@ class Playground {
     }
 
     this.scrollToBottom();
+    this.executing = false;
   }
 
   formatTable(columns, rows, count) {
@@ -348,7 +368,11 @@ class Playground {
     div.className = `pg-line pg-${type}`;
 
     if (type === 'command') {
-      div.innerHTML = `<span class="pg-cmd-prompt">stoolap&gt;</span> ${this.escapeHtml(text)}`;
+      const promptSpan = document.createElement('span');
+      promptSpan.className = 'pg-cmd-prompt';
+      promptSpan.textContent = 'stoolap>';
+      div.appendChild(promptSpan);
+      div.appendChild(document.createTextNode(' ' + text));
     } else if (type === 'table') {
       const pre = document.createElement('pre');
       pre.className = 'pg-table-pre';
@@ -362,18 +386,8 @@ class Playground {
     this.scrollToBottom();
   }
 
-  escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-  }
-
   scrollToBottom() {
     this.output.scrollTop = this.output.scrollHeight;
-  }
-
-  autoResize() {
-    // no-op: terminal has fixed CSS height, body scrolls
   }
 
   clearOutput() {
@@ -387,7 +401,8 @@ class Playground {
   }
 
   async resetDatabase() {
-    if (!this.db) return;
+    if (!this.db || this.executing) return;
+    this.executing = true;
     this.clearOutput();
 
     try {
@@ -398,10 +413,19 @@ class Playground {
       this.appendOutput('info', 'Database reset. Sample tables reloaded.');
     } catch (err) {
       this.appendOutput('error', `Reset failed: ${err.message}`);
+    } finally {
+      this.executing = false;
     }
   }
 }
 
-// Boot
-const playground = new Playground();
-playground.init();
+// Boot after DOM is ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', function () {
+    const playground = new Playground();
+    playground.init();
+  });
+} else {
+  const playground = new Playground();
+  playground.init();
+}

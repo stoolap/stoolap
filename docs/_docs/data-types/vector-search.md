@@ -32,7 +32,7 @@ INSERT INTO embeddings (id, content, embedding)
 VALUES (1, 'Hello world', '[0.1, 0.2, 0.3, ...]');
 ```
 
-Dimension count is validated on insert &mdash; providing a vector with the wrong number of dimensions will return an error.
+Dimension count is validated on insert. Providing a vector with the wrong number of dimensions will return an error.
 
 ### NULL Handling
 
@@ -195,7 +195,7 @@ SELECT VEC_TO_TEXT(embedding) FROM embeddings WHERE id = 1;
 
 - **Vector data** is fully persisted through WAL and snapshots, like any other data type
 - **HNSW index definitions** are persisted in WAL (index metadata includes m, ef_construction, ef_search, and metric)
-- **HNSW graph structure** is serialized to binary files during snapshots for fast recovery &mdash; avoiding expensive graph rebuilds on restart
+- **HNSW graph structure** is serialized to binary files during snapshots for fast recovery, avoiding expensive graph rebuilds on restart
 - On recovery, if a graph file is found, it is loaded directly; otherwise the graph is rebuilt from table data
 
 ## Performance

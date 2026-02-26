@@ -7,7 +7,7 @@ order: 5
 
 # Semantic Search
 
-Stoolap provides built-in semantic search powered by a sentence-transformer model running entirely in Rust. The `EMBED()` function converts text into 384-dimensional vector embeddings &mdash; no external APIs, no Python, no Docker. Just SQL.
+Stoolap provides built-in semantic search powered by a sentence-transformer model running entirely in Rust. The `EMBED()` function converts text into 384-dimensional vector embeddings. No external APIs, no Python, no Docker. Just SQL.
 
 > **Feature flag required:** Semantic search requires the `semantic` feature flag. Build with `cargo build --features semantic` or add `features = ["semantic"]` to your Cargo.toml dependency.
 
@@ -62,7 +62,7 @@ VALUES (
 );
 ```
 
-For best results, concatenate the title and content when generating embeddings &mdash; this gives the model more context.
+For best results, concatenate the title and content when generating embeddings. This gives the model more context.
 
 ### 3. Build an HNSW Index
 
@@ -85,7 +85,7 @@ ORDER BY distance
 LIMIT 10;
 ```
 
-This finds documents semantically similar to the query &mdash; even without any keyword overlap. For example, "forgot my login credentials" would match "Password Reset Guide" because the model understands these concepts are related.
+This finds documents semantically similar to the query, even without any keyword overlap. For example, "forgot my login credentials" would match "Password Reset Guide" because the model understands these concepts are related.
 
 ## Search Patterns
 
@@ -323,5 +323,5 @@ LIMIT 5;
 
 ## See Also
 
-- [Vector Search]({% link _docs/data-types/vector-search.md %}) &mdash; VECTOR data type, distance functions, and HNSW index details
-- [Scalar Functions]({% link _docs/functions/scalar-functions.md %}) &mdash; Complete function reference including EMBED()
+- [Vector Search]({% link _docs/data-types/vector-search.md %}): VECTOR data type, distance functions, and HNSW index details
+- [Scalar Functions]({% link _docs/functions/scalar-functions.md %}): Complete function reference including EMBED()

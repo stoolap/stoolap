@@ -1,14 +1,14 @@
 ---
 layout: default
-title: Stoolap - High-performance embedded SQL database in Rust
+title: High-performance embedded SQL database in Rust
 ---
 
-<!-- Hero — Immersive Terminal -->
+<!-- Hero - Immersive Terminal -->
 <section class="hero">
   <div class="hero-bg"></div>
   <div class="container hero-inner">
     <h1 class="hero-heading">The SQL Database That<br><span class="hero-accent">Ships With Your App</span></h1>
-    <p class="hero-tagline">Pure Rust. Zero C dependencies. ACID transactions, cost-based optimizer, parallel execution, and 117 built-in functions. Compiles to WebAssembly.</p>
+    <p class="hero-tagline">Pure Rust. Zero C dependencies. ACID transactions, cost-based optimizer, parallel execution, vector search with HNSW indexes, and 117 built-in functions. Compiles to WebAssembly.</p>
     <div class="hero-terminal" id="heroTerminal" aria-hidden="true">
       <div class="hero-term-output" id="heroTermOutput"></div>
       <div class="hero-term-input">
@@ -29,7 +29,7 @@ title: Stoolap - High-performance embedded SQL database in Rust
   </div>
 </section>
 
-<!-- Spotlight Features — 3 large with visual emphasis -->
+<!-- Spotlight Features - 3 large with visual emphasis -->
 <section class="spotlights">
   <div class="container">
     <div class="spotlight-item">
@@ -37,7 +37,7 @@ title: Stoolap - High-performance embedded SQL database in Rust
         <div class="spotlight-tag">Concurrency</div>
         <h2>MVCC Transactions</h2>
         <p>Full multi-version concurrency control with snapshot isolation. Readers never block writers. Optimistic concurrency delivers high throughput on mixed workloads with time-travel queries via <code>AS OF</code>.</p>
-        <a href="{{ '/docs/architecture/architecture/' | relative_url }}" class="spotlight-link">Learn about MVCC &rarr;</a>
+        <a href="{{ '/docs/architecture/mvcc-implementation/' | relative_url }}" class="spotlight-link">Learn about MVCC &rarr;</a>
       </div>
       <div class="spotlight-visual">
         <pre class="spotlight-code"><span class="c-cmt">-- Concurrent transactions</span>
@@ -59,7 +59,7 @@ title: Stoolap - High-performance embedded SQL database in Rust
         <div class="spotlight-tag">Performance</div>
         <h2>Cost-Based Optimizer</h2>
         <p>PostgreSQL-style query planning with adaptive execution. The optimizer learns from actual cardinalities and re-optimizes at runtime. Bloom filter propagation, zone map pruning, and semantic query caching reduce redundant work.</p>
-        <a href="{{ '/docs/architecture/architecture/' | relative_url }}" class="spotlight-link">Explore the optimizer &rarr;</a>
+        <a href="{{ '/docs/performance/query-optimizer/' | relative_url }}" class="spotlight-link">Explore the optimizer &rarr;</a>
       </div>
       <div class="spotlight-visual">
         <pre class="spotlight-code"><span class="c-cmt">-- EXPLAIN shows the optimizer at work</span>
@@ -80,7 +80,7 @@ title: Stoolap - High-performance embedded SQL database in Rust
         <div class="spotlight-tag">Scale</div>
         <h2>Parallel Execution</h2>
         <p>Rayon work-stealing scheduler automatically parallelizes filters, joins, sorts, and distinct operations. Chunked processing with configurable thresholds keeps small queries fast while large queries scale across all cores.</p>
-        <a href="{{ '/docs/architecture/architecture/' | relative_url }}" class="spotlight-link">See parallel execution &rarr;</a>
+        <a href="{{ '/docs/performance/parallel-execution/' | relative_url }}" class="spotlight-link">See parallel execution &rarr;</a>
       </div>
       <div class="spotlight-visual">
         <pre class="spotlight-code"><span class="c-cmt">-- Automatic parallel execution</span>
@@ -95,54 +95,78 @@ title: Stoolap - High-performance embedded SQL database in Rust
 --   parallel speedup: 6.2x</span></pre>
       </div>
     </div>
+
+    <div class="spotlight-item spotlight-reverse">
+      <div class="spotlight-content">
+        <div class="spotlight-tag">AI / ML</div>
+        <h2>Vector &amp; Semantic Search</h2>
+        <p>Native VECTOR type with HNSW indexes for sub-linear approximate nearest neighbor search. Three distance metrics (L2, Cosine, Inner Product). Optional <code>EMBED()</code> function converts text to vectors using a built-in sentence-transformer model, no external APIs or Python needed.</p>
+        <a href="{{ '/docs/data-types/vector-search/' | relative_url }}" class="spotlight-link">Explore vector search &rarr;</a>
+      </div>
+      <div class="spotlight-visual">
+        <pre class="spotlight-code"><span class="c-cmt">-- Semantic search with HNSW index</span>
+<span class="c-kw">CREATE TABLE</span> docs (
+    id <span class="c-kw">INTEGER PRIMARY KEY</span>,
+    content <span class="c-kw">TEXT</span>,
+    embedding <span class="c-kw">VECTOR</span>(<span class="c-num">384</span>)
+);
+<span class="c-kw">CREATE INDEX</span> idx_emb <span class="c-kw">ON</span> docs(embedding)
+    <span class="c-kw">USING HNSW WITH</span> (metric = <span class="c-str">'cosine'</span>);
+
+<span class="c-kw">SELECT</span> content, <span class="c-fn">VEC_DISTANCE_COSINE</span>(
+    embedding, <span class="c-fn">EMBED</span>(<span class="c-str">'forgot password'</span>)
+) <span class="c-kw">AS</span> dist
+<span class="c-kw">FROM</span> docs <span class="c-kw">ORDER BY</span> dist <span class="c-kw">LIMIT</span> <span class="c-num">5</span>;</pre>
+      </div>
+    </div>
   </div>
 </section>
 
-<!-- More Features — Compact grid, not cards -->
+<!-- More Features - Compact grid, not cards -->
 <section class="more-features">
   <div class="container">
     <h2 class="section-heading">Everything You Need</h2>
     <p class="section-sub">Enterprise-grade features in an embeddable package.</p>
     <div class="mf-grid">
       <div class="mf-item">
-        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
         <div>
-          <h4>Multiple Index Types</h4>
-          <p>B-tree, Hash, Bitmap indexes auto-selected by type. Multi-column composite indexes.</p>
+          <h3>Vector &amp; HNSW Indexes</h3>
+          <p>Native VECTOR type with HNSW, B-tree, Hash, and Bitmap indexes. Optional built-in semantic search.</p>
         </div>
       </div>
       <div class="mf-item">
-        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         <div>
-          <h4>Semantic Query Caching</h4>
+          <h3>Semantic Query Caching</h3>
           <p>Predicate subsumption detects when cached results can answer stricter queries.</p>
         </div>
       </div>
       <div class="mf-item">
-        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h18v18H3zM21 9H3M21 15H3M12 3v18"/></svg>
+        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3h18v18H3zM21 9H3M21 15H3M12 3v18"/></svg>
         <div>
-          <h4>Window Functions</h4>
+          <h3>Window Functions</h3>
           <p>ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, NTILE with PARTITION BY and frames.</p>
         </div>
       </div>
       <div class="mf-item">
-        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
         <div>
-          <h4>Recursive CTEs</h4>
+          <h3>Recursive CTEs</h3>
           <p>WITH RECURSIVE for hierarchical queries, graph traversal, and sequence generation.</p>
         </div>
       </div>
       <div class="mf-item">
-        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         <div>
-          <h4>WAL + Crash Recovery</h4>
+          <h3>WAL + Crash Recovery</h3>
           <p>Write-ahead logging with snapshots ensures durability. Automatic recovery on restart.</p>
         </div>
       </div>
       <div class="mf-item">
-        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+        <svg class="mf-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
         <div>
-          <h4>Full SQL Support</h4>
+          <h3>Full SQL Support</h3>
           <p>JOINs, subqueries, ROLLUP/CUBE/GROUPING SETS, UNION/INTERSECT/EXCEPT, and more.</p>
         </div>
       </div>
@@ -150,13 +174,13 @@ title: Stoolap - High-performance embedded SQL database in Rust
   </div>
 </section>
 
-<!-- Try It Live — Playground CTA -->
+<!-- Try It Live - Playground CTA -->
 <section class="try-live">
   <div class="container">
     <div class="try-live-inner">
       <div class="try-live-text">
         <h2>Try It in Your Browser</h2>
-        <p>Stoolap compiles to WebAssembly. Run real SQL queries right now &mdash; no installation, no server, everything runs locally.</p>
+        <p>Stoolap compiles to WebAssembly. Run real SQL queries right now, no installation, no server. Everything runs locally.</p>
         <a href="{{ '/playground' | relative_url }}" class="btn-hero-primary">Open Stoolap Playground</a>
       </div>
       <div class="try-live-preview">
@@ -199,34 +223,34 @@ title: Stoolap - High-performance embedded SQL database in Rust
         <div class="code-dots">
           <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
         </div>
-        <div class="code-tabs">
-          <button class="code-tab active" data-tab="rust">Rust API</button>
-          <button class="code-tab" data-tab="sql">Advanced SQL</button>
+        <div class="code-tabs" role="tablist" aria-label="Code examples">
+          <button class="code-tab active" data-tab="rust" role="tab" aria-selected="true" aria-controls="panel-rust" id="tab-rust">Rust API</button>
+          <button class="code-tab" data-tab="sql" role="tab" aria-selected="false" aria-controls="panel-sql" id="tab-sql">Advanced SQL</button>
         </div>
       </div>
-      <div class="code-panel active" data-tab="rust">
+      <div class="code-panel active" data-tab="rust" role="tabpanel" id="panel-rust" aria-labelledby="tab-rust">
         <pre class="code-pre"><span class="c-kw">use</span> stoolap::Database;
 
 <span class="c-kw">fn</span> <span class="c-fn">main</span>() -&gt; <span class="c-type">Result</span>&lt;(), Box&lt;<span class="c-kw">dyn</span> std::error::Error&gt;&gt; {
     <span class="c-kw">let</span> db = Database::open(<span class="c-str">"my_database"</span>)?;
-    <span class="c-kw">let</span> conn = db.connect();
 
-    conn.execute(<span class="c-str">"CREATE TABLE users (
+    db.execute(<span class="c-str">"CREATE TABLE users (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
         email TEXT UNIQUE
-    )"</span>)?;
+    )"</span>, ())?;
 
-    conn.execute(<span class="c-str">"INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"</span>)?;
+    db.execute(<span class="c-str">"INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"</span>, ())?;
 
-    <span class="c-kw">let mut</span> result = conn.query(<span class="c-str">"SELECT * FROM users"</span>)?;
-    <span class="c-kw">while</span> result.next() {
-        <span class="c-fn">println!</span>(<span class="c-str">"{:?}"</span>, result.row());
+    <span class="c-kw">for</span> row <span class="c-kw">in</span> db.query(<span class="c-str">"SELECT * FROM users"</span>, ())? {
+        <span class="c-kw">let</span> row = row?;
+        <span class="c-kw">let</span> name: String = row.get(<span class="c-num">1</span>)?;
+        <span class="c-fn">println!</span>(<span class="c-str">"{name}"</span>);
     }
     <span class="c-type">Ok</span>(())
 }</pre>
       </div>
-      <div class="code-panel" data-tab="sql">
+      <div class="code-panel" data-tab="sql" role="tabpanel" id="panel-sql" aria-labelledby="tab-sql">
         <pre class="code-pre"><span class="c-cmt">-- Window functions with CTEs</span>
 <span class="c-kw">WITH</span> ranked <span class="c-kw">AS</span> (
     <span class="c-kw">SELECT</span>
@@ -261,6 +285,7 @@ title: Stoolap - High-performance embedded SQL database in Rust
     <p class="section-sub">Feature-by-feature comparison with popular databases</p>
     <div class="table-wrap">
       <table>
+        <caption class="sr-only">Feature comparison between Stoolap, SQLite, DuckDB, and PostgreSQL</caption>
         <thead>
           <tr>
             <th>Feature</th>
@@ -271,18 +296,19 @@ title: Stoolap - High-performance embedded SQL database in Rust
           </tr>
         </thead>
         <tbody>
-          <tr><td>MVCC Transactions</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="n">&#10007;</span></td><td><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td></tr>
-          <tr><td>AS OF Temporal Queries</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="n">&#10007;</span></td><td><span class="n">&#10007;</span></td><td><span class="n">&#10007;</span></td></tr>
-          <tr><td>Cost-Based Optimizer</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="n">&#10007;</span></td><td><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td></tr>
-          <tr><td>Adaptive Query Execution</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="n">&#10007;</span></td><td><span class="n">&#10007;</span></td><td><span class="n">&#10007;</span></td></tr>
-          <tr><td>Semantic Query Caching</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="n">&#10007;</span></td><td><span class="n">&#10007;</span></td><td><span class="n">&#10007;</span></td></tr>
-          <tr><td>Parallel Query Execution</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="n">&#10007;</span></td><td><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td></tr>
-          <tr><td>Hash / Merge Joins</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="n">&#10007;</span></td><td><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td></tr>
-          <tr><td>Window Functions</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td></tr>
-          <tr><td>ROLLUP / CUBE / GROUPING SETS</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="n">&#10007;</span></td><td><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td></tr>
-          <tr><td>Recursive CTEs</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td></tr>
-          <tr><td>Pure Rust (Memory Safe)</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="n">&#10007;</span></td><td><span class="n">&#10007;</span></td><td><span class="n">&#10007;</span></td></tr>
-          <tr><td>Embeddable (No Server)</td><td class="hl"><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td><td><span class="y">&#10003;</span></td><td><span class="n">&#10007;</span></td></tr>
+          <tr><td>MVCC Transactions</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td></tr>
+          <tr><td>AS OF Temporal Queries</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td></tr>
+          <tr><td>Cost-Based Optimizer</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td></tr>
+          <tr><td>Adaptive Query Execution</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td></tr>
+          <tr><td>Semantic Query Caching</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td></tr>
+          <tr><td>Parallel Query Execution</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td></tr>
+          <tr><td>Hash / Merge Joins</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td></tr>
+          <tr><td>Window Functions</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td></tr>
+          <tr><td>ROLLUP / CUBE / GROUPING SETS</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td></tr>
+          <tr><td>Recursive CTEs</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td></tr>
+          <tr><td>Native Vector / HNSW Search</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td></tr>
+          <tr><td>Pure Rust (Memory Safe)</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td></tr>
+          <tr><td>Embeddable (No Server)</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td></tr>
         </tbody>
       </table>
     </div>
@@ -295,34 +321,34 @@ title: Stoolap - High-performance embedded SQL database in Rust
     <h2 class="section-heading">Modern Architecture</h2>
     <p class="section-sub">Designed for performance, scalability, and ease of use</p>
     <div class="arch-diagram">
-      <object type="image/svg+xml" data="{{ '/assets/img/architecture-diagram.svg' | relative_url }}" class="arch-svg" id="architecture-svg"></object>
+      <object type="image/svg+xml" data="{{ '/assets/img/architecture-diagram.svg' | relative_url }}" class="arch-svg" id="architecture-svg" aria-label="Stoolap architecture diagram">Stoolap architecture diagram</object>
     </div>
     <div class="arch-grid">
       <div class="arch-item">
         <div class="arch-icon arch-icon-green">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h6v6h-6z"/><path d="M14 4h6v6h-6z"/><path d="M14 17a3 3 0 0 0 0-6H7"/></svg>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14h6v6h-6z"/><path d="M14 4h6v6h-6z"/><path d="M14 17a3 3 0 0 0 0-6H7"/></svg>
         </div>
         <div>
-          <h4>Flexible Client Interface</h4>
+          <h3>Flexible Client Interface</h3>
           <p>CLI and Rust API. Embed directly in your application with zero external dependencies.</p>
         </div>
       </div>
       <div class="arch-item">
         <div class="arch-icon arch-icon-blue">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
         </div>
         <div>
-          <h4>Optimized Query Processing</h4>
+          <h3>Optimized Query Processing</h3>
           <p>SQL parsing, cost-based optimization, and parallel execution for exceptional performance.</p>
         </div>
       </div>
       <div class="arch-item">
         <div class="arch-icon arch-icon-purple">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
         </div>
         <div>
-          <h4>MVCC Storage Engine</h4>
-          <p>Row-based version store with B-tree, Hash, and Bitmap indexes for transactional integrity.</p>
+          <h3>MVCC Storage Engine</h3>
+          <p>Row-based version store with B-tree, Hash, Bitmap, and HNSW indexes for transactional integrity and vector search.</p>
         </div>
       </div>
     </div>
@@ -339,16 +365,16 @@ title: Stoolap - High-performance embedded SQL database in Rust
     <p class="section-sub">Licensed under Apache 2.0 with explicit patent grants.</p>
     <div class="os-grid">
       <div class="os-item">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-        <div><h4>Patent Protection</h4><p>Explicit patent grant protects users and contributors</p></div>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        <div><h3>Patent Protection</h3><p>Explicit patent grant protects users and contributors</p></div>
       </div>
       <div class="os-item">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
-        <div><h4>Community-Friendly</h4><p>Promotes collaboration while protecting contributions</p></div>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+        <div><h3>Community-Friendly</h3><p>Promotes collaboration while protecting contributions</p></div>
       </div>
       <div class="os-item">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>
-        <div><h4>Enterprise-Ready</h4><p>Widely accepted license for enterprise environments</p></div>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>
+        <div><h3>Enterprise-Ready</h3><p>Widely accepted license for enterprise environments</p></div>
       </div>
     </div>
     <div class="os-actions">

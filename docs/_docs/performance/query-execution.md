@@ -107,18 +107,6 @@ The output shows:
 - Index usage
 - Estimated row counts
 
-## Profiling Queries
-
-For deeper performance analysis, Stoolap provides query profiling:
-
-```sql
-SET profiling = ON;
-SELECT * FROM large_table WHERE complex_condition;
-SHOW PROFILE;
-```
-
-This provides detailed timing information for each step of query execution.
-
 ## Best Practices for Query Performance
 
 To get the best performance from Stoolap:

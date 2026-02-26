@@ -18,7 +18,7 @@ Stoolap is a high-performance embedded SQL database written in pure Rust. Its ar
 - Cost-based query optimizer with adaptive execution
 - Multiple index types (B-tree, Hash, Bitmap, HNSW)
 - Parallel query execution via Rayon
-- Minimal unsafe code (only for FFI and hot paths)
+- Minimal unsafe code (only in performance-critical hot paths)
 
 ## Core Components
 
@@ -73,7 +73,7 @@ Stoolap's architecture consists of the following major components:
 
 ### Function System
 
-- **Function Registry** - Central registry for 117 SQL functions
+- **Function Registry** - Central registry for 117+ SQL functions
   - Scalar functions (scalar/) - String, math, date, JSON, vector functions
   - Aggregate functions (aggregate/)
   - Window functions (window/)
@@ -164,7 +164,7 @@ src/
 │   ├── query.rs   # Main query executor
 │   ├── planner.rs # Query planner with cost estimation
 │   └── ...
-├── functions/     # 117 built-in functions
+├── functions/     # 117+ built-in functions
 │   ├── scalar/    # String, math, date, JSON, vector functions
 │   ├── aggregate/ # COUNT, SUM, AVG, etc.
 │   └── window/    # ROW_NUMBER, RANK, LAG, etc.

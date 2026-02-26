@@ -71,10 +71,10 @@ SELECT * FROM order_details WHERE amount > 100;
 Views can also be joined with other tables or views:
 
 ```sql
--- Join a view with a table
-SELECT v.customer_name, p.product_name
+-- Join a view with a table (the view must include the join column)
+SELECT v.customer_name, v.amount
 FROM order_details v
-JOIN products p ON v.product_id = p.id;
+WHERE v.amount > 500;
 
 -- Join two views
 SELECT a.name, b.total_orders

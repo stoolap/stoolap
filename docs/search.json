@@ -1,0 +1,20 @@
+---
+layout: null
+permalink: /search.json
+---
+[
+{% assign sep = "" %}{% for doc in site.docs %}{{ sep }}{
+  "title": {{ doc.title | jsonify }},
+  "url": "{{ doc.url | relative_url }}",
+  "category": "Documentation",
+  "type": "doc",
+  "content": {{ doc.content | strip_html | strip_newlines | jsonify }}
+}{% assign sep = "," %}{% endfor %}{% for post in site.posts %}{{ sep }}{
+  "title": {{ post.title | jsonify }},
+  "url": "{{ post.url | relative_url }}",
+  "category": "Blog",
+  "type": "post",
+  "content": {{ post.content | strip_html | strip_newlines | jsonify }},
+  "date": "{{ post.date | date: '%Y-%m-%d' }}"
+}{% assign sep = "," %}{% endfor %}
+]

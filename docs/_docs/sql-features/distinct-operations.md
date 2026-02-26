@@ -7,7 +7,7 @@ order: 8
 
 # DISTINCT Operations
 
-This document explains DISTINCT operations in Stoolap based on the implementation and test files.
+Stoolap supports the DISTINCT keyword to eliminate duplicate rows from query results.
 
 ## Overview
 

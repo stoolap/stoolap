@@ -29,8 +29,9 @@ docs/
 │   ├── default.html          # Base layout (nav, footer, theme toggle)
 │   ├── doc.html              # Documentation page (sidebar, prev/next nav)
 │   └── post.html             # Blog post
-├── _docs/                    # 51 documentation pages in 7 categories
+├── _docs/                    # 55 documentation pages in 8 categories
 │   ├── getting-started/      # Installation, quickstart, API reference
+│   ├── drivers/              # Node.js, Python, and WASM integrations
 │   ├── architecture/         # MVCC, storage engine, indexes, persistence
 │   ├── data-types/           # Types overview, date/time, JSON
 │   ├── sql-commands/         # SQL reference, SHOW, PRAGMA, DESCRIBE
@@ -81,6 +82,6 @@ Pushing to the `main` branch triggers automatic deployment via GitHub Pages. The
 | Static site generator | Jekyll 4.4 |
 | Hosting | GitHub Pages |
 | Fonts | Rubik (body), JetBrains Mono (code) |
-| Theme | Light/dark mode with system preference detection |
+| Theme | Light/dark mode with persisted user preference (light default) |
 | Playground | WebAssembly (Rust compiled via `wasm-pack`) |
 | Plugins | jekyll-sitemap, jekyll-seo-tag |

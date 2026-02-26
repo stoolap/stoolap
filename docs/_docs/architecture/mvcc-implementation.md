@@ -44,7 +44,7 @@ Stoolap implements a **true multi-version MVCC** design:
 - Maintains full version chains for each row
 - Tracks both creation (`txn_id`) and deletion (`deleted_at_txn_id`) transaction IDs
 - Implements efficient concurrent access using concurrent data structures
-- Manages B-tree, Hash, and Bitmap indexes
+- Manages B-tree, Hash, Bitmap, and HNSW indexes
 - Provides visibility-aware traversal of version chains
 
 ### Row Version Structure
@@ -215,16 +215,10 @@ When a row is deleted:
 
 ### Lock-Free Data Structures
 
-- `SegmentInt64Map`: High-performance concurrent maps
+- `I64Map`: Custom high-performance hash map for i64 keys with zero-collision sequential key hashing
 - Atomic operations for counters and flags
 - Minimal mutex usage in hot paths
-
-### Object Pooling
-
-- Transaction objects
-- Table objects  
-- Version maps
-- Reduces GC pressure in high-throughput scenarios
+- `parking_lot::RwLock` for fine-grained concurrent access
 
 ### Optimized Visibility Checks
 
@@ -237,7 +231,7 @@ When a row is deleted:
 - Version chains built on-demand from WAL
 - Automatic cleanup of old versions no longer needed
 - Periodic cleanup of deleted rows
-- Cold data eviction to disk
+- Arena-based row storage for cache-efficient access
 
 ## Garbage Collection
 
@@ -288,11 +282,16 @@ Deleted rows are removed based on:
 4. **Monitor Deleted Rows**: Ensure garbage collection keeps up with deletions
 5. **Batch Operations**: Group related changes in single transactions
 
+## Implemented Features
+
+The following advanced features are fully implemented:
+1. **Time Travel Queries**: `AS OF TIMESTAMP` and `AS OF TRANSACTION` for querying historical data
+2. **Isolation Level Aliases**: `REPEATABLE READ`, `SERIALIZABLE`, `SNAPSHOT` all map to Snapshot Isolation
+3. **Savepoint Support**: `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT` for partial rollbacks
+4. **Arena-Based Storage**: Cache-efficient row storage with zero-copy access via `NonZeroU64` indices
+
 ## Future Improvements
 
 Potential enhancements to the current design:
-1. **Time Travel Queries**: Query data as of specific timestamps
-2. **Additional Isolation Levels**: REPEATABLE READ, SERIALIZABLE
-3. **Read-Set Tracking**: Detect read-write conflicts for SERIALIZABLE
-4. **Savepoint Support**: Transaction savepoints for partial rollbacks
-5. **Version Compression**: Delta encoding for version chains
+1. **Read-Set Tracking**: Detect read-write conflicts for true SERIALIZABLE isolation
+2. **Version Compression**: Delta encoding for version chains

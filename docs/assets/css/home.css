@@ -9,17 +9,7 @@
 .site-content:has(.hero) ~ .site-footer { margin-top: 0; }
 .site-content.homepage-content ~ .site-footer { margin-top: 0; }
 
-/* ── Entrance animations ── */
-@keyframes fadeUp {
-  from { opacity: 0; transform: translateY(24px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-@keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
+/* ── Entrance animations (fadeUp, fadeIn defined in main.css) ── */
 @keyframes slideDown {
   from { opacity: 0; transform: translateY(-16px); }
   to { opacity: 1; transform: translateY(0); }
@@ -244,6 +234,15 @@
 
 @media (prefers-reduced-motion: reduce) {
   .hero-cursor { animation: none; }
+  .hero-heading,
+  .hero-tagline,
+  .hero-terminal,
+  .hero-actions,
+  .playground-title,
+  .playground-desc,
+  .playground-terminal {
+    animation: none !important;
+  }
 }
 
 /* ── Hero buttons ── */
@@ -270,15 +269,20 @@
   text-decoration: none;
   background: linear-gradient(135deg, #1a9355 0%, #4aad35 100%);
   color: #fff !important;
-  box-shadow: 0 4px 20px rgba(26,147,85,0.35), inset 0 1px 0 rgba(255,255,255,0.1);
+  box-shadow: 0 2px 8px rgba(26,147,85,0.18);
   transition: transform 0.2s, box-shadow 0.2s;
 }
 
 .btn-hero-primary:hover {
   transform: translateY(-2px);
-  box-shadow: 0 8px 30px rgba(26,147,85,0.45), inset 0 1px 0 rgba(255,255,255,0.1);
+  box-shadow: 0 4px 12px rgba(26,147,85,0.25);
   text-decoration: none;
   color: #fff !important;
+}
+
+.btn-hero-primary:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 .btn-hero-playground {
@@ -304,6 +308,11 @@
   transform: translateY(-2px);
   text-decoration: none;
   color: var(--color-text) !important;
+}
+
+.btn-hero-playground:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 [data-theme="dark"] .btn-hero-playground {
@@ -343,6 +352,11 @@
   transform: translateY(-2px);
   text-decoration: none;
   color: var(--color-text) !important;
+}
+
+.btn-hero-ghost:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 [data-theme="dark"] .btn-hero-ghost {
@@ -461,6 +475,11 @@
   text-decoration: none;
 }
 
+.spotlight-link:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
 .spotlight-visual {
   border-radius: 10px;
   overflow: hidden;
@@ -538,7 +557,7 @@
   color: var(--color-primary);
 }
 
-.mf-item h4 {
+.mf-item h3 {
   margin: 0 0 0.25rem;
   font-size: 0.95rem;
   font-weight: 600;
@@ -720,6 +739,11 @@
 
 .code-tab:hover { color: var(--color-text); }
 
+.code-tab:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+
 .code-tab.active {
   color: var(--color-primary);
   border-bottom-color: var(--color-primary);
@@ -772,6 +796,11 @@
   background: rgba(var(--color-primary-rgb), 0.04);
   transform: translateY(-1px);
   box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+
+.code-links a:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 [data-theme="dark"] .code-links a {
@@ -917,7 +946,7 @@
 [data-theme="dark"] .arch-icon-blue { background: rgba(33,150,243,0.12); color: #64b5f6; }
 [data-theme="dark"] .arch-icon-purple { background: rgba(156,39,176,0.12); color: #ce93d8; }
 
-.arch-item h4 { margin: 0 0 0.3rem; font-size: 1rem; font-weight: 600; }
+.arch-item h3 { margin: 0 0 0.3rem; font-size: 1rem; font-weight: 600; }
 .arch-item p { margin: 0; color: var(--color-text-muted); font-size: 0.9rem; line-height: 1.6; }
 
 .center-link { text-align: center; margin-top: 2.5rem; }
@@ -940,6 +969,11 @@
   background: rgba(var(--color-primary-rgb), 0.04);
   text-decoration: none;
   transform: translateY(-1px);
+}
+
+.btn-outline:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 /* ============================================
@@ -970,7 +1004,7 @@
   color: var(--color-primary);
 }
 
-.os-item h4 { margin: 0 0 0.25rem; font-size: 0.95rem; font-weight: 600; }
+.os-item h3 { margin: 0 0 0.25rem; font-size: 0.95rem; font-weight: 600; }
 .os-item p { margin: 0; font-size: 0.88rem; color: var(--color-text-muted); line-height: 1.55; }
 
 .os-actions {
