@@ -144,7 +144,7 @@ Features:
 - Nested structures
 - Validation of JSON syntax on insert
 - Basic equality comparison
-- More details in the dedicated [JSON Support](json-support) documentation
+- More details in the dedicated [JSON Support]({% link _docs/data-types/json-support.md %}) documentation
 
 ### VECTOR
 
@@ -169,7 +169,7 @@ Features:
 - Dimension validation on insert
 - Distance functions: `VEC_DISTANCE_L2`, `VEC_DISTANCE_COSINE`, `VEC_DISTANCE_IP`
 - HNSW index support for O(log N) approximate nearest neighbor search
-- More details in the dedicated [Vector Search](vector-search) documentation
+- More details in the dedicated [Vector Search]({% link _docs/data-types/vector-search.md %}) documentation
 
 ## Column Constraints
 
@@ -287,7 +287,7 @@ Features:
 - IS NULL and IS NOT NULL operators
 - NULL propagation in expressions
 - NULL is distinct from any value, including another NULL
-- More details in the dedicated [NULL Handling](../sql-features/null-handling) documentation
+- More details in the dedicated [NULL Handling]({% link _docs/sql-features/null-handling.md %}) documentation
 
 ## Type Conversions
 
@@ -303,7 +303,7 @@ SELECT CAST('2023-01-01' AS TIMESTAMP);
 SELECT '42' + 1;  -- Converts '42' to INTEGER
 ```
 
-More details on type conversions can be found in the dedicated [CAST Operations](../sql-features/cast-operations) documentation.
+More details on type conversions can be found in the dedicated [CAST Operations]({% link _docs/sql-features/cast-operations.md %}) documentation.
 
 ## Examples
 

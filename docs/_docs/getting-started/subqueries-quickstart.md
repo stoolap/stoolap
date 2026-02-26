@@ -176,6 +176,6 @@ Stoolap fully supports:
 
 ## Next Steps
 
-- Read the full [Subqueries documentation](../sql-features/subqueries)
-- Learn about [JOIN operations](../sql-features/join-operations) as an alternative
-- Explore [SQL Commands reference](../sql-commands/sql-commands)
+- Read the full [Subqueries documentation]({% link _docs/sql-features/subqueries.md %})
+- Learn about [JOIN operations]({% link _docs/sql-features/join-operations.md %}) as an alternative
+- Explore [SQL Commands reference]({% link _docs/sql-commands/sql-commands.md %})

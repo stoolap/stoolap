@@ -11,7 +11,7 @@ This tutorial will guide you through creating your first database with Stoolap a
 
 ## Installation
 
-Before starting, ensure you have Stoolap installed. If not, follow the [Installation Guide](installation).
+Before starting, ensure you have Stoolap installed. If not, follow the [Installation Guide]({% link _docs/getting-started/installation.md %}).
 
 ```bash
 # Install with Cargo
@@ -242,10 +242,10 @@ ORDER BY pct_above_avg DESC;
 
 Now that you've learned the basics, you might want to explore:
 
-- [Connection Strings](/docs/getting-started/connection-strings/) - More connection options
-- [SQL Commands](/docs/sql-commands/sql-commands/) - Comprehensive SQL reference
-- [Data Types](/docs/data-types/data-types/) - Detailed information on data types
-- [Indexing](/docs/architecture/indexing/) - How to optimize queries with indexes
-- [Transaction Isolation](/docs/architecture/transaction-isolation/) - How transactions work
+- [Connection Strings]({% link _docs/getting-started/connection-strings.md %}) - More connection options
+- [SQL Commands]({% link _docs/sql-commands/sql-commands.md %}) - Comprehensive SQL reference
+- [Data Types]({% link _docs/data-types/data-types.md %}) - Detailed information on data types
+- [Indexing]({% link _docs/architecture/indexing.md %}) - How to optimize queries with indexes
+- [Transaction Isolation]({% link _docs/architecture/transaction-isolation.md %}) - How transactions work
 
-For a more comprehensive reference, browse the [Documentation](/docs/).
+For a more comprehensive reference, browse the [Documentation]({{ site.baseurl }}/docs/).

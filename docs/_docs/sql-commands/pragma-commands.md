@@ -228,7 +228,7 @@ Background cleanup settings can be configured via connection string query parame
 | `deleted_row_retention` | 300 | Seconds before deleted rows are permanently removed |
 | `transaction_retention` | 3600 | Seconds before stale transaction metadata is removed |
 
-See [Connection Strings](../getting-started/connection-strings) for the full list of DSN options.
+See [Connection Strings]({% link _docs/getting-started/connection-strings.md %}) for the full list of DSN options.
 
 ## Implementation Details
 

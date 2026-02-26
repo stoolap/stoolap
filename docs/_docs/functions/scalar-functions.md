@@ -583,7 +583,7 @@ SELECT JSON_OBJECT('name', 'Alice', 'age', 30);   -- '{"age":30,"name":"Alice"}'
 
 ## Vector Functions
 
-Stoolap provides functions for computing distances between vectors and inspecting vector values. These are used with the `VECTOR(N)` data type for similarity search. See [Vector Search](../data-types/vector-search) for complete documentation.
+Stoolap provides functions for computing distances between vectors and inspecting vector values. These are used with the `VECTOR(N)` data type for similarity search. See [Vector Search]({% link _docs/data-types/vector-search.md %}) for complete documentation.
 
 ### VEC_DISTANCE_L2
 Computes the Euclidean (L2) distance between two vectors.
@@ -658,7 +658,7 @@ SELECT content,
 FROM docs ORDER BY dist LIMIT 5;
 ```
 
-Returns a `VECTOR(384)` value. Accepts TEXT, INTEGER, or FLOAT arguments. Returns NULL for NULL input. See [Semantic Search](../data-types/semantic-search) for complete documentation.
+Returns a `VECTOR(384)` value. Accepts TEXT, INTEGER, or FLOAT arguments. Returns NULL for NULL input. See [Semantic Search]({% link _docs/data-types/semantic-search.md %}) for complete documentation.
 
 ## Utility Functions
 

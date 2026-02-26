@@ -323,5 +323,5 @@ LIMIT 5;
 
 ## See Also
 
-- [Vector Search](../data-types/vector-search) &mdash; VECTOR data type, distance functions, and HNSW index details
-- [Scalar Functions](../functions/scalar-functions) &mdash; Complete function reference including EMBED()
+- [Vector Search]({% link _docs/data-types/vector-search.md %}) &mdash; VECTOR data type, distance functions, and HNSW index details
+- [Scalar Functions]({% link _docs/functions/scalar-functions.md %}) &mdash; Complete function reference including EMBED()

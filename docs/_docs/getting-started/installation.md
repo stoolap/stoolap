@@ -118,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-See the [API Reference](api-reference) for complete documentation of the Stoolap API.
+See the [API Reference]({% link _docs/getting-started/api-reference.md %}) for complete documentation of the Stoolap API.
 
 ## Verifying Installation
 
@@ -134,10 +134,10 @@ This should display the version number of your Stoolap installation.
 
 After installing Stoolap, you can:
 
-- Follow the [Quick Start Tutorial](quickstart) to create your first database using the CLI
-- Learn about [Connection Strings](connection-strings) to configure your database
-- Check the [API Reference](api-reference) for using Stoolap in your Rust applications
-- Check the [SQL Commands](../sql-commands/sql-commands) reference for working with data
+- Follow the [Quick Start Tutorial]({% link _docs/getting-started/quickstart.md %}) to create your first database using the CLI
+- Learn about [Connection Strings]({% link _docs/getting-started/connection-strings.md %}) to configure your database
+- Check the [API Reference]({% link _docs/getting-started/api-reference.md %}) for using Stoolap in your Rust applications
+- Check the [SQL Commands]({% link _docs/sql-commands/sql-commands.md %}) reference for working with data
 
 ## Troubleshooting
 

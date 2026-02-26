@@ -204,5 +204,5 @@ The AS OF feature is the foundation for Stoolap's planned "Git for Data" functio
 
 ## See Also
 
-- [MVCC Implementation](../architecture/mvcc-implementation)
-- [Transaction Isolation](../architecture/transaction-isolation)
+- [MVCC Implementation]({% link _docs/architecture/mvcc-implementation.md %})
+- [Transaction Isolation]({% link _docs/architecture/transaction-isolation.md %})

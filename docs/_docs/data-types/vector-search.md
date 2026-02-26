@@ -9,7 +9,7 @@ order: 4
 
 Stoolap supports native vector storage and similarity search, enabling AI/ML use cases such as semantic search, recommendation systems, and retrieval-augmented generation (RAG) directly within the database.
 
-> **Built-in semantic search:** With the `semantic` feature flag, Stoolap provides the `EMBED()` function for automatic text-to-vector conversion using a built-in sentence-transformer model. See [Semantic Search](../data-types/semantic-search) for details.
+> **Built-in semantic search:** With the `semantic` feature flag, Stoolap provides the `EMBED()` function for automatic text-to-vector conversion using a built-in sentence-transformer model. See [Semantic Search]({% link _docs/data-types/semantic-search.md %}) for details.
 
 ## VECTOR Data Type
 
@@ -274,4 +274,4 @@ ORDER BY dist
 LIMIT 5;
 ```
 
-See [Semantic Search](../data-types/semantic-search) for full documentation on the `EMBED()` function.
+See [Semantic Search]({% link _docs/data-types/semantic-search.md %}) for full documentation on the `EMBED()` function.

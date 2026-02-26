@@ -180,7 +180,7 @@ VACUUM table_name;
 PRAGMA vacuum;
 ```
 
-See the [PRAGMA Commands](../sql-commands/pragma-commands) documentation for details.
+See the [PRAGMA Commands]({% link _docs/sql-commands/pragma-commands.md %}) documentation for details.
 
 ## Best Practices
 

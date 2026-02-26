@@ -117,7 +117,7 @@ WITH (m = 32, ef_construction = 400, ef_search = 128, metric = 'cosine');
 | `ef_search` | Search width during queries | 64 |
 | `metric` | Distance metric (`l2`, `cosine`, `ip`) | `l2` |
 
-See [Vector Search](../data-types/vector-search) for detailed documentation.
+See [Vector Search]({% link _docs/data-types/vector-search.md %}) for detailed documentation.
 
 ## Automatic Index Type Selection
 

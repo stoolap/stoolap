@@ -169,7 +169,7 @@ SELECT data -> 'address' ->> 'city' FROM users;
 SELECT * FROM products WHERE attributes ->> 'color' = 'red';
 ```
 
-These are shorthand for `JSON_EXTRACT`. See [JSON Support](../data-types/json-support) for more JSON functions.
+These are shorthand for `JSON_EXTRACT`. See [JSON Support]({% link _docs/data-types/json-support.md %}) for more JSON functions.
 
 ## NULL Operators
 

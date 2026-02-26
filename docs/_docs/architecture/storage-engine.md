@@ -83,7 +83,7 @@ The storage engine uses MVCC to provide transaction isolation:
 - **Lock-Free Reads** - Readers never block writers
 - **Automatic Cleanup** - Old versions garbage collected when no longer needed
 
-For more details, see the [MVCC Implementation](mvcc-implementation) and [Transaction Isolation](transaction-isolation) documentation.
+For more details, see the [MVCC Implementation]({% link _docs/architecture/mvcc-implementation.md %}) and [Transaction Isolation]({% link _docs/architecture/transaction-isolation.md %}) documentation.
 
 ## Data Access Paths
 
