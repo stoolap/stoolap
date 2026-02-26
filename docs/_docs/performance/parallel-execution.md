@@ -83,12 +83,12 @@ DISTINCT operations use two-phase deduplication:
 
 ## Performance Benefits
 
-Parallel execution provides significant benefits for analytical queries:
+Parallel execution provides significant benefits for analytical queries. Typical gains vary by workload shape, data distribution, and core count:
 
-- **Filter Operations**: 2-5x speedup for complex predicates
-- **Hash Joins**: 2-4x speedup for large joins
-- **Sorting**: 3-6x speedup for large ORDER BY
-- **Aggregations**: Linear speedup with core count
+- **Filter Operations**: Better throughput for complex predicates on large datasets
+- **Hash Joins**: Lower join latency for larger joins
+- **Sorting**: Faster large `ORDER BY` workloads
+- **Aggregations**: Scales with available CPU cores when data volume is high
 
 ## EXPLAIN ANALYZE Output
 

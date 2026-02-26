@@ -14,52 +14,31 @@
 
 //! Index implementations for Stoolap
 //!
-//! This module provides B-tree based index structures for efficient
-//! key-value lookups and range scans.
+//! This module provides all index structures used by the storage engine:
 //!
-//! # Index Types
-//!
-//! - [`BTree`] - Generic B-tree for any comparable key type
-//! - [`Int64BTree`] - Optimized B-tree for int64 keys
+//! - [`BTreeIndex`] - B-tree index for range queries and sorted access
+//! - [`HashIndex`] - Hash index for O(1) equality lookups
+//! - [`BitmapIndex`] - Bitmap index for low-cardinality columns
+//! - [`HnswIndex`] - HNSW index for approximate nearest neighbor search
+//! - [`MultiColumnIndex`] - Composite index for multi-column queries
+//! - [`PkIndex`] - Primary key index (virtual, auto-created)
 
+pub mod bitmap;
 pub mod btree;
-pub mod int64_btree;
+pub mod hash;
+pub mod hnsw;
+pub mod multi_column;
+pub mod pk;
 
 // Re-export main types
-pub use btree::BTree;
-pub use int64_btree::Int64BTree;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_btree_basic() {
-        let mut tree: BTree<i64, String> = BTree::new();
-
-        tree.insert(5, "five".to_string());
-        tree.insert(3, "three".to_string());
-        tree.insert(7, "seven".to_string());
-
-        assert_eq!(tree.size(), 3);
-        assert_eq!(tree.search(&5), Some(&"five".to_string()));
-        assert_eq!(tree.search(&3), Some(&"three".to_string()));
-        assert_eq!(tree.search(&7), Some(&"seven".to_string()));
-        assert_eq!(tree.search(&1), None);
-    }
-
-    #[test]
-    fn test_int64_btree_basic() {
-        let mut tree: Int64BTree<String> = Int64BTree::new();
-
-        tree.insert(5, "five".to_string());
-        tree.insert(3, "three".to_string());
-        tree.insert(7, "seven".to_string());
-
-        assert_eq!(tree.size(), 3);
-        assert_eq!(tree.search(5), Some(&"five".to_string()));
-        assert_eq!(tree.search(3), Some(&"three".to_string()));
-        assert_eq!(tree.search(7), Some(&"seven".to_string()));
-        assert_eq!(tree.search(1), None);
-    }
-}
+pub use bitmap::BitmapIndex;
+pub use btree::{
+    intersect_multiple_sorted_ids, intersect_sorted_ids, union_multiple_sorted_ids,
+    union_sorted_ids, BTreeIndex,
+};
+pub use hash::HashIndex;
+pub use hnsw::{
+    default_ef_construction, default_ef_search, default_m_for_dims, HnswDistanceMetric, HnswIndex,
+};
+pub use multi_column::{CompositeKey, MultiColumnIndex};
+pub use pk::PkIndex;

@@ -25,10 +25,10 @@ Expression pushdown is a query optimization technique that "pushes" filter expre
 
 ### Measurable Impacts
 
-Depending on the query, expression pushdown can provide:
+Depending on selectivity and index coverage, expression pushdown can provide:
 
-- 10-100x reduction in processed data volume
-- 2-10x improvement in query execution time
+- Large reductions in processed data volume
+- Meaningful query latency improvements by filtering earlier
 - Significant memory usage reduction
 
 ## How Expression Pushdown Works in Stoolap

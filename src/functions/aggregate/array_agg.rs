@@ -164,7 +164,17 @@ impl AggregateFunction for ArrayAggFunction {
                 Value::Boolean(b) => b.to_string(),
                 Value::Null(_) => "null".to_string(),
                 Value::Timestamp(t) => format!("\"{}\"", t),
-                Value::Json(j) => j.to_string(),
+                Value::Extension(data)
+                    if data.first() == Some(&(crate::core::DataType::Json as u8)) =>
+                {
+                    std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
+                }
+                Value::Extension(_) => {
+                    format!(
+                        "\"{}\"",
+                        v.to_string().replace('\\', "\\\\").replace('"', "\\\"")
+                    )
+                }
             })
             .collect();
         Value::text(format!("[{}]", json_elements.join(",")))

@@ -34,10 +34,10 @@
 //! - `sorted_values` BTree is built on first range query
 //! - `prefix_indexes` are built on first partial query per prefix length
 
+use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::RwLock;
 
 use rustc_hash::FxHashMap;
 
@@ -226,8 +226,8 @@ impl MultiColumnIndex {
 
         // Acquire both locks to prevent race condition:
         // We need to ensure no inserts happen between reading hash and setting btree_built
-        let value_to_rows = self.value_to_rows.read().unwrap();
-        let mut sorted_values = self.sorted_values.write().unwrap();
+        let value_to_rows = self.value_to_rows.read();
+        let mut sorted_values = self.sorted_values.write();
 
         // Double-check after acquiring write lock
         if self.btree_built.load(AtomicOrdering::Acquire) {
@@ -257,8 +257,8 @@ impl MultiColumnIndex {
 
         // Acquire both locks to prevent race condition:
         // Holding row_to_key read lock blocks concurrent inserts (which need write lock)
-        let row_to_key = self.row_to_key.read().unwrap();
-        let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
+        let row_to_key = self.row_to_key.read();
+        let mut prefix_index = self.prefix_indexes[idx].write();
 
         // Double-check after acquiring write lock
         if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
@@ -353,8 +353,8 @@ impl Index for MultiColumnIndex {
 
         // Acquire BOTH write locks FIRST to prevent race conditions during updates
         // Lock order: value_to_rows → row_to_key (same as remove())
-        let mut value_to_rows = self.value_to_rows.write().unwrap();
-        let mut row_to_key = self.row_to_key.write().unwrap();
+        let mut value_to_rows = self.value_to_rows.write();
+        let mut row_to_key = self.row_to_key.write();
 
         // Check if row already exists with different key (for updates)
         // Now safe to do atomically since we hold both write locks
@@ -411,7 +411,7 @@ impl Index for MultiColumnIndex {
 
         // Update BTree only if it was already built
         if btree_needs_update {
-            let mut sorted_values = self.sorted_values.write().unwrap();
+            let mut sorted_values = self.sorted_values.write();
 
             // First remove old entry if this was an update
             if let Some(ref old_arc_values) = old_key_for_cleanup {
@@ -437,7 +437,7 @@ impl Index for MultiColumnIndex {
         for prefix_len in 1..num_cols {
             let idx = prefix_len - 1;
             if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
-                let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
+                let mut prefix_index = self.prefix_indexes[idx].write();
 
                 // First remove old entry if this was an update
                 if let Some(ref old_arc_values) = old_key_for_cleanup {
@@ -485,8 +485,8 @@ impl Index for MultiColumnIndex {
 
         // LAZY: Only update hash index and reverse mapping
         {
-            let mut value_to_rows = self.value_to_rows.write().unwrap();
-            let mut row_to_key = self.row_to_key.write().unwrap();
+            let mut value_to_rows = self.value_to_rows.write();
+            let mut row_to_key = self.row_to_key.write();
 
             // Remove from hash index (row_ids are sorted, use binary search)
             if let Some(rows) = value_to_rows.get_mut(&key) {
@@ -504,7 +504,7 @@ impl Index for MultiColumnIndex {
 
         // Only update BTree if it was built (row_ids are sorted, use binary search)
         if self.btree_built.load(AtomicOrdering::Acquire) {
-            let mut sorted_values = self.sorted_values.write().unwrap();
+            let mut sorted_values = self.sorted_values.write();
             if let Some(rows) = sorted_values.get_mut(&key) {
                 if let Ok(pos) = rows.binary_search(&row_id) {
                     rows.remove(pos);
@@ -520,7 +520,7 @@ impl Index for MultiColumnIndex {
             let idx = prefix_len - 1;
             if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
                 let prefix_key = CompositeKey(values[..prefix_len].to_vec());
-                let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
+                let mut prefix_index = self.prefix_indexes[idx].write();
                 if let Some(rows) = prefix_index.get_mut(&prefix_key) {
                     if let Ok(pos) = rows.binary_search(&row_id) {
                         rows.remove(pos);
@@ -565,8 +565,8 @@ impl Index for MultiColumnIndex {
         }
 
         // Acquire ALL write locks ONCE for the entire batch
-        let mut value_to_rows = self.value_to_rows.write().unwrap();
-        let mut row_to_key = self.row_to_key.write().unwrap();
+        let mut value_to_rows = self.value_to_rows.write();
+        let mut row_to_key = self.row_to_key.write();
 
         // Reserve capacity to reduce reallocations
         value_to_rows.reserve(entries.len());
@@ -667,7 +667,7 @@ impl Index for MultiColumnIndex {
 
         // Update BTree only if it was already built
         if btree_needs_update {
-            let mut sorted_values = self.sorted_values.write().unwrap();
+            let mut sorted_values = self.sorted_values.write();
 
             // First remove old entries for updated rows
             for (row_id, existing_arc_values) in &updates_to_old_key {
@@ -695,7 +695,7 @@ impl Index for MultiColumnIndex {
         for prefix_len in 1..num_cols {
             let idx = prefix_len - 1;
             if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
-                let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
+                let mut prefix_index = self.prefix_indexes[idx].write();
 
                 // First remove old entries for updated rows
                 for (row_id, existing_arc_values) in &updates_to_old_key {
@@ -739,8 +739,8 @@ impl Index for MultiColumnIndex {
         }
 
         // Acquire BOTH write locks ONCE for entire batch
-        let mut value_to_rows = self.value_to_rows.write().unwrap();
-        let mut row_to_key = self.row_to_key.write().unwrap();
+        let mut value_to_rows = self.value_to_rows.write();
+        let mut row_to_key = self.row_to_key.write();
 
         // Remove all entries from hash index and reverse mapping
         for &(row_id, values) in entries {
@@ -766,7 +766,7 @@ impl Index for MultiColumnIndex {
 
         // Only update BTree if it was built
         if self.btree_built.load(AtomicOrdering::Acquire) {
-            let mut sorted_values = self.sorted_values.write().unwrap();
+            let mut sorted_values = self.sorted_values.write();
             for &(row_id, values) in entries {
                 let key = CompositeKey(values.to_vec());
                 if let Some(rows) = sorted_values.get_mut(&key) {
@@ -784,7 +784,7 @@ impl Index for MultiColumnIndex {
         for prefix_len in 1..self.column_ids.len() {
             let idx = prefix_len - 1;
             if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
-                let mut prefix_index = self.prefix_indexes[idx].write().unwrap();
+                let mut prefix_index = self.prefix_indexes[idx].write();
                 for &(row_id, values) in entries {
                     if values.len() >= prefix_len {
                         let prefix_key = CompositeKey(values[..prefix_len].to_vec());
@@ -837,7 +837,7 @@ impl Index for MultiColumnIndex {
 
         if values.len() == self.column_ids.len() {
             // Exact match - use full key hash index (O(1))
-            let value_to_rows = self.value_to_rows.read().unwrap();
+            let value_to_rows = self.value_to_rows.read();
             if let Some(row_ids) = value_to_rows.get(&key) {
                 return Ok(row_ids
                     .iter()
@@ -850,7 +850,7 @@ impl Index for MultiColumnIndex {
         // Partial match - LAZY build prefix index if needed
         self.ensure_prefix_built(values.len());
 
-        let prefix_index = self.prefix_indexes[values.len() - 1].read().unwrap();
+        let prefix_index = self.prefix_indexes[values.len() - 1].read();
         if let Some(row_ids) = prefix_index.get(&key) {
             return Ok(row_ids
                 .iter()
@@ -874,7 +874,7 @@ impl Index for MultiColumnIndex {
         // LAZY build BTree if needed
         self.ensure_btree_built();
 
-        let sorted_values = self.sorted_values.read().unwrap();
+        let sorted_values = self.sorted_values.read();
         let mut results = Vec::new();
         let min_key = CompositeKey(min.to_vec());
         let max_key = CompositeKey(max.to_vec());
@@ -975,7 +975,7 @@ impl Index for MultiColumnIndex {
 
         if values.len() == self.column_ids.len() {
             // Exact match - use full key hash index (O(1))
-            let value_to_rows = self.value_to_rows.read().unwrap();
+            let value_to_rows = self.value_to_rows.read();
             if let Some(row_ids) = value_to_rows.get(&key) {
                 // extend_from_slice uses memcpy for efficient bulk copy
                 buffer.extend_from_slice(row_ids.as_slice());
@@ -986,7 +986,7 @@ impl Index for MultiColumnIndex {
         // Partial match - LAZY build prefix index if needed
         self.ensure_prefix_built(values.len());
 
-        let prefix_index = self.prefix_indexes[values.len() - 1].read().unwrap();
+        let prefix_index = self.prefix_indexes[values.len() - 1].read();
         if let Some(row_ids) = prefix_index.get(&key) {
             buffer.extend_from_slice(row_ids.as_slice());
         }
@@ -999,15 +999,19 @@ impl Index for MultiColumnIndex {
     }
 
     fn clear(&self) -> Result<()> {
-        self.sorted_values.write().unwrap().clear();
+        self.sorted_values.write().clear();
         self.btree_built.store(false, AtomicOrdering::Release);
-        self.value_to_rows.write().unwrap().clear();
+        self.value_to_rows.write().clear();
         for (prefix_index, built_flag) in self.prefix_indexes.iter().zip(self.prefix_built.iter()) {
-            prefix_index.write().unwrap().clear();
+            prefix_index.write().clear();
             built_flag.store(false, AtomicOrdering::Release);
         }
-        self.row_to_key.write().unwrap().clear();
+        self.row_to_key.write().clear();
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn close(&mut self) -> Result<()> {

@@ -36,14 +36,9 @@
 //!
 
 pub mod arena;
-pub mod bitmap_index;
-pub mod btree_index;
 pub mod engine;
 pub mod file_lock;
-pub mod hash_index;
-pub mod multi_column_index;
 pub mod persistence;
-pub mod pk_index;
 pub mod registry;
 pub mod scanner;
 pub mod snapshot;
@@ -55,21 +50,20 @@ pub mod version_store;
 pub mod wal_manager;
 pub mod zonemap;
 
-// Re-export main types
-pub use bitmap_index::BitmapIndex;
-pub use btree_index::{
+// Re-export index types (moved to storage::index)
+pub use crate::storage::index::{
     intersect_multiple_sorted_ids, intersect_sorted_ids, union_multiple_sorted_ids,
-    union_sorted_ids, BTreeIndex,
+    union_sorted_ids, BTreeIndex, BitmapIndex, CompositeKey, HashIndex, HnswIndex,
+    MultiColumnIndex, PkIndex,
 };
+
+// Re-export main types
 pub use engine::{CleanupHandle, MVCCEngine};
-pub use hash_index::HashIndex;
-pub use multi_column_index::{CompositeKey, MultiColumnIndex};
 pub use persistence::{
     deserialize_row_version, deserialize_value, serialize_row_version, serialize_value,
     IndexMetadata, PersistenceManager, PersistenceMeta, DEFAULT_KEEP_SNAPSHOTS,
     DEFAULT_SNAPSHOT_INTERVAL,
 };
-pub use pk_index::PkIndex;
 pub use registry::{TransactionRegistry, INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID};
 pub use scanner::{EmptyScanner, MVCCScanner, RangeScanner, SingleRowScanner};
 pub use snapshot::{DiskVersionStore, SnapshotReader, SnapshotWriter};

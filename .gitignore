@@ -34,6 +34,7 @@ tarpaulin-report.html
 CLAUDE.md
 TODO.md
 *.disabled
+deny.toml
 
 # Documentation build artifacts
 docs/_site/

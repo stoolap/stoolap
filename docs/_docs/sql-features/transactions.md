@@ -62,7 +62,7 @@ COMMIT;
 -- Only Order A is committed
 ```
 
-For full savepoint documentation, see [Savepoints](../sql-features/savepoints).
+For full savepoint documentation, see [Savepoints]({% link _docs/sql-features/savepoints.md %}).
 
 ## Isolation Levels
 
@@ -157,4 +157,4 @@ Stoolap uses MVCC (Multi-Version Concurrency Control) to handle concurrent trans
 - Write conflicts are detected at commit time
 - Each transaction sees a consistent view of the data based on its isolation level
 
-For architectural details on MVCC, see [MVCC Implementation](../architecture/mvcc-implementation).
+For architectural details on MVCC, see [MVCC Implementation]({% link _docs/architecture/mvcc-implementation.md %}).

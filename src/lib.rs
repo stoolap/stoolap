@@ -96,9 +96,6 @@ pub use storage::{
     NullCheckExpr, OrExpr, RangeExpr,
 };
 
-// Re-export index types
-pub use storage::{BTree, Int64BTree};
-
 // Re-export config types
 pub use storage::{Config, PersistenceConfig, SyncMode};
 

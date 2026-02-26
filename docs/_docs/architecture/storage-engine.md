@@ -28,7 +28,7 @@ Tables in Stoolap are composed of:
 - **Metadata** - Schema information, column definitions, and indexes
 - **Row Data** - The primary data storage, organized by row
 - **Version Store** - Tracks row versions for MVCC
-- **Indexes** - B-tree, Hash, Bitmap, and multi-column indexes
+- **Indexes** - B-tree, Hash, Bitmap, HNSW, and multi-column indexes
 - **Transaction Manager** - Manages transaction state and visibility
 
 ### Data Types
@@ -41,6 +41,7 @@ Stoolap supports a variety of data types, each with optimized storage:
 - **BOOLEAN** - Boolean values (true/false)
 - **TIMESTAMP** - Date and time values
 - **JSON** - JSON documents
+- **VECTOR** - Fixed-dimension floating-point vectors for similarity search
 - **NULL** - Null values supported for all types
 
 ### Version Management
@@ -82,7 +83,7 @@ The storage engine uses MVCC to provide transaction isolation:
 - **Lock-Free Reads** - Readers never block writers
 - **Automatic Cleanup** - Old versions garbage collected when no longer needed
 
-For more details, see the [MVCC Implementation](mvcc-implementation) and [Transaction Isolation](transaction-isolation) documentation.
+For more details, see the [MVCC Implementation]({% link _docs/architecture/mvcc-implementation.md %}) and [Transaction Isolation]({% link _docs/architecture/transaction-isolation.md %}) documentation.
 
 ## Data Access Paths
 
@@ -180,15 +181,17 @@ src/storage/
 │   ├── engine.rs       # Engine trait
 │   ├── table.rs        # Table trait
 │   └── transaction.rs  # Transaction trait
+├── index/              # Index implementations
+│   ├── btree.rs        # B-tree index
+│   ├── hash.rs         # Hash index
+│   ├── bitmap.rs       # Bitmap index
+│   ├── multi_column.rs # Multi-column index
+│   └── hnsw.rs         # HNSW vector index
 └── mvcc/               # MVCC implementation
     ├── engine.rs       # MVCC storage engine
     ├── table.rs        # Table with row storage
     ├── transaction.rs  # Transaction management
     ├── version_store.rs # Version tracking
-    ├── btree_index.rs  # B-tree index
-    ├── hash_index.rs   # Hash index
-    ├── bitmap_index.rs # Bitmap index
-    ├── multi_column_index.rs # Multi-column index
     └── persistence.rs  # WAL and snapshots
 ```
 

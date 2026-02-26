@@ -45,8 +45,11 @@
 mod conversion;
 mod datetime;
 mod math;
+#[cfg(feature = "semantic")]
+pub mod semantic;
 mod string;
 mod utility;
+pub mod vector;
 
 pub use conversion::{CastFunction, CollateFunction};
 pub use datetime::{
@@ -75,7 +78,7 @@ pub use utility::{
     NullIfFunction, SleepFunction, TypeOfFunction,
 };
 
-use crate::core::Value;
+use crate::core::{DataType, Value};
 
 /// Macro to validate argument count for scalar functions.
 ///
@@ -137,7 +140,13 @@ pub fn value_to_string(value: &Value) -> String {
         Value::Text(s) => s.to_string(),
         Value::Boolean(b) => b.to_string(),
         Value::Timestamp(t) => t.to_rfc3339(),
-        Value::Json(j) => j.to_string(),
+        Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+            std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
+        }
+        Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
+            crate::core::value::format_vector_bytes(&data[1..])
+        }
+        Value::Extension(_) => String::new(),
     }
 }
 

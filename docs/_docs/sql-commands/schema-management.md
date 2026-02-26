@@ -36,7 +36,7 @@ When creating tables, you can specify the following constraints:
 - **UNIQUE** - Enforce uniqueness on a column (also available via `CREATE UNIQUE INDEX`)
 - **DEFAULT** - Specify a default value for a column
 - **CHECK** - Define a check constraint expression
-- **REFERENCES** - Define a foreign key constraint referencing another table (see [Foreign Keys](../sql-features/foreign-keys))
+- **REFERENCES** - Define a foreign key constraint referencing another table (see [Foreign Keys]({% link _docs/sql-features/foreign-keys.md %}))
 
 ```sql
 CREATE TABLE orders (
@@ -88,6 +88,7 @@ Stoolap supports the following data types:
 
 ### Special Types
 - **JSON** - JSON document
+- **VECTOR(N)** - Fixed-dimension floating-point vector (see [Vector Search]({% link _docs/data-types/vector-search.md %}))
 
 ## Primary Keys
 
@@ -133,12 +134,16 @@ Stoolap supports multiple index implementations:
 1. **B-tree Indexes** - For numeric and timestamp columns, supporting equality and range queries
 2. **Hash Indexes** - For text and JSON columns, optimized for equality lookups
 3. **Bitmap Indexes** - For boolean columns and low-cardinality data
-4. **Multi-column Indexes** - For queries that filter on multiple columns together
+4. **HNSW Indexes** - For vector columns, approximate nearest neighbor search (see [Vector Search]({% link _docs/data-types/vector-search.md %}))
+5. **Multi-column Indexes** - For queries that filter on multiple columns together
 
 ### Dropping Indexes
 
 ```sql
 DROP INDEX idx_user_email;
+
+-- Or with explicit table name
+DROP INDEX idx_user_email ON users;
 ```
 
 ## Schema Information

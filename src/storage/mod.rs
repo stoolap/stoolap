@@ -37,7 +37,11 @@ pub use expression::{
 };
 
 // Re-export index types
-pub use index::{BTree, Int64BTree};
+pub use index::{
+    intersect_multiple_sorted_ids, intersect_sorted_ids, union_multiple_sorted_ids,
+    union_sorted_ids, BTreeIndex, BitmapIndex, CompositeKey, HashIndex, HnswDistanceMetric,
+    HnswIndex, MultiColumnIndex, PkIndex,
+};
 
 // Re-export config types
 pub use config::{CleanupConfig, Config, PersistenceConfig, SyncMode};
@@ -50,11 +54,10 @@ pub use traits::{
 
 // Re-export MVCC types
 pub use mvcc::{
-    get_fast_timestamp, BTreeIndex, EmptyScanner as MvccEmptyScanner, MVCCEngine, MVCCScanner,
-    MVCCTable, MvccTransaction, RangeScanner, RowVersion, SingleRowScanner,
-    TransactionEngineOperations, TransactionRegistry, TransactionState, TransactionVersionStore,
-    VersionStore, VisibilityChecker, WriteSetEntry, INVALID_TRANSACTION_ID,
-    RECOVERY_TRANSACTION_ID,
+    get_fast_timestamp, EmptyScanner as MvccEmptyScanner, MVCCEngine, MVCCScanner, MVCCTable,
+    MvccTransaction, RangeScanner, RowVersion, SingleRowScanner, TransactionEngineOperations,
+    TransactionRegistry, TransactionState, TransactionVersionStore, VersionStore,
+    VisibilityChecker, WriteSetEntry, INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID,
 };
 
 // Re-export WAL types

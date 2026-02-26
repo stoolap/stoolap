@@ -11,7 +11,7 @@ This document explains Stoolap's indexing system, including the types of indexes
 
 ## Index Types
 
-Stoolap supports three primary index types, each optimized for different query patterns:
+Stoolap supports five primary index types, each optimized for different query patterns:
 
 ### 1. B-tree Indexes
 
@@ -86,6 +86,39 @@ CREATE INDEX idx_verified ON users(verified) USING BITMAP;
 - Range queries
 - IN clause with many values
 
+### 4. HNSW Indexes
+
+HNSW (Hierarchical Navigable Small World) indexes provide approximate nearest neighbor search for vector data:
+
+- **Design**: Multi-layer navigable small world graph with skip-list structure
+- **Strengths**: O(log N) approximate nearest neighbor search with high recall
+- **Default For**: `VECTOR` columns
+- **Use Cases**: Similarity search, semantic search, recommendation systems
+
+```sql
+-- Create HNSW index with default parameters
+CREATE INDEX idx_emb ON embeddings(embedding) USING HNSW;
+
+-- Create HNSW index with custom parameters
+CREATE INDEX idx_emb ON embeddings(embedding) USING HNSW
+WITH (m = 32, ef_construction = 400, ef_search = 128, metric = 'cosine');
+```
+
+**Supported Operations:**
+- k-nearest neighbor search: `ORDER BY VEC_DISTANCE_*(col, query) LIMIT k`
+- Multiple distance metrics: L2, cosine, inner product
+
+**HNSW Parameters:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `m` | Max connections per node | 16 |
+| `ef_construction` | Search width during build | 200 |
+| `ef_search` | Search width during queries | 64 |
+| `metric` | Distance metric (`l2`, `cosine`, `ip`) | `l2` |
+
+See [Vector Search]({% link _docs/data-types/vector-search.md %}) for detailed documentation.
+
 ## Automatic Index Type Selection
 
 When you create an index without specifying a type, Stoolap automatically selects the optimal type based on the column's data type:
@@ -98,6 +131,7 @@ When you create an index without specifying a type, Stoolap automatically select
 | `TEXT` | Hash | O(1) equality lookups for strings |
 | `JSON` | Hash | O(1) equality lookups for JSON |
 | `BOOLEAN` | Bitmap | Only two values, perfect for bitmap |
+| `VECTOR` | HNSW | Nearest neighbor search |
 
 ## The USING Clause
 
@@ -112,6 +146,13 @@ CREATE INDEX idx_id_hash ON orders(user_id) USING HASH;
 
 -- Force Bitmap on a low-cardinality text column
 CREATE INDEX idx_status_bitmap ON orders(status) USING BITMAP;
+
+-- HNSW for vector similarity search
+CREATE INDEX idx_emb ON embeddings(embedding) USING HNSW;
+
+-- HNSW with custom parameters via WITH clause
+CREATE INDEX idx_emb ON embeddings(embedding) USING HNSW
+WITH (m = 32, ef_construction = 400, metric = 'cosine');
 ```
 
 ## Multi-Column Indexes
@@ -173,6 +214,11 @@ CREATE INDEX index_name ON table_name(column_name);
 CREATE INDEX index_name ON table_name(column_name) USING BTREE;
 CREATE INDEX index_name ON table_name(column_name) USING HASH;
 CREATE INDEX index_name ON table_name(column_name) USING BITMAP;
+CREATE INDEX index_name ON table_name(column_name) USING HNSW;
+
+-- HNSW with parameters
+CREATE INDEX index_name ON table_name(column_name) USING HNSW
+WITH (m = 32, ef_construction = 400, ef_search = 128, metric = 'cosine');
 
 -- Multi-column index
 CREATE INDEX index_name ON table_name(col1, col2, col3);
@@ -201,8 +247,9 @@ Stoolap's indexes are integrated with the MVCC system:
 
 All indexes are fully persisted:
 
-- Index metadata stored in WAL (type, columns, unique flag)
+- Index metadata stored in WAL (type, columns, unique flag, HNSW parameters)
 - Index data rebuilt from table data on recovery
+- HNSW graph structure is serialized to binary files during snapshots for fast recovery
 - Snapshots capture index definitions
 - Recovery restores all indexes automatically
 
@@ -243,6 +290,7 @@ ANALYZE orders;
 | `WHERE active = true` | Bitmap (default for BOOLEAN) |
 | `WHERE cat = x AND brand = y` | Multi-column |
 | `ORDER BY date` | B-tree |
+| `ORDER BY VEC_DISTANCE_*(col, q) LIMIT k` | HNSW |
 
 ### Common Mistakes
 
@@ -253,11 +301,12 @@ ANALYZE orders;
 
 ## Performance Characteristics
 
-| Index Type | Equality | Range | Space | Write Cost |
-|------------|:--------:|:-----:|:-----:|:----------:|
-| B-tree | O(log n) | O(log n + k) | Medium | Medium |
-| Hash | O(1) avg | N/A | Medium | Low |
-| Bitmap | O(1) | N/A | Low* | Low |
+| Index Type | Equality | Range | k-NN | Space | Write Cost |
+|------------|:--------:|:-----:|:----:|:-----:|:----------:|
+| B-tree | O(log n) | O(log n + k) | N/A | Medium | Medium |
+| Hash | O(1) avg | N/A | N/A | Medium | Low |
+| Bitmap | O(1) | N/A | N/A | Low* | Low |
+| HNSW | N/A | N/A | O(log n) | High | High |
 
 *For low cardinality columns
 
@@ -265,8 +314,9 @@ ANALYZE orders;
 
 Stoolap's indexes are implemented in:
 
-- `src/storage/mvcc/btree_index.rs` - B-tree index implementation
-- `src/storage/mvcc/hash_index.rs` - Hash index implementation
-- `src/storage/mvcc/bitmap_index.rs` - Bitmap index implementation
-- `src/storage/mvcc/multi_column_index.rs` - Multi-column index
+- `src/storage/index/btree.rs` - B-tree index implementation
+- `src/storage/index/hash.rs` - Hash index implementation
+- `src/storage/index/bitmap.rs` - Bitmap index implementation
+- `src/storage/index/multi_column.rs` - Multi-column index
+- `src/storage/index/hnsw.rs` - HNSW vector index implementation
 - `src/storage/traits/index_trait.rs` - Common index trait

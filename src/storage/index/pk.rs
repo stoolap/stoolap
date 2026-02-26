@@ -28,8 +28,8 @@
 //! It reports `IndexType::PrimaryKey` which is used to filter it from
 //! `list_indexes` display and to block redundant CREATE INDEX on the PK column.
 
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
 
 use crate::common::{I64Map, I64Set};
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
@@ -385,13 +385,13 @@ impl Index for PkIndex {
 
     fn add(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         let _ = values;
-        let mut inner = self.data.write().unwrap();
+        let mut inner = self.data.write();
         inner.insert(row_id);
         Ok(())
     }
 
     fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        let mut inner = self.data.write().unwrap();
+        let mut inner = self.data.write();
         for (row_id, _) in entries.iter() {
             inner.insert(row_id);
         }
@@ -399,7 +399,7 @@ impl Index for PkIndex {
     }
 
     fn add_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
-        let mut inner = self.data.write().unwrap();
+        let mut inner = self.data.write();
         for &(row_id, _) in entries {
             inner.insert(row_id);
         }
@@ -407,13 +407,13 @@ impl Index for PkIndex {
     }
 
     fn remove(&self, _values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
-        let mut inner = self.data.write().unwrap();
+        let mut inner = self.data.write();
         inner.remove(row_id);
         Ok(())
     }
 
     fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        let mut inner = self.data.write().unwrap();
+        let mut inner = self.data.write();
         for (row_id, _) in entries.iter() {
             inner.remove(row_id);
         }
@@ -421,7 +421,7 @@ impl Index for PkIndex {
     }
 
     fn remove_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
-        let mut inner = self.data.write().unwrap();
+        let mut inner = self.data.write();
         for &(row_id, _) in entries {
             inner.remove(row_id);
         }
@@ -452,7 +452,7 @@ impl Index for PkIndex {
         let Some(row_id) = Self::extract_i64(values) else {
             return Ok(Vec::new());
         };
-        let inner = self.data.read().unwrap();
+        let inner = self.data.read();
         if inner.contains(row_id) {
             Ok(vec![IndexEntry {
                 row_id,
@@ -503,7 +503,7 @@ impl Index for PkIndex {
             return Ok(Vec::new());
         }
 
-        let inner = self.data.read().unwrap();
+        let inner = self.data.read();
         let total_bits = bit_capacity(&inner.words) as i64;
 
         // Collect from bitset portion
@@ -549,7 +549,7 @@ impl Index for PkIndex {
                 let Some(exclude_id) = Self::extract_i64(values) else {
                     return Ok(Vec::new());
                 };
-                let inner = self.data.read().unwrap();
+                let inner = self.data.read();
                 let mut result = Vec::new();
                 for_each_set_bit(&inner.words, |rid| {
                     if rid != exclude_id {
@@ -584,7 +584,7 @@ impl Index for PkIndex {
         let Some(row_id) = Self::extract_i64(values) else {
             return;
         };
-        let inner = self.data.read().unwrap();
+        let inner = self.data.read();
         if inner.contains(row_id) {
             buffer.push(row_id);
         }
@@ -604,7 +604,7 @@ impl Index for PkIndex {
     }
 
     fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
-        let inner = self.data.read().unwrap();
+        let inner = self.data.read();
         for value in value_list {
             if let Value::Integer(row_id) = value {
                 if inner.contains(*row_id) {
@@ -696,7 +696,7 @@ impl Index for PkIndex {
     }
 
     fn get_min_value(&self) -> Option<Value> {
-        let inner = self.data.read().unwrap();
+        let inner = self.data.read();
         let b_min = bitset_min(&inner.words);
         let o_min = Self::overflow_min(&inner);
         match (b_min, o_min) {
@@ -708,7 +708,7 @@ impl Index for PkIndex {
     }
 
     fn get_max_value(&self) -> Option<Value> {
-        let inner = self.data.read().unwrap();
+        let inner = self.data.read();
         let b_max = bitset_max(&inner.words);
         let o_max = Self::overflow_max(&inner);
         match (b_max, o_max) {
@@ -720,7 +720,7 @@ impl Index for PkIndex {
     }
 
     fn get_all_values(&self) -> Vec<Value> {
-        let inner = self.data.read().unwrap();
+        let inner = self.data.read();
         let mut result = Vec::with_capacity(inner.count);
         for_each_set_bit(&inner.words, |rid| {
             result.push(Value::Integer(rid));
@@ -740,7 +740,7 @@ impl Index for PkIndex {
     }
 
     fn get_distinct_count_excluding_null(&self) -> Option<usize> {
-        let inner = self.data.read().unwrap();
+        let inner = self.data.read();
         Some(inner.count)
     }
 
@@ -750,7 +750,7 @@ impl Index for PkIndex {
         limit: usize,
         offset: usize,
     ) -> Option<Vec<i64>> {
-        let inner = self.data.read().unwrap();
+        let inner = self.data.read();
 
         if inner.overflow_empty() {
             // Fast path: bitset only — iterate in order with offset/limit
@@ -871,7 +871,7 @@ impl Index for PkIndex {
     }
 
     fn get_grouped_row_ids(&self) -> Option<Vec<(Value, Vec<i64>)>> {
-        let inner = self.data.read().unwrap();
+        let inner = self.data.read();
         let mut result = Vec::with_capacity(inner.count);
         for_each_set_bit(&inner.words, |rid| {
             result.push((Value::Integer(rid), vec![rid]));
@@ -890,7 +890,7 @@ impl Index for PkIndex {
         &self,
         callback: &mut dyn FnMut(&Value, &[i64]) -> Result<bool>,
     ) -> Option<Result<()>> {
-        let inner = self.data.read().unwrap();
+        let inner = self.data.read();
 
         if inner.overflow_empty() {
             // Fast path: bitset only, already in ascending order.
@@ -975,9 +975,13 @@ impl Index for PkIndex {
     }
 
     fn clear(&self) -> Result<()> {
-        let mut inner = self.data.write().unwrap();
+        let mut inner = self.data.write();
         inner.clear();
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn close(&mut self) -> Result<()> {
@@ -1004,7 +1008,7 @@ mod tests {
     }
 
     fn count(idx: &PkIndex) -> usize {
-        idx.data.read().unwrap().count
+        idx.data.read().count
     }
 
     #[test]
@@ -1138,7 +1142,7 @@ mod tests {
         for i in 0..1000 {
             idx.add(&[Value::Integer(i)], i, i).unwrap();
         }
-        let inner = idx.data.read().unwrap();
+        let inner = idx.data.read();
         // 1000 bits needs ceil(1000/64) = 16 words = 128 bytes
         assert!(inner.words.len() <= 16);
         assert_eq!(inner.count, 1000);

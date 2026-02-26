@@ -56,9 +56,9 @@
 //! contention characteristics. A concurrent map could help for truly concurrent writes
 //! but would complicate atomicity across the three maps.
 
+use parking_lot::RwLock;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::RwLock;
 
 use rustc_hash::FxHashMap;
 
@@ -282,9 +282,9 @@ impl Index for HashIndex {
         let hash = hash_values(values);
 
         // Acquire all write locks to ensure atomic operation
-        let mut hash_to_rows = self.hash_to_rows.write().unwrap();
-        let mut row_to_hash = self.row_to_hash.write().unwrap();
-        let mut hash_to_values = self.hash_to_values.write().unwrap();
+        let mut hash_to_rows = self.hash_to_rows.write();
+        let mut row_to_hash = self.row_to_hash.write();
+        let mut hash_to_values = self.hash_to_values.write();
 
         // Check if row already exists (for updates)
         if let Some(&old_hash) = row_to_hash.get(row_id) {
@@ -377,9 +377,9 @@ impl Index for HashIndex {
 
         let hash = hash_values(values);
 
-        let mut hash_to_rows = self.hash_to_rows.write().unwrap();
-        let mut row_to_hash = self.row_to_hash.write().unwrap();
-        let mut hash_to_values = self.hash_to_values.write().unwrap();
+        let mut hash_to_rows = self.hash_to_rows.write();
+        let mut row_to_hash = self.row_to_hash.write();
+        let mut hash_to_values = self.hash_to_values.write();
 
         // Remove from hash_to_rows (row_ids are sorted, use binary search)
         if let Some(rows) = hash_to_rows.get_mut(&hash) {
@@ -436,9 +436,9 @@ impl Index for HashIndex {
         let num_cols = self.column_ids.len();
 
         // Acquire all write locks ONCE for entire batch
-        let mut hash_to_rows = self.hash_to_rows.write().unwrap();
-        let mut row_to_hash = self.row_to_hash.write().unwrap();
-        let mut hash_to_values = self.hash_to_values.write().unwrap();
+        let mut hash_to_rows = self.hash_to_rows.write();
+        let mut row_to_hash = self.row_to_hash.write();
+        let mut hash_to_values = self.hash_to_values.write();
 
         // Reserve capacity to reduce reallocations
         hash_to_rows.reserve(entries.len());
@@ -580,9 +580,9 @@ impl Index for HashIndex {
         }
 
         // Acquire all write locks ONCE for entire batch
-        let mut hash_to_rows = self.hash_to_rows.write().unwrap();
-        let mut row_to_hash = self.row_to_hash.write().unwrap();
-        let mut hash_to_values = self.hash_to_values.write().unwrap();
+        let mut hash_to_rows = self.hash_to_rows.write();
+        let mut row_to_hash = self.row_to_hash.write();
+        let mut hash_to_values = self.hash_to_values.write();
 
         for &(row_id, values) in entries {
             let hash = hash_values(values);
@@ -655,7 +655,7 @@ impl Index for HashIndex {
         let hash = hash_values(values);
 
         // First check hash_to_rows for quick path (no collisions)
-        let hash_to_values = self.hash_to_values.read().unwrap();
+        let hash_to_values = self.hash_to_values.read();
 
         if let Some(entries) = hash_to_values.get(&hash) {
             // Handle hash collisions by checking actual values (CompactArc<Value>)
@@ -707,7 +707,7 @@ impl Index for HashIndex {
         }
 
         let hash = hash_values(values);
-        let hash_to_values = self.hash_to_values.read().unwrap();
+        let hash_to_values = self.hash_to_values.read();
 
         if let Some(entries) = hash_to_values.get(&hash) {
             // Handle hash collisions by checking actual values (CompactArc<Value>)
@@ -728,7 +728,7 @@ impl Index for HashIndex {
         }
 
         // Single lock acquisition for all lookups
-        let hash_to_values = self.hash_to_values.read().unwrap();
+        let hash_to_values = self.hash_to_values.read();
 
         for value in value_list {
             // Hash without cloning - pass reference to slice
@@ -783,7 +783,7 @@ impl Index for HashIndex {
 
         // Fallback: return all row IDs and let caller filter
         // This is inefficient but necessary for correctness for complex expressions
-        let hash_to_values = self.hash_to_values.read().unwrap();
+        let hash_to_values = self.hash_to_values.read();
         let mut results = RowIdVec::new();
 
         for entries in hash_to_values.values() {
@@ -799,7 +799,7 @@ impl Index for HashIndex {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Vec::new();
         }
-        let hash_to_values = self.hash_to_values.read().unwrap();
+        let hash_to_values = self.hash_to_values.read();
         let mut result = Vec::with_capacity(hash_to_values.len());
         for entries in hash_to_values.values() {
             for (values, _row_ids) in entries {
@@ -816,7 +816,7 @@ impl Index for HashIndex {
         if self.closed.load(AtomicOrdering::Acquire) {
             return None;
         }
-        let hash_to_values = self.hash_to_values.read().unwrap();
+        let hash_to_values = self.hash_to_values.read();
         // Count unique value combinations excluding null
         let mut count = 0;
         for entries in hash_to_values.values() {
@@ -838,10 +838,14 @@ impl Index for HashIndex {
     }
 
     fn clear(&self) -> Result<()> {
-        self.hash_to_rows.write().unwrap().clear();
-        self.row_to_hash.write().unwrap().clear();
-        self.hash_to_values.write().unwrap().clear();
+        self.hash_to_rows.write().clear();
+        self.row_to_hash.write().clear();
+        self.hash_to_values.write().clear();
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn close(&mut self) -> Result<()> {

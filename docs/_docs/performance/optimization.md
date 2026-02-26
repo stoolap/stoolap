@@ -41,7 +41,7 @@ CREATE INDEX idx_product_category_price ON products (category_id, price);
 
 Stoolap includes significant performance optimizations:
 
-- **Hash-Based IN Subqueries** - Up to 2048x faster for large IN lists
+- **Hash-Based IN Subqueries** - Converts large IN/NOT IN lookups to hash probes for substantial speedups on many workloads
 - **Array-Based Row Storage** - Eliminated map allocations throughout query execution
 - **Efficient Aggregations** - Optimized operations for COUNT, SUM, AVG, MIN, MAX
 - **Parallel Execution** - Rayon-based parallelism for filter, join, sort, and distinct operations
@@ -164,7 +164,7 @@ EXPLAIN SELECT * FROM orders WHERE amount > 1000;
 EXPLAIN ANALYZE SELECT * FROM products WHERE category = 'Electronics';
 ```
 
-See [EXPLAIN](../sql-features/explain) for detailed documentation.
+See [EXPLAIN]({% link _docs/sql-features/explain.md %}) for detailed documentation.
 
 ## Implementation-Specific Optimizations
 
@@ -242,7 +242,7 @@ GROUP BY s1.region;
 ### Subquery Optimization
 
 - **Hash-Based IN/NOT IN**: Automatic conversion to hash lookups
-- **Performance Gains**: Up to 2048x faster for large IN lists
+- **Performance Gains**: Can be substantial for large IN/NOT IN lists; verify with `EXPLAIN ANALYZE` on your workload
 - **Memory Efficiency**: O(1) lookups instead of O(n×m) comparisons
 
 ```sql

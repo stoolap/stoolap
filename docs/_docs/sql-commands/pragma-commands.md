@@ -2,7 +2,7 @@
 layout: doc
 title: PRAGMA Commands
 category: SQL Commands
-order: 3
+order: 4
 ---
 
 # PRAGMA Commands
@@ -41,6 +41,7 @@ Stoolap currently supports the following PRAGMA commands:
 | `wal_flush_trigger` | Operations before WAL flush | 32768 |
 | `snapshot` | Manually create a snapshot (no value) | - |
 | `checkpoint` | Alias for `snapshot` (SQLite-compatible) | - |
+| `vacuum` | Manual cleanup of deleted rows and index compaction | - |
 
 #### snapshot_interval
 
@@ -104,6 +105,37 @@ This command is useful for:
 
 Note: This PRAGMA does not accept any values.
 
+### Maintenance
+
+#### vacuum
+
+Performs manual cleanup of deleted rows, old version chains, stale transaction metadata, and triggers index compaction (e.g., HNSW graph rebuild when tombstone ratio exceeds 20%).
+
+```sql
+-- Vacuum all tables
+PRAGMA vacuum;
+
+-- Also available as a standalone SQL command
+VACUUM;
+
+-- Vacuum a specific table
+VACUUM table_name;
+```
+
+Returns a result row with three columns:
+
+| Column | Description |
+|--------|-------------|
+| `deleted_rows_cleaned` | Number of tombstoned rows reclaimed |
+| `old_versions_cleaned` | Number of old version chains pruned |
+| `transactions_cleaned` | Number of stale transaction entries removed |
+
+This is especially useful on WASM where the background cleanup thread is unavailable, but can be called on any platform for on-demand maintenance.
+
+**Warning:** VACUUM uses zero retention, meaning all historical row versions not needed by currently active transactions are permanently removed. This destroys AS OF TIMESTAMP history. Temporal queries referencing timestamps before the VACUUM will no longer return results. If you rely on time-travel queries, consider using the background cleanup (which preserves a 5-minute retention window) instead of VACUUM.
+
+Note: This PRAGMA does not accept any values.
+
 ## Examples
 
 ### Basic PRAGMA Usage
@@ -145,6 +177,22 @@ UPDATE users SET name = 'Jane' WHERE id = 1;
 PRAGMA snapshot;
 ```
 
+### VACUUM Example
+
+```sql
+-- Delete some data
+DELETE FROM orders WHERE status = 'cancelled';
+
+-- Run vacuum to reclaim storage and compact indexes
+VACUUM;
+
+-- Or vacuum a specific table
+VACUUM orders;
+
+-- Or use PRAGMA syntax
+PRAGMA vacuum;
+```
+
 ## PRAGMA Persistence
 
 PRAGMA settings are persisted for file-based and db:// connections, but reset for each new connection. If you want settings to persist across database restarts, you should execute PRAGMA commands after opening the connection.
@@ -161,6 +209,26 @@ PRAGMA settings are persisted for file-based and db:// connections, but reset fo
 3. **Manage Snapshots**: Set `keep_snapshots` based on your backup needs and disk space constraints.
 
 4. **Apply PRAGMA at Startup**: Run important PRAGMA commands right after opening the database connection.
+
+5. **Configure Cleanup via DSN**: Set cleanup retention values in the connection string for consistent behavior across connections:
+   ```
+   file:///data/mydb?cleanup_interval=30&deleted_row_retention=60&transaction_retention=1800
+   ```
+
+6. **Use VACUUM on WASM**: The background cleanup thread is unavailable on WASM. Use `VACUUM` or `PRAGMA vacuum` for manual cleanup instead.
+
+## Cleanup Configuration (DSN Options)
+
+Background cleanup settings can be configured via connection string query parameters:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `cleanup` | on | Enable/disable the background cleanup thread |
+| `cleanup_interval` | 60 | Seconds between automatic cleanup runs |
+| `deleted_row_retention` | 300 | Seconds before deleted rows are permanently removed |
+| `transaction_retention` | 3600 | Seconds before stale transaction metadata is removed |
+
+See [Connection Strings]({% link _docs/getting-started/connection-strings.md %}) for the full list of DSN options.
 
 ## Implementation Details
 

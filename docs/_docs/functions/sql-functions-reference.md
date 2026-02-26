@@ -7,7 +7,7 @@ order: 1
 
 # SQL Functions Reference
 
-Quick reference for all 110 built-in SQL functions in Stoolap, organized by category. For detailed documentation with examples, see [Scalar Functions]({% link _docs/functions/scalar-functions.md %}), [Aggregate Functions]({% link _docs/functions/aggregate-functions.md %}), and [Window Functions]({% link _docs/functions/window-functions.md %}).
+Quick reference for all 117 built-in SQL functions in Stoolap, organized by category. For detailed documentation with examples, see [Scalar Functions]({% link _docs/functions/scalar-functions.md %}), [Aggregate Functions]({% link _docs/functions/aggregate-functions.md %}), and [Window Functions]({% link _docs/functions/window-functions.md %}).
 
 ## Aggregate Functions (17)
 
@@ -33,7 +33,7 @@ Aggregate functions operate on a set of rows and return a single value. Used wit
 | `VAR_SAMP` | `VAR_SAMP(expr)` | Sample variance |
 | `VAR_POP` | `VAR_POP(expr)` | Population variance |
 
-## Scalar Functions (82)
+## Scalar Functions (89)
 
 ### String Functions (24)
 
@@ -77,7 +77,7 @@ Aggregate functions operate on a set of rows and return a single value. Used wit
 | `POWER` | `POWER(base, exp)` | Exponentiation |
 | `POW` | `POW(base, exp)` | Alias for POWER |
 | `SQRT` | `SQRT(n)` | Square root |
-| `LOG` | `LOG(n)`, `LOG(base, n)` | Natural log or log with base |
+| `LOG` | `LOG(n)`, `LOG(base, n)` | Base-10 log, or log with specified base |
 | `LOG10` | `LOG10(n)` | Base-10 logarithm |
 | `LOG2` | `LOG2(n)` | Base-2 logarithm |
 | `LN` | `LN(n)` | Natural logarithm |
@@ -97,6 +97,7 @@ Aggregate functions operate on a set of rows and return a single value. Used wit
 |----------|--------|-------------|
 | `NOW` | `NOW()` | Current date and time |
 | `CURRENT_DATE` | `CURRENT_DATE` | Current date |
+| `CURRENT_TIME` | `CURRENT_TIME` | Current time as HH:MM:SS |
 | `CURRENT_TIMESTAMP` | `CURRENT_TIMESTAMP` | Current date and time (alias for NOW) |
 | `DATE_TRUNC` | `DATE_TRUNC(unit, timestamp)` | Truncate timestamp to unit |
 | `TIME_TRUNC` | `TIME_TRUNC(unit, timestamp)` | Truncate time to unit |
@@ -107,12 +108,11 @@ Aggregate functions operate on a set of rows and return a single value. Used wit
 | `HOUR` | `HOUR(timestamp)` | Extract hour |
 | `MINUTE` | `MINUTE(timestamp)` | Extract minute |
 | `SECOND` | `SECOND(timestamp)` | Extract second |
-| `DATE_ADD` | `DATE_ADD(timestamp, INTERVAL n unit)` | Add interval to date |
-| `DATE_SUB` | `DATE_SUB(timestamp, INTERVAL n unit)` | Subtract interval from date |
+| `DATE_ADD` | `DATE_ADD(timestamp, n [, unit])` | Add interval to date |
+| `DATE_SUB` | `DATE_SUB(timestamp, n [, unit])` | Subtract interval from date |
 | `DATEDIFF` | `DATEDIFF(date1, date2)` | Difference between dates in days |
 | `DATE_DIFF` | `DATE_DIFF(date1, date2)` | Alias for DATEDIFF |
 | `TO_CHAR` | `TO_CHAR(timestamp, format)` | Format timestamp as string |
-| `VERSION` | `VERSION()` | Database version string |
 
 ### JSON Functions (8)
 
@@ -149,14 +149,31 @@ JSON shorthand operators are also supported:
 |----------|--------|-------------|
 | `CAST` | `CAST(expr AS type)` | Convert to another data type |
 | `TYPEOF` | `TYPEOF(expr)` | Return the data type name |
-| `COLLATE` | `expr COLLATE collation` | Apply collation for comparison |
+| `COLLATE` | `COLLATE(expr, collation)` | Apply collation for comparison |
 | `GREATEST` | `GREATEST(val1, val2, ...)` | Largest value from list |
 | `LEAST` | `LEAST(val1, val2, ...)` | Smallest value from list |
 
-### System Functions (1)
+### Vector Functions (7)
 
 | Function | Syntax | Description |
 |----------|--------|-------------|
+| `VEC_DISTANCE_L2` | `VEC_DISTANCE_L2(vec_a, vec_b)` | Euclidean (L2) distance between vectors |
+| `VEC_DISTANCE_COSINE` | `VEC_DISTANCE_COSINE(vec_a, vec_b)` | Cosine distance (1 - cosine similarity) |
+| `VEC_DISTANCE_IP` | `VEC_DISTANCE_IP(vec_a, vec_b)` | Negative inner product distance (-dot product) |
+| `VEC_DIMS` | `VEC_DIMS(vec)` | Number of dimensions in a vector |
+| `VEC_NORM` | `VEC_NORM(vec)` | L2 norm (magnitude) of a vector |
+| `VEC_TO_TEXT` | `VEC_TO_TEXT(vec)` | Convert vector to text representation |
+| `EMBED`* | `EMBED(text)` | Convert text to 384-dim semantic embedding (MiniLM-L6-v2) |
+
+\* Requires `--features semantic`. See [Semantic Search]({% link _docs/data-types/semantic-search.md %}) for details.
+
+See [Vector Search]({% link _docs/data-types/vector-search.md %}) for usage examples and HNSW index documentation.
+
+### System Functions (2)
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `VERSION` | `VERSION()` | Database version string |
 | `SLEEP` | `SLEEP(seconds)` | Pause execution (for testing) |
 
 ## Window Functions (11)

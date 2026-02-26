@@ -359,11 +359,57 @@ pub trait Index: Send + Sync {
         None // Default implementation - only B-tree indexes support this
     }
 
+    /// Searches for the k nearest neighbors to a query vector.
+    ///
+    /// Only implemented by HNSW indexes. Returns `None` for non-vector indexes.
+    ///
+    /// # Arguments
+    /// * `query` - The query vector as Extension(Vector) value
+    /// * `k` - Number of nearest neighbors to return
+    /// * `ef_search` - Search beam width (higher = better recall, slower)
+    ///
+    /// # Returns
+    /// `Some(Vec<(row_id, distance)>)` sorted by distance (closest first),
+    /// or `None` if this index doesn't support nearest neighbor search.
+    fn search_nearest(
+        &self,
+        _query: &Value,
+        _k: usize,
+        _ef_search: usize,
+    ) -> Option<Vec<(i64, f64)>> {
+        None
+    }
+
+    /// Returns the HNSW distance metric as u8 (0=L2, 1=Cosine, 2=IP).
+    /// Non-HNSW indexes return None.
+    fn hnsw_distance_metric(&self) -> Option<u8> {
+        None
+    }
+
+    /// Returns the default ef_search for HNSW indexes.
+    /// Non-HNSW indexes return None.
+    fn default_ef_search(&self) -> Option<usize> {
+        None
+    }
+
     /// Clears all data from the index without closing it.
     /// Used by TRUNCATE for O(1) memory release.
     fn clear(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Performs post-deletion maintenance on the index.
+    ///
+    /// Called by the background cleanup cycle after deleted rows have been
+    /// removed via `remove_batch_slice`. Most index types are no-ops because
+    /// `remove` already reclaims storage. HNSW overrides this to compact
+    /// the graph when the tombstone ratio exceeds a threshold.
+    fn cleanup(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Downcast to concrete type for type-specific operations (e.g., HNSW graph serialization).
+    fn as_any(&self) -> &dyn std::any::Any;
 
     /// Closes the index and releases any resources
     fn close(&mut self) -> Result<()>;

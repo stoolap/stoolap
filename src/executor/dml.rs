@@ -47,6 +47,7 @@ fn validate_coercion(
     coerced: &Value,
     column_name: &str,
     target_type: DataType,
+    vector_dimensions: u16,
 ) -> Result<()> {
     // If original was non-null but coerced is null, the conversion failed
     if !original.is_null() && coerced.is_null() {
@@ -54,6 +55,22 @@ fn validate_coercion(
             "cannot convert value '{}' to {:?} for column '{}'",
             original, target_type, column_name
         )));
+    }
+    // Validate vector dimension matches column definition
+    if target_type == DataType::Vector {
+        if let Value::Extension(data) = coerced {
+            if data.first() == Some(&(DataType::Vector as u8)) {
+                // Payload is packed LE f32 bytes after the tag byte
+                let got_dim = u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
+                // vector_dimensions == 0 means unspecified, skip check
+                if vector_dimensions > 0 && got_dim != vector_dimensions {
+                    return Err(Error::VectorDimensionMismatch {
+                        expected: vector_dimensions,
+                        got: got_dim,
+                    });
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -240,6 +257,8 @@ impl Executor {
         let column_indices: Vec<usize>;
         // Pre-compute column types for type coercion
         let column_types: Vec<crate::core::DataType>;
+        // Pre-compute vector dimensions for vector columns (0 for non-vector)
+        let column_vector_dims: Vec<u16>;
         // Pre-compute column names for error messages
         let column_names: Vec<String>;
         // Pre-compute ALL column types for default values and check constraints
@@ -276,6 +295,7 @@ impl Executor {
             if stmt.columns.is_empty() {
                 column_indices = (0..schema_column_count).collect();
                 column_types = all_column_types.clone();
+                column_vector_dims = schema.columns.iter().map(|c| c.vector_dimensions).collect();
                 // Use schema's cached column names - avoids re-collecting on every INSERT
                 column_names = schema.column_names_owned().to_vec();
             } else {
@@ -297,6 +317,10 @@ impl Executor {
                 column_types = column_indices
                     .iter()
                     .map(|&idx| schema.columns[idx].data_type)
+                    .collect();
+                column_vector_dims = column_indices
+                    .iter()
+                    .map(|&idx| schema.columns[idx].vector_dimensions)
                     .collect();
                 // Get column names for error messages
                 column_names = column_indices
@@ -378,7 +402,13 @@ impl Executor {
                     // Coerce value to target column type
                     let coerced = value.coerce_to_type(column_types[i]);
                     // Validate coercion didn't silently fail
-                    validate_coercion(value, &coerced, &column_names[i], column_types[i])?;
+                    validate_coercion(
+                        value,
+                        &coerced,
+                        &column_names[i],
+                        column_types[i],
+                        column_vector_dims[i],
+                    )?;
                     row_values[column_indices[i]] = coerced;
                 }
 
@@ -482,7 +512,13 @@ impl Executor {
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
                     // Validate coercion didn't silently fail
-                    validate_coercion(&value, &coerced, &column_names[i], column_types[i])?;
+                    validate_coercion(
+                        &value,
+                        &coerced,
+                        &column_names[i],
+                        column_types[i],
+                        column_vector_dims[i],
+                    )?;
                     row_values[column_indices[i]] = coerced;
                 }
 
@@ -590,7 +626,13 @@ impl Executor {
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
                     // Validate coercion didn't silently fail
-                    validate_coercion(&value, &coerced, &column_names[i], column_types[i])?;
+                    validate_coercion(
+                        &value,
+                        &coerced,
+                        &column_names[i],
+                        column_types[i],
+                        column_vector_dims[i],
+                    )?;
                     row_values[column_indices[i]] = coerced;
                 }
 
@@ -723,6 +765,7 @@ impl Executor {
         let (
             column_indices,
             column_types,
+            column_vector_dims,
             column_names,
             all_column_types,
             default_row_template,
@@ -732,6 +775,7 @@ impl Executor {
             (
                 cached.column_indices,
                 cached.column_types,
+                cached.column_vector_dims,
                 cached.column_names,
                 cached.all_column_types,
                 cached.default_row_template,
@@ -775,45 +819,53 @@ impl Executor {
                 })
                 .collect();
 
-            let (column_indices, column_types, column_names) = if stmt.columns.is_empty() {
-                // No columns specified - insert into all columns in order
-                let indices: Vec<usize> = (0..schema_column_count).collect();
-                let types = all_column_types.clone();
-                let names: Vec<SmartString> = schema
-                    .columns
-                    .iter()
-                    .map(|c| SmartString::new(&c.name))
-                    .collect();
-                (indices, types, names)
-            } else {
-                // Validate columns exist and pre-compute their indices
-                let col_map = schema.column_index_map();
-                let indices: Vec<usize> = stmt
-                    .columns
-                    .iter()
-                    .map(|id| {
-                        col_map
-                            .get(id.value_lower.as_str())
-                            .copied()
-                            .ok_or_else(|| Error::ColumnNotFound(id.value.to_string()))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let types: Vec<DataType> = indices
-                    .iter()
-                    .map(|&idx| schema.columns[idx].data_type)
-                    .collect();
-                let names: Vec<SmartString> = indices
-                    .iter()
-                    .map(|&idx| SmartString::new(&schema.columns[idx].name))
-                    .collect();
-                (indices, types, names)
-            };
+            let (column_indices, column_types, column_vector_dims, column_names) =
+                if stmt.columns.is_empty() {
+                    // No columns specified - insert into all columns in order
+                    let indices: Vec<usize> = (0..schema_column_count).collect();
+                    let types = all_column_types.clone();
+                    let dims: Vec<u16> =
+                        schema.columns.iter().map(|c| c.vector_dimensions).collect();
+                    let names: Vec<SmartString> = schema
+                        .columns
+                        .iter()
+                        .map(|c| SmartString::new(&c.name))
+                        .collect();
+                    (indices, types, dims, names)
+                } else {
+                    // Validate columns exist and pre-compute their indices
+                    let col_map = schema.column_index_map();
+                    let indices: Vec<usize> = stmt
+                        .columns
+                        .iter()
+                        .map(|id| {
+                            col_map
+                                .get(id.value_lower.as_str())
+                                .copied()
+                                .ok_or_else(|| Error::ColumnNotFound(id.value.to_string()))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let types: Vec<DataType> = indices
+                        .iter()
+                        .map(|&idx| schema.columns[idx].data_type)
+                        .collect();
+                    let dims: Vec<u16> = indices
+                        .iter()
+                        .map(|&idx| schema.columns[idx].vector_dimensions)
+                        .collect();
+                    let names: Vec<SmartString> = indices
+                        .iter()
+                        .map(|&idx| SmartString::new(&schema.columns[idx].name))
+                        .collect();
+                    (indices, types, dims, names)
+                };
 
             // Store in cache for next execution
             let compiled = CompiledInsert {
                 table_name: SmartString::new(table_name),
                 column_indices: Arc::new(column_indices.clone()),
                 column_types: Arc::new(column_types.clone()),
+                column_vector_dims: Arc::new(column_vector_dims.clone()),
                 column_names: Arc::new(column_names.clone()),
                 all_column_types: Arc::new(all_column_types.clone()),
                 default_row_template: Arc::new(default_row_template.clone()),
@@ -829,6 +881,7 @@ impl Executor {
             (
                 Arc::new(column_indices),
                 Arc::new(column_types),
+                Arc::new(column_vector_dims),
                 Arc::new(column_names),
                 Arc::new(all_column_types),
                 Arc::new(default_row_template),
@@ -911,6 +964,7 @@ impl Executor {
                             &coerced,
                             &column_names[value_pos],
                             column_types[value_pos],
+                            column_vector_dims[value_pos],
                         )?;
                         row_values.push(coerced);
                     } else {
@@ -989,6 +1043,7 @@ impl Executor {
                                 &coerced,
                                 &column_names[value_pos],
                                 target_type,
+                                column_vector_dims[value_pos],
                             )?;
                             row_values.push(coerced);
                         }
@@ -1212,7 +1267,7 @@ impl Executor {
         // Pre-compute column indices for correlated updates path only
         // For non-correlated path, we compile directly from source expressions
         // This avoids cloning Expression objects when they're not needed
-        let update_indices: Vec<(usize, crate::core::DataType, Expression, bool)> =
+        let update_indices: Vec<(usize, crate::core::DataType, u16, Expression, bool)> =
             if has_correlated_updates {
                 // Only clone expressions when we actually need them (correlated path)
                 {
@@ -1227,6 +1282,7 @@ impl Executor {
                                 (
                                     idx,
                                     schema.columns[idx].data_type,
+                                    schema.columns[idx].vector_dimensions,
                                     expr.clone(),
                                     is_correlated,
                                 )
@@ -1390,7 +1446,7 @@ impl Executor {
 
                 // Evaluate all update expressions
                 let mut new_values: Vec<(usize, Value)> = Vec::with_capacity(update_indices.len());
-                for (idx, col_type, expr, is_correlated) in update_indices.iter() {
+                for (idx, col_type, vec_dims, expr, is_correlated) in update_indices.iter() {
                     let evaluated = if *is_correlated {
                         // Process correlated expression - this executes the subquery
                         match self.process_correlated_expression(expr, &correlated_ctx) {
@@ -1409,7 +1465,15 @@ impl Executor {
                     };
 
                     if let Some(new_value) = evaluated {
-                        new_values.push((*idx, new_value.into_coerce_to_type(*col_type)));
+                        let coerced = new_value.coerce_to_type(*col_type);
+                        validate_coercion(
+                            &new_value,
+                            &coerced,
+                            &schema.columns[*idx].name,
+                            *col_type,
+                            *vec_dims,
+                        )?;
+                        new_values.push((*idx, coerced));
                     }
                 }
 
@@ -1423,7 +1487,7 @@ impl Executor {
             drop(scanner);
 
             // Now update using precomputed values
-            let mut setter = |mut row: Row| -> (Row, bool) {
+            let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 let pk_value = row.get(pk_idx).cloned().unwrap_or(Value::null_unknown());
 
                 if let Some(updates) = precomputed.get(&pk_value) {
@@ -1434,9 +1498,9 @@ impl Executor {
                     if has_returning {
                         returning_rows.borrow_mut().push(row.clone());
                     }
-                    (row, true)
+                    Ok((row, true))
                 } else {
-                    (row, false)
+                    Ok((row, false))
                 }
             };
 
@@ -1448,7 +1512,7 @@ impl Executor {
             use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
 
             let col_map = schema.column_index_map();
-            let compiled_updates: Vec<(usize, crate::core::DataType, SharedProgram)> =
+            let compiled_updates: Vec<(usize, crate::core::DataType, u16, SharedProgram)> =
                 if let Some(ref processed) = processed_updates {
                     // Use pre-processed expressions (subqueries already evaluated)
                     processed
@@ -1456,9 +1520,14 @@ impl Executor {
                         .filter_map(|(col_name, expr)| {
                             let col_lower = col_name.to_lowercase();
                             col_map.get(&col_lower).and_then(|&idx| {
-                                compile_expression(expr, &column_names)
-                                    .ok()
-                                    .map(|program| (idx, schema.columns[idx].data_type, program))
+                                compile_expression(expr, &column_names).ok().map(|program| {
+                                    (
+                                        idx,
+                                        schema.columns[idx].data_type,
+                                        schema.columns[idx].vector_dimensions,
+                                        program,
+                                    )
+                                })
                             })
                         })
                         .collect()
@@ -1469,9 +1538,14 @@ impl Executor {
                         .filter_map(|(col_name, expr)| {
                             let col_lower: String = col_name.to_lowercase().into();
                             col_map.get(&col_lower).and_then(|&idx| {
-                                compile_expression(expr, &column_names)
-                                    .ok()
-                                    .map(|program| (idx, schema.columns[idx].data_type, program))
+                                compile_expression(expr, &column_names).ok().map(|program| {
+                                    (
+                                        idx,
+                                        schema.columns[idx].data_type,
+                                        schema.columns[idx].vector_dimensions,
+                                        program,
+                                    )
+                                })
                             })
                         })
                         .collect()
@@ -1484,15 +1558,14 @@ impl Executor {
             let named_params = ctx.named_params();
             // Pre-compute PK column index for FK enforcement inside closure
             let pk_col_idx_for_fk = schema.pk_column_index();
-
-            let mut setter = |mut row: Row| -> (Row, bool) {
+            let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 // If we need in-memory WHERE filtering, check the condition first
                 if needs_memory_filter {
                     evaluator.set_row_array(&row);
                     if let Some(ref where_expr) = memory_where_clause {
                         match evaluator.evaluate_bool(where_expr) {
                             Ok(true) => {}
-                            _ => return (row, false),
+                            _ => return Ok((row, false)),
                         }
                     }
                 }
@@ -1503,14 +1576,29 @@ impl Executor {
                         .with_params(params)
                         .with_named_params(named_params);
 
-                    compiled_updates
-                        .iter()
-                        .filter_map(|(idx, col_type, program)| {
-                            vm.execute_cow(program, &exec_ctx)
-                                .ok()
-                                .map(|v| (*idx, v.into_coerce_to_type(*col_type)))
-                        })
-                        .collect()
+                    let mut updates = Vec::with_capacity(compiled_updates.len());
+                    for (idx, col_type, vec_dims, program) in &compiled_updates {
+                        if let Ok(v) = vm.execute_cow(program, &exec_ctx) {
+                            let coerced = v.into_coerce_to_type(*col_type);
+                            // Validate vector dimensions
+                            if *col_type == DataType::Vector && *vec_dims > 0 {
+                                if let Value::Extension(data) = &coerced {
+                                    if data.first() == Some(&(DataType::Vector as u8)) {
+                                        let got_dim =
+                                            u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
+                                        if got_dim != *vec_dims {
+                                            return Err(Error::VectorDimensionMismatch {
+                                                expected: *vec_dims,
+                                                got: got_dim,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            updates.push((*idx, coerced));
+                        }
+                    }
+                    updates
                 };
 
                 // Now apply all the computed values to the row
@@ -1548,12 +1636,12 @@ impl Executor {
                     returning_rows.borrow_mut().push(row.clone());
                 }
 
-                (row, changed)
+                Ok((row, changed))
             };
 
             // OPTIMIZATION: Use SELECT executor to find matching row_ids, then batch update.
             // This reuses ALL SELECT optimizations: indexes, semi-joins, parallel execution, etc.
-            if let Some(ref where_clause) = memory_where_clause {
+            let rows = if let Some(ref where_clause) = memory_where_clause {
                 if let Some(row_ids) = self.select_row_ids_for_dml(
                     table_name,
                     where_clause,
@@ -1568,7 +1656,8 @@ impl Executor {
                 }
             } else {
                 table.update(where_expr.as_deref(), &mut setter)?
-            }
+            };
+            rows
         };
 
         // Post-update FK validation: check new FK values reference existing parent rows
@@ -2125,7 +2214,7 @@ impl Executor {
         row_id: i64,
         _insert_values: &[Value],
         stmt: &InsertStatement,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<()> {
         // Build a WHERE clause to find the specific row by primary key
         // Use schema's cached pk_column_index for O(1) lookup
@@ -2145,14 +2234,19 @@ impl Executor {
         // OPTIMIZATION: Pre-compute column indices and types to avoid per-row linear search
         // Use cached column_index_map for O(1) lookups
         let col_map = schema.column_index_map();
-        let update_specs: Vec<(usize, crate::core::DataType, &Expression)> = stmt
+        let update_specs: Vec<(usize, crate::core::DataType, u16, &Expression)> = stmt
             .update_columns
             .iter()
             .zip(stmt.update_expressions.iter())
             .filter_map(|(col, expr)| {
-                col_map
-                    .get(col.value_lower.as_str())
-                    .map(|&idx| (idx, schema.columns[idx].data_type, expr))
+                col_map.get(col.value_lower.as_str()).map(|&idx| {
+                    (
+                        idx,
+                        schema.columns[idx].data_type,
+                        schema.columns[idx].vector_dimensions,
+                        expr,
+                    )
+                })
             })
             .collect();
 
@@ -2160,32 +2254,58 @@ impl Executor {
 
         // Pre-compile update expressions for efficient evaluation
         use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
-        let compiled_updates: Vec<(usize, crate::core::DataType, SharedProgram)> = update_specs
-            .iter()
-            .filter_map(|(idx, col_type, expr)| {
-                compile_expression(expr, &column_names)
-                    .ok()
-                    .map(|program| (*idx, *col_type, program))
-            })
-            .collect();
+        let compiled_updates: Vec<(usize, crate::core::DataType, u16, SharedProgram)> =
+            update_specs
+                .iter()
+                .filter_map(|(idx, col_type, vec_dims, expr)| {
+                    compile_expression(expr, &column_names)
+                        .ok()
+                        .map(|program| (*idx, *col_type, *vec_dims, program))
+                })
+                .collect();
 
         // Create VM once and reuse for all rows
         let mut vm = ExprVM::new();
 
+        // Extract params from execution context for use in the setter closure
+        let params = ctx.params();
+        let named_params = ctx.named_params();
+
         // Create a setter function that applies the ON DUPLICATE KEY UPDATE
-        let mut setter = |mut row: Row| -> (Row, bool) {
+        let mut setter = |mut row: Row| -> Result<(Row, bool)> {
             // Collect all updates first to avoid borrow conflicts
             let updates_to_apply: Vec<(usize, Value)> = {
-                let exec_ctx = ExecuteContext::new(&row);
+                let mut exec_ctx = ExecuteContext::new(&row);
+                if !params.is_empty() {
+                    exec_ctx = exec_ctx.with_params(params);
+                }
+                if !named_params.is_empty() {
+                    exec_ctx = exec_ctx.with_named_params(named_params);
+                }
 
-                compiled_updates
-                    .iter()
-                    .filter_map(|(idx, col_type, program)| {
-                        vm.execute_cow(program, &exec_ctx)
-                            .ok()
-                            .map(|v| (*idx, v.into_coerce_to_type(*col_type)))
-                    })
-                    .collect()
+                let mut updates = Vec::with_capacity(compiled_updates.len());
+                for (idx, col_type, vec_dims, program) in &compiled_updates {
+                    if let Ok(v) = vm.execute_cow(program, &exec_ctx) {
+                        let coerced = v.into_coerce_to_type(*col_type);
+                        // Validate vector dimensions
+                        if *col_type == DataType::Vector && *vec_dims > 0 {
+                            if let Value::Extension(data) = &coerced {
+                                if data.first() == Some(&(DataType::Vector as u8)) {
+                                    let got_dim =
+                                        u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
+                                    if got_dim != *vec_dims {
+                                        return Err(Error::VectorDimensionMismatch {
+                                            expected: *vec_dims,
+                                            got: got_dim,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        updates.push((*idx, coerced));
+                    }
+                }
+                updates
             };
 
             // Now apply updates
@@ -2194,7 +2314,7 @@ impl Executor {
                 let _ = row.set(idx, new_value);
             }
 
-            (row, changed)
+            Ok((row, changed))
         };
 
         // Update the row

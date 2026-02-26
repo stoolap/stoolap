@@ -475,7 +475,7 @@ fn cascade_update(
 
     let count = child.update(Some(&expr), &mut |mut row| {
         let _ = row.set(col_idx, new_val.clone());
-        (row, true)
+        Ok((row, true))
     })?;
     // Do NOT commit here — changes committed atomically with parent transaction.
 
@@ -521,7 +521,7 @@ fn set_null_on_delete(
 
     let count = child.update(Some(&expr), &mut |mut row| {
         let _ = row.set(col_idx, null_val.clone());
-        (row, true)
+        Ok((row, true))
     })?;
     // Do NOT commit here — changes committed atomically with parent transaction.
 

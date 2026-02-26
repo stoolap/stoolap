@@ -152,6 +152,10 @@ This feature enables powerful use cases:
 - Transaction-based queries are generally faster than timestamp-based queries
 - Using indexes with AS OF queries provides the same benefits as regular queries
 
+### VACUUM Warning
+
+Running `VACUUM` (or `PRAGMA vacuum`) permanently removes all historical row versions not needed by currently active transactions. After a VACUUM, AS OF TIMESTAMP queries referencing timestamps before the VACUUM will no longer return results. If you rely on time-travel queries, use the background cleanup (which preserves a configurable retention window) instead of VACUUM.
+
 ### Limitations
 
 - Subqueries with AS OF are not yet supported
@@ -200,5 +204,5 @@ The AS OF feature is the foundation for Stoolap's planned "Git for Data" functio
 
 ## See Also
 
-- [MVCC Implementation](../architecture/mvcc-implementation)
-- [Transaction Isolation](../architecture/transaction-isolation)
+- [MVCC Implementation]({% link _docs/architecture/mvcc-implementation.md %})
+- [Transaction Isolation]({% link _docs/architecture/transaction-isolation.md %})

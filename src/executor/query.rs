@@ -1667,6 +1667,27 @@ impl Executor {
             }
         }
 
+        // FAST PATH: Vector search optimization (HNSW index or parallel brute-force)
+        // For queries like `SELECT id, VEC_DISTANCE_L2(embedding, '...') AS dist
+        //   FROM documents ORDER BY dist LIMIT 10`
+        // Supports WHERE: brute-force pre-filters rows; HNSW oversamples then post-filters
+        // Skip when transaction has local changes — HNSW index and collect_rows_by_ids
+        // only see committed data, so local INSERTs/UPDATEs would be missed.
+        if classification.has_limit
+            && stmt.order_by.len() == 1
+            && !classification.has_group_by
+            && !classification.has_aggregation
+            && !classification.has_window_functions
+            && !classification.has_distinct
+            && !table.has_local_changes()
+        {
+            if let Some((result, columns)) =
+                self.try_vector_search_optimization(stmt, &*table, &all_columns, ctx)?
+            {
+                return Ok((result, columns, true, None));
+            }
+        }
+
         // FAST PATH: Keyset pagination optimization
         // For queries like `SELECT * FROM table WHERE id > X ORDER BY id LIMIT Y`,
         // use the PK's ordering to start iteration from X directly.
@@ -6842,7 +6863,7 @@ impl Executor {
     pub(crate) fn execute_pragma(
         &self,
         stmt: &PragmaStatement,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         let pragma_name = stmt.name.value.to_uppercase();
 
@@ -6982,11 +7003,69 @@ impl Executor {
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
             }
+            "VACUUM" => {
+                if stmt.value.is_some() {
+                    return Err(Error::internal("PRAGMA VACUUM does not accept values"));
+                }
+                // Delegate to the unified VACUUM implementation (no table filter)
+                let vacuum_stmt = crate::parser::ast::VacuumStatement {
+                    token: stmt.token.clone(),
+                    table_name: None,
+                };
+                self.execute_vacuum(&vacuum_stmt, ctx)
+            }
             _ => {
                 // Unknown pragma - return empty result for compatibility
                 Ok(Box::new(ExecResult::empty()))
             }
         }
+    }
+
+    /// Execute VACUUM statement — manual cleanup of deleted rows and index compaction
+    ///
+    /// VACUUM aggressively reclaims storage by removing deleted rows, pruning old
+    /// version chains, and cleaning up stale transaction metadata. Unlike background
+    /// cleanup (which uses a 5-minute retention), VACUUM uses zero retention so all
+    /// historical versions not needed by active transactions are removed.
+    ///
+    /// Safety: `cleanup_deleted_rows` and `cleanup_old_previous_versions_with_retention`
+    /// check active transaction visibility before removing any version, so concurrent
+    /// readers are never disrupted. However, AS OF TIMESTAMP queries that reference
+    /// timestamps before the VACUUM will no longer work — this is intentional.
+    pub(crate) fn execute_vacuum(
+        &self,
+        stmt: &VacuumStatement,
+        _ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        // VACUUM must not run inside an explicit transaction
+        let active_tx = self.active_transaction.lock().unwrap();
+        if active_tx.is_some() {
+            return Err(Error::internal(
+                "VACUUM cannot be executed within an active transaction",
+            ));
+        }
+        drop(active_tx);
+
+        let retention = std::time::Duration::ZERO;
+        let table_name = stmt.table_name.as_ref().map(|id| id.value_lower.as_str());
+
+        let cleaned = self.engine.vacuum(table_name, retention)?;
+
+        let columns = vec![
+            "deleted_rows_cleaned".to_string(),
+            "old_versions_cleaned".to_string(),
+            "transactions_cleaned".to_string(),
+        ];
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((
+            0,
+            Row::from_values(vec![
+                Value::Integer(cleaned.0 as i64),
+                Value::Integer(cleaned.1 as i64),
+                Value::Integer(cleaned.2 as i64),
+            ]),
+        ));
+        Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
 
     /// Extract integer value from PRAGMA value expression

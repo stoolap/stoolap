@@ -467,6 +467,9 @@ pub struct MVCCEngine {
     /// Cached reverse FK mapping: parent_table → Vec<(child_table, FK constraint)>
     /// Rebuilt lazily on schema_epoch change. Zero cost for non-FK databases.
     fk_reverse_cache: RwLock<FkReverseCache>,
+    /// Snapshot timestamps loaded per table — used to pair HNSW graph files with their
+    /// matching data snapshots during WAL replay.
+    snapshot_timestamps: RwLock<FxHashMap<String, String>>,
 }
 
 impl MVCCEngine {
@@ -506,6 +509,7 @@ impl MVCCEngine {
             schema_epoch: AtomicU64::new(0),
             cleanup_handle: Mutex::new(None),
             fk_reverse_cache: RwLock::new((u64::MAX, StringMap::default())),
+            snapshot_timestamps: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -686,6 +690,19 @@ impl MVCCEngine {
                         any_snapshot_loaded = true;
                         if source_lsn < min_header_lsn {
                             min_header_lsn = source_lsn;
+                        }
+                        // Extract timestamp from snapshot filename for HNSW graph pairing.
+                        // Format: "snapshot-{timestamp}.bin" → extract "{timestamp}"
+                        if let Some(fname) = snapshot_path.file_name().and_then(|n| n.to_str()) {
+                            if let Some(ts) = fname
+                                .strip_prefix("snapshot-")
+                                .and_then(|s| s.strip_suffix(".bin"))
+                            {
+                                self.snapshot_timestamps
+                                    .write()
+                                    .unwrap()
+                                    .insert(table_name.clone(), ts.to_string());
+                            }
                         }
                         break; // Successfully loaded, stop trying older snapshots
                     }
@@ -898,7 +915,61 @@ impl MVCCEngine {
                 if let Ok(index_meta) = IndexMetadata::deserialize(&entry.data) {
                     let table_name = entry.table_name.to_lowercase();
                     if let Ok(store) = self.get_version_store(&table_name) {
-                        let _ = store.create_index_from_metadata(&index_meta, true);
+                        // For HNSW indexes, try loading saved graph from snapshot dir.
+                        // Use the timestamped graph file matching the loaded data snapshot
+                        // to avoid row_id mismatches on fallback recovery.
+                        let hnsw_graph_path = if index_meta.index_type
+                            == crate::core::IndexType::Hnsw
+                        {
+                            if let Some(ref pm) = *self.persistence {
+                                let dir = pm.path().join("snapshots").join(&table_name);
+                                if dir.exists() {
+                                    // Look up the timestamp of the loaded snapshot
+                                    let ts = self
+                                        .snapshot_timestamps
+                                        .read()
+                                        .unwrap()
+                                        .get(&table_name)
+                                        .cloned();
+                                    if let Some(ts) = ts {
+                                        // Try timestamped file first (new format)
+                                        let timestamped = dir
+                                            .join(format!("hnsw_{}-{}.bin", index_meta.name, ts));
+                                        if timestamped.exists() {
+                                            Some(timestamped)
+                                        } else {
+                                            // Backwards compat: try old non-timestamped format
+                                            let old =
+                                                dir.join(format!("hnsw_{}.bin", index_meta.name));
+                                            if old.exists() {
+                                                Some(old)
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        // No snapshot loaded (pure WAL replay), try old format
+                                        let old = dir.join(format!("hnsw_{}.bin", index_meta.name));
+                                        if old.exists() {
+                                            Some(old)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let _ = store.create_index_from_metadata_with_graph(
+                            &index_meta,
+                            true,
+                            hnsw_graph_path.as_deref(),
+                        );
                     }
                 }
             }
@@ -1024,12 +1095,21 @@ impl MVCCEngine {
                 .map_err(|e| Error::internal(format!("invalid column name: {}", e)))?;
             pos += col_name_len;
 
-            // Data type (1 byte)
+            // Data type (1 byte, + 2 bytes dimension for Vector)
             if pos >= data.len() {
                 return Err(Error::internal("invalid schema: missing data type"));
             }
-            let data_type = DataType::from_u8(data[pos]).unwrap_or(DataType::Null);
+            let dt_tag = data[pos];
             pos += 1;
+            let data_type = DataType::from_u8(dt_tag).unwrap_or(DataType::Null);
+            let mut vector_dimensions: u16 = 0;
+            if dt_tag == 7 {
+                // Vector type: read 2 bytes for dimension
+                if pos + 2 <= data.len() {
+                    vector_dimensions = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                    pos += 2;
+                }
+            }
 
             // Nullable (1 byte)
             if pos >= data.len() {
@@ -1086,7 +1166,7 @@ impl MVCCEngine {
                 None
             };
 
-            columns.push(SchemaColumn::with_constraints(
+            let mut col = SchemaColumn::with_constraints(
                 i,
                 &col_name,
                 data_type,
@@ -1095,7 +1175,9 @@ impl MVCCEngine {
                 auto_increment,
                 default_expr,
                 check_expr,
-            ));
+            );
+            col.vector_dimensions = vector_dimensions;
+            columns.push(col);
         }
 
         // Foreign key constraints (optional for backwards compatibility)
@@ -1322,13 +1404,19 @@ impl MVCCEngine {
                     .map_err(|e| Error::internal(format!("invalid column name: {}", e)))?;
                 pos += col_name_len;
 
-                // Read data type
+                // Read data type (1 byte, + 2 bytes dimension for Vector)
                 if pos >= data.len() {
                     return Err(Error::internal("invalid AddColumn data: missing data type"));
                 }
-                let data_type = DataType::from_u8(data[pos])
+                let dt_tag = data[pos];
+                let data_type = DataType::from_u8(dt_tag)
                     .ok_or_else(|| Error::internal("invalid data type byte"))?;
                 pos += 1;
+                let mut vector_dimensions: u16 = 0;
+                if data_type == DataType::Vector && pos + 2 <= data.len() {
+                    vector_dimensions = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                    pos += 2;
+                }
 
                 // Read nullable
                 if pos >= data.len() {
@@ -1354,13 +1442,13 @@ impl MVCCEngine {
                 };
 
                 // Apply the ADD COLUMN using engine method
-                // Note: create_column doesn't support default_expr, so we need enhanced version
                 self.create_column_with_default(
                     &table_name,
                     &column_name,
                     data_type,
                     nullable,
                     default_expr,
+                    vector_dimensions,
                 )?;
             }
             2 => {
@@ -1449,7 +1537,7 @@ impl MVCCEngine {
                     .map_err(|e| Error::internal(format!("invalid column name: {}", e)))?;
                 pos += col_name_len;
 
-                // Read data type
+                // Read data type (1 byte, + 2 bytes dimension for Vector)
                 if pos >= data.len() {
                     return Err(Error::internal(
                         "invalid ModifyColumn data: missing data type",
@@ -1458,6 +1546,11 @@ impl MVCCEngine {
                 let data_type = DataType::from_u8(data[pos])
                     .ok_or_else(|| Error::internal("invalid data type byte"))?;
                 pos += 1;
+                let mut vector_dimensions: u16 = 0;
+                if data_type == DataType::Vector && pos + 2 <= data.len() {
+                    vector_dimensions = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                    pos += 2;
+                }
 
                 // Read nullable
                 if pos >= data.len() {
@@ -1468,7 +1561,13 @@ impl MVCCEngine {
                 let nullable = data[pos] != 0;
 
                 // Apply the MODIFY COLUMN using engine method
-                self.modify_column(&table_name, &column_name, data_type, nullable)?;
+                self.modify_column_with_dimensions(
+                    &table_name,
+                    &column_name,
+                    data_type,
+                    nullable,
+                    vector_dimensions,
+                )?;
             }
             5 => {
                 // RenameTable - special handling since table name changes
@@ -1542,8 +1641,11 @@ impl MVCCEngine {
             buf.extend_from_slice(&(col.name.len() as u16).to_le_bytes());
             buf.extend_from_slice(col.name.as_bytes());
 
-            // Data type (1 byte)
+            // Data type (1 byte, + 2 bytes dimension for Vector)
             buf.push(col.data_type.as_u8());
+            if col.data_type == DataType::Vector {
+                buf.extend_from_slice(&col.vector_dimensions.to_le_bytes());
+            }
 
             // Nullable (1 byte)
             buf.push(if col.nullable { 1 } else { 0 });
@@ -1845,6 +1947,7 @@ impl MVCCEngine {
         data_type: DataType,
         nullable: bool,
         default_expr: Option<String>,
+        vector_dimensions: u16,
     ) -> Result<()> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
@@ -1878,6 +1981,7 @@ impl MVCCEngine {
                     false,
                 );
                 col.default_expr = default_expr;
+                col.vector_dimensions = vector_dimensions;
                 vs_schema.add_column(col)?;
             }
         }
@@ -2067,6 +2171,67 @@ impl MVCCEngine {
                     Some(data_type),
                     Some(nullable),
                 )?;
+            }
+        }
+
+        // Sync engine schema cache from version store
+        {
+            let vs_schema = {
+                let stores = self.version_stores.read().unwrap();
+                stores
+                    .get(&table_name_lower)
+                    .map(|store| store.schema().clone())
+            };
+            if let Some(schema) = vs_schema {
+                let mut schemas = self.schemas.write().unwrap();
+                schemas.insert(table_name_lower, schema);
+            }
+        }
+
+        // Increment schema epoch for cache invalidation
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+
+        Ok(())
+    }
+
+    /// Modifies a column's type, nullable, and vector dimensions
+    /// Used by WAL replay to restore ALTER TABLE MODIFY COLUMN with full dimension info
+    pub fn modify_column_with_dimensions(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        data_type: DataType,
+        nullable: bool,
+        vector_dimensions: u16,
+    ) -> Result<()> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+
+        let table_name_lower = table_name.to_lowercase();
+
+        // Validate under read lock first
+        {
+            let schemas = self.schemas.read().unwrap();
+            let schema_arc = schemas
+                .get(&table_name_lower)
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
+            if !schema_arc.has_column(column_name) {
+                return Err(Error::ColumnNotFound(column_name.to_string()));
+            }
+        }
+
+        // Update version store schema first (source of truth)
+        {
+            let stores = self.version_stores.read().unwrap();
+            if let Some(store) = stores.get(&table_name_lower) {
+                let mut vs_schema_guard = store.schema_mut();
+                let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                vs_schema.modify_column(column_name, Some(data_type), Some(nullable))?;
+                // Set vector_dimensions on the modified column
+                if let Some(idx) = vs_schema.get_column_index(column_name) {
+                    vs_schema.columns[idx].vector_dimensions = vector_dimensions;
+                }
             }
         }
 
@@ -2580,6 +2745,41 @@ impl Engine for MVCCEngine {
                     break;
                 }
 
+                // Save HNSW graph files for this table (timestamped to match data snapshot)
+                if let Some(store) = stores.get(table_name) {
+                    let mut graph_error = false;
+                    for idx in store.get_all_indexes() {
+                        if idx.index_type() == crate::core::IndexType::Hnsw {
+                            if let Some(hnsw_idx) = idx
+                                .as_any()
+                                .downcast_ref::<crate::storage::index::HnswIndex>()
+                            {
+                                if hnsw_idx.node_count() > 0 {
+                                    let graph_path = table_snapshot_dir.join(format!(
+                                        "hnsw_{}-{}.bin",
+                                        idx.name(),
+                                        timestamp
+                                    ));
+                                    if let Err(e) = hnsw_idx.save_graph(&graph_path) {
+                                        eprintln!(
+                                            "Warning: Failed to save HNSW graph for {}.{}: {}",
+                                            table_name,
+                                            idx.name(),
+                                            e
+                                        );
+                                        graph_error = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if graph_error {
+                        all_succeeded = false;
+                        break;
+                    }
+                }
+
                 // Track this temp file for later rename
                 pending_snapshots.push((temp_path, final_path, table_name.clone()));
             }
@@ -2724,6 +2924,7 @@ impl Engine for MVCCEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_create_index(
         &self,
         table_name: &str,
@@ -2731,6 +2932,10 @@ impl Engine for MVCCEngine {
         column_names: &[String],
         is_unique: bool,
         index_type: crate::core::IndexType,
+        hnsw_m: Option<u16>,
+        hnsw_ef_construction: Option<u16>,
+        hnsw_ef_search: Option<u16>,
+        hnsw_distance_metric: Option<u8>,
     ) -> Result<()> {
         if self.should_skip_wal() {
             return Ok(());
@@ -2764,6 +2969,10 @@ impl Engine for MVCCEngine {
             data_types,
             is_unique,
             index_type,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_ef_search,
+            hnsw_distance_metric,
         };
 
         // Serialize and record to WAL
@@ -2791,13 +3000,14 @@ impl Engine for MVCCEngine {
         data_type: crate::core::DataType,
         nullable: bool,
         default_expr: Option<&str>,
+        vector_dimensions: u16,
     ) -> Result<()> {
         if self.should_skip_wal() {
             return Ok(());
         }
 
         // Serialize: operation_type(1) + table_name_len(2) + table_name + column_name_len(2) + column_name
-        //          + data_type(1) + nullable(1) + default_expr_len(2) + default_expr
+        //          + data_type(1) + [IF Vector: vec_dims(2)] + nullable(1) + default_expr_len(2) + default_expr
         let mut data = Vec::new();
         data.push(1u8); // Operation type: AddColumn = 1
 
@@ -2809,8 +3019,11 @@ impl Engine for MVCCEngine {
         data.extend_from_slice(&(column_name.len() as u16).to_le_bytes());
         data.extend_from_slice(column_name.as_bytes());
 
-        // Data type
-        data.push(data_type as u8);
+        // Data type (1 byte, + 2 bytes dimension for Vector)
+        data.push(data_type.as_u8());
+        if data_type == DataType::Vector {
+            data.extend_from_slice(&vector_dimensions.to_le_bytes());
+        }
 
         // Nullable
         data.push(if nullable { 1 } else { 0 });
@@ -2882,13 +3095,14 @@ impl Engine for MVCCEngine {
         column_name: &str,
         data_type: crate::core::DataType,
         nullable: bool,
+        vector_dimensions: u16,
     ) -> Result<()> {
         if self.should_skip_wal() {
             return Ok(());
         }
 
         // Serialize: operation_type(1) + table_name_len(2) + table_name
-        //          + column_name_len(2) + column_name + data_type(1) + nullable(1)
+        //          + column_name_len(2) + column_name + data_type(1) + [IF Vector: vec_dims(2)] + nullable(1)
         let mut data = Vec::new();
         data.push(4u8); // Operation type: ModifyColumn = 4
 
@@ -2900,8 +3114,11 @@ impl Engine for MVCCEngine {
         data.extend_from_slice(&(column_name.len() as u16).to_le_bytes());
         data.extend_from_slice(column_name.as_bytes());
 
-        // Data type
-        data.push(data_type as u8);
+        // Data type (1 byte, + 2 bytes dimension for Vector)
+        data.push(data_type.as_u8());
+        if data_type == DataType::Vector {
+            data.extend_from_slice(&vector_dimensions.to_le_bytes());
+        }
 
         // Nullable
         data.push(if nullable { 1 } else { 0 });
@@ -3103,6 +3320,43 @@ impl MVCCEngine {
         }
 
         total_cleaned
+    }
+
+    /// Manual VACUUM: cleanup deleted rows, old versions, and stale transactions.
+    ///
+    /// When `table_name` is `Some`, only that table is vacuumed.
+    /// Returns `(deleted_rows_cleaned, old_versions_cleaned, transactions_cleaned)`.
+    pub fn vacuum(
+        &self,
+        table_name: Option<&str>,
+        retention: std::time::Duration,
+    ) -> crate::core::Result<(i32, i32, i32)> {
+        if !self.is_open() {
+            return Ok((0, 0, 0));
+        }
+
+        let txn_cleaned = self.cleanup_old_transactions(retention);
+
+        let stores = self.version_stores.read().unwrap();
+
+        let mut rows_cleaned = 0;
+        let mut versions_cleaned = 0;
+
+        if let Some(name) = table_name {
+            if let Some(store) = stores.get(name) {
+                rows_cleaned += store.cleanup_deleted_rows(retention);
+                versions_cleaned += store.cleanup_old_previous_versions_with_retention(retention);
+            } else {
+                return Err(crate::core::Error::TableNotFound(name.to_string()));
+            }
+        } else {
+            for store in stores.values() {
+                rows_cleaned += store.cleanup_deleted_rows(retention);
+                versions_cleaned += store.cleanup_old_previous_versions_with_retention(retention);
+            }
+        }
+
+        Ok((rows_cleaned, versions_cleaned, txn_cleaned))
     }
 
     /// Start periodic cleanup of old transactions and deleted rows

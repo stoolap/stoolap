@@ -60,6 +60,7 @@ impl Parser {
                     .parse_set_statement()
                     .map(|s| Statement::Set(Box::new(s))),
                 "PRAGMA" => self.parse_pragma_statement().map(Statement::Pragma),
+                "VACUUM" => self.parse_vacuum_statement().map(Statement::Vacuum),
                 "SHOW" => self.parse_show_statement(),
                 "DESCRIBE" | "DESC" => self.parse_describe_statement().map(Statement::Describe),
                 "EXPLAIN" => self.parse_explain_statement().map(Statement::Explain),
@@ -1277,6 +1278,25 @@ impl Parser {
         Some(TruncateStatement { token, table_name })
     }
 
+    /// Parse a VACUUM statement
+    /// VACUUM [table_name]
+    fn parse_vacuum_statement(&mut self) -> Option<VacuumStatement> {
+        let token = self.cur_token.clone();
+
+        // Optional table name
+        let table_name = if self.peek_token_is(TokenType::Identifier) {
+            self.next_token();
+            Some(Identifier::new(
+                self.cur_token.clone(),
+                self.cur_token.literal.clone(),
+            ))
+        } else {
+            None
+        };
+
+        Some(VacuumStatement { token, table_name })
+    }
+
     /// Parse a CREATE statement
     fn parse_create_statement(&mut self) -> Option<Statement> {
         if self.peek_token_is_keyword("TABLE") {
@@ -1658,6 +1678,37 @@ impl Parser {
             }
         }
 
+        // Handle VECTOR(dimension) syntax — rewrite data_type to "VECTOR(N)" for DataType::FromStr
+        let data_type = if data_type == "VECTOR" && self.peek_token_is_punctuator("(") {
+            self.next_token(); // consume (
+            if self.peek_token.token_type != TokenType::Integer {
+                self.add_error(
+                    "VECTOR requires a positive integer dimension, e.g. VECTOR(384)".to_string(),
+                );
+                return None;
+            }
+            self.next_token(); // consume dimension number
+            let dim_str = &self.cur_token.literal;
+            let dim: u16 = match dim_str.parse::<u16>() {
+                Ok(d) if d > 0 => d,
+                _ => {
+                    self.add_error(format!(
+                        "VECTOR dimension must be between 1 and 65535, got '{}'",
+                        dim_str
+                    ));
+                    return None;
+                }
+            };
+            // Consume closing )
+            if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+                self.add_error("expected ) after VECTOR dimension".to_string());
+                return None;
+            }
+            SmartString::from_string(format!("VECTOR({})", dim))
+        } else {
+            data_type
+        };
+
         // Parse constraints
         let mut constraints = Vec::new();
         while self.peek_token_is(TokenType::Keyword) {
@@ -1809,9 +1860,10 @@ impl Parser {
                 "BTREE" | "B_TREE" => Some(IndexMethod::BTree),
                 "HASH" => Some(IndexMethod::Hash),
                 "BITMAP" => Some(IndexMethod::Bitmap),
+                "HNSW" => Some(IndexMethod::Hnsw),
                 _ => {
                     self.add_error(format!(
-                        "unknown index method '{}'. Supported methods: BTREE, HASH, BITMAP",
+                        "unknown index method '{}'. Supported methods: BTREE, HASH, BITMAP, HNSW",
                         self.cur_token.literal
                     ));
                     return None;
@@ -1819,6 +1871,78 @@ impl Parser {
             }
         } else {
             None
+        };
+
+        // Parse optional WITH clause: WITH (key = value, ...)
+        let options = if self.peek_token_is_keyword("WITH") {
+            self.next_token(); // consume WITH
+            if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
+                self.add_error(format!(
+                    "expected '(' after WITH at {}",
+                    self.cur_token.position
+                ));
+                return None;
+            }
+            let mut opts = Vec::new();
+            loop {
+                // Parse key
+                if !self.expect_peek(TokenType::Identifier) {
+                    return None;
+                }
+                let key = self.cur_token.literal.to_lowercase().to_string();
+
+                // Parse = (tokenized as Operator, not Punctuator)
+                if !self.expect_peek(TokenType::Operator) || self.cur_token.literal != "=" {
+                    self.add_error(format!(
+                        "expected '=' after option name at {}",
+                        self.cur_token.position
+                    ));
+                    return None;
+                }
+
+                // Parse value (integer, string literal, or identifier)
+                self.next_token();
+                let value = match self.cur_token.token_type {
+                    TokenType::Integer => self.cur_token.literal.to_string(),
+                    TokenType::String => {
+                        // Strip surrounding quotes from string literals
+                        let lit = &self.cur_token.literal;
+                        if lit.len() >= 2
+                            && (lit.starts_with('\'') || lit.starts_with('"'))
+                            && lit.ends_with(lit.chars().next().unwrap())
+                        {
+                            lit[1..lit.len() - 1].to_string()
+                        } else {
+                            lit.to_string()
+                        }
+                    }
+                    TokenType::Identifier => self.cur_token.literal.to_lowercase().to_string(),
+                    TokenType::Keyword => self.cur_token.literal.to_lowercase().to_string(),
+                    _ => {
+                        self.add_error(format!(
+                            "expected value for option '{}' at {}",
+                            key, self.cur_token.position
+                        ));
+                        return None;
+                    }
+                };
+
+                opts.push((key, value));
+
+                // Check for comma or closing paren
+                if self.peek_token_is(TokenType::Punctuator) && self.peek_token.literal == "," {
+                    self.next_token(); // consume comma
+                } else {
+                    break;
+                }
+            }
+            if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+                self.add_error(format!("expected ')' at {}", self.cur_token.position));
+                return None;
+            }
+            opts
+        } else {
+            Vec::new()
         };
 
         Some(CreateIndexStatement {
@@ -1829,6 +1953,7 @@ impl Parser {
             is_unique,
             if_not_exists,
             index_method,
+            options,
         })
     }
 
@@ -2336,7 +2461,8 @@ impl Parser {
         let token = self.cur_token.clone();
 
         self.next_token();
-        if !self.cur_token_is(TokenType::Identifier) {
+        // Accept both identifiers and keywords as pragma names (e.g., PRAGMA vacuum)
+        if !self.cur_token_is(TokenType::Identifier) && !self.cur_token_is(TokenType::Keyword) {
             self.add_error(format!(
                 "expected pragma name at {}",
                 self.cur_token.position

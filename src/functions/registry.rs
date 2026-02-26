@@ -36,6 +36,12 @@ use super::aggregate::{
     StddevSampFunction, StringAggFunction, SumFunction, VarPopFunction, VarSampFunction,
     VarianceFunction,
 };
+#[cfg(feature = "semantic")]
+use super::scalar::semantic::EmbedFunction;
+use super::scalar::vector::{
+    VecDimsFunction, VecDistanceCosineFunction, VecDistanceIpFunction, VecDistanceL2Function,
+    VecNormFunction, VecToTextFunction,
+};
 use super::scalar::{
     AbsFunction, CastFunction, CeilFunction, CeilingFunction, CharFunction, CharLengthFunction,
     CoalesceFunction, CollateFunction, ConcatFunction, ConcatWsFunction, CosFunction,
@@ -183,10 +189,10 @@ impl FunctionRegistry {
         registry.register_scalar::<DateSubFunction>();
         registry.register_scalar::<DateDiffFunction>();
         registry.register_scalar::<DateDiffAliasFunction>(); // DATE_DIFF alias for DATEDIFF
-        registry.register_scalar::<VersionFunction>();
         registry.register_scalar::<ToCharFunction>();
 
-        // Utility functions
+        // Utility/System functions
+        registry.register_scalar::<VersionFunction>();
         registry.register_scalar::<CoalesceFunction>();
         registry.register_scalar::<NullIfFunction>();
         registry.register_scalar::<IfNullFunction>();
@@ -205,6 +211,18 @@ impl FunctionRegistry {
         registry.register_scalar::<JsonKeysFunction>();
         registry.register_scalar::<TypeOfFunction>();
         registry.register_scalar::<SleepFunction>();
+
+        // Register vector functions
+        registry.register_scalar::<VecDistanceL2Function>();
+        registry.register_scalar::<VecDistanceCosineFunction>();
+        registry.register_scalar::<VecDistanceIpFunction>();
+        registry.register_scalar::<VecDimsFunction>();
+        registry.register_scalar::<VecNormFunction>();
+        registry.register_scalar::<VecToTextFunction>();
+
+        // Register semantic embedding function (requires --features semantic)
+        #[cfg(feature = "semantic")]
+        registry.register_scalar::<EmbedFunction>();
 
         // Register built-in window functions
         registry.register_window::<RowNumberFunction>();

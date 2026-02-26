@@ -61,6 +61,10 @@ pub enum Error {
     #[error("invalid column type")]
     InvalidColumnType,
 
+    /// Vector dimension mismatch
+    #[error("Vector dimension mismatch: expected {expected}, got {got}")]
+    VectorDimensionMismatch { expected: u16, got: u16 },
+
     /// Duplicate column name in schema
     #[error("duplicate column")]
     DuplicateColumn,

@@ -37,7 +37,7 @@ CREATE TABLE orders (
 When the referenced column is omitted, it defaults to the parent table's primary key:
 
 ```sql
--- References customers(id) — the primary key
+-- References customers(id), the primary key
 CREATE TABLE orders (
     id INTEGER PRIMARY KEY,
     customer_id INTEGER REFERENCES customers
@@ -125,7 +125,7 @@ CREATE TABLE line_items (
 A NULL value in a FK column means "no reference" and is always allowed, regardless of the referential action. This follows the SQL standard:
 
 ```sql
--- NULL FK is valid — the row has no parent reference
+-- NULL FK is valid, the row has no parent reference
 INSERT INTO children (id, parent_id, name) VALUES (1, NULL, 'No Parent');
 ```
 
@@ -173,7 +173,7 @@ CREATE TABLE children (
 
 -- This fails: CASCADE would delete parents, but RESTRICT blocks because children exist
 DELETE FROM grandparents WHERE id = 1;
--- Error: cannot cascade-delete row — still referenced by table 'children'
+-- Error: cannot cascade-delete row, still referenced by table 'children'
 ```
 
 ## Transaction Semantics
@@ -223,7 +223,7 @@ DROP TABLE is blocked if any child table has rows with non-NULL FK values refere
 ```sql
 -- Blocked: child rows reference this table
 DROP TABLE parents;
--- Error: cannot drop/truncate table 'parents' — rows in 'children' still reference it
+-- Error: cannot drop/truncate table 'parents', rows in 'children' still reference it
 
 -- Solution: delete child rows first, then drop
 DELETE FROM children WHERE parent_id IS NOT NULL;
@@ -234,7 +234,7 @@ When a parent table is dropped (after child references are cleared), FK constrai
 
 ```sql
 DROP TABLE parents;
--- children.parent_id is no longer a FK — inserts with any value succeed
+-- children.parent_id is no longer a FK, inserts with any value succeed
 INSERT INTO children VALUES (1, 999, 'No FK');
 ```
 

@@ -42,8 +42,8 @@
 //! Uses `roaring` crate (RoaringBitmap) - same as Lucene, Druid, Spark.
 //! Automatic compression: array for sparse, bitmap for dense, RLE for runs.
 
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::RwLock;
 
 use ahash::AHashMap;
 use roaring::RoaringTreemap;
@@ -163,14 +163,14 @@ impl BitmapIndex {
     pub fn get_bitmap(&self, value: &Value) -> Option<RoaringTreemap> {
         // Intern value to get Arc for lookup
         let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
-        let bitmaps = self.bitmaps.read().unwrap();
+        let bitmaps = self.bitmaps.read();
         bitmaps.get(&arc_key).cloned()
     }
 
     /// Perform AND operation on multiple values (for multi-predicate queries)
     /// Returns row IDs that match ALL values
     pub fn and_values(&self, values: &[Value]) -> RoaringTreemap {
-        let bitmaps = self.bitmaps.read().unwrap();
+        let bitmaps = self.bitmaps.read();
         let mut result: Option<RoaringTreemap> = None;
 
         for value in values {
@@ -192,7 +192,7 @@ impl BitmapIndex {
     /// Perform OR operation on multiple values
     /// Returns row IDs that match ANY value
     pub fn or_values(&self, values: &[Value]) -> RoaringTreemap {
-        let bitmaps = self.bitmaps.read().unwrap();
+        let bitmaps = self.bitmaps.read();
         let mut result = RoaringTreemap::new();
 
         for value in values {
@@ -210,7 +210,7 @@ impl BitmapIndex {
     /// Note: Requires knowing all row IDs in the table
     pub fn not_value(&self, value: &Value) -> RoaringTreemap {
         let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
-        let bitmaps = self.bitmaps.read().unwrap();
+        let bitmaps = self.bitmaps.read();
 
         // Get all row IDs (union of all bitmaps)
         let mut all_rows = RoaringTreemap::new();
@@ -255,8 +255,8 @@ impl BitmapIndex {
         values: &[Value],
         row_id: i64,
         row_id_u64: u64,
-        mut bitmaps: std::sync::RwLockWriteGuard<'_, AHashMap<CompactArc<Value>, RoaringTreemap>>,
-        mut row_to_value: std::sync::RwLockWriteGuard<'_, I64Map<CompactArc<Value>>>,
+        mut bitmaps: parking_lot::RwLockWriteGuard<'_, AHashMap<CompactArc<Value>, RoaringTreemap>>,
+        mut row_to_value: parking_lot::RwLockWriteGuard<'_, I64Map<CompactArc<Value>>>,
     ) -> Result<()> {
         // Create composite key for multi-column lookup
         let arc_key = self.value_to_arc_key(values);
@@ -350,8 +350,8 @@ impl Index for BitmapIndex {
         }
 
         // Acquire write locks
-        let mut bitmaps = self.bitmaps.write().unwrap();
-        let mut row_to_value = self.row_to_value.write().unwrap();
+        let mut bitmaps = self.bitmaps.write();
+        let mut row_to_value = self.row_to_value.write();
 
         // Build lookup key (for single-column, just the first value)
         let lookup_value = if values.len() == 1 {
@@ -446,8 +446,8 @@ impl Index for BitmapIndex {
         // Intern value to get Arc key for lookup
         let arc_key = self.value_to_arc_key(values);
 
-        let mut bitmaps = self.bitmaps.write().unwrap();
-        let mut row_to_value = self.row_to_value.write().unwrap();
+        let mut bitmaps = self.bitmaps.write();
+        let mut row_to_value = self.row_to_value.write();
 
         // Remove from bitmap
         if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
@@ -484,8 +484,8 @@ impl Index for BitmapIndex {
         let num_cols = self.column_ids.len();
 
         // Acquire write locks ONCE for entire batch
-        let mut bitmaps = self.bitmaps.write().unwrap();
-        let mut row_to_value = self.row_to_value.write().unwrap();
+        let mut bitmaps = self.bitmaps.write();
+        let mut row_to_value = self.row_to_value.write();
 
         // Reserve capacity
         row_to_value.reserve(entries.len());
@@ -603,8 +603,8 @@ impl Index for BitmapIndex {
         }
 
         // Acquire write locks ONCE for entire batch
-        let mut bitmaps = self.bitmaps.write().unwrap();
-        let mut row_to_value = self.row_to_value.write().unwrap();
+        let mut bitmaps = self.bitmaps.write();
+        let mut row_to_value = self.row_to_value.write();
 
         for &(row_id, values) in entries {
             if row_id < 0 {
@@ -663,7 +663,7 @@ impl Index for BitmapIndex {
 
         // Intern value to get Arc key for lookup
         let arc_key = self.value_to_arc_key(values);
-        let bitmaps = self.bitmaps.read().unwrap();
+        let bitmaps = self.bitmaps.read();
 
         if let Some(bitmap) = bitmaps.get(&arc_key) {
             Ok(bitmap
@@ -743,7 +743,7 @@ impl Index for BitmapIndex {
 
         // Intern value to get Arc key for lookup
         let arc_key = self.value_to_arc_key(values);
-        let bitmaps = self.bitmaps.read().unwrap();
+        let bitmaps = self.bitmaps.read();
 
         if let Some(bitmap) = bitmaps.get(&arc_key) {
             // RoaringTreemap iteration is efficient
@@ -764,7 +764,7 @@ impl Index for BitmapIndex {
 
     fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {
         // For complex expressions, return all row IDs and let caller filter
-        let bitmaps = self.bitmaps.read().unwrap();
+        let bitmaps = self.bitmaps.read();
         let mut all_rows = RoaringTreemap::new();
         for bitmap in bitmaps.values() {
             all_rows |= bitmap;
@@ -775,16 +775,20 @@ impl Index for BitmapIndex {
     }
 
     fn get_all_values(&self) -> Vec<Value> {
-        let bitmaps = self.bitmaps.read().unwrap();
+        let bitmaps = self.bitmaps.read();
         // Dereference CompactArc<Value> to clone inner Value
         bitmaps.keys().map(|arc| (**arc).clone()).collect()
     }
 
     fn clear(&self) -> Result<()> {
-        self.bitmaps.write().unwrap().clear();
-        self.row_to_value.write().unwrap().clear();
+        self.bitmaps.write().clear();
+        self.row_to_value.write().clear();
         self.distinct_count.store(0, AtomicOrdering::Relaxed);
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn close(&mut self) -> Result<()> {

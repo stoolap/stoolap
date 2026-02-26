@@ -80,6 +80,23 @@ file:///path/to/data?sync_mode=normal&snapshot_interval=60
 | `compression` | on/off | on | Enable both WAL and snapshot compression |
 | `compression_threshold` | Integer (bytes) | 64 | Minimum size for compression |
 
+### Cleanup Options
+
+| Option | Values | Default | Description |
+|--------|--------|---------|-------------|
+| `cleanup` | on/off | on | Enable/disable background cleanup thread |
+| `cleanup_interval` | Integer (seconds) | 60 | Interval between automatic cleanup runs |
+| `deleted_row_retention` | Integer (seconds) | 300 | How long deleted rows are kept before permanent removal |
+| `transaction_retention` | Integer (seconds) | 3600 | How long stale transaction metadata is kept |
+
+The background cleanup thread periodically removes deleted rows, old version chains, and stale transaction metadata. On WASM where background threads are unavailable, use the `VACUUM` command for manual cleanup.
+
+Example:
+```
+file:///data/mydb?cleanup_interval=30&deleted_row_retention=60
+file:///data/mydb?cleanup=off
+```
+
 ### Sync Mode Details
 
 | Mode | Value | Description |
@@ -156,9 +173,14 @@ PRAGMA snapshot_interval;
 
 -- Create a snapshot manually
 PRAGMA snapshot;
+
+-- Manual cleanup (works on all platforms including WASM)
+VACUUM;
+VACUUM table_name;
+PRAGMA vacuum;
 ```
 
-See the [PRAGMA Commands](pragma-commands) documentation for details.
+See the [PRAGMA Commands]({% link _docs/sql-commands/pragma-commands.md %}) documentation for details.
 
 ## Best Practices
 

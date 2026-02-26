@@ -26,6 +26,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::api::{Database, Transaction as ApiTransaction};
 use crate::common::version::{GIT_COMMIT, VERSION};
+use crate::core::types::DataType;
 use crate::core::Value;
 
 /// A Stoolap database instance for use from JavaScript.
@@ -134,6 +135,7 @@ impl StoolapDB {
             || upper.starts_with("DESCRIBE")
             || upper.starts_with("DESC ")
             || upper.starts_with("EXPLAIN")
+            || upper.starts_with("VACUUM")
             || (upper.starts_with("PRAGMA") && !upper.contains('='))
             || upper.contains(" RETURNING ")
             || upper.ends_with(" RETURNING");
@@ -275,7 +277,13 @@ fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Timestamp(ts) => {
             serde_json::json!(ts.format("%Y-%m-%dT%H:%M:%SZ").to_string())
         }
-        Value::Json(s) => serde_json::json!(s.as_ref()),
+        Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+            serde_json::json!(std::str::from_utf8(&data[1..]).unwrap_or(""))
+        }
+        Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
+            serde_json::json!(crate::core::value::format_vector_bytes(&data[1..]))
+        }
+        Value::Extension(_) => serde_json::Value::Null,
     }
 }
 

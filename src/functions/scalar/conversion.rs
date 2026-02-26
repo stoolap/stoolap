@@ -19,7 +19,7 @@
 //! - [`CastFunction`] - CAST(value AS type) - Convert value to another type
 //! - [`CollateFunction`] - COLLATE(string, collation) - Apply collation to string
 
-use crate::common::{CompactArc, SmartString};
+use crate::common::SmartString;
 use crate::core::{DataType, Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
@@ -146,7 +146,7 @@ fn cast_to_integer(value: &Value) -> Result<Value> {
             )))
         }
         Value::Timestamp(t) => Ok(Value::Integer(t.timestamp())),
-        Value::Json(_) => Ok(Value::Integer(0)),
+        Value::Extension(_) => Ok(Value::Integer(0)),
         Value::Null(dt) => Ok(Value::Null(*dt)),
     }
 }
@@ -170,7 +170,7 @@ fn cast_to_float(value: &Value) -> Result<Value> {
             }
         }
         Value::Timestamp(t) => Ok(Value::Float(t.timestamp() as f64)),
-        Value::Json(_) => Err(Error::invalid_argument("Cannot convert JSON to FLOAT")),
+        Value::Extension(_) => Err(Error::invalid_argument("Cannot convert JSON to FLOAT")),
         Value::Null(dt) => Ok(Value::Null(*dt)),
     }
 }
@@ -186,7 +186,11 @@ fn cast_to_string(value: &Value) -> Result<Value> {
         }
         Value::Boolean(b) => Ok(Value::Text(SmartString::from_string(b.to_string()))),
         Value::Timestamp(t) => Ok(Value::Text(SmartString::from_string(t.to_rfc3339()))),
-        Value::Json(j) => Ok(Value::Text(SmartString::from(&**j))),
+        Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+            let s = std::str::from_utf8(&data[1..]).unwrap_or("");
+            Ok(Value::Text(SmartString::from(s)))
+        }
+        Value::Extension(_) => Ok(Value::Text(SmartString::from(""))),
         Value::Null(dt) => Ok(Value::Null(*dt)),
     }
 }
@@ -208,7 +212,7 @@ fn cast_to_boolean(value: &Value) -> Result<Value> {
         Value::Timestamp(_) => Err(Error::invalid_argument(
             "Cannot convert TIMESTAMP to BOOLEAN",
         )),
-        Value::Json(_) => Err(Error::invalid_argument("Cannot convert JSON to BOOLEAN")),
+        Value::Extension(_) => Err(Error::invalid_argument("Cannot convert JSON to BOOLEAN")),
         Value::Null(dt) => Ok(Value::Null(*dt)),
     }
 }
@@ -248,16 +252,16 @@ fn cast_to_timestamp(value: &Value) -> Result<Value> {
 /// Cast a value to JSON
 fn cast_to_json(value: &Value) -> Result<Value> {
     match value {
-        Value::Json(j) => Ok(Value::Json(j.clone())),
-        Value::Text(s) => Ok(Value::Json(CompactArc::from(s.as_str()))),
-        Value::Integer(i) => Ok(Value::Json(CompactArc::from(i.to_string()))),
-        Value::Float(f) => Ok(Value::Json(CompactArc::from(f.to_string()))),
-        Value::Boolean(b) => Ok(Value::Json(CompactArc::from(b.to_string()))),
-        Value::Null(_) => Ok(Value::Json(CompactArc::from("null"))),
-        Value::Timestamp(t) => Ok(Value::Json(CompactArc::from(format!(
-            "\"{}\"",
-            t.to_rfc3339()
-        )))),
+        Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+            Ok(value.clone())
+        }
+        Value::Text(s) => Ok(Value::json(s.as_ref())),
+        Value::Integer(i) => Ok(Value::json(i.to_string())),
+        Value::Float(f) => Ok(Value::json(f.to_string())),
+        Value::Boolean(b) => Ok(Value::json(b.to_string())),
+        Value::Null(_) => Ok(Value::json("null")),
+        Value::Timestamp(t) => Ok(Value::json(format!("\"{}\"", t.to_rfc3339()))),
+        Value::Extension(_) => Ok(Value::json("null")),
     }
 }
 
@@ -307,7 +311,10 @@ impl ScalarFunction for CollateFunction {
             Value::Float(f) => f.to_string(),
             Value::Boolean(b) => b.to_string(),
             Value::Timestamp(t) => t.to_rfc3339(),
-            Value::Json(j) => j.to_string(),
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
+            }
+            Value::Extension(_) => String::new(),
             Value::Null(_) => return Ok(Value::null_unknown()),
         };
 

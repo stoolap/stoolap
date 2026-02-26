@@ -64,6 +64,14 @@ pub struct IndexMetadata {
     pub is_unique: bool,
     /// Type of index (BTree, Hash, Bitmap)
     pub index_type: IndexType,
+    /// HNSW parameter: max connections per node per layer (default: 16)
+    pub hnsw_m: Option<u16>,
+    /// HNSW parameter: build beam width (default: 200)
+    pub hnsw_ef_construction: Option<u16>,
+    /// HNSW parameter: search beam width (default: 64)
+    pub hnsw_ef_search: Option<u16>,
+    /// HNSW parameter: distance metric (0=L2, 1=Cosine, 2=InnerProduct)
+    pub hnsw_distance_metric: Option<u8>,
 }
 
 impl IndexMetadata {
@@ -108,10 +116,19 @@ impl IndexMetadata {
             IndexType::Hash => 1,
             IndexType::Bitmap => 2,
             IndexType::MultiColumn => 3,
+            IndexType::Hnsw => 5,
             // PrimaryKey is auto-created from schema, never serialized as IndexMetadata
             IndexType::PrimaryKey => unreachable!("PkIndex is never persisted via IndexMetadata"),
         };
         buf.push(index_type_byte);
+
+        // HNSW-specific parameters (appended after index type for backward compat)
+        if self.index_type == IndexType::Hnsw {
+            buf.extend_from_slice(&self.hnsw_m.unwrap_or(16).to_le_bytes());
+            buf.extend_from_slice(&self.hnsw_ef_construction.unwrap_or(200).to_le_bytes());
+            buf.extend_from_slice(&self.hnsw_ef_search.unwrap_or(64).to_le_bytes());
+            buf.push(self.hnsw_distance_metric.unwrap_or(0)); // 0 = L2
+        }
 
         buf
     }
@@ -219,16 +236,34 @@ impl IndexMetadata {
 
         // Index type (1 byte: 0=BTree, 1=Hash, 2=Bitmap, 3=MultiColumn)
         let index_type = if pos < data.len() {
-            match data[pos] {
+            let t = match data[pos] {
                 0 => IndexType::BTree,
                 1 => IndexType::Hash,
                 2 => IndexType::Bitmap,
                 3 => IndexType::MultiColumn,
+                5 => IndexType::Hnsw,
                 _ => IndexType::BTree,
-            }
+            };
+            pos += 1;
+            t
         } else {
             IndexType::BTree
         };
+
+        // HNSW-specific parameters (trailing bytes, backward compat: use defaults if missing)
+        let (hnsw_m, hnsw_ef_construction, hnsw_ef_search, hnsw_distance_metric) =
+            if index_type == IndexType::Hnsw && pos + 7 <= data.len() {
+                let m = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                pos += 2;
+                let ef_c = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                pos += 2;
+                let ef_s = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                pos += 2;
+                let metric = data[pos];
+                (Some(m), Some(ef_c), Some(ef_s), Some(metric))
+            } else {
+                (None, None, None, None)
+            };
 
         Ok(Self {
             name,
@@ -238,6 +273,10 @@ impl IndexMetadata {
             data_types,
             is_unique,
             index_type,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_ef_search,
+            hnsw_distance_metric,
         })
     }
 }
@@ -800,10 +839,27 @@ pub fn serialize_value(value: &Value) -> Result<Vec<u8>> {
             buf.extend_from_slice(&ts.timestamp().to_le_bytes());
             buf.extend_from_slice(&ts.timestamp_subsec_nanos().to_le_bytes());
         }
-        Value::Json(j) => {
-            buf.push(6);
-            buf.extend_from_slice(&(j.len() as u32).to_le_bytes());
-            buf.extend_from_slice(j.as_bytes());
+        Value::Extension(data) => {
+            let tag = data.first().copied().unwrap_or(0);
+            let payload = &data[1..];
+            if tag == DataType::Json as u8 {
+                // Tag 6: Json (wire-compatible with old Json variant)
+                buf.push(6);
+                buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                buf.extend_from_slice(payload);
+            } else if tag == DataType::Vector as u8 {
+                // Tag 10: new binary vector format (dim_count + raw LE f32 bytes)
+                buf.push(10);
+                let dim = (payload.len() / 4) as u32;
+                buf.extend_from_slice(&dim.to_le_bytes());
+                buf.extend_from_slice(payload);
+            } else {
+                // Tag 11: generic extension (dt_u8 + len + raw bytes)
+                buf.push(11);
+                buf.push(tag);
+                buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                buf.extend_from_slice(payload);
+            }
         }
     }
 
@@ -895,7 +951,7 @@ pub fn deserialize_value(data: &[u8]) -> Result<Value> {
             Ok(Value::Timestamp(ts))
         }
         6 => {
-            // Json
+            // Json → Extension(DataType::Json, bytes)
             if rest.len() < 4 {
                 return Err(Error::internal("missing json length"));
             }
@@ -903,9 +959,66 @@ pub fn deserialize_value(data: &[u8]) -> Result<Value> {
             if rest.len() < 4 + len {
                 return Err(Error::internal("missing json data"));
             }
-            let s = String::from_utf8(rest[4..4 + len].to_vec())
-                .map_err(|e| Error::internal(format!("invalid json: {}", e)))?;
-            Ok(Value::Json(CompactArc::from(s)))
+            // Validate UTF-8, then store with tag byte prepended
+            let payload = &rest[4..4 + len];
+            std::str::from_utf8(payload)
+                .map_err(|e| Error::internal(format!("invalid json utf8: {}", e)))?;
+            let mut bytes = Vec::with_capacity(1 + payload.len());
+            bytes.push(DataType::Json as u8);
+            bytes.extend_from_slice(payload);
+            Ok(Value::Extension(CompactArc::from(bytes)))
+        }
+        9 => {
+            // Backward compat: old Vector tag → Extension with Vector tag byte
+            if rest.len() < 4 {
+                return Err(Error::internal("missing vector dimension"));
+            }
+            let dim = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            if rest.len() < 4 + dim * 4 {
+                return Err(Error::internal("missing vector data"));
+            }
+            let payload = &rest[4..4 + dim * 4];
+            let mut bytes = Vec::with_capacity(1 + payload.len());
+            bytes.push(DataType::Vector as u8);
+            bytes.extend_from_slice(payload);
+            Ok(Value::Extension(CompactArc::from(bytes)))
+        }
+        10 => {
+            // New binary vector format: dim_u32 + raw LE f32 bytes
+            if rest.len() < 4 {
+                return Err(Error::internal("missing vector dimension"));
+            }
+            let dim = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            if rest.len() < 4 + dim * 4 {
+                return Err(Error::internal("missing vector data"));
+            }
+            let payload = &rest[4..4 + dim * 4];
+            let mut bytes = Vec::with_capacity(1 + payload.len());
+            bytes.push(DataType::Vector as u8);
+            bytes.extend_from_slice(payload);
+            Ok(Value::Extension(CompactArc::from(bytes)))
+        }
+        11 => {
+            // Generic extension: dt_u8 + len_u32 + raw bytes
+            if rest.len() < 5 {
+                return Err(Error::internal("missing extension header"));
+            }
+            let dt_byte = rest[0];
+            let dt = DataType::from_u8(dt_byte)
+                .ok_or_else(|| Error::internal(format!("unknown extension type: {}", dt_byte)))?;
+            let len = u32::from_le_bytes(rest[1..5].try_into().unwrap()) as usize;
+            if rest.len() < 5 + len {
+                return Err(Error::internal("missing extension data"));
+            }
+            let payload = &rest[5..5 + len];
+            // Validate UTF-8 for text-based extension types
+            if dt == DataType::Json && std::str::from_utf8(payload).is_err() {
+                return Err(Error::internal("corrupted JSON extension: invalid UTF-8"));
+            }
+            let mut bytes = Vec::with_capacity(1 + payload.len());
+            bytes.push(dt_byte);
+            bytes.extend_from_slice(payload);
+            Ok(Value::Extension(CompactArc::from(bytes)))
         }
         _ => Err(Error::internal(format!(
             "unknown value type tag: {}",
@@ -931,6 +1044,10 @@ mod tests {
             data_types: vec![DataType::Integer, DataType::Text],
             is_unique: true,
             index_type: IndexType::Hash,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_ef_search: None,
+            hnsw_distance_metric: None,
         };
 
         let serialized = meta.serialize();
@@ -961,6 +1078,10 @@ mod tests {
                 data_types: vec![DataType::Integer],
                 is_unique: false,
                 index_type,
+                hnsw_m: None,
+                hnsw_ef_construction: None,
+                hnsw_ef_search: None,
+                hnsw_distance_metric: None,
             };
 
             let serialized = meta.serialize();
