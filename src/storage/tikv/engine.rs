@@ -130,10 +130,7 @@ impl TiKVEngine {
         let mut max_table_id = 0u64;
 
         let (schemas, views, next_tid, indexes, max_index_id) = self.runtime.block_on(async {
-            let mut txn = client
-                .begin_optimistic()
-                .await
-                .map_err(from_tikv_error)?;
+            let mut txn = client.begin_optimistic().await.map_err(from_tikv_error)?;
 
             let result: Result<_> = async {
                 // Scan all schema keys
@@ -154,13 +151,12 @@ impl TiKVEngine {
 
                     // Get table ID
                     let tid_key = make_table_id_key(&table_name);
-                    let tid = if let Some(tid_bytes) =
-                        txn.get(tid_key).await.map_err(from_tikv_error)?
-                    {
-                        decode_u64(&tid_bytes)
-                    } else {
-                        continue;
-                    };
+                    let tid =
+                        if let Some(tid_bytes) = txn.get(tid_key).await.map_err(from_tikv_error)? {
+                            decode_u64(&tid_bytes)
+                        } else {
+                            continue;
+                        };
 
                     if tid > max_table_id {
                         max_table_id = tid;
@@ -214,15 +210,11 @@ impl TiKVEngine {
                 }
 
                 // Load next table ID
-                let next_tid = if let Some(ntid_bytes) = txn
+                let next_tid = txn
                     .get(META_NEXT_TABLE_ID.to_vec())
                     .await
                     .map_err(from_tikv_error)?
-                {
-                    Some(decode_u64(&ntid_bytes))
-                } else {
-                    None
-                };
+                    .map(|ntid_bytes| decode_u64(&ntid_bytes));
 
                 Ok((schemas, views, next_tid, indexes, max_index_id))
             }
@@ -293,12 +285,9 @@ impl Engine for TiKVEngine {
         }
 
         let client = self.client()?;
-        let tikv_txn = self.runtime.block_on(async {
-            client
-                .begin_optimistic()
-                .await
-                .map_err(from_tikv_error)
-        })?;
+        let tikv_txn = self
+            .runtime
+            .block_on(async { client.begin_optimistic().await.map_err(from_tikv_error) })?;
 
         let txn_id = self.next_txn_id();
         let schemas_snapshot = self.schemas.read().clone();
@@ -346,9 +335,9 @@ impl Engine for TiKVEngine {
 
         // Create a read-only transaction for index operations
         let client = self.client()?;
-        let tikv_txn = self.runtime.block_on(async {
-            client.begin_optimistic().await.map_err(from_tikv_error)
-        })?;
+        let tikv_txn = self
+            .runtime
+            .block_on(async { client.begin_optimistic().await.map_err(from_tikv_error) })?;
 
         Ok(Box::new(super::index::TiKVIndex::new(
             meta,
@@ -370,10 +359,7 @@ impl Engine for TiKVEngine {
         self.schema_epoch.load(Ordering::Acquire)
     }
 
-    fn list_table_indexes(
-        &self,
-        table_name: &str,
-    ) -> Result<FxHashMap<String, String>> {
+    fn list_table_indexes(&self, table_name: &str) -> Result<FxHashMap<String, String>> {
         let table = table_name.to_lowercase();
         let indexes = self.indexes.read();
         let mut result = FxHashMap::default();
@@ -393,9 +379,9 @@ impl Engine for TiKVEngine {
         if let Some(table_indexes) = indexes.get(&table) {
             // Create a shared read-only transaction for all indexes
             let client = self.client()?;
-            let tikv_txn = self.runtime.block_on(async {
-                client.begin_optimistic().await.map_err(from_tikv_error)
-            })?;
+            let tikv_txn = self
+                .runtime
+                .block_on(async { client.begin_optimistic().await.map_err(from_tikv_error) })?;
             let shared_txn = Arc::new(parking_lot::Mutex::new(Some(tikv_txn)));
 
             for meta in table_indexes.values() {
@@ -649,19 +635,16 @@ impl Engine for TiKVEngine {
 
             let result: Result<Option<(String, u64, _)>> = async {
                 let schema_key = encoding::make_schema_key(&table_name_lower);
-                if let Some(schema_bytes) =
-                    txn.get(schema_key).await.map_err(from_tikv_error)?
-                {
+                if let Some(schema_bytes) = txn.get(schema_key).await.map_err(from_tikv_error)? {
                     let schema = encoding::deserialize_schema(&schema_bytes)?;
 
                     let tid_key = encoding::make_table_id_key(&table_name_lower);
-                    let table_id = if let Some(tid_bytes) =
-                        txn.get(tid_key).await.map_err(from_tikv_error)?
-                    {
-                        encoding::decode_u64(&tid_bytes)
-                    } else {
-                        return Err(Error::internal("table ID not found"));
-                    };
+                    let table_id =
+                        if let Some(tid_bytes) = txn.get(tid_key).await.map_err(from_tikv_error)? {
+                            encoding::decode_u64(&tid_bytes)
+                        } else {
+                            return Err(Error::internal("table ID not found"));
+                        };
 
                     Ok(Some((table_name_lower.clone(), table_id, schema)))
                 } else {
@@ -693,10 +676,7 @@ impl Engine for TiKVEngine {
             .collect()
     }
 
-    fn find_referencing_fks(
-        &self,
-        parent_table: &str,
-    ) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
+    fn find_referencing_fks(&self, parent_table: &str) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
         let parent_lower = parent_table.to_lowercase();
         let schemas = self.schemas.read();
         let mut result = Vec::new();
@@ -721,9 +701,9 @@ impl Engine for TiKVEngine {
 
         // Create a new TiKV transaction for this table access
         let client = self.client()?;
-        let tikv_txn = self.runtime.block_on(async {
-            client.begin_optimistic().await.map_err(from_tikv_error)
-        })?;
+        let tikv_txn = self
+            .runtime
+            .block_on(async { client.begin_optimistic().await.map_err(from_tikv_error) })?;
 
         let table = super::table::TiKVTable::new(
             *table_id,
@@ -753,13 +733,10 @@ impl Engine for TiKVEngine {
             let mut results = crate::core::RowVec::with_capacity(row_ids.len());
             for &row_id in row_ids {
                 let key = super::encoding::make_data_key(table_id, row_id);
-                match txn.get(key).await.map_err(from_tikv_error)? {
-                    Some(bytes) => {
-                        let values = super::encoding::deserialize_row(&bytes)?;
-                        let row = super::encoding::values_to_row(values);
-                        results.push((row_id, row));
-                    }
-                    None => {} // Row doesn't exist or is deleted
+                if let Some(bytes) = txn.get(key).await.map_err(from_tikv_error)? {
+                    let values = super::encoding::deserialize_row(&bytes)?;
+                    let row = super::encoding::values_to_row(values);
+                    results.push((row_id, row));
                 }
             }
 

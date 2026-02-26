@@ -160,7 +160,10 @@ fn test_tikv_left_join() {
         let _row = row.unwrap();
         count += 1;
     }
-    assert_eq!(count, 4, "Left join should return 4 rows (3 matches + 1 NULL)");
+    assert_eq!(
+        count, 4,
+        "Left join should return 4 rows (3 matches + 1 NULL)"
+    );
 
     cleanup(&db, &["tikv_lj_items", "tikv_lj_categories"]);
 }
@@ -188,11 +191,8 @@ fn test_tikv_subquery_in() {
         .unwrap();
     db.execute("INSERT INTO tikv_in_customers VALUES (2, 'Bob')", ())
         .unwrap();
-    db.execute(
-        "INSERT INTO tikv_in_customers VALUES (3, 'Charlie')",
-        (),
-    )
-    .unwrap();
+    db.execute("INSERT INTO tikv_in_customers VALUES (3, 'Charlie')", ())
+        .unwrap();
 
     db.execute("INSERT INTO tikv_in_orders VALUES (1, 1, 100.0)", ())
         .unwrap();
@@ -213,7 +213,11 @@ fn test_tikv_subquery_in() {
         names.push(name);
     }
     names.sort();
-    assert_eq!(names, vec!["Alice", "Bob"], "Should find customers with orders");
+    assert_eq!(
+        names,
+        vec!["Alice", "Bob"],
+        "Should find customers with orders"
+    );
 
     // NOT IN subquery: find customers without orders
     let mut no_order_names = Vec::new();
@@ -228,7 +232,11 @@ fn test_tikv_subquery_in() {
         let name: String = row.get(0).unwrap();
         no_order_names.push(name);
     }
-    assert_eq!(no_order_names, vec!["Charlie"], "Only Charlie has no orders");
+    assert_eq!(
+        no_order_names,
+        vec!["Charlie"],
+        "Only Charlie has no orders"
+    );
 
     // EXISTS subquery
     let mut exist_names = Vec::new();
@@ -244,7 +252,11 @@ fn test_tikv_subquery_in() {
         exist_names.push(name);
     }
     exist_names.sort();
-    assert_eq!(exist_names, vec!["Alice", "Bob"], "EXISTS should find Alice and Bob");
+    assert_eq!(
+        exist_names,
+        vec!["Alice", "Bob"],
+        "EXISTS should find Alice and Bob"
+    );
 
     cleanup(&db, &["tikv_in_orders", "tikv_in_customers"]);
 }
@@ -384,12 +396,21 @@ fn test_tikv_schema_operations() {
     cleanup(&db, &["tikv_schema_a", "tikv_schema_b", "tikv_schema_c"]);
 
     // Create multiple tables
-    db.execute("CREATE TABLE tikv_schema_a (id INTEGER PRIMARY KEY, a TEXT)", ())
-        .unwrap();
-    db.execute("CREATE TABLE tikv_schema_b (id INTEGER PRIMARY KEY, b TEXT)", ())
-        .unwrap();
-    db.execute("CREATE TABLE tikv_schema_c (id INTEGER PRIMARY KEY, c TEXT)", ())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE tikv_schema_a (id INTEGER PRIMARY KEY, a TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE tikv_schema_b (id INTEGER PRIMARY KEY, b TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE tikv_schema_c (id INTEGER PRIMARY KEY, c TEXT)",
+        (),
+    )
+    .unwrap();
 
     // Insert into each
     db.execute("INSERT INTO tikv_schema_a VALUES (1, 'hello')", ())
@@ -575,8 +596,11 @@ fn test_tikv_distinct() {
         .unwrap();
     db.execute("INSERT INTO tikv_distinct_t VALUES (2, 'B', 'active')", ())
         .unwrap();
-    db.execute("INSERT INTO tikv_distinct_t VALUES (3, 'A', 'inactive')", ())
-        .unwrap();
+    db.execute(
+        "INSERT INTO tikv_distinct_t VALUES (3, 'A', 'inactive')",
+        (),
+    )
+    .unwrap();
     db.execute("INSERT INTO tikv_distinct_t VALUES (4, 'B', 'active')", ())
         .unwrap();
     db.execute("INSERT INTO tikv_distinct_t VALUES (5, 'A', 'active')", ())
@@ -595,10 +619,7 @@ fn test_tikv_distinct() {
 
     // COUNT DISTINCT
     let distinct_count: i64 = db
-        .query_one(
-            "SELECT COUNT(DISTINCT status) FROM tikv_distinct_t",
-            (),
-        )
+        .query_one("SELECT COUNT(DISTINCT status) FROM tikv_distinct_t", ())
         .unwrap();
     assert_eq!(distinct_count, 2, "Two distinct statuses: active, inactive");
 
@@ -709,16 +730,17 @@ fn test_tikv_savepoint_ddl() {
     tx.execute("ROLLBACK TO SAVEPOINT sp1", ()).unwrap();
 
     // tikv_sp_t1 should still exist
-    let count: i64 = tx
-        .query_one("SELECT COUNT(*) FROM tikv_sp_t1", ())
-        .unwrap();
+    let count: i64 = tx.query_one("SELECT COUNT(*) FROM tikv_sp_t1", ()).unwrap();
     assert_eq!(count, 1, "tikv_sp_t1 should still have 1 row");
 
     tx.execute("COMMIT", ()).unwrap();
 
     // tikv_sp_t2 should NOT exist after commit
     let result = db.query("SELECT * FROM tikv_sp_t2", ());
-    assert!(result.is_err(), "tikv_sp_t2 should not exist after rollback");
+    assert!(
+        result.is_err(),
+        "tikv_sp_t2 should not exist after rollback"
+    );
 
     cleanup(&db, &["tikv_sp_t1"]);
 }
@@ -791,33 +813,28 @@ fn test_tikv_create_index() {
     let count: i64 = db
         .query_one("SELECT COUNT(*) FROM tikv_idx_t WHERE age > 27", ())
         .unwrap();
-    assert_eq!(count, 3, "3 people are older than 27 (Alice=30, Charlie=35, Diana=28)");
+    assert_eq!(
+        count, 3,
+        "3 people are older than 27 (Alice=30, Charlie=35, Diana=28)"
+    );
 
     // Test MIN/MAX on indexed column
-    let min_age: i64 = db
-        .query_one("SELECT MIN(age) FROM tikv_idx_t", ())
-        .unwrap();
+    let min_age: i64 = db.query_one("SELECT MIN(age) FROM tikv_idx_t", ()).unwrap();
     assert_eq!(min_age, 22, "Min age should be 22 (Eve)");
 
-    let max_age: i64 = db
-        .query_one("SELECT MAX(age) FROM tikv_idx_t", ())
-        .unwrap();
+    let max_age: i64 = db.query_one("SELECT MAX(age) FROM tikv_idx_t", ()).unwrap();
     assert_eq!(max_age, 35, "Max age should be 35 (Charlie)");
 
     // Test with update (index should be maintained)
     db.execute("UPDATE tikv_idx_t SET age = 40 WHERE name = 'Eve'", ())
         .unwrap();
-    let new_max: i64 = db
-        .query_one("SELECT MAX(age) FROM tikv_idx_t", ())
-        .unwrap();
+    let new_max: i64 = db.query_one("SELECT MAX(age) FROM tikv_idx_t", ()).unwrap();
     assert_eq!(new_max, 40, "Max age should now be 40 (Eve)");
 
     // Test with delete (index should be maintained)
     db.execute("DELETE FROM tikv_idx_t WHERE name = 'Eve'", ())
         .unwrap();
-    let count_after: i64 = db
-        .query_one("SELECT COUNT(*) FROM tikv_idx_t", ())
-        .unwrap();
+    let count_after: i64 = db.query_one("SELECT COUNT(*) FROM tikv_idx_t", ()).unwrap();
     assert_eq!(count_after, 4, "Should have 4 rows after delete");
 
     // Drop index
@@ -828,7 +845,10 @@ fn test_tikv_create_index() {
     let count_final: i64 = db
         .query_one("SELECT COUNT(*) FROM tikv_idx_t WHERE age > 27", ())
         .unwrap();
-    assert_eq!(count_final, 2, "2 people are older than 27 now (Alice=30, Charlie=35)");
+    assert_eq!(
+        count_final, 2,
+        "2 people are older than 27 now (Alice=30, Charlie=35)"
+    );
 
     cleanup(&db, &["tikv_idx_t"]);
 }
@@ -1154,8 +1174,11 @@ fn test_tikv_cte_multiple() {
     )
     .unwrap();
 
-    db.execute("INSERT INTO tikv_cte_dept VALUES (1, 'Engineering', 500000)", ())
-        .unwrap();
+    db.execute(
+        "INSERT INTO tikv_cte_dept VALUES (1, 'Engineering', 500000)",
+        (),
+    )
+    .unwrap();
     db.execute("INSERT INTO tikv_cte_dept VALUES (2, 'Sales', 200000)", ())
         .unwrap();
     db.execute(
@@ -1163,11 +1186,8 @@ fn test_tikv_cte_multiple() {
         (),
     )
     .unwrap();
-    db.execute(
-        "INSERT INTO tikv_cte_emp2 VALUES (2, 'Bob', 70000, 2)",
-        (),
-    )
-    .unwrap();
+    db.execute("INSERT INTO tikv_cte_emp2 VALUES (2, 'Bob', 70000, 2)", ())
+        .unwrap();
     db.execute(
         "INSERT INTO tikv_cte_emp2 VALUES (3, 'Carol', 95000, 1)",
         (),
@@ -1261,16 +1281,31 @@ fn test_tikv_cte_with_window_function() {
     )
     .unwrap();
 
-    db.execute("INSERT INTO tikv_cte_wf VALUES (1, 'Eng', 'Alice', 90000)", ())
-        .unwrap();
-    db.execute("INSERT INTO tikv_cte_wf VALUES (2, 'Eng', 'Bob', 85000)", ())
-        .unwrap();
-    db.execute("INSERT INTO tikv_cte_wf VALUES (3, 'Sales', 'Carol', 80000)", ())
-        .unwrap();
-    db.execute("INSERT INTO tikv_cte_wf VALUES (4, 'Sales', 'Dave', 75000)", ())
-        .unwrap();
-    db.execute("INSERT INTO tikv_cte_wf VALUES (5, 'Eng', 'Eve', 95000)", ())
-        .unwrap();
+    db.execute(
+        "INSERT INTO tikv_cte_wf VALUES (1, 'Eng', 'Alice', 90000)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO tikv_cte_wf VALUES (2, 'Eng', 'Bob', 85000)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO tikv_cte_wf VALUES (3, 'Sales', 'Carol', 80000)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO tikv_cte_wf VALUES (4, 'Sales', 'Dave', 75000)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO tikv_cte_wf VALUES (5, 'Eng', 'Eve', 95000)",
+        (),
+    )
+    .unwrap();
 
     // CTE + window function: top earner per department
     let rows: Vec<_> = db
@@ -1430,7 +1465,11 @@ fn test_tikv_large_dataset() {
     assert_eq!(rows.len(), 5);
     let r = rows[0].as_ref().unwrap();
     let top_val: i64 = r.get(1).unwrap();
-    assert_eq!(top_val, total_rows * 10, "Top value should be last row * 10");
+    assert_eq!(
+        top_val,
+        total_rows * 10,
+        "Top value should be last row * 10"
+    );
 
     // Filtered count
     let count: i64 = db
@@ -1439,7 +1478,11 @@ fn test_tikv_large_dataset() {
             (),
         )
         .unwrap();
-    assert_eq!(count, total_rows / 5, "Filtered count should be 1/5 of total");
+    assert_eq!(
+        count,
+        total_rows / 5,
+        "Filtered count should be 1/5 of total"
+    );
 
     // Range query
     let count: i64 = db

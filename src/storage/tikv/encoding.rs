@@ -197,8 +197,7 @@ pub fn decode_value_with_len(bytes: &[u8]) -> (Value, usize) {
         0x05 => {
             let millis = decode_i64(&bytes[1..9]);
             use chrono::{DateTime, Utc};
-            let ts = DateTime::<Utc>::from_timestamp_millis(millis)
-                .unwrap_or_default();
+            let ts = DateTime::<Utc>::from_timestamp_millis(millis).unwrap_or_default();
             (Value::Timestamp(ts), 9)
         }
         0x06 => {
@@ -219,10 +218,7 @@ pub fn decode_value_with_len(bytes: &[u8]) -> (Value, usize) {
                     i += 1;
                 }
             }
-            (
-                Value::Extension(CompactArc::from(s)),
-                i,
-            )
+            (Value::Extension(CompactArc::from(s)), i)
         }
         _ => (Value::Null(DataType::Text), 1),
     }
@@ -307,7 +303,8 @@ pub fn make_view_key(view_name: &str) -> Vec<u8> {
 
 /// Make a meta key for index: m_i_{table_name}_{index_name}
 pub fn make_index_meta_key(table_name: &str, index_name: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(META_INDEX_PREFIX.len() + table_name.len() + 1 + index_name.len());
+    let mut key =
+        Vec::with_capacity(META_INDEX_PREFIX.len() + table_name.len() + 1 + index_name.len());
     key.extend_from_slice(META_INDEX_PREFIX);
     key.extend_from_slice(table_name.as_bytes());
     key.push(b'_');
@@ -435,15 +432,18 @@ fn json_to_value(j: &serde_json::Value) -> Result<Value> {
                 .ok_or_else(|| Error::internal("bad vector value"))?;
             let mut v = Vec::with_capacity(arr.len());
             for val in arr {
-                v.push(val.as_f64().ok_or_else(|| Error::internal("bad vector element"))? as f32);
+                v.push(
+                    val.as_f64()
+                        .ok_or_else(|| Error::internal("bad vector element"))?
+                        as f32,
+                );
             }
             Ok(Value::vector(v))
         }
         "ext" => {
             let tag = j["tag"].as_u64().unwrap_or(0) as u8;
             // For now, don't support deserializing generic extensions
-            let mut bytes = Vec::with_capacity(1);
-            bytes.push(tag);
+            let bytes = vec![tag];
             Ok(Value::Extension(CompactArc::from(bytes)))
         }
         other => Err(Error::internal(format!("unknown value type tag: {other}"))),
@@ -484,8 +484,8 @@ pub fn serialize_row(row: &[Value]) -> Result<Vec<u8>> {
 
 /// Deserialize a row from bytes
 pub fn deserialize_row(bytes: &[u8]) -> Result<Vec<Value>> {
-    let json_values: Vec<serde_json::Value> =
-        serde_json::from_slice(bytes).map_err(|e| Error::internal(format!("deserialize row: {e}")))?;
+    let json_values: Vec<serde_json::Value> = serde_json::from_slice(bytes)
+        .map_err(|e| Error::internal(format!("deserialize row: {e}")))?;
     json_values.iter().map(json_to_value).collect()
 }
 
@@ -575,8 +575,8 @@ pub fn serialize_schema(schema: &Schema) -> Result<Vec<u8>> {
 
 /// Deserialize a Schema from bytes
 pub fn deserialize_schema(bytes: &[u8]) -> Result<Schema> {
-    let obj: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| Error::internal(format!("deserialize schema: {e}")))?;
+    let obj: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| Error::internal(format!("deserialize schema: {e}")))?;
 
     let table_name = obj["table_name"]
         .as_str()
@@ -639,7 +639,11 @@ pub fn deserialize_schema(bytes: &[u8]) -> Result<Schema> {
         .unwrap_or_else(Utc::now);
 
     Ok(Schema::with_timestamps_and_foreign_keys(
-        table_name, columns, foreign_keys, created_at, updated_at,
+        table_name,
+        columns,
+        foreign_keys,
+        created_at,
+        updated_at,
     ))
 }
 
@@ -712,7 +716,7 @@ mod tests {
             Value::Text(SmartString::from("hello")),
             Value::Null(DataType::Text),
             Value::Boolean(true),
-            Value::Float(3.14),
+            Value::Float(1.2345),
         ];
         let bytes = serialize_row(&values).unwrap();
         let decoded = deserialize_row(&bytes).unwrap();
@@ -721,7 +725,7 @@ mod tests {
         assert!(matches!(&decoded[1], Value::Text(s) if s.as_str() == "hello"));
         assert!(matches!(&decoded[2], Value::Null(DataType::Text)));
         assert_eq!(decoded[3], Value::Boolean(true));
-        assert_eq!(decoded[4], Value::Float(3.14));
+        assert_eq!(decoded[4], Value::Float(1.2345));
     }
 
     #[test]

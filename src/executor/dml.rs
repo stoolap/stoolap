@@ -1881,7 +1881,8 @@ impl Executor {
         };
 
         // Check if this table is referenced by child tables (for FK enforcement)
-        let referencing_fks = super::foreign_key::find_referencing_fks(self.engine.as_ref(), table_name);
+        let referencing_fks =
+            super::foreign_key::find_referencing_fks(self.engine.as_ref(), table_name);
 
         // Get schema info for RETURNING clause processing
         let column_names_owned = schema.column_names_owned().to_vec();

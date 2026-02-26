@@ -420,7 +420,10 @@ fn bench_transaction_commit(c: &mut Criterion) {
         b.iter(|| {
             let mut txn = mvcc_db.begin().unwrap();
             txn.execute(
-                &format!("INSERT INTO bench_txn_mvcc VALUES ({}, {})", mvcc_id, mvcc_id),
+                &format!(
+                    "INSERT INTO bench_txn_mvcc VALUES ({}, {})",
+                    mvcc_id, mvcc_id
+                ),
                 (),
             )
             .unwrap();
@@ -434,7 +437,10 @@ fn bench_transaction_commit(c: &mut Criterion) {
         b.iter(|| {
             let mut txn = tikv_db.begin().unwrap();
             txn.execute(
-                &format!("INSERT INTO bench_txn_tikv VALUES ({}, {})", tikv_id, tikv_id),
+                &format!(
+                    "INSERT INTO bench_txn_tikv VALUES ({}, {})",
+                    tikv_id, tikv_id
+                ),
                 (),
             )
             .unwrap();

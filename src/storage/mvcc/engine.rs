@@ -3238,10 +3238,7 @@ impl Engine for MVCCEngine {
         MVCCEngine::get_table_for_txn(self, txn_id, table_name)
     }
 
-    fn find_referencing_fks(
-        &self,
-        parent_table: &str,
-    ) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
+    fn find_referencing_fks(&self, parent_table: &str) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
         MVCCEngine::find_referencing_fks(self, parent_table)
     }
 
@@ -3950,7 +3947,7 @@ mod tests {
 
     #[test]
     fn test_engine_begin_transaction() {
-        let mut engine = MVCCEngine::in_memory();
+        let engine = MVCCEngine::in_memory();
         engine.open().unwrap();
 
         let txn = engine.begin_transaction();
@@ -3965,7 +3962,7 @@ mod tests {
 
     #[test]
     fn test_engine_transaction_create_table() {
-        let mut engine = MVCCEngine::in_memory();
+        let engine = MVCCEngine::in_memory();
         engine.open().unwrap();
 
         let mut txn = engine.begin_transaction().unwrap();
@@ -3985,7 +3982,7 @@ mod tests {
 
     #[test]
     fn test_engine_transaction_insert_and_select() {
-        let mut engine = MVCCEngine::in_memory();
+        let engine = MVCCEngine::in_memory();
         engine.open().unwrap();
 
         // Create table
@@ -4027,7 +4024,7 @@ mod tests {
 
     #[test]
     fn test_engine_isolation_level() {
-        let mut engine = MVCCEngine::in_memory();
+        let engine = MVCCEngine::in_memory();
         engine.open().unwrap();
 
         // Default should be ReadCommitted
@@ -4066,7 +4063,7 @@ mod tests {
 
     #[test]
     fn test_engine_get_table_schema() {
-        let mut engine = MVCCEngine::in_memory();
+        let engine = MVCCEngine::in_memory();
         engine.open().unwrap();
 
         let schema = SchemaBuilder::new("test_schema")
@@ -4087,7 +4084,7 @@ mod tests {
 
     #[test]
     fn test_engine_transaction_with_isolation_level() {
-        let mut engine = MVCCEngine::in_memory();
+        let engine = MVCCEngine::in_memory();
         engine.open().unwrap();
 
         let txn = engine.begin_transaction_with_level(IsolationLevel::SnapshotIsolation);
@@ -4111,7 +4108,7 @@ mod tests {
 
     #[test]
     fn test_engine_create_snapshot() {
-        let mut engine = MVCCEngine::in_memory();
+        let engine = MVCCEngine::in_memory();
         engine.open().unwrap();
 
         // Should succeed (no-op for now)
@@ -4122,7 +4119,7 @@ mod tests {
 
     #[test]
     fn test_engine_list_table_indexes() {
-        let mut engine = MVCCEngine::in_memory();
+        let engine = MVCCEngine::in_memory();
         engine.open().unwrap();
 
         let schema = SchemaBuilder::new("indexed")

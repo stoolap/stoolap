@@ -71,10 +71,9 @@ impl QueryResult for TiKVQueryResult {
 
     fn scan(&self, dest: &mut [Value]) -> Result<()> {
         let row = self.scanner.row();
-        let len = row.len().min(dest.len());
-        for i in 0..len {
+        for (i, d) in dest.iter_mut().enumerate() {
             if let Some(v) = row.get(i) {
-                dest[i] = v.clone();
+                *d = v.clone();
             }
         }
         Ok(())

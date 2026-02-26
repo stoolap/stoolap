@@ -85,28 +85,16 @@ fn test_tikv_insert_select() {
     .unwrap();
 
     // Insert
-    db.execute(
-        "INSERT INTO tikv_test_insert VALUES (1, 'Alice', 30)",
-        (),
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO tikv_test_insert VALUES (2, 'Bob', 25)",
-        (),
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO tikv_test_insert VALUES (3, 'Charlie', 35)",
-        (),
-    )
-    .unwrap();
+    db.execute("INSERT INTO tikv_test_insert VALUES (1, 'Alice', 30)", ())
+        .unwrap();
+    db.execute("INSERT INTO tikv_test_insert VALUES (2, 'Bob', 25)", ())
+        .unwrap();
+    db.execute("INSERT INTO tikv_test_insert VALUES (3, 'Charlie', 35)", ())
+        .unwrap();
 
     // Select all
     let mut count = 0;
-    for row in db
-        .query("SELECT * FROM tikv_test_insert", ())
-        .unwrap()
-    {
+    for row in db.query("SELECT * FROM tikv_test_insert", ()).unwrap() {
         let _row = row.unwrap();
         count += 1;
     }
@@ -115,10 +103,7 @@ fn test_tikv_insert_select() {
     // Select with WHERE
     let mut count = 0;
     for row in db
-        .query(
-            "SELECT name FROM tikv_test_insert WHERE age > 28",
-            (),
-        )
+        .query("SELECT name FROM tikv_test_insert WHERE age > 28", ())
         .unwrap()
     {
         let _row = row.unwrap();
@@ -149,18 +134,12 @@ fn test_tikv_update() {
         .unwrap();
 
     // Update
-    db.execute(
-        "UPDATE tikv_test_update SET value = 999 WHERE id = 1",
-        (),
-    )
-    .unwrap();
+    db.execute("UPDATE tikv_test_update SET value = 999 WHERE id = 1", ())
+        .unwrap();
 
     // Verify
     let val: i64 = db
-        .query_one(
-            "SELECT value FROM tikv_test_update WHERE id = 1",
-            (),
-        )
+        .query_one("SELECT value FROM tikv_test_update WHERE id = 1", ())
         .unwrap();
     assert_eq!(val, 999);
 
@@ -260,26 +239,14 @@ fn test_tikv_aggregation() {
     )
     .unwrap();
 
-    db.execute(
-        "INSERT INTO tikv_test_agg VALUES (1, 'A', 10.5)",
-        (),
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO tikv_test_agg VALUES (2, 'B', 20.0)",
-        (),
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO tikv_test_agg VALUES (3, 'A', 30.5)",
-        (),
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO tikv_test_agg VALUES (4, 'B', 40.0)",
-        (),
-    )
-    .unwrap();
+    db.execute("INSERT INTO tikv_test_agg VALUES (1, 'A', 10.5)", ())
+        .unwrap();
+    db.execute("INSERT INTO tikv_test_agg VALUES (2, 'B', 20.0)", ())
+        .unwrap();
+    db.execute("INSERT INTO tikv_test_agg VALUES (3, 'A', 30.5)", ())
+        .unwrap();
+    db.execute("INSERT INTO tikv_test_agg VALUES (4, 'B', 40.0)", ())
+        .unwrap();
 
     // SUM
     let total: f64 = db
@@ -352,16 +319,10 @@ fn test_tikv_auto_increment() {
     .unwrap();
 
     // Insert without specifying ID (auto-increment)
-    db.execute(
-        "INSERT INTO tikv_test_autoinc (name) VALUES ('first')",
-        (),
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO tikv_test_autoinc (name) VALUES ('second')",
-        (),
-    )
-    .unwrap();
+    db.execute("INSERT INTO tikv_test_autoinc (name) VALUES ('first')", ())
+        .unwrap();
+    db.execute("INSERT INTO tikv_test_autoinc (name) VALUES ('second')", ())
+        .unwrap();
 
     let count: i64 = db
         .query_one("SELECT COUNT(*) FROM tikv_test_autoinc", ())

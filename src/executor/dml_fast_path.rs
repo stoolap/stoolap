@@ -568,7 +568,8 @@ impl Executor {
         // Bail if table has FK constraints (child table) or is referenced by other tables (parent table)
         // FK enforcement requires cross-table lookups — fall back to normal path
         if !schema.foreign_keys.is_empty()
-            || !super::foreign_key::find_referencing_fks(self.engine.as_ref(), table_name).is_empty()
+            || !super::foreign_key::find_referencing_fks(self.engine.as_ref(), table_name)
+                .is_empty()
         {
             *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
             return None;

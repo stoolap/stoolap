@@ -274,16 +274,11 @@ impl TiKVTable {
                     })
                 })?;
             } else {
-                let key = encoding::make_index_key(
-                    self.table_id,
-                    meta.index_id,
-                    &index_values,
-                    row_id,
-                );
+                let key =
+                    encoding::make_index_key(self.table_id, meta.index_id, &index_values, row_id);
                 self.with_txn(|txn| {
-                    self.runtime.block_on(async {
-                        txn.put(key, vec![]).await.map_err(from_tikv_error)
-                    })
+                    self.runtime
+                        .block_on(async { txn.put(key, vec![]).await.map_err(from_tikv_error) })
                 })?;
             }
         }
@@ -320,21 +315,15 @@ impl TiKVTable {
                     key.extend_from_slice(&encoding::encode_value(v));
                 }
                 self.with_txn(|txn| {
-                    self.runtime.block_on(async {
-                        txn.delete(key).await.map_err(from_tikv_error)
-                    })
+                    self.runtime
+                        .block_on(async { txn.delete(key).await.map_err(from_tikv_error) })
                 })?;
             } else {
-                let key = encoding::make_index_key(
-                    self.table_id,
-                    meta.index_id,
-                    &index_values,
-                    row_id,
-                );
+                let key =
+                    encoding::make_index_key(self.table_id, meta.index_id, &index_values, row_id);
                 self.with_txn(|txn| {
-                    self.runtime.block_on(async {
-                        txn.delete(key).await.map_err(from_tikv_error)
-                    })
+                    self.runtime
+                        .block_on(async { txn.delete(key).await.map_err(from_tikv_error) })
                 })?;
             }
         }
@@ -370,7 +359,12 @@ impl Table for TiKVTable {
         self.txn_id
     }
 
-    fn create_column(&mut self, _name: &str, _column_type: DataType, _nullable: bool) -> Result<()> {
+    fn create_column(
+        &mut self,
+        _name: &str,
+        _column_type: DataType,
+        _nullable: bool,
+    ) -> Result<()> {
         Err(Error::internal("ALTER TABLE not yet supported with TiKV"))
     }
 
@@ -396,9 +390,8 @@ impl Table for TiKVTable {
         let value = encoding::serialize_row(&values)?;
 
         self.with_txn(|txn| {
-            self.runtime.block_on(async {
-                txn.put(key, value).await.map_err(from_tikv_error)
-            })
+            self.runtime
+                .block_on(async { txn.put(key, value).await.map_err(from_tikv_error) })
         })?;
 
         // Maintain indexes
@@ -438,9 +431,8 @@ impl Table for TiKVTable {
                 let key = encoding::make_data_key(self.table_id, *row_id);
                 let encoded = encoding::serialize_row(&new_values)?;
                 self.with_txn(|txn| {
-                    self.runtime.block_on(async {
-                        txn.put(key, encoded).await.map_err(from_tikv_error)
-                    })
+                    self.runtime
+                        .block_on(async { txn.put(key, encoded).await.map_err(from_tikv_error) })
                 })?;
                 updated += 1;
             }
@@ -457,9 +449,8 @@ impl Table for TiKVTable {
         for &row_id in row_ids {
             let key = encoding::make_data_key(self.table_id, row_id);
             let existing = self.with_txn(|txn| {
-                self.runtime.block_on(async {
-                    txn.get(key.clone()).await.map_err(from_tikv_error)
-                })
+                self.runtime
+                    .block_on(async { txn.get(key.clone()).await.map_err(from_tikv_error) })
             })?;
 
             if let Some(bytes) = existing {
@@ -491,9 +482,8 @@ impl Table for TiKVTable {
             let key = encoding::make_data_key(self.table_id, row_id);
             // Read old values for index removal
             let old_values = self.with_txn(|txn| {
-                self.runtime.block_on(async {
-                    txn.get(key.clone()).await.map_err(from_tikv_error)
-                })
+                self.runtime
+                    .block_on(async { txn.get(key.clone()).await.map_err(from_tikv_error) })
             })?;
             if let Some(bytes) = &old_values {
                 if let Ok(values) = encoding::deserialize_row(bytes) {
@@ -502,9 +492,8 @@ impl Table for TiKVTable {
             }
 
             self.with_txn(|txn| {
-                self.runtime.block_on(async {
-                    txn.delete(key).await.map_err(from_tikv_error)
-                })
+                self.runtime
+                    .block_on(async { txn.delete(key).await.map_err(from_tikv_error) })
             })?;
             deleted += 1;
         }
@@ -581,9 +570,7 @@ impl Table for TiKVTable {
     }
 
     fn row_count(&self) -> usize {
-        self.scan_all_rows()
-            .map(|rows| rows.len())
-            .unwrap_or(0)
+        self.scan_all_rows().map(|rows| rows.len()).unwrap_or(0)
     }
 
     fn row_count_hint(&self) -> usize {
@@ -616,9 +603,8 @@ impl Table for TiKVTable {
         for &row_id in row_ids {
             let key = encoding::make_data_key(self.table_id, row_id);
             let result = self.with_txn(|txn| {
-                self.runtime.block_on(async {
-                    txn.get(key).await.map_err(from_tikv_error)
-                })
+                self.runtime
+                    .block_on(async { txn.get(key).await.map_err(from_tikv_error) })
             });
 
             if let Ok(Some(bytes)) = result {
@@ -785,9 +771,7 @@ impl Table for TiKVTable {
                 let pairs_result = self.with_txn(|txn| {
                     let kv_pairs: Vec<(Vec<u8>, Vec<u8>)> = if ascending {
                         let pairs = self.runtime.block_on(async {
-                            txn.scan(prefix..end, total)
-                                .await
-                                .map_err(from_tikv_error)
+                            txn.scan(prefix..end, total).await.map_err(from_tikv_error)
                         })?;
                         pairs.into_iter().map(|p| (p.0.into(), p.1)).collect()
                     } else {
@@ -874,12 +858,10 @@ impl Table for TiKVTable {
             }
         } else if let Some(from) = start_from {
             from
+        } else if ascending {
+            i64::MIN
         } else {
-            if ascending {
-                i64::MIN
-            } else {
-                i64::MAX
-            }
+            i64::MAX
         };
 
         let prefix = encoding::make_data_prefix(self.table_id);
@@ -934,12 +916,7 @@ impl Table for TiKVTable {
         Err(Error::internal("ALTER TABLE not yet supported with TiKV"))
     }
 
-    fn modify_column(
-        &mut self,
-        _name: &str,
-        _new_type: DataType,
-        _nullable: bool,
-    ) -> Result<()> {
+    fn modify_column(&mut self, _name: &str, _new_type: DataType, _nullable: bool) -> Result<()> {
         Err(Error::internal("ALTER TABLE not yet supported with TiKV"))
     }
 

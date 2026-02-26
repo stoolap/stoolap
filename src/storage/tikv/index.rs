@@ -60,13 +60,14 @@ impl IndexMetadata {
             "data_types": data_type_strs,
             "is_unique": self.is_unique,
         });
-        serde_json::to_vec(&json).map_err(|e| Error::internal(format!("serialize index meta: {}", e)))
+        serde_json::to_vec(&json)
+            .map_err(|e| Error::internal(format!("serialize index meta: {}", e)))
     }
 
     /// Deserialize from JSON bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let json: serde_json::Value =
-            serde_json::from_slice(bytes).map_err(|e| Error::internal(format!("deserialize index meta: {}", e)))?;
+        let json: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| Error::internal(format!("deserialize index meta: {}", e)))?;
         let data_type_strs: Vec<String> = json["data_types"]
             .as_array()
             .unwrap_or(&Vec::new())
@@ -131,7 +132,9 @@ impl TiKVIndex {
         let mut guard = self.txn.lock();
         match guard.as_mut() {
             Some(txn) => f(txn),
-            None => Err(Error::internal("Transaction already committed or rolled back")),
+            None => Err(Error::internal(
+                "Transaction already committed or rolled back",
+            )),
         }
     }
 
@@ -203,8 +206,8 @@ impl Index for TiKVIndex {
                 if entry.row_id != row_id {
                     return Err(Error::unique_constraint(
                         &self.meta.name,
-                        &self.meta.column_names.join(","),
-                        &format!("{:?}", values),
+                        self.meta.column_names.join(","),
+                        format!("{:?}", values),
                     ));
                 }
             }
@@ -218,18 +221,11 @@ impl Index for TiKVIndex {
             })
         } else {
             // Non-unique: key includes row_id for uniqueness
-            let key = encoding::make_index_key(
-                self.meta.table_id,
-                self.meta.index_id,
-                values,
-                row_id,
-            );
+            let key =
+                encoding::make_index_key(self.meta.table_id, self.meta.index_id, values, row_id);
             self.with_txn(|txn| {
-                self.runtime.block_on(async {
-                    txn.put(key, vec![])
-                        .await
-                        .map_err(from_tikv_error)
-                })
+                self.runtime
+                    .block_on(async { txn.put(key, vec![]).await.map_err(from_tikv_error) })
             })
         }
     }
@@ -247,25 +243,15 @@ impl Index for TiKVIndex {
         if self.meta.is_unique {
             let prefix = self.make_value_prefix(values);
             self.with_txn(|txn| {
-                self.runtime.block_on(async {
-                    txn.delete(prefix)
-                        .await
-                        .map_err(from_tikv_error)
-                })
+                self.runtime
+                    .block_on(async { txn.delete(prefix).await.map_err(from_tikv_error) })
             })
         } else {
-            let key = encoding::make_index_key(
-                self.meta.table_id,
-                self.meta.index_id,
-                values,
-                row_id,
-            );
+            let key =
+                encoding::make_index_key(self.meta.table_id, self.meta.index_id, values, row_id);
             self.with_txn(|txn| {
-                self.runtime.block_on(async {
-                    txn.delete(key)
-                        .await
-                        .map_err(from_tikv_error)
-                })
+                self.runtime
+                    .block_on(async { txn.delete(key).await.map_err(from_tikv_error) })
             })
         }
     }
@@ -321,7 +307,11 @@ impl Index for TiKVIndex {
 
         // Scan the range between min and max
         let start = min_prefix.clone();
-        let end = if max_inclusive { max_end } else { max_prefix.clone() };
+        let end = if max_inclusive {
+            max_end
+        } else {
+            max_prefix.clone()
+        };
 
         self.with_txn(|txn| {
             let pairs = self.runtime.block_on(async {
@@ -363,10 +353,8 @@ impl Index for TiKVIndex {
         match op {
             Operator::Eq => self.find(values),
             Operator::Lt | Operator::Lte | Operator::Gt | Operator::Gte => {
-                let index_prefix = encoding::make_index_prefix(
-                    self.meta.table_id,
-                    self.meta.index_id,
-                );
+                let index_prefix =
+                    encoding::make_index_prefix(self.meta.table_id, self.meta.index_id);
                 let index_end = encoding::prefix_end_key(&index_prefix);
                 let value_prefix = self.make_value_prefix(values);
 
@@ -423,11 +411,9 @@ impl Index for TiKVIndex {
         let end = encoding::prefix_end_key(&prefix);
 
         self.with_txn(|txn| {
-            let pairs = self.runtime.block_on(async {
-                txn.scan(prefix..end, 1)
-                    .await
-                    .map_err(from_tikv_error)
-            })?;
+            let pairs = self
+                .runtime
+                .block_on(async { txn.scan(prefix..end, 1).await.map_err(from_tikv_error) })?;
 
             if let Some(pair) = pairs.into_iter().next() {
                 let key: Vec<u8> = pair.0.into();

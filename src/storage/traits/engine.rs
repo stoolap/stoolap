@@ -328,11 +328,7 @@ pub trait Engine: Send + Sync {
 
     /// Get a table handle for an existing transaction by txn_id.
     /// This allows FK enforcement to participate in the caller's transaction.
-    fn get_table_for_txn(
-        &self,
-        _txn_id: i64,
-        _table_name: &str,
-    ) -> Result<Box<dyn Table>> {
+    fn get_table_for_txn(&self, _txn_id: i64, _table_name: &str) -> Result<Box<dyn Table>> {
         Err(crate::core::Error::internal(
             "get_table_for_txn not supported by this engine",
         ))

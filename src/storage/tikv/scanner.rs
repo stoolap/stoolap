@@ -84,9 +84,7 @@ impl TiKVScanner {
                     let values: Vec<Value> = self
                         .column_indices
                         .iter()
-                        .map(|&i| {
-                            row.get(i).cloned().unwrap_or_else(Value::null_unknown)
-                        })
+                        .map(|&i| row.get(i).cloned().unwrap_or_else(Value::null_unknown))
                         .collect();
                     self.current_row = Row::from_values(values);
                 }

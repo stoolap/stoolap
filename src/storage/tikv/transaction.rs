@@ -99,7 +99,9 @@ impl TiKVTransaction {
         let mut guard = self.txn.lock();
         match guard.as_mut() {
             Some(txn) => f(txn),
-            None => Err(Error::internal("Transaction already committed or rolled back")),
+            None => Err(Error::internal(
+                "Transaction already committed or rolled back",
+            )),
         }
     }
 
@@ -114,9 +116,9 @@ impl TiKVTransaction {
 
         let engine = self.engine();
         let client = engine.client()?;
-        let fresh_txn = self.runtime.block_on(async {
-            client.begin_optimistic().await.map_err(from_tikv_error)
-        })?;
+        let fresh_txn = self
+            .runtime
+            .block_on(async { client.begin_optimistic().await.map_err(from_tikv_error) })?;
 
         let table = TiKVTable::new(
             *table_id,
@@ -257,13 +259,9 @@ impl Transaction for TiKVTransaction {
     }
 
     fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
-        let sp_state = self
-            .savepoints
-            .get(name)
-            .cloned()
-            .ok_or_else(|| {
-                Error::invalid_argument(format!("savepoint '{}' does not exist", name))
-            })?;
+        let sp_state = self.savepoints.get(name).cloned().ok_or_else(|| {
+            Error::invalid_argument(format!("savepoint '{}' does not exist", name))
+        })?;
 
         // Rollback DDL: undo CREATE TABLEs after savepoint
         while self.created_tables.len() > sp_state.created_tables_len {
@@ -283,8 +281,7 @@ impl Transaction for TiKVTransaction {
 
         // Remove this savepoint and all savepoints created after it
         let sp_timestamp = sp_state.timestamp;
-        self.savepoints
-            .retain(|_, sp| sp.timestamp <= sp_timestamp);
+        self.savepoints.retain(|_, sp| sp.timestamp <= sp_timestamp);
 
         Ok(())
     }
@@ -466,7 +463,8 @@ impl Transaction for TiKVTransaction {
         })?;
 
         // Update local cache
-        self.schemas.insert(new_lower.clone(), (table_id, schema.clone()));
+        self.schemas
+            .insert(new_lower.clone(), (table_id, schema.clone()));
 
         // Update engine cache
         let engine = self.engine();
@@ -506,7 +504,7 @@ impl Transaction for TiKVTransaction {
                 .find_column(col_name)
                 .ok_or_else(|| Error::ColumnNotFound(col_name.clone()))?;
             column_ids.push(idx as i32);
-            data_types.push(col.data_type.clone());
+            data_types.push(col.data_type);
         }
 
         // Allocate index ID
@@ -532,11 +530,8 @@ impl Transaction for TiKVTransaction {
         let meta_key = encoding::make_index_meta_key(&table_name_lower, index_name);
 
         self.with_txn(|txn| {
-            self.runtime.block_on(async {
-                txn.put(meta_key, meta_bytes)
-                    .await
-                    .map_err(from_tikv_error)
-            })
+            self.runtime
+                .block_on(async { txn.put(meta_key, meta_bytes).await.map_err(from_tikv_error) })
         })?;
 
         // Build index from existing data: scan all rows and add entries
@@ -587,9 +582,7 @@ impl Transaction for TiKVTransaction {
                         let idx_key =
                             encoding::make_index_key(table_id, index_id, &index_values, row_id);
                         self.runtime.block_on(async {
-                            txn.put(idx_key, vec![])
-                                .await
-                                .map_err(from_tikv_error)
+                            txn.put(idx_key, vec![]).await.map_err(from_tikv_error)
                         })?;
                     }
                 }
@@ -633,15 +626,13 @@ impl Transaction for TiKVTransaction {
                         .map_err(from_tikv_error)
                 })?;
                 for key in keys {
-                    self.runtime.block_on(async {
-                        txn.delete(key).await.map_err(from_tikv_error)
-                    })?;
+                    self.runtime
+                        .block_on(async { txn.delete(key).await.map_err(from_tikv_error) })?;
                 }
                 // Delete metadata key
                 let meta_key = encoding::make_index_meta_key(&table_name_lower, index_name);
-                self.runtime.block_on(async {
-                    txn.delete(meta_key).await.map_err(from_tikv_error)
-                })
+                self.runtime
+                    .block_on(async { txn.delete(meta_key).await.map_err(from_tikv_error) })
             })?;
 
             // Remove from engine cache
@@ -660,14 +651,27 @@ impl Transaction for TiKVTransaction {
         is_unique: bool,
         custom_name: Option<&str>,
     ) -> Result<()> {
-        let index_name = custom_name
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| format!("idx_{}_{}", table_name.to_lowercase(), column_name.to_lowercase()));
-        self.create_table_index(table_name, &index_name, &[column_name.to_string()], is_unique)
+        let index_name = custom_name.map(|n| n.to_string()).unwrap_or_else(|| {
+            format!(
+                "idx_{}_{}",
+                table_name.to_lowercase(),
+                column_name.to_lowercase()
+            )
+        });
+        self.create_table_index(
+            table_name,
+            &index_name,
+            &[column_name.to_string()],
+            is_unique,
+        )
     }
 
     fn drop_table_btree_index(&mut self, table_name: &str, column_name: &str) -> Result<()> {
-        let index_name = format!("idx_{}_{}", table_name.to_lowercase(), column_name.to_lowercase());
+        let index_name = format!(
+            "idx_{}_{}",
+            table_name.to_lowercase(),
+            column_name.to_lowercase()
+        );
         self.drop_table_index(table_name, &index_name)
     }
 
@@ -727,11 +731,7 @@ impl Transaction for TiKVTransaction {
         let table_id = *table_id;
         let mut schema = (**schema_arc).clone();
 
-        schema.modify_column(
-            &column.name,
-            Some(column.data_type),
-            Some(column.nullable),
-        )?;
+        schema.modify_column(&column.name, Some(column.data_type), Some(column.nullable))?;
 
         self.persist_schema(&table_name, table_id, &schema)
     }
@@ -812,8 +812,7 @@ impl Transaction for TiKVTransaction {
                         .map_err(from_tikv_error)
                 })?;
 
-                let col_refs: Vec<&str> =
-                    columns_to_fetch.iter().map(|s| s.as_str()).collect();
+                let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
                 let column_indices: Vec<usize> = {
                     let col_map: FxHashMap<String, usize> = schema
                         .columns
@@ -843,8 +842,7 @@ impl Transaction for TiKVTransaction {
                     result_rows.push((row_id, row));
                 }
 
-                let scanner =
-                    super::scanner::TiKVScanner::from_rows(result_rows, column_indices);
+                let scanner = super::scanner::TiKVScanner::from_rows(result_rows, column_indices);
                 let result_columns: Vec<String> = if columns_to_fetch.is_empty() {
                     schema.columns.iter().map(|c| c.name.clone()).collect()
                 } else {
