@@ -117,6 +117,10 @@
       toggles.forEach(function (t) {
         t.setAttribute('aria-expanded', t.parentElement === section);
       });
+    } else {
+      toggles.forEach(function (t, i) {
+        t.setAttribute('aria-expanded', i === 0);
+      });
     }
   }
 
