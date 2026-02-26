@@ -8750,11 +8750,11 @@ mod tests {
         let duration = start.elapsed();
         println!("Commit time for {} rows: {:?}", row_count, duration);
 
-        // If it's O(N^2), 5000 rows might take > 1-2 seconds.
-        // If it's O(N), it should be < 100ms.
-        // We set a threshold of 800ms to be safe but detect regression.
+        // If it's O(N^2), 30000 rows would take several seconds.
+        // If it's O(N), it should be < 200ms normally.
+        // Coverage instrumentation (llvm-cov) adds ~2-3x overhead, so use 2000ms.
         assert!(
-            duration.as_millis() < 800,
+            duration.as_millis() < 2000,
             "Performance regression detected! Commit took {:?}",
             duration
         );

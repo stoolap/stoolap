@@ -3345,10 +3345,13 @@ mod tests {
     #[test]
     fn test_hnsw_batch_build_recall() {
         // Exercises add_batch_slice() which uses the parallel build path when enabled.
+        // Uses clustered Gaussian vectors (same pattern as vector_search_bench.rs)
+        // with a deterministic LCG to ensure reproducible results across platforms.
         let dims = 32;
         let n = 10_000;
         let k = 10;
-        let num_queries = 20;
+        let num_queries = 50;
+        let num_clusters = 50;
 
         let mut index = HnswIndex::new(
             "test_idx_batch".to_string(),
@@ -3356,18 +3359,50 @@ mod tests {
             "embedding".to_string(),
             1,
             dims,
-            32,
+            16,
             200,
             200,
             HnswDistanceMetric::L2,
         );
         index.build().unwrap();
 
+        // Deterministic LCG PRNG
+        let mut rng: u64 = 42;
+        let next_f32 = |state: &mut u64| -> f32 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*state >> 33) as f32 / (u32::MAX >> 1) as f32 - 1.0
+        };
+
+        // Generate cluster centers
+        let centers: Vec<Vec<f32>> = (0..num_clusters)
+            .map(|c| {
+                (0..dims)
+                    .map(|d| {
+                        let base = ((c * 7 + d * 13) as f32).sin() * 3.0;
+                        let decay = 1.0 / (1.0 + d as f32 * 0.01);
+                        base * decay
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Generate clustered vectors with deterministic Gaussian noise (Box-Muller)
         let vectors: Vec<Vec<f32>> = (0..n)
             .map(|i| {
-                (0..dims)
-                    .map(|d| ((i * 17 + d * 31) as f32).sin())
-                    .collect::<Vec<f32>>()
+                let center = &centers[i % num_clusters];
+                center
+                    .iter()
+                    .map(|&c| {
+                        let u1 = (next_f32(&mut rng).abs() + 1.0) / 2.0; // map to (0, 1]
+                        let u1 = u1.max(1e-10);
+                        let u2 = (next_f32(&mut rng) + 1.0) / 2.0; // map to [0, 1]
+                        let noise =
+                            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+                        c + noise * 0.5
+                    })
+                    .collect()
             })
             .collect();
 
@@ -3381,10 +3416,20 @@ mod tests {
 
         index.add_batch_slice(&entry_refs).unwrap();
 
+        // Generate query vectors (different seed, same cluster structure with wider noise)
+        let mut qrng: u64 = 99999;
         let mut total_recall = 0.0;
         for qi in 0..num_queries {
-            let qvec: Vec<f32> = (0..dims)
-                .map(|d| ((qi * 101 + d * 29) as f32).sin() + 0.05)
+            let center = &centers[qi % num_clusters];
+            let qvec: Vec<f32> = center
+                .iter()
+                .map(|&c| {
+                    let u1 = (next_f32(&mut qrng).abs() + 1.0) / 2.0;
+                    let u1 = u1.max(1e-10);
+                    let u2 = (next_f32(&mut qrng) + 1.0) / 2.0;
+                    let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+                    c + noise * 0.6
+                })
                 .collect();
             let qval = make_vector_value(&qvec);
             let qbytes = extract_bytes(&qval);

@@ -1570,7 +1570,7 @@ fn test_hnsw_default_index_type() {
 
 #[test]
 fn test_hnsw_cosine_index() {
-    let db = Database::open("memory://hnsw_cosine").expect("db");
+    let db = Database::open("memory://hnsw_cosine_index").expect("db");
     db.execute(
         "CREATE TABLE docs (id INTEGER PRIMARY KEY, emb VECTOR(3))",
         (),
