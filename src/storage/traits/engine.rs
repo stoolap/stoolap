@@ -381,6 +381,16 @@ pub trait Engine: Send + Sync {
     fn refresh_schema_cache(&self, _table_name: &str) -> Result<()> {
         Ok(())
     }
+
+    /// Manually triggers vacuuming of deleted rows and old versions.
+    /// Returns (deleted_rows_cleaned, old_versions_cleaned, transactions_cleaned).
+    fn vacuum(
+        &self,
+        _table_name: Option<&str>,
+        _retention: std::time::Duration,
+    ) -> Result<(i32, i32, i32)> {
+        Ok((0, 0, 0))
+    }
 }
 
 #[cfg(test)]

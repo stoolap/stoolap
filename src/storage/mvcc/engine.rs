@@ -3275,6 +3275,14 @@ impl Engine for MVCCEngine {
     fn refresh_schema_cache(&self, table_name: &str) -> Result<()> {
         MVCCEngine::refresh_schema_cache(self, table_name)
     }
+
+    fn vacuum(
+        &self,
+        table_name: Option<&str>,
+        retention: std::time::Duration,
+    ) -> Result<(i32, i32, i32)> {
+        MVCCEngine::vacuum(self, table_name, retention)
+    }
 }
 
 // =============================================================================

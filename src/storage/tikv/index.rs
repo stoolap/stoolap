@@ -299,6 +299,10 @@ impl Index for TiKVIndex {
         self.meta.is_unique
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn find(&self, values: &[Value]) -> Result<Vec<IndexEntry>> {
         let prefix = self.make_value_prefix(values);
         self.scan_value_prefix(&prefix)

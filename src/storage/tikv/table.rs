@@ -417,7 +417,7 @@ impl Table for TiKVTable {
     fn update(
         &mut self,
         where_expr: Option<&dyn Expression>,
-        setter: &mut dyn FnMut(Row) -> (Row, bool),
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let all_rows = self.scan_all_rows()?;
         let mut updated: i32 = 0;
@@ -428,7 +428,7 @@ impl Table for TiKVTable {
             }
 
             let row = encoding::values_to_row(values.clone());
-            let (new_row, changed) = setter(row);
+            let (new_row, changed) = setter(row)?;
             if changed {
                 let new_values = encoding::row_to_values(&new_row);
                 // Update indexes: remove old entries, add new
@@ -451,7 +451,7 @@ impl Table for TiKVTable {
     fn update_by_row_ids(
         &mut self,
         row_ids: &[i64],
-        setter: &mut dyn FnMut(Row) -> (Row, bool),
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let mut updated: i32 = 0;
         for &row_id in row_ids {
@@ -465,7 +465,7 @@ impl Table for TiKVTable {
             if let Some(bytes) = existing {
                 let old_values = encoding::deserialize_row(&bytes)?;
                 let row = encoding::values_to_row(old_values.clone());
-                let (new_row, changed) = setter(row);
+                let (new_row, changed) = setter(row)?;
                 if changed {
                     let new_values = encoding::row_to_values(&new_row);
                     // Update indexes

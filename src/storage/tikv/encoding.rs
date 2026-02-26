@@ -128,9 +128,9 @@ pub fn encode_value(v: &Value) -> Vec<u8> {
             buf.extend_from_slice(&encode_i64(ts.timestamp_millis()));
             buf
         }
-        Value::Json(j) => {
+        Value::Extension(ext) => {
             let mut buf = vec![0x06];
-            for &b in j.as_bytes() {
+            for &b in ext.as_ref() {
                 if b == 0x00 {
                     buf.push(0x00);
                     buf.push(0xFF);
@@ -202,7 +202,7 @@ pub fn decode_value_with_len(bytes: &[u8]) -> (Value, usize) {
             (Value::Timestamp(ts), 9)
         }
         0x06 => {
-            // JSON: same null-terminated encoding as text
+            // Extension: tag byte + payload with null-terminated encoding
             let mut s = Vec::new();
             let mut i = 1;
             while i < bytes.len() {
@@ -219,9 +219,8 @@ pub fn decode_value_with_len(bytes: &[u8]) -> (Value, usize) {
                     i += 1;
                 }
             }
-            let json_str = String::from_utf8_lossy(&s);
             (
-                Value::Json(CompactArc::from(json_str.as_ref())),
+                Value::Extension(CompactArc::from(s)),
                 i,
             )
         }
@@ -355,7 +354,18 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Timestamp(ts) => {
             serde_json::json!({"t": "ts", "v": ts.to_rfc3339()})
         }
-        Value::Json(j) => serde_json::json!({"t": "json", "v": j.as_ref()}),
+        Value::Extension(ext) => {
+            let tag = ext.first().copied().unwrap_or(0);
+            if tag == DataType::Json as u8 {
+                let s = std::str::from_utf8(&ext[1..]).unwrap_or("");
+                serde_json::json!({"t": "json", "v": s})
+            } else if tag == DataType::Vector as u8 {
+                let v = v.as_vector_f32().unwrap_or_default();
+                serde_json::json!({"t": "vec", "v": v})
+            } else {
+                serde_json::json!({"t": "ext", "tag": tag, "v": format!("{:?}", &ext[1..])})
+            }
+        }
     }
 }
 
@@ -417,7 +427,24 @@ fn json_to_value(j: &serde_json::Value) -> Result<Value> {
             let v = j["v"]
                 .as_str()
                 .ok_or_else(|| Error::internal("bad json value"))?;
-            Ok(Value::Json(CompactArc::from(v)))
+            Ok(Value::json(v))
+        }
+        "vec" => {
+            let arr = j["v"]
+                .as_array()
+                .ok_or_else(|| Error::internal("bad vector value"))?;
+            let mut v = Vec::with_capacity(arr.len());
+            for val in arr {
+                v.push(val.as_f64().ok_or_else(|| Error::internal("bad vector element"))? as f32);
+            }
+            Ok(Value::vector(v))
+        }
+        "ext" => {
+            let tag = j["tag"].as_u64().unwrap_or(0) as u8;
+            // For now, don't support deserializing generic extensions
+            let mut bytes = Vec::with_capacity(1);
+            bytes.push(tag);
+            Ok(Value::Extension(CompactArc::from(bytes)))
         }
         other => Err(Error::internal(format!("unknown value type tag: {other}"))),
     }
@@ -431,6 +458,7 @@ fn datatype_to_str(dt: &DataType) -> &'static str {
         DataType::Text => "text",
         DataType::Timestamp => "ts",
         DataType::Json => "json",
+        DataType::Vector => "vec",
         DataType::Null => "null",
     }
 }
@@ -443,6 +471,7 @@ fn str_to_datatype(s: &str) -> DataType {
         "text" => DataType::Text,
         "ts" => DataType::Timestamp,
         "json" => DataType::Json,
+        "vec" => DataType::Vector,
         _ => DataType::Null,
     }
 }
@@ -721,12 +750,12 @@ mod tests {
 
     #[test]
     fn test_row_serialization_json() {
-        let values = vec![Value::Json(CompactArc::from(r#"{"key": "value"}"#))];
+        let values = vec![Value::json(r#"{"key": "value"}"#)];
         let bytes = serialize_row(&values).unwrap();
         let decoded = deserialize_row(&bytes).unwrap();
         assert_eq!(decoded.len(), 1);
-        if let Value::Json(j) = &decoded[0] {
-            assert_eq!(j.as_ref(), r#"{"key": "value"}"#);
+        if let Some(j) = decoded[0].as_json() {
+            assert_eq!(j, r#"{"key": "value"}"#);
         } else {
             panic!("Expected Json, got {:?}", decoded[0]);
         }
