@@ -1770,7 +1770,7 @@ unsafe fn l2_distance_sq_neon(ap: *const f32, bp: *const f32, n: usize) -> f32 {
 /// Horizontal sum of 8 f32 lanes in an `__m256` register.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
+#[inline]
 unsafe fn hsum_avx(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
     // hi = v[4..7], lo = v[0..3]

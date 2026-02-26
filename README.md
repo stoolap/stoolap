@@ -4,8 +4,8 @@
   <h3>A Modern Embedded SQL Database in Pure Rust</h3>
 
   <p>
-    <a href="https://stoolap.io">Website</a> •
     <a href="https://stoolap.io/docs">Documentation</a> •
+    <a href="https://stoolap.io/playground">Playground</a> •
     <a href="https://github.com/stoolap/stoolap/releases">Releases</a> •
     <a href="BENCHMARKS.md">Benchmarks</a>
   </p>
@@ -201,7 +201,7 @@ stoolap = { version = "0.3", features = ["semantic"] }
 SELECT EMBED('How to reset my password');
 ```
 
-See docs for full vector and semantic search workflows.
+See [Vector Search](https://stoolap.io/docs/data-types/vector-search/) and [Semantic Search](https://stoolap.io/docs/data-types/semantic-search/) docs for full workflows.
 
 ## Storage and Durability
 
@@ -229,9 +229,7 @@ Benchmark figures are point-in-time and workload-dependent. Validate on your own
 
 ```bash
 cargo build
-cargo build --release
-cargo nextest run --lib
-cargo test --lib
+cargo nextest run
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
