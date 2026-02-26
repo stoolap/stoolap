@@ -351,3 +351,117 @@ fn test_row_count_after_upserts() {
 
     assert_eq!(usernames.len(), 3, "Expected 3 distinct usernames");
 }
+
+#[test]
+fn test_on_duplicate_key_update_positional_params() {
+    let db = Database::open_in_memory().expect("Failed to open database");
+    setup_users_table(&db);
+
+    // Insert initial row
+    db.execute(
+        "INSERT INTO users (id, username, email, age) VALUES (1, 'alice', 'alice@example.com', 20)",
+        (),
+    )
+    .unwrap();
+
+    // Upsert with positional params — conflict on id=1 triggers UPDATE branch
+    db.execute(
+        "INSERT INTO users (id, username, email, age) VALUES ($1, $2, $3, $4)
+         ON DUPLICATE KEY UPDATE username = $5, age = $6",
+        (
+            1_i64,
+            "ignored",
+            "ignored@example.com",
+            0_i64,
+            "bob",
+            30_i64,
+        ),
+    )
+    .unwrap();
+
+    let name: String = db
+        .query_one("SELECT username FROM users WHERE id = 1", ())
+        .expect("Failed to query username");
+    let age: i64 = db
+        .query_one("SELECT age FROM users WHERE id = 1", ())
+        .expect("Failed to query age");
+
+    assert_eq!(
+        name, "bob",
+        "Username should be updated via positional param"
+    );
+    assert_eq!(age, 30, "Age should be updated via positional param");
+}
+
+#[test]
+fn test_on_duplicate_key_update_named_params() {
+    let db = Database::open_in_memory().expect("Failed to open database");
+    setup_users_table(&db);
+
+    db.execute(
+        "INSERT INTO users (id, username, email, age) VALUES (1, 'alice', 'alice@example.com', 20)",
+        (),
+    )
+    .unwrap();
+
+    // Upsert with named params
+    db.execute_named(
+        "INSERT INTO users (id, username, email, age) VALUES (:id, :ins_name, :ins_email, :ins_age)
+         ON DUPLICATE KEY UPDATE username = :new_name, age = :new_age",
+        stoolap::named_params! {
+            id: 1_i64,
+            ins_name: "ignored",
+            ins_email: "ignored@example.com",
+            ins_age: 0_i64,
+            new_name: "charlie",
+            new_age: 40_i64
+        },
+    )
+    .unwrap();
+
+    let name: String = db
+        .query_one("SELECT username FROM users WHERE id = 1", ())
+        .expect("Failed to query username");
+    let age: i64 = db
+        .query_one("SELECT age FROM users WHERE id = 1", ())
+        .expect("Failed to query age");
+
+    assert_eq!(
+        name, "charlie",
+        "Username should be updated via named param"
+    );
+    assert_eq!(age, 40, "Age should be updated via named param");
+}
+
+#[test]
+fn test_on_duplicate_key_update_mixed_literal_and_params() {
+    let db = Database::open_in_memory().expect("Failed to open database");
+    setup_users_table(&db);
+
+    db.execute(
+        "INSERT INTO users (id, username, email, age) VALUES (1, 'alice', 'alice@example.com', 20)",
+        (),
+    )
+    .unwrap();
+
+    // Mix of literal and param in UPDATE clause
+    db.execute(
+        "INSERT INTO users (id, username, email, age) VALUES ($1, $2, $3, $4)
+         ON DUPLICATE KEY UPDATE username = 'literal_name', age = $5",
+        (1_i64, "ignored", "ignored@example.com", 0_i64, 99_i64),
+    )
+    .unwrap();
+
+    let name: String = db
+        .query_one("SELECT username FROM users WHERE id = 1", ())
+        .expect("Failed to query username");
+    let age: i64 = db
+        .query_one("SELECT age FROM users WHERE id = 1", ())
+        .expect("Failed to query age");
+
+    assert_eq!(
+        name, "literal_name",
+        "Username should be updated via literal"
+    );
+    assert_eq!(age, 99, "Age should be updated via positional param");
+}

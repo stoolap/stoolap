@@ -387,9 +387,9 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &Value) {
             6_u8.hash(hasher);
             ts.timestamp_nanos_opt().hash(hasher);
         }
-        Value::Json(j) => {
-            7_u8.hash(hasher);
-            j.hash(hasher);
+        Value::Extension(data) => {
+            10_u8.hash(hasher);
+            data.hash(hasher);
         }
     }
 }
@@ -452,7 +452,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Null(_), Value::Null(_)) => false, // NULL != NULL
         (Value::Timestamp(x), Value::Timestamp(y)) => x == y,
-        (Value::Json(x), Value::Json(y)) => x == y,
+        (Value::Extension(x), Value::Extension(y)) => x == y,
         // Cross-type numeric comparison: convert integer to float and compare bits
         (Value::Integer(x), Value::Float(y)) => (*x as f64).to_bits() == y.to_bits(),
         (Value::Float(x), Value::Integer(y)) => x.to_bits() == (*y as f64).to_bits(),

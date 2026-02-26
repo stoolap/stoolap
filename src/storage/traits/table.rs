@@ -65,6 +65,24 @@ pub enum ScanPlan {
         columns: Vec<String>,
         conditions: Vec<String>,
     },
+    /// HNSW approximate nearest neighbor search
+    VectorSearch {
+        table: String,
+        index_name: String,
+        vector_column: String,
+        metric: String,
+        k: usize,
+        ef_search: usize,
+        filter: Option<String>,
+    },
+    /// Brute-force parallel vector distance scan
+    VectorBruteForce {
+        table: String,
+        vector_column: String,
+        metric: String,
+        k: usize,
+        filter: Option<String>,
+    },
 }
 
 impl fmt::Display for ScanPlan {
@@ -133,6 +151,42 @@ impl fmt::Display for ScanPlan {
                 )?;
                 for (col, cond) in columns.iter().zip(conditions.iter()) {
                     write!(f, "\n  {} {}", col, cond)?;
+                }
+                Ok(())
+            }
+            ScanPlan::VectorSearch {
+                table,
+                index_name,
+                vector_column,
+                metric,
+                k,
+                ef_search,
+                filter,
+            } => {
+                write!(
+                    f,
+                    "HNSW Index Scan using {} on {}\n  Column: {}\n  Metric: {}\n  K: {}\n  EF Search: {}",
+                    index_name, table, vector_column, metric, k, ef_search
+                )?;
+                if let Some(flt) = filter {
+                    write!(f, "\n  Filter: {}", flt)?;
+                }
+                Ok(())
+            }
+            ScanPlan::VectorBruteForce {
+                table,
+                vector_column,
+                metric,
+                k,
+                filter,
+            } => {
+                write!(
+                    f,
+                    "Vector Scan on {}\n  Column: {}\n  Metric: {}\n  K: {}",
+                    table, vector_column, metric, k
+                )?;
+                if let Some(flt) = filter {
+                    write!(f, "\n  Filter: {}", flt)?;
                 }
                 Ok(())
             }
@@ -268,7 +322,7 @@ pub trait Table: Send + Sync {
     fn update(
         &mut self,
         where_expr: Option<&dyn Expression>,
-        setter: &mut dyn FnMut(Row) -> (Row, bool),
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32>;
 
     /// Updates rows by their row IDs directly (O(k) lookup instead of O(n) scan).
@@ -285,7 +339,7 @@ pub trait Table: Send + Sync {
     fn update_by_row_ids(
         &mut self,
         row_ids: &[i64],
-        setter: &mut dyn FnMut(Row) -> (Row, bool),
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32>;
 
     /// Deletes rows by their row IDs directly (O(k) lookup instead of O(n) scan).
@@ -402,6 +456,16 @@ pub trait Table: Send + Sync {
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
         // Default implementation: delegate to ordered version
         self.collect_all_rows(None)
+    }
+
+    /// Collects rows for specific row IDs.
+    ///
+    /// Used by HNSW index search to fetch rows after approximate nearest neighbor lookup.
+    /// The returned rows preserve the order of the input row_ids.
+    fn collect_rows_by_ids(&self, _row_ids: &[i64]) -> Result<RowVec> {
+        Err(Error::NotSupported(
+            "collect_rows_by_ids not implemented".to_string(),
+        ))
     }
 
     /// Collect rows with ORDER BY + LIMIT using deferred materialization
@@ -525,6 +589,41 @@ pub trait Table: Send + Sync {
         // Default implementation calls create_index (ignores index_type)
         let _ = index_type;
         self.create_index(name, columns, is_unique)
+    }
+
+    /// Creates an HNSW index with custom parameters
+    ///
+    /// # Arguments
+    /// * `name` - The name of the index
+    /// * `column` - The vector column to index
+    /// * `is_unique` - Whether this is a unique index
+    /// * `m` - Max connections per node per layer
+    /// * `ef_construction` - Build-time beam width
+    /// * `ef_search` - Search-time beam width
+    /// * `metric` - Distance metric (L2, Cosine, InnerProduct)
+    #[allow(clippy::too_many_arguments)]
+    fn create_hnsw_index(
+        &self,
+        name: &str,
+        column: &str,
+        is_unique: bool,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        metric: crate::storage::index::HnswDistanceMetric,
+    ) -> Result<()> {
+        let _ = (
+            name,
+            column,
+            is_unique,
+            m,
+            ef_construction,
+            ef_search,
+            metric,
+        );
+        Err(crate::core::Error::internal(
+            "HNSW index not supported by this storage engine".to_string(),
+        ))
     }
 
     /// Drops an index from the table

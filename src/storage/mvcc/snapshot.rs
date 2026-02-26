@@ -366,8 +366,11 @@ fn serialize_snapshot_schema(schema: &Schema) -> Vec<u8> {
         buf.extend_from_slice(&(col.name.len() as u16).to_le_bytes());
         buf.extend_from_slice(col.name.as_bytes());
 
-        // Data type (1 byte)
+        // Data type (1 byte, + 2 bytes dimension for Vector)
         buf.push(col.data_type.as_u8());
+        if col.data_type == DataType::Vector {
+            buf.extend_from_slice(&col.vector_dimensions.to_le_bytes());
+        }
 
         // Nullable (1 byte)
         buf.push(if col.nullable { 1 } else { 0 });
@@ -481,6 +484,12 @@ fn deserialize_snapshot_schema(data: &[u8]) -> Result<Schema> {
         }
         let data_type = DataType::from_u8(data[pos]).unwrap_or(DataType::Null);
         pos += 1;
+        // For Vector type, read 2-byte dimension
+        let mut vector_dimensions: u16 = 0;
+        if data_type == DataType::Vector && pos + 2 <= data.len() {
+            vector_dimensions = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+        }
 
         // Nullable
         if pos >= data.len() {
@@ -574,6 +583,7 @@ fn deserialize_snapshot_schema(data: &[u8]) -> Result<Schema> {
             default_expr,
             default_value: None,
             check_expr,
+            vector_dimensions,
         });
     }
 
@@ -1681,11 +1691,21 @@ impl DiskVersionStore {
         // and delete everything else (corrupt files + excess valid files).
         // A corrupt file occupying a keep slot would permanently block WAL truncation.
         let mut valid_kept = 0usize;
+        let mut surviving_timestamps: Vec<String> = Vec::new();
         for snap_file in &snapshot_files {
             if valid_kept < keep_count {
                 // Check if this file is valid (CRC-verified)
                 if verify_snapshot_integrity(snap_file).is_ok() {
                     valid_kept += 1;
+                    // Track timestamp of surviving snapshot for HNSW graph cleanup
+                    if let Some(ts) = snap_file
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| n.strip_prefix("snapshot-"))
+                        .and_then(|n| n.strip_suffix(".bin"))
+                    {
+                        surviving_timestamps.push(ts.to_string());
+                    }
                     continue; // Keep this valid snapshot
                 }
                 // Corrupt file — delete it, don't count toward keep_count
@@ -1696,6 +1716,24 @@ impl DiskVersionStore {
                     "Warning: failed to delete old snapshot {:?}: {}",
                     snap_file, e
                 );
+            }
+        }
+
+        // Clean up HNSW graph files not matching any surviving snapshot.
+        // New format: hnsw_{name}-{timestamp}.bin — keep only if timestamp matches a survivor.
+        // Legacy format: hnsw_{name}.bin — always remove (orphaned from pre-timestamp code).
+        if let Ok(entries) = fs::read_dir(&snapshot_dir) {
+            for entry in entries.flatten() {
+                if let Some(name_str) = entry.file_name().to_str().map(|s| s.to_string()) {
+                    if name_str.starts_with("hnsw_") && name_str.ends_with(".bin") {
+                        let should_keep = surviving_timestamps
+                            .iter()
+                            .any(|ts| name_str.ends_with(&format!("-{}.bin", ts)));
+                        if !should_keep {
+                            let _ = fs::remove_file(entry.path());
+                        }
+                    }
+                }
             }
         }
 

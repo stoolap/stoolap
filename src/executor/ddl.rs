@@ -241,6 +241,14 @@ impl Executor {
                 check_expr,
             );
 
+            // Store vector dimension in SchemaColumn if this is a VECTOR type
+            if data_type == DataType::Vector {
+                let dim = crate::executor::utils::parse_vector_dimension(&col_def.data_type);
+                if dim > 0 {
+                    schema_builder = schema_builder.set_last_vector_dimensions(dim);
+                }
+            }
+
             // Track UNIQUE columns for index creation
             if is_unique && !is_primary_key {
                 unique_columns.push(col_name.to_string());
@@ -339,6 +347,10 @@ impl Executor {
                     std::slice::from_ref(col_name),
                     true,
                     idx_type,
+                    None,
+                    None,
+                    None,
+                    None,
                 )?;
             }
 
@@ -359,6 +371,10 @@ impl Executor {
                     col_names,
                     true,
                     idx_type,
+                    None,
+                    None,
+                    None,
+                    None,
                 )?;
             }
 
@@ -376,6 +392,10 @@ impl Executor {
                     std::slice::from_ref(col_name),
                     false,
                     idx_type,
+                    None,
+                    None,
+                    None,
+                    None,
                 )?;
             }
         } else {
@@ -403,6 +423,10 @@ impl Executor {
                         std::slice::from_ref(col_name),
                         true,
                         idx_type,
+                        None,
+                        None,
+                        None,
+                        None,
                     )?;
                 }
 
@@ -421,6 +445,10 @@ impl Executor {
                         col_names,
                         true,
                         idx_type,
+                        None,
+                        None,
+                        None,
+                        None,
                     )?;
                 }
 
@@ -438,6 +466,10 @@ impl Executor {
                         std::slice::from_ref(col_name),
                         false,
                         idx_type,
+                        None,
+                        None,
+                        None,
+                        None,
                     )?;
                 }
             }
@@ -522,7 +554,10 @@ impl Executor {
             crate::core::Value::Text(_) => DataType::Text,
             crate::core::Value::Boolean(_) => DataType::Boolean,
             crate::core::Value::Timestamp(_) => DataType::Timestamp,
-            crate::core::Value::Json(_) => DataType::Json,
+            crate::core::Value::Extension(data) => data
+                .first()
+                .and_then(|&b| DataType::from_u8(b))
+                .unwrap_or(DataType::Text),
             crate::core::Value::Null(_) => DataType::Text, // Default nulls to TEXT
         }
     }
@@ -643,17 +678,141 @@ impl Executor {
             crate::parser::ast::IndexMethod::BTree => crate::core::IndexType::BTree,
             crate::parser::ast::IndexMethod::Hash => crate::core::IndexType::Hash,
             crate::parser::ast::IndexMethod::Bitmap => crate::core::IndexType::Bitmap,
+            crate::parser::ast::IndexMethod::Hnsw => crate::core::IndexType::Hnsw,
         });
 
+        // HNSW only supports single-column indexes — reject multi-column early
+        if requested_index_type == Some(crate::core::IndexType::Hnsw) && column_names.len() > 1 {
+            return Err(Error::invalid_argument(
+                "HNSW index must be on a single vector column; multi-column HNSW indexes are not supported",
+            ));
+        }
+
+        // Extract HNSW-specific options from WITH clause
+        let mut hnsw_m: Option<u16> = None;
+        let mut hnsw_ef_construction: Option<u16> = None;
+        let mut hnsw_ef_search: Option<u16> = None;
+        let mut hnsw_distance_metric: Option<u8> = None;
+        let is_hnsw = requested_index_type == Some(crate::core::IndexType::Hnsw);
+        for (key, value) in &stmt.options {
+            match key.as_str() {
+                "m" => {
+                    let v = value.parse::<u16>().map_err(|_| {
+                        Error::invalid_argument(format!(
+                            "invalid value for HNSW option 'm': '{}' (expected integer >= 2)",
+                            value
+                        ))
+                    })?;
+                    if v < 2 {
+                        return Err(Error::invalid_argument(format!(
+                            "HNSW option 'm' must be >= 2, got {}",
+                            v
+                        )));
+                    }
+                    hnsw_m = Some(v);
+                }
+                "ef_construction" => {
+                    hnsw_ef_construction = Some(value.parse::<u16>().map_err(|_| {
+                        Error::invalid_argument(format!(
+                            "invalid value for HNSW option 'ef_construction': '{}' (expected positive integer)",
+                            value
+                        ))
+                    })?);
+                }
+                "ef_search" => {
+                    hnsw_ef_search = Some(value.parse::<u16>().map_err(|_| {
+                        Error::invalid_argument(format!(
+                            "invalid value for HNSW option 'ef_search': '{}' (expected positive integer)",
+                            value
+                        ))
+                    })?);
+                }
+                "metric" | "distance" => {
+                    let metric =
+                        crate::storage::index::HnswDistanceMetric::from_name(&value.to_lowercase())
+                            .ok_or_else(|| {
+                                Error::invalid_argument(format!(
+                            "unknown HNSW distance metric '{}' (expected: l2, cosine, or ip)",
+                            value
+                        ))
+                            })?;
+                    hnsw_distance_metric = Some(metric.as_u8());
+                }
+                other if is_hnsw => {
+                    return Err(Error::invalid_argument(format!(
+                        "unknown HNSW index option '{}' (valid options: m, ef_construction, ef_search, metric)",
+                        other
+                    )));
+                }
+                _ => {}
+            }
+        }
+
         // Create the index (supports both single and multi-column)
-        // Use create_index_with_type to pass the optional explicit index type
-        table.create_index_with_type(index_name, &column_refs, is_unique, requested_index_type)?;
+        let has_hnsw_opts = hnsw_m.is_some()
+            || hnsw_ef_construction.is_some()
+            || hnsw_ef_search.is_some()
+            || hnsw_distance_metric.is_some();
+        if has_hnsw_opts && requested_index_type == Some(crate::core::IndexType::Hnsw) {
+            // Auto-tune default M based on vector dimensions when not explicitly set
+            if hnsw_m.is_none() {
+                let dims = schema
+                    .find_column(&column_names[0])
+                    .map(|(_, col)| col.vector_dimensions as usize)
+                    .unwrap_or(0);
+                hnsw_m = Some(crate::storage::index::default_m_for_dims(dims) as u16);
+            }
+            // HNSW with custom params — use dedicated method
+            table.create_hnsw_index(
+                index_name,
+                column_refs[0],
+                is_unique,
+                hnsw_m.unwrap() as usize,
+                hnsw_ef_construction.unwrap_or(crate::storage::index::default_ef_construction(
+                    hnsw_m.unwrap() as usize,
+                ) as u16) as usize,
+                hnsw_ef_search.unwrap_or(crate::storage::index::default_ef_search(
+                    hnsw_m.unwrap() as usize
+                ) as u16) as usize,
+                crate::storage::index::HnswDistanceMetric::from_u8(
+                    hnsw_distance_metric.unwrap_or(0),
+                )
+                .unwrap_or(crate::storage::index::HnswDistanceMetric::L2),
+            )?;
+        } else {
+            // Standard index creation with optional type hint
+            table.create_index_with_type(
+                index_name,
+                &column_refs,
+                is_unique,
+                requested_index_type,
+            )?;
+        }
 
         // Get the created index to determine its actual type for WAL persistence
         let index_type = table
             .get_index(index_name)
             .map(|idx| idx.index_type())
             .unwrap_or(crate::core::IndexType::BTree);
+
+        // Always read back the effective HNSW params from the created index so
+        // the WAL persists the exact values used at runtime. This covers both the
+        // no-WITH path (all params auto-tuned from dims) and partial-WITH paths
+        // (e.g., WITH(metric='cosine') where ef_* are still auto-tuned).
+        if index_type == crate::core::IndexType::Hnsw {
+            if let Some(idx) = table.get_index(index_name) {
+                if let Some(hnsw) = idx
+                    .as_any()
+                    .downcast_ref::<crate::storage::index::HnswIndex>()
+                {
+                    let (m, efc, efs, met) = hnsw.params();
+                    hnsw_m = Some(m as u16);
+                    hnsw_ef_construction = Some(efc as u16);
+                    hnsw_ef_search = Some(efs as u16);
+                    hnsw_distance_metric = Some(met as u8);
+                }
+            }
+        }
 
         // Record index creation to WAL for persistence.
         // If WAL write fails, rollback the in-memory index to prevent ghost state
@@ -664,6 +823,10 @@ impl Executor {
             &column_names,
             is_unique,
             index_type,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_ef_search,
+            hnsw_distance_metric,
         ) {
             // Rollback: remove the index we just created
             let _ = table.drop_index(index_name);
@@ -782,12 +945,18 @@ impl Executor {
                     self.engine.refresh_schema_cache(table_name)?;
 
                     // Record ALTER TABLE ADD COLUMN to WAL for persistence
+                    let vector_dimensions = if data_type == DataType::Vector {
+                        crate::executor::utils::parse_vector_dimension(&col_def.data_type)
+                    } else {
+                        0
+                    };
                     self.engine.record_alter_table_add_column(
                         table_name,
                         &col_def.name.value,
                         data_type,
                         nullable,
                         default_expr.as_deref(),
+                        vector_dimensions,
                     )?;
                 } else {
                     return Err(Error::InvalidArgument(
@@ -845,11 +1014,17 @@ impl Executor {
                     self.engine.refresh_schema_cache(table_name)?;
 
                     // Record ALTER TABLE MODIFY COLUMN to WAL for persistence
+                    let vector_dimensions = if data_type == DataType::Vector {
+                        crate::executor::utils::parse_vector_dimension(&col_def.data_type)
+                    } else {
+                        0
+                    };
                     self.engine.record_alter_table_modify_column(
                         table_name,
                         &col_def.name.value,
                         data_type,
                         nullable,
+                        vector_dimensions,
                     )?;
                 } else {
                     return Err(Error::InvalidArgument(
@@ -940,6 +1115,7 @@ impl Executor {
             "JSON" | "JSONB" => Ok(DataType::Json),
             // Binary data stored as Text (base64 encoded)
             "BLOB" | "BINARY" | "VARBINARY" => Ok(DataType::Text),
+            "VECTOR" => Ok(DataType::Vector),
             _ => Err(Error::Type(format!("Unknown data type: {}", type_str))),
         }
     }

@@ -70,7 +70,7 @@ impl Precedence {
             // AS has lowest precedence to prevent it from being consumed by NOT/AND/OR etc.
             // e.g., "NOT TRUE AS alias" should parse as "(NOT TRUE) AS alias"
             "AS" => Precedence::Lowest,
-            "<" | ">" | "<=" | ">=" => Precedence::LessGreater,
+            "<" | ">" | "<=" | ">=" | "<=>" => Precedence::LessGreater,
 
             // Bitwise operators (lower to higher precedence)
             "|" => Precedence::BitwiseOr,

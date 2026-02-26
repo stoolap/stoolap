@@ -39,7 +39,7 @@
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::common::CompactVec;
@@ -1224,6 +1224,202 @@ pub fn parallel_filter_with_stats(
     };
 
     Ok((result, stats))
+}
+
+/// Distance metric for vector search
+#[derive(Debug, Clone, Copy)]
+pub enum DistanceMetric {
+    L2,
+    Cosine,
+    InnerProduct,
+}
+
+/// Parallel brute-force k-NN vector search
+///
+/// Fuses distance computation + top-K heap selection into parallel chunks,
+/// then merges chunk heaps. Zero-copy on Extension(Vector) values.
+///
+/// Returns (row_id, row, distance) sorted by distance (ascending).
+pub fn parallel_topn_vector_search(
+    rows: RowVec,
+    vector_col_idx: usize,
+    query_bytes: &[u8],
+    k: usize,
+    metric: DistanceMetric,
+    config: &ParallelConfig,
+) -> Vec<(i64, Row, f64)> {
+    use std::collections::BinaryHeap;
+
+    if k == 0 || rows.is_empty() {
+        return Vec::new();
+    }
+
+    let distance_fn: fn(&[u8], &[u8]) -> f64 = match metric {
+        DistanceMetric::L2 => crate::functions::scalar::vector::l2_distance_bytes,
+        DistanceMetric::Cosine => crate::functions::scalar::vector::cosine_distance_bytes,
+        DistanceMetric::InnerProduct => crate::functions::scalar::vector::ip_distance_bytes,
+    };
+
+    // Extract vector bytes from a row value — zero-copy for Extension(Vector)
+    #[inline]
+    fn get_vector_bytes(row: &Row, col_idx: usize) -> Option<&[u8]> {
+        match row.get(col_idx)? {
+            Value::Extension(data)
+                if data.first() == Some(&(crate::core::DataType::Vector as u8)) =>
+            {
+                Some(&data[1..])
+            }
+            _ => None,
+        }
+    }
+
+    /// Max-heap entry: highest distance at top so we can efficiently evict the worst
+    struct HeapEntry {
+        distance: f64,
+        idx: usize, // index into the chunk's collected (row_id, row) vec
+    }
+
+    impl PartialEq for HeapEntry {
+        fn eq(&self, other: &Self) -> bool {
+            self.distance == other.distance
+        }
+    }
+    impl Eq for HeapEntry {}
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.distance.total_cmp(&other.distance)
+        }
+    }
+
+    let row_vec: Vec<(i64, Row)> = rows.into_vec();
+
+    #[cfg(feature = "parallel")]
+    let use_parallel = config.should_parallel_filter(row_vec.len());
+    #[cfg(not(feature = "parallel"))]
+    let use_parallel = false;
+    let _ = config;
+
+    if use_parallel {
+        #[cfg(feature = "parallel")]
+        {
+            let n_threads = num_threads();
+            let chunk_size = (row_vec.len() / (n_threads * 4)).max(1024);
+
+            // Each chunk computes top-K locally, returns (row_id, row, distance)
+            let chunk_results: Vec<Vec<(i64, Row, f64)>> = row_vec
+                .into_par_iter()
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(k + 1);
+                    let mut entries: Vec<(i64, Row, f64)> = Vec::with_capacity(k + 1);
+
+                    for (row_id, row) in chunk {
+                        let dist = if let Some(vec_bytes) = get_vector_bytes(&row, vector_col_idx) {
+                            if vec_bytes.len() == query_bytes.len() {
+                                distance_fn(vec_bytes, query_bytes)
+                            } else {
+                                f64::INFINITY // Dimension mismatch → sort to end
+                            }
+                        } else {
+                            f64::INFINITY // No vector → sort to end
+                        };
+                        if entries.len() < k {
+                            let idx = entries.len();
+                            entries.push((row_id, row, dist));
+                            heap.push(HeapEntry {
+                                distance: dist,
+                                idx,
+                            });
+                        } else if let Some(worst) = heap.peek() {
+                            if dist < worst.distance {
+                                let evict_idx = worst.idx;
+                                heap.pop();
+                                entries[evict_idx] = (row_id, row, dist);
+                                heap.push(HeapEntry {
+                                    distance: dist,
+                                    idx: evict_idx,
+                                });
+                            }
+                        }
+                    }
+
+                    // Return only the live entries (some slots may have been reused)
+                    let live_indices: FxHashSet<usize> = heap.into_iter().map(|e| e.idx).collect();
+                    entries
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(i, e)| {
+                            if live_indices.contains(&i) {
+                                Some(e)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+
+            // Merge: collect all chunk results, take global top-K
+            let mut merged: Vec<(i64, Row, f64)> = chunk_results.into_iter().flatten().collect();
+            merged.sort_unstable_by(|a, b| a.2.total_cmp(&b.2));
+            merged.truncate(k);
+            return merged;
+        }
+    }
+
+    // Sequential fallback
+    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(k + 1);
+    let mut entries: Vec<(i64, Row, f64)> = Vec::with_capacity(k + 1);
+
+    for (row_id, row) in row_vec {
+        let dist = if let Some(vec_bytes) = get_vector_bytes(&row, vector_col_idx) {
+            if vec_bytes.len() == query_bytes.len() {
+                distance_fn(vec_bytes, query_bytes)
+            } else {
+                f64::INFINITY // Dimension mismatch → sort to end
+            }
+        } else {
+            f64::INFINITY // No vector → sort to end
+        };
+        if entries.len() < k {
+            let idx = entries.len();
+            entries.push((row_id, row, dist));
+            heap.push(HeapEntry {
+                distance: dist,
+                idx,
+            });
+        } else if let Some(worst) = heap.peek() {
+            if dist < worst.distance {
+                let evict_idx = worst.idx;
+                heap.pop();
+                entries[evict_idx] = (row_id, row, dist);
+                heap.push(HeapEntry {
+                    distance: dist,
+                    idx: evict_idx,
+                });
+            }
+        }
+    }
+
+    let live_indices: FxHashSet<usize> = heap.into_iter().map(|e| e.idx).collect();
+    let mut result: Vec<(i64, Row, f64)> = entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            if live_indices.contains(&i) {
+                Some(e)
+            } else {
+                None
+            }
+        })
+        .collect();
+    result.sort_unstable_by(|a, b| a.2.total_cmp(&b.2));
+    result
 }
 
 #[cfg(test)]

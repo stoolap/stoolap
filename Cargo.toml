@@ -84,6 +84,13 @@ duckdb = { version = "1.4.3", features = ["bundled"], optional = true }
 # Optional allocators
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
+# Semantic embedding (optional — enables EMBED() SQL function)
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "fancy-regex"], optional = true }
+hf-hub = { version = "0.4", optional = true }
+
 # Platform-specific file locking
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -115,6 +122,7 @@ dhat-heap = []
 sqlite = ["dep:rusqlite"]
 duckdb = ["dep:duckdb"]
 mimalloc = ["dep:mimalloc"]
+semantic = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
 
 [[example]]
 name = "benchmark_sqlite"
@@ -123,6 +131,10 @@ required-features = ["sqlite"]
 [[example]]
 name = "benchmark_duckdb"
 required-features = ["duckdb"]
+
+[[example]]
+name = "semantic_search"
+required-features = ["semantic"]
 
 [profile.release]
 lto = true

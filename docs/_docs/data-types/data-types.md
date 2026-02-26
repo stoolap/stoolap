@@ -7,7 +7,7 @@ order: 1
 
 # Data Types in Stoolap
 
-This document provides information about the data types supported in Stoolap, based on evidence from test files and implementations.
+This document describes the data types supported in Stoolap and how they behave in practice.
 
 ## Supported Data Types
 
@@ -146,6 +146,31 @@ Features:
 - Basic equality comparison
 - More details in the dedicated [JSON Support](json-support) documentation
 
+### VECTOR
+
+Fixed-dimension floating-point vectors for similarity search:
+
+```sql
+-- Column definition with dimension count
+CREATE TABLE embeddings (
+    id INTEGER PRIMARY KEY,
+    content TEXT,
+    embedding VECTOR(384)
+);
+
+-- Example values (bracket-delimited float arrays)
+INSERT INTO embeddings VALUES (1, 'Hello', '[0.1, 0.2, 0.3, ...]');
+INSERT INTO embeddings VALUES (2, 'World', '[0.4, 0.5, 0.6, ...]');
+```
+
+Features:
+- Fixed dimensions specified at table creation (`VECTOR(N)`)
+- Stored as packed little-endian f32 arrays for compact storage
+- Dimension validation on insert
+- Distance functions: `VEC_DISTANCE_L2`, `VEC_DISTANCE_COSINE`, `VEC_DISTANCE_IP`
+- HNSW index support for O(log N) approximate nearest neighbor search
+- More details in the dedicated [Vector Search](vector-search) documentation
+
 ## Column Constraints
 
 Stoolap supports several column constraints:
@@ -262,7 +287,7 @@ Features:
 - IS NULL and IS NOT NULL operators
 - NULL propagation in expressions
 - NULL is distinct from any value, including another NULL
-- More details in the dedicated [NULL Handling](null-handling) documentation
+- More details in the dedicated [NULL Handling](../sql-features/null-handling) documentation
 
 ## Type Conversions
 
@@ -278,7 +303,7 @@ SELECT CAST('2023-01-01' AS TIMESTAMP);
 SELECT '42' + 1;  -- Converts '42' to INTEGER
 ```
 
-More details on type conversions can be found in the dedicated [CAST Operations](cast-operations) documentation.
+More details on type conversions can be found in the dedicated [CAST Operations](../sql-features/cast-operations) documentation.
 
 ## Examples
 
@@ -347,7 +372,8 @@ Based on implementation details in the code:
 - TEXT strings use UTF-8 encoding for maximum compatibility
 - TIMESTAMP values are stored as Unix time with nanosecond precision
 - JSON values are validated on insert but stored as string representation
-- All data types support specialized compression based on data patterns
+- VECTOR values are stored as packed little-endian f32 bytes for zero-copy distance computation
+- Row data is compressed using LZ4 in snapshots for compact storage
 
 ## Best Practices
 
@@ -355,5 +381,6 @@ Based on implementation details in the code:
 - Use INTEGER for IDs and counters
 - Use BOOLEAN for true/false flags rather than INTEGER
 - Use JSON only for genuinely structured/schemaless data
+- Use VECTOR for embedding and similarity search workloads
 - Consider type-specific optimizations in WHERE clauses
 - Use TIMESTAMP for date and time values rather than storing as TEXT

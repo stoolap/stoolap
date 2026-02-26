@@ -567,6 +567,21 @@ pub enum Op {
     TimestampSubDays,
 
     // =========================================================================
+    // VECTOR DISTANCE OPERATIONS
+    // =========================================================================
+    /// L2 (Euclidean) distance between two vectors
+    /// Stack: [vector1, vector2] -> [float]
+    VectorDistanceL2,
+
+    /// Cosine distance between two vectors (1 - cosine_similarity)
+    /// Stack: [vector1, vector2] -> [float]
+    VectorDistanceCosine,
+
+    /// Negative inner product distance between two vectors
+    /// Stack: [vector1, vector2] -> [float]
+    VectorDistanceIP,
+
+    // =========================================================================
     // SET OPERATIONS
     // =========================================================================
     /// IN set membership (pre-built FxHashSet for fast lookups)
@@ -886,6 +901,9 @@ impl std::fmt::Debug for Op {
             Op::TimestampDiff => write!(f, "TimestampDiff"),
             Op::TimestampAddDays => write!(f, "TimestampAddDays"),
             Op::TimestampSubDays => write!(f, "TimestampSubDays"),
+            Op::VectorDistanceL2 => write!(f, "VectorDistanceL2"),
+            Op::VectorDistanceCosine => write!(f, "VectorDistanceCosine"),
+            Op::VectorDistanceIP => write!(f, "VectorDistanceIP"),
             Op::InSet(set, has_null) => {
                 write!(f, "InSet(len={}, has_null={})", set.len(), has_null)
             }

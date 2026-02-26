@@ -794,6 +794,11 @@ impl CostEstimator {
                 let pk_cost = self.constants.random_page_cost * 0.05;
                 (pk_cost, 0.0)
             }
+            IndexType::Hnsw => {
+                // HNSW: approximate graph traversal - similar cost model to Hash
+                let hnsw_cost = self.constants.random_page_cost * 0.2;
+                (hnsw_cost, 0.0)
+            }
         };
 
         // CPU cost for index entries
@@ -814,6 +819,10 @@ impl CostEstimator {
             IndexType::PrimaryKey => {
                 // PkIndex: Direct bitset test, cheapest CPU cost
                 estimated_rows as f64 * self.constants.cpu_operator_cost * 0.5
+            }
+            IndexType::Hnsw => {
+                // HNSW: distance computation per candidate
+                estimated_rows as f64 * self.constants.cpu_operator_cost * 1.5
             }
         };
 

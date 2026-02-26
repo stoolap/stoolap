@@ -137,7 +137,7 @@ After installing Stoolap, you can:
 - Follow the [Quick Start Tutorial](quickstart) to create your first database using the CLI
 - Learn about [Connection Strings](connection-strings) to configure your database
 - Check the [API Reference](api-reference) for using Stoolap in your Rust applications
-- Check the [SQL Commands](sql-commands) reference for working with data
+- Check the [SQL Commands](../sql-commands/sql-commands) reference for working with data
 
 ## Troubleshooting
 

@@ -121,7 +121,7 @@ impl AggregateFunction for StringAggFunction {
             Value::Float(f) => f.to_string(),
             Value::Boolean(b) => b.to_string(),
             Value::Timestamp(t) => t.to_string(),
-            Value::Json(j) => j.to_string(),
+            Value::Extension(_) => value.to_string(),
             Value::Null(_) => return,
         };
 
@@ -151,7 +151,7 @@ impl AggregateFunction for StringAggFunction {
             Value::Float(f) => f.to_string(),
             Value::Boolean(b) => b.to_string(),
             Value::Timestamp(t) => t.to_string(),
-            Value::Json(j) => j.to_string(),
+            Value::Extension(_) => value.to_string(),
             Value::Null(_) => return,
         };
 

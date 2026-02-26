@@ -46,7 +46,7 @@
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::core::{Error, IsolationLevel, Result, Value};
+use crate::core::{DataType, Error, IsolationLevel, Result, Value};
 use crate::executor::context::ExecutionContextBuilder;
 use crate::executor::{CachedPlanRef, ExecutionContext, Executor};
 use crate::storage::mvcc::engine::MVCCEngine;
@@ -415,6 +415,29 @@ impl Database {
                         if let Ok(bytes) = value.parse::<usize>() {
                             config.persistence.compression_threshold = bytes;
                         }
+                    }
+                    // Cleanup interval in seconds: cleanup_interval=60
+                    "cleanup_interval" => {
+                        if let Ok(secs) = value.parse::<u64>() {
+                            config.cleanup.interval_secs = secs;
+                        }
+                    }
+                    // Deleted row retention in seconds: deleted_row_retention=300
+                    "deleted_row_retention" => {
+                        if let Ok(secs) = value.parse::<u64>() {
+                            config.cleanup.deleted_row_retention_secs = secs;
+                        }
+                    }
+                    // Transaction retention in seconds: transaction_retention=3600
+                    "transaction_retention" => {
+                        if let Ok(secs) = value.parse::<u64>() {
+                            config.cleanup.transaction_retention_secs = secs;
+                        }
+                    }
+                    // Disable cleanup: cleanup=off
+                    "cleanup" => {
+                        config.cleanup.enabled =
+                            matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
                     }
                     _ => {} // Ignore unknown parameters
                 }
@@ -1076,7 +1099,9 @@ impl FromValue for String {
     fn from_value(value: &Value) -> Result<Self> {
         match value {
             Value::Text(s) => Ok(s.to_string()),
-            Value::Json(s) => Ok(s.to_string()),
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                Ok(std::str::from_utf8(&data[1..]).unwrap_or("").to_string())
+            }
             // Convert other types to string representation
             Value::Integer(i) => Ok(i.to_string()),
             Value::Float(f) => Ok(f.to_string()),
@@ -1086,6 +1111,9 @@ impl FromValue for String {
                 "false".to_string()
             }),
             Value::Timestamp(ts) => Ok(ts.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            Value::Extension(_) => value
+                .as_string()
+                .ok_or_else(|| Error::invalid_argument("Cannot convert extension to String")),
             Value::Null(_) => Ok(String::new()),
         }
     }

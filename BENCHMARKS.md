@@ -208,22 +208,22 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 ```
 Stoolap Strengths:
-  Point Queries (ID):     ████████████████████  DOMINANT (1213x vs DuckDB)
-  Subquery Compare:       ████████████████████  EXCELLENT (258x vs SQLite)
-  DISTINCT Operations:    ████████████████████  EXCELLENT (22-286x vs SQLite)
-  Semi-joins (EXISTS):    ████████████████████  EXCELLENT (13-303x faster)
-  Batch Inserts:          ████████████████████  EXCELLENT (191x vs DuckDB)
-  Window (PARTITION BY):  ████████████████████  EXCELLENT (154x vs DuckDB)
-  OFFSET Pagination:      ████████████████████  EXCELLENT (84x vs DuckDB)
-  Complex DML:            ████████████████████  EXCELLENT (68-131x faster)
-  Aggregations:           ████████████████████  EXCELLENT (29x vs SQLite)
+  Point Queries (ID):     ████████████████████  1213x vs DuckDB
+  Subquery Compare:       ████████████████████  258x vs SQLite
+  DISTINCT Operations:    ████████████████████  22-286x vs SQLite
+  Semi-joins (EXISTS):    ████████████████████  13-303x faster
+  Batch Inserts:          ████████████████████  191x vs DuckDB
+  Window (PARTITION BY):  ████████████████████  154x vs DuckDB
+  OFFSET Pagination:      ████████████████████  84x vs DuckDB
+  Complex DML:            ████████████████████  68-131x faster
+  Aggregations:           ████████████████████  29x vs SQLite
 
 SQLite Strengths:
-  Simple JOINs:           ████████              GOOD (1.4x faster)
-  Simple Expressions:     ██████                MODERATE (1.0-1.5x faster)
+  Simple JOINs:           ████████              SQLite ~1.4x faster
+  Simple Expressions:     ██████                SQLite ~1.0-1.5x faster
 
 DuckDB Strengths:
-  Derived Tables:         ██████                MODERATE (1.6x faster)
+  Derived Tables:         ██████                DuckDB ~1.6x faster
 ```
 
 ---
@@ -271,4 +271,4 @@ cargo build --release --example benchmark --example benchmark_sqlite --example b
 
 ---
 
-*Benchmarks performed on Apple Silicon, in-memory mode, best of 10 runs.*
+*Benchmarks performed on Apple Silicon, in-memory mode, best of 10 runs. Results are point-in-time for v0.3.2; re-run on your hardware and workload for current numbers.*

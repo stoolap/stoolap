@@ -967,6 +967,13 @@ impl<'a> ExprCompiler<'a> {
                 builder.emit(Op::JsonAccess);
             }
 
+            // Vector distance operator (<=>)
+            InfixOperator::VectorDistance => {
+                self.compile_expr(&infix.left, builder)?;
+                self.compile_expr(&infix.right, builder)?;
+                builder.emit(Op::VectorDistanceL2);
+            }
+
             // Other/unknown operators
             InfixOperator::Other => {
                 return Err(CompileError::UnsupportedExpression(format!(

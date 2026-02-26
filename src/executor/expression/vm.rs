@@ -1798,6 +1798,72 @@ impl ExprVM {
                     self.stack.push(Value::Null(*dt));
                     break;
                 }
+
+                // =============================================================
+                // VECTOR DISTANCE OPERATIONS
+                // =============================================================
+                Op::VectorDistanceL2 => {
+                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let mut buf_a = Vec::new();
+                    let mut buf_b = Vec::new();
+                    match (
+                        extract_vector_bytes(&a, &mut buf_a),
+                        extract_vector_bytes(&b, &mut buf_b),
+                    ) {
+                        (Some(ba), Some(bb)) if ba.len() == bb.len() => {
+                            self.stack.push(Value::Float(
+                                crate::functions::scalar::vector::l2_distance_bytes(ba, bb),
+                            ));
+                        }
+                        _ => {
+                            self.stack.push(Value::null_unknown());
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Op::VectorDistanceCosine => {
+                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let mut buf_a = Vec::new();
+                    let mut buf_b = Vec::new();
+                    match (
+                        extract_vector_bytes(&a, &mut buf_a),
+                        extract_vector_bytes(&b, &mut buf_b),
+                    ) {
+                        (Some(ba), Some(bb)) if ba.len() == bb.len() => {
+                            self.stack.push(Value::Float(
+                                crate::functions::scalar::vector::cosine_distance_bytes(ba, bb),
+                            ));
+                        }
+                        _ => {
+                            self.stack.push(Value::null_unknown());
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Op::VectorDistanceIP => {
+                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let mut buf_a = Vec::new();
+                    let mut buf_b = Vec::new();
+                    match (
+                        extract_vector_bytes(&a, &mut buf_a),
+                        extract_vector_bytes(&b, &mut buf_b),
+                    ) {
+                        (Some(ba), Some(bb)) if ba.len() == bb.len() => {
+                            self.stack.push(Value::Float(
+                                crate::functions::scalar::vector::ip_distance_bytes(ba, bb),
+                            ));
+                        }
+                        _ => {
+                            self.stack.push(Value::null_unknown());
+                        }
+                    }
+                    pc += 1;
+                }
             }
         }
 
@@ -3153,7 +3219,9 @@ impl ExprVM {
 
         // Get the JSON string
         let json_str = match json_val {
-            Value::Json(s) => s.as_ref(),
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                std::str::from_utf8(&data[1..]).unwrap_or("")
+            }
             Value::Text(s) => s.as_ref(),
             Value::Null(_) => {
                 return Value::Null(if as_text {
@@ -3207,7 +3275,7 @@ impl ExprVM {
                     }
                 } else {
                     // -> returns JSON
-                    Value::Json(CompactArc::from(v.to_string()))
+                    Value::json(v.to_string())
                 }
             }
             None => Value::Null(if as_text {
@@ -3327,6 +3395,27 @@ impl ExprVM {
 impl Default for ExprVM {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Extract raw LE f32 bytes from a vector Value, zero-copy for Extension.
+/// For Text values, parses and writes into `buf` as fallback.
+#[inline]
+fn extract_vector_bytes<'a>(v: &'a Value, buf: &'a mut Vec<u8>) -> Option<&'a [u8]> {
+    match v {
+        Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
+            Some(&data[1..])
+        }
+        Value::Text(s) => {
+            let floats = crate::core::value::parse_vector_str(s.as_ref())?;
+            buf.clear();
+            buf.reserve(floats.len() * 4);
+            for f in &floats {
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+            Some(buf.as_slice())
+        }
+        _ => None,
     }
 }
 

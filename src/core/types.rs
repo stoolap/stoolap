@@ -24,11 +24,10 @@ use super::error::Error;
 /// SQL data types supported by Stoolap
 ///
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(u8)]
 pub enum DataType {
     /// NULL data type, used for unknown/unspecified types
-
     #[default]
     Null = 0,
 
@@ -49,6 +48,10 @@ pub enum DataType {
 
     /// JSON document
     Json = 6,
+
+    /// Vector of f32 values for similarity search
+    /// Dimensions are stored in SchemaColumn.vector_dimensions
+    Vector = 7,
 }
 
 impl DataType {
@@ -59,15 +62,16 @@ impl DataType {
 
     /// Returns true if this type can be compared for ordering
     pub fn is_orderable(&self) -> bool {
-        !matches!(self, DataType::Json)
+        !matches!(self, DataType::Json | DataType::Vector)
     }
 
     /// Returns the type ID as u8 for serialization
+    #[inline(always)]
     pub fn as_u8(&self) -> u8 {
         *self as u8
     }
 
-    /// Create DataType from u8
+    /// Create DataType from u8 tag byte
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(DataType::Null),
@@ -77,6 +81,7 @@ impl DataType {
             4 => Some(DataType::Boolean),
             5 => Some(DataType::Timestamp),
             6 => Some(DataType::Json),
+            7 => Some(DataType::Vector),
             _ => None,
         }
     }
@@ -92,6 +97,7 @@ impl fmt::Display for DataType {
             DataType::Boolean => write!(f, "BOOLEAN"),
             DataType::Timestamp => write!(f, "TIMESTAMP"),
             DataType::Json => write!(f, "JSON"),
+            DataType::Vector => write!(f, "VECTOR"),
         }
     }
 }
@@ -100,7 +106,12 @@ impl FromStr for DataType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_uppercase().as_str() {
+        let upper = s.to_uppercase();
+        // Handle VECTOR or VECTOR(N) format — dimension is stored in SchemaColumn
+        if upper.starts_with("VECTOR") {
+            return Ok(DataType::Vector);
+        }
+        match upper.as_str() {
             "NULL" => Ok(DataType::Null),
             "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" => Ok(DataType::Integer),
             "FLOAT" | "DOUBLE" | "REAL" | "DECIMAL" | "NUMERIC" => Ok(DataType::Float),
@@ -256,6 +267,11 @@ pub enum IndexType {
     /// Automatically created for INTEGER PRIMARY KEY columns
     /// O(1) existence checks, not user-creatable via CREATE INDEX
     PrimaryKey,
+
+    /// HNSW (Hierarchical Navigable Small World) index for vector similarity search
+    /// Best for: VECTOR columns with approximate nearest neighbor queries
+    /// Supports: ORDER BY col <=> query_vec LIMIT k
+    Hnsw,
 }
 
 impl IndexType {
@@ -267,6 +283,7 @@ impl IndexType {
             IndexType::Hash => "hash",
             IndexType::MultiColumn => "multicolumn",
             IndexType::PrimaryKey => "primarykey",
+            IndexType::Hnsw => "hnsw",
         }
     }
 }
@@ -287,6 +304,7 @@ impl FromStr for IndexType {
             "hash" => Ok(IndexType::Hash),
             "multicolumn" | "multi-column" | "composite" => Ok(IndexType::MultiColumn),
             "primarykey" | "primary-key" | "primary_key" => Ok(IndexType::PrimaryKey),
+            "hnsw" => Ok(IndexType::Hnsw),
             _ => Err(Error::parse(format!("unknown index type: {}", s))),
         }
     }
@@ -423,6 +441,11 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn test_datatype_size() {
+        assert_eq!(std::mem::size_of::<DataType>(), 1);
+    }
+
+    #[test]
     fn test_datatype_display() {
         assert_eq!(DataType::Null.to_string(), "NULL");
         assert_eq!(DataType::Integer.to_string(), "INTEGER");
@@ -431,6 +454,7 @@ mod tests {
         assert_eq!(DataType::Boolean.to_string(), "BOOLEAN");
         assert_eq!(DataType::Timestamp.to_string(), "TIMESTAMP");
         assert_eq!(DataType::Json.to_string(), "JSON");
+        assert_eq!(DataType::Vector.to_string(), "VECTOR");
     }
 
     #[test]
@@ -448,6 +472,9 @@ mod tests {
             DataType::Timestamp
         );
         assert_eq!("JSON".parse::<DataType>().unwrap(), DataType::Json);
+        assert_eq!("VECTOR(768)".parse::<DataType>().unwrap(), DataType::Vector);
+        assert_eq!("vector(384)".parse::<DataType>().unwrap(), DataType::Vector);
+        assert_eq!("VECTOR".parse::<DataType>().unwrap(), DataType::Vector);
         assert!("UNKNOWN".parse::<DataType>().is_err());
     }
 
@@ -460,6 +487,7 @@ mod tests {
         assert!(!DataType::Timestamp.is_numeric());
         assert!(!DataType::Json.is_numeric());
         assert!(!DataType::Null.is_numeric());
+        assert!(!DataType::Vector.is_numeric());
     }
 
     #[test]
@@ -470,6 +498,7 @@ mod tests {
         assert!(DataType::Boolean.is_orderable());
         assert!(DataType::Timestamp.is_orderable());
         assert!(!DataType::Json.is_orderable());
+        assert!(!DataType::Vector.is_orderable());
     }
 
     #[test]
@@ -482,6 +511,7 @@ mod tests {
             DataType::Boolean,
             DataType::Timestamp,
             DataType::Json,
+            DataType::Vector,
         ]
         .iter()
         .enumerate()
@@ -565,6 +595,7 @@ mod tests {
         assert_eq!(IndexType::Bitmap.to_string(), "bitmap");
         assert_eq!(IndexType::BTree.to_string(), "btree");
         assert_eq!(IndexType::Hash.to_string(), "hash");
+        assert_eq!(IndexType::Hnsw.to_string(), "hnsw");
     }
 
     #[test]
@@ -573,6 +604,7 @@ mod tests {
         assert_eq!("btree".parse::<IndexType>().unwrap(), IndexType::BTree);
         assert_eq!("b-tree".parse::<IndexType>().unwrap(), IndexType::BTree);
         assert_eq!("hash".parse::<IndexType>().unwrap(), IndexType::Hash);
+        assert_eq!("hnsw".parse::<IndexType>().unwrap(), IndexType::Hnsw);
         assert!("unknown".parse::<IndexType>().is_err());
     }
 

@@ -147,6 +147,8 @@ pub struct CompiledInsert {
     pub column_indices: Arc<Vec<usize>>,
     /// Column types for the INSERT columns (for type coercion)
     pub column_types: Arc<Vec<crate::core::DataType>>,
+    /// Vector dimensions for each INSERT column (0 for non-vector columns)
+    pub column_vector_dims: Arc<Vec<u16>>,
     /// Column names for error messages (Arc for zero-copy sharing)
     pub column_names: Arc<Vec<SmartString>>,
     /// All column types in the schema (for default value evaluation)

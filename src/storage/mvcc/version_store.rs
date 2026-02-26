@@ -4681,8 +4681,20 @@ impl VersionStore {
         meta: &crate::storage::mvcc::persistence::IndexMetadata,
         skip_population: bool,
     ) -> crate::core::Result<()> {
+        self.create_index_from_metadata_with_graph(meta, skip_population, None)
+    }
+
+    /// Create an index from persisted metadata, optionally loading HNSW graph from disk.
+    /// `hnsw_graph_path` is the full path to the HNSW graph file (timestamped to match the
+    /// loaded data snapshot, ensuring consistency during fallback recovery).
+    pub fn create_index_from_metadata_with_graph(
+        &self,
+        meta: &crate::storage::mvcc::persistence::IndexMetadata,
+        skip_population: bool,
+        hnsw_graph_path: Option<&std::path::Path>,
+    ) -> crate::core::Result<()> {
         use crate::core::IndexType;
-        use crate::storage::mvcc::{BitmapIndex, HashIndex};
+        use crate::storage::index::{BitmapIndex, HashIndex};
 
         // Check if we have the required column information
         if meta.column_names.is_empty() {
@@ -4747,7 +4759,7 @@ impl VersionStore {
                 }
                 IndexType::BTree => {
                     // BTree uses BTreeIndex implementation
-                    let idx = crate::storage::mvcc::BTreeIndex::new(
+                    let idx = crate::storage::index::BTreeIndex::new(
                         meta.name.clone(),
                         meta.table_name.clone(),
                         column_id,
@@ -4760,7 +4772,7 @@ impl VersionStore {
                 }
                 IndexType::MultiColumn => {
                     // MultiColumn uses MultiColumnIndex implementation
-                    let idx = crate::storage::mvcc::MultiColumnIndex::new(
+                    let idx = crate::storage::index::MultiColumnIndex::new(
                         meta.name.clone(),
                         meta.table_name.clone(),
                         meta.column_names.clone(),
@@ -4774,6 +4786,81 @@ impl VersionStore {
                 IndexType::PrimaryKey => {
                     // PrimaryKey indexes are auto-created, never persisted via CREATE INDEX
                     return Ok(());
+                }
+                IndexType::Hnsw => {
+                    // Get vector dimensions from schema
+                    let schema = self.schema();
+                    let dims = schema
+                        .find_column(column_name)
+                        .map(|(_, col)| col.vector_dimensions as usize)
+                        .unwrap_or(0);
+                    if dims == 0 {
+                        return Ok(()); // Cannot rebuild without dimension info
+                    }
+                    let m = meta
+                        .hnsw_m
+                        .map(|v| v as usize)
+                        .unwrap_or_else(|| crate::storage::index::default_m_for_dims(dims));
+                    let ef_construction = meta
+                        .hnsw_ef_construction
+                        .map(|v| v as usize)
+                        .unwrap_or_else(|| crate::storage::index::default_ef_construction(m));
+                    let ef_search = meta
+                        .hnsw_ef_search
+                        .map(|v| v as usize)
+                        .unwrap_or_else(|| crate::storage::index::default_ef_search(m));
+
+                    // Try loading saved HNSW graph from snapshot file
+                    if let Some(graph_path) = hnsw_graph_path {
+                        if let Ok(Some(mut loaded)) = crate::storage::index::HnswIndex::load_graph(
+                            graph_path,
+                            meta.name.clone(),
+                            meta.table_name.clone(),
+                            column_name.clone(),
+                            column_id,
+                            dims,
+                            m,
+                            ef_construction,
+                            ef_search,
+                        ) {
+                            loaded.set_unique(meta.is_unique);
+                            Arc::new(loaded)
+                        } else {
+                            let mut idx = crate::storage::index::HnswIndex::new(
+                                meta.name.clone(),
+                                meta.table_name.clone(),
+                                column_name.clone(),
+                                column_id,
+                                dims,
+                                m,
+                                ef_construction,
+                                ef_search,
+                                crate::storage::index::HnswDistanceMetric::from_u8(
+                                    meta.hnsw_distance_metric.unwrap_or(0),
+                                )
+                                .unwrap_or(crate::storage::index::HnswDistanceMetric::L2),
+                            );
+                            idx.set_unique(meta.is_unique);
+                            Arc::new(idx)
+                        }
+                    } else {
+                        let mut idx = crate::storage::index::HnswIndex::new(
+                            meta.name.clone(),
+                            meta.table_name.clone(),
+                            column_name.clone(),
+                            column_id,
+                            dims,
+                            m,
+                            ef_construction,
+                            ef_search,
+                            crate::storage::index::HnswDistanceMetric::from_u8(
+                                meta.hnsw_distance_metric.unwrap_or(0),
+                            )
+                            .unwrap_or(crate::storage::index::HnswDistanceMetric::L2),
+                        );
+                        idx.set_unique(meta.is_unique);
+                        Arc::new(idx)
+                    }
                 }
             };
 
@@ -4803,7 +4890,7 @@ impl VersionStore {
             self.add_index(meta.name.clone(), index);
         } else {
             // Multi-column index: use MultiColumnIndex
-            let index = crate::storage::mvcc::MultiColumnIndex::new(
+            let index = crate::storage::index::MultiColumnIndex::new(
                 meta.name.clone(),
                 meta.table_name.clone(),
                 meta.column_names.clone(),
@@ -4869,16 +4956,16 @@ impl VersionStore {
 
         // Collect index info: (column_ids as Vec<usize>, index_arc)
         // Supports both single-column and multi-column indexes
+        // HNSW indexes loaded from graph are included — HnswInner::insert skips duplicate row_ids
         let index_infos: Vec<(Vec<usize>, Arc<dyn Index>)> = indexes
             .values()
             .filter_map(|idx| {
                 let col_ids = idx.column_ids();
                 if col_ids.is_empty() {
-                    None
-                } else {
-                    let col_indices: Vec<usize> = col_ids.iter().map(|&id| id as usize).collect();
-                    Some((col_indices, Arc::clone(idx)))
+                    return None;
                 }
+                let col_indices: Vec<usize> = col_ids.iter().map(|&id| id as usize).collect();
+                Some((col_indices, Arc::clone(idx)))
             })
             .collect();
 
@@ -5053,6 +5140,9 @@ impl VersionStore {
                         .collect();
                     let _ = index.remove_batch_slice(&batch);
                 }
+
+                // Let index-specific maintenance run (e.g., HNSW graph compaction)
+                let _ = index.cleanup();
             }
         }
 
@@ -5093,6 +5183,16 @@ impl VersionStore {
     /// 1. Needed by active transactions
     /// 2. Within the retention period (for AS OF TIMESTAMP queries)
     pub fn cleanup_old_previous_versions(&self) -> i32 {
+        // Default 24-hour retention for background cleanup
+        self.cleanup_old_previous_versions_with_retention(std::time::Duration::from_secs(
+            24 * 60 * 60,
+        ))
+    }
+
+    pub fn cleanup_old_previous_versions_with_retention(
+        &self,
+        retention_period: std::time::Duration,
+    ) -> i32 {
         if self.closed.load(Ordering::Acquire) {
             return 0;
         }
@@ -5102,8 +5202,6 @@ impl VersionStore {
             None => return 0, // Need visibility checker for cleanup
         };
 
-        // Default 24-hour retention for historical versions
-        let retention_period = std::time::Duration::from_secs(24 * 60 * 60);
         let now = get_fast_timestamp();
         let retention_cutoff = now - retention_period.as_nanos() as i64;
 
@@ -6485,13 +6583,15 @@ impl TransactionVersionStore {
             let mut seen: ahash::AHashMap<&[crate::core::Value], i64> =
                 ahash::AHashMap::with_capacity(add_batches[idx].len());
 
+            let is_hnsw = index.index_type() == crate::core::IndexType::Hnsw;
+
             for (row_id, values) in &add_batches[idx] {
                 // Skip NULLs - they don't violate uniqueness
                 if values.iter().any(|v| v.is_null()) {
                     continue;
                 }
 
-                // Check intra-batch duplicate
+                // Check intra-batch duplicates (applies to all index types, including HNSW)
                 if let Some(&existing_row_id) = seen.get(values.as_slice()) {
                     if existing_row_id != *row_id {
                         let values_str: Vec<String> =
@@ -6505,23 +6605,54 @@ impl TransactionVersionStore {
                 }
                 seen.insert(values.as_slice(), *row_id);
 
-                // Check against existing index entries
-                let existing = index.get_row_ids_equal(values);
+                if is_hnsw {
+                    // HNSW uniqueness: use exact vector-byte duplicate check.
+                    // This is metric-independent and avoids threshold-based false negatives.
+                    let Some(hnsw_index) = index
+                        .as_any()
+                        .downcast_ref::<crate::storage::index::HnswIndex>()
+                    else {
+                        return Err(Error::internal(format!(
+                            "index '{}' advertised HNSW type but cannot be downcast",
+                            index.name()
+                        )));
+                    };
 
-                // Identify potential conflicts (exclude self and rows being removed)
-                // O(1) lookup using removals_set instead of O(N) scan
-                let has_real_conflict = existing.iter().any(|&conflict_id| {
-                    conflict_id != *row_id && !removals_set.contains(conflict_id)
-                });
+                    if let Some(value) = values.first() {
+                        if let Some(existing_row_id) =
+                            hnsw_index.find_exact_duplicate(value, *row_id, Some(&removals_set))
+                        {
+                            let dims = value.as_vector_f32().map_or(0, |v| v.len());
+                            return Err(Error::unique_constraint(
+                                index.name(),
+                                index.column_names().join(", "),
+                                format!(
+                                    "<vector({} dims)> conflicts with row_id {}",
+                                    dims, existing_row_id
+                                ),
+                            ));
+                        }
+                    }
+                } else {
+                    // Non-HNSW: standard equality-based uniqueness check
+                    // Check against existing index entries
+                    let existing = index.get_row_ids_equal(values);
 
-                if has_real_conflict {
-                    let values_str: Vec<String> =
-                        values.iter().map(|v| format!("{:?}", v)).collect();
-                    return Err(Error::unique_constraint(
-                        index.name(),
-                        index.column_names().join(", "),
-                        format!("[{}]", values_str.join(", ")),
-                    ));
+                    // Identify potential conflicts (exclude self and rows being removed)
+                    // O(1) lookup using removals_set instead of O(N) scan
+                    let has_real_conflict = existing.iter().any(|&conflict_id| {
+                        conflict_id != *row_id && !removals_set.contains(conflict_id)
+                    });
+
+                    if has_real_conflict {
+                        let values_str: Vec<String> =
+                            values.iter().map(|v| format!("{:?}", v)).collect();
+                        return Err(Error::unique_constraint(
+                            index.name(),
+                            index.column_names().join(", "),
+                            format!("[{}]", values_str.join(", ")),
+                        ));
+                    }
                 }
             }
         }
@@ -7777,7 +7908,7 @@ mod tests {
     #[test]
     fn test_version_store_index_operations() {
         use crate::core::types::DataType;
-        use crate::storage::mvcc::hash_index::HashIndex;
+        use crate::storage::index::HashIndex;
 
         let store = VersionStore::new("test_table".to_string(), test_schema());
 
@@ -8501,7 +8632,7 @@ mod tests {
     #[test]
     fn test_unique_constraint_swap() {
         use crate::core::DataType;
-        use crate::storage::mvcc::HashIndex;
+        use crate::storage::index::HashIndex;
 
         // Setup: Table with unique index on column 'u' (index 1)
         let schema = crate::core::SchemaBuilder::new("test_swap")
@@ -8562,7 +8693,7 @@ mod tests {
     #[test]
     fn test_unique_constraint_performance_bulk_update() {
         use crate::core::DataType;
-        use crate::storage::mvcc::HashIndex;
+        use crate::storage::index::HashIndex;
         use std::time::Instant;
 
         // Setup: Table with unique index on column 'u' (index 1)

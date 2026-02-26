@@ -652,6 +652,7 @@ impl Executor {
             Statement::Expression(stmt) => self.execute_expression_stmt(stmt, &ctx),
             Statement::Explain(stmt) => self.execute_explain(stmt, &ctx),
             Statement::Analyze(stmt) => self.execute_analyze(stmt, &ctx),
+            Statement::Vacuum(stmt) => self.execute_vacuum(stmt, &ctx),
         }
     }
 

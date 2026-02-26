@@ -279,6 +279,7 @@ pub static KEYWORDS: &[&str] = &[
     "DATE",
     "TIME",
     "JSON",
+    "VECTOR",
     "CASE",
     "CAST",
     "EXTRACT",
@@ -373,6 +374,7 @@ pub static KEYWORDS: &[&str] = &[
     "FETCH",
     "NEXT",
     "ONLY",
+    "VACUUM",
 ];
 
 /// Compiled keyword set for O(1) lookups
@@ -419,7 +421,8 @@ pub static OPERATORS: &[&str] = &[
     "#>", "#>>", // JSON path operators
     "@>", "<@", // JSON contains
     "?", "?|", "?&", // JSON exists
-    "&", "|", "^", "~", "<<", ">>", // Bitwise operators
+    "&", "|", "^", "~", "<<", ">>",  // Bitwise operators
+    "<=>", // Vector distance operator
 ];
 
 /// Compiled operator set for O(1) lookups

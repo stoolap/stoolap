@@ -266,7 +266,10 @@ impl Program {
                 | Op::TimestampSubInterval
                 | Op::TimestampDiff
                 | Op::TimestampAddDays
-                | Op::TimestampSubDays => -1,
+                | Op::TimestampSubDays
+                | Op::VectorDistanceL2
+                | Op::VectorDistanceCosine
+                | Op::VectorDistanceIP => -1,
 
                 // Transform (0) - pop 1, push 1
                 Op::IsNull

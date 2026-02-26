@@ -126,9 +126,10 @@ Semantic caching provides significant speedups when:
 - Follow-up queries filter the same data
 - Data changes infrequently between queries
 
-Typical speedups:
-- Cache hit with filtering: **10-100x** faster than storage access
+Typical impact:
+- Cache hits can avoid storage access and reduce latency significantly
 - Particularly effective for large result sets being filtered down
+- Measure with `EXPLAIN ANALYZE` on your dataset to validate expected gains
 
 ## Best Practices
 

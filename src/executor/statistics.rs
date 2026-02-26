@@ -280,7 +280,7 @@ impl Executor {
             Value::Float(_) => 8,
             Value::Text(s) => s.len() + 4, // string + length prefix
             Value::Timestamp(_) => 8,
-            Value::Json(s) => s.len() + 4,
+            Value::Extension(data) => data.len() + 4,
         }
     }
 

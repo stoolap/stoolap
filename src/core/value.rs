@@ -59,8 +59,15 @@ const TIME_FORMATS: &[&str] = &[
 ///
 /// Value is exactly 16 bytes due to niche optimization:
 /// - Text(SmartString): 16 bytes with niches in tag byte (values 17-255 unused)
-/// - Json(Arc<String>): 8 bytes thin pointer with null niche
-/// - Rust stores Value's discriminant in these niche values
+/// - Extension(CompactArc<[u8]>): 8 bytes (thin pointer), leaving niche bytes free
+/// - Rust stores Value's discriminant in SmartString's niche values
+///
+/// ## Extension Variant
+///
+/// The Extension variant is a catch-all for all complex types (JSON, Vector, Blob, etc.)
+/// It stores a single `CompactArc<[u8]>` (8 bytes) where byte[0] is the DataType tag
+/// and byte[1..] is the payload. This keeps Value at exactly 7 variants forever —
+/// new types are added by extending DataType (a 1-byte `#[repr(u8)]` enum).
 ///
 /// Note: Text uses SmartString for inline storage of strings up to 15 bytes.
 /// Longer strings use Arc<String> for O(1) clone and sharing.
@@ -84,8 +91,11 @@ pub enum Value {
     /// Timestamp (UTC)
     Timestamp(DateTime<Utc>),
 
-    /// JSON document (CompactArc<str> for cheap cloning, 16-byte fat pointer)
-    Json(CompactArc<str>),
+    /// Extension type: byte[0] = DataType tag, byte[1..] = payload
+    /// - Json: byte[0]=6, byte[1..]=UTF-8 bytes (access via `as_json()`)
+    /// - Vector: byte[0]=7, byte[1..]=packed LE f32 bytes (access via `as_vector_f32()`)
+    /// - Future types (Blob, Array, etc.) add DataType variants, not Value variants
+    Extension(CompactArc<[u8]>),
 }
 
 /// Static NULL value for zero-cost reuse
@@ -144,14 +154,31 @@ impl Value {
         Value::Timestamp(value)
     }
 
-    /// Create a JSON value
+    /// Create a JSON value (stored as UTF-8 bytes in Extension, tag byte prepended)
     pub fn json(value: impl Into<String>) -> Self {
-        Value::Json(CompactArc::from(value.into()))
+        let s_bytes = value.into().into_bytes();
+        let mut bytes = Vec::with_capacity(1 + s_bytes.len());
+        bytes.push(DataType::Json as u8);
+        bytes.extend_from_slice(&s_bytes);
+        Value::Extension(CompactArc::from(bytes))
     }
 
-    /// Create a JSON value from CompactArc<str> (zero-copy)
-    pub fn json_arc(value: CompactArc<str>) -> Self {
-        Value::Json(value)
+    /// Create a vector value from f32 data (stored as packed LE f32 bytes in Extension)
+    pub fn vector(data: Vec<f32>) -> Self {
+        let mut bytes = Vec::with_capacity(1 + data.len() * 4);
+        bytes.push(DataType::Vector as u8);
+        for f in &data {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        Value::Extension(CompactArc::from(bytes))
+    }
+
+    /// Create a vector value from pre-packed f32 bytes (prepends tag)
+    pub fn vector_from_bytes(raw_f32_bytes: CompactArc<[u8]>) -> Self {
+        let mut bytes = Vec::with_capacity(1 + raw_f32_bytes.len());
+        bytes.push(DataType::Vector as u8);
+        bytes.extend_from_slice(&raw_f32_bytes);
+        Value::Extension(CompactArc::from(bytes))
     }
 
     // =========================================================================
@@ -167,7 +194,10 @@ impl Value {
             Value::Text(_) => DataType::Text,
             Value::Boolean(_) => DataType::Boolean,
             Value::Timestamp(_) => DataType::Timestamp,
-            Value::Json(_) => DataType::Json,
+            Value::Extension(data) => data
+                .first()
+                .and_then(|&b| DataType::from_u8(b))
+                .unwrap_or(DataType::Null),
         }
     }
 
@@ -197,7 +227,7 @@ impl Value {
                 .or_else(|| s.parse::<f64>().ok().map(|f| f as i64)),
             Value::Boolean(b) => Some(if *b { 1 } else { 0 }),
             Value::Timestamp(t) => Some(t.timestamp_nanos_opt().unwrap_or(0)),
-            Value::Json(_) => None,
+            Value::Extension(_) => None,
         }
     }
 
@@ -209,8 +239,7 @@ impl Value {
             Value::Float(v) => Some(*v),
             Value::Text(s) => s.parse::<f64>().ok(),
             Value::Boolean(b) => Some(if *b { 1.0 } else { 0.0 }),
-            Value::Timestamp(_) => None,
-            Value::Json(_) => None,
+            Value::Timestamp(_) | Value::Extension(_) => None,
         }
     }
 
@@ -243,8 +272,7 @@ impl Value {
                 }
             }
             Value::Boolean(b) => Some(*b),
-            Value::Timestamp(_) => None,
-            Value::Json(_) => None,
+            Value::Timestamp(_) | Value::Extension(_) => None,
         }
     }
 
@@ -257,7 +285,21 @@ impl Value {
             Value::Text(s) => Some(s.to_string()),
             Value::Boolean(b) => Some(if *b { "true" } else { "false" }.to_string()),
             Value::Timestamp(t) => Some(t.to_rfc3339()),
-            Value::Json(s) => Some(s.to_string()),
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                // SAFETY: Json data is always stored as valid UTF-8
+                Some(std::str::from_utf8(&data[1..]).unwrap_or("").to_string())
+            }
+            Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
+                Some(format_vector_bytes(&data[1..]))
+            }
+            Value::Extension(data) => {
+                // Generic fallback: try payload as UTF-8
+                if data.len() > 1 {
+                    std::str::from_utf8(&data[1..]).ok().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -265,16 +307,10 @@ impl Value {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::Text(s) => Some(s.as_str()),
-            Value::Json(s) => Some(s.as_ref()),
-            _ => None,
-        }
-    }
-
-    /// Extract as CompactArc<str> (creates CompactArc for Text, cheap clone for Json)
-    pub fn as_arc_str(&self) -> Option<CompactArc<str>> {
-        match self {
-            Value::Text(s) => Some(CompactArc::from(s.as_str())),
-            Value::Json(s) => Some(s.clone()),
+            // SAFETY: Json data is always stored as valid UTF-8 (tag at [0], payload at [1..])
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                Some(std::str::from_utf8(&data[1..]).unwrap_or(""))
+            }
             _ => None,
         }
     }
@@ -297,7 +333,32 @@ impl Value {
     pub fn as_json(&self) -> Option<&str> {
         match self {
             Value::Null(_) => Some("{}"),
-            Value::Json(s) => Some(s),
+            // SAFETY: Json data is always stored as valid UTF-8 (tag at [0], payload at [1..])
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                Some(std::str::from_utf8(&data[1..]).unwrap_or(""))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract vector as Vec<f32> (reads packed LE f32 bytes from Extension payload)
+    pub fn as_vector_f32(&self) -> Option<Vec<f32>> {
+        match self {
+            Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
+                let payload = &data[1..];
+                let len = payload.len() / 4;
+                let mut result = Vec::with_capacity(len);
+                for i in 0..len {
+                    let bytes = [
+                        payload[i * 4],
+                        payload[i * 4 + 1],
+                        payload[i * 4 + 2],
+                        payload[i * 4 + 3],
+                    ];
+                    result.push(f32::from_le_bytes(bytes));
+                }
+                Some(result)
+            }
             _ => None,
         }
     }
@@ -341,7 +402,11 @@ impl Value {
                     return Ok(ts.cmp(&parsed));
                 }
             }
-            (Value::Timestamp(ts), Value::Json(s)) => {
+            (Value::Timestamp(ts), Value::Extension(data))
+                if data.first() == Some(&(DataType::Json as u8)) =>
+            {
+                // SAFETY: Json data is always valid UTF-8
+                let s = std::str::from_utf8(&data[1..]).unwrap_or("");
                 if let Ok(parsed) = parse_timestamp(s) {
                     return Ok(ts.cmp(&parsed));
                 }
@@ -351,7 +416,11 @@ impl Value {
                     return Ok(parsed.cmp(ts));
                 }
             }
-            (Value::Json(s), Value::Timestamp(ts)) => {
+            (Value::Extension(data), Value::Timestamp(ts))
+                if data.first() == Some(&(DataType::Json as u8)) =>
+            {
+                // SAFETY: Json data is always valid UTF-8
+                let s = std::str::from_utf8(&data[1..]).unwrap_or("");
                 if let Ok(parsed) = parse_timestamp(s) {
                     return Ok(parsed.cmp(ts));
                 }
@@ -373,8 +442,12 @@ impl Value {
             (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
             (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
             (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
-            (Value::Json(a), Value::Json(b)) => {
-                // JSON can only test equality, not ordering
+            (Value::Extension(a), Value::Extension(b)) => {
+                // Extension: tag byte is [0], so same-tag comparison is data equality
+                if a.first() != b.first() {
+                    return Err(Error::IncomparableTypes);
+                }
+                // All extension types: equality only (not orderable)
                 if a == b {
                     Ok(Ordering::Equal)
                 } else {
@@ -455,10 +528,17 @@ impl Value {
                         if let Some(s) = v.downcast_ref::<String>() {
                             // Validate JSON
                             if serde_json::from_str::<serde_json::Value>(s).is_ok() {
-                                Value::Json(CompactArc::from(s.as_str()))
+                                Value::json(s)
                             } else {
                                 Value::Null(data_type)
                             }
+                        } else {
+                            Value::Null(data_type)
+                        }
+                    }
+                    DataType::Vector => {
+                        if let Some(vec) = v.downcast_ref::<Vec<f32>>() {
+                            Value::vector(vec.clone())
                         } else {
                             Value::Null(data_type)
                         }
@@ -532,7 +612,15 @@ impl Value {
                         Value::Text(SmartString::new(if *b { "true" } else { "false" }))
                     }
                     Value::Timestamp(t) => Value::Text(SmartString::from_string(t.to_rfc3339())),
-                    Value::Json(s) => Value::Text(SmartString::new(s.as_ref())),
+                    Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                        Value::Text(SmartString::new(
+                            std::str::from_utf8(&data[1..]).unwrap_or(""),
+                        ))
+                    }
+                    Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
+                        Value::Text(SmartString::from_string(format_vector_bytes(&data[1..])))
+                    }
+                    Value::Extension(_) => Value::Null(target_type),
                     Value::Null(_) => Value::Null(target_type),
                 }
             }
@@ -588,24 +676,37 @@ impl Value {
             DataType::Json => {
                 // Convert to JSON
                 match self {
-                    Value::Json(s) => Value::Json(s.clone()),
+                    Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                        self.clone()
+                    }
                     Value::Text(s) => {
                         // Validate JSON
                         if serde_json::from_str::<serde_json::Value>(s.as_str()).is_ok() {
-                            Value::Json(CompactArc::from(s.as_str()))
+                            Value::json(s.as_str())
                         } else {
                             Value::Null(target_type)
                         }
                     }
                     // Convert other types to JSON representation
-                    Value::Integer(v) => Value::Json(CompactArc::from(v.to_string())),
-                    Value::Float(v) => Value::Json(CompactArc::from(format_float(*v))),
-                    Value::Boolean(b) => {
-                        Value::Json(CompactArc::from(if *b { "true" } else { "false" }))
-                    }
+                    Value::Integer(v) => Value::json(v.to_string()),
+                    Value::Float(v) => Value::json(format_float(*v)),
+                    Value::Boolean(b) => Value::json(if *b { "true" } else { "false" }),
                     _ => Value::Null(target_type),
                 }
             }
+            DataType::Vector => match self {
+                Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
+                    self.clone()
+                }
+                Value::Text(s) => {
+                    if let Some(floats) = parse_vector_str(s.as_str()) {
+                        Value::vector(floats)
+                    } else {
+                        Value::Null(target_type)
+                    }
+                }
+                _ => Value::Null(target_type),
+            },
             DataType::Null => Value::Null(DataType::Null),
         }
     }
@@ -653,8 +754,15 @@ impl Value {
                     Value::Text(SmartString::new(if b { "true" } else { "false" }))
                 }
                 Value::Timestamp(t) => Value::Text(SmartString::from_string(t.to_rfc3339())),
-                Value::Json(s) => Value::Text(SmartString::new(s.as_ref())),
-                Value::Null(_) => Value::Null(target_type),
+                Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                    Value::Text(SmartString::new(
+                        std::str::from_utf8(&data[1..]).unwrap_or(""),
+                    ))
+                }
+                Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
+                    Value::Text(SmartString::from_string(format_vector_bytes(&data[1..])))
+                }
+                Value::Extension(_) | Value::Null(_) => Value::Null(target_type),
             },
             DataType::Boolean => match &self {
                 Value::Boolean(b) => Value::Boolean(*b),
@@ -696,18 +804,29 @@ impl Value {
                 _ => Value::Null(target_type),
             },
             DataType::Json => match self {
-                Value::Json(s) => Value::Json(s),
+                Value::Extension(ref data) if data.first() == Some(&(DataType::Json as u8)) => self,
                 Value::Text(s) => {
                     if serde_json::from_str::<serde_json::Value>(s.as_str()).is_ok() {
-                        Value::Json(CompactArc::from(s.as_str()))
+                        Value::json(s.as_str())
                     } else {
                         Value::Null(target_type)
                     }
                 }
-                Value::Integer(v) => Value::Json(CompactArc::from(v.to_string())),
-                Value::Float(v) => Value::Json(CompactArc::from(format_float(v))),
-                Value::Boolean(b) => {
-                    Value::Json(CompactArc::from(if b { "true" } else { "false" }))
+                Value::Integer(v) => Value::json(v.to_string()),
+                Value::Float(v) => Value::json(format_float(v)),
+                Value::Boolean(b) => Value::json(if b { "true" } else { "false" }),
+                _ => Value::Null(target_type),
+            },
+            DataType::Vector => match self {
+                Value::Extension(ref data) if data.first() == Some(&(DataType::Vector as u8)) => {
+                    self
+                }
+                Value::Text(s) => {
+                    if let Some(floats) = parse_vector_str(s.as_str()) {
+                        Value::vector(floats)
+                    } else {
+                        Value::Null(target_type)
+                    }
                 }
                 _ => Value::Null(target_type),
             },
@@ -735,7 +854,16 @@ impl fmt::Display for Value {
             Value::Text(s) => write!(f, "{}", s),
             Value::Boolean(b) => write!(f, "{}", if *b { "true" } else { "false" }),
             Value::Timestamp(t) => write!(f, "{}", t.to_rfc3339()),
-            Value::Json(s) => write!(f, "{}", s),
+            Value::Extension(data) => {
+                let tag = data.first().copied().unwrap_or(0);
+                if tag == DataType::Json as u8 {
+                    write!(f, "{}", std::str::from_utf8(&data[1..]).unwrap_or(""))
+                } else if tag == DataType::Vector as u8 {
+                    write!(f, "{}", format_vector_bytes(&data[1..]))
+                } else {
+                    write!(f, "<extension:{}>", tag)
+                }
+            }
         }
     }
 }
@@ -767,7 +895,7 @@ impl PartialEq for Value {
             (Value::Text(a), Value::Text(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
-            (Value::Json(a), Value::Json(b)) => a == b,
+            (Value::Extension(a), Value::Extension(b)) => a == b,
             _ => false,
         }
     }
@@ -880,11 +1008,12 @@ impl Hash for Value {
                 let nanos = t.timestamp_nanos_opt().unwrap_or(i64::MAX);
                 state.write_u64(wymix(3 ^ (nanos as u64), WY_P1));
             }
-            Value::Json(s) => {
-                // Pre-hash JSON with WyHash-style mixing
-                let bytes = s.as_bytes();
+            Value::Extension(data) => {
+                // Pre-hash extension data with WyHash-style mixing
+                // Tag byte is included in data, so discriminant is embedded
+                let bytes: &[u8] = data;
                 let len = bytes.len();
-                let mut h = wymix(7 ^ (len as u64), WY_P1);
+                let mut h = wymix(10 ^ (len as u64), WY_P1);
 
                 let chunks = len / 8;
                 let ptr = bytes.as_ptr();
@@ -981,7 +1110,7 @@ impl Ord for Value {
                 Value::Integer(_) | Value::Float(_) => 2,
                 Value::Text(_) => 3,
                 Value::Timestamp(_) => 4,
-                Value::Json(_) => 5,
+                Value::Extension(_) => 5,
             }
         }
 
@@ -1008,8 +1137,8 @@ impl Ord for Value {
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
-            (Value::Json(a), Value::Json(b)) => a.cmp(b), // Lexicographic for JSON
-            _ => Ordering::Equal,                         // Should not reach here
+            (Value::Extension(a), Value::Extension(b)) => a.cmp(b),
+            _ => Ordering::Equal, // Should not reach here
         }
     }
 }
@@ -1198,6 +1327,49 @@ fn format_float(v: f64) -> String {
             s
         }
     }
+}
+
+/// Format packed LE f32 bytes as "[1.0, 2.0, 3.0]" string
+pub fn format_vector_bytes(data: &[u8]) -> String {
+    let len = data.len() / 4;
+    let mut s = String::with_capacity(len * 8 + 2);
+    s.push('[');
+    for i in 0..len {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        let f = f32::from_le_bytes([
+            data[i * 4],
+            data[i * 4 + 1],
+            data[i * 4 + 2],
+            data[i * 4 + 3],
+        ]);
+        use std::fmt::Write;
+        if f.fract() == 0.0 && f.is_finite() {
+            let _ = write!(s, "{:.1}", f);
+        } else {
+            let _ = write!(s, "{}", f);
+        }
+    }
+    s.push(']');
+    s
+}
+
+/// Convert Extension byte data to str (for JSON and other UTF-8 extension types)
+///
+/// Parse a vector string in [f32, f32, ...] format
+pub fn parse_vector_str(s: &str) -> Option<Vec<f32>> {
+    let s = s.trim();
+    let inner = s.strip_prefix('[')?.strip_suffix(']')?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut result = Vec::new();
+    for part in inner.split(',') {
+        let val: f32 = part.trim().parse().ok()?;
+        result.push(val);
+    }
+    Some(result)
 }
 
 /// Compare two floats with proper NaN handling

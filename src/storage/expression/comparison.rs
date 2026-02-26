@@ -51,7 +51,15 @@ impl ComparisonValue {
             Value::Text(s) => ComparisonValue::Text(s.to_string()),
             Value::Boolean(b) => ComparisonValue::Boolean(*b),
             Value::Timestamp(t) => ComparisonValue::Timestamp(*t),
-            Value::Json(j) => ComparisonValue::Text(j.to_string()),
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                ComparisonValue::Text(std::str::from_utf8(&data[1..]).unwrap_or("").to_string())
+            }
+            Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
+                ComparisonValue::Text(crate::core::value::format_vector_bytes(&data[1..]))
+            }
+            Value::Extension(data) => {
+                ComparisonValue::Text(String::from_utf8_lossy(&data[1..]).into_owned())
+            }
         }
     }
 

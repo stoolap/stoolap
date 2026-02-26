@@ -26,7 +26,7 @@ use stoolap::Database;
 // In-memory (unique instance per call)
 let db = Database::open_in_memory()?;
 
-// In-memory (shared instance — same DSN returns same engine)
+// In-memory (shared instance, same DSN returns same engine)
 let db = Database::open("memory://")?;
 
 // File-based (persistent)
@@ -62,7 +62,7 @@ Execute DDL or DML statements. Returns the number of rows affected.
 ```rust
 use stoolap::params;
 
-// DDL — no parameters
+// DDL, no parameters
 db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", ())?;
 
 // DML with tuple parameters
@@ -427,7 +427,7 @@ For bulk serialization, `advance()` / `current_row()` avoids per-row cloning.
 let mut rows = db.query("SELECT * FROM users", ())?;
 while rows.advance() {
     let row: &Row = rows.current_row();
-    // Access row by reference — no clone
+    // Access row by reference, no clone
     if let Some(value) = row.get(0) {
         // ...
     }
@@ -510,7 +510,7 @@ match db.execute("INSERT INTO users VALUES (1, 'Alice')", ()) {
         if msg.contains("UNIQUE constraint") {
             println!("Duplicate key");
         } else if msg.contains("write-write conflict") {
-            println!("Transaction conflict — retry");
+            println!("Transaction conflict, retry");
         } else {
             return Err(e.into());
         }
@@ -520,7 +520,7 @@ match db.execute("INSERT INTO users VALUES (1, 'Alice')", ()) {
 
 ## Thread Safety
 
-`Database` is `Send + Sync`. Clone to share across threads — each clone has its own executor with independent transaction state but shares the same storage engine.
+`Database` is `Send + Sync`. Clone to share across threads. Each clone has its own executor with independent transaction state but shares the same storage engine.
 
 ```rust
 use std::sync::Arc;

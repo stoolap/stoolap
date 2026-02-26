@@ -363,37 +363,105 @@ impl Lexer {
 
     /// Read a string literal (single-quoted)
     fn read_string_literal(&mut self) -> SmartString {
-        let mut result = SmartString::new("");
         let quote = self.ch;
+        let quote_byte = quote as u8;
+        let start_pos = self.position; // byte position of opening quote
+
+        // Fast path: scan raw bytes for closing quote.
+        // If no escape characters found, slice the input directly (zero allocation).
+        // This is safe for UTF-8: quote (0x27/0x22), backslash (0x5C), and NUL (0x00)
+        // are all single-byte ASCII and cannot appear as continuation bytes in multi-byte sequences.
+        let mut scan_pos = self.read_position; // byte after opening quote
+        let input_len = self.input.len();
+        let mut found_escape = false;
+
+        while scan_pos < input_len {
+            let b = self.input[scan_pos];
+            if b == quote_byte {
+                // Check for doubled quote escape
+                if scan_pos + 1 < input_len && self.input[scan_pos + 1] == quote_byte {
+                    found_escape = true;
+                    break;
+                }
+                // Found unescaped closing quote — fast path succeeds
+                let end_pos = scan_pos + 1; // one past closing quote
+
+                // Update line/column tracking for chars between opening and closing quotes
+                for &byte in &self.input[self.read_position..scan_pos] {
+                    if byte == b'\n' {
+                        self.pos.line += 1;
+                        self.pos.column = 1;
+                    } else {
+                        self.pos.column += 1;
+                    }
+                }
+                // Account for closing quote
+                self.pos.column += 1;
+
+                // Advance lexer past closing quote
+                self.position = scan_pos;
+                self.read_position = end_pos;
+                self.pos.offset = self.position;
+
+                // Read next char after closing quote
+                if self.read_position >= input_len {
+                    self.ch = '\0';
+                    self.position = self.read_position;
+                } else {
+                    let (ch, len) = self.decode_char_at(self.read_position);
+                    self.ch = ch;
+                    self.position = self.read_position;
+                    self.read_position += len;
+                }
+                self.pos.offset = self.position;
+
+                // SAFETY: input was constructed from valid UTF-8 (String/&str).
+                // We only scanned for ASCII bytes, so all byte boundaries are valid.
+                let slice =
+                    unsafe { std::str::from_utf8_unchecked(&self.input[start_pos..end_pos]) };
+                return SmartString::new(slice);
+            } else if b == b'\\' || b == 0 {
+                found_escape = true;
+                break;
+            }
+            scan_pos += 1;
+        }
+
+        if !found_escape && scan_pos >= input_len {
+            // EOF without closing quote — fall through to slow path for error handling
+        }
+
+        // Slow path: escapes or edge cases. Build a String with pre-allocated capacity.
+        let estimated_len = if scan_pos > self.read_position {
+            scan_pos - start_pos + 2
+        } else {
+            32
+        };
+        let mut result = String::with_capacity(estimated_len);
         result.push(quote);
         self.read_char(); // consume opening quote
 
         loop {
             if self.ch == '\0' {
-                // Distinguish between actual EOF and NULL byte in input
                 if self.position >= self.input.len() {
                     self.last_error = Some("unterminated string literal".to_string());
                 } else {
                     self.last_error =
                         Some("NULL byte (0x00) is not allowed in string literals".to_string());
                 }
-                result.push(quote); // Add closing quote for consistency
+                result.push(quote);
                 break;
             } else if self.ch == quote {
-                // Check for SQL-style escape (doubled quote)
                 if self.peek_char() == quote {
-                    // It's an escaped quote - SQL standard: '' becomes '
-                    result.push(self.ch); // Add single quote (not both)
-                    self.read_char(); // consume first quote
-                    self.read_char(); // consume second quote
+                    result.push(self.ch);
+                    self.read_char();
+                    self.read_char();
                 } else {
-                    // End of string
                     result.push(quote);
                     self.read_char();
                     break;
                 }
             } else if self.ch == '\\' {
-                // Handle backslash escape sequences
                 result.push(self.ch);
                 self.read_char();
                 if self.ch != '\0' {
@@ -406,7 +474,7 @@ impl Lexer {
             }
         }
 
-        result
+        SmartString::from_string(result)
     }
 
     /// Read a quoted identifier (double quotes or backticks)

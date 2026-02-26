@@ -16,7 +16,7 @@ Stoolap is a high-performance embedded SQL database written in pure Rust. Its ar
 - Memory-first design with optional disk persistence
 - Full ACID transactions with MVCC
 - Cost-based query optimizer with adaptive execution
-- Multiple index types (B-tree, Hash, Bitmap)
+- Multiple index types (B-tree, Hash, Bitmap, HNSW)
 - Parallel query execution via Rayon
 - Minimal unsafe code (only for FFI and hot paths)
 
@@ -60,10 +60,11 @@ Stoolap's architecture consists of the following major components:
   - Column type management
 
 - **Index System** - Multiple index types for different query patterns
-  - B-tree indexes (btree_index.rs) - Range queries, sorting
-  - Hash indexes (hash_index.rs) - O(1) equality lookups
-  - Bitmap indexes (bitmap_index.rs) - Low-cardinality columns
-  - Multi-column indexes (multi_column_index.rs)
+  - B-tree indexes (btree.rs) - Range queries, sorting
+  - Hash indexes (hash.rs) - O(1) equality lookups
+  - Bitmap indexes (bitmap.rs) - Low-cardinality columns
+  - HNSW indexes (hnsw.rs) - Vector similarity search
+  - Multi-column indexes (multi_column.rs)
 
 - **Persistence Layer** - Optional disk storage
   - Write-ahead logging (WAL)
@@ -72,8 +73,8 @@ Stoolap's architecture consists of the following major components:
 
 ### Function System
 
-- **Function Registry** - Central registry for 101+ SQL functions
-  - Scalar functions (scalar/)
+- **Function Registry** - Central registry for 117 SQL functions
+  - Scalar functions (scalar/) - String, math, date, JSON, vector functions
   - Aggregate functions (aggregate/)
   - Window functions (window/)
 
@@ -163,8 +164,8 @@ src/
 │   ├── query.rs   # Main query executor
 │   ├── planner.rs # Query planner with cost estimation
 │   └── ...
-├── functions/     # 101+ built-in functions
-│   ├── scalar/    # String, math, date, JSON functions
+├── functions/     # 117 built-in functions
+│   ├── scalar/    # String, math, date, JSON, vector functions
 │   ├── aggregate/ # COUNT, SUM, AVG, etc.
 │   └── window/    # ROW_NUMBER, RANK, LAG, etc.
 ├── optimizer/     # Cost-based query optimizer
@@ -173,7 +174,8 @@ src/
 │   └── ...
 ├── parser/        # SQL parser (lexer, AST, parser)
 ├── storage/       # Storage engine
-│   └── mvcc/      # MVCC implementation with indexes
+│   ├── index/     # B-tree, Hash, Bitmap, HNSW indexes
+│   └── mvcc/      # MVCC implementation
 └── bin/           # CLI binary
 ```
 

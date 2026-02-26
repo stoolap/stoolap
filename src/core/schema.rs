@@ -58,6 +58,9 @@ pub struct SchemaColumn {
 
     /// CHECK constraint expression as a string (to be parsed and evaluated during INSERT)
     pub check_expr: Option<String>,
+
+    /// Number of dimensions for VECTOR columns (0 = not a vector column)
+    pub vector_dimensions: u16,
 }
 
 impl SchemaColumn {
@@ -82,7 +85,14 @@ impl SchemaColumn {
             default_expr: None,
             default_value: None,
             check_expr: None,
+            vector_dimensions: 0,
         }
+    }
+
+    /// Set vector dimensions (for VECTOR columns)
+    pub fn with_vector_dimensions(mut self, dims: u16) -> Self {
+        self.vector_dimensions = dims;
+        self
     }
 
     /// Create a new column definition with all options
@@ -110,6 +120,7 @@ impl SchemaColumn {
             default_expr,
             default_value: None,
             check_expr,
+            vector_dimensions: 0,
         }
     }
 
@@ -139,6 +150,7 @@ impl SchemaColumn {
             default_expr,
             default_value,
             check_expr,
+            vector_dimensions: 0,
         }
     }
 
@@ -160,7 +172,11 @@ impl SchemaColumn {
 
 impl fmt::Display for SchemaColumn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.name, self.data_type)?;
+        if self.data_type == DataType::Vector && self.vector_dimensions > 0 {
+            write!(f, "{} VECTOR({})", self.name, self.vector_dimensions)?;
+        } else {
+            write!(f, "{} {}", self.name, self.data_type)?;
+        }
         if self.primary_key {
             write!(f, " PRIMARY KEY")?;
         }
@@ -798,6 +814,14 @@ impl SchemaBuilder {
             default_expr,
             check_expr,
         ));
+        self
+    }
+
+    /// Set vector dimensions on the last added column
+    pub fn set_last_vector_dimensions(mut self, dims: u16) -> Self {
+        if let Some(col) = self.columns.last_mut() {
+            col.vector_dimensions = dims;
+        }
         self
     }
 

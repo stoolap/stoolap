@@ -338,13 +338,35 @@ fn substitute_outer_references_inner(
 
 /// Build a column name to index map for fast column lookups.
 /// Column names are lowercased for case-insensitive matching.
-#[inline]
+/// Also adds unqualified base names as fallbacks for qualified columns
+/// (e.g., "t.val" also registers "val") when the base name is unambiguous.
 pub fn build_column_index_map(columns: &[String]) -> StringMap<usize> {
-    columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.to_lowercase(), i))
-        .collect()
+    let mut map: StringMap<usize> = StringMap::with_capacity(columns.len());
+    for (i, c) in columns.iter().enumerate() {
+        map.insert(c.to_lowercase(), i);
+    }
+    // Add unqualified fallbacks for qualified column names (e.g., "t.val" → "val")
+    // Only add when the base name is unambiguous (appears in exactly one table)
+    // and doesn't conflict with an existing entry (e.g., an unqualified column)
+    let mut base_count: StringMap<u8> = StringMap::default();
+    for c in columns {
+        let lower = c.to_lowercase();
+        if let Some(dot_pos) = lower.rfind('.') {
+            let base = &lower[dot_pos + 1..];
+            let entry = base_count.entry(base.to_string()).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
+    }
+    for (i, c) in columns.iter().enumerate() {
+        let lower = c.to_lowercase();
+        if let Some(dot_pos) = lower.rfind('.') {
+            let base = &lower[dot_pos + 1..];
+            if base_count.get(base).copied().unwrap_or(0) == 1 && !map.contains_key(base) {
+                map.insert(base.to_string(), i);
+            }
+        }
+    }
+    map
 }
 
 // ============================================================================
@@ -429,9 +451,9 @@ pub fn hash_value_into<H: Hasher>(value: &Value, hasher: &mut H) {
             6u8.hash(hasher);
             ts.timestamp_nanos_opt().hash(hasher);
         }
-        Value::Json(j) => {
-            7u8.hash(hasher);
-            j.hash(hasher);
+        Value::Extension(data) => {
+            10u8.hash(hasher);
+            data.hash(hasher);
         }
     }
 }
@@ -450,7 +472,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Null(_), Value::Null(_)) => false, // NULL != NULL in SQL
         (Value::Timestamp(x), Value::Timestamp(y)) => x == y,
-        (Value::Json(x), Value::Json(y)) => x == y,
+        (Value::Extension(x), Value::Extension(y)) => x == y,
         // Cross-type comparisons - try numeric
         (Value::Integer(x), Value::Float(y)) | (Value::Float(y), Value::Integer(x)) => {
             (*x as f64 - y).abs() < f64::EPSILON
@@ -468,7 +490,7 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
         (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
         (Value::Null(_), Value::Null(_)) => Ordering::Equal,
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
-        (Value::Json(x), Value::Json(y)) => x.cmp(y),
+        (Value::Extension(x), Value::Extension(y)) => x.cmp(y),
         // Cross-type comparisons - try numeric
         (Value::Integer(x), Value::Float(y)) => {
             (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
@@ -489,7 +511,7 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
                     Value::Float(_) => 3,
                     Value::Text(_) => 4,
                     Value::Timestamp(_) => 5,
-                    Value::Json(_) => 6,
+                    Value::Extension(_) => 6,
                 }
             }
             type_code(a).cmp(&type_code(b))
@@ -1339,14 +1361,36 @@ fn is_pair_sorted(prev: &Row, curr: &Row, key_indices: &[usize]) -> bool {
 /// Convert type string to DataType.
 /// Handles common SQL type names like INTEGER, VARCHAR, BOOLEAN, etc.
 pub fn string_to_datatype(type_str: &str) -> DataType {
-    match type_str.to_uppercase().as_str() {
+    let upper = type_str.to_uppercase();
+    match upper.as_str() {
         "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" => DataType::Integer,
         "FLOAT" | "DOUBLE" | "REAL" | "DECIMAL" | "NUMERIC" => DataType::Float,
         "TEXT" | "VARCHAR" | "CHAR" | "STRING" => DataType::Text,
         "BOOLEAN" | "BOOL" => DataType::Boolean,
         "TIMESTAMP" | "DATETIME" | "DATE" | "TIME" => DataType::Timestamp,
         "JSON" | "JSONB" => DataType::Json,
-        _ => DataType::Text,
+        _ => {
+            // Handle VECTOR or VECTOR(N) pattern
+            if upper.starts_with("VECTOR") {
+                DataType::Vector
+            } else {
+                DataType::Text
+            }
+        }
+    }
+}
+
+/// Parse vector dimension from a type string like "VECTOR(768)".
+/// Returns 0 if no dimension is specified.
+pub fn parse_vector_dimension(type_str: &str) -> u16 {
+    let upper = type_str.to_uppercase();
+    if let Some(inner) = upper
+        .strip_prefix("VECTOR(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        inner.trim().parse::<u16>().unwrap_or(0)
+    } else {
+        0
     }
 }
 

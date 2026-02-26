@@ -395,6 +395,9 @@ pub enum InfixOperator {
     JsonAccess,     // -> (returns JSON)
     JsonAccessText, // ->> (returns TEXT)
 
+    // Vector distance operator
+    VectorDistance, // <=>
+
     // Bitwise operators
     BitwiseAnd, // &
     BitwiseOr,  // |
@@ -442,6 +445,7 @@ impl InfixOperator {
             "[]" => InfixOperator::Index,
             "->" => InfixOperator::JsonAccess,
             "->>" => InfixOperator::JsonAccessText,
+            "<=>" => InfixOperator::VectorDistance,
             "&" => InfixOperator::BitwiseAnd,
             "|" => InfixOperator::BitwiseOr,
             "^" => InfixOperator::BitwiseXor,
@@ -1244,6 +1248,7 @@ pub enum Statement {
     Expression(ExpressionStatement),
     Explain(ExplainStatement),
     Analyze(AnalyzeStatement),
+    Vacuum(VacuumStatement),
 }
 
 impl fmt::Display for Statement {
@@ -1277,6 +1282,7 @@ impl fmt::Display for Statement {
             Statement::Expression(s) => write!(f, "{}", s),
             Statement::Explain(s) => write!(f, "{}", s),
             Statement::Analyze(s) => write!(f, "{}", s),
+            Statement::Vacuum(s) => write!(f, "{}", s),
         }
     }
 }
@@ -1806,6 +1812,23 @@ impl fmt::Display for TruncateStatement {
     }
 }
 
+/// VACUUM statement — triggers manual cleanup of deleted rows and index compaction
+#[derive(Debug, Clone, PartialEq)]
+pub struct VacuumStatement {
+    pub token: Token,
+    pub table_name: Option<Identifier>,
+}
+
+impl fmt::Display for VacuumStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(ref table_name) = self.table_name {
+            write!(f, "VACUUM {}", table_name)
+        } else {
+            write!(f, "VACUUM")
+        }
+    }
+}
+
 /// ALTER TABLE operation type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlterTableOperation {
@@ -1871,6 +1894,8 @@ pub enum IndexMethod {
     Hash,
     /// Bitmap index (default for BOOLEAN) - good for low-cardinality columns
     Bitmap,
+    /// HNSW index - approximate nearest neighbor search for vector columns
+    Hnsw,
 }
 
 impl fmt::Display for IndexMethod {
@@ -1879,6 +1904,7 @@ impl fmt::Display for IndexMethod {
             IndexMethod::BTree => write!(f, "BTREE"),
             IndexMethod::Hash => write!(f, "HASH"),
             IndexMethod::Bitmap => write!(f, "BITMAP"),
+            IndexMethod::Hnsw => write!(f, "HNSW"),
         }
     }
 }
@@ -1894,6 +1920,8 @@ pub struct CreateIndexStatement {
     pub if_not_exists: bool,
     /// Optional index type from USING clause (None = auto-select based on column type)
     pub index_method: Option<IndexMethod>,
+    /// Optional WITH clause for index parameters (e.g., HNSW m, ef_construction, ef_search, metric)
+    pub options: Vec<(String, String)>,
 }
 
 impl fmt::Display for CreateIndexStatement {
@@ -1912,6 +1940,16 @@ impl fmt::Display for CreateIndexStatement {
         result.push(')');
         if let Some(method) = &self.index_method {
             result.push_str(&format!(" USING {}", method));
+        }
+        if !self.options.is_empty() {
+            result.push_str(" WITH (");
+            for (i, (key, val)) in self.options.iter().enumerate() {
+                if i > 0 {
+                    result.push_str(", ");
+                }
+                result.push_str(&format!("{} = {}", key, val));
+            }
+            result.push(')');
         }
         write!(f, "{}", result)
     }

@@ -77,7 +77,7 @@ Configure WAL behavior using PRAGMA:
 -- Sync mode: 0=None, 1=Normal (default), 2=Full
 PRAGMA sync_mode = 1;
 
--- Number of operations before automatic WAL flush
+-- Buffer size in bytes before automatic WAL flush
 PRAGMA wal_flush_trigger = 32768;
 ```
 
@@ -106,8 +106,9 @@ Old WAL files are automatically cleaned up after successful snapshots.
 
 Snapshots capture the complete database state at a point in time:
 1. All table data and schema
-2. All index definitions
-3. Current transaction state
+2. All index definitions (including HNSW parameters)
+3. HNSW graph structures (serialized as binary files for fast recovery)
+4. Current transaction state
 
 After a snapshot is created, older WAL entries can be safely deleted.
 
@@ -126,16 +127,18 @@ PRAGMA snapshot;
 
 ### Snapshot Files
 
-Snapshots are stored as binary files:
+Snapshots are stored as binary files, organized per table:
 ```
 /path/to/database/
   snapshots/
-    snapshot_1704067200.bin
-    snapshot_1704067500.bin
-    ...
+    table_name/
+      snapshot-20240101-120000.000.bin
+      snapshot-20240101-130000.000.bin
+    other_table/
+      snapshot-20240101-120000.000.bin
 ```
 
-The filename includes the timestamp of creation.
+Each table has its own subdirectory, and filenames include the timestamp of creation.
 
 ## Recovery Process
 
@@ -234,7 +237,8 @@ A persistent database creates this directory structure:
   wal/
     wal_NNNNNN.log     # WAL segment files
   snapshots/
-    snapshot_TIMESTAMP.bin  # Snapshot files
+    table_name/
+      snapshot-TIMESTAMP.bin  # Per-table snapshot files
 ```
 
 ## Error Handling

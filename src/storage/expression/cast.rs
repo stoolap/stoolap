@@ -20,7 +20,7 @@ use rustc_hash::FxHashMap;
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::{find_column_index, resolve_alias, Expression};
-use crate::common::{CompactArc, SmartString};
+use crate::common::SmartString;
 use crate::core::{DataType, Operator, Result, Row, Schema, Value};
 
 /// CAST expression (CAST(column AS type))
@@ -72,6 +72,10 @@ impl CastExpr {
             DataType::Boolean => cast_to_boolean(value),
             DataType::Timestamp => cast_to_timestamp(value),
             DataType::Json => cast_to_json(value),
+            DataType::Vector => Err(crate::core::Error::type_conversion(
+                format!("{:?}", value),
+                "VECTOR",
+            )),
             DataType::Null => Ok(Value::null(DataType::Null)),
         }
     }
@@ -445,7 +449,11 @@ fn cast_to_string(value: &Value) -> Result<Value> {
             "false"
         }))),
         Value::Timestamp(t) => Ok(Value::Text(SmartString::from_string(t.to_rfc3339()))),
-        Value::Json(j) => Ok(Value::Text(SmartString::from(&**j))),
+        Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+            let s = std::str::from_utf8(&data[1..]).unwrap_or("");
+            Ok(Value::Text(SmartString::from(s)))
+        }
+        Value::Extension(_) => Ok(Value::Text(SmartString::from(""))),
         Value::Null(_) => Ok(Value::null(DataType::Text)),
     }
 }
@@ -490,17 +498,15 @@ fn cast_to_timestamp(value: &Value) -> Result<Value> {
 
 fn cast_to_json(value: &Value) -> Result<Value> {
     match value {
-        Value::Json(j) => Ok(Value::Json(j.clone())),
-        Value::Text(s) => Ok(Value::Json(CompactArc::from(s.as_str()))),
-        Value::Integer(v) => Ok(Value::Json(CompactArc::from(v.to_string()))),
-        Value::Float(v) => Ok(Value::Json(CompactArc::from(v.to_string()))),
-        Value::Boolean(b) => Ok(Value::Json(CompactArc::from(if *b {
-            "true"
-        } else {
-            "false"
-        }))),
-        Value::Null(_) => Ok(Value::Json(CompactArc::from("null"))),
-        _ => Ok(Value::Json(CompactArc::from("null"))),
+        Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+            Ok(value.clone())
+        }
+        Value::Text(s) => Ok(Value::json(s.as_ref())),
+        Value::Integer(v) => Ok(Value::json(v.to_string())),
+        Value::Float(v) => Ok(Value::json(v.to_string())),
+        Value::Boolean(b) => Ok(Value::json(if *b { "true" } else { "false" })),
+        Value::Null(_) => Ok(Value::json("null")),
+        _ => Ok(Value::json("null")),
     }
 }
 

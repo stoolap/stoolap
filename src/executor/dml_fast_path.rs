@@ -389,11 +389,11 @@ impl Executor {
         pk_expr.prepare_for_schema(schema);
 
         // Execute update with simple setter
-        let mut setter = |mut row: Row| -> (Row, bool) {
+        let mut setter = |mut row: Row| -> Result<(Row, bool)> {
             for (idx, new_value) in &updates {
                 let _ = row.set(*idx, new_value.clone());
             }
-            (row, true)
+            Ok((row, true))
         };
 
         let rows_affected = table.update(Some(&pk_expr), &mut setter)?;

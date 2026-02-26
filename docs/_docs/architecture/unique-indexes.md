@@ -37,17 +37,9 @@ Primary keys automatically create an underlying unique index:
 ```sql
 -- Creating a table with a primary key
 CREATE TABLE products (
-    product_id INT PRIMARY KEY,
-    name VARCHAR(255),
-    price DECIMAL(10,2)
-);
-
--- This is equivalent to:
-CREATE TABLE products (
-    product_id INT,
-    name VARCHAR(255),
-    price DECIMAL(10,2),
-    CONSTRAINT pk_products PRIMARY KEY (product_id)
+    product_id INTEGER PRIMARY KEY,
+    name TEXT,
+    price FLOAT
 );
 ```
 
@@ -58,13 +50,13 @@ Unique constraints can also be defined when creating or altering tables:
 ```sql
 -- Adding a unique constraint when creating a table
 CREATE TABLE users (
-    id INT PRIMARY KEY,
-    email VARCHAR(255) UNIQUE,
-    username VARCHAR(50)
+    id INTEGER PRIMARY KEY,
+    email TEXT UNIQUE,
+    username TEXT
 );
 
--- Adding a unique constraint to an existing table
-ALTER TABLE users ADD CONSTRAINT unique_username UNIQUE (username);
+-- Adding a unique index to an existing table
+CREATE UNIQUE INDEX idx_username ON users (username);
 ```
 
 ### Composite Unique Indexes
@@ -74,10 +66,6 @@ Multiple columns can be combined in a single unique index:
 ```sql
 -- Ensure each user has a unique combination of first and last name
 CREATE UNIQUE INDEX idx_users_name ON users (first_name, last_name);
-
--- Ensure each subscription has at most one active plan per user
-CREATE UNIQUE INDEX idx_active_subscription ON subscriptions (user_id, plan_id) 
-WHERE status = 'active';
 ```
 
 ## How Unique Indexes Work in Stoolap
@@ -190,9 +178,9 @@ match db.execute("INSERT INTO users (email) VALUES ($1)", (email,)) {
 
 Stoolap's unique index implementation is found in these key components:
 
-- **src/storage/mvcc/btree_index.rs** - B-tree index implementation
-- **src/storage/mvcc/hash_index.rs** - Hash index implementation
-- **src/storage/mvcc/multi_column_index.rs** - Multi-column index implementation
+- **src/storage/index/btree.rs** - B-tree index implementation
+- **src/storage/index/hash.rs** - Hash index implementation
+- **src/storage/index/multi_column.rs** - Multi-column index implementation
 - **src/storage/mvcc/table.rs** - Table-level uniqueness enforcement
 - **src/executor/ddl.rs** - SQL-level uniqueness handling
 

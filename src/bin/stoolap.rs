@@ -342,6 +342,7 @@ impl Cli {
             || upper_query.starts_with("DESCRIBE")
             || upper_query.starts_with("DESC ")
             || upper_query.starts_with("EXPLAIN")
+            || upper_query.starts_with("VACUUM")
             || (upper_query.starts_with("PRAGMA") && !upper_query.contains('='))
             || upper_query.contains(" RETURNING ")
             || upper_query.ends_with(" RETURNING")
@@ -1022,6 +1023,7 @@ fn execute_query_with_options(
         || upper_query.starts_with("DESCRIBE")
         || upper_query.starts_with("DESC ")
         || upper_query.starts_with("EXPLAIN")
+        || upper_query.starts_with("VACUUM")
         || (upper_query.starts_with("PRAGMA") && !upper_query.contains('='))
         || upper_query.contains(" RETURNING ")
         || upper_query.ends_with(" RETURNING")
@@ -1398,7 +1400,13 @@ fn format_value(value: &Value) -> String {
         Value::Text(s) => s.to_string(),
         Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Timestamp(ts) => ts.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        Value::Json(s) => s.to_string(),
+        Value::Extension(data) if data.first() == Some(&(stoolap::DataType::Json as u8)) => {
+            std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
+        }
+        Value::Extension(data) if data.first() == Some(&(stoolap::DataType::Vector as u8)) => {
+            stoolap::core::value::format_vector_bytes(&data[1..])
+        }
+        Value::Extension(_) => "<extension>".to_string(),
     }
 }
 
@@ -1458,7 +1466,13 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Text(s) => serde_json::json!(s.as_str()),
         Value::Boolean(b) => serde_json::json!(b),
         Value::Timestamp(ts) => serde_json::json!(ts.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
-        Value::Json(s) => serde_json::json!(s.as_ref()),
+        Value::Extension(data) if data.first() == Some(&(stoolap::DataType::Json as u8)) => {
+            serde_json::json!(std::str::from_utf8(&data[1..]).unwrap_or(""))
+        }
+        Value::Extension(data) if data.first() == Some(&(stoolap::DataType::Vector as u8)) => {
+            serde_json::json!(stoolap::core::value::format_vector_bytes(&data[1..]))
+        }
+        Value::Extension(_) => serde_json::Value::Null,
     }
 }
 

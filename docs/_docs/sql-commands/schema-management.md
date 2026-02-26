@@ -88,6 +88,7 @@ Stoolap supports the following data types:
 
 ### Special Types
 - **JSON** - JSON document
+- **VECTOR(N)** - Fixed-dimension floating-point vector (see [Vector Search](../data-types/vector-search))
 
 ## Primary Keys
 
@@ -133,12 +134,16 @@ Stoolap supports multiple index implementations:
 1. **B-tree Indexes** - For numeric and timestamp columns, supporting equality and range queries
 2. **Hash Indexes** - For text and JSON columns, optimized for equality lookups
 3. **Bitmap Indexes** - For boolean columns and low-cardinality data
-4. **Multi-column Indexes** - For queries that filter on multiple columns together
+4. **HNSW Indexes** - For vector columns, approximate nearest neighbor search (see [Vector Search](../data-types/vector-search))
+5. **Multi-column Indexes** - For queries that filter on multiple columns together
 
 ### Dropping Indexes
 
 ```sql
 DROP INDEX idx_user_email;
+
+-- Or with explicit table name
+DROP INDEX idx_user_email ON users;
 ```
 
 ## Schema Information

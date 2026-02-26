@@ -230,7 +230,9 @@ impl BloomFilter {
             Value::Float(f) => f.to_bits().hash(&mut hasher),
             Value::Text(s) => s.hash(&mut hasher),
             Value::Timestamp(t) => t.timestamp_nanos_opt().hash(&mut hasher),
-            Value::Json(j) => j.hash(&mut hasher),
+            Value::Extension(data) => {
+                data.hash(&mut hasher);
+            }
         }
         hasher.finish()
     }

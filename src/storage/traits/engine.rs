@@ -124,6 +124,7 @@ pub trait Engine: Send + Sync {
     ///
     /// This should be called by the executor after creating an index to ensure
     /// the index is recreated on recovery.
+    #[allow(clippy::too_many_arguments)]
     fn record_create_index(
         &self,
         table_name: &str,
@@ -131,9 +132,23 @@ pub trait Engine: Send + Sync {
         column_names: &[String],
         is_unique: bool,
         index_type: crate::core::IndexType,
+        hnsw_m: Option<u16>,
+        hnsw_ef_construction: Option<u16>,
+        hnsw_ef_search: Option<u16>,
+        hnsw_distance_metric: Option<u8>,
     ) -> Result<()> {
         // Default implementation does nothing (for in-memory engines)
-        let _ = (table_name, index_name, column_names, is_unique, index_type);
+        let _ = (
+            table_name,
+            index_name,
+            column_names,
+            is_unique,
+            index_type,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_ef_search,
+            hnsw_distance_metric,
+        );
         Ok(())
     }
 
@@ -152,9 +167,17 @@ pub trait Engine: Send + Sync {
         data_type: crate::core::DataType,
         nullable: bool,
         default_expr: Option<&str>,
+        vector_dimensions: u16,
     ) -> Result<()> {
         // Default implementation does nothing (for in-memory engines)
-        let _ = (table_name, column_name, data_type, nullable, default_expr);
+        let _ = (
+            table_name,
+            column_name,
+            data_type,
+            nullable,
+            default_expr,
+            vector_dimensions,
+        );
         Ok(())
     }
 
@@ -184,9 +207,16 @@ pub trait Engine: Send + Sync {
         column_name: &str,
         data_type: crate::core::DataType,
         nullable: bool,
+        vector_dimensions: u16,
     ) -> Result<()> {
         // Default implementation does nothing
-        let _ = (table_name, column_name, data_type, nullable);
+        let _ = (
+            table_name,
+            column_name,
+            data_type,
+            nullable,
+            vector_dimensions,
+        );
         Ok(())
     }
 

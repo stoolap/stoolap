@@ -345,6 +345,13 @@ Returns the current date (at midnight UTC).
 SELECT CURRENT_DATE;                       -- Returns today's date
 ```
 
+### CURRENT_TIME
+Returns the current time as a string in HH:MM:SS format.
+
+```sql
+SELECT CURRENT_TIME;                       -- Returns e.g. '14:30:45'
+```
+
 ### DATE_TRUNC
 Truncates a timestamp to specified precision.
 
@@ -465,7 +472,7 @@ SELECT CAST('true' AS BOOLEAN);            -- Returns true
 SELECT CAST('2024-03-15' AS TIMESTAMP);    -- Returns timestamp
 ```
 
-Supported types: `INTEGER`/`INT`, `FLOAT`/`REAL`/`DOUBLE`, `TEXT`/`STRING`/`VARCHAR`, `BOOLEAN`/`BOOL`, `TIMESTAMP`/`DATETIME`/`DATE`, `JSON`
+Supported types: `INTEGER`/`INT`, `FLOAT`/`REAL`/`DOUBLE`, `TEXT`/`STRING`/`VARCHAR`, `BOOLEAN`/`BOOL`, `TIMESTAMP`/`DATETIME`/`DATE`, `JSON`, `VECTOR(N)`
 
 ### COALESCE
 Returns the first non-NULL value.
@@ -573,6 +580,85 @@ Creates a JSON object from key-value pairs.
 ```sql
 SELECT JSON_OBJECT('name', 'Alice', 'age', 30);   -- '{"age":30,"name":"Alice"}'
 ```
+
+## Vector Functions
+
+Stoolap provides functions for computing distances between vectors and inspecting vector values. These are used with the `VECTOR(N)` data type for similarity search. See [Vector Search](../data-types/vector-search) for complete documentation.
+
+### VEC_DISTANCE_L2
+Computes the Euclidean (L2) distance between two vectors.
+
+```sql
+-- VEC_DISTANCE_L2(vector_a, vector_b)
+SELECT VEC_DISTANCE_L2(embedding, '[0.1, 0.2, 0.3]') AS dist FROM items;
+
+-- k-nearest neighbor search
+SELECT id, VEC_DISTANCE_L2(embedding, '[0.1, 0.2, 0.3]') AS dist
+FROM items ORDER BY dist LIMIT 10;
+```
+
+Returns a FLOAT value. Both arguments must have the same number of dimensions.
+
+### VEC_DISTANCE_COSINE
+Computes the cosine distance (1 - cosine similarity) between two vectors.
+
+```sql
+-- VEC_DISTANCE_COSINE(vector_a, vector_b)
+SELECT VEC_DISTANCE_COSINE(embedding, '[0.1, 0.2, 0.3]') AS dist FROM items;
+```
+
+Returns 0.0 for identical directions, 1.0 for orthogonal vectors, 2.0 for opposite directions. Returns 1.0 if either vector is a zero vector.
+
+### VEC_DISTANCE_IP
+Computes the negative inner product distance (-dot product) between two vectors.
+
+```sql
+-- VEC_DISTANCE_IP(vector_a, vector_b)
+SELECT VEC_DISTANCE_IP(embedding, '[0.1, 0.2, 0.3]') AS dist FROM items;
+```
+
+### VEC_DIMS
+Returns the number of dimensions in a vector.
+
+```sql
+SELECT VEC_DIMS(embedding) FROM items WHERE id = 1;  -- Returns 384
+```
+
+### VEC_NORM
+Returns the L2 norm (magnitude) of a vector.
+
+```sql
+SELECT VEC_NORM(embedding) FROM items WHERE id = 1;  -- Returns 1.0 for normalized vectors
+```
+
+### VEC_TO_TEXT
+Converts a vector to its text representation.
+
+```sql
+SELECT VEC_TO_TEXT(embedding) FROM items WHERE id = 1;  -- Returns '[0.1, 0.2, 0.3, ...]'
+```
+
+### EMBED
+
+> **Requires:** `--features semantic`
+
+Converts text into a 384-dimensional semantic embedding vector using the built-in all-MiniLM-L6-v2 sentence-transformer model. The model runs in pure Rust and is automatically downloaded on first use.
+
+```sql
+-- Generate an embedding from text
+SELECT EMBED('How to reset my password');
+
+-- Insert with auto-generated embedding
+INSERT INTO docs (content, embedding)
+VALUES ('Hello world', EMBED('Hello world'));
+
+-- Semantic search
+SELECT content,
+       VEC_DISTANCE_COSINE(embedding, EMBED('greeting')) AS dist
+FROM docs ORDER BY dist LIMIT 5;
+```
+
+Returns a `VECTOR(384)` value. Accepts TEXT, INTEGER, or FLOAT arguments. Returns NULL for NULL input. See [Semantic Search](../data-types/semantic-search) for complete documentation.
 
 ## Utility Functions
 

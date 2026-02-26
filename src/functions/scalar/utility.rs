@@ -16,8 +16,7 @@
 
 use chrono::Utc;
 
-use crate::common::CompactArc;
-use crate::core::{Error, Result, Value};
+use crate::core::{DataType, Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
 };
@@ -391,7 +390,9 @@ impl ScalarFunction for JsonExtractFunction {
 
         // Get JSON string
         let json_str = match &args[0] {
-            Value::Json(j) => j.to_string(),
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
+            }
             Value::Text(s) => s.to_string(),
             _ => {
                 return Err(Error::invalid_argument(
@@ -491,7 +492,7 @@ fn json_to_value(json: &serde_json::Value) -> Result<Value> {
         }
         serde_json::Value::String(s) => Ok(Value::text(s)),
         // For arrays and objects, return as JSON string
-        _ => Ok(Value::Json(CompactArc::from(json.to_string()))),
+        _ => Ok(Value::json(json.to_string())),
     }
 }
 
@@ -532,7 +533,9 @@ impl ScalarFunction for JsonArrayLengthFunction {
 
         // Get JSON string
         let json_str = match &args[0] {
-            Value::Json(j) => j.to_string(),
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
+            }
             Value::Text(s) => s.to_string(),
             _ => {
                 return Err(Error::invalid_argument(
@@ -614,7 +617,7 @@ impl ScalarFunction for JsonArrayFunction {
         let json_values: Vec<serde_json::Value> = args.iter().map(value_to_json).collect();
 
         let json_array = serde_json::Value::Array(json_values);
-        Ok(Value::Json(CompactArc::from(json_array.to_string())))
+        Ok(Value::json(json_array.to_string()))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -676,7 +679,7 @@ impl ScalarFunction for JsonObjectFunction {
         }
 
         let json_object = serde_json::Value::Object(map);
-        Ok(Value::Json(CompactArc::from(json_object.to_string())))
+        Ok(Value::json(json_object.to_string()))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -694,11 +697,13 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         Value::Text(s) => serde_json::Value::String(s.to_string()),
-        Value::Json(j) => {
+        Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
             // Parse the JSON string to get a proper JSON value
-            serde_json::from_str(j).unwrap_or(serde_json::Value::String(j.to_string()))
+            let s = std::str::from_utf8(&data[1..]).unwrap_or("");
+            serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.to_string()))
         }
         Value::Timestamp(t) => serde_json::Value::String(t.to_rfc3339()),
+        Value::Extension(_) => serde_json::Value::Null,
     }
 }
 
@@ -738,7 +743,9 @@ impl ScalarFunction for JsonTypeFunction {
 
         // Get JSON string
         let json_str = match &args[0] {
-            Value::Json(j) => j.to_string(),
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
+            }
             Value::Text(s) => s.to_string(),
             _ => {
                 return Err(Error::invalid_argument(
@@ -854,7 +861,9 @@ impl ScalarFunction for JsonValidFunction {
 
         // Get string to validate
         let json_str = match &args[0] {
-            Value::Json(_) => return Ok(Value::Integer(1)), // Already JSON type, valid
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                return Ok(Value::Integer(1))
+            } // Already JSON type, valid
             Value::Text(s) => s.to_string(),
             _ => return Ok(Value::Integer(0)), // Non-string types are not valid JSON strings
         };
@@ -900,7 +909,9 @@ impl ScalarFunction for JsonKeysFunction {
 
         // Get JSON string
         let json_str = match &args[0] {
-            Value::Json(j) => j.to_string(),
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
+            }
             Value::Text(s) => s.to_string(),
             _ => {
                 return Err(Error::invalid_argument(
@@ -923,7 +934,7 @@ impl ScalarFunction for JsonKeysFunction {
                     .map(|k| serde_json::Value::String(k.clone()))
                     .collect();
                 let keys_array = serde_json::Value::Array(keys);
-                Ok(Value::Json(CompactArc::from(keys_array.to_string())))
+                Ok(Value::json(keys_array.to_string()))
             }
             _ => Ok(Value::null_unknown()), // Not an object, return NULL
         }
@@ -1030,7 +1041,9 @@ impl ScalarFunction for TypeOfFunction {
             Value::Text(_) => "TEXT",
             Value::Boolean(_) => "BOOLEAN",
             Value::Timestamp(_) => "TIMESTAMP",
-            Value::Json(_) => "JSON",
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => "JSON",
+            Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => "VECTOR",
+            Value::Extension(_) => "EXTENSION",
         };
 
         Ok(Value::text(type_name))
@@ -1386,9 +1399,7 @@ mod tests {
     #[test]
     fn test_json_extract_simple() {
         let f = JsonExtractFunction;
-        let json = Value::Json(CompactArc::from(
-            r#"{"name": "Alice", "age": 30}"#.to_owned(),
-        ));
+        let json = Value::json(r#"{"name": "Alice", "age": 30}"#.to_owned());
 
         // Extract string
         assert_eq!(
@@ -1406,7 +1417,7 @@ mod tests {
     #[test]
     fn test_json_extract_nested() {
         let f = JsonExtractFunction;
-        let json = Value::Json(CompactArc::from(r#"{"user": {"name": "Bob"}}"#.to_owned()));
+        let json = Value::json(r#"{"user": {"name": "Bob"}}"#.to_owned());
 
         assert_eq!(
             f.evaluate(&[json, Value::text("$.user.name")]).unwrap(),
@@ -1417,7 +1428,7 @@ mod tests {
     #[test]
     fn test_json_extract_array() {
         let f = JsonExtractFunction;
-        let json = Value::Json(CompactArc::from(r#"{"items": [1, 2, 3]}"#.to_owned()));
+        let json = Value::json(r#"{"items": [1, 2, 3]}"#.to_owned());
 
         assert_eq!(
             f.evaluate(&[json.clone(), Value::text("$.items[0]")])
@@ -1434,7 +1445,7 @@ mod tests {
     #[test]
     fn test_json_extract_missing_path() {
         let f = JsonExtractFunction;
-        let json = Value::Json(CompactArc::from(r#"{"name": "Alice"}"#.to_owned()));
+        let json = Value::json(r#"{"name": "Alice"}"#.to_owned());
 
         assert!(f
             .evaluate(&[json, Value::text("$.missing")])
@@ -1495,8 +1506,7 @@ mod tests {
     fn test_typeof_json() {
         let f = TypeOfFunction;
         assert_eq!(
-            f.evaluate(&[Value::Json(CompactArc::from("{}".to_owned()))])
-                .unwrap(),
+            f.evaluate(&[Value::json("{}".to_owned())]).unwrap(),
             Value::text("JSON")
         );
     }

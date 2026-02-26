@@ -36,6 +36,19 @@ use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::Executor;
 
+/// Pre-compiled projection slot for vector search results.
+/// Built once, applied per row — avoids per-row expression compilation.
+enum VectorProjectionSlot {
+    /// SELECT * — copy all columns from base row
+    Star,
+    /// Column reference by index
+    Column(usize),
+    /// Pre-computed distance value
+    Distance,
+    /// Pre-compiled expression evaluator (boxed to reduce enum size)
+    Compiled(Box<ExpressionEval>),
+}
+
 impl Executor {
     /// Try to optimize simple MIN/MAX aggregates using index
     ///
@@ -1749,5 +1762,555 @@ impl Executor {
 
             _ => None,
         }
+    }
+
+    /// Vector search optimization using HNSW index or parallel brute-force
+    ///
+    /// For queries like:
+    ///   SELECT id, VEC_DISTANCE_L2(embedding, '[1.0, 2.0, ...]') AS dist
+    ///   FROM documents ORDER BY dist LIMIT 10;
+    ///
+    /// Detects the VEC_DISTANCE pattern in ORDER BY:
+    /// 1. If an HNSW index exists → use approximate nearest neighbor search (O(log N))
+    /// 2. Otherwise → use parallel brute-force k-NN (fused distance + top-K selection)
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn try_vector_search_optimization(
+        &self,
+        stmt: &SelectStatement,
+        table: &dyn Table,
+        all_columns: &[String],
+        ctx: &ExecutionContext,
+    ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
+        // Must have exactly 1 ORDER BY + LIMIT, ascending order
+        if stmt.order_by.len() != 1 || stmt.limit.is_none() {
+            return Ok(None);
+        }
+
+        let order_by = &stmt.order_by[0];
+        if !order_by.ascending {
+            return Ok(None); // Vector search always returns closest first
+        }
+
+        // Find the VEC_DISTANCE function call — either directly in ORDER BY, via alias,
+        // or via the <=> infix operator (which is equivalent to VEC_DISTANCE_L2).
+        // For <=> operator, we synthesize an equivalent FunctionCall to reuse the same logic.
+        let synthesized_fc;
+        let func_call = match &order_by.expression {
+            Expression::FunctionCall(fc) => Some(fc.as_ref()),
+            Expression::Identifier(id) => {
+                // Look up alias in SELECT columns — try FunctionCall first, then <=> infix
+                if let Some(fc) = Self::find_vec_distance_alias(&id.value_lower, &stmt.columns) {
+                    Some(fc)
+                } else if let Some(infix) =
+                    Self::find_vec_distance_infix_alias(&id.value_lower, &stmt.columns)
+                {
+                    synthesized_fc = FunctionCall {
+                        token: infix.token.clone(),
+                        function: "VEC_DISTANCE_L2".into(),
+                        arguments: vec![(*infix.left).clone(), (*infix.right).clone()],
+                        is_distinct: false,
+                        order_by: Vec::new(),
+                        filter: None,
+                    };
+                    Some(&synthesized_fc)
+                } else {
+                    None
+                }
+            }
+            Expression::Infix(infix) if infix.op_type == InfixOperator::VectorDistance => {
+                // <=> operator is equivalent to VEC_DISTANCE_L2
+                synthesized_fc = FunctionCall {
+                    token: infix.token.clone(),
+                    function: "VEC_DISTANCE_L2".into(),
+                    arguments: vec![(*infix.left).clone(), (*infix.right).clone()],
+                    is_distinct: false,
+                    order_by: Vec::new(),
+                    filter: None,
+                };
+                Some(&synthesized_fc)
+            }
+            _ => None,
+        };
+
+        let func_call = match func_call {
+            Some(fc) => fc,
+            None => return Ok(None),
+        };
+
+        // Check if it's a VEC_DISTANCE function
+        let fn_name_upper = func_call.function.to_uppercase();
+        let is_vec_distance = matches!(
+            fn_name_upper.as_str(),
+            "VEC_DISTANCE_L2" | "VEC_DISTANCE_COSINE" | "VEC_DISTANCE_IP"
+        );
+        if !is_vec_distance || func_call.arguments.len() != 2 {
+            return Ok(None);
+        }
+
+        // Extract vector column name from first argument
+        let vec_col_name = match &func_call.arguments[0] {
+            Expression::Identifier(id) => id.value.clone(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+            _ => return Ok(None),
+        };
+
+        // Check if an HNSW index exists on this column with matching metric.
+        // Map query function to expected metric, only use HNSW if metric matches.
+        let expected_metric: Option<u8> = match fn_name_upper.as_str() {
+            "VEC_DISTANCE_L2" => Some(0),     // HnswDistanceMetric::L2
+            "VEC_DISTANCE_COSINE" => Some(1), // HnswDistanceMetric::Cosine
+            "VEC_DISTANCE_IP" => Some(2),     // HnswDistanceMetric::InnerProduct
+            _ => None,
+        };
+        let hnsw_index = expected_metric.and_then(|expected| {
+            table.get_index_on_column(&vec_col_name).filter(|idx| {
+                idx.index_type() == crate::core::IndexType::Hnsw
+                    && idx.hnsw_distance_metric() == Some(expected)
+            })
+        });
+
+        // Extract query vector from second argument
+        let query_vec_value = match &func_call.arguments[1] {
+            Expression::StringLiteral(s) => {
+                // Parse "[1.0, 2.0, ...]" string literal to vector
+                match crate::core::value::parse_vector_str(&s.value) {
+                    Some(floats) => Value::vector(floats),
+                    None => return Ok(None),
+                }
+            }
+            Expression::Parameter(_) => {
+                // Evaluate parameter
+                match ExpressionEval::compile(&func_call.arguments[1], &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
+                {
+                    Some(v @ Value::Extension(_)) => v,
+                    Some(Value::Text(s)) => {
+                        match crate::core::value::parse_vector_str(s.as_ref()) {
+                            Some(floats) => Value::vector(floats),
+                            None => return Ok(None),
+                        }
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        // Evaluate limit + offset
+        let limit = match &stmt.limit {
+            Some(limit_expr) => {
+                match ExpressionEval::compile(limit_expr, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
+                {
+                    Some(Value::Integer(l)) if l >= 0 => l as usize,
+                    Some(Value::Float(f)) if f >= 0.0 => f as usize,
+                    _ => return Ok(None),
+                }
+            }
+            None => return Ok(None),
+        };
+
+        let offset = if let Some(ref offset_expr) = stmt.offset {
+            match ExpressionEval::compile(offset_expr, &[])
+                .ok()
+                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
+            {
+                Some(Value::Integer(o)) if o >= 0 => o as usize,
+                Some(Value::Float(f)) if f >= 0.0 => f as usize,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+
+        let k = limit.saturating_add(offset);
+
+        // Compile WHERE filter if present
+        let where_filter = if let Some(ref where_expr) = stmt.where_clause {
+            match RowFilter::new(where_expr, all_columns) {
+                Ok(filter) => Some(filter.with_context(ctx)),
+                Err(_) => return Ok(None), // Can't compile WHERE — fall through to normal path
+            }
+        } else {
+            None
+        };
+
+        // Determine distance results: HNSW path or brute-force path
+        // nn_results: Vec<(row_id, distance)> sorted by distance ascending
+        let (nn_results, fetched_rows) = if let Some(ref idx) = hnsw_index {
+            // HNSW index path — O(log N) approximate search
+            // With WHERE: oversample by 4x, then post-filter
+            let oversample = if where_filter.is_some() { 4 } else { 1 };
+            let hnsw_k = k.saturating_mul(oversample);
+            let default_ef = idx.default_ef_search().unwrap_or(64);
+            let ef_search = std::cmp::max(hnsw_k.saturating_mul(2), default_ef);
+            let results = match idx.search_nearest(&query_vec_value, hnsw_k, ef_search) {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+            if results.is_empty() {
+                let output_columns =
+                    CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, None));
+                let result = ExecutorResult::with_arc_columns(
+                    CompactArc::clone(&output_columns),
+                    RowVec::new(),
+                );
+                return Ok(Some((Box::new(result), output_columns)));
+            }
+            let row_ids: Vec<i64> = results.iter().map(|(rid, _)| *rid).collect();
+            let rows = table.collect_rows_by_ids(&row_ids)?;
+
+            // Post-filter with WHERE if present
+            if let Some(ref filter) = where_filter {
+                // Build O(1) lookup map from row_id -> row
+                let row_map: rustc_hash::FxHashMap<i64, &crate::core::Row> =
+                    rows.iter().map(|(rid, row)| (*rid, row)).collect();
+                let mut filtered_nn = Vec::with_capacity(k);
+                let mut filtered_rows = RowVec::with_capacity(k);
+                for (rid, dist) in &results {
+                    if let Some(row) = row_map.get(rid) {
+                        if filter.matches(row) {
+                            filtered_nn.push((*rid, *dist));
+                            filtered_rows.push((*rid, (*row).clone()));
+                            if filtered_nn.len() >= k {
+                                break; // We have enough results
+                            }
+                        }
+                    }
+                }
+                // If HNSW post-filtering yielded fewer results than requested,
+                // fall back to the normal brute-force query path to guarantee
+                // correct result counts. The HNSW index may miss qualifying rows
+                // because ANN search only explores a subset of the graph.
+                if filtered_nn.len() < k {
+                    return Ok(None);
+                }
+                (filtered_nn, filtered_rows)
+            } else {
+                (results, rows)
+            }
+        } else {
+            // Brute-force path — parallel distance computation + top-K
+            let query_bytes = match &query_vec_value {
+                Value::Extension(data)
+                    if data.first() == Some(&(crate::core::DataType::Vector as u8)) =>
+                {
+                    &data[1..]
+                }
+                _ => return Ok(None),
+            };
+
+            // Find vector column index in schema
+            let schema = table.schema();
+            let vec_col_idx = match schema
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&vec_col_name))
+            {
+                Some(idx) => idx,
+                None => return Ok(None),
+            };
+
+            let metric = match fn_name_upper.as_str() {
+                "VEC_DISTANCE_L2" => super::parallel::DistanceMetric::L2,
+                "VEC_DISTANCE_COSINE" => super::parallel::DistanceMetric::Cosine,
+                "VEC_DISTANCE_IP" => super::parallel::DistanceMetric::InnerProduct,
+                _ => return Ok(None),
+            };
+
+            // Collect rows — push WHERE to storage level for index-accelerated filtering
+            let scan_rows = if let Some(ref where_expr) = stmt.where_clause {
+                // Try storage-level pushdown (uses indexes when available)
+                let storage_expr = super::expr_converter::convert_ast_to_storage_expr(where_expr);
+                let rows = table.collect_all_rows(storage_expr.as_deref())?;
+                // Storage may not handle all predicates — apply residual in-memory filter
+                if let Some(ref filter) = where_filter {
+                    rows.into_iter()
+                        .filter(|(_, row)| filter.matches(row))
+                        .collect()
+                } else {
+                    rows
+                }
+            } else {
+                table.collect_all_rows_unsorted()?
+            };
+            if scan_rows.is_empty() {
+                let output_columns =
+                    CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, None));
+                let result = ExecutorResult::with_arc_columns(
+                    CompactArc::clone(&output_columns),
+                    RowVec::new(),
+                );
+                return Ok(Some((Box::new(result), output_columns)));
+            }
+
+            let config = super::parallel::ParallelConfig::default();
+            let topn = super::parallel::parallel_topn_vector_search(
+                scan_rows,
+                vec_col_idx,
+                query_bytes,
+                k,
+                metric,
+                &config,
+            );
+
+            // Convert to (row_id, distance) + fetched rows
+            let nn: Vec<(i64, f64)> = topn.iter().map(|(rid, _, dist)| (*rid, *dist)).collect();
+            let rows: RowVec = topn.into_iter().map(|(rid, row, _)| (rid, row)).collect();
+            (nn, rows)
+        };
+
+        // Build a map from row_id to fetched row for order preservation
+        let mut row_map: crate::common::I64Map<Row> =
+            crate::common::I64Map::with_capacity(fetched_rows.len());
+        for (rid, row) in fetched_rows.into_iter() {
+            row_map.insert(rid, row);
+        }
+
+        // Pre-compile projection plan once (avoid per-row expression compilation)
+        let mut projection_plan =
+            self.compile_vector_projection_plan(&stmt.columns, all_columns, ctx, func_call)?;
+
+        // Project rows according to the pre-compiled plan
+        let mut result_rows = RowVec::with_capacity(k);
+        for (i, (row_id, dist)) in nn_results.iter().enumerate() {
+            if i < offset {
+                continue;
+            }
+            if result_rows.len() >= limit {
+                break;
+            }
+            if let Some(base_row) = row_map.get(*row_id) {
+                let projected =
+                    Self::apply_vector_projection(&mut projection_plan, base_row, *dist)?;
+                result_rows.push((*row_id, projected));
+            }
+        }
+
+        let output_columns =
+            CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, None));
+
+        let result =
+            ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), result_rows);
+        Ok(Some((Box::new(result), output_columns)))
+    }
+
+    /// Find a VEC_DISTANCE function call (or <=> operator) that's aliased in SELECT columns.
+    /// For <=> operator, returns None and the caller handles it via the synthesized_fc path.
+    fn find_vec_distance_alias<'a>(
+        alias_lower: &str,
+        columns: &'a [Expression],
+    ) -> Option<&'a FunctionCall> {
+        for col_expr in columns {
+            if let Expression::Aliased(aliased) = col_expr {
+                if aliased.alias.value_lower == alias_lower {
+                    if let Expression::FunctionCall(fc) = &*aliased.expression {
+                        let fn_upper = fc.function.to_uppercase();
+                        if matches!(
+                            fn_upper.as_str(),
+                            "VEC_DISTANCE_L2" | "VEC_DISTANCE_COSINE" | "VEC_DISTANCE_IP"
+                        ) {
+                            return Some(fc.as_ref());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if an alias in SELECT points to a <=> infix operator.
+    /// Returns the InfixExpression if found, to synthesize a FunctionCall from.
+    fn find_vec_distance_infix_alias<'a>(
+        alias_lower: &str,
+        columns: &'a [Expression],
+    ) -> Option<&'a InfixExpression> {
+        for col_expr in columns {
+            if let Expression::Aliased(aliased) = col_expr {
+                if aliased.alias.value_lower == alias_lower {
+                    if let Expression::Infix(infix) = &*aliased.expression {
+                        if infix.op_type == InfixOperator::VectorDistance {
+                            return Some(infix);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if two FunctionCall nodes represent the same call (same name + same arguments).
+    /// Used to match ORDER BY distance with the correct SELECT column.
+    fn func_calls_match(a: &FunctionCall, b: &FunctionCall) -> bool {
+        if !a.function.eq_ignore_ascii_case(&b.function) {
+            return false;
+        }
+        if a.arguments.len() != b.arguments.len() {
+            return false;
+        }
+        // Compare each argument structurally for common patterns
+        a.arguments.iter().zip(b.arguments.iter()).all(|(x, y)| {
+            match (x, y) {
+                (Expression::Identifier(a_id), Expression::Identifier(b_id)) => {
+                    a_id.value.eq_ignore_ascii_case(&b_id.value)
+                }
+                (
+                    Expression::QualifiedIdentifier(a_qid),
+                    Expression::QualifiedIdentifier(b_qid),
+                ) => a_qid.name.value.eq_ignore_ascii_case(&b_qid.name.value),
+                (Expression::Identifier(a_id), Expression::QualifiedIdentifier(b_qid))
+                | (Expression::QualifiedIdentifier(b_qid), Expression::Identifier(a_id)) => {
+                    a_id.value.eq_ignore_ascii_case(&b_qid.name.value)
+                }
+                (Expression::StringLiteral(a_s), Expression::StringLiteral(b_s)) => {
+                    a_s.value == b_s.value
+                }
+                (Expression::IntegerLiteral(a_i), Expression::IntegerLiteral(b_i)) => {
+                    a_i.value == b_i.value
+                }
+                (Expression::FloatLiteral(a_f), Expression::FloatLiteral(b_f)) => {
+                    a_f.value == b_f.value
+                }
+                (Expression::FunctionCall(a_fc), Expression::FunctionCall(b_fc)) => {
+                    Self::func_calls_match(a_fc, b_fc)
+                }
+                // For other expression kinds, use pointer equality as last resort
+                // (works when ORDER BY references alias that points into SELECT)
+                _ => std::ptr::eq(x as *const Expression, y as *const Expression),
+            }
+        })
+    }
+
+    /// Compile a projection plan from SELECT columns. Called once before the row loop.
+    /// `order_by_fc` is the FunctionCall used in ORDER BY — only this exact call gets the
+    /// precomputed Distance slot. Other VEC_DISTANCE_* calls are compiled for per-row eval.
+    fn compile_vector_projection_plan(
+        &self,
+        select_columns: &[Expression],
+        all_columns: &[String],
+        ctx: &ExecutionContext,
+        order_by_fc: &FunctionCall,
+    ) -> Result<Vec<VectorProjectionSlot>> {
+        let mut plan = Vec::with_capacity(select_columns.len());
+
+        for col_expr in select_columns {
+            let expr = match col_expr {
+                Expression::Aliased(aliased) => &*aliased.expression,
+                other => other,
+            };
+
+            match expr {
+                Expression::Star(_) => {
+                    plan.push(VectorProjectionSlot::Star);
+                }
+                Expression::Identifier(id) => {
+                    if let Some(idx) = all_columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(&id.value))
+                    {
+                        plan.push(VectorProjectionSlot::Column(idx));
+                    } else {
+                        return Err(crate::core::Error::ColumnNotFound(id.value.to_string()));
+                    }
+                }
+                Expression::QualifiedIdentifier(qid) => {
+                    if let Some(idx) = all_columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(&qid.name.value))
+                    {
+                        plan.push(VectorProjectionSlot::Column(idx));
+                    } else {
+                        return Err(crate::core::Error::ColumnNotFound(
+                            qid.name.value.to_string(),
+                        ));
+                    }
+                }
+                Expression::FunctionCall(fc) => {
+                    let fn_upper = fc.function.to_uppercase();
+                    if matches!(
+                        fn_upper.as_str(),
+                        "VEC_DISTANCE_L2" | "VEC_DISTANCE_COSINE" | "VEC_DISTANCE_IP"
+                    ) && Self::func_calls_match(fc, order_by_fc)
+                    {
+                        plan.push(VectorProjectionSlot::Distance);
+                    } else {
+                        let eval = ExpressionEval::compile(expr, all_columns)?.with_context(ctx);
+                        plan.push(VectorProjectionSlot::Compiled(Box::new(eval)));
+                    }
+                }
+                Expression::Infix(infix) if infix.op_type == InfixOperator::VectorDistance => {
+                    // <=> operator is equivalent to VEC_DISTANCE_L2.
+                    // Check if it matches the ORDER BY distance expression.
+                    let equiv_fc = FunctionCall {
+                        token: infix.token.clone(),
+                        function: "VEC_DISTANCE_L2".into(),
+                        arguments: vec![(*infix.left).clone(), (*infix.right).clone()],
+                        is_distinct: false,
+                        order_by: Vec::new(),
+                        filter: None,
+                    };
+                    if Self::func_calls_match(&equiv_fc, order_by_fc) {
+                        plan.push(VectorProjectionSlot::Distance);
+                    } else {
+                        let eval = ExpressionEval::compile(expr, all_columns)?.with_context(ctx);
+                        plan.push(VectorProjectionSlot::Compiled(Box::new(eval)));
+                    }
+                }
+                _ => {
+                    let eval = ExpressionEval::compile(expr, all_columns)?.with_context(ctx);
+                    plan.push(VectorProjectionSlot::Compiled(Box::new(eval)));
+                }
+            }
+        }
+
+        Ok(plan)
+    }
+
+    /// Apply a pre-compiled projection plan to a single row.
+    fn apply_vector_projection(
+        plan: &mut [VectorProjectionSlot],
+        base_row: &Row,
+        distance: f64,
+    ) -> Result<Row> {
+        let mut values = Vec::with_capacity(plan.len());
+
+        for slot in plan.iter_mut() {
+            match slot {
+                VectorProjectionSlot::Star => {
+                    for i in 0..base_row.len() {
+                        values.push(
+                            base_row
+                                .get(i)
+                                .cloned()
+                                .unwrap_or(Value::Null(crate::core::DataType::Null)),
+                        );
+                    }
+                }
+                VectorProjectionSlot::Column(idx) => {
+                    values.push(
+                        base_row
+                            .get(*idx)
+                            .cloned()
+                            .unwrap_or(Value::Null(crate::core::DataType::Null)),
+                    );
+                }
+                VectorProjectionSlot::Distance => {
+                    if distance.is_infinite() {
+                        // Dimension mismatch or missing vector → NULL distance
+                        values.push(Value::Null(crate::core::DataType::Float));
+                    } else {
+                        values.push(Value::Float(distance));
+                    }
+                }
+                VectorProjectionSlot::Compiled(eval) => {
+                    let val = eval.eval_slice(base_row)?;
+                    values.push(val);
+                }
+            }
+        }
+
+        Ok(Row::from_values(values))
     }
 }

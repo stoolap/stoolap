@@ -180,7 +180,31 @@ impl Executor {
                 self.explain_select_columns(select, lines, indent);
 
                 // FROM clause with access plan
-                if let Some(ref table_expr) = select.table_expr {
+                // Check for vector search fast path first
+                let vector_plan = if let Some(ref table_expr) = select.table_expr {
+                    if let Some(table_name) = extract_table_name(table_expr) {
+                        self.detect_vector_search_plan(select, &table_name)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(ref vplan) = vector_plan {
+                    let plan_str = format!("{}", vplan);
+                    let inner_prefix = "  ".repeat(indent + 1);
+                    for (i, line) in plan_str.lines().enumerate() {
+                        if i == 0 {
+                            lines.push(format!(
+                                "{}-> {} (actual rows={})",
+                                inner_prefix, line, row_count
+                            ));
+                        } else {
+                            lines.push(format!("{}   {}", inner_prefix, line));
+                        }
+                    }
+                } else if let Some(ref table_expr) = select.table_expr {
                     self.explain_table_expr_with_where_and_stats(
                         table_expr,
                         select.where_clause.as_deref(),
@@ -527,7 +551,29 @@ impl Executor {
         }
 
         // FROM clause with access plan
-        if let Some(ref table_expr) = select.table_expr {
+        // Check for vector search fast path first
+        let vector_plan = if let Some(ref table_expr) = select.table_expr {
+            if let Some(table_name) = extract_table_name(table_expr) {
+                self.detect_vector_search_plan(select, &table_name)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(ref vplan) = vector_plan {
+            // Vector search detected: show vector-specific scan plan
+            let plan_str = format!("{}", vplan);
+            let inner_prefix = "  ".repeat(indent + 1);
+            for (i, line) in plan_str.lines().enumerate() {
+                if i == 0 {
+                    lines.push(format!("{}-> {}", inner_prefix, line));
+                } else {
+                    lines.push(format!("{}   {}", inner_prefix, line));
+                }
+            }
+        } else if let Some(ref table_expr) = select.table_expr {
             self.explain_table_expr_with_where(
                 table_expr,
                 select.where_clause.as_deref(),
@@ -878,6 +924,192 @@ impl Executor {
         };
 
         (algo_name, None)
+    }
+
+    /// Detect if a SELECT statement would use the vector search fast path.
+    /// Returns the appropriate ScanPlan (VectorSearch or VectorBruteForce) if detected.
+    fn detect_vector_search_plan(
+        &self,
+        select: &SelectStatement,
+        table_name: &str,
+    ) -> Option<ScanPlan> {
+        // Same conditions as the execution fast path in query.rs
+        if select.limit.is_none()
+            || select.order_by.len() != 1
+            || !select.group_by.columns.is_empty()
+            || select.having.is_some()
+            || select.distinct
+        {
+            return None;
+        }
+
+        let order_by = &select.order_by[0];
+        if !order_by.ascending {
+            return None;
+        }
+
+        // Find VEC_DISTANCE function: direct call, alias, or <=> operator
+        let (fn_name_upper, vec_col_name) = match &order_by.expression {
+            Expression::FunctionCall(fc) => {
+                let name = fc.function.to_uppercase();
+                if !matches!(
+                    name.as_str(),
+                    "VEC_DISTANCE_L2" | "VEC_DISTANCE_COSINE" | "VEC_DISTANCE_IP"
+                ) {
+                    return None;
+                }
+                if fc.arguments.len() != 2 {
+                    return None;
+                }
+                let col = Self::extract_vec_col_name(&fc.arguments[0])?;
+                (name.to_string(), col)
+            }
+            Expression::Identifier(id) => {
+                // Alias lookup in SELECT columns
+                if let Some(fc) =
+                    Self::find_vec_distance_alias_for_explain(&id.value_lower, &select.columns)
+                {
+                    let name = fc.function.to_uppercase();
+                    let col = Self::extract_vec_col_name(&fc.arguments[0])?;
+                    (name.to_string(), col)
+                } else if let Some(infix) = Self::find_vec_distance_infix_alias_for_explain(
+                    &id.value_lower,
+                    &select.columns,
+                ) {
+                    // <=> operator is equivalent to VEC_DISTANCE_L2
+                    let col = Self::extract_vec_col_name(&infix.left)?;
+                    ("VEC_DISTANCE_L2".to_string(), col)
+                } else {
+                    return None;
+                }
+            }
+            Expression::Infix(infix) if infix.op_type == InfixOperator::VectorDistance => {
+                let col = Self::extract_vec_col_name(&infix.left)?;
+                ("VEC_DISTANCE_L2".to_string(), col)
+            }
+            _ => return None,
+        };
+
+        // Map function name to metric string and numeric code
+        let (metric, expected_metric): (&str, u8) = match fn_name_upper.as_str() {
+            "VEC_DISTANCE_L2" => ("L2", 0),
+            "VEC_DISTANCE_COSINE" => ("Cosine", 1),
+            "VEC_DISTANCE_IP" => ("InnerProduct", 2),
+            _ => return None,
+        };
+
+        // Extract k from LIMIT
+        let k = Self::extract_limit_value(select)?;
+
+        // Check for WHERE clause filter text
+        let filter = select.where_clause.as_ref().map(|w| format!("{}", w));
+
+        if let Ok(tx) = self.engine.begin_transaction() {
+            if let Ok(table) = tx.get_table(table_name) {
+                let hnsw_index = table.get_index_on_column(&vec_col_name).filter(|idx| {
+                    idx.index_type() == crate::core::IndexType::Hnsw
+                        && idx.hnsw_distance_metric() == Some(expected_metric)
+                });
+
+                if let Some(idx) = hnsw_index {
+                    let ef_search = idx.default_ef_search().unwrap_or(64);
+                    return Some(ScanPlan::VectorSearch {
+                        table: table_name.to_string(),
+                        index_name: idx.name().to_string(),
+                        vector_column: vec_col_name,
+                        metric: metric.to_string(),
+                        k,
+                        ef_search,
+                        filter,
+                    });
+                }
+
+                return Some(ScanPlan::VectorBruteForce {
+                    table: table_name.to_string(),
+                    vector_column: vec_col_name,
+                    metric: metric.to_string(),
+                    k,
+                    filter,
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Extract vector column name from a function argument expression
+    fn extract_vec_col_name(expr: &Expression) -> Option<String> {
+        match expr {
+            Expression::Identifier(id) => Some(id.value.to_string()),
+            Expression::QualifiedIdentifier(qid) => Some(qid.name.value.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Find a VEC_DISTANCE function call aliased in SELECT columns (for EXPLAIN)
+    fn find_vec_distance_alias_for_explain<'a>(
+        alias_lower: &str,
+        columns: &'a [Expression],
+    ) -> Option<&'a FunctionCall> {
+        for col_expr in columns {
+            if let Expression::Aliased(aliased) = col_expr {
+                if aliased.alias.value_lower == alias_lower {
+                    if let Expression::FunctionCall(fc) = &*aliased.expression {
+                        let fn_upper = fc.function.to_uppercase();
+                        if matches!(
+                            fn_upper.as_str(),
+                            "VEC_DISTANCE_L2" | "VEC_DISTANCE_COSINE" | "VEC_DISTANCE_IP"
+                        ) && fc.arguments.len() == 2
+                        {
+                            return Some(fc.as_ref());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a <=> infix operator aliased in SELECT columns (for EXPLAIN)
+    fn find_vec_distance_infix_alias_for_explain<'a>(
+        alias_lower: &str,
+        columns: &'a [Expression],
+    ) -> Option<&'a InfixExpression> {
+        for col_expr in columns {
+            if let Expression::Aliased(aliased) = col_expr {
+                if aliased.alias.value_lower == alias_lower {
+                    if let Expression::Infix(infix) = &*aliased.expression {
+                        if infix.op_type == InfixOperator::VectorDistance {
+                            return Some(infix);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract integer limit value from a SELECT statement (simple cases only)
+    fn extract_limit_value(select: &SelectStatement) -> Option<usize> {
+        let limit_expr = select.limit.as_deref()?;
+        match limit_expr {
+            Expression::IntegerLiteral(lit) => {
+                if lit.value >= 0 {
+                    let k = lit.value as usize;
+                    if let Some(ref offset_expr) = select.offset {
+                        if let Expression::IntegerLiteral(off) = &**offset_expr {
+                            if off.value >= 0 {
+                                return Some(k.saturating_add(off.value as usize));
+                            }
+                        }
+                    }
+                    Some(k)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 }
 

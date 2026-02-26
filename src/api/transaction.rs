@@ -318,20 +318,11 @@ impl Transaction {
                 let positional_params = ctx.params_arc().clone();
                 let named_params = ctx.named_params_arc().clone();
 
-                // CRITICAL: Capture errors from setter since closure can't return Result
-                use std::cell::RefCell;
-                let update_error: RefCell<Option<Error>> = RefCell::new(None);
-
-                let mut setter = |row: Row| -> (Row, bool) {
-                    // If we already have an error, skip processing
-                    if update_error.borrow().is_some() {
-                        return (row, false);
-                    }
-
+                let mut setter = |row: Row| -> Result<(Row, bool)> {
                     // Check WHERE clause if present (uses thread-local VM internally)
                     if let Some(ref filter) = where_filter {
                         if !filter.matches(&row) {
-                            return (row, false);
+                            return Ok((row, false));
                         }
                     }
 
@@ -345,17 +336,12 @@ impl Transaction {
                         exec_ctx = exec_ctx.with_named_params(&named_params);
                     }
 
-                    // CRITICAL: Collect evaluated values, capturing any errors
+                    // CRITICAL: Collect evaluated values, propagating any errors
                     let mut updates_to_apply: Vec<(usize, Value)> =
                         Vec::with_capacity(compiled_updates.len());
                     for (idx, program) in compiled_updates.iter() {
-                        match vm.execute(program, &exec_ctx) {
-                            Ok(v) => updates_to_apply.push((*idx, v)),
-                            Err(e) => {
-                                *update_error.borrow_mut() = Some(e);
-                                return (row, false);
-                            }
-                        }
+                        let v = vm.execute(program, &exec_ctx)?;
+                        updates_to_apply.push((*idx, v));
                     }
 
                     // Now apply updates - take ownership of row
@@ -364,7 +350,7 @@ impl Transaction {
                         new_values[idx] = value;
                     }
 
-                    (Row::from_values(new_values), true)
+                    Ok((Row::from_values(new_values), true))
                 };
 
                 // Try to convert WHERE clause to storage expression for index optimization
@@ -376,11 +362,6 @@ impl Transaction {
                     .and_then(|expr| self.convert_to_storage_expression(expr, ctx, &schema).ok());
 
                 let updated_count = table.update(storage_where_expr.as_deref(), &mut setter)?;
-
-                // Check if any errors were captured during update
-                if let Some(err) = update_error.into_inner() {
-                    return Err(err);
-                }
 
                 Ok(Box::new(ExecResult::with_rows_affected(
                     updated_count as i64,

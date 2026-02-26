@@ -25,10 +25,7 @@ use crate::core::{
     DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
 };
 use crate::storage::expression::Expression;
-use crate::storage::mvcc::bitmap_index::BitmapIndex;
-use crate::storage::mvcc::btree_index::BTreeIndex;
-use crate::storage::mvcc::hash_index::HashIndex;
-use crate::storage::mvcc::multi_column_index::MultiColumnIndex;
+use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
 use crate::storage::mvcc::scanner::MVCCScanner;
 use crate::storage::mvcc::{TransactionVersionStore, VersionStore};
 use crate::storage::traits::{Index, QueryResult, ScanPlan, Scanner, Table};
@@ -127,6 +124,9 @@ impl MVCCTable {
 
             // Numeric types - use BTree for range query support
             DataType::Integer | DataType::Float | DataType::Timestamp => IndexType::BTree,
+
+            // Vector columns - use HNSW for approximate nearest neighbor search
+            DataType::Vector => IndexType::Hnsw,
 
             // NULL type - use BTree as safe default
             DataType::Null => IndexType::BTree,
@@ -288,7 +288,7 @@ impl MVCCTable {
     #[allow(clippy::only_used_in_recursion)]
     fn try_index_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<RowIdVec> {
         use crate::core::Operator;
-        use crate::storage::mvcc::intersect_sorted_ids;
+        use crate::storage::index::intersect_sorted_ids;
 
         // First, try simple comparison on a single column
         if let Some((col_name, operator, value)) = expr.get_comparison_info() {
@@ -954,6 +954,21 @@ impl MVCCTable {
                         // Coerce Integer to Boolean (0 = false, non-zero = true)
                         if let Value::Integer(n) = value {
                             let _ = row.set(i, Value::Boolean(*n != 0));
+                        }
+                    } else if actual_type == DataType::Text && col.data_type == DataType::Vector {
+                        // Coerce Text to Extension(Vector) binary format
+                        if let Value::Text(s) = value {
+                            match crate::core::value::parse_vector_str(s.as_ref()) {
+                                Some(floats) => {
+                                    let _ = row.set(i, Value::vector(floats));
+                                }
+                                None => {
+                                    return Err(Error::internal(format!(
+                                        "cannot parse vector value in column '{}': '{}'",
+                                        col.name, s
+                                    )));
+                                }
+                            }
                         }
                     } else {
                         return Err(Error::internal(format!(
@@ -1696,7 +1711,7 @@ impl Table for MVCCTable {
     fn update(
         &mut self,
         where_expr: Option<&dyn Expression>,
-        setter: &mut dyn FnMut(Row) -> (Row, bool),
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         // OPTIMIZATION: Borrow schema instead of cloning - saves allocation per update
         let schema = &self.cached_schema;
@@ -1734,7 +1749,10 @@ impl Table for MVCCTable {
                 if let Some((row, original_version)) = row_with_original {
                     // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
                     let row = self.normalize_row_to_schema(row, schema);
-                    let (updated_row, _) = setter(row);
+                    let (updated_row, changed) = setter(row)?;
+                    if !changed {
+                        return Ok(0);
+                    }
                     if let Some(orig) = original_version {
                         // Use optimized put that skips redundant get_visible_version
                         self.txn_versions.write().unwrap().put_with_original(
@@ -1771,8 +1789,10 @@ impl Table for MVCCTable {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
                                 let row = self.normalize_row_to_schema(local.data.clone(), schema);
-                                let (updated_row, _) = setter(row);
-                                local_rows.push((row_id, updated_row));
+                                let (updated_row, changed) = setter(row)?;
+                                if changed {
+                                    local_rows.push((row_id, updated_row));
+                                }
                             }
                             // Locally deleted — skip, don't fall through
                         } else {
@@ -1788,8 +1808,10 @@ impl Table for MVCCTable {
                         .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
                     for (row_id, row, version) in batch_rows {
                         let row = self.normalize_row_to_schema(row, schema);
-                        let (updated_row, _) = setter(row);
-                        rows_with_originals.push((row_id, updated_row, version));
+                        let (updated_row, changed) = setter(row)?;
+                        if changed {
+                            rows_with_originals.push((row_id, updated_row, version));
+                        }
                     }
                 }
 
@@ -1850,21 +1872,51 @@ impl Table for MVCCTable {
                     }
                 }
 
-                // Step 3: Apply setter to all rows
-                let update_count = local_rows_to_update.len() + rows_with_originals.len();
-
-                // OPTIMIZATION: Apply setter in-place, avoiding intermediate Vec allocation
-                // Update local rows (these already have write-set tracking)
-                for (_, row) in &mut local_rows_to_update {
-                    let (updated_row, _) = setter(std::mem::take(row));
-                    *row = updated_row;
-                }
+                // Step 3: Apply setter to all rows, filtering out unchanged rows
+                // Setter returns Result — on error, abort BEFORE batch put
+                // to guarantee statement-level atomicity.
+                let mut setter_error: Option<crate::core::Error> = None;
+                local_rows_to_update.retain_mut(|(_, row)| {
+                    if setter_error.is_some() {
+                        return false;
+                    }
+                    match setter(std::mem::take(row)) {
+                        Ok((updated_row, changed)) => {
+                            *row = updated_row;
+                            changed
+                        }
+                        Err(e) => {
+                            setter_error = Some(e);
+                            false
+                        }
+                    }
+                });
 
                 // Update rows from version store with pre-fetched originals
-                for (_, row, _) in &mut rows_with_originals {
-                    let (updated_row, _) = setter(std::mem::take(row));
-                    *row = updated_row;
+                if setter_error.is_none() {
+                    rows_with_originals.retain_mut(|(_, row, _)| {
+                        if setter_error.is_some() {
+                            return false;
+                        }
+                        match setter(std::mem::take(row)) {
+                            Ok((updated_row, changed)) => {
+                                *row = updated_row;
+                                changed
+                            }
+                            Err(e) => {
+                                setter_error = Some(e);
+                                false
+                            }
+                        }
+                    });
                 }
+
+                // Abort before batch put if setter reported an error
+                if let Some(err) = setter_error {
+                    return Err(err);
+                }
+
+                let update_count = local_rows_to_update.len() + rows_with_originals.len();
 
                 // Batch put - first the local rows (use regular put)
                 {
@@ -1952,20 +2004,47 @@ impl Table for MVCCTable {
                 .collect()
         };
 
-        // Apply setter to rows with originals (from version store)
-        for (_, row, _) in &mut rows_with_originals {
-            let (updated_row, _) = setter(std::mem::take(row));
-            *row = updated_row;
+        // Apply setter to rows with originals (from version store), filtering out unchanged
+        // Setter returns Result — on error, abort BEFORE batch put for statement atomicity.
+        let mut setter_error: Option<crate::core::Error> = None;
+        rows_with_originals.retain_mut(|(_, row, _)| {
+            if setter_error.is_some() {
+                return false;
+            }
+            match setter(std::mem::take(row)) {
+                Ok((updated_row, changed)) => {
+                    *row = updated_row;
+                    changed
+                }
+                Err(e) => {
+                    setter_error = Some(e);
+                    false
+                }
+            }
+        });
+
+        // Apply setter to local rows, filtering out unchanged
+        let mut local_updated: RowVec = RowVec::new();
+        if setter_error.is_none() {
+            for (row_id, row) in local_rows_to_update {
+                match setter(row) {
+                    Ok((updated_row, changed)) => {
+                        if changed {
+                            local_updated.push((row_id, updated_row));
+                        }
+                    }
+                    Err(e) => {
+                        setter_error = Some(e);
+                        break;
+                    }
+                }
+            }
         }
 
-        // Apply setter to local rows
-        let local_updated: RowVec = local_rows_to_update
-            .into_iter()
-            .map(|(row_id, row)| {
-                let (updated_row, _) = setter(row);
-                (row_id, updated_row)
-            })
-            .collect();
+        // Abort before batch put if setter reported an error
+        if let Some(err) = setter_error {
+            return Err(err);
+        }
 
         // Batch update all rows at once
         let update_count = rows_with_originals.len() + local_updated.len();
@@ -1983,7 +2062,7 @@ impl Table for MVCCTable {
     fn update_by_row_ids(
         &mut self,
         row_ids: &[i64],
-        setter: &mut dyn FnMut(Row) -> (Row, bool),
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let schema = &self.cached_schema;
 
@@ -1998,8 +2077,10 @@ impl Table for MVCCTable {
                 if let Some(local) = txn_versions.get_local_version(row_id) {
                     if !local.is_deleted() {
                         let row = self.normalize_row_to_schema(local.data.clone(), schema);
-                        let (updated_row, _) = setter(row);
-                        local_rows.push((row_id, updated_row));
+                        let (updated_row, changed) = setter(row)?;
+                        if changed {
+                            local_rows.push((row_id, updated_row));
+                        }
                     }
                     // Locally deleted — skip, don't fall through
                 } else {
@@ -2017,8 +2098,10 @@ impl Table for MVCCTable {
                 .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
             for (row_id, row, version) in batch_rows {
                 let row = self.normalize_row_to_schema(row, schema);
-                let (updated_row, _) = setter(row);
-                rows_with_originals.push((row_id, updated_row, version));
+                let (updated_row, changed) = setter(row)?;
+                if changed {
+                    rows_with_originals.push((row_id, updated_row, version));
+                }
             }
         }
 
@@ -2419,6 +2502,18 @@ impl Table for MVCCTable {
         Ok(self.collect_visible_rows_unsorted())
     }
 
+    fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
+        let mut rows = RowVec::with_capacity(row_ids.len());
+        for &row_id in row_ids {
+            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                if !version.is_deleted() {
+                    rows.push((row_id, version.data.clone()));
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     fn collect_rows_with_limit(
         &self,
         where_expr: Option<&dyn Expression>,
@@ -2714,6 +2809,44 @@ impl Table for MVCCTable {
                     "cannot explicitly create a primary key index; use PRIMARY KEY constraint instead".to_string(),
                 ));
             }
+            IndexType::Hnsw => {
+                // HNSW only supports single-column vector indexes
+                if columns.len() != 1 {
+                    return Err(Error::internal(
+                        "HNSW index must be on a single vector column".to_string(),
+                    ));
+                }
+                if data_types[0] != DataType::Vector {
+                    return Err(Error::internal(format!(
+                        "HNSW index requires a VECTOR column, got {:?}",
+                        data_types[0]
+                    )));
+                }
+                // Get vector dimensions from schema column
+                let (_, col) = schema
+                    .find_column(columns[0])
+                    .ok_or(Error::ColumnNotFound(columns[0].to_string()))?;
+                let dims = col.vector_dimensions as usize;
+                if dims == 0 {
+                    return Err(Error::internal(
+                        "HNSW index requires a VECTOR column with specified dimensions".to_string(),
+                    ));
+                }
+                let default_m = crate::storage::index::default_m_for_dims(dims);
+                let mut hnsw = HnswIndex::new(
+                    name.to_string(),
+                    self.name().to_string(),
+                    column_names[0].clone(),
+                    column_ids[0],
+                    dims,
+                    default_m,
+                    crate::storage::index::default_ef_construction(default_m),
+                    crate::storage::index::default_ef_search(default_m),
+                    crate::storage::index::HnswDistanceMetric::L2,
+                );
+                hnsw.set_unique(is_unique);
+                Arc::new(hnsw)
+            }
         };
 
         // Populate the index with existing data using batch_slice for better performance
@@ -2770,6 +2903,101 @@ impl Table for MVCCTable {
         // Add to version store
         self.version_store.add_index(name.to_string(), index);
 
+        Ok(())
+    }
+
+    fn create_hnsw_index(
+        &self,
+        name: &str,
+        column: &str,
+        is_unique: bool,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        metric: crate::storage::index::HnswDistanceMetric,
+    ) -> Result<()> {
+        let schema = self.version_store.schema();
+        let (col_idx, col) = schema
+            .find_column(column)
+            .ok_or(Error::ColumnNotFound(column.to_string()))?;
+
+        if col.data_type != DataType::Vector {
+            return Err(Error::internal(format!(
+                "HNSW index requires a VECTOR column, got {:?}",
+                col.data_type
+            )));
+        }
+        let dims = col.vector_dimensions as usize;
+        if dims == 0 {
+            return Err(Error::internal(
+                "HNSW index requires a VECTOR column with specified dimensions".to_string(),
+            ));
+        }
+
+        // Check for duplicate
+        if self.version_store.index_exists(name) {
+            return Err(Error::IndexAlreadyExists(name.to_string()));
+        }
+        if let Some(existing_idx) = self.version_store.get_index_by_column(column) {
+            if existing_idx.index_type() == IndexType::PrimaryKey {
+                return Ok(());
+            }
+            return Err(Error::internal(format!(
+                "an index already exists on column '{}'",
+                column
+            )));
+        }
+
+        let mut hnsw = HnswIndex::new(
+            name.to_string(),
+            self.name().to_string(),
+            col.name.clone(),
+            col.id as i32,
+            dims,
+            m,
+            ef_construction,
+            ef_search,
+            metric,
+        );
+        hnsw.set_unique(is_unique);
+        let index: Arc<dyn Index> = Arc::new(hnsw);
+
+        // Populate with existing data
+        let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
+        for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
+            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                if !version.is_deleted() {
+                    let val = version
+                        .data
+                        .get(col_idx)
+                        .cloned()
+                        .unwrap_or(Value::Null(DataType::Null));
+                    entries.push((row_id, vec![val]));
+                }
+            }
+        }
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            for (row_id, version) in txn_versions.iter_local() {
+                if !version.is_deleted() && !self.version_store.quick_check_row_existence(row_id) {
+                    let val = version
+                        .data
+                        .get(col_idx)
+                        .cloned()
+                        .unwrap_or(Value::Null(DataType::Null));
+                    entries.push((row_id, vec![val]));
+                }
+            }
+        }
+        if !entries.is_empty() {
+            let entry_refs: Vec<(i64, &[Value])> = entries
+                .iter()
+                .map(|(row_id, values)| (*row_id, values.as_slice()))
+                .collect();
+            index.add_batch_slice(&entry_refs)?;
+        }
+
+        self.version_store.add_index(name.to_string(), index);
         Ok(())
     }
 
@@ -3904,7 +4132,7 @@ mod tests {
             .update(None, &mut |row| {
                 let mut new_row = row.clone();
                 let _ = new_row.set(1, Value::Integer(20));
-                (new_row, false)
+                Ok((new_row, true))
             })
             .unwrap();
 
