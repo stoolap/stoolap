@@ -151,7 +151,7 @@ div.highlight code {
   margin: 0;
 }
 
-.highlight, div.highlighter-rouge, pre.highlight {
+.highlight, pre.highlight {
   background-color: var(--syntax-bg);
   margin: 0;
   border-radius: 6px;
@@ -178,7 +178,7 @@ div.highlighter-rouge::before {
   border-radius: 0 5px 0 5px;
   background-color: var(--color-primary);
   color: white;
-  z-index: 1;
+  z-index: 3;
   opacity: 0.85;
 }
 
@@ -342,6 +342,7 @@ pre {
 .copy-button {
   position: absolute;
   top: 0;
+  right: 0;
   display: flex;
   align-items: center;
   justify-content: center;

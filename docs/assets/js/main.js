@@ -19,8 +19,8 @@
     initThemeToggle();
     initMobileMenu();
     initSidebarNav();
-    addCodeCopyButtons();
     addLanguageBadges();
+    addCodeCopyButtons();
     initSvgThemeSync();
     initCodeTabs();
     initHeroTerminal();
@@ -151,16 +151,22 @@
         });
       });
 
-      // Append to outer div.highlighter-rouge if it exists (for toolbar alignment with language badge)
+      // Append to outer div.highlighter-rouge if it exists
       var wrapper = block.closest('div.highlighter-rouge');
       if (wrapper) {
         wrapper.appendChild(btn);
-        // Position copy button to the left of the language badge
-        var badgeWidth = window.getComputedStyle(wrapper, '::before').width;
-        var w = parseFloat(badgeWidth) || 0;
-        btn.style.right = w + 'px';
+        // Offset copy button to the left of the language badge (::before pseudo-element)
+        var lang = wrapper.getAttribute('data-lang');
+        if (lang) {
+          // Measure badge width using a temporary span with matching styles
+          var probe = document.createElement('span');
+          probe.style.cssText = 'position:absolute;visibility:hidden;font-size:0.7em;font-weight:600;letter-spacing:0.03em;padding:0 0.6em;white-space:nowrap;';
+          probe.textContent = lang;
+          wrapper.appendChild(probe);
+          btn.style.right = probe.offsetWidth + 'px';
+          wrapper.removeChild(probe);
+        }
       } else {
-        btn.style.right = '0px';
         block.appendChild(btn);
       }
     });
@@ -191,11 +197,14 @@
     toc.className = 'table-of-contents';
     toc.setAttribute('aria-label', 'Table of Contents');
 
-    var title = document.createElement('h2');
-    title.textContent = 'On this page';
-    title.className = 'toc-title';
+    var toggle = document.createElement('button');
+    toggle.className = 'toc-toggle';
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.innerHTML = '<span class="toc-toggle-text">Table of Contents</span><svg class="toc-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
 
     var list = document.createElement('ul');
+    list.className = 'toc-list';
+    list.hidden = true;
 
     headings.forEach(function (h, i) {
       if (!h.id) h.id = 'heading-' + i;
@@ -204,11 +213,21 @@
       var a = document.createElement('a');
       a.href = '#' + h.id;
       a.textContent = h.textContent;
+      a.addEventListener('click', function () {
+        list.hidden = true;
+        toggle.setAttribute('aria-expanded', 'false');
+      });
       li.appendChild(a);
       list.appendChild(li);
     });
 
-    toc.appendChild(title);
+    toggle.addEventListener('click', function () {
+      var expanded = this.getAttribute('aria-expanded') === 'true';
+      this.setAttribute('aria-expanded', String(!expanded));
+      list.hidden = expanded;
+    });
+
+    toc.appendChild(toggle);
     toc.appendChild(list);
 
     var header = document.querySelector('.doc-header');
