@@ -712,6 +712,7 @@ impl Engine for TiKVEngine {
             _txn_id,
             Arc::new(parking_lot::Mutex::new(Some(tikv_txn))),
             self.runtime.handle().clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .with_engine(self);
         Ok(Box::new(table))

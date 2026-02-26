@@ -59,6 +59,10 @@ pub struct TiKVTransaction {
     created_tables: Vec<String>,
     /// Tables dropped during this transaction (for savepoint DDL rollback)
     dropped_tables: Vec<(String, Schema)>,
+    /// Whether any write operations have been performed
+    pub(crate) has_writes: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether isolation level was explicitly set by user
+    isolation_level_explicitly_set: bool,
 }
 
 // SAFETY: TiKVEngine is Send + Sync, and we only use the pointer for read access
@@ -83,6 +87,8 @@ impl TiKVTransaction {
             savepoints: FxHashMap::default(),
             created_tables: Vec::new(),
             dropped_tables: Vec::new(),
+            has_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            isolation_level_explicitly_set: false,
         }
     }
 
@@ -127,7 +133,9 @@ impl TiKVTransaction {
             self.id,
             Arc::new(parking_lot::Mutex::new(Some(fresh_txn))),
             self.runtime.clone(),
+            Arc::clone(&self.has_writes),
         )
+        .with_owns_txn(true)
         .with_engine(engine);
         Ok(Box::new(table))
     }
@@ -158,7 +166,13 @@ impl TiKVTransaction {
                     .map_err(from_tikv_error)?;
                 Ok(())
             })
-        })
+        })?;
+
+        // Track write for isolation level logic
+        self.has_writes
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        Ok(())
     }
 
     /// Persist an updated schema to TiKV and update both local and engine caches
@@ -172,6 +186,10 @@ impl TiKVTransaction {
                     .map_err(from_tikv_error)
             })
         })?;
+
+        // Track write for isolation level logic
+        self.has_writes
+            .store(true, std::sync::atomic::Ordering::Release);
 
         let schema_arc = CompactArc::new(schema.clone());
 
@@ -296,6 +314,7 @@ impl Transaction for TiKVTransaction {
 
     fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()> {
         self.isolation_level = level;
+        self.isolation_level_explicitly_set = true;
         Ok(())
     }
 
@@ -361,6 +380,10 @@ impl Transaction for TiKVTransaction {
         // Track for savepoint DDL rollback
         self.created_tables.push(table_name.clone());
 
+        // Track write for isolation level logic
+        self.has_writes
+            .store(true, std::sync::atomic::Ordering::Release);
+
         let table = TiKVTable::new(
             table_id,
             table_name,
@@ -368,6 +391,7 @@ impl Transaction for TiKVTransaction {
             self.id,
             Arc::clone(&self.txn),
             self.runtime.clone(),
+            Arc::clone(&self.has_writes),
         )
         .with_engine(self.engine());
         Ok(Box::new(table))
@@ -386,6 +410,15 @@ impl Transaction for TiKVTransaction {
     }
 
     fn get_table(&self, name: &str) -> Result<Box<dyn Table>> {
+        // Read Committed: use a fresh snapshot if no local changes have been made yet,
+        // and ONLY if the user explicitly requested this isolation level.
+        if self.isolation_level == IsolationLevel::ReadCommitted
+            && self.isolation_level_explicitly_set
+            && !self.has_writes.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return self.get_table_fresh_snapshot(name);
+        }
+
         let table_name = name.to_lowercase();
         let (table_id, schema) = self
             .schemas
@@ -399,6 +432,7 @@ impl Transaction for TiKVTransaction {
             self.id,
             Arc::clone(&self.txn),
             self.runtime.clone(),
+            Arc::clone(&self.has_writes),
         )
         .with_engine(self.engine());
         Ok(Box::new(table))
@@ -475,6 +509,10 @@ impl Transaction for TiKVTransaction {
         engine
             .schema_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+        // Track write for isolation level logic
+        self.has_writes
+            .store(true, std::sync::atomic::Ordering::Release);
 
         Ok(())
     }
@@ -598,6 +636,10 @@ impl Transaction for TiKVTransaction {
             .or_default()
             .insert(index_name.to_string(), meta);
 
+        // Track write for isolation level logic
+        self.has_writes
+            .store(true, std::sync::atomic::Ordering::Release);
+
         Ok(())
     }
 
@@ -640,6 +682,10 @@ impl Transaction for TiKVTransaction {
                 table_indexes.remove(index_name);
             }
         }
+
+        // Track write for isolation level logic
+        self.has_writes
+            .store(true, std::sync::atomic::Ordering::Release);
 
         Ok(())
     }

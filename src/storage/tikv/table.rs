@@ -50,6 +50,10 @@ pub struct TiKVTable {
     row_id_initialized: std::sync::atomic::AtomicBool,
     /// Optional engine reference for index lookups
     engine: Option<*const super::engine::TiKVEngine>,
+    /// Shared write tracking flag
+    pub(crate) has_writes: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this table handle owns the transaction (should rollback on drop)
+    pub(crate) owns_txn: bool,
 }
 
 // SAFETY: TiKVEngine is Send + Sync, and we only use the pointer for read access
@@ -64,6 +68,7 @@ impl TiKVTable {
         txn_id: i64,
         txn: Arc<Mutex<Option<tikv_client::Transaction>>>,
         runtime: tokio::runtime::Handle,
+        has_writes: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             table_id,
@@ -76,7 +81,15 @@ impl TiKVTable {
             row_id_batch_end: AtomicI64::new(0),
             row_id_initialized: std::sync::atomic::AtomicBool::new(false),
             engine: None,
+            has_writes,
+            owns_txn: false,
         }
+    }
+
+    /// Set whether this table handle owns the transaction
+    pub(crate) fn with_owns_txn(mut self, owns_txn: bool) -> Self {
+        self.owns_txn = owns_txn;
+        self
     }
 
     /// Set the engine reference for index lookups
@@ -420,6 +433,10 @@ impl Table for TiKVTable {
                 .block_on(async { txn.put(key, value).await.map_err(from_tikv_error) })
         })?;
 
+        // Track write for isolation level logic
+        self.has_writes
+            .store(true, std::sync::atomic::Ordering::Release);
+
         // Maintain indexes
         self.add_index_entries(row_id, &values)?;
 
@@ -463,6 +480,12 @@ impl Table for TiKVTable {
                 updated += 1;
             }
         }
+
+        if updated > 0 {
+            self.has_writes
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
         Ok(updated)
     }
 
@@ -499,6 +522,12 @@ impl Table for TiKVTable {
                 }
             }
         }
+
+        if updated > 0 {
+            self.has_writes
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
         Ok(updated)
     }
 
@@ -523,6 +552,12 @@ impl Table for TiKVTable {
             })?;
             deleted += 1;
         }
+
+        if deleted > 0 {
+            self.has_writes
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
         Ok(deleted)
     }
 
@@ -1145,5 +1180,15 @@ impl Table for TiKVTable {
         Err(Error::internal(
             "Temporal queries should be executed via transaction, not table directly",
         ))
+    }
+}
+
+impl Drop for TiKVTable {
+    fn drop(&mut self) {
+        if self.owns_txn {
+            if let Some(mut txn) = self.txn.lock().take() {
+                let _ = self.runtime.block_on(async { txn.rollback().await });
+            }
+        }
     }
 }

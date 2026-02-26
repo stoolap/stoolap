@@ -861,7 +861,15 @@ impl Database {
     /// tx.commit()?;
     /// ```
     pub fn begin(&self) -> Result<Transaction> {
-        self.begin_with_isolation(IsolationLevel::ReadCommitted)
+        let level = {
+            let executor = self
+                .inner
+                .executor
+                .lock()
+                .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+            executor.default_isolation_level()
+        };
+        self.begin_with_isolation(level)
     }
 
     /// Begin a new transaction with a specific isolation level
