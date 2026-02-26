@@ -814,4 +814,25 @@ impl Engine for TiKVEngine {
             count_result.unwrap_or(0)
         }))
     }
+
+    fn record_create_index(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _column_names: &[String],
+        _is_unique: bool,
+        _index_type: crate::core::IndexType,
+        _hnsw_m: Option<u16>,
+        _hnsw_ef_construction: Option<u16>,
+        _hnsw_ef_search: Option<u16>,
+        _hnsw_distance_metric: Option<u8>,
+    ) -> Result<()> {
+        // Handled by TiKVTable::create_index
+        Ok(())
+    }
+
+    fn record_drop_index(&self, _table_name: &str, _index_name: &str) -> Result<()> {
+        // Handled by TiKVTable::drop_index
+        Ok(())
+    }
 }

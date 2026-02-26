@@ -166,7 +166,7 @@ impl TiKVTable {
     }
 
     /// Batch size for paginated TiKV scans
-    const SCAN_BATCH_SIZE: u32 = 1000;
+    const SCAN_BATCH_SIZE: u32 = 20000;
 
     /// Scan all rows of this table from TiKV using paginated scan
     /// This fetches rows in batches to reduce peak memory of a single TiKV response
@@ -268,6 +268,19 @@ impl TiKVTable {
                 }
                 self.with_txn(|txn| {
                     self.runtime.block_on(async {
+                        // Check for existing entry
+                        if let Some(existing_row_id_bytes) =
+                            txn.get(key.clone()).await.map_err(from_tikv_error)?
+                        {
+                            let existing_row_id = encoding::decode_i64(&existing_row_id_bytes);
+                            if existing_row_id != row_id {
+                                return Err(Error::unique_constraint(
+                                    &meta.name,
+                                    meta.column_names.join(","),
+                                    format!("{:?}", index_values),
+                                ));
+                            }
+                        }
                         txn.put(key, encoding::encode_i64(row_id).to_vec())
                             .await
                             .map_err(from_tikv_error)
@@ -373,17 +386,30 @@ impl Table for TiKVTable {
     }
 
     fn insert(&mut self, row: Row) -> Result<Row> {
-        let row_id = self.allocate_row_id()?;
-
-        // Handle AUTO_INCREMENT: if PK integer column and value is NULL/0, use row_id
         let mut values = encoding::row_to_values(&row);
+        let mut row_id = 0i64;
+        let mut row_id_set = false;
+
+        // Handle AUTO_INCREMENT and manual PK: if PK integer column, use its value as row_id
         if let Some(pk_col_idx) = self.schema.pk_column_index() {
             if pk_col_idx < values.len() {
-                let needs_auto = matches!(&values[pk_col_idx], Value::Null(_) | Value::Integer(0));
-                if needs_auto {
-                    values[pk_col_idx] = Value::Integer(row_id);
+                match &values[pk_col_idx] {
+                    Value::Integer(i) if *i != 0 => {
+                        row_id = *i;
+                        row_id_set = true;
+                    }
+                    Value::Null(_) | Value::Integer(0) => {
+                        row_id = self.allocate_row_id()?;
+                        values[pk_col_idx] = Value::Integer(row_id);
+                        row_id_set = true;
+                    }
+                    _ => {}
                 }
             }
+        }
+
+        if !row_id_set {
+            row_id = self.allocate_row_id()?;
         }
 
         let key = encoding::make_data_key(self.table_id, row_id);
@@ -626,7 +652,7 @@ impl Table for TiKVTable {
     ) -> Result<RowVec> {
         let prefix = encoding::make_data_prefix(self.table_id);
         let end = encoding::prefix_end_key(&prefix);
-        let mut result = RowVec::with_capacity(limit);
+        let mut result = RowVec::with_capacity(limit.min(1000));
         let mut skipped = 0;
         let mut start_key = prefix;
 
@@ -687,14 +713,164 @@ impl Table for TiKVTable {
         false // TiKV handles change tracking internally
     }
 
-    fn create_index(&self, _name: &str, _columns: &[&str], _is_unique: bool) -> Result<()> {
-        // Index creation is handled at transaction level via create_table_index
+    fn create_index(&self, name: &str, columns: &[&str], is_unique: bool) -> Result<()> {
+        self.create_index_with_type(name, columns, is_unique, None)
+    }
+
+    fn drop_index(&self, name: &str) -> Result<()> {
+        let engine = self
+            .engine()
+            .ok_or_else(|| Error::internal("Engine not set"))?;
+        let table_name_lower = self.name.to_lowercase();
+
+        // Get index metadata
+        let meta = {
+            let indexes = engine.indexes.read();
+            indexes
+                .get(&table_name_lower)
+                .and_then(|t| t.get(name))
+                .cloned()
+        };
+
+        if let Some(meta) = meta {
+            // Delete all index entries
+            let prefix = encoding::make_index_prefix(meta.table_id, meta.index_id);
+            let end = encoding::prefix_end_key(&prefix);
+
+            self.with_txn(|txn| {
+                let keys = self.runtime.block_on(async {
+                    txn.scan_keys(prefix..end, u32::MAX)
+                        .await
+                        .map_err(from_tikv_error)
+                })?;
+                for key in keys {
+                    self.runtime
+                        .block_on(async { txn.delete(key).await.map_err(from_tikv_error) })?;
+                }
+                // Delete metadata key
+                let meta_key = encoding::make_index_meta_key(&table_name_lower, name);
+                self.runtime
+                    .block_on(async { txn.delete(meta_key).await.map_err(from_tikv_error) })
+            })?;
+
+            // Remove from engine cache
+            if let Some(table_indexes) = engine.indexes.write().get_mut(&table_name_lower) {
+                table_indexes.remove(name);
+            }
+        }
+
         Ok(())
     }
 
-    fn drop_index(&self, _name: &str) -> Result<()> {
-        // Index deletion is handled at transaction level via drop_table_index
-        Ok(())
+    fn create_index_with_type(
+        &self,
+        name: &str,
+        columns: &[&str],
+        is_unique: bool,
+        _index_type: Option<crate::core::IndexType>,
+    ) -> Result<()> {
+        let engine = self
+            .engine()
+            .ok_or_else(|| Error::internal("Engine not set"))?;
+
+        let cols_vec: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
+
+        // 1. Allocate index ID
+        let index_id = engine
+            .next_index_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // 2. Build metadata
+        let mut col_ids = Vec::new();
+        let mut dts = Vec::new();
+        for col_name in &cols_vec {
+            let (idx, col) = self
+                .schema
+                .find_column(col_name)
+                .ok_or_else(|| Error::ColumnNotFound(col_name.clone()))?;
+            col_ids.push(idx as i32);
+            dts.push(col.data_type);
+        }
+
+        let meta = super::index::IndexMetadata {
+            name: name.to_string(),
+            table_name: self.name.clone(),
+            table_id: self.table_id,
+            index_id,
+            column_names: cols_vec,
+            column_ids: col_ids,
+            data_types: dts,
+            is_unique,
+        };
+
+        // 3. Persist metadata to TiKV
+        let meta_key = encoding::make_index_meta_key(&self.name, name);
+        let meta_bytes = meta.to_bytes()?;
+
+        self.with_txn(|txn| {
+            self.runtime
+                .block_on(async { txn.put(meta_key, meta_bytes).await.map_err(from_tikv_error) })
+        })?;
+
+        // 4. Update engine cache
+        engine
+            .indexes
+            .write()
+            .entry(self.name.clone())
+            .or_default()
+            .insert(name.to_string(), meta.clone());
+
+        // 5. Build index entries from existing data
+        let prefix = encoding::make_data_prefix(self.table_id);
+        let end = encoding::prefix_end_key(&prefix);
+        let col_indices: Vec<usize> = meta.column_ids.iter().map(|id| *id as usize).collect();
+
+        self.with_txn(|txn| {
+            let pairs = self.runtime.block_on(async {
+                txn.scan(prefix..end, u32::MAX)
+                    .await
+                    .map_err(from_tikv_error)
+            })?;
+
+            for pair in pairs {
+                let key: Vec<u8> = pair.0.into();
+                let row_id = encoding::extract_row_id_from_data_key(&key);
+                let row_values = encoding::deserialize_row(&pair.1)?;
+
+                let index_values: Vec<Value> = col_indices
+                    .iter()
+                    .map(|&idx| {
+                        if idx < row_values.len() {
+                            row_values[idx].clone()
+                        } else {
+                            Value::Null(DataType::Text)
+                        }
+                    })
+                    .collect();
+
+                if is_unique {
+                    let idx_key = {
+                        let mut k = encoding::make_index_prefix(self.table_id, index_id);
+                        for v in &index_values {
+                            k.extend_from_slice(&encoding::encode_value(v));
+                        }
+                        k
+                    };
+                    self.runtime.block_on(async {
+                        txn.put(idx_key, encoding::encode_i64(row_id).to_vec())
+                            .await
+                            .map_err(from_tikv_error)
+                    })?;
+                } else {
+                    let idx_key =
+                        encoding::make_index_key(self.table_id, index_id, &index_values, row_id);
+                    self.runtime.block_on(async {
+                        txn.put(idx_key, vec![]).await.map_err(from_tikv_error)
+                    })?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn create_btree_index(
@@ -786,7 +962,7 @@ impl Table for TiKVTable {
                 });
 
                 if let Ok(kv_pairs) = pairs_result {
-                    let mut result = RowVec::with_capacity(limit);
+                    let mut result = RowVec::with_capacity(limit.min(1000));
                     for (i, (key, value)) in kv_pairs.into_iter().enumerate() {
                         if i < offset {
                             continue;
@@ -813,7 +989,7 @@ impl Table for TiKVTable {
         let batch_size = (limit + offset) * 2 + 100;
         let ordered_row_ids = index.get_row_ids_ordered(ascending, batch_size, 0)?;
 
-        let mut result = RowVec::with_capacity(limit);
+        let mut result = RowVec::with_capacity(limit.min(1000));
         let mut skipped = 0;
 
         for row_id in ordered_row_ids {
@@ -897,7 +1073,7 @@ impl Table for TiKVTable {
         };
 
         let kv_pairs = pairs_result.ok()?;
-        let mut result = RowVec::with_capacity(limit);
+        let mut result = RowVec::with_capacity(limit.min(1000));
 
         for (key, value) in kv_pairs {
             let row_id = encoding::extract_row_id_from_data_key(&key);

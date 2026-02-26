@@ -846,8 +846,8 @@ fn test_tikv_create_index() {
         .query_one("SELECT COUNT(*) FROM tikv_idx_t WHERE age > 27", ())
         .unwrap();
     assert_eq!(
-        count_final, 2,
-        "2 people are older than 27 now (Alice=30, Charlie=35)"
+        count_final, 3,
+        "3 people are older than 27 now (Alice=30, Charlie=35, Diana=28)"
     );
 
     cleanup(&db, &["tikv_idx_t"]);

@@ -2428,8 +2428,44 @@ impl Parser {
     fn parse_set_statement(&mut self) -> Option<SetStatement> {
         let token = self.cur_token.clone();
 
+        // Handle SET TRANSACTION ISOLATION LEVEL ...
+        if token.literal.to_uppercase() == "SET" && self.peek_token_is_keyword("TRANSACTION") {
+            self.next_token(); // Consume SET, cur is now TRANSACTION
+            if self.peek_token_is_keyword("ISOLATION") {
+                self.next_token(); // Consume TRANSACTION, cur is now ISOLATION
+                if self.expect_keyword("LEVEL") {
+                    // Consume LEVEL, cur is now the first word of isolation level
+                    self.next_token();
+                    let mut level = self.cur_token.literal.to_string();
+                    if (level.to_uppercase() == "READ" || level.to_uppercase() == "REPEATABLE")
+                        && (self.peek_token_is_keyword("COMMITTED")
+                            || self.peek_token_is_keyword("READ")
+                            || self.peek_token_is_keyword("SNAPSHOT"))
+                    {
+                        self.next_token();
+                        level.push(' ');
+                        level.push_str(&self.cur_token.literal);
+                    }
+
+                    // Move to next token after level
+                    self.next_token();
+
+                    // Return a special SetStatement where name is "TRANSACTION_ISOLATION"
+                    return Some(SetStatement {
+                        token,
+                        name: Identifier::new(self.cur_token.clone(), "TRANSACTION_ISOLATION"),
+                        value: Expression::StringLiteral(StringLiteral {
+                            token: self.cur_token.clone(),
+                            value: level.into(),
+                            type_hint: None,
+                        }),
+                    });
+                }
+            }
+        }
+
         self.next_token();
-        if !self.cur_token_is(TokenType::Identifier) {
+        if !self.cur_token_is(TokenType::Identifier) && !self.cur_token_is(TokenType::Keyword) {
             self.add_error(format!(
                 "expected variable name at {}",
                 self.cur_token.position
