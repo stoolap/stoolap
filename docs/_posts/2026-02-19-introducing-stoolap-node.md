@@ -3,6 +3,7 @@ layout: post
 title: "Introducing @stoolap/node: A Native Node.js Driver That's Surprisingly Fast"
 author: Semih Alev
 date: 2026-02-19
+category: drivers
 ---
 
 I've been working on Stoolap for a while now, an embedded SQL database written in pure Rust. It started as a Go project, grew into something much bigger, and recently hit a point where I thought: okay, this thing is fast, but how do people actually *use* it outside of Rust?

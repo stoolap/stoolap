@@ -4,28 +4,47 @@ title: Blog - Stoolap
 ---
 
 <section class="blog-header">
+  <div class="blog-header-bg"></div>
+  <div class="blog-header-grid" aria-hidden="true"></div>
   <div class="container">
-    <p class="blog-badge">Engineering Blog</p>
-    <h1>Stoolap Blog</h1>
+    <h1>Stoolap <span class="blog-accent">Blog</span></h1>
     <p class="lead">Updates, technical insights, and database engineering stories</p>
   </div>
 </section>
 
 <section class="blog-list">
   <div class="container">
-    <div class="blog-posts">
+    <nav class="blog-filters" aria-label="Filter posts by category">
+      <button class="blog-filter-btn active" data-category="all">All</button>
+      <button class="blog-filter-btn" data-category="releases">Releases</button>
+      <button class="blog-filter-btn" data-category="engineering">Engineering</button>
+      <button class="blog-filter-btn" data-category="drivers">Drivers</button>
+      <button class="blog-filter-btn" data-category="benchmarks">Benchmarks</button>
+      <button class="blog-filter-btn" data-category="tutorials">Tutorials</button>
+    </nav>
+
+    <div class="blog-posts" id="blogPosts">
       {% assign posts = site.posts | sort: 'date' | reverse %}
       {% if posts.size > 0 %}
         {% for post in posts %}
-        <article class="blog-post-card">
-          <time class="post-date" datetime="{{ post.date | date_to_xmlschema }}">{{ post.date | date: "%B %d, %Y" }}</time>
-          <h2 class="post-title">
-            <a href="{{ post.url | relative_url }}">{{ post.title }}</a>
-          </h2>
-          <p class="post-excerpt">{{ post.excerpt | strip_html | truncate: 200 }}</p>
-          <div class="post-meta">
-            <span class="post-author">By {{ post.author }}</span>
-            <a href="{{ post.url | relative_url }}" class="read-more">Read more →</a>
+        {% assign words = post.content | number_of_words %}
+        {% assign read_time = words | divided_by: 250 %}
+        {% if read_time < 1 %}{% assign read_time = 1 %}{% endif %}
+        <article class="blog-post-card" data-category="{{ post.category | default: 'engineering' }}">
+          <div class="post-card-body">
+            <div class="post-card-meta">
+              <span class="post-category-badge post-category-{{ post.category | default: 'engineering' }}">{{ post.category | default: 'engineering' }}</span>
+              <time class="post-date" datetime="{{ post.date | date_to_xmlschema }}">{{ post.date | date: "%B %d, %Y" }}</time>
+              <span class="post-read-time">{{ read_time }} min read</span>
+            </div>
+            <h2 class="post-title">
+              <a href="{{ post.url | relative_url }}">{{ post.title }}</a>
+            </h2>
+            <p class="post-excerpt">{{ post.excerpt | strip_html | truncate: 200 }}</p>
+            <div class="post-footer">
+              <span class="post-author">// {{ post.author }}</span>
+              <a href="{{ post.url | relative_url }}" class="read-more">read_more() &rarr;</a>
+            </div>
           </div>
         </article>
         {% endfor %}
@@ -35,5 +54,79 @@ title: Blog - Stoolap
         </div>
       {% endif %}
     </div>
+
+    <nav class="blog-pagination" id="blogPagination" aria-label="Blog pagination"></nav>
   </div>
 </section>
+
+<script>
+(function () {
+  var PER_PAGE = 6;
+  var currentPage = 1;
+  var currentCategory = 'all';
+
+  var buttons = document.querySelectorAll('.blog-filter-btn');
+  var allCards = Array.prototype.slice.call(document.querySelectorAll('.blog-post-card'));
+  var pagination = document.getElementById('blogPagination');
+
+  function getVisible() {
+    return allCards.filter(function (c) {
+      return currentCategory === 'all' || c.getAttribute('data-category') === currentCategory;
+    });
+  }
+
+  function render() {
+    var visible = getVisible();
+    var totalPages = Math.ceil(visible.length / PER_PAGE) || 1;
+    if (currentPage > totalPages) currentPage = totalPages;
+
+    var start = (currentPage - 1) * PER_PAGE;
+    var end = start + PER_PAGE;
+
+    allCards.forEach(function (c) { c.style.display = 'none'; });
+    visible.forEach(function (c, i) {
+      c.style.display = (i >= start && i < end) ? '' : 'none';
+    });
+
+    // Pagination buttons
+    if (totalPages <= 1) {
+      pagination.innerHTML = '';
+      return;
+    }
+
+    var html = '<button class="blog-page-btn" data-page="prev">&laquo;</button>';
+    for (var p = 1; p <= totalPages; p++) {
+      html += '<button class="blog-page-btn' + (p === currentPage ? ' active' : '') + '" data-page="' + p + '">' + p + '</button>';
+    }
+    html += '<button class="blog-page-btn" data-page="next">&raquo;</button>';
+    pagination.innerHTML = html;
+
+    pagination.querySelector('[data-page="prev"]').disabled = currentPage === 1;
+    pagination.querySelector('[data-page="next"]').disabled = currentPage === totalPages;
+  }
+
+  buttons.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      buttons.forEach(function (b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      currentCategory = btn.getAttribute('data-category');
+      currentPage = 1;
+      render();
+    });
+  });
+
+  pagination.addEventListener('click', function (e) {
+    var btn = e.target.closest('.blog-page-btn');
+    if (!btn || btn.disabled) return;
+    var page = btn.getAttribute('data-page');
+    if (page === 'prev') currentPage--;
+    else if (page === 'next') currentPage++;
+    else currentPage = parseInt(page, 10);
+    render();
+    document.querySelector('.blog-filters').scrollIntoView({ behavior: 'smooth' });
+  });
+
+  render();
+})();
+
+</script>
