@@ -185,9 +185,10 @@ LIMIT 10;
 | Property | Value |
 |----------|-------|
 | Model | [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) |
-| Architecture | BERT (6 layers, 6 attention heads) |
+| Architecture | BERT (6 layers, 12 attention heads) |
 | Output dimensions | 384 |
-| Parameters | 22 million |
+| Parameters | 22.7 million |
+| Training data | 1.17 billion sentence pairs |
 | Size on disk | ~90 MB |
 | Inference | Pure Rust (candle framework) |
 | Pooling | Mean pooling with attention mask |
