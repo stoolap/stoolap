@@ -1,6 +1,6 @@
 [package]
 name = "stoolap"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 authors = ["Stoolap Contributors"]
 description = "High-performance embedded SQL database with MVCC, time-travel queries, and full ACID compliance"

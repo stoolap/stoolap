@@ -1,4 +1,4 @@
-# Stoolap v0.3.2 Benchmark Results
+# Stoolap v0.3.3 Benchmark Results
 
 Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using identical workloads.
 
@@ -271,4 +271,4 @@ cargo build --release --example benchmark --example benchmark_sqlite --example b
 
 ---
 
-*Benchmarks performed on Apple Silicon, in-memory mode, best of 10 runs. Results are point-in-time for v0.3.2; re-run on your hardware and workload for current numbers.*
+*Benchmarks performed on Apple Silicon, in-memory mode, best of 10 runs. Results are point-in-time for v0.3.3; re-run on your hardware and workload for current numbers.*

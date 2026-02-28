@@ -107,7 +107,7 @@ db.execute_batch(`
 Returns the Stoolap version string.
 
 ```javascript
-console.log(db.version()); // "0.3.2-f426423"
+console.log(db.version()); // "0.3.3"
 ```
 
 #### `free()`

@@ -111,7 +111,7 @@ Lower m values (4, 8) give the fastest queries with lower recall. The sweet spot
 | OS | Darwin 25.1.0 arm64 |
 | CPU | Apple M4 (single core, `RAYON_NUM_THREADS=1`) |
 | RAM | 16 GiB |
-| Engine | stoolap v0.3.2 |
+| Engine | stoolap v0.3.3 |
 | Rust | rustc 1.92.0 |
 | Sweep m | 4, 8, 12, 16, 24, 36, 48, 64, 96 |
 | Sweep ef_search | 10, 20, 40, 80, 120, 200, 400, 600, 800 |
