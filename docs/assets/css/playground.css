@@ -319,17 +319,9 @@ pre.pg-table-pre {
   gap: 0.5rem;
 }
 
-[data-theme="light"] .pg-input-area:focus-within {
-  box-shadow: inset 0 0 0 2px rgba(var(--color-primary-rgb), 0.35);
-}
-
 [data-theme="dark"] .pg-input-area {
   background: #0d1320;
   border-top-color: rgba(255,255,255,0.04);
-}
-
-[data-theme="dark"] .pg-input-area:focus-within {
-  box-shadow: inset 0 0 0 2px rgba(126,231,135,0.35);
 }
 
 .pg-prompt {
@@ -356,8 +348,10 @@ pre.pg-table-pre {
   border: none;
   outline: none;
   resize: none;
-  overflow: hidden;
+  overflow-y: hidden;
+  overflow-x: auto;
   padding: 0;
+  max-height: 8lh;
   caret-color: var(--color-primary);
 }
 

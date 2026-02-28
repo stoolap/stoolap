@@ -45,7 +45,12 @@ description: Interactive SQL playground running Stoolap entirely in your browser
           <button class="hint-chip" data-sql="SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name ORDER BY total DESC;">JOINs + Aggregation</button>
           <button class="hint-chip" data-sql="SELECT category, ROUND(AVG(price), 2) AS avg_price, COUNT(*) AS count FROM products GROUP BY category HAVING COUNT(*) > 2 ORDER BY avg_price DESC;">GROUP BY + HAVING</button>
           <button class="hint-chip" data-sql="WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 10) SELECT n, n*n AS square FROM seq;">Recursive CTE</button>
-          <button class="hint-chip" data-sql="EXPLAIN SELECT u.name, SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 50 GROUP BY u.name;">EXPLAIN</button>
+          <button class="hint-chip" data-sql="SELECT title, category, ROUND(VEC_DISTANCE_COSINE(embedding, '[0.90, 0.15, 0.10, 0.10]'), 4) AS distance FROM documents ORDER BY distance LIMIT 5;">Vector k-NN Search</button>
+          <button class="hint-chip" data-sql="SELECT title, category, ROUND(VEC_DISTANCE_L2(embedding, (SELECT embedding FROM documents WHERE id = 1)), 4) AS distance FROM documents WHERE id != 1 ORDER BY distance LIMIT 3;">Find Similar Docs</button>
+          <button class="hint-chip" data-sql="SELECT title, category, ROUND(VEC_DISTANCE_COSINE(embedding, '[0.50, 0.50, 0.10, 0.10]'), 4) AS distance FROM documents WHERE category = 'Science' ORDER BY distance;">Hybrid Filter + Vector</button>
+          <button class="hint-chip" data-sql="SELECT title, category, VEC_DIMS(embedding) AS dims, ROUND(VEC_NORM(embedding), 4) AS norm, VEC_TO_TEXT(embedding) AS vector FROM documents;">Vector Info</button>
+          <button class="hint-chip" data-sql="SELECT title, ROUND(embedding <=> '[0.90, 0.15, 0.10, 0.10]', 4) AS l2_distance FROM documents ORDER BY l2_distance LIMIT 5;">Distance Operator <=></button>
+          <button class="hint-chip" data-sql="EXPLAIN SELECT title, VEC_DISTANCE_COSINE(embedding, '[0.90, 0.15, 0.10, 0.10]') AS distance FROM documents ORDER BY distance LIMIT 5;">EXPLAIN Vector</button>
         </div>
       </div>
     </div>

@@ -81,6 +81,10 @@ lru = "0.16"  # O(1) LRU cache for compiled expression programs
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 duckdb = { version = "1.4.3", features = ["bundled"], optional = true }
 
+# Optional ANN benchmark dependencies (download + decompress datasets)
+ureq = { version = "2", optional = true }
+flate2 = { version = "1", optional = true }
+
 # Optional allocators
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
@@ -123,6 +127,7 @@ sqlite = ["dep:rusqlite"]
 duckdb = ["dep:duckdb"]
 mimalloc = ["dep:mimalloc"]
 semantic = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
+ann-benchmark = ["dep:ureq", "dep:flate2"]
 
 [[example]]
 name = "benchmark_sqlite"
@@ -135,6 +140,10 @@ required-features = ["duckdb"]
 [[example]]
 name = "semantic_search"
 required-features = ["semantic"]
+
+[[example]]
+name = "ann_benchmark"
+required-features = ["ann-benchmark"]
 
 [profile.release]
 lto = true

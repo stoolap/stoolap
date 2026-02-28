@@ -64,6 +64,27 @@ INSERT INTO products VALUES
 
 CREATE INDEX idx_orders_user ON orders(user_id);
 CREATE INDEX idx_products_category ON products(category);
+
+CREATE TABLE documents (
+  id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  category TEXT,
+  embedding VECTOR(4)
+);
+
+INSERT INTO documents VALUES
+  (1, 'Introduction to Machine Learning', 'Technology', '[0.92, 0.12, 0.15, 0.08]'),
+  (2, 'Deep Learning with Neural Networks', 'Technology', '[0.89, 0.18, 0.10, 0.12]'),
+  (3, 'Building REST APIs', 'Technology', '[0.85, 0.08, 0.22, 0.05]'),
+  (4, 'Quantum Physics Explained', 'Science', '[0.22, 0.91, 0.13, 0.15]'),
+  (5, 'The Human Genome Project', 'Science', '[0.18, 0.87, 0.08, 0.25]'),
+  (6, 'Climate Change Research', 'Science', '[0.25, 0.82, 0.20, 0.10]'),
+  (7, 'World Cup 2024 Highlights', 'Sports', '[0.10, 0.15, 0.93, 0.08]'),
+  (8, 'Marathon Training Guide', 'Sports', '[0.12, 0.20, 0.88, 0.14]'),
+  (9, 'History of Jazz Music', 'Music', '[0.08, 0.14, 0.10, 0.94]'),
+  (10, 'Classical Piano Techniques', 'Music', '[0.11, 0.10, 0.15, 0.90]');
+
+CREATE INDEX idx_doc_embedding ON documents(embedding) USING HNSW;
 `;
 
 const MAX_HISTORY = 200;
@@ -91,6 +112,7 @@ class Playground {
 
   bindEvents() {
     this.input.addEventListener('keydown', (e) => this.handleKeydown(e));
+    this.input.addEventListener('input', () => this.autoResize());
     if (this.btnClear) this.btnClear.addEventListener('click', () => this.clearOutput());
     if (this.btnReset) this.btnReset.addEventListener('click', () => this.resetDatabase());
 
@@ -99,12 +121,18 @@ class Playground {
       chip.addEventListener('click', () => {
         const sql = chip.dataset.sql;
         this.input.value = sql;
+        this.autoResize();
         this.input.focus();
       });
     });
 
     // Click on terminal body focuses input
     this.output.addEventListener('click', () => this.input.focus());
+  }
+
+  autoResize() {
+    this.input.style.height = 'auto';
+    this.input.style.height = this.input.scrollHeight + 'px';
   }
 
   async init() {
@@ -124,7 +152,7 @@ class Playground {
         'Type SQL commands or click a query chip below.',
         'Use Up/Down arrows for history, Ctrl+L to clear.',
         '',
-        'Sample tables loaded: users, orders, products',
+        'Sample tables loaded: users, orders, products, documents',
         'Type SHOW TABLES; to see all tables.',
         ''
       ].join('\n'));
@@ -177,6 +205,7 @@ class Playground {
           this.historyIndex--;
         }
         this.input.value = this.history[this.historyIndex];
+        this.autoResize();
       }
       return;
     }
@@ -192,6 +221,7 @@ class Playground {
         } else {
           this.input.value = this.history[this.historyIndex];
         }
+        this.autoResize();
       }
       return;
     }
@@ -216,6 +246,7 @@ class Playground {
 
       if (full.endsWith(';') || isTxnCmd || full === '') {
         this.input.value = '';
+        this.input.style.height = 'auto';
         this.multiLineBuffer = '';
         this.prompt.textContent = 'stoolap>';
 
@@ -225,6 +256,7 @@ class Playground {
       } else {
         // Multi-line continuation
         this.input.value = '';
+        this.input.style.height = 'auto';
         this.prompt.textContent = '     ->';
       }
       return;

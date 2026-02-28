@@ -1292,6 +1292,8 @@ img {
   background: var(--color-bg);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
   transition: transform 0.2s, box-shadow 0.2s;
+  display: flex;
+  flex-direction: column;
 }
 
 [data-theme="dark"] .blog-post-card {
@@ -1315,6 +1317,9 @@ img {
   font-size: 0.82rem;
   line-height: 1.65;
   color: var(--color-text);
+  flex: 1;
+  display: flex;
+  flex-direction: column;
 }
 
 [data-theme="dark"] .blog-post-card .post-card-body {
@@ -1393,13 +1398,16 @@ img {
 }
 
 /* Footer as comment */
-.post-footer {
+.blog-post-card .post-footer {
   display: flex;
   justify-content: space-between;
   align-items: center;
   font-size: 0.82rem;
   color: #6a737d;
   font-family: var(--font-mono);
+  margin-top: auto;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--color-border);
 }
 
 [data-theme="dark"] .post-footer {
