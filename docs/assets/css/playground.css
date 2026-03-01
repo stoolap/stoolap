@@ -13,7 +13,7 @@
 .playground-hero {
   position: relative;
   margin-top: calc(-1 * var(--header-height));
-  padding: calc(var(--header-height) + 1.5rem) 0 1rem;
+  padding: calc(var(--header-height) + 1rem) 0 1.5rem;
   text-align: center;
   color: var(--color-text);
   overflow: hidden;
@@ -34,18 +34,50 @@
   background: linear-gradient(180deg, #0a1a28 0%, #0f2535 35%, #163348 65%, #1a3b50 100%);
 }
 
+.playground-hero-grid {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(0deg,   rgba(30,41,59,0.12) 1px, transparent 1px),
+    linear-gradient(90deg,  rgba(30,41,59,0.12) 1px, transparent 1px),
+    linear-gradient(0deg,   rgba(30,41,59,0.06) 1px, transparent 1px),
+    linear-gradient(90deg,  rgba(30,41,59,0.06) 1px, transparent 1px);
+  background-size:
+    120px 120px,
+    120px 120px,
+    24px 24px,
+    24px 24px;
+  -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 50%, black 5%, transparent 60%);
+  mask-image: radial-gradient(ellipse 70% 60% at 50% 50%, black 5%, transparent 60%);
+}
+
+[data-theme="dark"] .playground-hero-grid {
+  background-image:
+    linear-gradient(0deg,   rgba(203,213,225,0.1) 1px, transparent 1px),
+    linear-gradient(90deg,  rgba(203,213,225,0.1) 1px, transparent 1px),
+    linear-gradient(0deg,   rgba(203,213,225,0.04) 1px, transparent 1px),
+    linear-gradient(90deg,  rgba(203,213,225,0.04) 1px, transparent 1px);
+  background-size:
+    120px 120px,
+    120px 120px,
+    24px 24px,
+    24px 24px;
+}
+
 .playground-hero-inner {
   position: relative;
   z-index: 2;
 }
 
 .playground-title {
-  font-size: 1.6rem;
+  font-size: 2rem;
   font-weight: 700;
-  letter-spacing: -0.03em;
-  margin: 0 0 0.4rem;
+  letter-spacing: -0.02em;
+  margin: 0 0 0.75rem;
   color: var(--color-text);
-  line-height: 1.1;
+  text-align: center;
   animation: fadeUp 0.7s ease both;
 }
 
@@ -54,16 +86,17 @@
 }
 
 .playground-desc {
-  font-size: 0.92rem;
+  font-size: 1.1rem;
   color: var(--color-text-muted);
+  text-align: center;
   max-width: 600px;
   margin: 0 auto;
-  line-height: 1.5;
+  line-height: 1.6;
   animation: fadeUp 0.7s ease 0.1s both;
 }
 
 [data-theme="dark"] .playground-desc {
-  color: rgba(255,255,255,0.55);
+  color: rgba(255,255,255,0.6);
 }
 
 /* ============================================
@@ -71,12 +104,12 @@
    ============================================ */
 .playground-section {
   padding: 0 0 4rem;
-  background: linear-gradient(180deg, #edf0f4 0%, #edf0f4 2%, var(--color-bg) 12%);
+  background: linear-gradient(180deg, #edf0f4 0px, #edf0f4 16px, var(--color-bg) 480px);
   margin-top: -1px;
 }
 
 [data-theme="dark"] .playground-section {
-  background: linear-gradient(180deg, #1a3b50 0%, #1a3b50 3%, var(--color-bg) 40%);
+  background: linear-gradient(180deg, #1a3b50 0px, #1a3b50 16px, var(--color-bg) 480px);
 }
 
 /* ============================================
@@ -436,7 +469,7 @@ pre.pg-table-pre {
   .playground-hero {
     padding: calc(var(--header-height) + 1.5rem) 0 1.5rem;
   }
-  .playground-title { font-size: 1.8rem; }
+  .playground-title { font-size: 2.2rem; }
   .playground-desc { font-size: 0.92rem; }
   .playground-terminal { border-radius: 8px; }
   .pg-body {

@@ -1,0 +1,153 @@
+---
+layout: default
+title: Changelog - Stoolap
+description: Release history and version notes for Stoolap
+---
+
+<section class="blog-header">
+  <div class="blog-header-bg"></div>
+  <div class="blog-header-grid" aria-hidden="true"></div>
+  <div class="container">
+    <h1>Stoolap <span class="blog-accent">Changelog</span></h1>
+    <p class="lead">Release history pulled from GitHub Releases</p>
+  </div>
+</section>
+
+<section class="changelog-list">
+  <div class="container">
+    <div id="changelogContent">
+      <div class="changelog-loading" id="changelogLoading">
+        <div class="changelog-spinner"></div>
+        <p>Loading releases...</p>
+      </div>
+    </div>
+    <div class="changelog-load-more" id="changelogLoadMore" style="display:none">
+      <button class="changelog-more-btn" id="loadMoreBtn">Load older releases</button>
+    </div>
+    <div class="changelog-error" id="changelogError" style="display:none">
+      <p>Could not load releases.</p>
+      <a href="https://github.com/stoolap/stoolap/releases" target="_blank" rel="noopener">View on GitHub &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<script>
+(function () {
+  var CACHE_KEY = 'stoolap_releases';
+  var CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+  var PER_PAGE = 10;
+  var page = 1;
+  var allDone = false;
+
+  var content = document.getElementById('changelogContent');
+  var loading = document.getElementById('changelogLoading');
+  var errorEl = document.getElementById('changelogError');
+  var loadMoreWrap = document.getElementById('changelogLoadMore');
+  var loadMoreBtn = document.getElementById('loadMoreBtn');
+
+  function formatDate(dateStr) {
+    var d = new Date(dateStr);
+    return d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  }
+
+  function renderRelease(r) {
+    var article = document.createElement('article');
+    article.className = 'changelog-release';
+
+    var header = document.createElement('header');
+    header.className = 'changelog-release-header';
+
+    var tag = document.createElement('a');
+    tag.href = r.html_url;
+    tag.target = '_blank';
+    tag.rel = 'noopener';
+    tag.className = 'changelog-tag';
+    tag.textContent = r.tag_name;
+
+    var date = document.createElement('time');
+    date.className = 'changelog-date';
+    date.dateTime = r.published_at;
+    date.textContent = formatDate(r.published_at);
+
+    header.appendChild(tag);
+    header.appendChild(date);
+
+    var body = document.createElement('div');
+    body.className = 'changelog-body';
+    body.innerHTML = r.body_html || '<p>No release notes.</p>';
+
+    article.appendChild(header);
+    article.appendChild(body);
+    return article;
+  }
+
+  function fetchReleases(pageNum) {
+    loading.style.display = '';
+    loadMoreWrap.style.display = 'none';
+
+    var url = 'https://api.github.com/repos/stoolap/stoolap/releases?per_page=' + PER_PAGE + '&page=' + pageNum;
+
+    fetch(url, {
+      headers: { 'Accept': 'application/vnd.github.html+json' }
+    })
+    .then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    })
+    .then(function (releases) {
+      loading.style.display = 'none';
+
+      if (!releases.length) {
+        allDone = true;
+        return;
+      }
+
+      if (releases.length < PER_PAGE) allDone = true;
+
+      releases.forEach(function (r) {
+        content.appendChild(renderRelease(r));
+      });
+
+      if (!allDone) {
+        loadMoreWrap.style.display = '';
+      }
+
+      // Cache first page
+      if (pageNum === 1) {
+        try {
+          sessionStorage.setItem(CACHE_KEY, JSON.stringify({
+            ts: Date.now(),
+            data: releases
+          }));
+        } catch (e) { /* quota */ }
+      }
+    })
+    .catch(function () {
+      loading.style.display = 'none';
+      if (pageNum === 1) errorEl.style.display = '';
+    });
+  }
+
+  loadMoreBtn.addEventListener('click', function () {
+    page++;
+    fetchReleases(page);
+  });
+
+  // Try cache first
+  try {
+    var cached = JSON.parse(sessionStorage.getItem(CACHE_KEY));
+    if (cached && (Date.now() - cached.ts) < CACHE_TTL && cached.data.length) {
+      loading.style.display = 'none';
+      cached.data.forEach(function (r) {
+        content.appendChild(renderRelease(r));
+      });
+      if (cached.data.length >= PER_PAGE) {
+        loadMoreWrap.style.display = '';
+      }
+      return;
+    }
+  } catch (e) { /* parse error or missing */ }
+
+  fetchReleases(1);
+})();
+</script>
