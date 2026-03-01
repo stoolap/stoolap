@@ -35,8 +35,8 @@ use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
-use crate::storage::mvcc::engine::ViewDefinition;
-use crate::storage::traits::{Engine, QueryResult};
+use crate::storage::traits::view::ViewDefinition;
+use crate::storage::traits::QueryResult;
 
 /// Maximum depth for nested views to prevent stack overflow
 const MAX_VIEW_DEPTH: usize = 32;
@@ -6828,7 +6828,7 @@ impl Executor {
                     tx_state.transaction.set_isolation_level(isolation)?;
                 } else {
                     // No active transaction: set the engine's default isolation level
-                    self.engine.registry().set_global_isolation_level(isolation);
+                    self.engine.set_global_isolation_level(isolation);
                 }
 
                 Ok(Box::new(ExecResult::empty()))
@@ -6903,7 +6903,7 @@ impl Executor {
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
             "SNAPSHOT_INTERVAL" => {
-                let config = self.engine.config();
+                let config = self.engine.get_config();
                 let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
                 if let Some(ref value) = stmt.value {
@@ -6911,7 +6911,7 @@ impl Executor {
                     let new_value = self.extract_pragma_int_value(value)?;
                     let mut new_config = config.clone();
                     new_config.persistence.snapshot_interval = new_value as u32;
-                    self.engine.update_engine_config(new_config)?;
+                    self.engine.update_config(new_config)?;
                     let mut rows = RowVec::with_capacity(1);
                     rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
@@ -6928,14 +6928,14 @@ impl Executor {
                 }
             }
             "KEEP_SNAPSHOTS" => {
-                let config = self.engine.config();
+                let config = self.engine.get_config();
                 let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
                 if let Some(ref value) = stmt.value {
                     let new_value = self.extract_pragma_int_value(value)?;
                     let mut new_config = config.clone();
                     new_config.persistence.keep_snapshots = new_value as u32;
-                    self.engine.update_engine_config(new_config)?;
+                    self.engine.update_config(new_config)?;
                     let mut rows = RowVec::with_capacity(1);
                     rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
@@ -6951,7 +6951,7 @@ impl Executor {
                 }
             }
             "SYNC_MODE" => {
-                let config = self.engine.config();
+                let config = self.engine.get_config();
                 let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
                 if let Some(ref value) = stmt.value {
@@ -6967,7 +6967,7 @@ impl Executor {
                             ))
                         }
                     };
-                    self.engine.update_engine_config(new_config)?;
+                    self.engine.update_config(new_config)?;
                     let mut rows = RowVec::with_capacity(1);
                     rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
@@ -6981,14 +6981,14 @@ impl Executor {
                 }
             }
             "WAL_FLUSH_TRIGGER" => {
-                let config = self.engine.config();
+                let config = self.engine.get_config();
                 let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
                 if let Some(ref value) = stmt.value {
                     let new_value = self.extract_pragma_int_value(value)?;
                     let mut new_config = config.clone();
                     new_config.persistence.wal_flush_trigger = new_value as usize;
-                    self.engine.update_engine_config(new_config)?;
+                    self.engine.update_config(new_config)?;
                     let mut rows = RowVec::with_capacity(1);
                     rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
                     Ok(Box::new(ExecutorResult::new(columns, rows)))

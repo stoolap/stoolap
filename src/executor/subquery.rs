@@ -27,7 +27,6 @@ use crate::common::SmartString;
 use crate::core::{Error, Result, Value, ValueMap, ValueSet};
 use crate::parser::ast::*;
 use crate::parser::token::TokenType;
-use crate::storage::traits::Engine;
 
 use super::context::{
     cache_batch_aggregate, cache_batch_aggregate_info, cache_count_counter,

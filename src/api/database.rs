@@ -61,6 +61,8 @@ use super::transaction::Transaction;
 /// Storage scheme constants
 pub const MEMORY_SCHEME: &str = "memory";
 pub const FILE_SCHEME: &str = "file";
+#[cfg(feature = "tikv")]
+pub const TIKV_SCHEME: &str = "tikv";
 
 /// Global database registry to ensure single instance per DSN
 static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<FxHashMap<String, Arc<DatabaseInner>>>> =
@@ -68,7 +70,7 @@ static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<FxHashMap<String, Arc<Datab
 
 /// Inner database state (shared between Database instances with same DSN)
 pub(crate) struct DatabaseInner {
-    engine: Arc<MVCCEngine>,
+    engine: Arc<dyn Engine>,
     executor: Mutex<Executor>,
     dsn: String,
     /// Whether this DatabaseInner owns the engine (created it via open()).
@@ -88,7 +90,7 @@ impl Drop for DatabaseInner {
         // Only close the engine if we own it (created via open(), not clone()).
         // Cloned databases share the engine but don't close it on drop.
         if self.owns_engine {
-            let _ = self.engine.close_engine();
+            let _ = self.engine.close();
         }
     }
 }
@@ -225,6 +227,7 @@ impl Database {
                 let engine = Arc::new(engine);
                 // Start background cleanup (uses config from engine)
                 engine.start_cleanup();
+                let engine: Arc<dyn Engine> = engine;
                 engine
             }
             FILE_SCHEME => {
@@ -236,6 +239,15 @@ impl Database {
                 let engine = Arc::new(engine);
                 // Start background cleanup (uses config from engine)
                 engine.start_cleanup();
+                let engine: Arc<dyn Engine> = engine;
+                engine
+            }
+            #[cfg(feature = "tikv")]
+            TIKV_SCHEME => {
+                use crate::storage::tikv::TiKVEngine;
+                let tikv_engine = TiKVEngine::new(&path)?;
+                tikv_engine.open()?;
+                let engine: Arc<dyn Engine> = Arc::new(tikv_engine);
                 engine
             }
             _ => {
@@ -274,6 +286,7 @@ impl Database {
         let engine = Arc::new(engine);
         // Start background cleanup (uses config from engine)
         engine.start_cleanup();
+        let engine: Arc<dyn Engine> = engine;
 
         // Create executor (uses shared default function registry)
         let executor = Executor::new(Arc::clone(&engine));
@@ -300,6 +313,8 @@ impl Database {
         // Validate scheme
         match scheme.as_str() {
             MEMORY_SCHEME | FILE_SCHEME => {}
+            #[cfg(feature = "tikv")]
+            TIKV_SCHEME => {}
             _ => {
                 return Err(Error::parse(format!(
                     "Unsupported scheme '{}'. Use 'memory://' or 'file://path'",
@@ -846,7 +861,15 @@ impl Database {
     /// tx.commit()?;
     /// ```
     pub fn begin(&self) -> Result<Transaction> {
-        self.begin_with_isolation(IsolationLevel::ReadCommitted)
+        let level = {
+            let executor = self
+                .inner
+                .executor
+                .lock()
+                .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+            executor.default_isolation_level()
+        };
+        self.begin_with_isolation(level)
     }
 
     /// Begin a new transaction with a specific isolation level
@@ -875,7 +898,7 @@ impl Database {
     /// Get the underlying storage engine
     ///
     /// This is primarily for advanced use cases and testing.
-    pub fn engine(&self) -> &Arc<MVCCEngine> {
+    pub fn engine(&self) -> &Arc<dyn Engine> {
         &self.inner.engine
     }
 
@@ -896,7 +919,7 @@ impl Database {
 
         // Close the engine immediately to release the file lock
         // This is idempotent - calling close_engine() multiple times is safe
-        self.inner.engine.close_engine()?;
+        self.inner.engine.close()?;
 
         Ok(())
     }
@@ -1003,7 +1026,6 @@ impl Database {
     ///
     /// Note: This is a no-op for in-memory databases.
     pub fn create_snapshot(&self) -> Result<()> {
-        use crate::storage::Engine;
         self.inner.engine.create_snapshot()
     }
 

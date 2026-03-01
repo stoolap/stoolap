@@ -1,0 +1,73 @@
+name: TiKV Integration Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'src/storage/tikv/**'
+      - 'tests/tikv_*'
+      - 'docker-compose.tikv.yml'
+      - '.github/workflows/tikv.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/storage/tikv/**'
+      - 'tests/tikv_*'
+      - 'docker-compose.tikv.yml'
+      - '.github/workflows/tikv.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  TIKV_PD_ENDPOINTS: 127.0.0.1:2379
+
+jobs:
+  tikv-tests:
+    name: TiKV Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Start TiKV cluster
+      run: |
+        docker compose -f docker-compose.tikv.yml up -d
+        echo "Waiting for TiKV to be ready..."
+        for i in $(seq 1 30); do
+          if curl -sf http://127.0.0.1:2379/pd/api/v1/stores > /dev/null 2>&1; then
+            echo "TiKV is ready"
+            break
+          fi
+          echo "Waiting... ($i/30)"
+          sleep 2
+        done
+
+    - name: Run TiKV basic tests
+      run: cargo test --features tikv --test tikv_test -- --test-threads=1
+
+    - name: Run TiKV complex tests
+      run: cargo test --features tikv --test tikv_complex_test -- --test-threads=1
+
+    - name: Stop TiKV cluster
+      if: always()
+      run: docker compose -f docker-compose.tikv.yml down -v

@@ -35,7 +35,7 @@ use crate::core::{Result, Row, RowVec, Value, ValueMap};
 use crate::functions::aggregate::CompiledAggregate;
 use crate::functions::AggregateFunction;
 use crate::parser::ast::*;
-use crate::storage::traits::{Engine, QueryResult};
+use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
 #[allow(deprecated)]
@@ -5932,7 +5932,7 @@ impl Executor {
         classification: &QueryClassification,
     ) -> Option<Box<dyn QueryResult>> {
         use crate::parser::ast::GroupByModifier;
-        use crate::storage::mvcc::version_store::AggregateOp;
+        use crate::storage::traits::aggregation::AggregateOp;
 
         // Only for GROUP BY without WHERE or HAVING
         if classification.has_where || !classification.has_group_by || classification.has_having {

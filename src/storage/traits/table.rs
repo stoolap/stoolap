@@ -20,7 +20,7 @@ use std::fmt;
 
 use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, Value};
 use crate::storage::expression::Expression;
-use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
+use crate::storage::traits::aggregation::{AggregateOp, GroupedAggregateResult};
 use crate::storage::traits::{Index, QueryResult, Scanner};
 
 /// Describes the access method that will be used for a table scan

@@ -96,7 +96,6 @@ fn default_function_registry() -> Arc<FunctionRegistry> {
 }
 use crate::parser::ast::{Program, Statement};
 use crate::parser::Parser;
-use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 
 pub use context::{clear_all_thread_local_caches, ExecutionContext, TimeoutGuard};
@@ -164,7 +163,7 @@ struct ActiveTransaction {
 /// It coordinates between the parser, storage engine, and function registry.
 pub struct Executor {
     /// Storage engine
-    engine: Arc<MVCCEngine>,
+    engine: Arc<dyn Engine>,
     /// Function registry for scalar, aggregate, and window functions
     function_registry: Arc<FunctionRegistry>,
     /// Default isolation level for transactions
@@ -181,11 +180,11 @@ pub struct Executor {
 
 impl Executor {
     /// Create a new executor with the given storage engine
-    pub fn new(engine: Arc<MVCCEngine>) -> Self {
+    pub fn new(engine: Arc<dyn Engine>) -> Self {
         Self {
             engine,
             function_registry: default_function_registry(),
-            default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
+            default_isolation_level: crate::core::IsolationLevel::SnapshotIsolation,
             query_cache: QueryCache::default(),
             semantic_cache: SemanticCache::default(),
             active_transaction: Mutex::new(None),
@@ -195,13 +194,13 @@ impl Executor {
 
     /// Create a new executor with a custom function registry
     pub fn with_function_registry(
-        engine: Arc<MVCCEngine>,
+        engine: Arc<dyn Engine>,
         function_registry: Arc<FunctionRegistry>,
     ) -> Self {
         Self {
             engine,
             function_registry,
-            default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
+            default_isolation_level: crate::core::IsolationLevel::SnapshotIsolation,
             query_cache: QueryCache::default(),
             semantic_cache: SemanticCache::default(),
             active_transaction: Mutex::new(None),
@@ -210,11 +209,11 @@ impl Executor {
     }
 
     /// Create a new executor with a custom cache size
-    pub fn with_cache_size(engine: Arc<MVCCEngine>, cache_size: usize) -> Self {
+    pub fn with_cache_size(engine: Arc<dyn Engine>, cache_size: usize) -> Self {
         Self {
             engine,
             function_registry: default_function_registry(),
-            default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
+            default_isolation_level: crate::core::IsolationLevel::SnapshotIsolation,
             query_cache: QueryCache::new(cache_size),
             semantic_cache: SemanticCache::default(),
             active_transaction: Mutex::new(None),
@@ -299,8 +298,13 @@ impl Executor {
     }
 
     /// Get the storage engine
-    pub fn engine(&self) -> &Arc<MVCCEngine> {
+    pub fn engine(&self) -> &Arc<dyn Engine> {
         &self.engine
+    }
+
+    /// Get the default isolation level
+    pub fn default_isolation_level(&self) -> crate::core::IsolationLevel {
+        self.default_isolation_level
     }
 
     /// Get the function registry

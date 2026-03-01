@@ -29,7 +29,7 @@ use crate::storage::statistics::{
     is_stats_table, Histogram, DEFAULT_HISTOGRAM_BUCKETS, DEFAULT_SAMPLE_SIZE, SYS_COLUMN_STATS,
     SYS_TABLE_STATS,
 };
-use crate::storage::traits::{Engine, QueryResult, Transaction};
+use crate::storage::traits::{QueryResult, Transaction};
 
 use super::context::ExecutionContext;
 use super::result::ExecutorResult;
