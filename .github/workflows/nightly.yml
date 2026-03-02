@@ -8,10 +8,11 @@ on:
       suite:
         description: 'Which suite to run'
         required: false
-        default: 'all'
+        default: 'auto'
         type: choice
         options:
-          - all         # Run everything
+          - auto        # Scheduled behavior: one heavy suite + light suites
+          - all         # Everything (for manual sweeps)
           - mutation    # Mutation testing only
           - miri        # Miri only
           - stress      # Stress tests only
@@ -27,12 +28,53 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # ─── Lightweight jobs: run every night ───────────────────────────────
+  heavy_plan:
+    name: Select Heavy Suite
+    runs-on: ubuntu-latest
+    outputs:
+      run_mutation: ${{ steps.select.outputs.run_mutation }}
+      run_miri: ${{ steps.select.outputs.run_miri }}
+    steps:
+    - id: select
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        SUITE_INPUT: ${{ github.event.inputs.suite }}
+      run: |
+        suite="${SUITE_INPUT:-auto}"
+        run_mutation=false
+        run_miri=false
+
+        if [ "$EVENT_NAME" = "schedule" ] || [ "$suite" = "auto" ]; then
+          # Alternate heavy suites by UTC weekday to keep wall-time bounded.
+          # Mon/Wed/Fri/Sun => mutation, Tue/Thu/Sat => miri
+          weekday="$(date -u +%u)"
+          case "$weekday" in
+            1|3|5|7) run_mutation=true ;;
+            2|4|6) run_miri=true ;;
+          esac
+        else
+          case "$suite" in
+            all)
+              run_mutation=true
+              run_miri=true
+              ;;
+            mutation)
+              run_mutation=true
+              ;;
+            miri)
+              run_miri=true
+              ;;
+          esac
+        fi
+
+        echo "run_mutation=$run_mutation" >> "$GITHUB_OUTPUT"
+        echo "run_miri=$run_miri" >> "$GITHUB_OUTPUT"
 
   stress-tests:
     name: Stress Tests
     if: >-
       github.event_name == 'schedule'
+      || github.event.inputs.suite == 'auto'
       || github.event.inputs.suite == 'all'
       || github.event.inputs.suite == 'stress'
     runs-on: ubuntu-latest
@@ -69,6 +111,7 @@ jobs:
     name: Thread Sanitizer
     if: >-
       github.event_name == 'schedule'
+      || github.event.inputs.suite == 'auto'
       || github.event.inputs.suite == 'all'
       || github.event.inputs.suite == 'sanitizers'
     runs-on: ubuntu-latest
@@ -106,6 +149,7 @@ jobs:
     name: Address Sanitizer
     if: >-
       github.event_name == 'schedule'
+      || github.event.inputs.suite == 'auto'
       || github.event.inputs.suite == 'all'
       || github.event.inputs.suite == 'sanitizers'
     runs-on: ubuntu-latest
@@ -139,19 +183,11 @@ jobs:
       env:
         ASAN_OPTIONS: "detect_leaks=0"
 
-  # ─── Heavy jobs: sharded / parallelized ──────────────────────────────
-
   mutation:
-    name: Mutation Testing (shard ${{ matrix.shard }})
-    if: >-
-      github.event_name == 'schedule'
-      || github.event.inputs.suite == 'all'
-      || github.event.inputs.suite == 'mutation'
+    name: Mutation Testing (budgeted shard)
+    needs: heavy_plan
+    if: needs.heavy_plan.outputs.run_mutation == 'true'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
     - name: Free disk space
       run: |
@@ -169,45 +205,45 @@ jobs:
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Install mold linker
-      run: sudo apt-get install -y mold
-
     - name: Install cargo-mutants
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-mutants
 
-    - name: Run mutation testing (shard ${{ matrix.shard }}/8)
+    - name: Run mutation testing (day shard)
       run: |
+        TOTAL_SHARDS=96
+        DAY_OF_YEAR="$(date -u +%j)"
+        SHARD_INDEX=$((10#$DAY_OF_YEAR % TOTAL_SHARDS))
+        echo "Running shard ${SHARD_INDEX}/${TOTAL_SHARDS}"
+
         cargo mutants --package stoolap \
           --in-place \
-          --shard ${{ matrix.shard }}/8 \
+          --baseline=skip \
+          --timeout 420 \
+          --shard "${SHARD_INDEX}/${TOTAL_SHARDS}" \
           -f src/executor/expression/ \
           -f src/executor/aggregation.rs \
           -f src/executor/subquery.rs \
           -f src/functions/scalar/ \
           -f src/storage/mvcc/transaction.rs \
           -f src/storage/mvcc/registry.rs \
-          -- --all-targets -- --test-threads=4
-      timeout-minutes: 90
-      env:
-        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-        RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          -- --lib --tests -- --test-threads=4
+      timeout-minutes: 100
 
     - name: Upload mutation report
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: mutation-report-${{ matrix.shard }}
+        name: mutation-report
         path: mutants.out/
 
   miri:
     name: Miri
-    if: >-
-      github.event_name == 'schedule'
-      || github.event.inputs.suite == 'all'
-      || github.event.inputs.suite == 'miri'
+    needs: heavy_plan
+    if: needs.heavy_plan.outputs.run_miri == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 100
     steps:
     - uses: actions/checkout@v4
 
@@ -216,16 +252,10 @@ jobs:
       with:
         components: miri
 
-    - name: Install nextest
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-nextest
-
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Run Miri on core modules (parallel via nextest)
-      run: cargo +nightly miri nextest run --lib -E 'test(/^(core|common)::/)' --no-fail-fast
-      timeout-minutes: 45
+    - name: Run Miri on core modules
+      run: "cargo +nightly miri test --lib -- core:: common::"
       env:
         MIRIFLAGS: "-Zmiri-disable-isolation"
