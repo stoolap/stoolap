@@ -132,8 +132,7 @@ impl<V: Clone> Drop for NodePtr<V> {
             // SAFETY: We are the last reference (old_count == 1). The children at indices
             // 0..=len are valid NodePtr instances. After dropping, we don't access them.
             unsafe {
-                let c_ptr =
-                    self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
+                let c_ptr = self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
                 for i in 0..=len {
                     ptr::drop_in_place(c_ptr.add(i));
                 }
@@ -225,7 +224,7 @@ impl<V: Clone> NodePtr<V> {
             // Keys are i64 (Copy type), so byte copy is safe. len <= MAX_KEYS.
             unsafe {
                 let k_src = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *const i64;
-                let k_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                let k_dst = new_node.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
                 ptr::copy_nonoverlapping(k_src, k_dst, len);
             }
 
@@ -235,7 +234,7 @@ impl<V: Clone> NodePtr<V> {
             // clone to maintain exception safety (if clone panics, only initialized values are dropped).
             unsafe {
                 let v_src = self.ptr.data_ptr_mut().add(Self::values_offset()) as *const V;
-                let v_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+                let v_dst = new_node.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
                 for i in 0..len {
                     ptr::write(v_dst.add(i), (*v_src.add(i)).clone());
                     // Increment len after successful write/clone
@@ -254,7 +253,7 @@ impl<V: Clone> NodePtr<V> {
             // Keys are i64 (Copy type), so byte copy is safe. len <= MAX_KEYS.
             unsafe {
                 let k_src = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *const i64;
-                let k_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                let k_dst = new_node.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
                 ptr::copy_nonoverlapping(k_src, k_dst, len);
             }
 
@@ -264,9 +263,10 @@ impl<V: Clone> NodePtr<V> {
             // SAFETY: c_src points to len+1 valid NodePtr instances. c_dst points to uninitialized memory.
             // NodePtr::clone only does atomic operations and cannot panic.
             unsafe {
-                let c_src = self.ptr.data_ptr_mut().add(Self::children_offset()) as *const NodePtr<V>;
-                let c_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::children_offset())
-                    as *mut NodePtr<V>;
+                let c_src =
+                    self.ptr.data_ptr_mut().add(Self::children_offset()) as *const NodePtr<V>;
+                let c_dst =
+                    new_node.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
                 for i in 0..=len {
                     // children count = keys count + 1
                     ptr::write(c_dst.add(i), (*c_src.add(i)).clone());
@@ -353,8 +353,7 @@ impl<V: Clone> NodePtr<V> {
         // SAFETY: This is an internal node (asserted). ptr + children_offset points to
         // an array of len initialized NodePtr children. Caller has &mut self, ensuring unique access.
         unsafe {
-            let ptr =
-                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
+            let ptr = self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             std::slice::from_raw_parts_mut(ptr, len)
         }
     }
@@ -448,8 +447,7 @@ impl<V: Clone> NodePtr<V> {
             let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             ptr::write(k_ptr.add(len), key);
 
-            let c_ptr =
-                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
+            let c_ptr = self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             ptr::write(c_ptr.add(len + 1), child);
         }
         self.set_len(len + 1);
@@ -470,13 +468,11 @@ impl<V: Clone> NodePtr<V> {
         // so those slots become logically uninitialized (won't be dropped when self is dropped).
         unsafe {
             let k_src = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
-            let k_dst = (right.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_dst = right.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             ptr::copy_nonoverlapping(k_src.add(mid + 1), k_dst, right_keys_count);
 
-            let c_src =
-                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
-            let c_dst =
-                (right.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+            let c_src = self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
+            let c_dst = right.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             ptr::copy_nonoverlapping(c_src.add(mid + 1), c_dst, right_children_count);
         }
 
@@ -504,10 +500,8 @@ impl<V: Clone> NodePtr<V> {
         // We move only the last child to right. Children are moved via ptr::read then ptr::write.
         // After set_len(len-1), the source slots are logically uninitialized.
         unsafe {
-            let c_src =
-                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
-            let c_dst =
-                (right.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+            let c_src = self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
+            let c_dst = right.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
 
             // Move last child (index len, since we have len+1 children)
             ptr::write(c_dst, ptr::read(c_src.add(len)));
@@ -533,8 +527,7 @@ impl<V: Clone> NodePtr<V> {
                 // We move the value out via ptr::read, then set_len(left_len - 1) marks it
                 // as logically removed so it won't be double-dropped.
                 let val = unsafe {
-                    let val_ptr =
-                        (left.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+                    let val_ptr = left.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
                     ptr::read(val_ptr.add(left_len - 1))
                 };
                 left.set_len(left_len - 1);
@@ -561,8 +554,8 @@ impl<V: Clone> NodePtr<V> {
                 // We move the child out via ptr::read, then set_len(left_len - 1) ensures it
                 // won't be double-dropped.
                 let child = unsafe {
-                    let c_ptr = (left.ptr.as_ptr() as *mut u8).add(Self::children_offset())
-                        as *mut NodePtr<V>;
+                    let c_ptr =
+                        left.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
                     ptr::read(c_ptr.add(left_len))
                 };
                 left.set_len(left_len - 1);
@@ -599,8 +592,7 @@ impl<V: Clone> NodePtr<V> {
             ptr::copy(k_ptr.add(index), k_ptr.add(index + 1), len - index);
             ptr::write(k_ptr.add(index), key);
 
-            let c_ptr =
-                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
+            let c_ptr = self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             ptr::copy(c_ptr.add(index + 1), c_ptr.add(index + 2), len - index);
             ptr::write(c_ptr.add(index + 1), child);
         }
@@ -619,8 +611,7 @@ impl<V: Clone> NodePtr<V> {
             ptr::copy(k_ptr, k_ptr.add(1), len);
             ptr::write(k_ptr, key);
 
-            let c_ptr =
-                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
+            let c_ptr = self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             ptr::copy(c_ptr, c_ptr.add(1), len + 1);
             ptr::write(c_ptr, child);
         }
@@ -659,8 +650,8 @@ impl<V: Clone> NodePtr<V> {
                 // Index 0 is valid for children array. We move the first child out via ptr::read,
                 // then remove_internal_at_start() shifts remaining elements left and decrements len.
                 let child = unsafe {
-                    let c_ptr = (right.ptr.as_ptr() as *mut u8).add(Self::children_offset())
-                        as *mut NodePtr<V>;
+                    let c_ptr =
+                        right.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
                     ptr::read(c_ptr)
                 };
                 right.remove_internal_at_start();
@@ -693,8 +684,7 @@ impl<V: Clone> NodePtr<V> {
             let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             ptr::copy(k_ptr.add(1), k_ptr, len - 1);
 
-            let c_ptr =
-                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
+            let c_ptr = self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             ptr::copy(c_ptr.add(1), c_ptr, len);
         }
         self.set_len(len - 1);
@@ -722,8 +712,8 @@ impl<V: Clone> NodePtr<V> {
             // We set_len(0) immediately after to mark them as logically removed, preventing
             // double-free when right's NodePtr is eventually dropped.
             unsafe {
-                let k_ptr = right.ptr.as_ptr().add(Self::keys_offset()) as *const i64;
-                let v_ptr = right.ptr.as_ptr().add(Self::values_offset()) as *mut V;
+                let k_ptr = right.ptr.data_ptr_mut().add(Self::keys_offset()) as *const i64;
+                let v_ptr = right.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
                 for i in 0..r_len {
                     let key = *k_ptr.add(i);
                     let val = ptr::read(v_ptr.add(i)); // Move, not clone!
@@ -746,7 +736,8 @@ impl<V: Clone> NodePtr<V> {
             // SAFETY: right is an internal node. We read all children from indices [0..r_len+1).
             // Children are moved via ptr::read.
             let children: Vec<NodePtr<V>> = unsafe {
-                let c_ptr = right.ptr.as_ptr().add(Self::children_offset()) as *const NodePtr<V>;
+                let c_ptr =
+                    right.ptr.data_ptr_mut().add(Self::children_offset()) as *const NodePtr<V>;
                 (0..=r_len).map(|i| ptr::read(c_ptr.add(i))).collect()
             };
 
@@ -759,7 +750,7 @@ impl<V: Clone> NodePtr<V> {
             // to 2 is safe because we're about to drop this node in remove_key_and_child,
             // and we want Drop to skip the children (they've been moved out).
             unsafe {
-                let header = &*(right.ptr.as_ptr() as *const NodeHeader);
+                let header = &*(right.ptr.data_ptr_mut() as *const NodeHeader);
                 header.drop_count.store(2, Ordering::Release);
             }
             right.set_len(0);
@@ -797,8 +788,7 @@ impl<V: Clone> NodePtr<V> {
                 len - key_idx - 1,
             );
 
-            let c_ptr =
-                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
+            let c_ptr = self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             // Drop the child being removed before overwriting it
             ptr::drop_in_place(c_ptr.add(child_idx));
             ptr::copy(
@@ -823,11 +813,11 @@ impl<V: Clone> NodePtr<V> {
         // slots become logically uninitialized (won't be dropped when self is dropped).
         unsafe {
             let k_src = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
-            let k_dst = (right.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_dst = right.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             ptr::copy_nonoverlapping(k_src.add(mid), k_dst, right_count);
 
             let v_src = self.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
-            let v_dst = (right.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let v_dst = right.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
             ptr::copy_nonoverlapping(v_src.add(mid), v_dst, right_count);
         }
 
@@ -856,10 +846,10 @@ impl<V: Clone> NodePtr<V> {
         // then ptr::write. After set_len(len-1), the source slot is logically uninitialized.
         unsafe {
             let k_src = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *const i64;
-            let k_dst = (right.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_dst = right.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
 
             let v_src = self.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
-            let v_dst = (right.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let v_dst = right.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
 
             // Copy last key
             ptr::write(k_dst, *k_src.add(len - 1));
@@ -1073,7 +1063,9 @@ impl<V: Clone> CowBTree<V> {
                     // so with len=0 we have space for 1 child at index 0. old_root is moved
                     // (not cloned) into the slot. push_internal will add children[1] and set len=1.
                     unsafe {
-                        let c_ptr = (new_root.ptr.as_ptr() as *mut u8)
+                        let c_ptr = new_root
+                            .ptr
+                            .data_ptr_mut()
                             .add(NodePtr::<V>::children_offset())
                             as *mut NodePtr<V>;
                         ptr::write(c_ptr, old_root);
@@ -1109,7 +1101,9 @@ impl<V: Clone> CowBTree<V> {
                 // so with len=0 we have space for 1 child at index 0. old_root is moved
                 // (not cloned) into the slot. push_internal will add children[1] and set len=1.
                 unsafe {
-                    let c_ptr = (new_root.ptr.as_ptr() as *mut u8)
+                    let c_ptr = new_root
+                        .ptr
+                        .data_ptr_mut()
                         .add(NodePtr::<V>::children_offset())
                         as *mut NodePtr<V>;
                     ptr::write(c_ptr, old_root);
@@ -1151,17 +1145,15 @@ impl<V: Clone> CowBTree<V> {
             // All pointer arithmetic stays within allocated bounds.
             unsafe {
                 let len = node.len();
-                let v_ptr =
-                    (node.ptr.as_ptr() as *mut u8).add(NodePtr::<V>::values_offset()) as *mut V;
+                let v_ptr = node.ptr.data_ptr_mut().add(NodePtr::<V>::values_offset()) as *mut V;
                 let ptr = v_ptr.add(len - 1);
 
                 if node.len() > MAX_KEYS {
                     // Use rightmost split: keeps MAX_KEYS in left, moves 1 to right
                     let (median, right) = node.split_leaf_rightmost();
                     // After rightmost split, the inserted value is at right[0]
-                    let v_ptr_new = (right.ptr.as_ptr() as *mut u8)
-                        .add(NodePtr::<V>::values_offset())
-                        as *mut V;
+                    let v_ptr_new =
+                        right.ptr.data_ptr_mut().add(NodePtr::<V>::values_offset()) as *mut V;
                     (InsertResult::Split(median, right), v_ptr_new)
                 } else {
                     (InsertResult::Done(None), ptr)
@@ -1200,7 +1192,7 @@ impl<V: Clone> CowBTree<V> {
                 // of an existing value, so no len change is needed.
                 Ok(i) => unsafe {
                     let v_ptr =
-                        (node.ptr.as_ptr() as *mut u8).add(NodePtr::<V>::values_offset()) as *mut V;
+                        node.ptr.data_ptr_mut().add(NodePtr::<V>::values_offset()) as *mut V;
                     let old = ptr::read(v_ptr.add(i));
                     ptr::write(v_ptr.add(i), value);
                     InsertResult::Done(Some(old))
@@ -1339,9 +1331,8 @@ impl<V: Clone> CowBTree<V> {
                     // node is a valid leaf with i < node.len() after the split. We compute a
                     // pointer to the inserted value at index i.
                     unsafe {
-                        let v_ptr = (node.ptr.as_ptr() as *mut u8)
-                            .add(NodePtr::<V>::values_offset())
-                            as *mut V;
+                        let v_ptr =
+                            node.ptr.data_ptr_mut().add(NodePtr::<V>::values_offset()) as *mut V;
                         v_ptr.add(i)
                     }
                 } else {
@@ -1350,7 +1341,9 @@ impl<V: Clone> CowBTree<V> {
                     // right_node is a valid leaf with right_idx < right_node.len() after the split.
                     // We compute a pointer to the inserted value at index right_idx.
                     unsafe {
-                        let v_ptr = (right_node.ptr.as_ptr() as *mut u8)
+                        let v_ptr = right_node
+                            .ptr
+                            .data_ptr_mut()
                             .add(NodePtr::<V>::values_offset())
                             as *mut V;
                         v_ptr.add(right_idx)
@@ -1363,7 +1356,7 @@ impl<V: Clone> CowBTree<V> {
                 // We compute a pointer to the newly inserted value.
                 unsafe {
                     let v_ptr =
-                        (node.ptr.as_ptr() as *mut u8).add(NodePtr::<V>::values_offset()) as *mut V;
+                        node.ptr.data_ptr_mut().add(NodePtr::<V>::values_offset()) as *mut V;
                     let ptr = v_ptr.add(i);
                     (InsertResult::Done(None), ptr)
                 }
@@ -1558,7 +1551,9 @@ impl<V: Clone> CowBTree<V> {
                 // so with len=0 we have space for 1 child at index 0. old_root is moved
                 // (not cloned) into the slot. push_internal will add children[1] and set len=1.
                 unsafe {
-                    let c_ptr = (new_root.ptr.as_ptr() as *mut u8)
+                    let c_ptr = new_root
+                        .ptr
+                        .data_ptr_mut()
                         .add(NodePtr::<V>::children_offset())
                         as *mut NodePtr<V>;
                     ptr::write(c_ptr, old_root);
@@ -1640,7 +1635,9 @@ impl<V: Clone> CowBTree<V> {
                 // so with len=0 we have space for 1 child at index 0. old_root is moved
                 // (not cloned) into the slot. push_internal will add children[1] and set len=1.
                 unsafe {
-                    let c_ptr = (new_root.ptr.as_ptr() as *mut u8)
+                    let c_ptr = new_root
+                        .ptr
+                        .data_ptr_mut()
                         .add(NodePtr::<V>::children_offset())
                         as *mut NodePtr<V>;
                     ptr::write(c_ptr, old_root);
@@ -1740,7 +1737,7 @@ impl<'a, V: Clone> OccupiedEntry<'a, V> {
         // We read the old value via ptr::read and write the new value via ptr::write.
         // This is a replacement of an existing value, so no len change is needed.
         unsafe {
-            let v_ptr = (node.ptr.as_ptr() as *mut u8).add(NodePtr::<V>::values_offset()) as *mut V;
+            let v_ptr = node.ptr.data_ptr_mut().add(NodePtr::<V>::values_offset()) as *mut V;
             let ptr = v_ptr.add(self.leaf_idx);
             let old = ptr::read(ptr);
             ptr::write(ptr, value);
