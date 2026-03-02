@@ -422,13 +422,22 @@ impl<T: CompactArcDrop> CompactArc<T> {
     /// Returns a raw pointer to the contained data.
     #[inline]
     pub fn as_ptr(this: &Self) -> *const T {
-        &**this as *const T
+        // Derive from the header pointer via raw pointer arithmetic to avoid
+        // creating a shared reference (&T) that would restrict the borrow stack.
+        // Going through Deref (&*this) creates a SharedReadOnly tag that
+        // invalidates later writes to the header (e.g., refcount decrement).
+        let header = this.ptr.as_ptr();
+        unsafe { (header as *const u8).add(data_offset_for::<T>()) as *const T }
     }
 
     /// Converts a `CompactArc<T>` into a raw pointer.
     #[inline]
     pub fn into_raw(this: Self) -> *const T {
-        let ptr = &*this as *const T;
+        // Use raw pointer arithmetic instead of &*this to avoid Stacked Borrows
+        // violation: a SharedReadOnly retag from &*this would conflict with
+        // the SharedReadWrite needed by Drop to decrement the refcount.
+        let header = this.ptr.as_ptr();
+        let ptr = unsafe { (header as *const u8).add(data_offset_for::<T>()) as *const T };
         mem::forget(this);
         ptr
     }

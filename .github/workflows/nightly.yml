@@ -47,7 +47,7 @@ jobs:
           -f src/functions/scalar/ \
           -f src/storage/mvcc/transaction.rs \
           -f src/storage/mvcc/registry.rs \
-          -- --test-threads=4
+          -- -- --test-threads=4
       timeout-minutes: 120
 
     - name: Upload mutation report
@@ -133,7 +133,7 @@ jobs:
     - name: Run with ThreadSanitizer
       run: |
         RUSTFLAGS="-Zsanitizer=thread" \
-        cargo +nightly test --target x86_64-unknown-linux-gnu \
+        cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu \
           --test dirty_read_test \
           --test mvcc_isolation_sql_test \
           --test parallel_execution_tests
@@ -165,7 +165,7 @@ jobs:
     - name: Run with AddressSanitizer
       run: |
         RUSTFLAGS="-Zsanitizer=address" \
-        cargo +nightly test --target x86_64-unknown-linux-gnu \
+        cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu \
           --test durability_test \
           --test snapshot_recovery_test \
           --test persistence_test
