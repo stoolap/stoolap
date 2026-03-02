@@ -46,6 +46,7 @@ use crate::storage::mvcc::get_fast_timestamp;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::mvcc::streaming_result::{StreamingResult, VisibleRowInfo};
+pub use crate::storage::traits::aggregation::{AggregateOp, GroupedAggregateResult};
 use crate::storage::Index;
 use ahash::AHashMap;
 #[cfg(feature = "parallel")]
@@ -95,14 +96,7 @@ impl std::hash::Hash for GroupKey {
 /// Hash map for GroupKey with randomized hashing (HashDoS resistant)
 type GroupKeyMap<V> = AHashMap<GroupKey, V>;
 
-/// Result of storage-level grouped aggregation
-#[derive(Debug, Clone)]
-pub struct GroupedAggregateResult {
-    /// Group key values
-    pub group_values: Vec<Value>,
-    /// Aggregate results in order of requested aggregates
-    pub aggregate_values: Vec<Value>,
-}
+// GroupedAggregateResult is re-exported from crate::storage::traits::aggregation
 
 /// Represents a specific version of a row with complete data
 ///
@@ -369,18 +363,7 @@ impl RowIndex {
     }
 }
 
-/// Aggregate operation type for deferred aggregation
-///
-/// Used with `compute_aggregates()` to perform multiple aggregations in a single pass.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AggregateOp {
-    Count,
-    CountStar,
-    Sum,
-    Min,
-    Max,
-    Avg,
-}
+// AggregateOp is re-exported from crate::storage::traits::aggregation
 
 /// Result of an aggregate operation
 #[derive(Clone, Debug)]

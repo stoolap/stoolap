@@ -33,7 +33,6 @@ use crate::core::{Operator, Result, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::optimizer::workload::{EdgeAwarePlanner, EdgeJoinRecommendation};
 use crate::parser::ast::Expression;
-use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::mvcc::zonemap::TableZoneMap;
 use crate::storage::statistics::{
     Histogram, HistogramOp, TableStats, SYS_COLUMN_STATS, SYS_TABLE_STATS,
@@ -43,7 +42,7 @@ use crate::storage::traits::{Engine, Table, Transaction};
 /// Query planner that integrates statistics-based optimization
 pub struct QueryPlanner {
     /// Reference to the storage engine for reading statistics
-    engine: Arc<MVCCEngine>,
+    engine: Arc<dyn Engine>,
     /// Cache of table statistics to avoid repeated lookups
     stats_cache: std::sync::RwLock<StringMap<CachedStats>>,
 }
@@ -101,7 +100,7 @@ pub struct ColumnStatsCache {
 
 impl QueryPlanner {
     /// Create a new query planner
-    pub fn new(engine: Arc<MVCCEngine>) -> Self {
+    pub fn new(engine: Arc<dyn Engine>) -> Self {
         Self {
             engine,
             stats_cache: std::sync::RwLock::new(StringMap::new()),
@@ -1262,10 +1261,11 @@ impl QueryPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::mvcc::engine::MVCCEngine;
 
     #[test]
     fn test_selectivity_estimation() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()) as Arc<dyn Engine>);
 
         // Test equality selectivity with distinct count
         let col_stats = ColumnStatsCache {
@@ -1365,7 +1365,7 @@ mod tests {
 
     #[test]
     fn test_runtime_join_decision_hash_join() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()) as Arc<dyn Engine>);
 
         // For equality joins with reasonable sizes, hash join should be selected
         let decision = planner.plan_runtime_join(1000, 1000, true);
@@ -1376,7 +1376,7 @@ mod tests {
 
     #[test]
     fn test_runtime_join_decision_nested_loop() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()) as Arc<dyn Engine>);
 
         // Non-equality joins should use nested loop
         let decision = planner.plan_runtime_join(100, 100, false);
@@ -1387,7 +1387,7 @@ mod tests {
 
     #[test]
     fn test_runtime_join_decision_small_tables() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()) as Arc<dyn Engine>);
 
         // Very small tables might still use hash join for equality
         let decision = planner.plan_runtime_join(10, 10, true);
@@ -1397,7 +1397,7 @@ mod tests {
 
     #[test]
     fn test_runtime_join_decision_merge_join() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()) as Arc<dyn Engine>);
 
         // When both sides are sorted, merge join might be preferred
         let decision = planner.plan_runtime_join_with_sort_info(10000, 10000, true, true, true);
@@ -1406,7 +1406,7 @@ mod tests {
 
     #[test]
     fn test_selectivity_range_operators() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()) as Arc<dyn Engine>);
 
         let col_stats = ColumnStatsCache {
             null_count: 0,
@@ -1439,7 +1439,7 @@ mod tests {
 
     #[test]
     fn test_selectivity_no_operator() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()) as Arc<dyn Engine>);
         let table_stats = TableStats::default();
 
         // No operator should return default selectivity
@@ -1449,7 +1449,7 @@ mod tests {
 
     #[test]
     fn test_stats_health_missing() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()) as Arc<dyn Engine>);
 
         // Non-existent table should return Missing
         let health = planner.stats_health("non_existent_table");
@@ -1477,7 +1477,7 @@ mod tests {
 
     #[test]
     fn test_runtime_join_decision_explanation() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
+        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()) as Arc<dyn Engine>);
 
         let decision = planner.plan_runtime_join(1000, 1000, true);
         // Explanation should not be empty

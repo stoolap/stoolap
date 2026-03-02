@@ -1,0 +1,37 @@
+# TiKV cluster for integration testing
+# Usage: docker compose -f docker-compose.tikv.yml up -d
+# Connect: tikv://127.0.0.1:2379
+#
+# Run tests:
+#   TIKV_PD_ENDPOINTS=127.0.0.1:2379 cargo test --features tikv --test tikv_test
+
+services:
+  pd:
+    image: pingcap/pd:latest
+    network_mode: host
+    command:
+      - --name=pd
+      - --client-urls=http://0.0.0.0:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-client-urls=http://127.0.0.1:2379
+      - --advertise-peer-urls=http://127.0.0.1:2380
+      - --data-dir=/data/pd
+    volumes:
+      - pd_data:/data
+
+  tikv:
+    image: pingcap/tikv:latest
+    network_mode: host
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=127.0.0.1:20160
+      - --pd=127.0.0.1:2379
+      - --data-dir=/data/tikv
+    depends_on:
+      - pd
+    volumes:
+      - tikv_data:/data
+
+volumes:
+  pd_data:
+  tikv_data:

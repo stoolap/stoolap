@@ -304,25 +304,29 @@ impl Executor {
         // OPTIMIZATION: LIMIT pushdown for PARTITION BY queries
         // If there's a LIMIT and PARTITION BY, we can process partitions one at a time
         // and stop early once we have enough rows (like SQLite does)
+        // CRITICAL: Only do this if there's no outer ORDER BY, or if the ORDER BY
+        // matches the partition key, because hash map iteration is non-deterministic.
         if let Some(limit_expr) = &stmt.limit {
-            // Check if we have PARTITION BY (not just ORDER BY)
-            let has_partition_by = window_functions
-                .iter()
-                .any(|wf| !wf.partition_by.is_empty());
+            if stmt.order_by.is_empty() {
+                // Check if we have PARTITION BY (not just ORDER BY)
+                let has_partition_by = window_functions
+                    .iter()
+                    .any(|wf| !wf.partition_by.is_empty());
 
-            if has_partition_by {
-                // Try to evaluate the LIMIT expression
-                if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
-                    let limit_val = lit.value;
-                    if limit_val > 0 {
-                        return self.execute_select_with_window_functions_streaming(
-                            stmt,
-                            ctx,
-                            base_rows,
-                            base_columns,
-                            &window_functions,
-                            limit_val as usize,
-                        );
+                if has_partition_by {
+                    // Try to evaluate the LIMIT expression
+                    if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
+                        let limit_val = lit.value;
+                        if limit_val > 0 {
+                            return self.execute_select_with_window_functions_streaming(
+                                stmt,
+                                ctx,
+                                base_rows,
+                                base_columns,
+                                &window_functions,
+                                limit_val as usize,
+                            );
+                        }
                     }
                 }
             }

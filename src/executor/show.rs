@@ -28,7 +28,7 @@ use crate::common::SmartString;
 use crate::core::row_vec::RowVec;
 use crate::core::{Error, Result, Row, Value};
 use crate::parser::ast::*;
-use crate::storage::traits::{Engine, QueryResult};
+use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
 use super::result::ExecutorResult;

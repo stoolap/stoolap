@@ -400,7 +400,7 @@ impl Executor {
             }
         } else {
             // No active transaction - use direct engine call (auto-committed)
-            self.engine.create_table(schema)?;
+            self.engine.create_table_direct(schema)?;
 
             // Create unique indexes and FK indexes
             let needs_indexes = !unique_columns.is_empty()
@@ -527,7 +527,7 @@ impl Executor {
         let schema = schema_builder.build();
 
         // Create the table
-        self.engine.create_table(schema)?;
+        self.engine.create_table_direct(schema)?;
 
         // Insert the rows into the new table
         let rows_count = rows.len();
@@ -584,7 +584,7 @@ impl Executor {
 
         // Check FK constraints: block DROP if child tables reference this table
         // Uses the caller's transaction (if any) so uncommitted child deletes are visible
-        super::foreign_key::check_no_referencing_rows(&self.engine, table_name, txn_id)?;
+        super::foreign_key::check_no_referencing_rows(self.engine.as_ref(), table_name, txn_id)?;
 
         if let Some(ref mut tx_state) = *active_tx {
             // WARNING: DROP TABLE within a transaction has limited rollback support.
@@ -598,7 +598,7 @@ impl Executor {
             tx_state.transaction.drop_table(table_name)?;
         } else {
             // No active transaction - use engine method directly (auto-committed with WAL)
-            self.engine.drop_table_internal(table_name)?;
+            self.engine.drop_table_direct(table_name)?;
         }
 
         // Invalidate query cache for this table (schema no longer exists)
@@ -1076,7 +1076,7 @@ impl Executor {
 
         // Create the view (engine handles if_not_exists logic)
         self.engine
-            .create_view(view_name, query_sql, stmt.if_not_exists)?;
+            .create_view(view_name, &query_sql, stmt.if_not_exists)?;
 
         Ok(Box::new(ExecResult::empty()))
     }
@@ -1090,7 +1090,10 @@ impl Executor {
         let view_name = &stmt.view_name.value;
 
         // Drop the view (engine handles if_exists logic)
-        self.engine.drop_view(view_name, stmt.if_exists)?;
+        if stmt.if_exists && !self.engine.view_exists(view_name)? {
+            return Ok(Box::new(ExecResult::empty()));
+        }
+        self.engine.drop_view(view_name)?;
 
         // Invalidate subquery caches that may reference this view
         invalidate_semi_join_cache_for_table(view_name);

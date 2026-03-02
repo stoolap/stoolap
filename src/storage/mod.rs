@@ -26,6 +26,8 @@ pub mod expression;
 pub mod index;
 pub mod mvcc;
 pub mod statistics;
+#[cfg(feature = "tikv")]
+pub mod tikv;
 pub mod traits;
 
 // Re-export main expression types at storage level for convenience

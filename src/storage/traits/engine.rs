@@ -16,11 +16,13 @@
 //!
 
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 use crate::common::CompactArc;
-use crate::core::{IsolationLevel, Result, RowVec, Schema};
+use crate::core::{ForeignKeyConstraint, IsolationLevel, Result, RowVec, Schema};
 use crate::storage::config::Config;
-use crate::storage::traits::{Index, Transaction};
+use crate::storage::traits::view::ViewDefinition;
+use crate::storage::traits::{Index, Table, Transaction};
 
 /// Engine represents the storage engine
 ///
@@ -45,13 +47,15 @@ pub trait Engine: Send + Sync {
     ///
     /// This initializes the engine, opens the database path (if any),
     /// recovers from WAL, and loads existing data.
-    fn open(&mut self) -> Result<()>;
+    /// Uses interior mutability so the engine can be wrapped in Arc.
+    fn open(&self) -> Result<()>;
 
     /// Closes the storage engine
     ///
     /// This flushes pending writes, creates a final snapshot if needed,
     /// and releases all resources.
-    fn close(&mut self) -> Result<()>;
+    /// Uses interior mutability so the engine can be wrapped in Arc.
+    fn close(&self) -> Result<()>;
 
     /// Begins a new transaction
     ///
@@ -103,7 +107,8 @@ pub trait Engine: Send + Sync {
     fn get_isolation_level(&self) -> IsolationLevel;
 
     /// Sets the default isolation level for new transactions
-    fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()>;
+    /// Uses interior mutability so the engine can be wrapped in Arc.
+    fn set_isolation_level(&self, level: IsolationLevel) -> Result<()>;
 
     /// Gets the current engine configuration
     ///
@@ -113,12 +118,20 @@ pub trait Engine: Send + Sync {
     /// Updates the engine configuration
     ///
     /// Note: Some configuration changes may require a restart to take effect.
-    fn update_config(&mut self, config: Config) -> Result<()>;
+    /// Uses interior mutability so the engine can be wrapped in Arc.
+    fn update_config(&self, config: Config) -> Result<()>;
 
     /// Manually triggers snapshot creation for all tables
     ///
     /// This is useful for creating a consistent backup point.
     fn create_snapshot(&self) -> Result<()>;
+
+    /// Start background tasks (e.g., cleanup, compaction)
+    ///
+    /// Called after the engine is opened and wrapped in Arc.
+    fn start_background_tasks(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Record an index creation operation to WAL for persistence
     ///
@@ -278,6 +291,101 @@ pub trait Engine: Send + Sync {
         Err(crate::core::Error::internal(
             "get_row_counter not supported by this engine",
         ))
+    }
+
+    // --- View operations ---
+
+    /// Get a view definition by name (case-insensitive, expects lowercase input)
+    fn get_view_lowercase(&self, _name_lower: &str) -> Result<Option<Arc<ViewDefinition>>> {
+        Ok(None)
+    }
+
+    /// Get a view definition by name (handles case conversion)
+    fn get_view(&self, name: &str) -> Result<Option<Arc<ViewDefinition>>> {
+        self.get_view_lowercase(&name.to_lowercase())
+    }
+
+    /// List all view names
+    fn list_views(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Create a view
+    fn create_view(&self, _name: &str, _query: &str, _or_replace: bool) -> Result<()> {
+        Err(crate::core::Error::internal(
+            "create_view not supported by this engine",
+        ))
+    }
+
+    /// Drop a view
+    fn drop_view(&self, _name: &str) -> Result<()> {
+        Err(crate::core::Error::internal(
+            "drop_view not supported by this engine",
+        ))
+    }
+
+    // --- Foreign key operations ---
+
+    /// Get a table handle for an existing transaction by txn_id.
+    /// This allows FK enforcement to participate in the caller's transaction.
+    fn get_table_for_txn(&self, _txn_id: i64, _table_name: &str) -> Result<Box<dyn Table>> {
+        Err(crate::core::Error::internal(
+            "get_table_for_txn not supported by this engine",
+        ))
+    }
+
+    /// Find all FK constraints in other tables that reference the given parent table.
+    fn find_referencing_fks(
+        &self,
+        _parent_table: &str,
+    ) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
+        Arc::new(Vec::new())
+    }
+
+    /// Returns all schemas currently in the engine
+    fn get_all_schemas(&self) -> Vec<CompactArc<Schema>> {
+        Vec::new()
+    }
+
+    /// Set the global isolation level (affects all new transactions)
+    fn set_global_isolation_level(&self, level: IsolationLevel) {
+        let _ = self.set_isolation_level(level);
+    }
+
+    // --- DDL operations at engine level ---
+
+    /// Check if a view exists
+    fn view_exists(&self, _name: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Create a table at the engine level (outside of a transaction)
+    fn create_table_direct(&self, _schema: Schema) -> Result<Schema> {
+        Err(crate::core::Error::internal(
+            "create_table_direct not supported by this engine",
+        ))
+    }
+
+    /// Drop a table at the engine level (outside of a transaction)
+    fn drop_table_direct(&self, _name: &str) -> Result<()> {
+        Err(crate::core::Error::internal(
+            "drop_table_direct not supported by this engine",
+        ))
+    }
+
+    /// Refresh the engine's schema cache for a table after DDL operations
+    fn refresh_schema_cache(&self, _table_name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Manually triggers vacuuming of deleted rows and old versions.
+    /// Returns (deleted_rows_cleaned, old_versions_cleaned, transactions_cleaned).
+    fn vacuum(
+        &self,
+        _table_name: Option<&str>,
+        _retention: std::time::Duration,
+    ) -> Result<(i32, i32, i32)> {
+        Ok((0, 0, 0))
     }
 }
 

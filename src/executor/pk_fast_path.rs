@@ -31,7 +31,7 @@ use std::sync::RwLock;
 use crate::common::{CompactArc, SmartString};
 use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement};
-use crate::storage::traits::{Engine, QueryResult};
+use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
 use super::query_cache::{CompiledExecution, CompiledPkLookup, PkValueSource};
