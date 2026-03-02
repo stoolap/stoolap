@@ -460,6 +460,16 @@ impl Executor {
                 }
                 lines.push(cte_info);
             }
+            Expression::FunctionTableSource(fs) => {
+                let mut info = format!(
+                    "{}-> Function Scan on {} (actual rows={})",
+                    prefix, fs.function.value, row_count
+                );
+                if let Some(ref alias) = fs.alias {
+                    info.push_str(&format!(" AS {}", alias.value));
+                }
+                lines.push(info);
+            }
             _ => {
                 lines.push(format!(
                     "{}-> Scan: {} (actual rows={})",
@@ -818,6 +828,13 @@ impl Executor {
                     cte_info.push_str(&format!(" AS {}", alias));
                 }
                 lines.push(cte_info);
+            }
+            Expression::FunctionTableSource(fs) => {
+                let mut info = format!("{}-> Function Scan on {}", prefix, fs.function.value);
+                if let Some(ref alias) = fs.alias {
+                    info.push_str(&format!(" AS {}", alias.value));
+                }
+                lines.push(info);
             }
             _ => {
                 lines.push(format!("{}-> Scan: {}", prefix, expr));

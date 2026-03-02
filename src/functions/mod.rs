@@ -24,6 +24,7 @@
 pub mod aggregate;
 pub mod registry;
 pub mod scalar;
+pub mod tvf;
 pub mod window;
 
 use crate::core::{Error, Result, Value};
@@ -37,6 +38,8 @@ pub enum FunctionType {
     Scalar,
     /// Window function (operates over a window of rows)
     Window,
+    /// Table-valued function (generates rows)
+    TableValued,
 }
 
 /// Data type for function signatures

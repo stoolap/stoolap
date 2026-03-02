@@ -881,10 +881,391 @@ impl Executor {
             Expression::ValuesSource(values_source) => {
                 self.execute_values_source(values_source, stmt, ctx, classification)
             }
+            Expression::FunctionTableSource(tvf_source) => {
+                self.execute_tvf_source(tvf_source, stmt, ctx, classification)
+            }
             _ => Err(Error::NotSupported(
                 "Unsupported FROM clause type".to_string(),
             )),
         }
+    }
+
+    /// Evaluate a TVF source: look up function, evaluate args, generate rows, determine columns.
+    /// Execute a TVF for use in a join context: generate rows, build qualified columns,
+    /// and apply an optional filter. Shared by execute_table_expression_with_filter
+    /// and execute_table_expression_with_filter_limit.
+    fn execute_tvf_for_join(
+        tvf_source: &FunctionTableSource,
+        ctx: &ExecutionContext,
+        filter: Option<&Expression>,
+        limit: Option<usize>,
+    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
+        // Only push limit to TVF generation when no filter will discard rows afterwards.
+        // With a filter, we must generate all rows first, then filter, then let
+        // downstream processing handle the limit.
+        let tvf_limit = if filter.is_some() { None } else { limit };
+
+        // Extract range bounds from the filter to narrow TVF generation range.
+        // This avoids materializing millions of rows when a selective predicate exists.
+        let range_hint = filter.and_then(|filter_expr| {
+            let col_name: SmartString = if !tvf_source.column_aliases.is_empty() {
+                tvf_source.column_aliases[0].value_lower.clone()
+            } else {
+                SmartString::from("value")
+            };
+            let mut min_bound: Option<i64> = None;
+            let mut max_bound: Option<i64> = None;
+            Self::collect_range_bounds(filter_expr, &col_name, ctx, &mut min_bound, &mut max_bound);
+            if min_bound.is_some() || max_bound.is_some() {
+                Some((min_bound, max_bound))
+            } else {
+                None
+            }
+        });
+
+        let (mut result_rows, column_names) =
+            Self::evaluate_tvf_with_range(tvf_source, ctx, tvf_limit, range_hint)?;
+
+        let table_alias = tvf_source
+            .alias
+            .as_ref()
+            .map(|a| a.value.to_string())
+            .unwrap_or_else(|| tvf_source.function.value.to_string());
+
+        let qualified_columns: Vec<String> = column_names
+            .iter()
+            .map(|col| format!("{}.{}", table_alias, col))
+            .collect();
+
+        if let Some(filter_expr) = filter {
+            let row_filter = RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
+            result_rows.retain(|(_, row)| row_filter.matches(row));
+        }
+
+        let result: Box<dyn QueryResult> = Box::new(ExecutorResult::new(column_names, result_rows));
+        Ok((result, qualified_columns))
+    }
+
+    /// Extract a simple LIMIT value from a SelectStatement, if present and evaluable.
+    fn extract_limit_hint(stmt: &SelectStatement, ctx: &ExecutionContext) -> Option<usize> {
+        let limit_expr = stmt.limit.as_ref()?;
+        let offset = stmt.offset.as_ref().and_then(|off| {
+            ExpressionEval::compile(off, &[])
+                .ok()?
+                .with_context(ctx)
+                .eval_slice(&Row::new())
+                .ok()
+                .and_then(|v| v.as_int64())
+                .map(|v| v.max(0) as usize)
+        });
+        let limit_val = ExpressionEval::compile(limit_expr, &[])
+            .ok()?
+            .with_context(ctx)
+            .eval_slice(&Row::new())
+            .ok()?
+            .as_int64()?;
+        if limit_val < 0 {
+            return None;
+        }
+        let total = (limit_val as usize).saturating_add(offset.unwrap_or(0));
+        Some(total)
+    }
+
+    /// Execute a table-valued function source (e.g., generate_series(1, 10))
+    fn execute_tvf_source(
+        &self,
+        tvf_source: &FunctionTableSource,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        classification: &Arc<QueryClassification>,
+    ) -> SelectResult {
+        // Push LIMIT down to TVF generation only when nothing can filter/reshape/reorder:
+        // WHERE, GROUP BY, HAVING, ORDER BY, DISTINCT, aggregation, window functions, set operations
+        let limit_hint = if stmt.where_clause.is_none()
+            && stmt.group_by.columns.is_empty()
+            && stmt.having.is_none()
+            && stmt.order_by.is_empty()
+            && !stmt.distinct
+            && !classification.has_aggregation
+            && !classification.has_window_functions
+            && !classification.has_set_operations
+        {
+            Self::extract_limit_hint(stmt, ctx)
+        } else {
+            None
+        };
+
+        // Short-circuit: if WHERE is a constant-false expression (e.g., 1=0),
+        // skip TVF generation entirely and return empty result.
+        if let Some(ref where_clause) = stmt.where_clause {
+            if let Ok(eval) = ExpressionEval::compile(where_clause, &[]) {
+                if let Ok(val) = eval.with_context(ctx).eval_slice(&Row::new()) {
+                    if val == Value::Boolean(false) {
+                        let columns = if !tvf_source.column_aliases.is_empty() {
+                            tvf_source
+                                .column_aliases
+                                .iter()
+                                .map(|id| id.value.to_string())
+                                .collect()
+                        } else {
+                            vec!["value".to_string()]
+                        };
+                        return self.execute_query_on_memory_result(
+                            stmt,
+                            ctx,
+                            columns,
+                            RowVec::new(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Extract range bounds from WHERE clause to narrow TVF generation range.
+        // This avoids materializing millions of rows when a selective predicate exists.
+        let range_hint = Self::extract_tvf_range_hint(tvf_source, stmt, ctx);
+
+        let (result_rows, columns) =
+            Self::evaluate_tvf_with_range(tvf_source, ctx, limit_hint, range_hint)?;
+
+        // Delegate to execute_query_on_memory_result which handles
+        // WHERE, ORDER BY, LIMIT, GROUP BY, aggregation, window functions
+        self.execute_query_on_memory_result(stmt, ctx, columns, result_rows)
+    }
+
+    /// Extract integer range bounds from the WHERE clause for a TVF.
+    /// Returns (min_bound, max_bound) where each is inclusive.
+    /// Only handles simple comparisons on the TVF's output column with integer literals.
+    fn extract_tvf_range_hint(
+        tvf_source: &FunctionTableSource,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Option<(Option<i64>, Option<i64>)> {
+        let where_clause = stmt.where_clause.as_ref()?;
+
+        // Determine the TVF value column name (from alias or default "value")
+        let col_name: SmartString = if !tvf_source.column_aliases.is_empty() {
+            tvf_source.column_aliases[0].value_lower.clone()
+        } else {
+            SmartString::from("value")
+        };
+
+        let mut min_bound: Option<i64> = None;
+        let mut max_bound: Option<i64> = None;
+
+        Self::collect_range_bounds(where_clause, &col_name, ctx, &mut min_bound, &mut max_bound);
+
+        if min_bound.is_some() || max_bound.is_some() {
+            Some((min_bound, max_bound))
+        } else {
+            None
+        }
+    }
+
+    /// Recursively collect range bounds from AND-conjuncted comparison predicates.
+    fn collect_range_bounds(
+        expr: &Expression,
+        col_name: &str,
+        ctx: &ExecutionContext,
+        min_bound: &mut Option<i64>,
+        max_bound: &mut Option<i64>,
+    ) {
+        match expr {
+            Expression::Infix(infix) if infix.operator == "AND" => {
+                Self::collect_range_bounds(&infix.left, col_name, ctx, min_bound, max_bound);
+                Self::collect_range_bounds(&infix.right, col_name, ctx, min_bound, max_bound);
+            }
+            Expression::Infix(infix) => {
+                // Try col OP literal and literal OP col
+                let (is_col_left, literal_val) = if Self::is_tvf_column(&infix.left, col_name) {
+                    (true, Self::try_eval_to_i64(&infix.right, ctx))
+                } else if Self::is_tvf_column(&infix.right, col_name) {
+                    (false, Self::try_eval_to_i64(&infix.left, ctx))
+                } else {
+                    return;
+                };
+
+                let val = match literal_val {
+                    Some(v) => v,
+                    None => return,
+                };
+
+                // Normalize to col OP val form
+                let op = if is_col_left {
+                    infix.operator.as_str()
+                } else {
+                    // Flip: literal OP col → col FLIPPED_OP literal
+                    match infix.operator.as_str() {
+                        ">" => "<",
+                        ">=" => "<=",
+                        "<" => ">",
+                        "<=" => ">=",
+                        "=" => "=",
+                        _ => return,
+                    }
+                };
+
+                match op {
+                    ">=" => {
+                        *min_bound = Some(min_bound.map_or(val, |cur| cur.max(val)));
+                    }
+                    ">" => {
+                        let bound = val.saturating_add(1);
+                        *min_bound = Some(min_bound.map_or(bound, |cur| cur.max(bound)));
+                    }
+                    "<=" => {
+                        *max_bound = Some(max_bound.map_or(val, |cur| cur.min(val)));
+                    }
+                    "<" => {
+                        let bound = val.saturating_sub(1);
+                        *max_bound = Some(max_bound.map_or(bound, |cur| cur.min(bound)));
+                    }
+                    "=" => {
+                        *min_bound = Some(min_bound.map_or(val, |cur| cur.max(val)));
+                        *max_bound = Some(max_bound.map_or(val, |cur| cur.min(val)));
+                    }
+                    _ => {}
+                }
+            }
+            Expression::Between(between) if !between.not => {
+                if Self::is_tvf_column(&between.expr, col_name) {
+                    if let Some(lo) = Self::try_eval_to_i64(&between.lower, ctx) {
+                        *min_bound = Some(min_bound.map_or(lo, |cur| cur.max(lo)));
+                    }
+                    if let Some(hi) = Self::try_eval_to_i64(&between.upper, ctx) {
+                        *max_bound = Some(max_bound.map_or(hi, |cur| cur.min(hi)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Check if an expression refers to the TVF's output column.
+    fn is_tvf_column(expr: &Expression, col_name: &str) -> bool {
+        match expr {
+            Expression::Identifier(id) => id.value_lower.eq_ignore_ascii_case(col_name),
+            Expression::QualifiedIdentifier(qi) => {
+                qi.name.value_lower.eq_ignore_ascii_case(col_name)
+            }
+            _ => false,
+        }
+    }
+
+    /// Try to extract an exact i64 constant from an expression (for TVF range pushdown).
+    /// Only accepts syntactically visible constants (integer literals, negated integer literals,
+    /// simple arithmetic on integer literals). Never evaluates function calls or other
+    /// potentially volatile expressions — those would be evaluated once here but per-row
+    /// in the real WHERE filter, changing semantics.
+    fn try_eval_to_i64(expr: &Expression, _ctx: &ExecutionContext) -> Option<i64> {
+        match expr {
+            Expression::IntegerLiteral(lit) => Some(lit.value),
+            Expression::Prefix(p) if p.operator == "-" => {
+                if let Expression::IntegerLiteral(lit) = &*p.right {
+                    lit.value.checked_neg()
+                } else {
+                    None
+                }
+            }
+            // Simple constant arithmetic: 2+3, 10-1, 2*5
+            Expression::Infix(inf) => {
+                let l = Self::try_eval_to_i64(&inf.left, _ctx)?;
+                let r = Self::try_eval_to_i64(&inf.right, _ctx)?;
+                match inf.operator.as_str() {
+                    "+" => l.checked_add(r),
+                    "-" => l.checked_sub(r),
+                    "*" => l.checked_mul(r),
+                    "/" if r != 0 => Some(l / r),
+                    _ => None,
+                }
+            }
+            // Everything else (floats, function calls, casts, subqueries, etc.)
+            // is either non-integer or potentially volatile — reject.
+            _ => None,
+        }
+    }
+
+    /// Evaluate a TVF with optional range clamping on start/stop args.
+    fn evaluate_tvf_with_range(
+        tvf_source: &FunctionTableSource,
+        ctx: &ExecutionContext,
+        limit: Option<usize>,
+        range_hint: Option<(Option<i64>, Option<i64>)>,
+    ) -> Result<(RowVec, Vec<String>)> {
+        use crate::functions::global_registry;
+
+        let func_name = &tvf_source.function.value;
+        let tvf = global_registry().get_tvf(func_name).ok_or_else(|| {
+            Error::NotSupported(format!("Unknown table-valued function: {}", func_name))
+        })?;
+
+        // Evaluate arguments to Values
+        let mut arg_values = Vec::with_capacity(tvf_source.arguments.len());
+        for arg in &tvf_source.arguments {
+            let value = ExpressionEval::compile(arg, &[])?
+                .with_context(ctx)
+                .eval_slice(&Row::new())?;
+            arg_values.push(value);
+        }
+
+        // Apply range clamping for integer series: narrow start/stop based on WHERE bounds.
+        // Only safe when: 2-3 integer args, step is 1 or -1 (or defaulted).
+        if let Some((min_bound, max_bound)) = range_hint {
+            if arg_values.len() >= 2 {
+                let all_integer = arg_values.iter().all(|v| matches!(v, Value::Integer(_)));
+                if all_integer {
+                    let start = arg_values[0].as_int64().unwrap();
+                    let stop = arg_values[1].as_int64().unwrap();
+                    let step = if arg_values.len() == 3 {
+                        arg_values[2].as_int64().unwrap()
+                    } else if start <= stop {
+                        1
+                    } else {
+                        -1
+                    };
+
+                    // Only clamp for unit step (1 or -1) where bounds align exactly
+                    if step == 1 {
+                        if let Some(lo) = min_bound {
+                            if lo > start {
+                                arg_values[0] = Value::Integer(lo);
+                            }
+                        }
+                        if let Some(hi) = max_bound {
+                            if hi < stop {
+                                arg_values[1] = Value::Integer(hi);
+                            }
+                        }
+                    } else if step == -1 {
+                        // Descending: start is the high end, stop is the low end
+                        if let Some(hi) = max_bound {
+                            if hi < start {
+                                arg_values[0] = Value::Integer(hi);
+                            }
+                        }
+                        if let Some(lo) = min_bound {
+                            if lo > stop {
+                                arg_values[1] = Value::Integer(lo);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let result_rows = tvf.generate(&arg_values, limit)?;
+
+        let columns: Vec<String> = if !tvf_source.column_aliases.is_empty() {
+            tvf_source
+                .column_aliases
+                .iter()
+                .map(|id| id.value.to_string())
+                .collect()
+        } else {
+            tvf.column_names()
+        };
+
+        Ok((result_rows, columns))
     }
 
     /// Execute SELECT without FROM (expressions only)
@@ -980,9 +1361,25 @@ impl Executor {
         columns: Vec<String>,
         rows: RowVec,
     ) -> SelectResult {
-        // Use the CTE execution logic from cte.rs
-        let (result_cols, result_rows) =
-            self.execute_query_on_cte_result(stmt, ctx, columns, rows)?;
+        // Check if ORDER BY has complex expressions (e.g., -value, SUM(x), val*2)
+        // that the CTE path's simple column-name-based sort can't handle.
+        // If so, skip ORDER BY/LIMIT in the CTE path and let outer execute_select handle it.
+        let has_complex_order_by = stmt.order_by.iter().any(|ob| {
+            !matches!(
+                &ob.expression,
+                Expression::Identifier(_)
+                    | Expression::QualifiedIdentifier(_)
+                    | Expression::IntegerLiteral(_)
+            )
+        });
+
+        // Also skip when DISTINCT is present: the outer execute_select applies
+        // DISTINCT after projection but before LIMIT. If we apply LIMIT here first,
+        // DISTINCT sees too few rows and produces wrong results.
+        let skip_order_limit = has_complex_order_by || stmt.distinct;
+
+        let (result_cols, result_rows, order_limit_applied) =
+            self.execute_query_on_cte_result_inner(stmt, ctx, columns, rows, skip_order_limit)?;
         let result_cols = CompactArc::new(result_cols);
         Ok((
             Box::new(ExecutorResult::with_arc_columns(
@@ -990,7 +1387,7 @@ impl Executor {
                 result_rows,
             )),
             result_cols,
-            false,
+            order_limit_applied,
             None,
         ))
     }
@@ -2926,6 +3323,34 @@ impl Executor {
         classification: &std::sync::Arc<QueryClassification>,
     ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
+
+        // Short-circuit: if WHERE is constant-false (e.g., 1=0), skip all join
+        // materialization and return an empty result immediately.
+        if let Some(ref where_clause) = stmt.where_clause {
+            if let Ok(eval) = ExpressionEval::compile(where_clause, &[]) {
+                if let Ok(Value::Boolean(false)) = eval.with_context(ctx).eval_slice(&Row::new()) {
+                    // Derive output column names from SELECT clause
+                    let col_names: Vec<String> = stmt
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, expr)| match expr {
+                            Expression::Aliased(a) => Some(a.alias.value.to_string()),
+                            Expression::Identifier(id) => Some(id.value.to_string()),
+                            Expression::QualifiedIdentifier(qi) => Some(qi.name.value.to_string()),
+                            Expression::Star(_) | Expression::QualifiedStar(_) => None,
+                            _ => Some(format!("column{}", i + 1)),
+                        })
+                        .collect();
+                    let columns = CompactArc::new(col_names);
+                    let result = ExecutorResult::with_arc_columns(
+                        CompactArc::clone(&columns),
+                        RowVec::new(),
+                    );
+                    return Ok((Box::new(result), columns, false, None));
+                }
+            }
+        }
 
         // Get table aliases for filter pushdown
         let left_alias = get_table_alias_from_expr(&join_source.left);
@@ -5009,6 +5434,9 @@ impl Executor {
                     self.execute_values_source(vs, &select_all, ctx, &classification)?;
                 Ok((result, columns.to_vec()))
             }
+            Expression::FunctionTableSource(tvf_source) => {
+                Self::execute_tvf_for_join(tvf_source, ctx, filter, None)
+            }
             _ => Err(Error::NotSupported(
                 "Unsupported table expression type".to_string(),
             )),
@@ -5026,6 +5454,22 @@ impl Executor {
         filter: Option<&Expression>,
         row_limit: Option<usize>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
+        // Handle FunctionTableSource with limit passthrough
+        let tvf_source = match expr {
+            Expression::FunctionTableSource(fts) => Some(fts.as_ref()),
+            Expression::Aliased(aliased) => {
+                if let Expression::FunctionTableSource(fts) = aliased.expression.as_ref() {
+                    Some(fts.as_ref())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(tvf_source) = tvf_source {
+            return Self::execute_tvf_for_join(tvf_source, ctx, filter, row_limit);
+        }
+
         // Extract TableSource from the expression (handles both direct and aliased)
         let (ts, custom_alias) = match expr {
             Expression::TableSource(ts) => (ts, None),

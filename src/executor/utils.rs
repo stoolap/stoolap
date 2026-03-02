@@ -966,6 +966,19 @@ pub fn get_table_alias_from_expr(expr: &Expression) -> Option<String> {
                 .unwrap_or_else(|| ts.name.value.to_string()),
         ),
         Expression::SubquerySource(ss) => ss.alias.as_ref().map(|a| a.value.to_string()),
+        Expression::FunctionTableSource(fs) => Some(
+            fs.alias
+                .as_ref()
+                .map(|a| a.value.to_string())
+                .unwrap_or_else(|| fs.function.value.to_string()),
+        ),
+        Expression::ValuesSource(vs) => vs.alias.as_ref().map(|a| a.value.to_string()),
+        Expression::CteReference(cr) => Some(
+            cr.alias
+                .as_ref()
+                .map(|a| a.value.to_string())
+                .unwrap_or_else(|| cr.name.value.to_string()),
+        ),
         _ => None,
     }
 }

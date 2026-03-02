@@ -21,7 +21,42 @@ use rustc_hash::FxHashMap;
 use super::ast::*;
 use super::parser::Parser;
 use super::precedence::Precedence;
-use super::token::TokenType;
+use super::token::{Token, TokenType};
+
+/// Keywords that cannot be used as implicit table aliases in FROM clauses.
+/// Shared by SimpleTableSource, FunctionTableSource, and ValuesTableSource parsing.
+const RESERVED_ALIAS_KEYWORDS: &[&str] = &[
+    "JOIN",
+    "LEFT",
+    "RIGHT",
+    "INNER",
+    "OUTER",
+    "CROSS",
+    "FULL",
+    "NATURAL",
+    "ON",
+    "USING",
+    "WHERE",
+    "GROUP",
+    "HAVING",
+    "ORDER",
+    "LIMIT",
+    "OFFSET",
+    "FETCH",
+    "WINDOW",
+    "FOR",
+    "INTO",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+];
+
+/// Check if a token's uppercase literal is a reserved alias keyword.
+fn is_reserved_alias_keyword(upper: &str) -> bool {
+    RESERVED_ALIAS_KEYWORDS
+        .iter()
+        .any(|&kw| kw.eq_ignore_ascii_case(upper))
+}
 
 impl Parser {
     /// Parse a statement
@@ -502,6 +537,11 @@ impl Parser {
         let token = self.cur_token.clone();
         let name = Identifier::new(token.clone(), self.cur_token.literal.clone());
 
+        // Check for table-valued function: identifier followed by '('
+        if self.peek_token_is_punctuator("(") {
+            return self.parse_function_table_source(token, name);
+        }
+
         // Check for AS OF clause (temporal queries)
         let as_of = if self.peek_token_is_keyword("AS") {
             self.next_token(); // consume AS
@@ -548,27 +588,7 @@ impl Parser {
         } else if self.peek_token_is(TokenType::Identifier) {
             // Check if this might be a join keyword or clause keyword
             let peek_upper = self.peek_token.literal.to_uppercase();
-            if !matches!(
-                peek_upper.as_str(),
-                "JOIN"
-                    | "LEFT"
-                    | "RIGHT"
-                    | "INNER"
-                    | "OUTER"
-                    | "CROSS"
-                    | "NATURAL"
-                    | "ON"
-                    | "WHERE"
-                    | "GROUP"
-                    | "HAVING"
-                    | "ORDER"
-                    | "LIMIT"
-                    | "OFFSET"
-                    | "FETCH"
-                    | "UNION"
-                    | "INTERSECT"
-                    | "EXCEPT"
-            ) {
+            if !is_reserved_alias_keyword(&peek_upper) {
                 self.next_token();
                 alias = Some(Identifier::new(
                     self.cur_token.clone(),
@@ -1121,6 +1141,116 @@ impl Parser {
             alias,
             column_aliases,
         })))
+    }
+
+    /// Parse a function table source (table-valued function in FROM clause)
+    /// e.g., generate_series(1, 10) AS gs(value)
+    fn parse_function_table_source(
+        &mut self,
+        token: Token,
+        name: Identifier,
+    ) -> Option<Expression> {
+        self.next_token(); // consume '('
+        self.next_token(); // advance to first arg or ')'
+
+        let mut arguments = Vec::new();
+
+        // Parse arguments (comma-separated expressions)
+        if !self.cur_token_is_punctuator(")") {
+            if let Some(arg) = self.parse_expression(Precedence::Lowest) {
+                arguments.push(arg);
+            }
+            while self.peek_token_is_punctuator(",") {
+                self.next_token(); // consume ','
+                self.next_token(); // move to next arg
+                if let Some(arg) = self.parse_expression(Precedence::Lowest) {
+                    arguments.push(arg);
+                } else {
+                    self.add_error(format!(
+                        "expected expression after ',' at {}",
+                        self.cur_token.position
+                    ));
+                    return None;
+                }
+            }
+        }
+
+        // Expect closing ')' - if cur_token is already ')' (zero-arg case), we're done;
+        // otherwise it should be the peek token
+        if !self.cur_token_is_punctuator(")")
+            && (!self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")")
+        {
+            self.add_error(format!(
+                "expected ')' after function arguments at {}",
+                self.cur_token.position
+            ));
+            return None;
+        }
+
+        // Parse optional alias and column aliases (same pattern as VALUES table source)
+        let mut alias = None;
+        let mut column_aliases = Vec::new();
+
+        if self.peek_token_is_keyword("AS") {
+            self.next_token(); // consume AS
+            if !self.expect_peek(TokenType::Identifier) {
+                self.add_error(format!(
+                    "expected alias after AS at {}",
+                    self.cur_token.position
+                ));
+                return None;
+            }
+            alias = Some(Identifier::new(
+                self.cur_token.clone(),
+                self.cur_token.literal.clone(),
+            ));
+
+            // Parse optional column aliases: AS gs(value)
+            if self.peek_token_is_punctuator("(") {
+                self.next_token(); // consume (
+                column_aliases = self.parse_identifier_list();
+                if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+                    self.add_error(format!(
+                        "expected ')' after column aliases at {}",
+                        self.cur_token.position
+                    ));
+                    return None;
+                }
+            }
+        } else if self.peek_token_is(TokenType::Identifier) {
+            // Implicit alias without AS keyword
+            let peek_upper = self.peek_token.literal.to_uppercase();
+            if !is_reserved_alias_keyword(&peek_upper) {
+                self.next_token();
+                alias = Some(Identifier::new(
+                    self.cur_token.clone(),
+                    self.cur_token.literal.clone(),
+                ));
+
+                // Parse optional column aliases
+                if self.peek_token_is_punctuator("(") {
+                    self.next_token(); // consume (
+                    column_aliases = self.parse_identifier_list();
+                    if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+                        self.add_error(format!(
+                            "expected ')' after column aliases at {}",
+                            self.cur_token.position
+                        ));
+                        return None;
+                    }
+                }
+            }
+        }
+
+        Some(Expression::FunctionTableSource(Box::new(
+            FunctionTableSource {
+                token,
+                function: name,
+                arguments,
+                alias,
+                column_aliases,
+            },
+        )))
     }
 
     /// Parse an UPDATE statement

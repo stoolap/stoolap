@@ -2209,6 +2209,13 @@ impl Executor {
                     tables.push(alias.value_lower.to_string());
                 }
             }
+            Expression::FunctionTableSource(fs) => {
+                if let Some(ref alias) = fs.alias {
+                    tables.push(alias.value_lower.to_string());
+                } else {
+                    tables.push(fs.function.value_lower.to_string());
+                }
+            }
             _ => {}
         }
     }

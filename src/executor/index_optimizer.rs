@@ -635,7 +635,8 @@ impl Executor {
             | Expression::JoinSource(_)
             | Expression::SubquerySource(_)
             | Expression::ValuesSource(_)
-            | Expression::CteReference(_) => true,
+            | Expression::CteReference(_)
+            | Expression::FunctionTableSource(_) => true,
         }
     }
 

@@ -107,6 +107,8 @@ pub enum Expression {
     ValuesSource(Box<ValuesTableSource>),
     /// CTE reference - Boxed to reduce enum size (336 bytes unboxed)
     CteReference(Box<CteReference>),
+    /// Function table source (table-valued function in FROM clause) - Boxed to reduce enum size
+    FunctionTableSource(Box<FunctionTableSource>),
     /// Star (*) for SELECT *
     Star(StarExpression),
     /// Qualified star (table.*) for SELECT table.*
@@ -149,6 +151,7 @@ impl fmt::Display for Expression {
             Expression::SubquerySource(e) => write!(f, "{}", e),
             Expression::ValuesSource(e) => write!(f, "{}", e),
             Expression::CteReference(e) => write!(f, "{}", e),
+            Expression::FunctionTableSource(e) => write!(f, "{}", e),
             Expression::Star(e) => write!(f, "{}", e),
             Expression::QualifiedStar(e) => write!(f, "{}", e),
             Expression::Default(e) => write!(f, "{}", e),
@@ -191,6 +194,7 @@ impl Expression {
             Expression::SubquerySource(e) => e.token.position,
             Expression::ValuesSource(e) => e.token.position,
             Expression::CteReference(e) => e.token.position,
+            Expression::FunctionTableSource(e) => e.token.position,
             Expression::Star(e) => e.token.position,
             Expression::QualifiedStar(e) => e.token.position,
             Expression::Default(e) => e.token.position,
@@ -1157,6 +1161,42 @@ impl fmt::Display for ValuesTableSource {
             }
         }
         write!(f, "{}", result)
+    }
+}
+
+/// Function table source (table-valued function in FROM clause)
+/// e.g., SELECT * FROM generate_series(1, 10) AS gs(value)
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionTableSource {
+    pub token: Token,
+    /// Function name
+    pub function: Identifier,
+    /// Function arguments
+    pub arguments: Vec<Expression>,
+    /// Optional table alias
+    pub alias: Option<Identifier>,
+    /// Optional column aliases (e.g., AS gs(value))
+    pub column_aliases: Vec<Identifier>,
+}
+
+impl fmt::Display for FunctionTableSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}(", self.function)?;
+        for (i, arg) in self.arguments.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{}", arg)?;
+        }
+        write!(f, ")")?;
+        if let Some(ref alias) = self.alias {
+            write!(f, " AS {}", alias)?;
+            if !self.column_aliases.is_empty() {
+                let cols: Vec<String> = self.column_aliases.iter().map(|c| c.to_string()).collect();
+                write!(f, "({})", cols.join(", "))?;
+            }
+        }
+        Ok(())
     }
 }
 

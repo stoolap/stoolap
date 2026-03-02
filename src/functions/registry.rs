@@ -59,6 +59,7 @@ use super::scalar::{
     SubstringFunction, TanFunction, TimeTruncFunction, ToCharFunction, TrimFunction, TruncFunction,
     TruncateFunction, TypeOfFunction, UpperFunction, VersionFunction, YearFunction,
 };
+use super::tvf::{GenerateSeriesFunction, GenerateSeriesScalarFunction, TableValuedFunction};
 use super::window::{
     CumeDistFunction, DenseRankFunction, FirstValueFunction, LagFunction, LastValueFunction,
     LeadFunction, NthValueFunction, NtileFunction, PercentRankFunction, RankFunction,
@@ -72,6 +73,8 @@ type AggregateFnFactory = Arc<dyn Fn() -> Box<dyn AggregateFunction> + Send + Sy
 type ScalarFnFactory = Arc<dyn Fn() -> Box<dyn ScalarFunction> + Send + Sync>;
 /// Type alias for window function factory
 type WindowFnFactory = Arc<dyn Fn() -> Box<dyn WindowFunction> + Send + Sync>;
+/// Type alias for table-valued function factory
+type TvfFactory = Arc<dyn Fn() -> Box<dyn TableValuedFunction> + Send + Sync>;
 
 /// Function registry for SQL functions
 pub struct FunctionRegistry {
@@ -81,6 +84,8 @@ pub struct FunctionRegistry {
     scalar_functions: RwLock<StringMap<ScalarFnFactory>>,
     /// Window functions
     window_functions: RwLock<StringMap<WindowFnFactory>>,
+    /// Table-valued functions
+    tvf_functions: RwLock<StringMap<TvfFactory>>,
     /// Function info cache
     function_info: RwLock<StringMap<FunctionInfo>>,
 }
@@ -98,6 +103,7 @@ impl FunctionRegistry {
             aggregate_functions: RwLock::new(StringMap::new()),
             scalar_functions: RwLock::new(StringMap::new()),
             window_functions: RwLock::new(StringMap::new()),
+            tvf_functions: RwLock::new(StringMap::new()),
             function_info: RwLock::new(StringMap::new()),
         };
 
@@ -224,6 +230,9 @@ impl FunctionRegistry {
         #[cfg(feature = "semantic")]
         registry.register_scalar::<EmbedFunction>();
 
+        // Register generate_series as scalar (returns JSON array for SELECT usage)
+        registry.register_scalar::<GenerateSeriesScalarFunction>();
+
         // Register built-in window functions
         registry.register_window::<RowNumberFunction>();
         registry.register_window::<RankFunction>();
@@ -236,6 +245,12 @@ impl FunctionRegistry {
         registry.register_window::<NthValueFunction>();
         registry.register_window::<PercentRankFunction>();
         registry.register_window::<CumeDistFunction>();
+
+        // Register built-in table-valued functions
+        registry.register_tvf(
+            "GENERATE_SERIES",
+            Arc::new(|| Box::new(GenerateSeriesFunction)),
+        );
 
         registry
     }
@@ -351,9 +366,35 @@ impl FunctionRegistry {
         funcs.contains_key(&upper)
     }
 
+    /// Register a table-valued function
+    pub fn register_tvf(&self, name: &str, factory: TvfFactory) {
+        let mut funcs = self.tvf_functions.write().unwrap();
+        funcs.insert(name.to_string(), factory);
+    }
+
+    /// Get a new instance of a table-valued function by name
+    pub fn get_tvf(&self, name: &str) -> Option<Box<dyn TableValuedFunction>> {
+        let funcs = self.tvf_functions.read().unwrap();
+        if let Some(f) = funcs.get(name) {
+            return Some(f());
+        }
+        let upper = name.to_uppercase();
+        funcs.get(&upper).map(|f| f())
+    }
+
+    /// Check if a function name is a table-valued function
+    pub fn is_tvf(&self, name: &str) -> bool {
+        let funcs = self.tvf_functions.read().unwrap();
+        if funcs.contains_key(name) {
+            return true;
+        }
+        let upper = name.to_uppercase();
+        funcs.contains_key(&upper)
+    }
+
     /// Check if a function exists
     pub fn exists(&self, name: &str) -> bool {
-        self.is_aggregate(name) || self.is_scalar(name) || self.is_window(name)
+        self.is_aggregate(name) || self.is_scalar(name) || self.is_window(name) || self.is_tvf(name)
     }
 
     /// Get function info by name

@@ -7,7 +7,7 @@ order: 1
 
 # SQL Functions Reference
 
-Quick reference for all built-in SQL functions in Stoolap (117 in the default build, 118 with the `semantic` feature), organized by category. For detailed documentation with examples, see [Scalar Functions]({% link _docs/functions/scalar-functions.md %}), [Aggregate Functions]({% link _docs/functions/aggregate-functions.md %}), and [Window Functions]({% link _docs/functions/window-functions.md %}).
+Quick reference for all built-in SQL functions in Stoolap (118 in the default build, 119 with the `semantic` feature), organized by category. For detailed documentation with examples, see [Scalar Functions]({% link _docs/functions/scalar-functions.md %}), [Aggregate Functions]({% link _docs/functions/aggregate-functions.md %}), [Window Functions]({% link _docs/functions/window-functions.md %}), and [Table-Valued Functions]({% link _docs/functions/table-valued-functions.md %}).
 
 ## Aggregate Functions (17)
 
@@ -222,6 +222,22 @@ SELECT
 FROM orders
 WINDOW w AS (PARTITION BY customer_id ORDER BY order_date);
 ```
+
+## Table-Valued Functions (1)
+
+Table-valued functions return a set of rows and are used in the `FROM` clause. See [Table-Valued Functions]({% link _docs/functions/table-valued-functions.md %}) for detailed documentation.
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `GENERATE_SERIES` | `GENERATE_SERIES(start, stop [, step])` | Generate a series of integer, float, or timestamp values |
+
+Supported types:
+
+| Type | Start/Stop | Step | Example |
+|------|-----------|------|---------|
+| Integer | `1`, `100` | `1`, `2`, `-1` | `generate_series(1, 10, 2)` |
+| Float | `0.0`, `1.0` | `0.25` | `generate_series(0.0, 1.0, 0.25)` |
+| Timestamp | `'2024-01-01'` | `'1 day'`, `'2 hours'` | `generate_series('2024-01-01', '2024-12-31', '1 day')` |
 
 ## CASE Expression
 

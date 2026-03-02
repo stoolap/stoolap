@@ -607,6 +607,7 @@ impl<'a> ExprCompiler<'a> {
             | Expression::SubquerySource(_)
             | Expression::ValuesSource(_)
             | Expression::CteReference(_)
+            | Expression::FunctionTableSource(_)
             | Expression::Star(_)
             | Expression::QualifiedStar(_)
             | Expression::Default(_) => {

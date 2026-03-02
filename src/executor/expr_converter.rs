@@ -109,6 +109,7 @@ pub fn convert_ast_to_storage_expr(expr: &ast::Expression) -> Option<Box<dyn Exp
         | ast::Expression::SubquerySource(_)
         | ast::Expression::ValuesSource(_)
         | ast::Expression::CteReference(_)
+        | ast::Expression::FunctionTableSource(_)
         | ast::Expression::Star(_)
         | ast::Expression::QualifiedStar(_)
         | ast::Expression::Default(_)

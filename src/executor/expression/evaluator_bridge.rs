@@ -285,6 +285,12 @@ fn hash_expression(expr: &Expression, hasher: &mut FxHasher) {
         Expression::CteReference(cte) => {
             cte.name.value_lower.hash(hasher);
         }
+        Expression::FunctionTableSource(fts) => {
+            fts.function.value_lower.hash(hasher);
+            for arg in &fts.arguments {
+                hash_expression(arg, hasher);
+            }
+        }
         Expression::Star(_) => {
             // Just discriminant
         }
@@ -1680,6 +1686,12 @@ impl<'a> CompiledEvaluator<'a> {
             }
             Expression::CteReference(cte) => {
                 cte.name.value_lower.hash(hasher);
+            }
+            Expression::FunctionTableSource(fts) => {
+                fts.function.value_lower.hash(hasher);
+                for arg in &fts.arguments {
+                    Self::hash_expression(arg, hasher);
+                }
             }
             Expression::Star(_) => {
                 // Just discriminant

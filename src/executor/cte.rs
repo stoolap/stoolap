@@ -44,7 +44,7 @@ use super::join_executor::{JoinExecutor, JoinRequest};
 use super::operator::{ColumnInfo, Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{IndexLookupStrategy, IndexNestedLoopJoinOperator};
-use super::query_classification::get_classification;
+use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
 use super::utils::{build_column_index_map, extract_join_keys_and_residual, is_sorted_on_keys};
 use super::Executor;
@@ -1084,6 +1084,23 @@ impl Executor {
         cte_columns: Vec<String>,
         cte_rows: RowVec,
     ) -> Result<(Vec<String>, RowVec)> {
+        let (cols, rows, _applied) =
+            self.execute_query_on_cte_result_inner(stmt, ctx, cte_columns, cte_rows, false)?;
+        Ok((cols, rows))
+    }
+
+    /// Inner implementation that optionally skips ORDER BY/LIMIT processing.
+    /// Returns (columns, rows, order_limit_applied).
+    /// When `skip_order_limit` is true, ORDER BY and LIMIT/OFFSET are NOT applied,
+    /// allowing the caller to delegate to a more capable ORDER BY handler.
+    pub(crate) fn execute_query_on_cte_result_inner(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        cte_columns: Vec<String>,
+        cte_rows: RowVec,
+        skip_order_limit: bool,
+    ) -> Result<(Vec<String>, RowVec, bool)> {
         // OPTIMIZATION: Get cached query classification to avoid repeated AST traversals
         let classification = get_classification(stmt);
 
@@ -1119,9 +1136,12 @@ impl Executor {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &cte_columns)?;
             let columns = result.columns().to_vec();
-            let rows = Self::materialize_result(result)?;
+            let mut rows = Self::materialize_result(result)?;
 
-            return Ok((columns, rows));
+            if !skip_order_limit {
+                rows = self.apply_order_by_limit_offset(stmt, &classification, rows, &columns)?;
+            }
+            return Ok((columns, rows, !skip_order_limit));
         }
 
         // Check for window functions
@@ -1129,9 +1149,12 @@ impl Executor {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, &filtered_rows, &cte_columns)?;
             let columns = result.columns().to_vec();
-            let rows = Self::materialize_result(result)?;
+            let mut rows = Self::materialize_result(result)?;
 
-            return Ok((columns, rows));
+            if !skip_order_limit {
+                rows = self.apply_order_by_limit_offset(stmt, &classification, rows, &columns)?;
+            }
+            return Ok((columns, rows, !skip_order_limit));
         }
 
         // Process scalar subqueries in SELECT columns before projection
@@ -1142,18 +1165,116 @@ impl Executor {
         let output_columns =
             self.resolve_cte_output_columns_from_exprs(columns_to_use, &cte_columns)?;
 
-        // Project rows if needed
-        let mut result_rows = if self.needs_projection_for_columns(columns_to_use) {
-            self.project_cte_rows_from_columns(columns_to_use, &filtered_rows, &cte_columns, ctx)?
-        } else {
-            filtered_rows
-        };
+        let needs_projection = self.needs_projection_for_columns(columns_to_use);
 
-        // Apply ORDER BY sorting
-        if classification.has_order_by {
-            result_rows =
-                self.apply_order_by_to_rows(result_rows, &stmt.order_by, &output_columns)?;
+        if skip_order_limit {
+            // Caller will handle ORDER BY + LIMIT/OFFSET via expression-based sort.
+            // If ORDER BY references source columns not in the projected output,
+            // return unprojected rows so the caller can evaluate ORDER BY expressions.
+            // The caller's truncation logic (expected_columns) will trim afterwards.
+            let needs_source_for_order = classification.has_order_by
+                && self.order_by_needs_source_columns(
+                    &stmt.order_by,
+                    &output_columns,
+                    &cte_columns,
+                );
+
+            if needs_source_for_order {
+                // Return source columns + projected columns so caller can sort on source columns
+                // then trim to projected columns via expected_columns mechanism
+                let mut combined_columns = output_columns.clone();
+                for src_col in &cte_columns {
+                    if !combined_columns
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(src_col))
+                    {
+                        combined_columns.push(src_col.clone());
+                    }
+                }
+
+                // Build rows with projected columns first, then extra source columns
+                let result_rows = if needs_projection {
+                    let projected = self.project_cte_rows_from_columns(
+                        columns_to_use,
+                        &filtered_rows,
+                        &cte_columns,
+                        ctx,
+                    )?;
+                    // Append source columns that aren't in output
+                    let extra_src_indices: Vec<usize> = cte_columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| {
+                            !output_columns.iter().any(|oc| oc.eq_ignore_ascii_case(c))
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+
+                    projected
+                        .into_iter()
+                        .zip(filtered_rows.iter())
+                        .map(|((id, proj_row), (_, src_row))| {
+                            let mut vals = proj_row.into_values();
+                            for &idx in &extra_src_indices {
+                                vals.push(
+                                    src_row.get(idx).cloned().unwrap_or(Value::null_unknown()),
+                                );
+                            }
+                            (id, Row::from_values(vals))
+                        })
+                        .collect()
+                } else {
+                    filtered_rows
+                };
+                return Ok((combined_columns, result_rows, false));
+            }
+
+            let result_rows = if needs_projection {
+                self.project_cte_rows_from_columns(
+                    columns_to_use,
+                    &filtered_rows,
+                    &cte_columns,
+                    ctx,
+                )?
+            } else {
+                filtered_rows
+            };
+            return Ok((output_columns, result_rows, false));
         }
+
+        // Check if ORDER BY references source columns not in the projected output.
+        // If so, sort BEFORE projection using source columns, then project after.
+        let needs_pre_sort = classification.has_order_by
+            && self.order_by_needs_source_columns(&stmt.order_by, &output_columns, &cte_columns);
+
+        // Sort before projection if ORDER BY references non-projected source columns
+        let mut result_rows = if needs_pre_sort {
+            if needs_projection {
+                // Sort on source columns first, then project
+                let sorted =
+                    self.apply_order_by_to_rows(filtered_rows, &stmt.order_by, &cte_columns)?;
+                self.project_cte_rows_from_columns(columns_to_use, &sorted, &cte_columns, ctx)?
+            } else {
+                self.apply_order_by_to_rows(filtered_rows, &stmt.order_by, &cte_columns)?
+            }
+        } else {
+            // Normal path: project first, then sort on output columns
+            let mut rows = if needs_projection {
+                self.project_cte_rows_from_columns(
+                    columns_to_use,
+                    &filtered_rows,
+                    &cte_columns,
+                    ctx,
+                )?
+            } else {
+                filtered_rows
+            };
+
+            if classification.has_order_by {
+                rows = self.apply_order_by_to_rows(rows, &stmt.order_by, &output_columns)?;
+            }
+            rows
+        };
 
         // Apply LIMIT and OFFSET (using classification for quick check)
         if classification.has_offset {
@@ -1185,7 +1306,7 @@ impl Executor {
             }
         }
 
-        Ok((output_columns, result_rows))
+        Ok((output_columns, result_rows, true))
     }
 
     /// Extract the base CTE/table name for registry lookup (ignores aliases)
@@ -1450,6 +1571,133 @@ impl Executor {
             }
             std::cmp::Ordering::Equal
         });
+
+        Ok(rows)
+    }
+
+    /// Check if ORDER BY references source columns not present in the projected output.
+    /// Returns true if sorting must happen before projection.
+    /// Recursively inspects expressions (e.g., -value, value*2) for column references.
+    fn order_by_needs_source_columns(
+        &self,
+        order_by: &[OrderByExpression],
+        output_columns: &[String],
+        source_columns: &[String],
+    ) -> bool {
+        let output_lower: AHashSet<String> =
+            output_columns.iter().map(|c| c.to_lowercase()).collect();
+
+        for ob in order_by {
+            if self.expr_references_source_not_output(&ob.expression, &output_lower, source_columns)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Recursively check if an expression references source columns not in the output.
+    /// Conservative: returns true for any unknown composite expression to avoid
+    /// silently dropping columns that ORDER BY needs.
+    fn expr_references_source_not_output(
+        &self,
+        expr: &Expression,
+        output_lower: &AHashSet<String>,
+        source_columns: &[String],
+    ) -> bool {
+        let check = |e: &Expression| {
+            self.expr_references_source_not_output(e, output_lower, source_columns)
+        };
+        let is_source_not_output = |name: &str| {
+            !output_lower.contains(name)
+                && source_columns.iter().any(|c| c.eq_ignore_ascii_case(name))
+        };
+
+        match expr {
+            // Leaf column references — the core check
+            Expression::Identifier(id) => is_source_not_output(id.value_lower.as_str()),
+            Expression::QualifiedIdentifier(qi) => {
+                is_source_not_output(qi.name.value_lower.as_str())
+            }
+
+            // Literals and constants — never reference columns
+            Expression::IntegerLiteral(_)
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
+            | Expression::Parameter(_)
+            | Expression::Star(_)
+            | Expression::QualifiedStar(_)
+            | Expression::Default(_) => false,
+
+            // Composite expressions — recurse into children
+            Expression::Prefix(p) => check(&p.right),
+            Expression::Infix(inf) => check(&inf.left) || check(&inf.right),
+            Expression::FunctionCall(fc) => fc.arguments.iter().any(&check),
+            Expression::Cast(c) => check(&c.expr),
+            Expression::Aliased(a) => check(&a.expression),
+            Expression::Case(case) => {
+                case.value.as_ref().is_some_and(|v| check(v))
+                    || case
+                        .when_clauses
+                        .iter()
+                        .any(|w| check(&w.condition) || check(&w.then_result))
+                    || case.else_value.as_ref().is_some_and(|e| check(e))
+            }
+            Expression::Between(b) => check(&b.expr) || check(&b.lower) || check(&b.upper),
+            Expression::In(i) => check(&i.left),
+            Expression::Like(l) => check(&l.left) || check(&l.pattern),
+            Expression::Distinct(d) => check(&d.expr),
+            Expression::Window(w) => w.function.arguments.iter().any(check),
+
+            // Unknown composite — conservatively assume it may reference source columns
+            _ => true,
+        }
+    }
+
+    /// Apply ORDER BY, OFFSET, and LIMIT to in-memory rows.
+    /// Used by aggregation and window function paths in execute_query_on_cte_result
+    /// which otherwise early-return without these post-processing steps.
+    fn apply_order_by_limit_offset(
+        &self,
+        stmt: &SelectStatement,
+        classification: &QueryClassification,
+        mut rows: RowVec,
+        columns: &[String],
+    ) -> Result<RowVec> {
+        if classification.has_order_by {
+            rows = self.apply_order_by_to_rows(rows, &stmt.order_by, columns)?;
+        }
+
+        if classification.has_offset {
+            if let Some(ref offset_expr) = stmt.offset {
+                let offset = match offset_expr.as_ref() {
+                    Expression::IntegerLiteral(lit) => lit.value as usize,
+                    Expression::FloatLiteral(lit) => lit.value as usize,
+                    _ => 0,
+                };
+                if offset > 0 && offset < rows.len() {
+                    rows.drain(..offset);
+                } else if offset >= rows.len() {
+                    rows.clear();
+                }
+            }
+        }
+
+        if classification.has_limit {
+            if let Some(ref limit_expr) = stmt.limit {
+                let limit = match limit_expr.as_ref() {
+                    Expression::IntegerLiteral(lit) => lit.value as usize,
+                    Expression::FloatLiteral(lit) => lit.value as usize,
+                    _ => usize::MAX,
+                };
+                if limit < rows.len() {
+                    rows.truncate(limit);
+                }
+            }
+        }
 
         Ok(rows)
     }
