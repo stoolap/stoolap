@@ -104,7 +104,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
 
     - name: Run Miri on core modules
-      run: cargo +nightly miri test --lib -- core:: common::
+      run: "cargo +nightly miri test --lib -- core:: common::"
       env:
         MIRIFLAGS: "-Zmiri-disable-isolation"
 
