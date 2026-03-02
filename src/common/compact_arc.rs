@@ -890,6 +890,16 @@ impl<T> CompactArc<[T]> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Returns a raw mutable pointer to the first element of the data region.
+    ///
+    /// Derives the pointer from the header via raw pointer arithmetic, bypassing
+    /// `Deref` (which would create a SharedReadOnly borrow tag under Stacked
+    /// Borrows and prevent subsequent mutable access to the same allocation).
+    #[inline]
+    pub(crate) fn data_ptr_mut(&self) -> *mut T {
+        unsafe { (self.ptr.as_ptr() as *mut u8).add(data_offset_for::<T>()) as *mut T }
+    }
 }
 
 impl<T> Deref for CompactArc<[T]> {

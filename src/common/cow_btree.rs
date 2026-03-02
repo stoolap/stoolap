@@ -88,7 +88,7 @@ impl<V: Clone> Clone for NodePtr<V> {
 
         // SAFETY: ptr points to a valid CompactArc allocation that starts with NodeHeader.
         // The header is read-only here (only accessing drop_count atomically).
-        let header = unsafe { &*(self.ptr.as_ptr() as *const NodeHeader) };
+        let header = unsafe { &*(self.ptr.data_ptr_mut() as *const NodeHeader) };
         header.drop_count.fetch_add(1, Ordering::Relaxed);
 
         Self {
@@ -107,7 +107,7 @@ impl<V: Clone> Drop for NodePtr<V> {
         // With atomic fetch_sub, exactly one thread will see old_count == 1
         // and that thread is responsible for dropping the contents.
         // SAFETY: ptr points to a valid CompactArc allocation that starts with NodeHeader.
-        let header = unsafe { &*(self.ptr.as_ptr() as *const NodeHeader) };
+        let header = unsafe { &*(self.ptr.data_ptr_mut() as *const NodeHeader) };
         let old_count = header.drop_count.fetch_sub(1, Ordering::AcqRel);
 
         if old_count != 1 {
@@ -122,7 +122,7 @@ impl<V: Clone> Drop for NodePtr<V> {
             // SAFETY: We are the last reference (old_count == 1). The values at indices
             // 0..len are valid initialized V instances. After dropping, we don't access them.
             unsafe {
-                let v_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+                let v_ptr = self.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
                 for i in 0..len {
                     ptr::drop_in_place(v_ptr.add(i));
                 }
@@ -133,7 +133,7 @@ impl<V: Clone> Drop for NodePtr<V> {
             // 0..=len are valid NodePtr instances. After dropping, we don't access them.
             unsafe {
                 let c_ptr =
-                    (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+                    self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
                 for i in 0..=len {
                     ptr::drop_in_place(c_ptr.add(i));
                 }
@@ -200,7 +200,7 @@ impl<V: Clone> NodePtr<V> {
         // Check if this node is shared using our own drop_count.
         // If drop_count > 1, we need to deep clone to maintain COW semantics.
         // SAFETY: ptr points to a valid CompactArc allocation that starts with NodeHeader.
-        let header = unsafe { &*(self.ptr.as_ptr() as *const NodeHeader) };
+        let header = unsafe { &*(self.ptr.data_ptr_mut() as *const NodeHeader) };
         if header.drop_count.load(Ordering::Acquire) != 1 {
             // Shared - need proper deep clone (not just byte copy!)
             // Byte copy would cause double-free for non-Copy value types
@@ -224,7 +224,7 @@ impl<V: Clone> NodePtr<V> {
             // SAFETY: Both src and dst are valid pointers within their respective node allocations.
             // Keys are i64 (Copy type), so byte copy is safe. len <= MAX_KEYS.
             unsafe {
-                let k_src = self.ptr.as_ptr().add(Self::keys_offset()) as *const i64;
+                let k_src = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *const i64;
                 let k_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
                 ptr::copy_nonoverlapping(k_src, k_dst, len);
             }
@@ -234,7 +234,7 @@ impl<V: Clone> NodePtr<V> {
             // We use ptr::write to initialize each slot, and increment len after each successful
             // clone to maintain exception safety (if clone panics, only initialized values are dropped).
             unsafe {
-                let v_src = self.ptr.as_ptr().add(Self::values_offset()) as *const V;
+                let v_src = self.ptr.data_ptr_mut().add(Self::values_offset()) as *const V;
                 let v_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
                 for i in 0..len {
                     ptr::write(v_dst.add(i), (*v_src.add(i)).clone());
@@ -253,7 +253,7 @@ impl<V: Clone> NodePtr<V> {
             // SAFETY: Both src and dst are valid pointers within their respective node allocations.
             // Keys are i64 (Copy type), so byte copy is safe. len <= MAX_KEYS.
             unsafe {
-                let k_src = self.ptr.as_ptr().add(Self::keys_offset()) as *const i64;
+                let k_src = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *const i64;
                 let k_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
                 ptr::copy_nonoverlapping(k_src, k_dst, len);
             }
@@ -264,7 +264,7 @@ impl<V: Clone> NodePtr<V> {
             // SAFETY: c_src points to len+1 valid NodePtr instances. c_dst points to uninitialized memory.
             // NodePtr::clone only does atomic operations and cannot panic.
             unsafe {
-                let c_src = self.ptr.as_ptr().add(Self::children_offset()) as *const NodePtr<V>;
+                let c_src = self.ptr.data_ptr_mut().add(Self::children_offset()) as *const NodePtr<V>;
                 let c_dst = (new_node.ptr.as_ptr() as *mut u8).add(Self::children_offset())
                     as *mut NodePtr<V>;
                 for i in 0..=len {
@@ -279,13 +279,17 @@ impl<V: Clone> NodePtr<V> {
 
     fn header(&self) -> &NodeHeader {
         // SAFETY: ptr points to a valid CompactArc allocation that starts with NodeHeader.
-        unsafe { &*(self.ptr.as_ptr() as *const NodeHeader) }
+        // Use data_ptr_mut() to bypass Deref and avoid Stacked Borrows conflicts.
+        unsafe { &*(self.ptr.data_ptr_mut() as *const NodeHeader) }
     }
 
     fn header_mut(&mut self) -> &mut NodeHeader {
         // Assumes we have unique access (called make_mut)
         // SAFETY: ptr points to a valid CompactArc allocation. Caller guarantees unique access.
-        unsafe { &mut *(self.ptr.as_ptr() as *mut NodeHeader) }
+        // Use data_ptr_mut() to bypass Deref and avoid Stacked Borrows conflicts:
+        // going through <[u8]>::as_ptr() would create a SharedReadOnly tag that
+        // prevents the &mut cast needed here.
+        unsafe { &mut *(self.ptr.data_ptr_mut() as *mut NodeHeader) }
     }
 
     fn is_leaf(&self) -> bool {
@@ -305,7 +309,7 @@ impl<V: Clone> NodePtr<V> {
         // SAFETY: ptr + keys_offset points to an array of len initialized i64 keys.
         // The slice lifetime is tied to &self, ensuring validity.
         unsafe {
-            let ptr = self.ptr.as_ptr().add(Self::keys_offset()) as *const i64;
+            let ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *const i64;
             std::slice::from_raw_parts(ptr, len)
         }
     }
@@ -316,7 +320,7 @@ impl<V: Clone> NodePtr<V> {
         // SAFETY: This is a leaf node (asserted). ptr + values_offset points to
         // an array of len initialized V values. The slice lifetime is tied to &self.
         unsafe {
-            let ptr = self.ptr.as_ptr().add(Self::values_offset()) as *const V;
+            let ptr = self.ptr.data_ptr_mut().add(Self::values_offset()) as *const V;
             std::slice::from_raw_parts(ptr, len)
         }
     }
@@ -327,7 +331,7 @@ impl<V: Clone> NodePtr<V> {
         // SAFETY: This is a leaf node (asserted). ptr + values_offset points to
         // an array of len initialized V values. Caller has &mut self, ensuring unique access.
         unsafe {
-            let ptr = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let ptr = self.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
             std::slice::from_raw_parts_mut(ptr, len)
         }
     }
@@ -338,7 +342,7 @@ impl<V: Clone> NodePtr<V> {
                                   // SAFETY: This is an internal node (asserted). ptr + children_offset points to
                                   // an array of len initialized NodePtr children. The slice lifetime is tied to &self.
         unsafe {
-            let ptr = self.ptr.as_ptr().add(Self::children_offset()) as *const NodePtr<V>;
+            let ptr = self.ptr.data_ptr_mut().add(Self::children_offset()) as *const NodePtr<V>;
             std::slice::from_raw_parts(ptr, len)
         }
     }
@@ -350,7 +354,7 @@ impl<V: Clone> NodePtr<V> {
         // an array of len initialized NodePtr children. Caller has &mut self, ensuring unique access.
         unsafe {
             let ptr =
-                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             std::slice::from_raw_parts_mut(ptr, len)
         }
     }
@@ -375,10 +379,10 @@ impl<V: Clone> NodePtr<V> {
         // SAFETY: This is a leaf node (asserted). len <= MAX_KEYS, so index len is within
         // the allocated array bounds (size MAX_KEYS + 1). We write to uninitialized slots.
         unsafe {
-            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             ptr::write(k_ptr.add(len), key);
 
-            let v_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let v_ptr = self.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
             ptr::write(v_ptr.add(len), value);
         }
         self.set_len(len + 1);
@@ -393,10 +397,10 @@ impl<V: Clone> NodePtr<V> {
         // We read the value at index (moving it out), then shift remaining elements left.
         // The last position becomes logically invalid and is excluded by set_len.
         unsafe {
-            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             ptr::copy(k_ptr.add(index + 1), k_ptr.add(index), len - index - 1);
 
-            let v_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let v_ptr = self.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
             let val = ptr::read(v_ptr.add(index));
             ptr::copy(v_ptr.add(index + 1), v_ptr.add(index), len - index - 1);
 
@@ -420,12 +424,12 @@ impl<V: Clone> NodePtr<V> {
         // SAFETY: This is a leaf node (asserted). len <= MAX_KEYS, so we have room for one more.
         // We shift elements at [index..len] to [index+1..len+1], then write the new key/value at index.
         unsafe {
-            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             let p_key = k_ptr.add(index);
             ptr::copy(p_key, p_key.add(1), len - index);
             ptr::write(p_key, key);
 
-            let v_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let v_ptr = self.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
             let p_val = v_ptr.add(index);
             ptr::copy(p_val, p_val.add(1), len - index);
             ptr::write(p_val, value);
@@ -441,11 +445,11 @@ impl<V: Clone> NodePtr<V> {
         // SAFETY: This is an internal node (asserted). len <= MAX_KEYS, so indices len (for key)
         // and len+1 (for child) are within allocated bounds. We write to uninitialized slots.
         unsafe {
-            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             ptr::write(k_ptr.add(len), key);
 
             let c_ptr =
-                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             ptr::write(c_ptr.add(len + 1), child);
         }
         self.set_len(len + 1);
@@ -465,12 +469,12 @@ impl<V: Clone> NodePtr<V> {
         // (NodePtr<V>) are bitwise copied - this is safe because we set self.len = mid afterwards,
         // so those slots become logically uninitialized (won't be dropped when self is dropped).
         unsafe {
-            let k_src = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_src = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             let k_dst = (right.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
             ptr::copy_nonoverlapping(k_src.add(mid + 1), k_dst, right_keys_count);
 
             let c_src =
-                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             let c_dst =
                 (right.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
             ptr::copy_nonoverlapping(c_src.add(mid + 1), c_dst, right_children_count);
@@ -501,7 +505,7 @@ impl<V: Clone> NodePtr<V> {
         // After set_len(len-1), the source slots are logically uninitialized.
         unsafe {
             let c_src =
-                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             let c_dst =
                 (right.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
 
@@ -544,7 +548,7 @@ impl<V: Clone> NodePtr<V> {
             // index - 1 is a valid key index in self (parent of left and current).
             // Writing i64 which is Copy, overwriting existing separator key.
             unsafe {
-                let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
                 ptr::write(k_ptr.add(index - 1), key);
             }
         } else {
@@ -574,7 +578,7 @@ impl<V: Clone> NodePtr<V> {
             // SAFETY: self is an internal node (asserted). separator_idx is valid key index.
             // Writing i64 which is Copy, overwriting existing separator key.
             unsafe {
-                let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
                 ptr::write(k_ptr.add(separator_idx), key);
             }
         }
@@ -591,12 +595,12 @@ impl<V: Clone> NodePtr<V> {
         // index+1. ptr::copy handles overlapping regions correctly. Keys are Copy (i64).
         // The new child is moved in (not cloned) via ptr::write.
         unsafe {
-            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             ptr::copy(k_ptr.add(index), k_ptr.add(index + 1), len - index);
             ptr::write(k_ptr.add(index), key);
 
             let c_ptr =
-                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             ptr::copy(c_ptr.add(index + 1), c_ptr.add(index + 2), len - index);
             ptr::write(c_ptr.add(index + 1), child);
         }
@@ -611,12 +615,12 @@ impl<V: Clone> NodePtr<V> {
         // ptr::copy handles overlapping regions correctly. Keys are Copy (i64).
         // The new child is moved in via ptr::write. len + 1 <= MAX_KEYS + 1 by B-tree invariants.
         unsafe {
-            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             ptr::copy(k_ptr, k_ptr.add(1), len);
             ptr::write(k_ptr, key);
 
             let c_ptr =
-                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             ptr::copy(c_ptr, c_ptr.add(1), len + 1);
             ptr::write(c_ptr, child);
         }
@@ -644,7 +648,7 @@ impl<V: Clone> NodePtr<V> {
             // (it's the separator between children at index and index+1).
             // Writing i64 which is Copy, overwriting existing separator key.
             unsafe {
-                let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
                 ptr::write(k_ptr.add(index), new_sep);
             }
         } else {
@@ -671,7 +675,7 @@ impl<V: Clone> NodePtr<V> {
             // SAFETY: self is an internal node (asserted). index is valid key index.
             // Writing i64 which is Copy, overwriting existing separator key.
             unsafe {
-                let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+                let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
                 ptr::write(k_ptr.add(index), key);
             }
         }
@@ -686,11 +690,11 @@ impl<V: Clone> NodePtr<V> {
         // bitwise copied (ptr::copy handles overlap correctly). The child at the end becomes
         // logically uninitialized after set_len decrements the count.
         unsafe {
-            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             ptr::copy(k_ptr.add(1), k_ptr, len - 1);
 
             let c_ptr =
-                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             ptr::copy(c_ptr.add(1), c_ptr, len);
         }
         self.set_len(len - 1);
@@ -786,7 +790,7 @@ impl<V: Clone> NodePtr<V> {
         // left by 1. ptr::copy handles overlapping regions. Keys are Copy (i64). The slots
         // at the end become logically uninitialized after set_len decrements the count.
         unsafe {
-            let k_ptr = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_ptr = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             ptr::copy(
                 k_ptr.add(key_idx + 1),
                 k_ptr.add(key_idx),
@@ -794,7 +798,7 @@ impl<V: Clone> NodePtr<V> {
             );
 
             let c_ptr =
-                (self.ptr.as_ptr() as *mut u8).add(Self::children_offset()) as *mut NodePtr<V>;
+                self.ptr.data_ptr_mut().add(Self::children_offset()) as *mut NodePtr<V>;
             // Drop the child being removed before overwriting it
             ptr::drop_in_place(c_ptr.add(child_idx));
             ptr::copy(
@@ -818,11 +822,11 @@ impl<V: Clone> NodePtr<V> {
         // are bitwise copied - this is safe because we set self.len = mid afterwards, so those
         // slots become logically uninitialized (won't be dropped when self is dropped).
         unsafe {
-            let k_src = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
+            let k_src = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *mut i64;
             let k_dst = (right.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
             ptr::copy_nonoverlapping(k_src.add(mid), k_dst, right_count);
 
-            let v_src = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let v_src = self.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
             let v_dst = (right.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
             ptr::copy_nonoverlapping(v_src.add(mid), v_dst, right_count);
         }
@@ -851,10 +855,10 @@ impl<V: Clone> NodePtr<V> {
         // key/value to right. The key is Copy (i64). The value is moved via ptr::read
         // then ptr::write. After set_len(len-1), the source slot is logically uninitialized.
         unsafe {
-            let k_src = (self.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *const i64;
+            let k_src = self.ptr.data_ptr_mut().add(Self::keys_offset()) as *const i64;
             let k_dst = (right.ptr.as_ptr() as *mut u8).add(Self::keys_offset()) as *mut i64;
 
-            let v_src = (self.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
+            let v_src = self.ptr.data_ptr_mut().add(Self::values_offset()) as *mut V;
             let v_dst = (right.ptr.as_ptr() as *mut u8).add(Self::values_offset()) as *mut V;
 
             // Copy last key

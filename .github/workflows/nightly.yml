@@ -138,7 +138,7 @@ jobs:
           --test mvcc_isolation_sql_test \
           --test parallel_execution_tests
       env:
-        TSAN_OPTIONS: "second_deadlock_stack=1"
+        TSAN_OPTIONS: "second_deadlock_stack=1 suppressions=${{ github.workspace }}/tsan_suppressions.txt"
 
   address-sanitizer:
     name: Address Sanitizer
