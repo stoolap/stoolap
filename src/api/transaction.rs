@@ -624,12 +624,9 @@ impl Transaction {
                 tx.drop_table_index(table_name, stmt.index_name.value.as_str())?;
                 Ok(Box::new(ExecResult::empty()))
             }
-            Statement::Truncate(stmt) => {
-                tx.drop_table(&stmt.table_name.value)?;
-                // Re-creating table after truncate is complex here,
-                // but let's at least support drop for now if that's what TRUNCATE does in some contexts.
-                // Actually StorageTransaction should probably have a truncate method.
-                // For now, let's just return NotSupported for Truncate if we can't do it properly.
+            Statement::Truncate(_) => {
+                // TRUNCATE is not yet supported in the Transaction API.
+                // We must return an error BEFORE performing any destructive actions.
                 Err(Error::NotSupported(
                     "TRUNCATE not yet supported in Transaction API".to_string(),
                 ))

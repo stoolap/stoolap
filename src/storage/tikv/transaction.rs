@@ -28,6 +28,30 @@ use super::engine::TiKVEngine;
 use super::error::from_tikv_error;
 use super::table::TiKVTable;
 
+/// Represents a pending change to the engine's global metadata cache
+#[derive(Clone)]
+enum PendingChange {
+    /// Update or insert a table schema
+    SchemaUpsert {
+        name: String,
+        id: u64,
+        schema: CompactArc<Schema>,
+    },
+    /// Remove a table from the schema cache
+    SchemaRemove { name: String },
+    /// Update or insert an index metadata
+    IndexUpsert {
+        table_name: String,
+        index_name: String,
+        meta: super::index::IndexMetadata,
+    },
+    /// Remove an index from the cache
+    IndexRemove {
+        table_name: String,
+        index_name: String,
+    },
+}
+
 /// Savepoint state for DDL rollback emulation
 #[derive(Clone)]
 struct SavepointState {
@@ -37,6 +61,8 @@ struct SavepointState {
     created_tables_len: usize,
     /// Number of dropped_tables entries at savepoint time
     dropped_tables_len: usize,
+    /// Number of pending_changes entries at savepoint time
+    pending_changes_len: usize,
 }
 
 /// TiKV transaction
@@ -59,6 +85,8 @@ pub struct TiKVTransaction {
     created_tables: Vec<String>,
     /// Tables dropped during this transaction (for savepoint DDL rollback)
     dropped_tables: Vec<(String, Schema)>,
+    /// Pending changes to be applied to the engine's global cache upon commit
+    pending_changes: Vec<PendingChange>,
     /// Whether any write operations have been performed
     pub(crate) has_writes: Arc<std::sync::atomic::AtomicBool>,
     /// Whether isolation level was explicitly set by user
@@ -87,6 +115,7 @@ impl TiKVTransaction {
             savepoints: FxHashMap::default(),
             created_tables: Vec::new(),
             dropped_tables: Vec::new(),
+            pending_changes: Vec::new(),
             has_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             isolation_level_explicitly_set: false,
         }
@@ -145,12 +174,10 @@ impl TiKVTransaction {
         // Remove from local cache
         self.schemas.remove(table_name);
 
-        // Update engine cache
-        let engine = self.engine();
-        engine.schemas.write().remove(table_name);
-        engine
-            .schema_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Record pending change for engine cache update on commit
+        self.pending_changes.push(PendingChange::SchemaRemove {
+            name: table_name.to_string(),
+        });
 
         // Delete metadata within this transaction
         self.with_txn(|txn| {
@@ -197,15 +224,12 @@ impl TiKVTransaction {
         self.schemas
             .insert(table_name.to_string(), (table_id, schema_arc.clone()));
 
-        // Update engine cache
-        let engine = self.engine();
-        engine
-            .schemas
-            .write()
-            .insert(table_name.to_string(), (table_id, schema_arc));
-        engine
-            .schema_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Record pending change for engine cache update on commit
+        self.pending_changes.push(PendingChange::SchemaUpsert {
+            name: table_name.to_string(),
+            id: table_id,
+            schema: schema_arc,
+        });
 
         Ok(())
     }
@@ -234,6 +258,48 @@ impl Transaction for TiKVTransaction {
 
         self.runtime
             .block_on(async { txn.commit().await.map_err(from_tikv_error) })?;
+
+        // Apply all pending metadata changes to the global engine cache
+        if !self.pending_changes.is_empty() {
+            let engine = self.engine();
+            let mut schemas = engine.schemas.write();
+            let mut indexes = engine.indexes.write();
+
+            for change in &self.pending_changes {
+                match change {
+                    PendingChange::SchemaUpsert { name, id, schema } => {
+                        schemas.insert(name.clone(), (*id, schema.clone()));
+                    }
+                    PendingChange::SchemaRemove { name } => {
+                        schemas.remove(name);
+                    }
+                    PendingChange::IndexUpsert {
+                        table_name,
+                        index_name,
+                        meta,
+                    } => {
+                        indexes
+                            .entry(table_name.clone())
+                            .or_default()
+                            .insert(index_name.clone(), meta.clone());
+                    }
+                    PendingChange::IndexRemove {
+                        table_name,
+                        index_name,
+                    } => {
+                        if let Some(table_indexes) = indexes.get_mut(table_name) {
+                            table_indexes.remove(index_name);
+                        }
+                    }
+                }
+            }
+
+            // Invalidate all schema caches by bumping the epoch
+            engine
+                .schema_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+
         Ok(())
     }
 
@@ -261,6 +327,7 @@ impl Transaction for TiKVTransaction {
                 timestamp,
                 created_tables_len: self.created_tables.len(),
                 dropped_tables_len: self.dropped_tables.len(),
+                pending_changes_len: self.pending_changes.len(),
             },
         );
         Ok(())
@@ -296,6 +363,9 @@ impl Transaction for TiKVTransaction {
                 let _ = self.create_table(&table_name, schema);
             }
         }
+
+        // Truncate pending changes to the state at the savepoint
+        self.pending_changes.truncate(sp_state.pending_changes_len);
 
         // Remove this savepoint and all savepoints created after it
         let sp_timestamp = sp_state.timestamp;
@@ -367,15 +437,12 @@ impl Transaction for TiKVTransaction {
         self.schemas
             .insert(table_name.clone(), (table_id, schema_arc.clone()));
 
-        // Update engine cache (access engine via raw pointer again after self borrow is released)
-        let engine = self.engine();
-        engine
-            .schemas
-            .write()
-            .insert(table_name.clone(), (table_id, schema_arc));
-        engine
-            .schema_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Record pending change for engine cache update on commit
+        self.pending_changes.push(PendingChange::SchemaUpsert {
+            name: table_name.clone(),
+            id: table_id,
+            schema: schema_arc,
+        });
 
         // Track for savepoint DDL rollback
         self.created_tables.push(table_name.clone());
@@ -500,15 +567,15 @@ impl Transaction for TiKVTransaction {
         self.schemas
             .insert(new_lower.clone(), (table_id, schema.clone()));
 
-        // Update engine cache
-        let engine = self.engine();
-        let mut eng_schemas = engine.schemas.write();
-        eng_schemas.remove(&old_lower);
-        eng_schemas.insert(new_lower, (table_id, schema));
-        drop(eng_schemas);
-        engine
-            .schema_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Record pending changes for engine cache update on commit
+        self.pending_changes.push(PendingChange::SchemaRemove {
+            name: old_lower,
+        });
+        self.pending_changes.push(PendingChange::SchemaUpsert {
+            name: new_lower,
+            id: table_id,
+            schema,
+        });
 
         // Track write for isolation level logic
         self.has_writes
@@ -628,13 +695,12 @@ impl Transaction for TiKVTransaction {
             })?;
         }
 
-        // Update engine index cache
-        engine
-            .indexes
-            .write()
-            .entry(table_name_lower)
-            .or_default()
-            .insert(index_name.to_string(), meta);
+        // Record pending change for engine cache update on commit
+        self.pending_changes.push(PendingChange::IndexUpsert {
+            table_name: table_name_lower,
+            index_name: index_name.to_string(),
+            meta,
+        });
 
         // Track write for isolation level logic
         self.has_writes
@@ -677,10 +743,11 @@ impl Transaction for TiKVTransaction {
                     .block_on(async { txn.delete(meta_key).await.map_err(from_tikv_error) })
             })?;
 
-            // Remove from engine cache
-            if let Some(table_indexes) = engine.indexes.write().get_mut(&table_name_lower) {
-                table_indexes.remove(index_name);
-            }
+            // Record pending change for engine cache update on commit
+            self.pending_changes.push(PendingChange::IndexRemove {
+                table_name: table_name_lower,
+                index_name: index_name.to_string(),
+            });
         }
 
         // Track write for isolation level logic
@@ -910,5 +977,111 @@ impl Transaction for TiKVTransaction {
                 temporal_type
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::DataType;
+
+    #[test]
+    fn test_cache_reconciliation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        
+        let _guard = rt.enter();
+        
+        let engine = TiKVEngine::new("127.0.0.1:2379").unwrap();
+        assert_eq!(engine.schemas.read().len(), 0);
+
+        let mut txn = TiKVTransaction {
+            id: 1,
+            txn: Arc::new(Mutex::new(None)),
+            isolation_level: IsolationLevel::SnapshotIsolation,
+            runtime: tokio::runtime::Handle::current(),
+            schemas: FxHashMap::default(),
+            engine: &engine as *const TiKVEngine,
+            savepoints: FxHashMap::default(),
+            created_tables: Vec::new(),
+            dropped_tables: Vec::new(),
+            pending_changes: Vec::new(),
+            has_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            isolation_level_explicitly_set: false,
+        };
+
+        let schema = CompactArc::new(Schema::new(
+            "test_table", 
+            vec![SchemaColumn::new(0, "id", DataType::Integer, false, false)]
+        ));
+        
+        txn.pending_changes.push(PendingChange::SchemaUpsert {
+            name: "test_table".to_string(),
+            id: 100,
+            schema: schema.clone(),
+        });
+
+        assert_eq!(engine.schemas.read().len(), 0);
+
+        {
+            let engine_ref = unsafe { &*txn.engine };
+            let mut schemas = engine_ref.schemas.write();
+            let _indexes = engine_ref.indexes.write();
+
+            for change in &txn.pending_changes {
+                match change {
+                    PendingChange::SchemaUpsert { name, id, schema } => {
+                        schemas.insert(name.clone(), (*id, schema.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(engine.schemas.read().len(), 1);
+        assert!(engine.schemas.read().contains_key("test_table"));
+        
+        // Ensure engine is dropped BEFORE runtime
+        drop(engine);
+    }
+
+    #[test]
+    fn test_rollback_reconciliation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        
+        let _guard = rt.enter();
+
+        let engine = TiKVEngine::new("127.0.0.1:2379").unwrap();
+        let txn = TiKVTransaction {
+            id: 2,
+            txn: Arc::new(Mutex::new(None)),
+            isolation_level: IsolationLevel::SnapshotIsolation,
+            runtime: tokio::runtime::Handle::current(),
+            schemas: FxHashMap::default(),
+            engine: &engine as *const TiKVEngine,
+            savepoints: FxHashMap::default(),
+            created_tables: Vec::new(),
+            dropped_tables: Vec::new(),
+            pending_changes: vec![PendingChange::SchemaUpsert {
+                name: "failed_table".to_string(),
+                id: 101,
+                schema: CompactArc::new(Schema::new(
+                    "failed_table",
+                    vec![SchemaColumn::new(0, "id", DataType::Integer, false, false)]
+                )),
+            }],
+            has_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            isolation_level_explicitly_set: false,
+        };
+
+        drop(txn);
+        assert_eq!(engine.schemas.read().len(), 0);
+        
+        drop(engine);
     }
 }
