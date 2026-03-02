@@ -192,3 +192,8 @@ inherits = "release"
 lto = "thin"          # Much faster than full LTO
 codegen-units = 16    # Parallel codegen
 debug = false         # No debug symbols needed for tests
+
+# Mutation testing profile: fast incremental builds
+[profile.mutants]
+inherits = "test"
+debug = "none"

@@ -3,7 +3,19 @@ name: Nightly
 on:
   schedule:
     - cron: '0 3 * * *' # 3 AM UTC daily
-  workflow_dispatch: # Manual trigger
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Which suite to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all         # Run everything
+          - mutation    # Mutation testing only
+          - miri        # Miri only
+          - stress      # Stress tests only
+          - sanitizers  # TSAN + ASAN only
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,50 +27,14 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  mutation:
-    name: Mutation Testing
-    runs-on: ubuntu-latest
-    steps:
-    - name: Free disk space
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /usr/local/lib/android
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
-        sudo docker image prune --all --force
-
-    - uses: actions/checkout@v4
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Cache
-      uses: Swatinem/rust-cache@v2
-
-    - name: Install cargo-mutants
-      run: cargo install cargo-mutants
-
-    - name: Run mutation testing (core modules)
-      run: |
-        cargo mutants --package stoolap \
-          -f src/executor/expression/ \
-          -f src/executor/aggregation.rs \
-          -f src/executor/subquery.rs \
-          -f src/functions/scalar/ \
-          -f src/storage/mvcc/transaction.rs \
-          -f src/storage/mvcc/registry.rs \
-          -- -- --test-threads=4
-      timeout-minutes: 120
-
-    - name: Upload mutation report
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: mutation-report
-        path: mutants.out/
+  # ─── Lightweight jobs: run every night ───────────────────────────────
 
   stress-tests:
     name: Stress Tests
+    if: >-
+      github.event_name == 'schedule'
+      || github.event.inputs.suite == 'all'
+      || github.event.inputs.suite == 'stress'
     runs-on: ubuntu-latest
     steps:
     - name: Free disk space
@@ -89,27 +65,12 @@ jobs:
       run: cargo test --test concurrency_history_test --features stress-tests
       timeout-minutes: 15
 
-  miri:
-    name: Miri
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install Rust nightly with Miri
-      uses: dtolnay/rust-toolchain@nightly
-      with:
-        components: miri
-
-    - name: Cache
-      uses: Swatinem/rust-cache@v2
-
-    - name: Run Miri on core modules
-      run: "cargo +nightly miri test --lib -- core:: common::"
-      env:
-        MIRIFLAGS: "-Zmiri-disable-isolation"
-
   thread-sanitizer:
     name: Thread Sanitizer
+    if: >-
+      github.event_name == 'schedule'
+      || github.event.inputs.suite == 'all'
+      || github.event.inputs.suite == 'sanitizers'
     runs-on: ubuntu-latest
     steps:
     - name: Free disk space
@@ -137,11 +98,16 @@ jobs:
           --test dirty_read_test \
           --test mvcc_isolation_sql_test \
           --test parallel_execution_tests
+      timeout-minutes: 20
       env:
         TSAN_OPTIONS: "second_deadlock_stack=1 suppressions=${{ github.workspace }}/tsan_suppressions.txt"
 
   address-sanitizer:
     name: Address Sanitizer
+    if: >-
+      github.event_name == 'schedule'
+      || github.event.inputs.suite == 'all'
+      || github.event.inputs.suite == 'sanitizers'
     runs-on: ubuntu-latest
     steps:
     - name: Free disk space
@@ -169,5 +135,97 @@ jobs:
           --test durability_test \
           --test snapshot_recovery_test \
           --test persistence_test
+      timeout-minutes: 20
       env:
         ASAN_OPTIONS: "detect_leaks=0"
+
+  # ─── Heavy jobs: sharded / parallelized ──────────────────────────────
+
+  mutation:
+    name: Mutation Testing (shard ${{ matrix.shard }})
+    if: >-
+      github.event_name == 'schedule'
+      || github.event.inputs.suite == 'all'
+      || github.event.inputs.suite == 'mutation'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install mold linker
+      run: sudo apt-get install -y mold
+
+    - name: Install cargo-mutants
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-mutants
+
+    - name: Run mutation testing (shard ${{ matrix.shard }}/8)
+      run: |
+        cargo mutants --package stoolap \
+          --in-place \
+          --shard ${{ matrix.shard }}/8 \
+          -f src/executor/expression/ \
+          -f src/executor/aggregation.rs \
+          -f src/executor/subquery.rs \
+          -f src/functions/scalar/ \
+          -f src/storage/mvcc/transaction.rs \
+          -f src/storage/mvcc/registry.rs \
+          -- --all-targets -- --test-threads=4
+      timeout-minutes: 90
+      env:
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+        RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+    - name: Upload mutation report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: mutation-report-${{ matrix.shard }}
+        path: mutants.out/
+
+  miri:
+    name: Miri
+    if: >-
+      github.event_name == 'schedule'
+      || github.event.inputs.suite == 'all'
+      || github.event.inputs.suite == 'miri'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust nightly with Miri
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: miri
+
+    - name: Install nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Run Miri on core modules (parallel via nextest)
+      run: cargo +nightly miri nextest run --lib -E 'test(/^(core|common)::/)' --no-fail-fast
+      timeout-minutes: 45
+      env:
+        MIRIFLAGS: "-Zmiri-disable-isolation"
