@@ -1,0 +1,43 @@
+# Self-join tests
+
+statement ok
+CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER)
+
+statement ok
+INSERT INTO employees VALUES (1, 'CEO', NULL), (2, 'VP Eng', 1), (3, 'VP Sales', 1), (4, 'Dev Lead', 2), (5, 'Sales Rep', 3), (6, 'Engineer', 4)
+
+# Self-join to find related rows (employee with manager name)
+query TT rowsort
+SELECT e.name, m.name FROM employees e INNER JOIN employees m ON e.manager_id = m.id
+----
+Dev Lead VP Eng
+Engineer Dev Lead
+Sales Rep VP Sales
+VP Eng CEO
+VP Sales CEO
+
+# Self-join with inequality (find all pairs where a.id < b.id)
+query TT rowsort
+SELECT a.name, b.name FROM employees a INNER JOIN employees b ON a.manager_id = b.manager_id AND a.id < b.id
+----
+VP Eng VP Sales
+
+# Self-join with aggregation (count direct reports)
+query TI rowsort
+SELECT m.name, COUNT(*) AS reports FROM employees e INNER JOIN employees m ON e.manager_id = m.id GROUP BY m.name
+----
+CEO 2
+Dev Lead 1
+VP Eng 1
+VP Sales 1
+
+# Hierarchical self-join (two levels)
+query TTT rowsort
+SELECT e.name, m.name, gm.name FROM employees e INNER JOIN employees m ON e.manager_id = m.id INNER JOIN employees gm ON m.manager_id = gm.id
+----
+Dev Lead VP Eng CEO
+Engineer Dev Lead VP Eng
+Sales Rep VP Sales CEO
+
+statement ok
+DROP TABLE employees

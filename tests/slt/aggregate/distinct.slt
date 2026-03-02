@@ -1,0 +1,81 @@
+# DISTINCT tests
+
+statement ok
+CREATE TABLE dist_test (id INTEGER PRIMARY KEY, name TEXT, category TEXT, value INTEGER)
+
+statement ok
+INSERT INTO dist_test VALUES (1, 'Alice', 'A', 10), (2, 'Bob', 'A', 20), (3, 'Carol', 'B', 10), (4, 'Dave', 'B', 20), (5, 'Eve', 'A', 10), (6, 'Frank', NULL, NULL)
+
+# SELECT DISTINCT single column
+query T rowsort
+SELECT DISTINCT category FROM dist_test
+----
+A
+B
+NULL
+
+# SELECT DISTINCT multiple columns
+query TI rowsort
+SELECT DISTINCT category, value FROM dist_test WHERE category IS NOT NULL
+----
+A 10
+A 20
+B 10
+B 20
+
+# DISTINCT with NULL values
+query I rowsort
+SELECT DISTINCT value FROM dist_test
+----
+10
+20
+NULL
+
+# DISTINCT with ORDER BY
+query T
+SELECT DISTINCT category FROM dist_test WHERE category IS NOT NULL ORDER BY category
+----
+A
+B
+
+# DISTINCT with LIMIT
+query T
+SELECT DISTINCT category FROM dist_test WHERE category IS NOT NULL ORDER BY category LIMIT 1
+----
+A
+
+# COUNT(DISTINCT col)
+query I
+SELECT COUNT(DISTINCT category) FROM dist_test
+----
+2
+
+query I
+SELECT COUNT(DISTINCT value) FROM dist_test
+----
+2
+
+# DISTINCT on expressions
+query I rowsort
+SELECT DISTINCT value * 2 FROM dist_test WHERE value IS NOT NULL
+----
+20
+40
+
+# DISTINCT with all same values
+statement ok
+CREATE TABLE same_test (id INTEGER PRIMARY KEY, val INTEGER)
+
+statement ok
+INSERT INTO same_test VALUES (1, 5), (2, 5), (3, 5)
+
+query I
+SELECT DISTINCT val FROM same_test
+----
+5
+
+statement ok
+DROP TABLE same_test
+
+statement ok
+DROP TABLE dist_test

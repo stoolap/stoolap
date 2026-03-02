@@ -65,6 +65,32 @@ jobs:
     - name: Run tests
       run: cargo test
 
+  feature-gated-tests:
+    name: Feature-Gated Tests
+    runs-on: ubuntu-latest
+    steps:
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Differential oracle tests (Stoolap vs SQLite)
+      run: cargo test --test differential_oracle_test --features sqlite
+
+    - name: Failpoint I/O tests
+      run: cargo test --test failpoint_io_test --features test-failpoints -- --test-threads=1
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest

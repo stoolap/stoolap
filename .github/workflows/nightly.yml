@@ -1,0 +1,173 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # 3 AM UTC daily
+  workflow_dispatch: # Manual trigger
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  mutation:
+    name: Mutation Testing
+    runs-on: ubuntu-latest
+    steps:
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install cargo-mutants
+      run: cargo install cargo-mutants
+
+    - name: Run mutation testing (core modules)
+      run: |
+        cargo mutants --package stoolap \
+          -f src/executor/expression/ \
+          -f src/executor/aggregation.rs \
+          -f src/executor/subquery.rs \
+          -f src/functions/scalar/ \
+          -f src/storage/mvcc/transaction.rs \
+          -f src/storage/mvcc/registry.rs \
+          -- --test-threads=4
+      timeout-minutes: 120
+
+    - name: Upload mutation report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: mutation-report
+        path: mutants.out/
+
+  stress-tests:
+    name: Stress Tests
+    runs-on: ubuntu-latest
+    steps:
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Crash soak tests
+      run: cargo test --test crash_soak_test --features stress-tests
+      timeout-minutes: 30
+
+    - name: Metamorphic property tests
+      run: cargo test --test metamorphic_test --features stress-tests
+      timeout-minutes: 15
+
+    - name: Concurrency history tests
+      run: cargo test --test concurrency_history_test --features stress-tests
+      timeout-minutes: 15
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust nightly with Miri
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: miri
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Run Miri on core modules
+      run: cargo +nightly miri test --lib -- core:: common::
+      env:
+        MIRIFLAGS: "-Zmiri-disable-isolation"
+
+  thread-sanitizer:
+    name: Thread Sanitizer
+    runs-on: ubuntu-latest
+    steps:
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+
+    - uses: actions/checkout@v4
+
+    - name: Install Rust nightly
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: rust-src
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Run with ThreadSanitizer
+      run: |
+        RUSTFLAGS="-Zsanitizer=thread" \
+        cargo +nightly test --target x86_64-unknown-linux-gnu \
+          --test dirty_read_test \
+          --test mvcc_isolation_sql_test \
+          --test parallel_execution_tests
+      env:
+        TSAN_OPTIONS: "second_deadlock_stack=1"
+
+  address-sanitizer:
+    name: Address Sanitizer
+    runs-on: ubuntu-latest
+    steps:
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+
+    - uses: actions/checkout@v4
+
+    - name: Install Rust nightly
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: rust-src
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Run with AddressSanitizer
+      run: |
+        RUSTFLAGS="-Zsanitizer=address" \
+        cargo +nightly test --target x86_64-unknown-linux-gnu \
+          --test durability_test \
+          --test snapshot_recovery_test \
+          --test persistence_test
+      env:
+        ASAN_OPTIONS: "detect_leaks=0"

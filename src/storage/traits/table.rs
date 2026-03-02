@@ -51,12 +51,16 @@ pub enum ScanPlan {
         index_name: String,
         column: String,
         condition: String,
+        /// Non-indexed predicates applied as in-memory filter after index lookup
+        filter: Option<String>,
     },
     /// Multi-index scan - uses multiple indexes with AND/OR operations
     MultiIndexScan {
         table: String,
         indexes: Vec<(String, String, String)>, // (index_name, column, condition)
         operation: String,                      // "AND" or "OR"
+        /// Non-indexed predicates applied as in-memory filter after index lookup
+        filter: Option<String>,
     },
     /// Composite index scan - uses a multi-column index
     CompositeIndexScan {
@@ -64,6 +68,8 @@ pub enum ScanPlan {
         index_name: String,
         columns: Vec<String>,
         conditions: Vec<String>,
+        /// Non-indexed predicates applied as in-memory filter after index lookup
+        filter: Option<String>,
     },
     /// HNSW approximate nearest neighbor search
     VectorSearch {
@@ -118,21 +124,30 @@ impl fmt::Display for ScanPlan {
                 index_name,
                 column,
                 condition,
+                filter,
             } => {
                 write!(
                     f,
                     "Index Scan using {} on {}\n  Index Cond: {} {}",
                     index_name, table, column, condition
-                )
+                )?;
+                if let Some(flt) = filter {
+                    write!(f, "\n  Filter: {}", flt)?;
+                }
+                Ok(())
             }
             ScanPlan::MultiIndexScan {
                 table,
                 indexes,
                 operation,
+                filter,
             } => {
                 write!(f, "Multi-Index Scan on {} ({})", table, operation)?;
                 for (idx_name, col, cond) in indexes {
                     write!(f, "\n  -> {} on {}: {}", idx_name, col, cond)?;
+                }
+                if let Some(flt) = filter {
+                    write!(f, "\n  Filter: {}", flt)?;
                 }
                 Ok(())
             }
@@ -141,6 +156,7 @@ impl fmt::Display for ScanPlan {
                 index_name,
                 columns,
                 conditions,
+                filter,
             } => {
                 write!(
                     f,
@@ -151,6 +167,9 @@ impl fmt::Display for ScanPlan {
                 )?;
                 for (col, cond) in columns.iter().zip(conditions.iter()) {
                     write!(f, "\n  {} {}", col, cond)?;
+                }
+                if let Some(flt) = filter {
+                    write!(f, "\n  Filter: {}", flt)?;
                 }
                 Ok(())
             }
@@ -1183,6 +1202,7 @@ mod tests {
             index_name: "idx_customer_id".to_string(),
             column: "customer_id".to_string(),
             condition: "= 123".to_string(),
+            filter: None,
         };
         let display = format!("{}", plan);
         assert!(display.contains("Index Scan using idx_customer_id on orders"));
@@ -1206,6 +1226,7 @@ mod tests {
                 ),
             ],
             operation: "AND".to_string(),
+            filter: None,
         };
         let display = format!("{}", plan);
         assert!(display.contains("Multi-Index Scan on products (AND)"));
@@ -1222,6 +1243,7 @@ mod tests {
                 ("idx_b".to_string(), "col_b".to_string(), "= 2".to_string()),
             ],
             operation: "OR".to_string(),
+            filter: None,
         };
         let display = format!("{}", plan);
         assert!(display.contains("Multi-Index Scan on items (OR)"));
@@ -1234,6 +1256,7 @@ mod tests {
             index_name: "idx_cust_date".to_string(),
             columns: vec!["customer_id".to_string(), "order_date".to_string()],
             conditions: vec!["= 100".to_string(), "> '2024-01-01'".to_string()],
+            filter: None,
         };
         let display = format!("{}", plan);
         assert!(display.contains("Composite Index Scan using idx_cust_date on orders"));
@@ -1281,6 +1304,7 @@ mod tests {
             table: "empty".to_string(),
             indexes: vec![],
             operation: "AND".to_string(),
+            filter: None,
         };
         let display = format!("{}", plan);
         assert!(display.contains("Multi-Index Scan on empty (AND)"));
@@ -1293,6 +1317,7 @@ mod tests {
             index_name: "idx_single".to_string(),
             columns: vec!["id".to_string()],
             conditions: vec!["= 1".to_string()],
+            filter: None,
         };
         let display = format!("{}", plan);
         assert!(display.contains("Composite Index Scan using idx_single on single"));

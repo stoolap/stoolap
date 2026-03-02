@@ -1,0 +1,135 @@
+# Set operation tests: UNION, INTERSECT, EXCEPT
+
+statement ok
+CREATE TABLE set_a (id INTEGER PRIMARY KEY, name TEXT)
+
+statement ok
+CREATE TABLE set_b (id INTEGER PRIMARY KEY, name TEXT)
+
+statement ok
+INSERT INTO set_a VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')
+
+statement ok
+INSERT INTO set_b VALUES (2, 'Bob'), (3, 'Carol'), (4, 'Dave')
+
+# UNION removes duplicates
+query IT rowsort
+SELECT * FROM set_a UNION SELECT * FROM set_b
+----
+1 Alice
+2 Bob
+3 Carol
+4 Dave
+
+# UNION ALL keeps duplicates
+query IT rowsort
+SELECT * FROM set_a UNION ALL SELECT * FROM set_b
+----
+1 Alice
+2 Bob
+2 Bob
+3 Carol
+3 Carol
+4 Dave
+
+# INTERSECT basic
+query IT rowsort
+SELECT * FROM set_a INTERSECT SELECT * FROM set_b
+----
+2 Bob
+3 Carol
+
+# EXCEPT basic
+query IT
+SELECT * FROM set_a EXCEPT SELECT * FROM set_b
+----
+1 Alice
+
+# EXCEPT reverse direction
+query IT
+SELECT * FROM set_b EXCEPT SELECT * FROM set_a
+----
+4 Dave
+
+# Chained set operations
+statement ok
+CREATE TABLE set_c (id INTEGER PRIMARY KEY, name TEXT)
+
+statement ok
+INSERT INTO set_c VALUES (3, 'Carol'), (5, 'Eve')
+
+query IT rowsort
+SELECT * FROM set_a UNION SELECT * FROM set_b UNION SELECT * FROM set_c
+----
+1 Alice
+2 Bob
+3 Carol
+4 Dave
+5 Eve
+
+# Set ops with ORDER BY (applied to final result)
+query IT
+SELECT * FROM set_a UNION SELECT * FROM set_b ORDER BY id DESC
+----
+4 Dave
+3 Carol
+2 Bob
+1 Alice
+
+# Set ops with NULL values
+statement ok
+INSERT INTO set_a VALUES (6, NULL)
+
+statement ok
+INSERT INTO set_b VALUES (7, NULL)
+
+query I rowsort
+SELECT id FROM set_a WHERE name IS NULL UNION SELECT id FROM set_b WHERE name IS NULL
+----
+6
+7
+
+# INTERSECT with no common rows (empty)
+query IT
+SELECT * FROM set_a INTERSECT SELECT * FROM set_c WHERE id = 5
+----
+
+# EXCEPT with identical sets (empty)
+query IT
+SELECT id, name FROM set_a WHERE id IN (2, 3) EXCEPT SELECT id, name FROM set_b WHERE id IN (2, 3)
+----
+
+# Set ops with empty sides
+statement ok
+CREATE TABLE set_empty (id INTEGER PRIMARY KEY, name TEXT)
+
+query IT rowsort
+SELECT * FROM set_a UNION SELECT * FROM set_empty
+----
+1 Alice
+2 Bob
+3 Carol
+6 NULL
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM set_empty UNION SELECT * FROM set_empty)
+----
+0
+
+# INTERSECT with empty set
+query I
+SELECT COUNT(*) FROM (SELECT * FROM set_a INTERSECT SELECT * FROM set_empty)
+----
+0
+
+statement ok
+DROP TABLE set_empty
+
+statement ok
+DROP TABLE set_c
+
+statement ok
+DROP TABLE set_b
+
+statement ok
+DROP TABLE set_a

@@ -2114,7 +2114,12 @@ impl Executor {
         // FAST PATH: IN subquery index optimization
         // For queries like `SELECT * FROM table WHERE id IN (SELECT col FROM other_table WHERE ...)`
         // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows
-        if needs_memory_filter && !has_outer_context && !classification.has_group_by {
+        // Skip if query has aggregation: projection cannot compile aggregate functions
+        if needs_memory_filter
+            && !has_outer_context
+            && !classification.has_group_by
+            && !classification.has_aggregation
+        {
             if let Some(where_expr) = where_to_use {
                 if let Some((result, columns)) = self.try_in_subquery_index_optimization(
                     stmt,
@@ -2133,7 +2138,12 @@ impl Executor {
         // FAST PATH: IN list literal index optimization
         // For queries like `SELECT * FROM table WHERE id IN (1, 2, 3, 5, 8)`
         // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows
-        if needs_memory_filter && !has_outer_context && !classification.has_group_by {
+        // Skip if query has aggregation: projection cannot compile aggregate functions
+        if needs_memory_filter
+            && !has_outer_context
+            && !classification.has_group_by
+            && !classification.has_aggregation
+        {
             if let Some(where_expr) = where_to_use {
                 if let Some((result, columns)) = self.try_in_list_index_optimization(
                     stmt,
@@ -2571,9 +2581,11 @@ impl Executor {
             // If EXISTS was transformed to InHashSet and the column is PK/indexed,
             // probe directly instead of scanning all rows
             // Skip if there are correlated subqueries in SELECT columns
+            // Skip if query has aggregation: projection cannot compile aggregate functions
             // Use cached classification to avoid AST traversal
             if !has_correlated
                 && !classification.has_group_by
+                && !classification.has_aggregation
                 && !classification.select_has_correlated_subqueries
             {
                 if let Some(ref where_expr) = processed_where {

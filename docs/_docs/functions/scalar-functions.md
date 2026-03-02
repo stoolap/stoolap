@@ -163,6 +163,33 @@ SELECT CHAR(65);                           -- Returns 'A'
 SELECT CHAR(97);                           -- Returns 'a'
 ```
 
+### STARTS_WITH
+Returns true if a string starts with the specified prefix.
+
+```sql
+SELECT STARTS_WITH('Hello World', 'Hello');    -- Returns true
+SELECT STARTS_WITH('Hello World', 'World');    -- Returns false
+SELECT * FROM users WHERE STARTS_WITH(email, 'admin');
+```
+
+### ENDS_WITH
+Returns true if a string ends with the specified suffix.
+
+```sql
+SELECT ENDS_WITH('Hello World', 'World');      -- Returns true
+SELECT ENDS_WITH('Hello World', 'Hello');      -- Returns false
+SELECT * FROM users WHERE ENDS_WITH(email, '.com');
+```
+
+### CONTAINS
+Returns true if a string contains the specified substring.
+
+```sql
+SELECT CONTAINS('Hello World', 'lo Wo');       -- Returns true
+SELECT CONTAINS('Hello World', 'xyz');          -- Returns false
+SELECT * FROM products WHERE CONTAINS(name, 'organic');
+```
+
 ### COLLATE
 Applies a specific collation for sorting and comparison.
 
@@ -581,6 +608,61 @@ Creates a JSON object from key-value pairs.
 SELECT JSON_OBJECT('name', 'Alice', 'age', 30);   -- '{"age":30,"name":"Alice"}'
 ```
 
+## Hash Functions
+
+Stoolap provides cryptographic hash functions and checksums for data integrity, deduplication, and fingerprinting.
+
+All hash functions accept any data type as input (converted to its string representation before hashing) and return NULL for NULL input.
+
+### MD5
+Returns the MD5 hash of the input as a 32-character lowercase hex string.
+
+```sql
+SELECT MD5('hello');                           -- Returns '5d41402abc4b2a76b9719d911017c592'
+SELECT MD5(42);                                -- Returns 'a1d0c6e83f027327d8461063f4ac58a6'
+SELECT MD5(name) FROM users;
+```
+
+### SHA1
+Returns the SHA-1 hash of the input as a 40-character lowercase hex string.
+
+```sql
+SELECT SHA1('hello');                          -- Returns 'aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d'
+SELECT SHA1(email) FROM users;
+```
+
+### SHA256
+Returns the SHA-256 hash of the input as a 64-character lowercase hex string.
+
+```sql
+SELECT SHA256('hello');                        -- Returns '2cf24dba5fb0a30e26e83b2ac5b9e29e...'
+SELECT SHA256(CONCAT(salt, password)) FROM credentials;
+```
+
+### SHA384
+Returns the SHA-384 hash of the input as a 96-character lowercase hex string.
+
+```sql
+SELECT SHA384('hello');                        -- Returns '59e1748777448c69de6b800d7a33bbfb...'
+```
+
+### SHA512
+Returns the SHA-512 hash of the input as a 128-character lowercase hex string.
+
+```sql
+SELECT SHA512('hello');                        -- Returns '9b71d224bd62f3785d96d46ad3ea3d73...'
+```
+
+### CRC32
+Returns the CRC32 checksum of the input as an integer.
+
+```sql
+SELECT CRC32('hello');                         -- Returns 907060870
+SELECT CRC32(name) FROM users;
+```
+
+Note: CRC32 is a non-cryptographic checksum suitable for data integrity checks, not for security purposes.
+
 ## Vector Functions
 
 Stoolap provides functions for computing distances between vectors and inspecting vector values. These are used with the `VECTOR(N)` data type for similarity search. See [Vector Search]({% link _docs/data-types/vector-search.md %}) for complete documentation.
@@ -720,6 +802,14 @@ SELECT
     IIF(quantity > 0, 'In Stock', 'Out of Stock') AS availability,
     GREATEST(price * 0.9, min_price) AS sale_price
 FROM products;
+```
+
+### Data Fingerprinting
+```sql
+SELECT
+    id,
+    MD5(CONCAT(name, email, phone)) AS record_hash
+FROM customers;
 ```
 
 ## Performance Notes

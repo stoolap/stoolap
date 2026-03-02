@@ -1,0 +1,195 @@
+# Data types, NULL handling, type coercion
+
+statement ok
+CREATE TABLE types_test (id INTEGER PRIMARY KEY, i_val INTEGER, f_val FLOAT, t_val TEXT, b_val BOOLEAN, ts_val TIMESTAMP)
+
+# INTEGER: positive, negative, zero, large values
+statement ok
+INSERT INTO types_test (id, i_val) VALUES (1, 42), (2, -42), (3, 0), (4, 9223372036854775807), (5, -9223372036854775807)
+
+query II rowsort
+SELECT id, i_val FROM types_test WHERE i_val IS NOT NULL
+----
+1 42
+2 -42
+3 0
+4 9223372036854775807
+5 -9223372036854775807
+
+# FLOAT: positive, negative, zero, precision
+statement ok
+DELETE FROM types_test
+
+statement ok
+INSERT INTO types_test (id, f_val) VALUES (1, 3.14159), (2, -2.718), (3, 0.0), (4, 1000000.5), (5, 0.001)
+
+query IR rowsort
+SELECT id, f_val FROM types_test WHERE f_val IS NOT NULL
+----
+1 3.142
+2 -2.718
+3 0.000
+4 1000000.500
+5 0.001
+
+# TEXT: empty string, special characters
+statement ok
+DELETE FROM types_test
+
+statement ok
+INSERT INTO types_test (id, t_val) VALUES (1, 'hello'), (2, ''), (3, 'it''s a test'), (4, 'line1')
+
+query IT
+SELECT id, t_val FROM types_test WHERE id = 1
+----
+1 hello
+
+query IT
+SELECT id, t_val FROM types_test WHERE id = 2
+----
+2 (empty)
+
+query IT
+SELECT id, t_val FROM types_test WHERE id = 3
+----
+3 it's a test
+
+# BOOLEAN: true/false
+statement ok
+DELETE FROM types_test
+
+statement ok
+INSERT INTO types_test (id, b_val) VALUES (1, true), (2, false)
+
+query IT rowsort
+SELECT id, b_val FROM types_test WHERE b_val IS NOT NULL
+----
+1 true
+2 false
+
+# Boolean in WHERE
+query I
+SELECT id FROM types_test WHERE b_val = true
+----
+1
+
+# NULL: NULL in every type
+statement ok
+DELETE FROM types_test
+
+statement ok
+INSERT INTO types_test (id) VALUES (1)
+
+query IIRTT
+SELECT id, i_val, f_val, t_val, b_val FROM types_test
+----
+1 NULL NULL NULL NULL
+
+# NULL arithmetic propagation
+query IRIR
+SELECT NULL + 1, 1 + NULL, NULL * 5, 5 - NULL
+----
+NULL NULL NULL NULL
+
+# NULL string concatenation
+query T
+SELECT NULL || 'text'
+----
+NULL
+
+# NULL boolean logic: three-valued
+query TTT
+SELECT NULL AND true, NULL AND false, NULL OR true
+----
+NULL false true
+
+query TT
+SELECT NULL OR false, NOT NULL
+----
+NULL NULL
+
+# IS NULL / IS NOT NULL
+statement ok
+DELETE FROM types_test
+
+statement ok
+INSERT INTO types_test (id, i_val) VALUES (1, 10), (2, NULL)
+
+query I
+SELECT id FROM types_test WHERE i_val IS NULL
+----
+2
+
+query I
+SELECT id FROM types_test WHERE i_val IS NOT NULL
+----
+1
+
+# COALESCE
+query I
+SELECT COALESCE(NULL, NULL, 42)
+----
+42
+
+query I
+SELECT COALESCE(1, 2, 3)
+----
+1
+
+query T
+SELECT COALESCE(NULL, 'fallback')
+----
+fallback
+
+# NULLIF
+query I
+SELECT NULLIF(1, 1)
+----
+NULL
+
+query I
+SELECT NULLIF(1, 2)
+----
+1
+
+# CAST between types
+query T
+SELECT CAST(42 AS TEXT)
+----
+42
+
+query I
+SELECT CAST('123' AS INTEGER)
+----
+123
+
+query I
+SELECT CAST(3.7 AS INTEGER)
+----
+3
+
+query R
+SELECT CAST(42 AS FLOAT)
+----
+42.000
+
+# CAST invalid text to int returns NULL
+query I
+SELECT CAST('not_a_number' AS INTEGER)
+----
+NULL
+
+# Comparison with NULL always returns NULL/no match
+query I
+SELECT COUNT(*) FROM types_test WHERE i_val = NULL
+----
+0
+
+# NULL = NULL in stoolap evaluates to true (non-standard behavior)
+query I
+SELECT COUNT(*) FROM types_test WHERE NULL = NULL
+----
+2
+
+statement ok
+DROP TABLE types_test

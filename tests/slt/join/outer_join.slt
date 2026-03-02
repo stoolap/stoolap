@@ -1,0 +1,146 @@
+# Outer JOIN tests
+
+statement ok
+CREATE TABLE oj_emp (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)
+
+statement ok
+CREATE TABLE oj_dept (id INTEGER PRIMARY KEY, dept_name TEXT)
+
+statement ok
+INSERT INTO oj_emp VALUES (1, 'Alice', 1), (2, 'Bob', 2), (3, 'Carol', 1), (4, 'Dave', NULL), (5, 'Eve', 99)
+
+statement ok
+INSERT INTO oj_dept VALUES (1, 'Engineering'), (2, 'Sales'), (3, 'Marketing')
+
+# LEFT JOIN: matched and unmatched rows
+query ITT rowsort
+SELECT oj_emp.id, oj_emp.name, oj_dept.dept_name FROM oj_emp LEFT JOIN oj_dept ON oj_emp.dept_id = oj_dept.id
+----
+1 Alice Engineering
+2 Bob Sales
+3 Carol Engineering
+4 Dave NULL
+5 Eve NULL
+
+# LEFT JOIN: right side all NULL when unmatched
+query II rowsort
+SELECT oj_emp.id, oj_dept.id FROM oj_emp LEFT JOIN oj_dept ON oj_emp.dept_id = oj_dept.id
+----
+1 1
+2 2
+3 1
+4 NULL
+5 NULL
+
+# RIGHT JOIN: matched and unmatched rows
+query TTI rowsort
+SELECT oj_emp.name, oj_dept.dept_name, oj_dept.id FROM oj_emp RIGHT JOIN oj_dept ON oj_emp.dept_id = oj_dept.id
+----
+Alice Engineering 1
+Bob Sales 2
+Carol Engineering 1
+NULL Marketing 3
+
+# FULL OUTER JOIN: both sides unmatched
+query ITT rowsort
+SELECT oj_emp.id, oj_emp.name, oj_dept.dept_name FROM oj_emp FULL OUTER JOIN oj_dept ON oj_emp.dept_id = oj_dept.id
+----
+1 Alice Engineering
+2 Bob Sales
+3 Carol Engineering
+4 Dave NULL
+5 Eve NULL
+NULL NULL Marketing
+
+# LEFT JOIN with multiple matches (fan-out)
+statement ok
+CREATE TABLE oj_orders (id INTEGER PRIMARY KEY, emp_id INTEGER, amount INTEGER)
+
+statement ok
+INSERT INTO oj_orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150)
+
+query TII rowsort
+SELECT oj_emp.name, oj_orders.id, oj_orders.amount FROM oj_emp LEFT JOIN oj_orders ON oj_emp.id = oj_orders.emp_id
+----
+Alice 1 100
+Alice 2 200
+Bob 3 150
+Carol NULL NULL
+Dave NULL NULL
+Eve NULL NULL
+
+# LEFT JOIN with WHERE that filters NULLs (becomes inner join semantically)
+query IT rowsort
+SELECT oj_emp.id, oj_dept.dept_name FROM oj_emp LEFT JOIN oj_dept ON oj_emp.dept_id = oj_dept.id WHERE oj_dept.dept_name IS NOT NULL
+----
+1 Engineering
+2 Sales
+3 Engineering
+
+# LEFT JOIN with IS NULL (anti-join pattern)
+query IT rowsort
+SELECT oj_emp.id, oj_emp.name FROM oj_emp LEFT JOIN oj_dept ON oj_emp.dept_id = oj_dept.id WHERE oj_dept.id IS NULL
+----
+4 Dave
+5 Eve
+
+# Chained outer joins
+statement ok
+CREATE TABLE oj_skills (id INTEGER PRIMARY KEY, emp_id INTEGER, skill TEXT)
+
+statement ok
+INSERT INTO oj_skills VALUES (1, 1, 'Rust'), (2, 1, 'SQL'), (3, 3, 'Python')
+
+query TTTT rowsort
+SELECT oj_emp.name, oj_dept.dept_name, oj_skills.skill, oj_orders.amount FROM oj_emp LEFT JOIN oj_dept ON oj_emp.dept_id = oj_dept.id LEFT JOIN oj_skills ON oj_emp.id = oj_skills.emp_id LEFT JOIN oj_orders ON oj_emp.id = oj_orders.emp_id
+----
+Alice Engineering Rust 100
+Alice Engineering Rust 200
+Alice Engineering SQL 100
+Alice Engineering SQL 200
+Bob Sales NULL 150
+Carol Engineering Python NULL
+Dave NULL NULL NULL
+Eve NULL NULL NULL
+
+# LEFT JOIN with aggregation (COUNT(*) counts all rows including unmatched)
+query TI rowsort
+SELECT oj_dept.dept_name, COUNT(*) FROM oj_dept LEFT JOIN oj_emp ON oj_dept.id = oj_emp.dept_id GROUP BY oj_dept.dept_name
+----
+Engineering 2
+Marketing 1
+Sales 1
+
+# Outer join with NULL join keys - NULL never matches
+query II
+SELECT COUNT(*), SUM(CASE WHEN oj_dept.id IS NULL THEN 1 ELSE 0 END) FROM oj_emp LEFT JOIN oj_dept ON oj_emp.dept_id = oj_dept.id
+----
+5 2
+
+# FULL OUTER JOIN with no matches at all
+statement ok
+CREATE TABLE oj_empty (id INTEGER PRIMARY KEY, val TEXT)
+
+query IT rowsort
+SELECT oj_emp.id, oj_empty.val FROM oj_emp FULL OUTER JOIN oj_empty ON oj_emp.id = oj_empty.id
+----
+1 NULL
+2 NULL
+3 NULL
+4 NULL
+5 NULL
+
+statement ok
+DROP TABLE oj_empty
+
+statement ok
+DROP TABLE oj_skills
+
+statement ok
+DROP TABLE oj_orders
+
+statement ok
+DROP TABLE oj_dept
+
+statement ok
+DROP TABLE oj_emp

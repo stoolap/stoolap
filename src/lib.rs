@@ -153,6 +153,9 @@ pub use api::{
     ToParam, Transaction as ApiTransaction,
 };
 
+#[cfg(any(test, feature = "test-failpoints"))]
+pub mod test_failpoints;
+
 #[cfg(test)]
 mod size_tests {
     #[test]

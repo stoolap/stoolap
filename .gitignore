@@ -22,6 +22,9 @@ Thumbs.db
 *.db
 *.sqlite
 
+# Runtime database lock/WAL artifacts
+db.lock/
+
 # Coverage
 coverage.txt
 *.profraw

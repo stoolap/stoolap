@@ -1,0 +1,97 @@
+# CROSS JOIN tests
+
+statement ok
+CREATE TABLE cross_a (id INTEGER PRIMARY KEY, val TEXT)
+
+statement ok
+CREATE TABLE cross_b (id INTEGER PRIMARY KEY, val TEXT)
+
+statement ok
+INSERT INTO cross_a VALUES (1, 'x'), (2, 'y')
+
+statement ok
+INSERT INTO cross_b VALUES (10, 'a'), (20, 'b'), (30, 'c')
+
+# CROSS JOIN basic (2 x 3 = 6 rows)
+query ITIT rowsort
+SELECT cross_a.id, cross_a.val, cross_b.id, cross_b.val FROM cross_a CROSS JOIN cross_b
+----
+1 x 10 a
+1 x 20 b
+1 x 30 c
+2 y 10 a
+2 y 20 b
+2 y 30 c
+
+# Verify row count
+query I
+SELECT COUNT(*) FROM cross_a CROSS JOIN cross_b
+----
+6
+
+# CROSS JOIN with empty table (empty result)
+statement ok
+CREATE TABLE cross_empty (id INTEGER PRIMARY KEY, val TEXT)
+
+query I
+SELECT COUNT(*) FROM cross_a CROSS JOIN cross_empty
+----
+0
+
+# CROSS JOIN with single-row tables
+statement ok
+CREATE TABLE cross_one (id INTEGER PRIMARY KEY, val TEXT)
+
+statement ok
+INSERT INTO cross_one VALUES (1, 'only')
+
+query ITIT
+SELECT cross_one.id, cross_one.val, cross_a.id, cross_a.val FROM cross_one CROSS JOIN cross_a ORDER BY cross_a.id
+----
+1 only 1 x
+1 only 2 y
+
+# Implicit cross join (FROM a, b)
+query II rowsort
+SELECT cross_a.id, cross_b.id FROM cross_a, cross_b
+----
+1 10
+1 20
+1 30
+2 10
+2 20
+2 30
+
+# CROSS JOIN with WHERE (equivalent to inner join)
+query II rowsort
+SELECT cross_a.id, cross_b.id FROM cross_a CROSS JOIN cross_b WHERE cross_a.id * 10 = cross_b.id
+----
+1 10
+2 20
+
+# CROSS JOIN three tables
+statement ok
+CREATE TABLE cross_c (id INTEGER PRIMARY KEY, val TEXT)
+
+statement ok
+INSERT INTO cross_c VALUES (100, 'p'), (200, 'q')
+
+query I
+SELECT COUNT(*) FROM cross_a CROSS JOIN cross_b CROSS JOIN cross_c
+----
+12
+
+statement ok
+DROP TABLE cross_c
+
+statement ok
+DROP TABLE cross_one
+
+statement ok
+DROP TABLE cross_empty
+
+statement ok
+DROP TABLE cross_b
+
+statement ok
+DROP TABLE cross_a

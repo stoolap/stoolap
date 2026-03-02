@@ -1,0 +1,92 @@
+# VIEW tests
+
+statement ok
+CREATE TABLE view_emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)
+
+statement ok
+INSERT INTO view_emp VALUES (1, 'Alice', 'Eng', 100), (2, 'Bob', 'Eng', 120), (3, 'Carol', 'Sales', 80), (4, 'Dave', 'Sales', 90)
+
+# CREATE VIEW basic
+statement ok
+CREATE VIEW v_eng AS SELECT * FROM view_emp WHERE dept = 'Eng'
+
+# Query view like table
+query ITT rowsort
+SELECT id, name, dept FROM v_eng
+----
+1 Alice Eng
+2 Bob Eng
+
+# View with WHERE clause
+query IT
+SELECT id, name FROM v_eng WHERE salary > 100
+----
+2 Bob
+
+# View with aggregation
+statement ok
+CREATE VIEW v_dept_stats AS SELECT dept, COUNT(*) AS cnt, SUM(salary) AS total FROM view_emp GROUP BY dept
+
+query TIR rowsort
+SELECT * FROM v_dept_stats
+----
+Eng 2 220.000
+Sales 2 170.000
+
+# View with join
+statement ok
+CREATE TABLE view_dept_info (dept TEXT, location TEXT)
+
+statement ok
+INSERT INTO view_dept_info VALUES ('Eng', 'Building A'), ('Sales', 'Building B')
+
+statement ok
+CREATE VIEW v_emp_full AS SELECT e.id, e.name, e.dept, d.location FROM view_emp e INNER JOIN view_dept_info d ON e.dept = d.dept
+
+query ITTT rowsort
+SELECT * FROM v_emp_full
+----
+1 Alice Eng Building A
+2 Bob Eng Building A
+3 Carol Sales Building B
+4 Dave Sales Building B
+
+# View referencing view
+statement ok
+CREATE VIEW v_eng_full AS SELECT * FROM v_emp_full WHERE dept = 'Eng'
+
+query ITTT rowsort
+SELECT * FROM v_eng_full
+----
+1 Alice Eng Building A
+2 Bob Eng Building A
+
+# INSERT into base table reflected in view
+statement ok
+INSERT INTO view_emp VALUES (5, 'Eve', 'Eng', 130)
+
+query IT rowsort
+SELECT id, name FROM v_eng
+----
+1 Alice
+2 Bob
+5 Eve
+
+# DROP VIEW
+statement ok
+DROP VIEW v_eng_full
+
+statement ok
+DROP VIEW v_emp_full
+
+statement ok
+DROP VIEW v_dept_stats
+
+statement ok
+DROP VIEW v_eng
+
+statement ok
+DROP TABLE view_dept_info
+
+statement ok
+DROP TABLE view_emp

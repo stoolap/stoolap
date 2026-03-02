@@ -1,0 +1,62 @@
+# Scalar subquery tests
+
+statement ok
+CREATE TABLE sq_main (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, salary INTEGER)
+
+statement ok
+CREATE TABLE sq_dept (id INTEGER PRIMARY KEY, dept_name TEXT)
+
+statement ok
+INSERT INTO sq_dept VALUES (1, 'Engineering'), (2, 'Sales')
+
+statement ok
+INSERT INTO sq_main VALUES (1, 'Alice', 1, 100), (2, 'Bob', 1, 120), (3, 'Carol', 2, 80), (4, 'Dave', 2, 90)
+
+# Scalar subquery in SELECT
+query TI rowsort
+SELECT name, (SELECT MAX(salary) FROM sq_main) AS max_sal FROM sq_main
+----
+Alice 120
+Bob 120
+Carol 120
+Dave 120
+
+# Scalar subquery in WHERE
+query IT rowsort
+SELECT id, name FROM sq_main WHERE salary > (SELECT AVG(salary) FROM sq_main)
+----
+1 Alice
+2 Bob
+
+# Scalar subquery returning NULL (no rows match)
+query I
+SELECT (SELECT salary FROM sq_main WHERE id = 999)
+----
+NULL
+
+# Scalar subquery with aggregate
+query I
+SELECT (SELECT COUNT(*) FROM sq_main)
+----
+4
+
+# Nested scalar subqueries
+query IT rowsort
+SELECT id, name FROM sq_main WHERE salary = (SELECT MAX(salary) FROM sq_main WHERE dept_id = (SELECT id FROM sq_dept WHERE dept_name = 'Engineering'))
+----
+2 Bob
+
+# Scalar subquery returning department name
+query TT rowsort
+SELECT sq_main.name, (SELECT dept_name FROM sq_dept WHERE sq_dept.id = sq_main.dept_id) AS dept FROM sq_main
+----
+Alice Engineering
+Bob Engineering
+Carol Sales
+Dave Sales
+
+statement ok
+DROP TABLE sq_main
+
+statement ok
+DROP TABLE sq_dept

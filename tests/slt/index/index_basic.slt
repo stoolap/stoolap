@@ -1,0 +1,90 @@
+# Index tests
+
+statement ok
+CREATE TABLE idx_test (id INTEGER PRIMARY KEY, name TEXT, value INTEGER, flag BOOLEAN)
+
+statement ok
+INSERT INTO idx_test VALUES (1, 'Alice', 100, true), (2, 'Bob', 200, false), (3, 'Carol', 300, true), (4, 'Dave', 100, false), (5, 'Eve', 500, true)
+
+# CREATE INDEX (auto type selection)
+statement ok
+CREATE INDEX idx_value ON idx_test(value)
+
+# Query using index produces same results
+query IT rowsort
+SELECT id, name FROM idx_test WHERE value = 100
+----
+1 Alice
+4 Dave
+
+# CREATE INDEX USING BTREE (on a different column)
+statement ok
+CREATE INDEX idx_id_btree ON idx_test(id) USING BTREE
+
+# Range query with B-tree index
+query IT rowsort
+SELECT id, name FROM idx_test WHERE value > 200
+----
+3 Carol
+5 Eve
+
+query IT rowsort
+SELECT id, name FROM idx_test WHERE value BETWEEN 100 AND 300
+----
+1 Alice
+2 Bob
+3 Carol
+4 Dave
+
+# CREATE INDEX USING HASH
+statement ok
+CREATE INDEX idx_name_hash ON idx_test(name) USING HASH
+
+# Equality lookup with hash index
+query II
+SELECT id, value FROM idx_test WHERE name = 'Carol'
+----
+3 300
+
+# CREATE UNIQUE INDEX
+statement ok
+CREATE TABLE uniq_idx_test (id INTEGER PRIMARY KEY, email TEXT)
+
+statement ok
+INSERT INTO uniq_idx_test VALUES (1, 'a@test.com'), (2, 'b@test.com')
+
+statement ok
+CREATE UNIQUE INDEX idx_email ON uniq_idx_test(email)
+
+# Unique index violation
+statement error
+INSERT INTO uniq_idx_test VALUES (3, 'a@test.com')
+
+# DROP INDEX
+statement ok
+DROP INDEX idx_value ON idx_test
+
+# Multi-column index
+statement ok
+CREATE INDEX idx_multi ON idx_test(name, value)
+
+# Query using multi-column index
+query I
+SELECT id FROM idx_test WHERE name = 'Alice' AND value = 100
+----
+1
+
+# Verify results are same with and without index
+statement ok
+DROP INDEX idx_multi ON idx_test
+
+query I
+SELECT id FROM idx_test WHERE name = 'Alice' AND value = 100
+----
+1
+
+statement ok
+DROP TABLE uniq_idx_test
+
+statement ok
+DROP TABLE idx_test

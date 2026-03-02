@@ -1,0 +1,63 @@
+# CTE (Common Table Expression) tests
+
+statement ok
+CREATE TABLE cte_data (id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER, value INTEGER)
+
+statement ok
+INSERT INTO cte_data VALUES (1, 'Alice', NULL, 100), (2, 'Bob', 1, 200), (3, 'Carol', 1, 150), (4, 'Dave', 2, 300), (5, 'Eve', NULL, 250)
+
+# Single CTE
+query IT rowsort
+WITH top AS (SELECT * FROM cte_data WHERE value > 200) SELECT id, name FROM top
+----
+4 Dave
+5 Eve
+
+# Multiple CTEs
+query I
+WITH grp AS (SELECT parent_id, COUNT(*) AS cnt FROM cte_data WHERE parent_id IS NOT NULL GROUP BY parent_id), totals AS (SELECT SUM(cnt) AS total FROM grp) SELECT total FROM totals
+----
+3
+
+# CTE referenced multiple times
+query II
+WITH base AS (SELECT COUNT(*) AS cnt FROM cte_data) SELECT a.cnt, b.cnt FROM base a, base b
+----
+5 5
+
+# CTE with column aliases
+query TI rowsort
+WITH named(n, v) AS (SELECT name, value FROM cte_data WHERE value > 200) SELECT n, v FROM named
+----
+Dave 300
+Eve 250
+
+# Nested CTEs (CTE referencing another CTE)
+query I
+WITH base AS (SELECT * FROM cte_data WHERE parent_id IS NOT NULL), agg AS (SELECT MAX(value) AS max_val FROM base) SELECT max_val FROM agg
+----
+300
+
+# CTE with aggregation
+query IIR rowsort
+WITH stats AS (SELECT parent_id, COUNT(*) AS cnt, AVG(value) AS avg_val FROM cte_data WHERE parent_id IS NOT NULL GROUP BY parent_id) SELECT parent_id, cnt, avg_val FROM stats
+----
+1 2 175.000
+2 1 300.000
+
+# CTE with join
+query TT rowsort
+WITH children AS (SELECT id, name, parent_id FROM cte_data WHERE parent_id IS NOT NULL) SELECT c.name, p.name FROM children c INNER JOIN cte_data p ON c.parent_id = p.id
+----
+Bob Alice
+Carol Alice
+Dave Bob
+
+# CTE shadowing table name
+query I
+WITH cte_data AS (SELECT 42 AS val) SELECT val FROM cte_data
+----
+42
+
+statement ok
+DROP TABLE cte_data

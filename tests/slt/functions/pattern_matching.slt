@@ -1,0 +1,95 @@
+# Pattern matching tests: LIKE, ILIKE, GLOB, REGEXP
+
+statement ok
+CREATE TABLE pat_test (id INTEGER PRIMARY KEY, name TEXT)
+
+statement ok
+INSERT INTO pat_test VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol'), (4, 'ALICE'), (5, 'alice'), (6, 'Al'), (7, NULL), (8, ''), (9, 'Alice Smith')
+
+# LIKE with % wildcard
+query IT rowsort
+SELECT id, name FROM pat_test WHERE name LIKE 'A%'
+----
+1 Alice
+4 ALICE
+6 Al
+9 Alice Smith
+
+# LIKE with _ wildcard (single char)
+query IT rowsort
+SELECT id, name FROM pat_test WHERE name LIKE 'A_'
+----
+6 Al
+
+# LIKE with no wildcards (exact match)
+query IT
+SELECT id, name FROM pat_test WHERE name LIKE 'Alice'
+----
+1 Alice
+
+# LIKE case sensitivity (LIKE is case-sensitive)
+query I
+SELECT COUNT(*) FROM pat_test WHERE name LIKE 'alice'
+----
+1
+
+# ILIKE (case insensitive)
+query IT rowsort
+SELECT id, name FROM pat_test WHERE name ILIKE 'alice'
+----
+1 Alice
+4 ALICE
+5 alice
+
+# ILIKE with wildcards
+query IT rowsort
+SELECT id, name FROM pat_test WHERE name ILIKE 'al%'
+----
+1 Alice
+4 ALICE
+5 alice
+6 Al
+9 Alice Smith
+
+# NOT LIKE
+query IT rowsort
+SELECT id, name FROM pat_test WHERE name NOT LIKE 'A%' AND name IS NOT NULL AND name != ''
+----
+2 Bob
+3 Carol
+5 alice
+
+# Pattern with NULL (NULL result) - use IS NULL pattern instead of LIKE NULL
+query I
+SELECT COUNT(*) FROM pat_test WHERE name IS NULL
+----
+1
+
+# LIKE with empty string
+query IT
+SELECT id, name FROM pat_test WHERE name LIKE ''
+----
+8 (empty)
+
+# LIKE '%' matches everything (except NULL)
+query I
+SELECT COUNT(*) FROM pat_test WHERE name LIKE '%'
+----
+8
+
+# LIKE with pattern in middle
+query IT rowsort
+SELECT id, name FROM pat_test WHERE name LIKE '%ob'
+----
+2 Bob
+
+# LIKE with multiple %
+query IT rowsort
+SELECT id, name FROM pat_test WHERE name LIKE '%li%'
+----
+1 Alice
+5 alice
+9 Alice Smith
+
+statement ok
+DROP TABLE pat_test

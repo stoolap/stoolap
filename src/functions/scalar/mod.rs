@@ -44,6 +44,7 @@
 
 mod conversion;
 mod datetime;
+mod hash;
 mod math;
 #[cfg(feature = "semantic")]
 pub mod semantic;
@@ -58,6 +59,9 @@ pub use datetime::{
     ExtractFunction, HourFunction, MinuteFunction, MonthFunction, SecondFunction,
     TimeTruncFunction, ToCharFunction, VersionFunction, YearFunction,
 };
+pub use hash::{
+    Crc32Function, Md5Function, Sha1Function, Sha256Function, Sha384Function, Sha512Function,
+};
 pub use math::{
     AbsFunction, CeilFunction, CeilingFunction, CosFunction, ExpFunction, FloorFunction,
     LnFunction, Log10Function, Log2Function, LogFunction, ModFunction, PiFunction, PowFunction,
@@ -65,11 +69,12 @@ pub use math::{
     TanFunction, TruncFunction, TruncateFunction,
 };
 pub use string::{
-    CharFunction, CharLengthFunction, ConcatFunction, ConcatWsFunction, InstrFunction,
-    LeftFunction, LengthFunction, LocateFunction, LowerFunction, LpadFunction, LtrimFunction,
-    PositionFunction, RepeatFunction, ReplaceFunction, ReverseFunction, RightFunction,
-    RpadFunction, RtrimFunction, SplitPartFunction, StrposFunction, SubstrFunction,
-    SubstringFunction, TrimFunction, UpperFunction,
+    CharFunction, CharLengthFunction, ConcatFunction, ConcatWsFunction, ContainsFunction,
+    EndsWithFunction, InstrFunction, LeftFunction, LengthFunction, LocateFunction, LowerFunction,
+    LpadFunction, LtrimFunction, PositionFunction, RepeatFunction, ReplaceFunction,
+    ReverseFunction, RightFunction, RpadFunction, RtrimFunction, SplitPartFunction,
+    StartsWithFunction, StrposFunction, SubstrFunction, SubstringFunction, TrimFunction,
+    UpperFunction,
 };
 pub use utility::{
     CoalesceFunction, GreatestFunction, IfNullFunction, IifFunction, JsonArrayFunction,

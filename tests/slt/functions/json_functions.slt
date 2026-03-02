@@ -1,0 +1,62 @@
+# JSON function tests
+
+statement ok
+CREATE TABLE json_test (id INTEGER PRIMARY KEY, data TEXT)
+
+statement ok
+INSERT INTO json_test VALUES (1, '{"name":"Alice","age":30,"active":true}'), (2, '{"name":"Bob","scores":[85,90,95]}'), (3, '{"nested":{"key":"value"}}'), (4, NULL)
+
+# JSON_EXTRACT basic path
+query T
+SELECT JSON_EXTRACT(data, '$.name') FROM json_test WHERE id = 1
+----
+Alice
+
+# JSON_EXTRACT nested path
+query T
+SELECT JSON_EXTRACT(data, '$.nested.key') FROM json_test WHERE id = 3
+----
+value
+
+# JSON_EXTRACT array index
+query T
+SELECT JSON_EXTRACT(data, '$.scores[0]') FROM json_test WHERE id = 2
+----
+85
+
+# JSON_TYPE
+query T
+SELECT JSON_TYPE('{"key": "value"}')
+----
+object
+
+query T
+SELECT JSON_TYPE('[1, 2, 3]')
+----
+array
+
+# JSON_VALID with valid/invalid JSON (returns 1/0 as integers)
+query II
+SELECT JSON_VALID('{"key": "value"}'), JSON_VALID('not json')
+----
+1 0
+
+# JSON functions with NULL
+query T
+SELECT JSON_EXTRACT(NULL, '$.key')
+----
+NULL
+
+query I
+SELECT JSON_VALID(NULL)
+----
+NULL
+
+# JSON in WHERE clause
+query I
+SELECT id FROM json_test WHERE JSON_EXTRACT(data, '$.name') = 'Alice'
+----
+1
+
+statement ok
+DROP TABLE json_test

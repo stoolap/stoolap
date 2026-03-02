@@ -1,0 +1,66 @@
+# EXISTS / NOT EXISTS subquery tests
+
+statement ok
+CREATE TABLE ex_customers (id INTEGER PRIMARY KEY, name TEXT)
+
+statement ok
+CREATE TABLE ex_orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER)
+
+statement ok
+INSERT INTO ex_customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol'), (4, 'Dave')
+
+statement ok
+INSERT INTO ex_orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150)
+
+# EXISTS basic
+query IT rowsort
+SELECT id, name FROM ex_customers WHERE EXISTS (SELECT 1 FROM ex_orders WHERE ex_orders.customer_id = ex_customers.id)
+----
+1 Alice
+2 Bob
+
+# NOT EXISTS basic
+query IT rowsort
+SELECT id, name FROM ex_customers WHERE NOT EXISTS (SELECT 1 FROM ex_orders WHERE ex_orders.customer_id = ex_customers.id)
+----
+3 Carol
+4 Dave
+
+# EXISTS with empty table
+statement ok
+CREATE TABLE ex_empty (id INTEGER PRIMARY KEY)
+
+query I
+SELECT COUNT(*) FROM ex_customers WHERE EXISTS (SELECT 1 FROM ex_empty)
+----
+0
+
+# NOT EXISTS for anti-join pattern (customers without orders)
+query IT rowsort
+SELECT c.id, c.name FROM ex_customers c WHERE NOT EXISTS (SELECT 1 FROM ex_orders o WHERE o.customer_id = c.id)
+----
+3 Carol
+4 Dave
+
+# EXISTS with correlated subquery
+query IT rowsort
+SELECT id, name FROM ex_customers WHERE EXISTS (SELECT 1 FROM ex_orders WHERE customer_id = ex_customers.id AND amount > 150)
+----
+1 Alice
+
+# Nested EXISTS (customers with 2+ orders)
+# Bob has only 1 order (id=3), so the inner EXISTS should be FALSE for him.
+# Alice has 2 orders (id=1, id=2), so the inner EXISTS is TRUE.
+query IT rowsort
+SELECT id, name FROM ex_customers c WHERE EXISTS (SELECT 1 FROM ex_orders o WHERE o.customer_id = c.id AND EXISTS (SELECT 1 FROM ex_orders o2 WHERE o2.customer_id = c.id AND o2.id != o.id))
+----
+1 Alice
+
+statement ok
+DROP TABLE ex_empty
+
+statement ok
+DROP TABLE ex_orders
+
+statement ok
+DROP TABLE ex_customers

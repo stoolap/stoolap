@@ -1,0 +1,123 @@
+# String function tests
+
+# UPPER, LOWER
+query TT
+SELECT UPPER('hello'), LOWER('WORLD')
+----
+HELLO world
+
+# LENGTH
+query III
+SELECT LENGTH('hello'), LENGTH(''), LENGTH(NULL)
+----
+5 0 NULL
+
+# TRIM
+query T
+SELECT TRIM('  hello  ')
+----
+hello
+
+# LTRIM, RTRIM
+query TT
+SELECT LTRIM('  hello  '), RTRIM('  hello  ')
+----
+hello    hello
+
+# CONCAT
+query T
+SELECT CONCAT('Hello', ' ', 'World')
+----
+Hello World
+
+# || operator
+query T
+SELECT 'Hello' || ' ' || 'World'
+----
+Hello World
+
+# SUBSTRING(str, start, length)
+query TT
+SELECT SUBSTRING('Hello World', 1, 5), SUBSTRING('Hello World', 7, 5)
+----
+Hello World
+
+# REPLACE
+query T
+SELECT REPLACE('Hello World', 'World', 'Rust')
+----
+Hello Rust
+
+# REVERSE
+query T
+SELECT REVERSE('hello')
+----
+olleh
+
+# LEFT, RIGHT
+query TT
+SELECT LEFT('Hello World', 5), RIGHT('Hello World', 5)
+----
+Hello World
+
+# LPAD, RPAD
+query TT
+SELECT LPAD('42', 5, '0'), RPAD('hi', 5, '!')
+----
+00042 hi!!!
+
+# POSITION / LOCATE
+query I
+SELECT POSITION('World' IN 'Hello World')
+----
+7
+
+# REPEAT
+query T
+SELECT REPEAT('ab', 3)
+----
+ababab
+
+# STARTS_WITH, ENDS_WITH
+query TT
+SELECT STARTS_WITH('Hello World', 'Hello'), ENDS_WITH('Hello World', 'World')
+----
+true true
+
+query TT
+SELECT STARTS_WITH('Hello', 'Bye'), ENDS_WITH('Hello', 'Bye')
+----
+false false
+
+# String functions with NULL args (NULL propagation)
+query TTTT
+SELECT UPPER(NULL), LOWER(NULL), TRIM(NULL), REVERSE(NULL)
+----
+NULL NULL NULL NULL
+
+query T
+SELECT REPLACE(NULL, 'a', 'b')
+----
+NULL
+
+query T
+SELECT SUBSTRING(NULL, 1, 2)
+----
+NULL
+
+# CONCAT skips NULLs (PostgreSQL behavior)
+query T
+SELECT CONCAT(NULL, 'test')
+----
+test
+
+# Empty string handling
+query T
+SELECT REVERSE('')
+----
+(empty)
+
+query I
+SELECT LENGTH(TRIM('   '))
+----
+0

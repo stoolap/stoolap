@@ -830,6 +830,11 @@ impl SnapshotWriter {
 
     /// Append a single row version with its row_id
     pub fn append_row(&mut self, row_id: i64, version: &RowVersion) -> Result<()> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if crate::test_failpoints::SNAPSHOT_WRITE_FAIL.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::internal("failpoint: snapshot write"));
+        }
+
         // Check for duplicate row_id
         if self.row_index.contains_key(&row_id) {
             return Err(Error::internal(format!(
@@ -903,6 +908,11 @@ impl SnapshotWriter {
     /// This method uses incremental CRC computation to avoid reading back
     /// the entire file, which significantly improves performance for large snapshots.
     pub fn finalize(&mut self) -> Result<()> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if crate::test_failpoints::SNAPSHOT_SYNC_FAIL.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::internal("failpoint: snapshot sync"));
+        }
+
         // Flush buffered data
         self.file
             .flush()

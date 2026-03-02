@@ -3056,6 +3056,71 @@ impl VersionStore {
         result
     }
 
+    /// Iterate visible rows matching a filter with early termination via callback.
+    ///
+    /// Calls `callback(row_id, row_data)` for each matching row. The callback
+    /// returns `true` to continue or `false` to stop iteration.
+    /// This avoids materializing all matching rows into a Vec.
+    pub fn for_each_visible_filtered<F>(
+        &self,
+        txn_id: i64,
+        filter: &dyn crate::storage::expression::Expression,
+        mut callback: F,
+    ) where
+        F: FnMut(i64, Row) -> bool,
+    {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let schema = self.schema.read();
+        let compiled_filter = CompiledFilter::compile(filter, &schema);
+        drop(schema);
+
+        let versions = self.versions.read().clone();
+        let arena_guard = self.arena.read_guard();
+        let arena_data = arena_guard.data();
+
+        for (&row_id, chain) in versions.iter() {
+            let mut current: Option<&VersionChainEntry> = Some(chain);
+
+            while let Some(e) = current {
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                if checker.is_visible(version_txn_id, txn_id) {
+                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
+                        break;
+                    }
+
+                    if let Some(idx) = unpack_arena_idx(e.arena_idx) {
+                        if let Some(arc_row) = arena_data.get(idx) {
+                            if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
+                                let row = Row::from_arc(CompactArc::clone(arc_row));
+                                if !callback(row_id, row) {
+                                    return;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if compiled_filter.matches(&e.version.data)
+                        && !callback(row_id, e.version.data.clone())
+                    {
+                        return;
+                    }
+                    break;
+                }
+                current = e.prev.as_deref();
+            }
+        }
+    }
+
     /// Get visible rows with filter, limit and offset applied at the storage layer.
     ///
     /// # True Early Termination
@@ -4447,8 +4512,8 @@ impl VersionStore {
                 }
             }
 
-            // We need at least 2 columns to match to prefer multi-col over single-col
-            if matched >= 2 {
+            // Use composite index if predicate covers a leftmost prefix
+            if matched >= 1 {
                 // Prefer index with more matching columns
                 if best_match.is_none() || matched > best_match.as_ref().unwrap().1 {
                     best_match = Some((index.clone(), matched));

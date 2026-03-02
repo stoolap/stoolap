@@ -1,0 +1,140 @@
+# INSERT, UPDATE, DELETE tests
+
+# Single row INSERT
+statement ok
+CREATE TABLE insert_test (id INTEGER PRIMARY KEY, name TEXT, value FLOAT)
+
+statement ok
+INSERT INTO insert_test VALUES (1, 'Alice', 10.5)
+
+query ITR
+SELECT * FROM insert_test
+----
+1 Alice 10.500
+
+# Multi-row INSERT
+statement ok
+INSERT INTO insert_test VALUES (2, 'Bob', 20.0), (3, 'Carol', 30.5)
+
+query I
+SELECT COUNT(*) FROM insert_test
+----
+3
+
+# INSERT with explicit column list
+statement ok
+INSERT INTO insert_test (id, name) VALUES (4, 'Dave')
+
+query ITR
+SELECT * FROM insert_test WHERE id = 4
+----
+4 Dave NULL
+
+# INSERT with NULL values
+statement ok
+INSERT INTO insert_test VALUES (5, NULL, NULL)
+
+query ITR
+SELECT * FROM insert_test WHERE id = 5
+----
+5 NULL NULL
+
+# INSERT duplicate PK should fail
+statement error
+INSERT INTO insert_test VALUES (1, 'Duplicate', 99.9)
+
+# UPDATE single row
+statement ok
+UPDATE insert_test SET name = 'Alicia' WHERE id = 1
+
+query T
+SELECT name FROM insert_test WHERE id = 1
+----
+Alicia
+
+# UPDATE multiple rows
+statement ok
+UPDATE insert_test SET value = 0.0 WHERE value IS NULL
+
+query R rowsort
+SELECT value FROM insert_test
+----
+0.000
+0.000
+10.500
+20.000
+30.500
+
+# UPDATE all rows
+statement ok
+UPDATE insert_test SET value = value + 1.0 WHERE value IS NOT NULL
+
+query IR rowsort
+SELECT id, value FROM insert_test
+----
+1 11.500
+2 21.000
+3 31.500
+4 1.000
+5 1.000
+
+# UPDATE with expression
+statement ok
+UPDATE insert_test SET value = value * 2 WHERE id = 1
+
+query R
+SELECT value FROM insert_test WHERE id = 1
+----
+23.000
+
+# UPDATE with WHERE that matches nothing
+statement ok
+UPDATE insert_test SET name = 'Nobody' WHERE id = 999
+
+query I
+SELECT COUNT(*) FROM insert_test WHERE name = 'Nobody'
+----
+0
+
+# DELETE single row
+statement ok
+DELETE FROM insert_test WHERE id = 5
+
+query I
+SELECT COUNT(*) FROM insert_test
+----
+4
+
+# DELETE conditional
+statement ok
+DELETE FROM insert_test WHERE id > 3
+
+query I
+SELECT COUNT(*) FROM insert_test
+----
+3
+
+# DELETE all rows
+statement ok
+DELETE FROM insert_test
+
+query I
+SELECT COUNT(*) FROM insert_test
+----
+0
+
+# Re-insert for TRUNCATE test
+statement ok
+INSERT INTO insert_test VALUES (1, 'A', 1.0), (2, 'B', 2.0), (3, 'C', 3.0)
+
+# TRUNCATE TABLE
+statement ok
+TRUNCATE TABLE insert_test
+
+query I
+SELECT COUNT(*) FROM insert_test
+----
+0
+
+statement ok
+DROP TABLE insert_test

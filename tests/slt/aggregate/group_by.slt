@@ -1,0 +1,139 @@
+# GROUP BY and aggregate function tests
+
+statement ok
+CREATE TABLE agg_test (id INTEGER PRIMARY KEY, category TEXT, value INTEGER, amount FLOAT)
+
+statement ok
+INSERT INTO agg_test VALUES (1, 'A', 10, 1.5), (2, 'A', 20, 2.5), (3, 'B', 30, 3.5), (4, 'B', 40, 4.5), (5, 'B', 50, 5.5), (6, 'C', NULL, NULL), (7, NULL, 70, 7.5)
+
+# GROUP BY single column
+query TI rowsort
+SELECT category, COUNT(*) FROM agg_test GROUP BY category
+----
+A 2
+B 3
+C 1
+NULL 1
+
+# GROUP BY with SUM (SUM in GROUP BY returns float)
+query TR rowsort
+SELECT category, SUM(value) FROM agg_test GROUP BY category
+----
+A 30.000
+B 120.000
+C NULL
+NULL 70.000
+
+# GROUP BY with AVG (float)
+query TR rowsort
+SELECT category, AVG(amount) FROM agg_test WHERE category IS NOT NULL GROUP BY category
+----
+A 2.000
+B 4.500
+C NULL
+
+# GROUP BY with MIN and MAX
+query TII rowsort
+SELECT category, MIN(value), MAX(value) FROM agg_test WHERE category IS NOT NULL GROUP BY category
+----
+A 10 20
+B 30 50
+C NULL NULL
+
+# GROUP BY multiple columns
+statement ok
+CREATE TABLE multi_group (id INTEGER PRIMARY KEY, dept TEXT, role TEXT, salary INTEGER)
+
+statement ok
+INSERT INTO multi_group VALUES (1, 'Eng', 'Dev', 100), (2, 'Eng', 'Dev', 120), (3, 'Eng', 'Mgr', 150), (4, 'Sales', 'Rep', 80), (5, 'Sales', 'Mgr', 130)
+
+query TTR rowsort
+SELECT dept, role, SUM(salary) FROM multi_group GROUP BY dept, role
+----
+Eng Dev 220.000
+Eng Mgr 150.000
+Sales Mgr 130.000
+Sales Rep 80.000
+
+# GROUP BY with HAVING
+query TR rowsort
+SELECT category, SUM(value) FROM agg_test GROUP BY category HAVING SUM(value) > 50
+----
+B 120.000
+NULL 70.000
+
+# HAVING without GROUP BY (aggregate whole table)
+query I
+SELECT COUNT(*) FROM agg_test HAVING COUNT(*) > 5
+----
+7
+
+# COUNT(*) vs COUNT(column) vs COUNT(DISTINCT column)
+query III
+SELECT COUNT(*), COUNT(value), COUNT(DISTINCT category) FROM agg_test
+----
+7 6 3
+
+# SUM/AVG of empty set returns NULL
+query IR
+SELECT SUM(value), AVG(amount) FROM agg_test WHERE id = 999
+----
+NULL NULL
+
+# COUNT of empty set returns 0
+query I
+SELECT COUNT(*) FROM agg_test WHERE id = 999
+----
+0
+
+# GROUP BY with NULL values (NULL forms its own group)
+query TI rowsort
+SELECT category, COUNT(*) FROM agg_test GROUP BY category
+----
+A 2
+B 3
+C 1
+NULL 1
+
+# Aggregate with no matching rows
+query I
+SELECT MAX(value) FROM agg_test WHERE value > 1000
+----
+NULL
+
+# GROUP BY with expression
+query II rowsort
+SELECT value / 10 AS bucket, COUNT(*) FROM agg_test WHERE value IS NOT NULL GROUP BY value / 10
+----
+1 1
+2 1
+3 1
+4 1
+5 1
+7 1
+
+# Note: SUM in GROUP BY returns float, SUM without GROUP BY returns integer
+
+# SUM with integers (no GROUP BY returns integer)
+query I
+SELECT SUM(value) FROM agg_test WHERE category = 'B'
+----
+120
+
+# AVG with mixed integer column
+query R
+SELECT AVG(value) FROM agg_test WHERE category = 'B'
+----
+40.000
+
+# MIN/MAX with text
+query TT
+SELECT MIN(category), MAX(category) FROM agg_test
+----
+A C
+
+statement ok
+DROP TABLE multi_group
+
+statement ok
+DROP TABLE agg_test

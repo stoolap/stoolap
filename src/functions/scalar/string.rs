@@ -1544,3 +1544,135 @@ mod tests {
             .is_null());
     }
 }
+
+// ============================================================================
+// STARTS_WITH
+// ============================================================================
+
+/// STARTS_WITH function - checks if a string starts with a prefix
+#[derive(Default)]
+pub struct StartsWithFunction;
+
+impl ScalarFunction for StartsWithFunction {
+    fn name(&self) -> &str {
+        "STARTS_WITH"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "STARTS_WITH",
+            FunctionType::Scalar,
+            "Returns true if string starts with prefix",
+            FunctionSignature::new(
+                FunctionDataType::Boolean,
+                vec![FunctionDataType::String, FunctionDataType::String],
+                2,
+                2,
+            ),
+        )
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "STARTS_WITH", 2);
+
+        if args[0].is_null() || args[1].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let s = value_to_string(&args[0]);
+        let prefix = value_to_string(&args[1]);
+        Ok(Value::Boolean(s.starts_with(prefix.as_str())))
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(StartsWithFunction)
+    }
+}
+
+// ============================================================================
+// ENDS_WITH
+// ============================================================================
+
+/// ENDS_WITH function - checks if a string ends with a suffix
+#[derive(Default)]
+pub struct EndsWithFunction;
+
+impl ScalarFunction for EndsWithFunction {
+    fn name(&self) -> &str {
+        "ENDS_WITH"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "ENDS_WITH",
+            FunctionType::Scalar,
+            "Returns true if string ends with suffix",
+            FunctionSignature::new(
+                FunctionDataType::Boolean,
+                vec![FunctionDataType::String, FunctionDataType::String],
+                2,
+                2,
+            ),
+        )
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "ENDS_WITH", 2);
+
+        if args[0].is_null() || args[1].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let s = value_to_string(&args[0]);
+        let suffix = value_to_string(&args[1]);
+        Ok(Value::Boolean(s.ends_with(suffix.as_str())))
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(EndsWithFunction)
+    }
+}
+
+// ============================================================================
+// CONTAINS
+// ============================================================================
+
+/// CONTAINS function - checks if a string contains a substring
+#[derive(Default)]
+pub struct ContainsFunction;
+
+impl ScalarFunction for ContainsFunction {
+    fn name(&self) -> &str {
+        "CONTAINS"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "CONTAINS",
+            FunctionType::Scalar,
+            "Returns true if string contains substring",
+            FunctionSignature::new(
+                FunctionDataType::Boolean,
+                vec![FunctionDataType::String, FunctionDataType::String],
+                2,
+                2,
+            ),
+        )
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "CONTAINS", 2);
+
+        if args[0].is_null() || args[1].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let s = value_to_string(&args[0]);
+        let substr = value_to_string(&args[1]);
+        Ok(Value::Boolean(s.contains(substr.as_str())))
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(ContainsFunction)
+    }
+}

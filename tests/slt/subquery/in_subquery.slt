@@ -1,0 +1,62 @@
+# IN / NOT IN subquery tests
+
+statement ok
+CREATE TABLE in_main (id INTEGER PRIMARY KEY, name TEXT, category INTEGER)
+
+statement ok
+CREATE TABLE in_cats (id INTEGER PRIMARY KEY, cat_name TEXT)
+
+statement ok
+INSERT INTO in_main VALUES (1, 'Alpha', 1), (2, 'Beta', 2), (3, 'Gamma', 1), (4, 'Delta', 3), (5, 'Epsilon', NULL)
+
+statement ok
+INSERT INTO in_cats VALUES (1, 'Active'), (2, 'Pending')
+
+# IN subquery basic
+query IT rowsort
+SELECT id, name FROM in_main WHERE category IN (SELECT id FROM in_cats)
+----
+1 Alpha
+2 Beta
+3 Gamma
+
+# NOT IN subquery basic
+query IT rowsort
+SELECT id, name FROM in_main WHERE category NOT IN (SELECT id FROM in_cats) AND category IS NOT NULL
+----
+4 Delta
+
+# IN with empty subquery (no matches)
+statement ok
+CREATE TABLE in_empty (id INTEGER PRIMARY KEY)
+
+query I
+SELECT COUNT(*) FROM in_main WHERE category IN (SELECT id FROM in_empty)
+----
+0
+
+# IN subquery with duplicates (should still work)
+statement ok
+CREATE TABLE in_dups (val INTEGER)
+
+statement ok
+INSERT INTO in_dups VALUES (1), (1), (2), (2)
+
+query IT rowsort
+SELECT id, name FROM in_main WHERE category IN (SELECT val FROM in_dups)
+----
+1 Alpha
+2 Beta
+3 Gamma
+
+statement ok
+DROP TABLE in_dups
+
+statement ok
+DROP TABLE in_empty
+
+statement ok
+DROP TABLE in_cats
+
+statement ok
+DROP TABLE in_main

@@ -1337,6 +1337,11 @@ impl WALManager {
             return Ok(());
         }
 
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if crate::test_failpoints::WAL_WRITE_FAIL.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::internal("failpoint: WAL write"));
+        }
+
         let mut wal_file = self.wal_file.lock().unwrap();
         if let Some(file) = wal_file.as_mut() {
             file.write_all(data)
@@ -1352,6 +1357,11 @@ impl WALManager {
     fn sync_locked(&self) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
+        }
+
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if crate::test_failpoints::WAL_SYNC_FAIL.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::internal("failpoint: WAL sync"));
         }
 
         let wal_file = self.wal_file.lock().unwrap();
@@ -2008,6 +2018,13 @@ impl WALManager {
         };
 
         let checkpoint_path = self.path.join("checkpoint.meta");
+
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if crate::test_failpoints::CHECKPOINT_WRITE_FAIL.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::internal("failpoint: checkpoint write"));
+        }
+
         checkpoint.write_to_file(&checkpoint_path)?;
 
         self.last_checkpoint

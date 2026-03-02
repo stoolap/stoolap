@@ -73,7 +73,7 @@ Stoolap's architecture consists of the following major components:
 
 ### Function System
 
-- **Function Registry** - Central registry for 118+ SQL functions
+- **Function Registry** - Central registry for 127+ SQL functions
   - Scalar functions (scalar/) - String, math, date, JSON, vector functions
   - Aggregate functions (aggregate/)
   - Window functions (window/)
@@ -164,7 +164,7 @@ src/
 │   ├── query.rs   # Main query executor
 │   ├── planner.rs # Query planner with cost estimation
 │   └── ...
-├── functions/     # 118+ built-in functions
+├── functions/     # 127+ built-in functions
 │   ├── scalar/    # String, math, date, JSON, vector functions
 │   ├── aggregate/ # COUNT, SUM, AVG, etc.
 │   └── window/    # ROW_NUMBER, RANK, LAG, etc.

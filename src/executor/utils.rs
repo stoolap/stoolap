@@ -143,11 +143,10 @@ fn substitute_outer_references_inner(
             if let Some(value) = outer_row.get(qualified_name.as_str()) {
                 return Some(value_to_expression(value));
             }
-            // Try just the column name
+            // Try just the column name as fallback
             if let Some(value) = outer_row.get(qid.name.value_lower.as_str()) {
                 return Some(value_to_expression(value));
             }
-            // Not an outer reference, no change
             None
         }
 
@@ -925,9 +924,19 @@ fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<S
         }
         Expression::In(in_expr) => {
             collect_table_qualifiers_impl(&in_expr.left, qualifiers);
-            if let Expression::List(list) = in_expr.right.as_ref() {
-                for elem in &list.elements {
-                    collect_table_qualifiers_impl(elem, qualifiers);
+            match in_expr.right.as_ref() {
+                Expression::ExpressionList(el) => {
+                    for elem in &el.expressions {
+                        collect_table_qualifiers_impl(elem, qualifiers);
+                    }
+                }
+                Expression::List(list) => {
+                    for elem in &list.elements {
+                        collect_table_qualifiers_impl(elem, qualifiers);
+                    }
+                }
+                other => {
+                    collect_table_qualifiers_impl(other, qualifiers);
                 }
             }
         }
@@ -950,6 +959,18 @@ fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<S
         }
         Expression::Cast(cast) => {
             collect_table_qualifiers_impl(&cast.expr, qualifiers);
+        }
+        Expression::Case(case) => {
+            if let Some(ref val) = case.value {
+                collect_table_qualifiers_impl(val, qualifiers);
+            }
+            for when in &case.when_clauses {
+                collect_table_qualifiers_impl(&when.condition, qualifiers);
+                collect_table_qualifiers_impl(&when.then_result, qualifiers);
+            }
+            if let Some(ref else_val) = case.else_value {
+                collect_table_qualifiers_impl(else_val, qualifiers);
+            }
         }
         _ => {}
     }

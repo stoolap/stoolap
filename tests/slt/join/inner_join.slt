@@ -1,0 +1,109 @@
+# INNER JOIN tests
+
+statement ok
+CREATE TABLE j_left (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)
+
+statement ok
+CREATE TABLE j_right (id INTEGER PRIMARY KEY, dept_name TEXT)
+
+statement ok
+INSERT INTO j_left VALUES (1, 'Alice', 1), (2, 'Bob', 2), (3, 'Carol', 1), (4, 'Dave', NULL), (5, 'Eve', 3)
+
+statement ok
+INSERT INTO j_right VALUES (1, 'Engineering'), (2, 'Sales'), (4, 'Marketing')
+
+# Simple equi-join on single column
+query ITT rowsort
+SELECT j_left.id, j_left.name, j_right.dept_name FROM j_left INNER JOIN j_right ON j_left.dept_id = j_right.id
+----
+1 Alice Engineering
+2 Bob Sales
+3 Carol Engineering
+
+# Join producing empty result (no matches via WHERE)
+query IT
+SELECT j_left.id, j_left.name FROM j_left INNER JOIN j_right ON j_left.dept_id = j_right.id WHERE j_right.id = 999
+----
+
+# Join with NULL in join column (no match for NULL)
+query I
+SELECT COUNT(*) FROM j_left INNER JOIN j_right ON j_left.dept_id = j_right.id
+----
+3
+
+# Join with WHERE clause filtering
+query IT
+SELECT j_left.id, j_left.name FROM j_left INNER JOIN j_right ON j_left.dept_id = j_right.id WHERE j_right.dept_name = 'Engineering'
+----
+1 Alice
+3 Carol
+
+# Self-join
+query TT rowsort
+SELECT a.name, b.name FROM j_left a INNER JOIN j_left b ON a.dept_id = b.dept_id AND a.id < b.id
+----
+Alice Carol
+
+# Three-table join
+statement ok
+CREATE TABLE j_projects (id INTEGER PRIMARY KEY, dept_id INTEGER, project_name TEXT)
+
+statement ok
+INSERT INTO j_projects VALUES (1, 1, 'Alpha'), (2, 1, 'Beta'), (3, 2, 'Gamma')
+
+query TTT rowsort
+SELECT j_left.name, j_right.dept_name, j_projects.project_name FROM j_left INNER JOIN j_right ON j_left.dept_id = j_right.id INNER JOIN j_projects ON j_right.id = j_projects.dept_id
+----
+Alice Engineering Alpha
+Alice Engineering Beta
+Bob Sales Gamma
+Carol Engineering Alpha
+Carol Engineering Beta
+
+# Join with non-equi condition
+query TT rowsort
+SELECT a.name, b.name FROM j_left a INNER JOIN j_left b ON a.dept_id = b.dept_id AND a.id != b.id
+----
+Alice Carol
+Carol Alice
+
+# Join with additional WHERE filtering
+query IT rowsort
+SELECT j_left.id, j_right.dept_name FROM j_left INNER JOIN j_right ON j_left.dept_id = j_right.id WHERE j_left.id > 1
+----
+2 Sales
+3 Engineering
+
+# NATURAL JOIN (joins on columns with same name: id)
+statement ok
+CREATE TABLE nat_a (id INTEGER PRIMARY KEY, val_a TEXT)
+
+statement ok
+CREATE TABLE nat_b (id INTEGER PRIMARY KEY, val_b TEXT)
+
+statement ok
+INSERT INTO nat_a VALUES (1, 'x'), (2, 'y'), (3, 'z')
+
+statement ok
+INSERT INTO nat_b VALUES (2, 'p'), (3, 'q'), (4, 'r')
+
+query ITT rowsort
+SELECT id, val_a, val_b FROM nat_a NATURAL JOIN nat_b
+----
+2 y p
+3 z q
+
+statement ok
+DROP TABLE j_projects
+
+statement ok
+DROP TABLE nat_b
+
+statement ok
+DROP TABLE nat_a
+
+statement ok
+DROP TABLE j_right
+
+statement ok
+DROP TABLE j_left

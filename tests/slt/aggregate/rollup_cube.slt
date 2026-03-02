@@ -1,0 +1,70 @@
+# ROLLUP, CUBE, GROUPING SETS tests
+
+statement ok
+CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, product TEXT, amount INTEGER)
+
+statement ok
+INSERT INTO sales VALUES (1, 'East', 'Widget', 100), (2, 'East', 'Widget', 150), (3, 'East', 'Gadget', 200), (4, 'West', 'Widget', 120), (5, 'West', 'Gadget', 180), (6, 'West', 'Gadget', 220)
+
+# ROLLUP single column
+query TI rowsort
+SELECT region, SUM(amount) FROM sales GROUP BY ROLLUP(region)
+----
+East 450
+NULL 970
+West 520
+
+# ROLLUP multiple columns (subtotals at each level)
+query TTI rowsort
+SELECT region, product, SUM(amount) FROM sales GROUP BY ROLLUP(region, product)
+----
+East Gadget 200
+East NULL 450
+East Widget 250
+NULL NULL 970
+West Gadget 400
+West NULL 520
+West Widget 120
+
+# CUBE single column (same as ROLLUP for single)
+query TI rowsort
+SELECT region, SUM(amount) FROM sales GROUP BY CUBE(region)
+----
+East 450
+NULL 970
+West 520
+
+# CUBE multiple columns (all combinations)
+query TTI rowsort
+SELECT region, product, SUM(amount) FROM sales GROUP BY CUBE(region, product)
+----
+East Gadget 200
+East NULL 450
+East Widget 250
+NULL Gadget 600
+NULL NULL 970
+NULL Widget 370
+West Gadget 400
+West NULL 520
+West Widget 120
+
+# GROUPING SETS explicit
+query TTI rowsort
+SELECT region, product, SUM(amount) FROM sales GROUP BY GROUPING SETS ((region), (product))
+----
+East NULL 450
+NULL Gadget 600
+NULL Widget 370
+West NULL 520
+
+
+# ROLLUP with aggregate functions
+query TII rowsort
+SELECT region, COUNT(*), SUM(amount) FROM sales GROUP BY ROLLUP(region)
+----
+East 3 450
+NULL 6 970
+West 3 520
+
+statement ok
+DROP TABLE sales

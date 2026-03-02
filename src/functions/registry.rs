@@ -44,20 +44,22 @@ use super::scalar::vector::{
 };
 use super::scalar::{
     AbsFunction, CastFunction, CeilFunction, CeilingFunction, CharFunction, CharLengthFunction,
-    CoalesceFunction, CollateFunction, ConcatFunction, ConcatWsFunction, CosFunction,
-    CurrentDateFunction, CurrentTimeFunction, CurrentTimestampFunction, DateAddFunction,
-    DateDiffAliasFunction, DateDiffFunction, DateSubFunction, DateTruncFunction, DayFunction,
-    ExpFunction, ExtractFunction, FloorFunction, GreatestFunction, HourFunction, IfNullFunction,
-    IifFunction, InstrFunction, JsonArrayFunction, JsonArrayLengthFunction, JsonExtractFunction,
-    JsonKeysFunction, JsonObjectFunction, JsonTypeFunction, JsonTypeOfFunction, JsonValidFunction,
-    LeastFunction, LeftFunction, LengthFunction, LnFunction, LocateFunction, Log10Function,
-    Log2Function, LogFunction, LowerFunction, LpadFunction, LtrimFunction, MinuteFunction,
-    ModFunction, MonthFunction, NowFunction, NullIfFunction, PiFunction, PositionFunction,
-    PowFunction, PowerFunction, RandomFunction, RepeatFunction, ReplaceFunction, ReverseFunction,
-    RightFunction, RoundFunction, RpadFunction, RtrimFunction, SecondFunction, SignFunction,
-    SinFunction, SleepFunction, SplitPartFunction, SqrtFunction, StrposFunction, SubstrFunction,
-    SubstringFunction, TanFunction, TimeTruncFunction, ToCharFunction, TrimFunction, TruncFunction,
-    TruncateFunction, TypeOfFunction, UpperFunction, VersionFunction, YearFunction,
+    CoalesceFunction, CollateFunction, ConcatFunction, ConcatWsFunction, ContainsFunction,
+    CosFunction, Crc32Function, CurrentDateFunction, CurrentTimeFunction, CurrentTimestampFunction,
+    DateAddFunction, DateDiffAliasFunction, DateDiffFunction, DateSubFunction, DateTruncFunction,
+    DayFunction, EndsWithFunction, ExpFunction, ExtractFunction, FloorFunction, GreatestFunction,
+    HourFunction, IfNullFunction, IifFunction, InstrFunction, JsonArrayFunction,
+    JsonArrayLengthFunction, JsonExtractFunction, JsonKeysFunction, JsonObjectFunction,
+    JsonTypeFunction, JsonTypeOfFunction, JsonValidFunction, LeastFunction, LeftFunction,
+    LengthFunction, LnFunction, LocateFunction, Log10Function, Log2Function, LogFunction,
+    LowerFunction, LpadFunction, LtrimFunction, Md5Function, MinuteFunction, ModFunction,
+    MonthFunction, NowFunction, NullIfFunction, PiFunction, PositionFunction, PowFunction,
+    PowerFunction, RandomFunction, RepeatFunction, ReplaceFunction, ReverseFunction, RightFunction,
+    RoundFunction, RpadFunction, RtrimFunction, SecondFunction, Sha1Function, Sha256Function,
+    Sha384Function, Sha512Function, SignFunction, SinFunction, SleepFunction, SplitPartFunction,
+    SqrtFunction, StartsWithFunction, StrposFunction, SubstrFunction, SubstringFunction,
+    TanFunction, TimeTruncFunction, ToCharFunction, TrimFunction, TruncFunction, TruncateFunction,
+    TypeOfFunction, UpperFunction, VersionFunction, YearFunction,
 };
 use super::tvf::{GenerateSeriesFunction, GenerateSeriesScalarFunction, TableValuedFunction};
 use super::window::{
@@ -146,6 +148,9 @@ impl FunctionRegistry {
         registry.register_scalar::<RightFunction>();
         registry.register_scalar::<RepeatFunction>();
         registry.register_scalar::<SplitPartFunction>();
+        registry.register_scalar::<StartsWithFunction>();
+        registry.register_scalar::<EndsWithFunction>();
+        registry.register_scalar::<ContainsFunction>();
         registry.register_scalar::<PositionFunction>();
         registry.register_scalar::<StrposFunction>();
         registry.register_scalar::<InstrFunction>();
@@ -217,6 +222,14 @@ impl FunctionRegistry {
         registry.register_scalar::<JsonKeysFunction>();
         registry.register_scalar::<TypeOfFunction>();
         registry.register_scalar::<SleepFunction>();
+
+        // Hash functions
+        registry.register_scalar::<Md5Function>();
+        registry.register_scalar::<Sha1Function>();
+        registry.register_scalar::<Sha256Function>();
+        registry.register_scalar::<Sha384Function>();
+        registry.register_scalar::<Sha512Function>();
+        registry.register_scalar::<Crc32Function>();
 
         // Register vector functions
         registry.register_scalar::<VecDistanceL2Function>();

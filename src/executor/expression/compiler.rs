@@ -442,13 +442,25 @@ impl<'a> ExprCompiler<'a> {
                         ColumnSource::Row1(idx) => builder.emit(Op::LoadColumn(idx)),
                         ColumnSource::Row2(idx) => builder.emit(Op::LoadColumn2(idx)),
                     }
-                } else if let Some(name) = self.ctx.resolve_outer_column(column) {
-                    builder.emit(Op::LoadOuterColumn(name));
                 } else {
-                    return Err(CompileError::ColumnNotFound(format!(
-                        "{}.{}",
-                        table, column
-                    )));
+                    // For qualified identifiers (e.g., c.id), prefer the qualified
+                    // name in outer_columns over unqualified. This prevents incorrect
+                    // resolution when the unqualified key ("id") is overwritten in
+                    // outer_row by an inner row's column with the same name.
+                    let qualified_name =
+                        format!("{}.{}", table.to_lowercase(), column.to_lowercase());
+                    if let Some(name) = self
+                        .ctx
+                        .resolve_outer_column(&qualified_name)
+                        .or_else(|| self.ctx.resolve_outer_column(column))
+                    {
+                        builder.emit(Op::LoadOuterColumn(name));
+                    } else {
+                        return Err(CompileError::ColumnNotFound(format!(
+                            "{}.{}",
+                            table, column
+                        )));
+                    }
                 }
             }
 

@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use rustc_hash::FxHashMap;
 
 use super::{find_column_index, resolve_alias, Expression};
-use crate::core::{Result, Row, Schema, Value};
+use crate::core::{Operator, Result, Row, Schema, Value};
 
 /// BETWEEN expression (column BETWEEN low AND high)
 ///
@@ -321,6 +321,27 @@ impl Expression for BetweenExpr {
 
     fn can_use_index(&self) -> bool {
         true
+    }
+
+    fn collect_comparisons(&self) -> Vec<(&str, Operator, &Value)> {
+        // NOT BETWEEN cannot be decomposed into simple range comparisons
+        // for index use (it's a disjunction: col < low OR col > high)
+        if self.not {
+            return vec![];
+        }
+        if self.inclusive {
+            // BETWEEN low AND high  =>  col >= low AND col <= high
+            vec![
+                (&self.column, Operator::Gte, &self.lower_bound),
+                (&self.column, Operator::Lte, &self.upper_bound),
+            ]
+        } else {
+            // Exclusive BETWEEN  =>  col > low AND col < high
+            vec![
+                (&self.column, Operator::Gt, &self.lower_bound),
+                (&self.column, Operator::Lt, &self.upper_bound),
+            ]
+        }
     }
 
     fn clone_box(&self) -> Box<dyn Expression> {

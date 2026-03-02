@@ -24,6 +24,7 @@ use crate::common::{CompactArc, I64Set};
 use crate::core::{
     DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
 };
+use crate::storage::expression::logical::OrExpr;
 use crate::storage::expression::Expression;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
 use crate::storage::mvcc::scanner::MVCCScanner;
@@ -613,8 +614,8 @@ impl MVCCTable {
             })
             .collect();
 
-        // Try to find a multi-column index that covers these equality columns
-        if eq_columns.len() >= 2 {
+        // Try to find a multi-column index that covers these equality columns (prefix rule)
+        if !eq_columns.is_empty() {
             if let Some((multi_idx, matched_count)) =
                 self.version_store.get_multi_column_index(&eq_columns)
             {
@@ -642,15 +643,94 @@ impl MVCCTable {
 
                 // If we matched all columns in the prefix, use the multi-column index
                 if all_columns_matched && values.len() == matched_count {
-                    let row_ids = multi_idx.get_row_ids_equal(&values);
+                    // Check if the next index column has range predicates — use
+                    // BTree range scan instead of hash prefix lookup for better selectivity
+                    let trailing_range = if matched_count < index_columns.len() {
+                        let next_col = &index_columns[matched_count];
+                        column_comparisons.get(next_col.as_str()).and_then(|ops| {
+                            // Collect range bounds for this column
+                            let mut min_val: Option<(&Value, bool)> = None;
+                            let mut max_val: Option<(&Value, bool)> = None;
+                            for (op, val) in ops {
+                                match op {
+                                    Operator::Gt => {
+                                        min_val = Some((*val, false));
+                                    }
+                                    Operator::Gte => {
+                                        min_val = Some((*val, true));
+                                    }
+                                    Operator::Lt => {
+                                        max_val = Some((*val, false));
+                                    }
+                                    Operator::Lte => {
+                                        max_val = Some((*val, true));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            // Need an upper bound for a valid BTree range scan.
+                            // Lower-bound-only (b > 10) builds min_key=[prefix, 10]
+                            // but max_key=[prefix] which is SHORTER, and CompositeKey
+                            // ordering makes shorter keys less — creating an inverted
+                            // range that panics in BTreeMap::range.
+                            // Upper-bound-only (b < 10) is safe: min_key=[prefix] <
+                            // max_key=[prefix, 10].
+                            if max_val.is_some() {
+                                Some((min_val, max_val))
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
+
+                    let row_ids = if let Some((min_bound, max_bound)) = trailing_range {
+                        // Build composite min/max keys for BTree range scan
+                        let mut min_key = values.clone();
+                        let mut max_key = values.clone();
+                        let (min_inclusive, max_inclusive) = match (min_bound, max_bound) {
+                            (Some((min_v, min_inc)), Some((max_v, max_inc))) => {
+                                min_key.push(min_v.clone());
+                                max_key.push(max_v.clone());
+                                (min_inc, max_inc)
+                            }
+                            // Lower-bound-only is filtered out above (inverted range)
+                            (Some(_), None) => unreachable!(),
+                            (None, Some((max_v, max_inc))) => {
+                                // min_key stays as equality prefix
+                                max_key.push(max_v.clone());
+                                (true, max_inc)
+                            }
+                            (None, None) => unreachable!(),
+                        };
+                        if let Ok(entries) =
+                            multi_idx.find_range(&min_key, &max_key, min_inclusive, max_inclusive)
+                        {
+                            let mut ids = RowIdVec::with_capacity(entries.len());
+                            for entry in entries {
+                                ids.push(entry.row_id);
+                            }
+                            ids
+                        } else {
+                            multi_idx.get_row_ids_equal(&values)
+                        }
+                    } else {
+                        multi_idx.get_row_ids_equal(&values)
+                    };
+
                     if !row_ids.is_empty() {
                         // Multi-column index gave us results - check if we need to apply
                         // additional filters for columns not covered by the index
-                        let covered_columns: FxHashSet<&str> = index_columns
+                        let mut covered_columns: FxHashSet<&str> = index_columns
                             .iter()
                             .take(matched_count)
                             .map(|s| s.as_str())
                             .collect();
+                        // The trailing range column is also covered if used
+                        if trailing_range.is_some() && matched_count < index_columns.len() {
+                            covered_columns.insert(index_columns[matched_count].as_str());
+                        }
 
                         // Check if there are non-covered columns with predicates
                         let uncovered_columns: Vec<&str> = column_comparisons
@@ -872,6 +952,10 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Option<RowVec> {
+        if limit == 0 {
+            return Some(RowVec::new());
+        }
+
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
             return None; // Fall through to full path
@@ -897,6 +981,177 @@ impl MVCCTable {
                 }
                 true // Continue
             });
+        Some(result)
+    }
+
+    /// Hybrid optimization for mixed OR predicates (some indexed, some not).
+    ///
+    /// For `(indexed_col = X OR non_indexed_col = Y)`:
+    /// 1. Fetch rows matching indexed branches via index lookup
+    /// 2. Scan all rows evaluating only the non-indexed branches (skip already-found rows)
+    /// 3. Union deduplicated results
+    ///
+    /// Returns `Some(rows)` when we can handle this, `None` to fall through.
+    fn try_mixed_or_fetch(
+        &self,
+        expr: &dyn Expression,
+        schema: &Schema,
+        limit: usize,
+        offset: usize,
+    ) -> Option<RowVec> {
+        if limit == 0 {
+            return Some(RowVec::new());
+        }
+
+        let or_operands = expr.get_or_operands()?;
+
+        // Partition operands into indexed and non-indexed
+        let mut indexed_row_ids: Vec<RowIdVec> = Vec::new();
+        let mut unindexed_operands: Vec<Box<dyn Expression>> = Vec::new();
+
+        for operand in or_operands {
+            if let Some(row_ids) = self.try_index_lookup(operand.as_ref(), schema) {
+                indexed_row_ids.push(row_ids);
+            } else {
+                unindexed_operands.push(operand.clone_box());
+            }
+        }
+
+        // Only useful when we have BOTH indexed and non-indexed operands
+        if indexed_row_ids.is_empty() || unindexed_operands.is_empty() {
+            return None;
+        }
+
+        // Bail if there are local transaction changes (complex merge needed)
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        // Phase 1: Fetch rows matching indexed branches
+        // Build a bitset/set of indexed row IDs for dedup
+        const MAX_BITSET_WORDS: usize = 131_072;
+        let mut max_id = 0i64;
+        let mut min_id = 0i64;
+        let total_indexed: usize = indexed_row_ids.iter().map(|v| v.len()).sum();
+        for ids in &indexed_row_ids {
+            for &id in ids.iter() {
+                if id > max_id {
+                    max_id = id;
+                }
+                if id < min_id {
+                    min_id = id;
+                }
+            }
+        }
+
+        // Deduplicate indexed row IDs into a single RowIdVec + build lookup set
+        let num_words = if max_id >= 0 {
+            (max_id as usize / 64) + 1
+        } else {
+            0
+        };
+        let use_bitset = min_id >= 0 && num_words <= MAX_BITSET_WORDS;
+
+        let mut deduped_ids = RowIdVec::with_capacity(total_indexed);
+        let mut bitset = if use_bitset {
+            vec![0u64; num_words]
+        } else {
+            vec![]
+        };
+        let mut id_set = if !use_bitset {
+            I64Set::with_capacity(total_indexed)
+        } else {
+            I64Set::new()
+        };
+
+        for ids in &indexed_row_ids {
+            for &id in ids.iter() {
+                if use_bitset {
+                    let idx = id as usize;
+                    let word = idx / 64;
+                    let mask = 1u64 << (idx % 64);
+                    if (bitset[word] & mask) == 0 {
+                        bitset[word] |= mask;
+                        deduped_ids.push(id);
+                    }
+                } else if id_set.insert(id) {
+                    deduped_ids.push(id);
+                }
+            }
+        }
+
+        // Fetch indexed rows
+        let mut result = RowVec::with_capacity(limit.min(total_indexed + 64));
+        let mut skipped = 0usize;
+
+        self.version_store
+            .for_each_visible(&deduped_ids, self.txn_id, |row_id, row_data| {
+                let row = self.normalize_row_to_schema(row_data, schema);
+                // Re-apply full OR filter to ensure correctness (index may return superset)
+                if expr.evaluate_fast(&row) {
+                    if skipped < offset {
+                        skipped += 1;
+                    } else {
+                        result.push((row_id, row));
+                        if result.len() >= limit {
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+
+        if result.len() >= limit {
+            return Some(result);
+        }
+
+        // Phase 2: Scan for rows matching non-indexed branches (skip already-found rows)
+        // Build filter from non-indexed operands only
+        let mut unindexed_filter: Box<dyn Expression> = if unindexed_operands.len() == 1 {
+            unindexed_operands.into_iter().next().unwrap()
+        } else {
+            Box::new(OrExpr::new(unindexed_operands))
+        };
+        unindexed_filter.prepare_for_schema(schema);
+
+        let remaining_offset = offset.saturating_sub(skipped);
+        let mut scan_skipped = 0usize;
+
+        // Streaming scan: filter + dedup + limit inline, no bulk materialization
+        self.version_store.for_each_visible_filtered(
+            self.txn_id,
+            unindexed_filter.as_ref(),
+            |row_id, row_data| {
+                // Skip rows already found by index
+                let already_found = if use_bitset {
+                    let idx = row_id as usize;
+                    if idx / 64 < bitset.len() {
+                        (bitset[idx / 64] & (1u64 << (idx % 64))) != 0
+                    } else {
+                        false
+                    }
+                } else {
+                    id_set.contains(row_id)
+                };
+                if already_found {
+                    return true; // continue
+                }
+
+                let row = self.normalize_row_to_schema(row_data, schema);
+                if scan_skipped < remaining_offset {
+                    scan_skipped += 1;
+                } else {
+                    result.push((row_id, row));
+                    if result.len() >= limit {
+                        return false; // stop
+                    }
+                }
+                true // continue
+            },
+        );
+
         Some(result)
     }
 
@@ -1372,6 +1627,11 @@ impl MVCCTable {
                 }
                 // Has local changes - fall through to full path
             }
+
+            // OPTIMIZATION: Mixed OR (indexed OR non-indexed) hybrid scan
+            if let Some(result) = self.try_mixed_or_fetch(expr, schema, limit, offset) {
+                return result;
+            }
         }
 
         let txn_versions = self.txn_versions.read().unwrap();
@@ -1524,6 +1784,11 @@ impl MVCCTable {
                     return result;
                 }
                 // Has local changes - fall through to full path
+            }
+
+            // OPTIMIZATION: Mixed OR (indexed OR non-indexed) hybrid scan
+            if let Some(result) = self.try_mixed_or_fetch(expr, schema, limit, offset) {
+                return result;
             }
         }
 
@@ -3728,6 +3993,7 @@ impl Table for MVCCTable {
                         index_name: index.name().to_string(),
                         column: col_name.to_string(),
                         condition,
+                        filter: None,
                     };
                 }
             }
@@ -3742,6 +4008,7 @@ impl Table for MVCCTable {
                         index_name: index.name().to_string(),
                         column: col_name.to_string(),
                         condition: format!("LIKE '{}%'", prefix),
+                        filter: None,
                     };
                 }
             }
@@ -3769,20 +4036,54 @@ impl Table for MVCCTable {
                 }
             }
 
-            if all_indexed && !indexed_info.is_empty() {
-                if indexed_info.len() == 1 {
-                    let (idx_name, col, cond) = indexed_info.into_iter().next().unwrap();
-                    return ScanPlan::IndexScan {
+            if !indexed_info.is_empty() {
+                if all_indexed {
+                    if indexed_info.len() == 1 {
+                        let (idx_name, col, cond) = indexed_info.into_iter().next().unwrap();
+                        return ScanPlan::IndexScan {
+                            table: table_name,
+                            index_name: idx_name,
+                            column: col,
+                            condition: cond,
+                            filter: None,
+                        };
+                    }
+                    return ScanPlan::MultiIndexScan {
                         table: table_name,
-                        index_name: idx_name,
-                        column: col,
-                        condition: cond,
+                        indexes: indexed_info,
+                        operation: "OR".to_string(),
+                        filter: None,
                     };
                 }
+                // Mixed OR: some operands indexed, some not — hybrid scan
+                // Show as Multi-Index Scan with a Filter for the non-indexed operands
+                let non_indexed_parts: Vec<String> = or_operands
+                    .iter()
+                    .filter(|op| {
+                        if let Some((col_name, _, _)) = op.get_comparison_info() {
+                            self.version_store.get_index_by_column(col_name).is_none()
+                        } else {
+                            true
+                        }
+                    })
+                    .map(|op| {
+                        if let Some((col, operator, val)) = op.get_comparison_info() {
+                            format!("{} {} {}", col, operator_to_string(operator), val)
+                        } else {
+                            format!("{:?}", op)
+                        }
+                    })
+                    .collect();
+                let filter_str = if non_indexed_parts.len() == 1 {
+                    non_indexed_parts.into_iter().next().unwrap()
+                } else {
+                    non_indexed_parts.join(" OR ")
+                };
                 return ScanPlan::MultiIndexScan {
                     table: table_name,
                     indexes: indexed_info,
                     operation: "OR".to_string(),
+                    filter: Some(filter_str),
                 };
             }
         }
@@ -3812,8 +4113,8 @@ impl Table for MVCCTable {
                 })
                 .collect();
 
-            // Try multi-column index if we have 2+ equality predicates
-            if eq_columns.len() >= 2 {
+            // Try multi-column index if we have equality predicates matching a prefix
+            if !eq_columns.is_empty() {
                 if let Some((multi_idx, matched_count)) =
                     self.version_store.get_multi_column_index(&eq_columns)
                 {
@@ -3835,12 +4136,51 @@ impl Table for MVCCTable {
                         }
                     }
 
+                    // Check if the next index column (after the equality prefix) has
+                    // range predicates — the composite index BTree can serve these too
+                    if matched_count < index_columns.len() {
+                        let next_col = &index_columns[matched_count];
+                        if let Some(ops) = column_conditions.get(next_col.as_str()) {
+                            let range_ops: Vec<String> = ops
+                                .iter()
+                                .filter(|(op, _)| !matches!(op, Operator::Eq))
+                                .map(|(op, val)| format!("{} {}", operator_to_string(*op), val))
+                                .collect();
+                            if !range_ops.is_empty() {
+                                columns.push(next_col.clone());
+                                conditions.push(range_ops.join(" AND "));
+                            }
+                        }
+                    }
+
                     if !columns.is_empty() {
+                        // Collect residual predicates: columns not covered by the index
+                        let covered: rustc_hash::FxHashSet<&str> =
+                            columns.iter().map(|c| c.as_str()).collect();
+                        let residual: Vec<String> = column_conditions
+                            .iter()
+                            .filter(|(col, _)| !covered.contains(*col))
+                            .map(|(col, ops)| {
+                                ops.iter()
+                                    .map(|(op, val)| {
+                                        format!("{} {} {}", col, operator_to_string(*op), val)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" AND ")
+                            })
+                            .collect();
+                        let filter = if residual.is_empty() {
+                            None
+                        } else {
+                            Some(residual.join(" AND "))
+                        };
+
                         return ScanPlan::CompositeIndexScan {
                             table: table_name,
                             index_name: multi_idx.name().to_string(),
                             columns,
                             conditions,
+                            filter,
                         };
                     }
                 }
@@ -3861,6 +4201,7 @@ impl Table for MVCCTable {
                     .push((*op, *val));
             }
 
+            let mut indexed_columns: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
             for (col_name, ops) in &column_conditions {
                 if let Some(index) = self.version_store.get_index_by_column(col_name) {
                     // Simplify to a single condition string
@@ -3876,10 +4217,28 @@ impl Table for MVCCTable {
                         parts.join(" AND ")
                     };
                     indexed_info.push((index.name().to_string(), col_name.to_string(), condition));
+                    indexed_columns.insert(col_name);
                 }
             }
 
             if !indexed_info.is_empty() {
+                // Collect residual predicates for non-indexed columns
+                let residual: Vec<String> = column_conditions
+                    .iter()
+                    .filter(|(col, _)| !indexed_columns.contains(*col))
+                    .map(|(col, ops)| {
+                        ops.iter()
+                            .map(|(op, val)| format!("{} {} {}", col, operator_to_string(*op), val))
+                            .collect::<Vec<_>>()
+                            .join(" AND ")
+                    })
+                    .collect();
+                let filter = if residual.is_empty() {
+                    None
+                } else {
+                    Some(residual.join(" AND "))
+                };
+
                 if indexed_info.len() == 1 {
                     let (idx_name, col, cond) = indexed_info.into_iter().next().unwrap();
                     return ScanPlan::IndexScan {
@@ -3887,12 +4246,14 @@ impl Table for MVCCTable {
                         index_name: idx_name,
                         column: col,
                         condition: cond,
+                        filter,
                     };
                 }
                 return ScanPlan::MultiIndexScan {
                     table: table_name,
                     indexes: indexed_info,
                     operation: "AND".to_string(),
+                    filter,
                 };
             }
         }

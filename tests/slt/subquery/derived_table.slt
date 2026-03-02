@@ -1,0 +1,62 @@
+# Derived table (subquery in FROM) tests
+
+statement ok
+CREATE TABLE dt_data (id INTEGER PRIMARY KEY, category TEXT, value INTEGER)
+
+statement ok
+INSERT INTO dt_data VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 30), (4, 'B', 40), (5, 'C', 50)
+
+# Simple derived table (SUM in GROUP BY returns float)
+query TR rowsort
+SELECT sub.category, sub.total FROM (SELECT category, SUM(value) AS total FROM dt_data GROUP BY category) AS sub
+----
+A 30.000
+B 70.000
+C 50.000
+
+# Derived table with alias
+query TI rowsort
+SELECT t.category, t.cnt FROM (SELECT category, COUNT(*) AS cnt FROM dt_data GROUP BY category) AS t
+----
+A 2
+B 2
+C 1
+
+# Derived table joined with regular table
+statement ok
+CREATE TABLE dt_meta (category TEXT, label TEXT)
+
+statement ok
+INSERT INTO dt_meta VALUES ('A', 'Alpha'), ('B', 'Beta'), ('C', 'Gamma')
+
+query TTR rowsort
+SELECT m.label, s.category, s.total FROM (SELECT category, SUM(value) AS total FROM dt_data GROUP BY category) AS s INNER JOIN dt_meta m ON s.category = m.category
+----
+Alpha A 30.000
+Beta B 70.000
+Gamma C 50.000
+
+# Nested derived tables
+query I
+SELECT cnt FROM (SELECT COUNT(*) AS cnt FROM (SELECT DISTINCT category FROM dt_data) AS inner_q) AS outer_q
+----
+3
+
+# Derived table with aggregation
+query R
+SELECT MAX(total) FROM (SELECT category, SUM(value) AS total FROM dt_data GROUP BY category) AS sub
+----
+70.000
+
+# Derived table with ORDER BY/LIMIT (inline view)
+query TR
+SELECT sub.category, sub.total FROM (SELECT category, SUM(value) AS total FROM dt_data GROUP BY category ORDER BY total DESC LIMIT 2) AS sub ORDER BY sub.total DESC
+----
+B 70.000
+C 50.000
+
+statement ok
+DROP TABLE dt_meta
+
+statement ok
+DROP TABLE dt_data

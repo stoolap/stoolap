@@ -1,0 +1,142 @@
+# Window function tests
+
+statement ok
+CREATE TABLE win_data (id INTEGER PRIMARY KEY, dept TEXT, name TEXT, salary INTEGER)
+
+statement ok
+INSERT INTO win_data VALUES (1, 'Eng', 'Alice', 100), (2, 'Eng', 'Bob', 120), (3, 'Eng', 'Carol', 100), (4, 'Sales', 'Dave', 80), (5, 'Sales', 'Eve', 90), (6, 'HR', 'Frank', 110)
+
+# ROW_NUMBER() OVER (ORDER BY)
+query TI
+SELECT name, ROW_NUMBER() OVER (ORDER BY salary DESC) AS rn FROM win_data ORDER BY rn
+----
+Bob 1
+Frank 2
+Alice 3
+Carol 4
+Eve 5
+Dave 6
+
+# ROW_NUMBER() OVER (PARTITION BY ORDER BY)
+query TTI
+SELECT dept, name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM win_data ORDER BY dept, rn
+----
+Eng Bob 1
+Eng Alice 2
+Eng Carol 3
+HR Frank 1
+Sales Eve 1
+Sales Dave 2
+
+# RANK() with ties
+query TII
+SELECT name, salary, RANK() OVER (ORDER BY salary DESC) AS rnk FROM win_data ORDER BY rnk, name
+----
+Bob 120 1
+Frank 110 2
+Alice 100 3
+Carol 100 3
+Eve 90 5
+Dave 80 6
+
+# DENSE_RANK() with ties
+query TII
+SELECT name, salary, DENSE_RANK() OVER (ORDER BY salary DESC) AS drnk FROM win_data ORDER BY drnk, name
+----
+Bob 120 1
+Frank 110 2
+Alice 100 3
+Carol 100 3
+Eve 90 4
+Dave 80 5
+
+# NTILE(n)
+query TI
+SELECT name, NTILE(3) OVER (ORDER BY salary DESC) AS tile FROM win_data ORDER BY tile, name
+----
+Bob 1
+Frank 1
+Alice 2
+Carol 2
+Dave 3
+Eve 3
+
+# LAG(col, offset, default)
+query TII
+SELECT name, salary, LAG(salary, 1, 0) OVER (ORDER BY salary) AS prev_salary FROM win_data ORDER BY salary
+----
+Dave 80 0
+Eve 90 80
+Alice 100 90
+Carol 100 100
+Frank 110 100
+Bob 120 110
+
+# LEAD(col, offset, default)
+query TII
+SELECT name, salary, LEAD(salary, 1, 0) OVER (ORDER BY salary) AS next_salary FROM win_data ORDER BY salary
+----
+Dave 80 90
+Eve 90 100
+Alice 100 100
+Carol 100 110
+Frank 110 120
+Bob 120 0
+
+# FIRST_VALUE
+query TTI
+SELECT dept, name, FIRST_VALUE(salary) OVER (PARTITION BY dept ORDER BY salary DESC) AS max_in_dept FROM win_data ORDER BY dept, name
+----
+Eng Alice 120
+Eng Bob 120
+Eng Carol 120
+HR Frank 110
+Sales Dave 90
+Sales Eve 90
+
+# SUM() OVER (ORDER BY) - running sum
+query TII
+SELECT name, salary, SUM(salary) OVER (ORDER BY id) AS running_total FROM win_data ORDER BY id
+----
+Alice 100 100
+Bob 120 220
+Carol 100 320
+Dave 80 400
+Eve 90 490
+Frank 110 600
+
+# COUNT() OVER (PARTITION BY)
+query TTI
+SELECT dept, name, COUNT(*) OVER (PARTITION BY dept) AS dept_size FROM win_data ORDER BY dept, name
+----
+Eng Alice 3
+Eng Bob 3
+Eng Carol 3
+HR Frank 1
+Sales Dave 2
+Sales Eve 2
+
+# Multiple window functions in same query
+query TIII
+SELECT name, salary, ROW_NUMBER() OVER (ORDER BY salary DESC) AS rn, RANK() OVER (ORDER BY salary DESC) AS rnk FROM win_data ORDER BY rn
+----
+Bob 120 1 1
+Frank 110 2 2
+Alice 100 3 3
+Carol 100 4 3
+Eve 90 5 5
+Dave 80 6 6
+
+# Window function with different partitions in same query
+query TTII
+SELECT dept, name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS dept_rn, ROW_NUMBER() OVER (ORDER BY salary DESC) AS global_rn FROM win_data ORDER BY global_rn
+----
+Eng Bob 1 1
+HR Frank 1 2
+Eng Alice 2 3
+Eng Carol 3 4
+Sales Eve 1 5
+Sales Dave 2 6
+
+statement ok
+DROP TABLE win_data

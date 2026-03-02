@@ -1,0 +1,54 @@
+# Advanced aggregate function tests
+
+statement ok
+CREATE TABLE adv_agg (id INTEGER PRIMARY KEY, grp TEXT, val FLOAT, name TEXT)
+
+statement ok
+INSERT INTO adv_agg VALUES (1, 'A', 10.0, 'alpha'), (2, 'A', 20.0, 'beta'), (3, 'A', 30.0, 'gamma'), (4, 'B', 100.0, 'delta'), (5, 'B', 200.0, NULL), (6, 'C', 50.0, 'epsilon')
+
+# Multiple different aggregates in same query
+query TIRRI rowsort
+SELECT grp, COUNT(*), MIN(val), MAX(val), SUM(val) FROM adv_agg GROUP BY grp
+----
+A 3 10.000 30.000 60.000
+B 2 100.000 200.000 300.000
+C 1 50.000 50.000 50.000
+
+# STRING_AGG with delimiter
+query T
+SELECT STRING_AGG(name, ', ') FROM adv_agg WHERE grp = 'A' AND name IS NOT NULL
+----
+alpha, beta, gamma
+
+# STRING_AGG with NULL values (NULLs are skipped)
+query T
+SELECT STRING_AGG(name, ',') FROM adv_agg WHERE grp = 'B'
+----
+delta
+
+# AVG returns float
+query R
+SELECT AVG(val) FROM adv_agg WHERE grp = 'A'
+----
+20.000
+
+# COUNT(*) vs COUNT(column) - NULL handling
+query II
+SELECT COUNT(*), COUNT(name) FROM adv_agg WHERE grp = 'B'
+----
+2 1
+
+# Aggregate over entire table (no GROUP BY)
+query IRRI
+SELECT COUNT(*), MIN(val), MAX(val), SUM(val) FROM adv_agg
+----
+6 10.000 200.000 410
+
+# Multiple aggregates with different filters via CASE
+query RR
+SELECT SUM(CASE WHEN grp = 'A' THEN val ELSE 0 END), SUM(CASE WHEN grp = 'B' THEN val ELSE 0 END) FROM adv_agg
+----
+60.000 300.000
+
+statement ok
+DROP TABLE adv_agg

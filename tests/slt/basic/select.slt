@@ -1,0 +1,226 @@
+# Basic SELECT tests
+
+statement ok
+CREATE TABLE select_test (id INTEGER PRIMARY KEY, name TEXT, value FLOAT, active BOOLEAN)
+
+statement ok
+INSERT INTO select_test VALUES (1, 'Alice', 10.5, true), (2, 'Bob', 20.0, false), (3, 'Carol', 30.5, true), (4, 'Dave', NULL, NULL), (5, NULL, 50.0, false)
+
+# SELECT all columns
+query ITRT rowsort
+SELECT * FROM select_test
+----
+1 Alice 10.500 true
+2 Bob 20.000 false
+3 Carol 30.500 true
+4 Dave NULL NULL
+5 NULL 50.000 false
+
+# SELECT specific columns
+query IT rowsort
+SELECT id, name FROM select_test
+----
+1 Alice
+2 Bob
+3 Carol
+4 Dave
+5 NULL
+
+# SELECT with column alias
+query I
+SELECT COUNT(*) AS cnt FROM select_test
+----
+5
+
+# WHERE with equality
+query IT
+SELECT id, name FROM select_test WHERE id = 1
+----
+1 Alice
+
+# WHERE with inequality
+query IT rowsort
+SELECT id, name FROM select_test WHERE id != 1
+----
+2 Bob
+3 Carol
+4 Dave
+5 NULL
+
+# WHERE with greater than
+query IT rowsort
+SELECT id, name FROM select_test WHERE id > 3
+----
+4 Dave
+5 NULL
+
+# WHERE with less than
+query IT rowsort
+SELECT id, name FROM select_test WHERE id < 3
+----
+1 Alice
+2 Bob
+
+# WHERE with greater than or equal
+query IT rowsort
+SELECT id, name FROM select_test WHERE id >= 3
+----
+3 Carol
+4 Dave
+5 NULL
+
+# WHERE with less than or equal
+query IT rowsort
+SELECT id, name FROM select_test WHERE id <= 2
+----
+1 Alice
+2 Bob
+
+# WHERE with BETWEEN
+query IT rowsort
+SELECT id, name FROM select_test WHERE id BETWEEN 2 AND 4
+----
+2 Bob
+3 Carol
+4 Dave
+
+# WHERE with IN
+query IT rowsort
+SELECT id, name FROM select_test WHERE id IN (1, 3, 5)
+----
+1 Alice
+3 Carol
+5 NULL
+
+# WHERE with NOT IN
+query IT rowsort
+SELECT id, name FROM select_test WHERE id NOT IN (1, 3, 5)
+----
+2 Bob
+4 Dave
+
+# WHERE with AND
+query IT
+SELECT id, name FROM select_test WHERE id > 1 AND active = true
+----
+3 Carol
+
+# WHERE with OR
+query IT rowsort
+SELECT id, name FROM select_test WHERE id = 1 OR id = 5
+----
+1 Alice
+5 NULL
+
+# WHERE with IS NULL
+query IT
+SELECT id, name FROM select_test WHERE name IS NULL
+----
+5 NULL
+
+# WHERE with IS NOT NULL
+query IT rowsort
+SELECT id, name FROM select_test WHERE name IS NOT NULL
+----
+1 Alice
+2 Bob
+3 Carol
+4 Dave
+
+# ORDER BY ascending (default)
+query IT
+SELECT id, name FROM select_test ORDER BY id
+----
+1 Alice
+2 Bob
+3 Carol
+4 Dave
+5 NULL
+
+# ORDER BY descending
+query IT
+SELECT id, name FROM select_test ORDER BY id DESC
+----
+5 NULL
+4 Dave
+3 Carol
+2 Bob
+1 Alice
+
+# ORDER BY multiple columns
+query TI
+SELECT name, id FROM select_test WHERE name IS NOT NULL ORDER BY name ASC, id DESC
+----
+Alice 1
+Bob 2
+Carol 3
+Dave 4
+
+# LIMIT
+query IT
+SELECT id, name FROM select_test ORDER BY id LIMIT 3
+----
+1 Alice
+2 Bob
+3 Carol
+
+# OFFSET
+query IT
+SELECT id, name FROM select_test ORDER BY id LIMIT 2 OFFSET 2
+----
+3 Carol
+4 Dave
+
+# Large OFFSET beyond row count returns empty
+query IT
+SELECT id, name FROM select_test ORDER BY id LIMIT 10 OFFSET 100
+----
+
+# LIMIT 0 returns no rows
+query IT
+SELECT id, name FROM select_test ORDER BY id LIMIT 0
+----
+
+# SELECT with expression in projection
+query II rowsort
+SELECT id, id * 2 AS doubled FROM select_test
+----
+1 2
+2 4
+3 6
+4 8
+5 10
+
+# Empty result set from WHERE
+query IT
+SELECT id, name FROM select_test WHERE id = 999
+----
+
+# SELECT from non-existent table
+statement error
+SELECT * FROM nonexistent_table
+
+# SELECT with boolean filter
+query IT rowsort
+SELECT id, name FROM select_test WHERE active = true
+----
+1 Alice
+3 Carol
+
+# SELECT with float comparison
+query IT rowsort
+SELECT id, name FROM select_test WHERE value > 15.0
+----
+2 Bob
+3 Carol
+5 NULL
+
+# SELECT DISTINCT
+query T rowsort
+SELECT DISTINCT active FROM select_test WHERE active IS NOT NULL
+----
+false
+true
+
+statement ok
+DROP TABLE select_test

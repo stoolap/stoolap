@@ -186,7 +186,7 @@ The WASM build includes the full SQL engine:
 
 - All SQL features: joins, subqueries, CTEs (including recursive), window functions, aggregations (ROLLUP, CUBE, GROUPING SETS), set operations
 - All data types: INTEGER, FLOAT, TEXT, BOOLEAN, TIMESTAMP, JSON, VECTOR
-- All 118+ built-in functions (string, math, date/time, JSON, vector, aggregate, window)
+- All 127+ built-in functions (string, math, date/time, JSON, hash, vector, aggregate, window)
 - MVCC transactions with snapshot isolation
 - Cost-based query optimizer with EXPLAIN/EXPLAIN ANALYZE
 - All index types: B-tree, Hash, Bitmap, multi-column, HNSW

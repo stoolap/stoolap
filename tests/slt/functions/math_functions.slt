@@ -1,0 +1,78 @@
+# Math function tests
+
+# ABS
+query III
+SELECT ABS(5), ABS(-5), ABS(0)
+----
+5 5 0
+
+# CEIL, FLOOR (return float)
+query RRRR
+SELECT CEIL(3.2), CEIL(-3.2), FLOOR(3.8), FLOOR(-3.8)
+----
+4.000 -3.000 3.000 -4.000
+
+# ROUND with precision
+query RRR
+SELECT ROUND(3.14159, 2), ROUND(3.14159, 0), ROUND(3.5, 0)
+----
+3.140 3.000 4.000
+
+# SQRT
+query R
+SELECT SQRT(16.0)
+----
+4.000
+
+# POWER
+query R
+SELECT POWER(2.0, 10.0)
+----
+1024.000
+
+# MOD
+query II
+SELECT MOD(17, 5), MOD(10, 3)
+----
+2 1
+
+# SIGN
+query III
+SELECT SIGN(42), SIGN(-42), SIGN(0)
+----
+1 -1 0
+
+# GREATEST, LEAST with multiple args
+query II
+SELECT GREATEST(1, 5, 3, 2), LEAST(1, 5, 3, 2)
+----
+5 1
+
+# GREATEST, LEAST with NULL
+query II
+SELECT GREATEST(1, NULL, 3), LEAST(1, NULL, 3)
+----
+3 1
+
+# LN, EXP
+query R
+SELECT ROUND(LN(EXP(1.0)), 3)
+----
+1.000
+
+# PI (formatted to 3 decimal places)
+query R
+SELECT ROUND(PI(), 2)
+----
+3.140
+
+# Math functions with NULL (NULL propagation)
+query IIIR
+SELECT ABS(NULL), CEIL(NULL), FLOOR(NULL), SQRT(NULL)
+----
+NULL NULL NULL NULL
+
+query RR
+SELECT POWER(NULL, 2.0), ROUND(NULL, 2)
+----
+NULL NULL

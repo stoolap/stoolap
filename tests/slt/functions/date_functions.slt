@@ -1,0 +1,50 @@
+# Date/Time function tests
+
+statement ok
+CREATE TABLE date_test (id INTEGER PRIMARY KEY, ts TIMESTAMP)
+
+statement ok
+INSERT INTO date_test VALUES (1, '2024-06-15T10:30:00Z'), (2, '2024-01-01T00:00:00Z'), (3, '2024-12-31T23:59:59Z')
+
+# EXTRACT year, month, day
+query III
+SELECT EXTRACT(YEAR FROM ts), EXTRACT(MONTH FROM ts), EXTRACT(DAY FROM ts) FROM date_test WHERE id = 1
+----
+2024 6 15
+
+# EXTRACT hour, minute, second
+query III
+SELECT EXTRACT(HOUR FROM ts), EXTRACT(MINUTE FROM ts), EXTRACT(SECOND FROM ts) FROM date_test WHERE id = 1
+----
+10 30 0
+
+# Date comparison
+query I rowsort
+SELECT id FROM date_test WHERE ts > '2024-06-01T00:00:00Z'
+----
+1
+3
+
+# Date sorting
+query I
+SELECT id FROM date_test ORDER BY ts ASC
+----
+2
+1
+3
+
+query I
+SELECT id FROM date_test ORDER BY ts DESC
+----
+3
+1
+2
+
+# Date functions with NULL
+query I
+SELECT EXTRACT(YEAR FROM NULL)
+----
+NULL
+
+statement ok
+DROP TABLE date_test

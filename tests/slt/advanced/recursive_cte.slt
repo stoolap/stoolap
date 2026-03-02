@@ -1,0 +1,70 @@
+# Recursive CTE tests
+
+# Simple recursive: generate series 1..5
+query I
+WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5) SELECT n FROM seq ORDER BY n
+----
+1
+2
+3
+4
+5
+
+# Hierarchical: tree traversal (parent-child)
+statement ok
+CREATE TABLE rc_tree (id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER)
+
+statement ok
+INSERT INTO rc_tree VALUES (1, 'Root', NULL), (2, 'Child1', 1), (3, 'Child2', 1), (4, 'Grandchild1', 2), (5, 'Grandchild2', 3)
+
+query ITI
+WITH RECURSIVE tree(id, name, depth) AS (SELECT id, name, 0 FROM rc_tree WHERE parent_id IS NULL UNION ALL SELECT t.id, t.name, tr.depth + 1 FROM rc_tree t INNER JOIN tree tr ON t.parent_id = tr.id) SELECT id, name, depth FROM tree ORDER BY id
+----
+1 Root 0
+2 Child1 1
+3 Child2 1
+4 Grandchild1 2
+5 Grandchild2 2
+
+# Recursive with depth control (counter)
+query I
+WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < 10) SELECT n FROM cnt ORDER BY n
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+# Recursive fibonacci
+query II
+WITH RECURSIVE fibo(n, fib, next_fib) AS (SELECT 1, 0, 1 UNION ALL SELECT n + 1, next_fib, fib + next_fib FROM fibo WHERE n < 10) SELECT n, fib FROM fibo ORDER BY n
+----
+1 0
+2 1
+3 1
+4 2
+5 3
+6 5
+7 8
+8 13
+9 21
+10 34
+
+# Recursive CTE with multiple columns - path building
+query ITT
+WITH RECURSIVE paths(id, name, path) AS (SELECT id, name, name FROM rc_tree WHERE parent_id IS NULL UNION ALL SELECT t.id, t.name, p.path || '/' || t.name FROM rc_tree t INNER JOIN paths p ON t.parent_id = p.id) SELECT id, name, path FROM paths ORDER BY id
+----
+1 Root Root
+2 Child1 Root/Child1
+3 Child2 Root/Child2
+4 Grandchild1 Root/Child1/Grandchild1
+5 Grandchild2 Root/Child2/Grandchild2
+
+statement ok
+DROP TABLE rc_tree

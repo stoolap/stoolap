@@ -7,7 +7,7 @@ order: 1
 
 # SQL Functions Reference
 
-Quick reference for all built-in SQL functions in Stoolap (118 in the default build, 119 with the `semantic` feature), organized by category. For detailed documentation with examples, see [Scalar Functions]({% link _docs/functions/scalar-functions.md %}), [Aggregate Functions]({% link _docs/functions/aggregate-functions.md %}), [Window Functions]({% link _docs/functions/window-functions.md %}), and [Table-Valued Functions]({% link _docs/functions/table-valued-functions.md %}).
+Quick reference for all built-in SQL functions in Stoolap (127 in the default build, 128 with the `semantic` feature), organized by category. For detailed documentation with examples, see [Scalar Functions]({% link _docs/functions/scalar-functions.md %}), [Aggregate Functions]({% link _docs/functions/aggregate-functions.md %}), [Window Functions]({% link _docs/functions/window-functions.md %}), and [Table-Valued Functions]({% link _docs/functions/table-valued-functions.md %}).
 
 ## Aggregate Functions (17)
 
@@ -33,9 +33,9 @@ Aggregate functions operate on a set of rows and return a single value. Used wit
 | `VAR_SAMP` | `VAR_SAMP(expr)` | Sample variance |
 | `VAR_POP` | `VAR_POP(expr)` | Population variance |
 
-## Scalar Functions (89)
+## Scalar Functions (98)
 
-### String Functions (24)
+### String Functions (27)
 
 | Function | Syntax | Description |
 |----------|--------|-------------|
@@ -63,6 +63,9 @@ Aggregate functions operate on a set of rows and return a single value. Used wit
 | `LOCATE` | `LOCATE(substr, str)` | Position of substring (1-based) |
 | `LPAD` | `LPAD(str, len, pad)` | Left-pad to length |
 | `RPAD` | `RPAD(str, len, pad)` | Right-pad to length |
+| `STARTS_WITH` | `STARTS_WITH(str, prefix)` | Check if string starts with prefix |
+| `ENDS_WITH` | `ENDS_WITH(str, suffix)` | Check if string ends with suffix |
+| `CONTAINS` | `CONTAINS(str, substr)` | Check if string contains substring |
 
 ### Math Functions (22)
 
@@ -133,6 +136,17 @@ JSON shorthand operators are also supported:
 |----------|-------------|---------|
 | `->` | Extract JSON value (returns JSON) | `col -> 'key'` |
 | `->>` | Extract JSON value (returns TEXT) | `col ->> 'key'` |
+
+### Hash Functions (6)
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `MD5` | `MD5(value)` | MD5 hash as 32-char hex string |
+| `SHA1` | `SHA1(value)` | SHA-1 hash as 40-char hex string |
+| `SHA256` | `SHA256(value)` | SHA-256 hash as 64-char hex string |
+| `SHA384` | `SHA384(value)` | SHA-384 hash as 96-char hex string |
+| `SHA512` | `SHA512(value)` | SHA-512 hash as 128-char hex string |
+| `CRC32` | `CRC32(value)` | CRC32 checksum as integer |
 
 ### Conditional Functions (4)
 

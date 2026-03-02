@@ -2810,6 +2810,14 @@ impl Engine for MVCCEngine {
             let mut dirs_to_sync: FxHashSet<std::path::PathBuf> = FxHashSet::default();
 
             for (temp_path, final_path, table_name) in &pending_snapshots {
+                #[cfg(any(test, feature = "test-failpoints"))]
+                if crate::test_failpoints::SNAPSHOT_RENAME_FAIL
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    all_succeeded = false;
+                    break;
+                }
+
                 if let Err(e) = std::fs::rename(temp_path, final_path) {
                     eprintln!(
                         "Warning: Failed to rename snapshot for {}: {}",

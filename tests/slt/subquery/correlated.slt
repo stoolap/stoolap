@@ -1,0 +1,56 @@
+# Correlated subquery tests
+
+statement ok
+CREATE TABLE cor_emp (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, salary INTEGER)
+
+statement ok
+CREATE TABLE cor_dept (id INTEGER PRIMARY KEY, dept_name TEXT)
+
+statement ok
+INSERT INTO cor_dept VALUES (1, 'Engineering'), (2, 'Sales'), (3, 'Marketing')
+
+statement ok
+INSERT INTO cor_emp VALUES (1, 'Alice', 1, 100), (2, 'Bob', 1, 120), (3, 'Carol', 2, 80), (4, 'Dave', 2, 90), (5, 'Eve', 3, 110)
+
+# Correlated subquery in WHERE
+# Dept 1: avg=110, Alice=100 (no), Bob=120 (yes)
+# Dept 2: avg=85, Carol=80 (no), Dave=90 (yes)
+# Dept 3: avg=110, Eve=110 (no, not strictly greater)
+query IT rowsort
+SELECT id, name FROM cor_emp e WHERE salary > (SELECT AVG(salary) FROM cor_emp e2 WHERE e2.dept_id = e.dept_id)
+----
+2 Bob
+4 Dave
+
+# Correlated subquery in SELECT (scalar)
+query TT rowsort
+SELECT e.name, (SELECT d.dept_name FROM cor_dept d WHERE d.id = e.dept_id) AS dept FROM cor_emp e
+----
+Alice Engineering
+Bob Engineering
+Carol Sales
+Dave Sales
+Eve Marketing
+
+# Correlated subquery with aggregate
+query TTI rowsort
+SELECT d.dept_name, (SELECT MIN(salary) FROM cor_emp e WHERE e.dept_id = d.id), (SELECT MAX(salary) FROM cor_emp e WHERE e.dept_id = d.id) FROM cor_dept d
+----
+Engineering 100 120
+Marketing 110 110
+Sales 80 90
+
+# Correlated EXISTS
+query IT rowsort
+SELECT id, name FROM cor_emp e WHERE EXISTS (SELECT 1 FROM cor_emp e2 WHERE e2.dept_id = e.dept_id AND e2.id != e.id)
+----
+1 Alice
+2 Bob
+3 Carol
+4 Dave
+
+statement ok
+DROP TABLE cor_emp
+
+statement ok
+DROP TABLE cor_dept

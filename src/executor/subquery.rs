@@ -382,7 +382,6 @@ impl Executor {
 
         // Check if there's at least one row
         let exists = result.next();
-
         Ok(exists)
     }
 
@@ -454,9 +453,10 @@ impl Executor {
         let outer_value = match outer_value {
             Some(v) if !v.is_null() => v.clone(),
             Some(_) => return Ok(Some(false)), // NULL never matches in EXISTS
-            None => return Ok(None),           // Column not found, fall back
+            None => {
+                return Ok(None); // Column not found, fall back
+            }
         };
-
         // OPTIMIZATION: Cache index reference to avoid repeated lookups
         // This reduces the ~2-5μs overhead per EXISTS probe to nearly zero for subsequent probes
         // Uses pre-computed index_cache_key from ExistsCorrelationInfo to avoid per-probe format!
@@ -513,6 +513,29 @@ impl Executor {
         // OPTIMIZATION: Directly fetch rows by row_ids and evaluate the predicate
         // This avoids the overhead of building and executing a full SELECT query
         let additional_pred = correlation.additional_predicate.as_ref().unwrap();
+
+        // SAFETY: If the additional predicate has references to tables other than
+        // the inner table (outer column references) or contains subqueries (EXISTS, etc.),
+        // the RowFilter cannot evaluate them correctly because:
+        // 1. strip_table_alias_from_expr strips ALL qualifiers, merging outer refs with inner cols
+        // 2. RowFilter has no subquery_executor, so EXISTS always returns false
+        // Fall back to full query execution which handles these correctly.
+        // Check against both the inner table name and alias (predicates use the alias).
+        let inner_alias_name = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
+            Some(Expression::TableSource(ts)) => ts
+                .alias
+                .as_ref()
+                .map(|a| a.value.to_string())
+                .unwrap_or_else(|| correlation.inner_table.clone()),
+            _ => correlation.inner_table.clone(),
+        };
+        if Self::predicate_has_outer_refs_or_subqueries(
+            additional_pred,
+            &correlation.inner_table,
+            &inner_alias_name,
+        ) {
+            return Ok(None);
+        }
 
         // OPTIMIZATION: Cache schema column names to avoid repeated get_table_schema() calls
         // This reduces the ~1μs overhead per EXISTS probe
@@ -1309,6 +1332,111 @@ impl Executor {
         }
     }
 
+    /// Check if an expression contains references to tables other than the inner table,
+    /// or contains subqueries (EXISTS, ScalarSubquery, etc.).
+    /// Used to bail out of index probe when the additional predicate can't be evaluated
+    /// as a simple RowFilter against inner table rows.
+    fn predicate_has_outer_refs_or_subqueries(
+        expr: &Expression,
+        inner_table: &str,
+        inner_alias: &str,
+    ) -> bool {
+        match expr {
+            Expression::QualifiedIdentifier(qid) => {
+                let table = qid.qualifier.value_lower.as_str();
+                // If qualifier doesn't match inner table name or alias, it's an outer ref
+                !table.eq_ignore_ascii_case(inner_table) && !table.eq_ignore_ascii_case(inner_alias)
+            }
+            Expression::Infix(infix) => {
+                Self::predicate_has_outer_refs_or_subqueries(&infix.left, inner_table, inner_alias)
+                    || Self::predicate_has_outer_refs_or_subqueries(
+                        &infix.right,
+                        inner_table,
+                        inner_alias,
+                    )
+            }
+            Expression::Prefix(prefix) => Self::predicate_has_outer_refs_or_subqueries(
+                &prefix.right,
+                inner_table,
+                inner_alias,
+            ),
+            Expression::FunctionCall(func) => func.arguments.iter().any(|arg| {
+                Self::predicate_has_outer_refs_or_subqueries(arg, inner_table, inner_alias)
+            }),
+            Expression::In(in_expr) => {
+                Self::predicate_has_outer_refs_or_subqueries(
+                    &in_expr.left,
+                    inner_table,
+                    inner_alias,
+                ) || Self::predicate_has_outer_refs_or_subqueries(
+                    &in_expr.right,
+                    inner_table,
+                    inner_alias,
+                )
+            }
+            Expression::Between(between) => {
+                Self::predicate_has_outer_refs_or_subqueries(
+                    &between.expr,
+                    inner_table,
+                    inner_alias,
+                ) || Self::predicate_has_outer_refs_or_subqueries(
+                    &between.lower,
+                    inner_table,
+                    inner_alias,
+                ) || Self::predicate_has_outer_refs_or_subqueries(
+                    &between.upper,
+                    inner_table,
+                    inner_alias,
+                )
+            }
+            Expression::Like(like) => {
+                Self::predicate_has_outer_refs_or_subqueries(&like.left, inner_table, inner_alias)
+                    || Self::predicate_has_outer_refs_or_subqueries(
+                        &like.pattern,
+                        inner_table,
+                        inner_alias,
+                    )
+            }
+            Expression::Cast(cast) => {
+                Self::predicate_has_outer_refs_or_subqueries(&cast.expr, inner_table, inner_alias)
+            }
+            Expression::Case(case) => {
+                if let Some(ref val) = case.value {
+                    if Self::predicate_has_outer_refs_or_subqueries(val, inner_table, inner_alias) {
+                        return true;
+                    }
+                }
+                for when in &case.when_clauses {
+                    if Self::predicate_has_outer_refs_or_subqueries(
+                        &when.condition,
+                        inner_table,
+                        inner_alias,
+                    ) || Self::predicate_has_outer_refs_or_subqueries(
+                        &when.then_result,
+                        inner_table,
+                        inner_alias,
+                    ) {
+                        return true;
+                    }
+                }
+                if let Some(ref else_val) = case.else_value {
+                    if Self::predicate_has_outer_refs_or_subqueries(
+                        else_val,
+                        inner_table,
+                        inner_alias,
+                    ) {
+                        return true;
+                    }
+                }
+                false
+            }
+            // Subqueries cannot be evaluated by RowFilter
+            Expression::Exists(_) | Expression::ScalarSubquery(_) | Expression::AllAny(_) => true,
+            // Identifiers, literals, etc. are fine
+            _ => false,
+        }
+    }
+
     /// Strip table alias from column references in an expression.
     /// Converts "o.amount" to "amount", "t.name" to "name", etc.
     /// This is needed when evaluating predicates against rows from fetch_rows_by_ids,
@@ -1354,6 +1482,31 @@ impl Executor {
                     is_distinct: func.is_distinct,
                     order_by: func.order_by.clone(),
                     filter: func.filter.clone(),
+                }))
+            }
+            Expression::Case(case) => {
+                let new_value = case
+                    .value
+                    .as_ref()
+                    .map(|v| Box::new(Self::strip_table_alias_from_expr(v)));
+                let new_whens: Vec<WhenClause> = case
+                    .when_clauses
+                    .iter()
+                    .map(|w| WhenClause {
+                        token: w.token.clone(),
+                        condition: Self::strip_table_alias_from_expr(&w.condition),
+                        then_result: Self::strip_table_alias_from_expr(&w.then_result),
+                    })
+                    .collect();
+                let new_else = case
+                    .else_value
+                    .as_ref()
+                    .map(|e| Box::new(Self::strip_table_alias_from_expr(e)));
+                Expression::Case(Box::new(CaseExpression {
+                    token: case.token.clone(),
+                    value: new_value,
+                    when_clauses: new_whens,
+                    else_value: new_else,
                 }))
             }
             // For other expressions, return as-is
@@ -2669,8 +2822,51 @@ impl Executor {
                     )
                 })
             }
+            // For subqueries, check if their WHERE clause references outer tables.
+            // A nested EXISTS that only references its own scope and the immediate
+            // parent (inner_tables) is safe for semi-join. But if it references
+            // grandparent scope (outer_tables), semi-join cannot handle it.
+            Expression::Exists(exists) => {
+                Self::subquery_references_outer_tables(&exists.subquery, outer_tables, inner_tables)
+            }
+            Expression::ScalarSubquery(sq) => {
+                Self::subquery_references_outer_tables(&sq.subquery, outer_tables, inner_tables)
+            }
+            Expression::AllAny(aa) => {
+                Self::subquery_references_outer_tables(&aa.subquery, outer_tables, inner_tables)
+            }
             // Literals and other expressions don't reference tables
             _ => false,
+        }
+    }
+
+    /// Check if a subquery's WHERE clause references any of the outer tables.
+    /// This is used to determine if a nested EXISTS/ScalarSubquery can be safely
+    /// handled by the semi-join optimization (which only provides inner table context).
+    fn subquery_references_outer_tables(
+        subquery: &SelectStatement,
+        outer_tables: &[String],
+        inner_tables: &[String],
+    ) -> bool {
+        if let Some(ref where_clause) = subquery.where_clause {
+            // Collect the subquery's own tables to extend inner_tables
+            let mut sub_tables: Vec<String> = inner_tables.to_vec();
+            Self::collect_table_names_from_source_if_present(&subquery.table_expr, &mut sub_tables);
+            // Check if the WHERE references outer tables (grandparent scope)
+            if Self::expression_references_outer_tables(where_clause, outer_tables, &sub_tables) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Collect table names from an optional table expression.
+    fn collect_table_names_from_source_if_present(
+        table_expr: &Option<Box<Expression>>,
+        tables: &mut Vec<String>,
+    ) {
+        if let Some(ref expr) = table_expr {
+            Self::collect_table_names_from_source(expr.as_ref(), tables);
         }
     }
 

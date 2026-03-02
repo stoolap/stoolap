@@ -1,0 +1,141 @@
+# Constraint tests
+
+# PRIMARY KEY single column
+statement ok
+CREATE TABLE pk_test (id INTEGER PRIMARY KEY, name TEXT)
+
+statement ok
+INSERT INTO pk_test VALUES (1, 'Alice'), (2, 'Bob')
+
+# PK violation
+statement error
+INSERT INTO pk_test VALUES (1, 'Duplicate')
+
+statement ok
+DROP TABLE pk_test
+
+# UNIQUE constraint
+statement ok
+CREATE TABLE uniq_test (id INTEGER PRIMARY KEY, email TEXT UNIQUE)
+
+statement ok
+INSERT INTO uniq_test VALUES (1, 'alice@test.com')
+
+# UNIQUE violation
+statement error
+INSERT INTO uniq_test VALUES (2, 'alice@test.com')
+
+# UNIQUE with NULL - multiple NULLs allowed (SQL standard)
+statement ok
+INSERT INTO uniq_test VALUES (2, NULL), (3, NULL)
+
+query I
+SELECT COUNT(*) FROM uniq_test
+----
+3
+
+statement ok
+DROP TABLE uniq_test
+
+# NOT NULL constraint
+statement ok
+CREATE TABLE notnull_test (id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+
+statement ok
+INSERT INTO notnull_test VALUES (1, 'Alice')
+
+# NOT NULL violation
+statement error
+INSERT INTO notnull_test VALUES (2, NULL)
+
+statement ok
+DROP TABLE notnull_test
+
+# DEFAULT values
+statement ok
+CREATE TABLE default_test (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'active', score INTEGER DEFAULT 0)
+
+statement ok
+INSERT INTO default_test (id) VALUES (1)
+
+query ITI
+SELECT * FROM default_test
+----
+1 active 0
+
+statement ok
+INSERT INTO default_test (id, status) VALUES (2, 'inactive')
+
+query ITI
+SELECT * FROM default_test WHERE id = 2
+----
+2 inactive 0
+
+statement ok
+DROP TABLE default_test
+
+# CHECK constraint
+statement ok
+CREATE TABLE check_test (id INTEGER PRIMARY KEY, age INTEGER CHECK (age >= 0), score FLOAT CHECK (score BETWEEN 0.0 AND 100.0))
+
+statement ok
+INSERT INTO check_test VALUES (1, 25, 95.5)
+
+# CHECK violation on age
+statement error
+INSERT INTO check_test VALUES (2, -1, 50.0)
+
+# CHECK violation on score
+statement error
+INSERT INTO check_test VALUES (3, 30, 101.0)
+
+statement ok
+DROP TABLE check_test
+
+# FOREIGN KEY constraint
+statement ok
+CREATE TABLE fk_parent (id INTEGER PRIMARY KEY, name TEXT)
+
+statement ok
+INSERT INTO fk_parent VALUES (1, 'Parent1'), (2, 'Parent2')
+
+statement ok
+CREATE TABLE fk_child (id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES fk_parent(id))
+
+statement ok
+INSERT INTO fk_child VALUES (1, 1), (2, 2)
+
+# FK violation on INSERT: non-existent parent
+statement error
+INSERT INTO fk_child VALUES (3, 999)
+
+# FK violation on DELETE parent: child references it
+statement error
+DELETE FROM fk_parent WHERE id = 1
+
+# FK violation on UPDATE parent PK
+statement error
+UPDATE fk_parent SET id = 999 WHERE id = 1
+
+statement ok
+DROP TABLE fk_child
+
+statement ok
+DROP TABLE fk_parent
+
+# Composite PRIMARY KEY
+statement ok
+CREATE TABLE composite_pk (a INTEGER, b INTEGER, c TEXT, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO composite_pk VALUES (1, 1, 'a'), (1, 2, 'b'), (2, 1, 'c')
+
+query IIT rowsort
+SELECT * FROM composite_pk
+----
+1 1 a
+1 2 b
+2 1 c
+
+statement ok
+DROP TABLE composite_pk
