@@ -1,1 +1,2 @@
 profile = "mutants"
+test_tool = "nextest"

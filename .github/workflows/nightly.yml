@@ -207,10 +207,10 @@ jobs:
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Install cargo-mutants
+    - name: Install cargo-mutants and nextest
       uses: taiki-e/install-action@v2
       with:
-        tool: cargo-mutants
+        tool: cargo-mutants,cargo-nextest
 
     - name: Run mutation testing (day shard)
       run: |
@@ -230,7 +230,7 @@ jobs:
           -f src/functions/scalar/ \
           -f src/storage/mvcc/transaction.rs \
           -f src/storage/mvcc/registry.rs \
-          -- --lib --tests -- --test-threads=4
+          -- --lib --tests
       timeout-minutes: 100
 
     - name: Upload mutation report

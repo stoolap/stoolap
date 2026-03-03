@@ -168,13 +168,13 @@ impl<V: Clone> Drop for CowHashMap<V> {
         let capacity = header.get_capacity();
 
         if mem::needs_drop::<V>() {
-            let slots = self.slots();
-            for slot in slots.iter() {
+            let slots = self.slots_mut();
+            for slot in slots.iter_mut() {
                 if slot.key != EMPTY {
                     // SAFETY: We are the last reference (ref_count == 1 checked above).
                     // The slot is occupied (key != EMPTY), so value is initialized.
                     unsafe {
-                        ptr::drop_in_place(slot.value.as_ptr() as *mut V);
+                        ptr::drop_in_place(slot.value.as_mut_ptr());
                     }
                 }
             }
@@ -610,15 +610,15 @@ impl<V: Clone> CowHashMap<V> {
             };
 
             if dist_to_empty <= dist_to_next {
-                // Shift this entry back
-                slots[empty_idx].key = slots[next_idx].key;
-                // SAFETY: Moving initialized value
+                // Shift this entry back — derive both pointers from a single
+                // as_mut_ptr() to satisfy Stacked Borrows (as_ptr() would create
+                // a SharedReadOnly tag that conflicts with the Unique retag).
                 unsafe {
-                    ptr::copy_nonoverlapping(
-                        slots[next_idx].value.as_ptr(),
-                        slots[empty_idx].value.as_mut_ptr(),
-                        1,
-                    );
+                    let base = slots.as_mut_ptr();
+                    let src = base.add(next_idx);
+                    let dst = base.add(empty_idx);
+                    (*dst).key = (*src).key;
+                    ptr::copy_nonoverlapping((*src).value.as_ptr(), (*dst).value.as_mut_ptr(), 1);
                 }
                 empty_idx = next_idx;
             } else {
