@@ -1,2 +1,50 @@
 profile = "mutants"
 test_tool = "nextest"
+
+# Exclude functions where mutations cannot produce observable differences
+# in test output. These fall into two categories:
+#
+# 1. Optimizer heuristics: choose between strategies that produce identical
+#    query results (e.g., index-nested-loop vs semi-join).
+#
+# 2. Fast-path optimizations: try_* and fast_* functions that return
+#    None/Err on failure, falling back to the correct slow path.
+#    Mutating them just disables the optimization.
+exclude_re = [
+  # Optimizer heuristics (join strategy selection)
+  "should_use_index_nested_loop",
+
+  # Aggregation fast paths (fall back to full aggregation on failure)
+  "try_fast_aggregation",
+  "try_streaming_derived_table_aggregation",
+  "try_streaming_global_aggregation",
+  "try_storage_aggregation",
+  "try_aggregation_pushdown",
+  "try_fast_count_star_compiled",
+  "try_fast_count_distinct_compiled",
+  "try_lookup_batch_aggregate",
+  "try_execute_and_cache_batch_aggregate",
+  "fast_sum_column",
+  "fast_avg_column",
+  "is_pure_aggregate_expression",
+
+  # HAVING fast-path parsing (falls back to full expression evaluation)
+  "try_parse_simple_having",
+  "try_parse_single_having_condition",
+
+  # Semi-join optimization paths (fall back to correlated execution)
+  "try_extract_semi_join_info",
+  "try_extract_in_semi_join_info",
+  "try_extract_not_exists_info",
+  "try_extract_equality_pair",
+  "try_optimize_exists_to_semi_join",
+  "try_optimize_in_to_semi_join",
+
+  # Subquery pre-evaluation (falls back to per-row evaluation)
+  "try_process_select_subqueries",
+  "try_process_expression_subqueries",
+
+  # Index probe fast paths (fall back to full subquery execution)
+  "try_execute_exists_with_index_probe",
+  "try_execute_scalar_count_with_index",
+]
