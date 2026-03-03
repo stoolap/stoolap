@@ -111,14 +111,14 @@ impl IndexMetadata {
 /// TiKV secondary index
 pub struct TiKVIndex {
     meta: IndexMetadata,
-    txn: Arc<Mutex<Option<tikv_client::Transaction>>>,
+    txn: Option<Arc<Mutex<Option<tikv_client::Transaction>>>>,
     runtime: tokio::runtime::Handle,
 }
 
 impl TiKVIndex {
     pub fn new(
         meta: IndexMetadata,
-        txn: Arc<Mutex<Option<tikv_client::Transaction>>>,
+        txn: Option<Arc<Mutex<Option<tikv_client::Transaction>>>>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
         Self { meta, txn, runtime }
@@ -129,7 +129,11 @@ impl TiKVIndex {
     where
         F: FnOnce(&mut tikv_client::Transaction) -> Result<R>,
     {
-        let mut guard = self.txn.lock();
+        let txn_shared = self
+            .txn
+            .as_ref()
+            .ok_or_else(|| Error::internal("Index operation requires an active transaction"))?;
+        let mut guard = txn_shared.lock();
         match guard.as_mut() {
             Some(txn) => f(txn),
             None => Err(Error::internal(

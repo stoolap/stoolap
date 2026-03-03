@@ -24,7 +24,7 @@ use crate::storage::expression::Expression;
 use crate::storage::traits::{QueryResult, Table, Transaction};
 
 use super::encoding;
-use super::engine::TiKVEngine;
+use super::engine::TiKVEngineInner;
 use super::error::from_tikv_error;
 use super::table::TiKVTable;
 
@@ -77,8 +77,8 @@ pub struct TiKVTransaction {
     pub(crate) runtime: tokio::runtime::Handle,
     /// Snapshot of schemas at transaction start
     schemas: FxHashMap<String, (u64, CompactArc<Schema>)>,
-    /// Reference to engine (for DDL operations)
-    engine: *const TiKVEngine,
+    /// Shared reference to engine inner state
+    engine: Arc<TiKVEngineInner>,
     /// Savepoints for DDL rollback emulation
     savepoints: FxHashMap<String, SavepointState>,
     /// Tables created during this transaction (for savepoint DDL rollback)
@@ -93,9 +93,6 @@ pub struct TiKVTransaction {
     isolation_level_explicitly_set: bool,
 }
 
-// SAFETY: TiKVEngine is Send + Sync, and we only use the pointer for read access
-unsafe impl Send for TiKVTransaction {}
-
 impl TiKVTransaction {
     pub(crate) fn new(
         id: i64,
@@ -103,7 +100,7 @@ impl TiKVTransaction {
         isolation_level: IsolationLevel,
         runtime: tokio::runtime::Handle,
         schemas: FxHashMap<String, (u64, CompactArc<Schema>)>,
-        engine: &TiKVEngine,
+        engine: Arc<TiKVEngineInner>,
     ) -> Self {
         Self {
             id,
@@ -111,7 +108,7 @@ impl TiKVTransaction {
             isolation_level,
             runtime,
             schemas,
-            engine: engine as *const TiKVEngine,
+            engine,
             savepoints: FxHashMap::default(),
             created_tables: Vec::new(),
             dropped_tables: Vec::new(),
@@ -121,9 +118,8 @@ impl TiKVTransaction {
         }
     }
 
-    fn engine(&self) -> &TiKVEngine {
-        // SAFETY: engine lifetime is guaranteed to outlive the transaction
-        unsafe { &*self.engine }
+    fn engine(&self) -> &TiKVEngineInner {
+        &self.engine
     }
 
     /// Get the TiKV transaction, returning an error if already consumed
@@ -150,7 +146,11 @@ impl TiKVTransaction {
             .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
 
         let engine = self.engine();
-        let client = engine.client()?;
+        let client = engine
+            .client
+            .read()
+            .clone()
+            .ok_or_else(|| Error::internal("TiKV engine not open"))?;
         let fresh_txn = self
             .runtime
             .block_on(async { client.begin_optimistic().await.map_err(from_tikv_error) })?;
@@ -165,7 +165,7 @@ impl TiKVTransaction {
             Arc::clone(&self.has_writes),
         )
         .with_owns_txn(true)
-        .with_engine(engine);
+        .with_engine(Arc::clone(&self.engine));
         Ok(Box::new(table))
     }
 
@@ -396,7 +396,7 @@ impl Transaction for TiKVTransaction {
             return Err(Error::TableAlreadyExists(table_name));
         }
 
-        // Allocate table ID (access engine via raw pointer to avoid borrow issue)
+        // Allocate table ID
         let engine = self.engine();
         let table_id = engine
             .next_table_id
@@ -460,7 +460,7 @@ impl Transaction for TiKVTransaction {
             self.runtime.clone(),
             Arc::clone(&self.has_writes),
         )
-        .with_engine(self.engine());
+        .with_engine(Arc::clone(&self.engine));
         Ok(Box::new(table))
     }
 
@@ -501,7 +501,7 @@ impl Transaction for TiKVTransaction {
             self.runtime.clone(),
             Arc::clone(&self.has_writes),
         )
-        .with_engine(self.engine());
+        .with_engine(Arc::clone(&self.engine));
         Ok(Box::new(table))
     }
 
@@ -908,7 +908,11 @@ impl Transaction for TiKVTransaction {
                     .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
 
                 let engine = self.engine();
-                let client = engine.client()?;
+                let client = engine
+                    .client
+                    .read()
+                    .clone()
+                    .ok_or_else(|| Error::internal("TiKV engine not open"))?;
 
                 // Create a read-only snapshot at the historical timestamp
                 let options = tikv_client::TransactionOptions::new_optimistic().read_only();
@@ -984,6 +988,7 @@ impl Transaction for TiKVTransaction {
 mod tests {
     use super::*;
     use crate::core::DataType;
+    use crate::storage::tikv::engine::TiKVEngine;
 
     #[test]
     fn test_cache_reconciliation() {
@@ -995,7 +1000,7 @@ mod tests {
         let _guard = rt.enter();
         
         let engine = TiKVEngine::new("127.0.0.1:2379").unwrap();
-        assert_eq!(engine.schemas.read().len(), 0);
+        assert_eq!(engine.inner.schemas.read().len(), 0);
 
         let mut txn = TiKVTransaction {
             id: 1,
@@ -1003,7 +1008,7 @@ mod tests {
             isolation_level: IsolationLevel::SnapshotIsolation,
             runtime: tokio::runtime::Handle::current(),
             schemas: FxHashMap::default(),
-            engine: &engine as *const TiKVEngine,
+            engine: Arc::clone(&engine.inner),
             savepoints: FxHashMap::default(),
             created_tables: Vec::new(),
             dropped_tables: Vec::new(),
@@ -1023,10 +1028,10 @@ mod tests {
             schema: schema.clone(),
         });
 
-        assert_eq!(engine.schemas.read().len(), 0);
+        assert_eq!(engine.inner.schemas.read().len(), 0);
 
         {
-            let engine_ref = unsafe { &*txn.engine };
+            let engine_ref = &txn.engine;
             let mut schemas = engine_ref.schemas.write();
             let _indexes = engine_ref.indexes.write();
 
@@ -1040,8 +1045,8 @@ mod tests {
             }
         }
 
-        assert_eq!(engine.schemas.read().len(), 1);
-        assert!(engine.schemas.read().contains_key("test_table"));
+        assert_eq!(engine.inner.schemas.read().len(), 1);
+        assert!(engine.inner.schemas.read().contains_key("test_table"));
         
         // Ensure engine is dropped BEFORE runtime
         drop(engine);
@@ -1063,7 +1068,7 @@ mod tests {
             isolation_level: IsolationLevel::SnapshotIsolation,
             runtime: tokio::runtime::Handle::current(),
             schemas: FxHashMap::default(),
-            engine: &engine as *const TiKVEngine,
+            engine: Arc::clone(&engine.inner),
             savepoints: FxHashMap::default(),
             created_tables: Vec::new(),
             dropped_tables: Vec::new(),
@@ -1080,7 +1085,7 @@ mod tests {
         };
 
         drop(txn);
-        assert_eq!(engine.schemas.read().len(), 0);
+        assert_eq!(engine.inner.schemas.read().len(), 0);
         
         drop(engine);
     }

@@ -24,6 +24,7 @@ use crate::storage::expression::Expression;
 use crate::storage::traits::{QueryResult, Scanner, Table};
 
 use super::encoding;
+use super::engine::TiKVEngineInner;
 use super::error::from_tikv_error;
 use super::result::TiKVQueryResult;
 use super::scanner::TiKVScanner;
@@ -48,17 +49,13 @@ pub struct TiKVTable {
     row_id_batch_end: AtomicI64,
     /// Whether next_row_id has been initialized from TiKV
     row_id_initialized: std::sync::atomic::AtomicBool,
-    /// Optional engine reference for index lookups
-    engine: Option<*const super::engine::TiKVEngine>,
+    /// Optional shared engine inner state reference for index lookups
+    engine: Option<Arc<TiKVEngineInner>>,
     /// Shared write tracking flag
     pub(crate) has_writes: Arc<std::sync::atomic::AtomicBool>,
     /// Whether this table handle owns the transaction (should rollback on drop)
     pub(crate) owns_txn: bool,
 }
-
-// SAFETY: TiKVEngine is Send + Sync, and we only use the pointer for read access
-unsafe impl Send for TiKVTable {}
-unsafe impl Sync for TiKVTable {}
 
 impl TiKVTable {
     pub(crate) fn new(
@@ -93,14 +90,14 @@ impl TiKVTable {
     }
 
     /// Set the engine reference for index lookups
-    pub(crate) fn with_engine(mut self, engine: &super::engine::TiKVEngine) -> Self {
-        self.engine = Some(engine as *const super::engine::TiKVEngine);
+    pub(crate) fn with_engine(mut self, engine: Arc<TiKVEngineInner>) -> Self {
+        self.engine = Some(engine);
         self
     }
 
     /// Get the engine reference
-    fn engine(&self) -> Option<&super::engine::TiKVEngine> {
-        self.engine.map(|p| unsafe { &*p })
+    fn engine(&self) -> Option<&TiKVEngineInner> {
+        self.engine.as_deref()
     }
 
     /// Batch size for row ID allocation
@@ -957,7 +954,7 @@ impl Table for TiKVTable {
         // Create a TiKVIndex using the table's own transaction
         Some(std::sync::Arc::new(super::index::TiKVIndex::new(
             meta.clone(),
-            Arc::clone(&self.txn),
+            Some(Arc::clone(&self.txn)),
             self.runtime.clone(),
         )))
     }
