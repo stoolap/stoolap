@@ -143,7 +143,7 @@ jobs:
           --test parallel_execution_tests
       timeout-minutes: 20
       env:
-        TSAN_OPTIONS: "second_deadlock_stack=1 suppressions=${{ github.workspace }}/tsan_suppressions.txt"
+        TSAN_OPTIONS: "second_deadlock_stack=1"
 
   address-sanitizer:
     name: Address Sanitizer

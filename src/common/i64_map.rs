@@ -336,9 +336,12 @@ impl<V> I64Map<V> {
             if can_move {
                 // Move entry back
                 // SAFETY: Both indices are in bounds, src slot is occupied, dst slot is empty.
+                // Derive both pointers from a single as_mut_ptr() call to avoid
+                // Stacked Borrows invalidation (as_ptr then as_mut_ptr conflicts).
                 unsafe {
-                    let src = self.slots.as_ptr().add(next_idx);
-                    let dst = self.slots.as_mut_ptr().add(empty_idx);
+                    let base = self.slots.as_mut_ptr();
+                    let src = base.add(next_idx);
+                    let dst = base.add(empty_idx);
                     (*dst).key = (*src).key;
                     std::ptr::copy_nonoverlapping(
                         (*src).value.as_ptr(),
@@ -753,9 +756,12 @@ impl<'a, V> OccupiedEntry<'a, V> {
             if can_move {
                 // Move entry back
                 // SAFETY: Both indices are in bounds, src slot is occupied, dst slot is empty.
+                // Derive both pointers from a single as_mut_ptr() call to avoid
+                // Stacked Borrows invalidation (as_ptr then as_mut_ptr conflicts).
                 unsafe {
-                    let src = self.map.slots.as_ptr().add(next_idx);
-                    let dst = self.map.slots.as_mut_ptr().add(empty_idx);
+                    let base = self.map.slots.as_mut_ptr();
+                    let src = base.add(next_idx);
+                    let dst = base.add(empty_idx);
                     (*dst).key = (*src).key;
                     std::ptr::copy_nonoverlapping(
                         (*src).value.as_ptr(),
