@@ -34,6 +34,8 @@ jobs:
     outputs:
       run_mutation: ${{ steps.select.outputs.run_mutation }}
       run_miri: ${{ steps.select.outputs.run_miri }}
+      mutation_shard: ${{ steps.select.outputs.mutation_shard }}
+      miri_group: ${{ steps.select.outputs.miri_group }}
     steps:
     - id: select
       env:
@@ -43,32 +45,26 @@ jobs:
         suite="${SUITE_INPUT:-auto}"
         run_mutation=false
         run_miri=false
+        epoch_day=$(( $(date -u +%s) / 86400 ))
+        mutation_shard=$(( epoch_day % 24 ))
+        miri_group=$(( epoch_day % 5 ))
 
         if [ "$EVENT_NAME" = "schedule" ] || [ "$suite" = "auto" ]; then
-          # Alternate heavy suites by UTC weekday to keep wall-time bounded.
-          # Mon/Wed/Fri/Sun => mutation, Tue/Thu/Sat => miri
-          weekday="$(date -u +%u)"
-          case "$weekday" in
-            1|3|5|7) run_mutation=true ;;
-            2|4|6) run_miri=true ;;
-          esac
+          # Both run every night with rotating shards/groups
+          run_mutation=true
+          run_miri=true
         else
           case "$suite" in
-            all)
-              run_mutation=true
-              run_miri=true
-              ;;
-            mutation)
-              run_mutation=true
-              ;;
-            miri)
-              run_miri=true
-              ;;
+            all)      run_mutation=true; run_miri=true ;;
+            mutation) run_mutation=true ;;
+            miri)     run_miri=true ;;
           esac
         fi
 
         echo "run_mutation=$run_mutation" >> "$GITHUB_OUTPUT"
         echo "run_miri=$run_miri" >> "$GITHUB_OUTPUT"
+        echo "mutation_shard=$mutation_shard" >> "$GITHUB_OUTPUT"
+        echo "miri_group=$miri_group" >> "$GITHUB_OUTPUT"
 
   stress-tests:
     name: Stress Tests
@@ -212,11 +208,10 @@ jobs:
       with:
         tool: cargo-mutants,cargo-nextest
 
-    - name: Run mutation testing (day shard)
+    - name: Run mutation testing (rotating shard)
       run: |
-        TOTAL_SHARDS=96
-        DAY_OF_YEAR="$(date -u +%j)"
-        SHARD_INDEX=$((10#$DAY_OF_YEAR % TOTAL_SHARDS))
+        SHARD_INDEX=${{ needs.heavy_plan.outputs.mutation_shard }}
+        TOTAL_SHARDS=24
         echo "Running shard ${SHARD_INDEX}/${TOTAL_SHARDS}"
 
         cargo mutants --package stoolap \
@@ -247,6 +242,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 100
     steps:
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+
     - uses: actions/checkout@v4
 
     - name: Install Rust nightly with Miri
@@ -262,7 +265,26 @@ jobs:
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Run Miri on core modules (parallel via nextest)
-      run: cargo +nightly miri nextest run --lib -E 'test(/^(core|common)::/)' --no-fail-fast
+    - name: Run Miri (rotating module group)
+      run: |
+        GROUP=${{ needs.heavy_plan.outputs.miri_group }}
+        echo "Miri group: ${GROUP}/5"
+
+        # Rotate through 5 module groups (full cycle every 5 days):
+        #   0: compact_arc + compact_vec + buffer_pool  (fast, unsafe data structures)
+        #   1: cow_hashmap + i64_map                    (unsafe, recent Stacked Borrows fixes)
+        #   2: cow_btree (excluding deep-tree tests)    (unsafe, moderate speed)
+        #   3: core:: (value, row, schema, error)       (many tests, moderate speed)
+        #   4: cow_btree deep-tree tests only           (slowest tests, ~5-10 min each)
+        case "$GROUP" in
+          0) FILTER='test(/^common::(compact_arc|compact_vec|buffer_pool)::/)' ;;
+          1) FILTER='test(/^common::(cow_hashmap|i64_map)::/)' ;;
+          2) FILTER='test(/^common::cow_btree::/) - test(/deep_tree/)' ;;
+          3) FILTER='test(/^core::/)' ;;
+          4) FILTER='test(/^common::cow_btree::.*deep_tree/)' ;;
+        esac
+
+        echo "Filter: $FILTER"
+        cargo +nightly miri nextest run --lib -E "$FILTER" --no-fail-fast
       env:
         MIRIFLAGS: "-Zmiri-disable-isolation"
