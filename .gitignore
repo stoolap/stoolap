@@ -33,8 +33,6 @@ cobertura.xml
 tarpaulin-report.html
 
 # Local development
-.claude/settings.local.json
-CLAUDE.md
 TODO.md
 *.disabled
 deny.toml
@@ -42,4 +40,3 @@ deny.toml
 # Documentation build artifacts
 docs/_site/
 docs/.jekyll-cache/
-git_history_backup.log
