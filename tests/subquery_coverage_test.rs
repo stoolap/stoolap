@@ -1176,3 +1176,380 @@ fn test_subquery_with_order_by() {
     }
     assert_eq!(count, 5);
 }
+
+// =============================================================================
+// Outer Reference Detection Tests
+//
+// These tests exercise expression_has_outer_reference and
+// predicate_has_outer_refs_or_subqueries across various Expression variants
+// to ensure correlated subqueries are handled correctly (not mis-optimized).
+// =============================================================================
+
+fn setup_outer_ref_tables(db: &Database) {
+    db.execute(
+        "CREATE TABLE outer_t (id INTEGER PRIMARY KEY, val INTEGER, name TEXT, score FLOAT, active BOOLEAN)",
+        (),
+    )
+    .expect("Failed");
+    db.execute(
+        "CREATE TABLE inner_t (id INTEGER PRIMARY KEY, outer_id INTEGER, amount FLOAT, label TEXT, rating INTEGER)",
+        (),
+    )
+    .expect("Failed");
+
+    for i in 1..=10 {
+        db.execute(
+            &format!(
+                "INSERT INTO outer_t VALUES ({}, {}, 'name_{}', {}, {})",
+                i,
+                i * 10,
+                i,
+                i as f64 * 1.5,
+                i % 2 == 0
+            ),
+            (),
+        )
+        .expect("Failed");
+    }
+    for i in 1..=20 {
+        db.execute(
+            &format!(
+                "INSERT INTO inner_t VALUES ({}, {}, {}, 'label_{}', {})",
+                i,
+                (i % 10) + 1,
+                i as f64 * 2.5,
+                i,
+                i % 5
+            ),
+            (),
+        )
+        .expect("Failed");
+    }
+}
+
+/// EXISTS with outer ref in BETWEEN expression
+#[test]
+fn test_outer_ref_in_between() {
+    let db = Database::open("memory://outer_ref_between").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE EXISTS (
+                SELECT 1 FROM inner_t i WHERE i.outer_id = o.id
+                AND i.amount BETWEEN o.score AND o.score + 20.0
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(count > 0, "BETWEEN with outer refs should return results");
+}
+
+/// EXISTS with outer ref in CASE expression
+#[test]
+fn test_outer_ref_in_case() {
+    let db = Database::open("memory://outer_ref_case").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE EXISTS (
+                SELECT 1 FROM inner_t i WHERE i.outer_id = o.id
+                AND CASE WHEN o.val > 50 THEN i.amount > 10.0 ELSE i.amount > 5.0 END
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(count > 0, "CASE with outer refs should return results");
+}
+
+/// EXISTS with outer ref in LIKE expression
+#[test]
+fn test_outer_ref_in_like() {
+    let db = Database::open("memory://outer_ref_like").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE EXISTS (
+                SELECT 1 FROM inner_t i WHERE i.outer_id = o.id
+                AND i.label LIKE 'label_%'
+                AND o.name LIKE 'name_%'
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(count > 0, "LIKE with outer context should return results");
+}
+
+/// EXISTS with outer ref in CAST expression
+#[test]
+fn test_outer_ref_in_cast() {
+    let db = Database::open("memory://outer_ref_cast").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE EXISTS (
+                SELECT 1 FROM inner_t i WHERE i.outer_id = o.id
+                AND i.amount > CAST(o.val AS FLOAT)
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(count > 0, "CAST with outer refs should return results");
+}
+
+/// EXISTS with outer ref in function call
+#[test]
+fn test_outer_ref_in_function_call() {
+    let db = Database::open("memory://outer_ref_func").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE EXISTS (
+                SELECT 1 FROM inner_t i WHERE i.outer_id = o.id
+                AND ABS(i.amount - o.score) < 10.0
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(
+        count > 0,
+        "Function call with outer refs should return results"
+    );
+}
+
+/// EXISTS with outer ref in IN list
+#[test]
+fn test_outer_ref_in_in_expression() {
+    let db = Database::open("memory://outer_ref_in").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE EXISTS (
+                SELECT 1 FROM inner_t i WHERE i.outer_id = o.id
+                AND i.rating IN (1, 2, 3)
+                AND o.val > 30
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(count > 0, "IN with outer context should return results");
+}
+
+/// EXISTS with outer ref in PREFIX (NOT) expression
+#[test]
+fn test_outer_ref_in_prefix() {
+    let db = Database::open("memory://outer_ref_prefix").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE EXISTS (
+                SELECT 1 FROM inner_t i WHERE i.outer_id = o.id
+                AND NOT (o.val < 20)
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(count > 0, "NOT with outer refs should return results");
+}
+
+/// Correlated subquery with outer ref and multiple expression types combined
+#[test]
+fn test_outer_ref_combined_expressions() {
+    let db = Database::open("memory://outer_ref_combined").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id, o.name FROM outer_t o WHERE EXISTS (
+                SELECT 1 FROM inner_t i WHERE i.outer_id = o.id
+                AND i.amount BETWEEN o.score AND o.score + 50.0
+                AND CAST(o.val AS FLOAT) > 20.0
+                AND ABS(i.rating) < 5
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(
+        count > 0,
+        "Combined outer ref expressions should return results"
+    );
+}
+
+/// predicate_has_outer_refs_or_subqueries: EXISTS inside WHERE with subquery
+#[test]
+fn test_predicate_with_exists_subquery() {
+    let db = Database::open("memory://pred_exists").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE o.val > 30
+             AND EXISTS (SELECT 1 FROM inner_t i WHERE i.outer_id = o.id)",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(count > 0, "EXISTS predicate should return results");
+}
+
+/// predicate_has_outer_refs_or_subqueries: scalar subquery in WHERE
+#[test]
+fn test_predicate_with_scalar_subquery() {
+    let db = Database::open("memory://pred_scalar").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE o.val > (
+                SELECT AVG(i.amount) FROM inner_t i WHERE i.outer_id = o.id
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(count > 0, "Scalar subquery predicate should return results");
+}
+
+/// predicate_has_outer_refs_or_subqueries with LIKE + outer ref
+#[test]
+fn test_predicate_like_with_outer_ref() {
+    let db = Database::open("memory://pred_like").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE EXISTS (
+                SELECT 1 FROM inner_t i WHERE i.outer_id = o.id
+                AND i.label LIKE 'label_1%'
+                AND CAST(o.val AS TEXT) LIKE '%0'
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    // May or may not match, just ensure it doesn't error
+    let _ = count;
+}
+
+/// predicate_has_outer_refs_or_subqueries with CASE + outer ref in WHERE
+#[test]
+fn test_predicate_case_with_outer_ref() {
+    let db = Database::open("memory://pred_case").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE EXISTS (
+                SELECT 1 FROM inner_t i WHERE i.outer_id = o.id
+                AND CASE WHEN o.active = TRUE THEN i.amount > 5.0 ELSE i.amount > 0.0 END
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(
+        count > 0,
+        "CASE predicate with outer ref should return results"
+    );
+}
+
+/// predicate_has_outer_refs_or_subqueries with BETWEEN + outer ref
+#[test]
+fn test_predicate_between_with_outer_ref() {
+    let db = Database::open("memory://pred_between").expect("Failed");
+    setup_outer_ref_tables(&db);
+
+    let result = db
+        .query(
+            "SELECT o.id FROM outer_t o WHERE EXISTS (
+                SELECT 1 FROM inner_t i WHERE i.outer_id = o.id
+                AND i.amount BETWEEN CAST(o.val AS FLOAT) AND CAST(o.val AS FLOAT) + 30.0
+            )",
+            (),
+        )
+        .expect("Query failed");
+
+    let mut count = 0;
+    for row in result {
+        let _ = row.expect("Failed");
+        count += 1;
+    }
+    assert!(
+        count > 0,
+        "BETWEEN predicate with outer ref should return results"
+    );
+}
