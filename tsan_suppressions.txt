@@ -1,6 +1,0 @@
-# ThreadSanitizer suppressions for known false positives
-#
-# TSAN cannot verify the synchronization provided by Rust's atomic
-# reference counting (Arc/CompactArc). The Acquire fence before
-# deallocation in Drop is correct but invisible to TSAN.
-race:std::alloc::System

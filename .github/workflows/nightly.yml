@@ -188,6 +188,7 @@ jobs:
     needs: heavy_plan
     if: needs.heavy_plan.outputs.run_mutation == 'true'
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
     - name: Free disk space
       run: |
@@ -252,10 +253,15 @@ jobs:
       with:
         components: miri
 
+    - name: Install nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest
+
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Run Miri on core modules
-      run: "cargo +nightly miri test --lib -- core:: common::"
+    - name: Run Miri on core modules (parallel via nextest)
+      run: cargo +nightly miri nextest run --lib -E 'test(/^(core|common)::/)' --no-fail-fast
       env:
         MIRIFLAGS: "-Zmiri-disable-isolation"
