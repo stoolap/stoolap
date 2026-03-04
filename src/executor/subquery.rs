@@ -297,7 +297,42 @@ impl Executor {
                 }
             }
 
-            /* ~ changed by cargo-mutants ~ */
+            Expression::Case(case) => {
+                // Process the operand (if present)
+                let processed_value = if let Some(ref value) = case.value {
+                    Some(Box::new(self.process_where_subqueries(value, ctx)?))
+                } else {
+                    None
+                };
+
+                // Process each WHEN clause
+                let processed_whens: Result<Vec<WhenClause>> = case
+                    .when_clauses
+                    .iter()
+                    .map(|when| {
+                        Ok(WhenClause {
+                            token: when.token.clone(),
+                            condition: self.process_where_subqueries(&when.condition, ctx)?,
+                            then_result: self.process_where_subqueries(&when.then_result, ctx)?,
+                        })
+                    })
+                    .collect();
+
+                // Process the ELSE clause (if present)
+                let processed_else = if let Some(ref else_val) = case.else_value {
+                    Some(Box::new(self.process_where_subqueries(else_val, ctx)?))
+                } else {
+                    None
+                };
+
+                Ok(Expression::Case(Box::new(CaseExpression {
+                    token: case.token.clone(),
+                    value: processed_value,
+                    when_clauses: processed_whens?,
+                    else_value: processed_else,
+                })))
+            }
+
             Expression::Cast(cast) => {
                 let processed_expr = self.process_where_subqueries(&cast.expr, ctx)?;
                 Ok(Expression::Cast(CastExpression {

@@ -1110,4 +1110,308 @@ mod tests {
         let (txn4, _) = registry.begin_transaction();
         assert!(registry.is_visible(txn3, txn4));
     }
+
+    // === commit_transaction: line 371 override_count > 0 ===
+
+    #[test]
+    fn test_commit_read_committed_skips_snapshot_seqs() {
+        let registry = TransactionRegistry::new();
+        registry.set_global_isolation_level(IsolationLevel::ReadCommitted);
+
+        let (txn_id, _) = registry.begin_transaction();
+        registry.commit_transaction(txn_id);
+
+        // override_count == 0, global != snapshot => snapshot_seqs NOT populated
+        assert!(registry.snapshot_seqs.lock().is_empty());
+    }
+
+    // === recover_committed_transaction: lines 416, 432 ===
+
+    #[test]
+    fn test_recover_committed_advances_next_txn_id() {
+        let registry = TransactionRegistry::new();
+
+        // Recover txn 100 with commit_seq 50
+        registry.recover_committed_transaction(100, 50);
+        // next_txn_id must advance past 100
+        let (new_id, _) = registry.begin_transaction();
+        assert!(new_id > 100);
+    }
+
+    #[test]
+    fn test_recover_committed_advances_next_sequence() {
+        let registry = TransactionRegistry::new();
+
+        registry.recover_committed_transaction(10, 200);
+        // next_sequence must advance past 200
+        let (_, begin_seq) = registry.begin_transaction();
+        assert!(begin_seq > 200);
+    }
+
+    #[test]
+    fn test_recover_committed_descending_order() {
+        let registry = TransactionRegistry::new();
+
+        // Recover in descending order — next_txn_id must still track the max
+        registry.recover_committed_transaction(100, 50);
+        registry.recover_committed_transaction(50, 30);
+
+        let (new_id, _) = registry.begin_transaction();
+        assert!(new_id > 100, "next_txn_id should be >= 100, got {}", new_id);
+    }
+
+    // === recover_aborted_transaction: lines 448, 455 ===
+
+    #[test]
+    fn test_recover_aborted_marks_aborted() {
+        let registry = TransactionRegistry::new();
+
+        registry.recover_aborted_transaction(42);
+
+        // Must be aborted, not committed, not active
+        assert!(!registry.is_committed(42));
+        assert!(!registry.is_active(42));
+        let state = registry.transactions.lock().get(42).copied();
+        assert!(state.is_some());
+        assert!(state.unwrap().is_aborted());
+    }
+
+    #[test]
+    fn test_recover_aborted_advances_next_txn_id() {
+        let registry = TransactionRegistry::new();
+
+        registry.recover_aborted_transaction(100);
+        // next_txn_id must advance past 100
+        let (new_id, _) = registry.begin_transaction();
+        assert!(new_id > 100);
+    }
+
+    #[test]
+    fn test_recover_aborted_descending_order() {
+        let registry = TransactionRegistry::new();
+
+        registry.recover_aborted_transaction(200);
+        registry.recover_aborted_transaction(100);
+
+        // next_txn_id must still be >= 200
+        let (new_id, _) = registry.begin_transaction();
+        assert!(new_id > 200, "next_txn_id should be > 200, got {}", new_id);
+    }
+
+    #[test]
+    fn test_recover_aborted_not_visible() {
+        let registry = TransactionRegistry::new();
+
+        registry.recover_aborted_transaction(5);
+
+        let (viewer, _) = registry.begin_transaction();
+        // Aborted txn must never be visible
+        assert!(!registry.is_visible(5, viewer));
+    }
+
+    // === check_committed: line 512 ===
+
+    #[test]
+    fn test_check_committed_negative_txn_id_not_committed() {
+        let registry = TransactionRegistry::new();
+
+        // Start a real transaction so next_txn_id > 0
+        let (txn_id, _) = registry.begin_transaction();
+        registry.commit_transaction(txn_id);
+
+        // Negative txn_id must NOT be committed.
+        // Catches && -> || mutation: (-5 > 0 || -5 <= next) would wrongly be true
+        assert!(!registry.check_committed(-5));
+        assert!(!registry.check_committed(-100));
+    }
+
+    #[test]
+    fn test_check_committed_future_txn_id() {
+        let registry = TransactionRegistry::new();
+
+        // No transactions started yet, so txn_id 1 is beyond next_txn_id
+        assert!(!registry.check_committed(1));
+    }
+
+    #[test]
+    fn test_check_committed_valid_committed() {
+        let registry = TransactionRegistry::new();
+        registry.set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+
+        let (txn_id, _) = registry.begin_transaction();
+        registry.commit_transaction(txn_id);
+
+        assert!(registry.check_committed(txn_id));
+    }
+
+    #[test]
+    fn test_check_committed_boundary_next_txn_id() {
+        let registry = TransactionRegistry::new();
+
+        let (txn_id, _) = registry.begin_transaction();
+        registry.commit_transaction(txn_id);
+
+        // txn_id == next_txn_id should be committed (boundary: <= next)
+        assert!(registry.check_committed(txn_id));
+        // txn_id + 1 > next_txn_id should NOT be committed
+        assert!(!registry.check_committed(txn_id + 1));
+    }
+
+    // === is_directly_visible: line 523 ===
+
+    #[test]
+    fn test_is_directly_visible_recovery() {
+        let registry = TransactionRegistry::new();
+
+        // RECOVERY_TRANSACTION_ID is always directly visible
+        assert!(registry.is_directly_visible(RECOVERY_TRANSACTION_ID));
+    }
+
+    #[test]
+    fn test_is_directly_visible_normal_txn() {
+        let registry = TransactionRegistry::new();
+        registry.set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+
+        let (txn_id, _) = registry.begin_transaction();
+        // Active txn is NOT directly visible
+        assert!(!registry.is_directly_visible(txn_id));
+
+        registry.commit_transaction(txn_id);
+        // Committed txn IS directly visible
+        assert!(registry.is_directly_visible(txn_id));
+    }
+
+    #[test]
+    fn test_is_directly_visible_non_recovery_negative() {
+        let registry = TransactionRegistry::new();
+
+        // A negative txn_id that is NOT RECOVERY_TRANSACTION_ID should not be visible
+        assert!(!registry.is_directly_visible(-99));
+    }
+
+    // === is_visible_snapshot: lines 541, 570 ===
+
+    #[test]
+    fn test_snapshot_committed_viewer_fallback() {
+        // When the viewer has already committed, the match guard
+        // `is_active_or_committing()` fails → falls back to check_committed.
+        let registry = TransactionRegistry::new();
+        registry.set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+
+        let (txn1, _) = registry.begin_transaction();
+        registry.commit_transaction(txn1);
+
+        let (txn2, _) = registry.begin_transaction();
+        registry.commit_transaction(txn2);
+
+        // txn1 is committed → visible to committed viewer txn2
+        assert!(registry.is_visible(txn1, txn2));
+    }
+
+    #[test]
+    fn test_snapshot_invalid_version_txn_zero() {
+        let registry = TransactionRegistry::new();
+        registry.set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+
+        let (viewer, _) = registry.begin_transaction();
+
+        // version_txn_id 0 is invalid — not visible
+        // Catches || → && mutation: (0 <= 0 && 0 > next) = (true && false) = false
+        // but || → && would never return false for valid-looking IDs
+        assert!(!registry.is_visible(0, viewer));
+    }
+
+    #[test]
+    fn test_snapshot_invalid_version_txn_negative() {
+        let registry = TransactionRegistry::new();
+        registry.set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+
+        let (viewer, _) = registry.begin_transaction();
+
+        // Negative txn_id (not RECOVERY_TRANSACTION_ID) is invalid
+        assert!(!registry.is_visible(-50, viewer));
+    }
+
+    #[test]
+    fn test_snapshot_future_version_txn_not_visible() {
+        let registry = TransactionRegistry::new();
+        registry.set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+
+        let (viewer, _) = registry.begin_transaction();
+
+        // version_txn_id beyond next_txn_id is invalid
+        // Catches > → == mutation: 9999 == next would be false (not caught),
+        // but next+1 is immediately beyond
+        let next = registry.next_txn_id.load(Ordering::Acquire);
+        assert!(!registry.is_visible(next + 1, viewer));
+        assert!(!registry.is_visible(next + 100, viewer));
+    }
+
+    #[test]
+    fn test_snapshot_boundary_version_equals_next() {
+        // version_txn_id == next_txn_id should be valid (it's an assigned ID)
+        // Catches > → >= mutation at line 570
+        let registry = TransactionRegistry::new();
+        registry.set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+
+        let (txn1, _) = registry.begin_transaction();
+        registry.commit_transaction(txn1);
+
+        // txn1 == next_txn_id at this point
+        let (viewer, _) = registry.begin_transaction();
+        // txn1 committed before viewer — should be visible
+        assert!(registry.is_visible(txn1, viewer));
+    }
+
+    // === get_commit_sequence: line 608 ===
+
+    #[test]
+    fn test_get_commit_sequence_invalid_txn_id() {
+        let registry = TransactionRegistry::new();
+
+        // txn_id 0 is invalid
+        assert_eq!(registry.get_commit_sequence(0), None);
+        // Negative is invalid
+        assert_eq!(registry.get_commit_sequence(-1), None);
+    }
+
+    #[test]
+    fn test_get_commit_sequence_future_txn_id() {
+        let registry = TransactionRegistry::new();
+
+        // No transactions started, txn_id 1 is beyond next_txn_id
+        assert_eq!(registry.get_commit_sequence(1), None);
+    }
+
+    #[test]
+    fn test_get_commit_sequence_active() {
+        let registry = TransactionRegistry::new();
+
+        let (txn_id, _) = registry.begin_transaction();
+        // Active transaction has no commit_seq
+        assert_eq!(registry.get_commit_sequence(txn_id), None);
+    }
+
+    #[test]
+    fn test_get_commit_sequence_aborted() {
+        let registry = TransactionRegistry::new();
+
+        let (txn_id, _) = registry.begin_transaction();
+        registry.abort_transaction(txn_id);
+        // Aborted transaction has no commit_seq
+        assert_eq!(registry.get_commit_sequence(txn_id), None);
+    }
+
+    #[test]
+    fn test_get_commit_sequence_committed_with_snapshot() {
+        let registry = TransactionRegistry::new();
+        registry.set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+
+        let (txn_id, _) = registry.begin_transaction();
+        let commit_seq = registry.commit_transaction(txn_id);
+
+        // With snapshot isolation, exact commit_seq is stored
+        assert_eq!(registry.get_commit_sequence(txn_id), Some(commit_seq));
+        assert!(commit_seq > 0);
+    }
 }
