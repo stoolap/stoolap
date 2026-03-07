@@ -28,7 +28,7 @@ Stoolap's architecture consists of the following major components:
 
 - **Command-Line Interface** - Interactive CLI for database operations
 - **Library API** - Direct Rust API for embedded use
-- **C FFI** - SQLite-style C API for language bindings (`--features ffi`)
+- **C FFI** - C API for language bindings (`--features ffi`)
 
 ### Query Processing Pipeline
 

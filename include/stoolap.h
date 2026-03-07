@@ -18,7 +18,7 @@
  * @file stoolap.h
  * @brief Stoolap C API: high-performance embedded SQL database.
  *
- * SQLite-style interface with opaque handles, step-based result iteration,
+ * C interface with opaque handles, step-based result iteration,
  * and per-handle error messages.
  *
  * Build: cargo build --profile release-ffi --features ffi

@@ -14,7 +14,7 @@
 
 //! C FFI layer for Stoolap
 //!
-//! Provides a SQLite-style C API with opaque handles, step-based iteration,
+//! Provides a C API with opaque handles, step-based iteration,
 //! and per-handle error storage. Enable with `--features ffi`.
 //!
 //! Build: `cargo build --profile release-ffi --features ffi` produces `libstoolap.{so,dylib,dll}`

@@ -7,7 +7,7 @@ order: 4
 
 # C API (FFI)
 
-SQLite-style C API for Stoolap with opaque handles, step-based result iteration, and per-handle error messages. No external dependencies beyond the shared library and header file.
+C API for Stoolap with opaque handles, step-based result iteration, and per-handle error messages. No external dependencies beyond the shared library and header file.
 
 ## Building
 
