@@ -48,6 +48,7 @@ Stoolap uses Cargo features to enable optional functionality. The default featur
 | `cli` | Yes | Command-line interface with interactive REPL, requires `clap`, `rustyline`, `comfy-table`, `dirs` |
 | `parallel` | Yes | Multi-threaded query execution via Rayon (filter, join, sort, distinct) |
 | `wasm` | No | WebAssembly build mode. Excludes parallel execution and file persistence |
+| `ffi` | No | C FFI layer for language bindings. Produces `libstoolap.{so,dylib,dll}` with `include/stoolap.h` |
 | `mimalloc` | No | Use Microsoft's mimalloc allocator instead of the system allocator |
 
 ### Testing and Benchmarking Features
@@ -81,6 +82,9 @@ cargo build --release --features mimalloc
 
 # With SQLite comparison support
 cargo build --release --features sqlite
+
+# C FFI shared library (libstoolap.so / .dylib / .dll)
+cargo build --profile release-ffi --features ffi
 
 # Minimal build (no CLI, no parallel)
 cargo build --release --no-default-features

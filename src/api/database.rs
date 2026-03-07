@@ -127,6 +127,43 @@ pub struct Database {
     inner: Arc<DatabaseInner>,
 }
 
+#[cfg(feature = "ffi")]
+impl Database {
+    /// Returns an Arc reference to the inner state, preventing the engine
+    /// from being closed while any keepalive handle exists.
+    ///
+    /// Used by the FFI layer to ensure cloned handles keep the original
+    /// engine-owning DatabaseInner alive.
+    pub(crate) fn keepalive(&self) -> Arc<DatabaseInner> {
+        Arc::clone(&self.inner)
+    }
+
+    /// Returns a borrow of the inner Arc (no clone, no count change).
+    pub(crate) fn inner_arc(&self) -> &Arc<DatabaseInner> {
+        &self.inner
+    }
+
+    /// Try to remove `inner` from the global registry.
+    ///
+    /// Only removes the entry when:
+    /// 1. The registry entry points to the same `DatabaseInner` (`ptr_eq`), and
+    /// 2. `strong_count == 2`: the caller's reference + registry are the only
+    ///    remaining references. After the caller drops, only the registry holds
+    ///    a reference, so it is safe to clean up.
+    ///
+    /// This correctly handles both shared-DSN scenarios (two `stoolap_open()`
+    /// calls with the same DSN) and clone scenarios (keepalive Arcs).
+    pub(crate) fn try_unregister_arc(inner: &Arc<DatabaseInner>) {
+        if let Ok(mut registry) = DATABASE_REGISTRY.write() {
+            if let Some(entry) = registry.get(&inner.dsn) {
+                if Arc::ptr_eq(entry, inner) && Arc::strong_count(inner) == 2 {
+                    registry.remove(&inner.dsn);
+                }
+            }
+        }
+    }
+}
+
 impl Clone for Database {
     /// Clone the database handle.
     ///

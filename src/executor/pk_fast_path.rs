@@ -472,8 +472,12 @@ impl Executor {
                 return None
             }
             CompiledExecution::PkLookup(lookup) => {
-                let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
-                return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
+                // Re-validate epoch: another thread may have compiled before DDL
+                if self.engine.schema_epoch() == lookup.cached_epoch {
+                    let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
+                    return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
+                }
+                // Epoch changed since last compilation - fall through to recompile
             }
             CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
             // These variants are for UPDATE/DELETE/INSERT/COUNT DISTINCT/COUNT(*) - not PK lookups

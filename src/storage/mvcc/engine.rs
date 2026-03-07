@@ -2045,6 +2045,10 @@ impl MVCCEngine {
         // Update the engine's schema cache
         let mut schemas = self.schemas.write().unwrap();
         schemas.insert(table_name_lower, vs_schema);
+        drop(schemas);
+
+        // Bump schema epoch so compiled fast paths detect the change
+        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }

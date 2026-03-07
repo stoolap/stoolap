@@ -224,7 +224,7 @@ Benchmark figures are point-in-time and workload-dependent. Validate on your own
 - Data types: https://stoolap.io/docs/data-types/data-types/
 - Functions: https://stoolap.io/docs/functions/sql-functions-reference/
 - Architecture: https://stoolap.io/docs/architecture/architecture/
-- Drivers: [Node.js](https://stoolap.io/docs/drivers/nodejs/) | [Python](https://stoolap.io/docs/drivers/python/) | [WASM](https://stoolap.io/docs/drivers/wasm/)
+- Drivers: [Node.js](https://stoolap.io/docs/drivers/nodejs/) | [Python](https://stoolap.io/docs/drivers/python/) | [WASM](https://stoolap.io/docs/drivers/wasm/) | [C](https://stoolap.io/docs/drivers/c/)
 
 ## Development
 

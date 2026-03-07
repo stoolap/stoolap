@@ -379,17 +379,60 @@ try {
 
 ## Type Mapping
 
-| JavaScript | Stoolap |
-|-----------|---------|
-| `number` (integer) | `INTEGER` |
-| `number` (float) | `FLOAT` |
-| `string` | `TEXT` |
-| `boolean` | `BOOLEAN` |
-| `null` / `undefined` | `NULL` |
-| `BigInt` | `INTEGER` |
-| `Date` | `TIMESTAMP` |
-| `Buffer` | `TEXT` (UTF-8) |
-| `Object` / `Array` | `JSON` (stringified) |
+| JavaScript | Stoolap | Notes |
+|-----------|---------|-------|
+| `number` (integer) | `INTEGER` | |
+| `number` (float) | `FLOAT` | |
+| `string` | `TEXT` | |
+| `boolean` | `BOOLEAN` | |
+| `null` / `undefined` | `NULL` | |
+| `BigInt` | `INTEGER` | |
+| `Date` | `TIMESTAMP` | |
+| `Float32Array` | `VECTOR(N)` | Returned as `Float32Array` |
+| `Buffer` | `TEXT` (UTF-8) | |
+| `Object` / `Array` | `JSON` (stringified) | |
+
+## Vector Support
+
+Stoolap supports native vector storage and similarity search. Vectors are returned as `Float32Array` and can be passed as `Float32Array` bind parameters.
+
+```js
+// Create a table with a vector column
+await db.exec('CREATE TABLE embeddings (id INTEGER PRIMARY KEY, vec VECTOR(3))');
+
+// Insert vectors via SQL string literals
+await db.execute("INSERT INTO embeddings VALUES (1, '[0.1, 0.2, 0.3]')");
+
+// Query — vectors are returned as Float32Array
+const row = await db.queryOne('SELECT vec FROM embeddings WHERE id = 1');
+console.log(row.vec);              // Float32Array(3) [0.1, 0.2, 0.3]
+console.log(row.vec instanceof Float32Array); // true
+
+// k-NN search with distance functions
+const nearest = await db.query(`
+  SELECT id, VEC_DISTANCE_L2(vec, '[0.15, 0.25, 0.35]') AS dist
+  FROM embeddings ORDER BY dist LIMIT 5
+`);
+
+// HNSW index for fast approximate nearest neighbor search
+await db.exec('CREATE INDEX idx ON embeddings(vec) USING HNSW');
+```
+
+Available distance functions: `VEC_DISTANCE_L2`, `VEC_DISTANCE_COSINE`, `VEC_DISTANCE_IP`.
+
+See [Vector Search]({% link _docs/data-types/vector-search.md %}) for full details on HNSW indexes, distance metrics, and configuration.
+
+## Runtime Compatibility
+
+`@stoolap/node` uses direct V8 APIs for high-performance result set construction (~5x faster than pure NAPI). This means it is **Node.js only**.
+
+| Runtime | Engine | Supported |
+|---------|--------|-----------|
+| Node.js | V8 | Yes |
+| Deno | V8 | No — V8 symbols not exposed to addons |
+| Bun | JavaScriptCore | No — no V8 |
+
+For Deno or Bun, consider the [WASM driver]({% link _docs/drivers/wasm.md %}).
 
 ## Building from Source
 

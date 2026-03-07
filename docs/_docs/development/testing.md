@@ -59,6 +59,9 @@ cargo nextest run --features sqlite --test differential_oracle_test
 
 # I/O fault injection (must run single-threaded)
 cargo nextest run --features test-failpoints --test failpoint_io_test -- --test-threads=1
+
+# C FFI layer tests
+cargo nextest run --features ffi --test ffi_test
 ```
 
 ### Benchmarks
@@ -72,6 +75,15 @@ cargo bench --bench select_by_id
 ```
 
 Available benchmarks: `select_by_id`, `select_complex`, `update_by_id`, `update_complex`, `delete_by_id`, `delete_complex`.
+
+A C FFI benchmark is also available for comparing overhead:
+
+```bash
+cargo build --profile release-ffi --features ffi
+cc -O2 -o benchmark_ffi examples/benchmark_ffi.c -I include -L target/release-ffi -lstoolap
+DYLD_LIBRARY_PATH=target/release-ffi ./benchmark_ffi   # macOS
+LD_LIBRARY_PATH=target/release-ffi ./benchmark_ffi      # Linux
+```
 
 ## Test Categories
 

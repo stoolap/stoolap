@@ -81,6 +81,9 @@ pub mod storage;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
+#[cfg(feature = "ffi")]
+pub mod ffi;
+
 // Re-export main types for convenience
 pub use core::{
     DataType, Error, IndexEntry, IndexType, IsolationLevel, Operator, Result, Row, Schema,

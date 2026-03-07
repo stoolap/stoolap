@@ -859,11 +859,14 @@ impl ScalarFunction for JsonValidFunction {
             return Ok(Value::null_unknown());
         }
 
-        // Get string to validate
+        // Get string to validate — always parse, even for tagged JSON values
         let json_str = match &args[0] {
             Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
-                return Ok(Value::Integer(1))
-            } // Already JSON type, valid
+                match std::str::from_utf8(&data[1..]) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return Ok(Value::Integer(0)),
+                }
+            }
             Value::Text(s) => s.to_string(),
             _ => return Ok(Value::Integer(0)), // Non-string types are not valid JSON strings
         };

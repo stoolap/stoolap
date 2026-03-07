@@ -754,7 +754,7 @@ impl Executor {
 /// Count the number of parameter placeholders in a statement
 ///
 /// Returns (has_params, max_param_index)
-fn count_parameters(stmt: &Statement) -> (bool, usize) {
+pub(crate) fn count_parameters(stmt: &Statement) -> (bool, usize) {
     use crate::parser::ast::*;
 
     struct ParamCounter {

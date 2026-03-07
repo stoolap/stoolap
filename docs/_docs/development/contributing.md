@@ -172,6 +172,7 @@ src/
   optimizer/     Cost-based optimizer (cost, join DP, bloom, feedback)
   parser/        SQL parser (lexer, AST, parser)
   storage/       Storage engine (mvcc/, index/, statistics)
+  ffi/           C FFI layer (--features ffi)
   bin/           CLI binary
 ```
 

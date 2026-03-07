@@ -39,9 +39,12 @@
 //! }
 //! ```
 
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use crate::core::{Error, Result};
+use crate::executor::context::ExecutionContext;
+use crate::executor::query_cache::CachedPlanRef;
+use crate::parser::Parser;
 
 use super::database::{Database, DatabaseInnerHandle, FromValue};
 use super::params::Params;
@@ -49,9 +52,9 @@ use super::rows::Rows;
 
 /// A prepared SQL statement
 ///
-/// Prepared statements allow you to compile a SQL query once and execute it
-/// multiple times with different parameters. This is more efficient than
-/// parsing the same query repeatedly.
+/// Prepared statements parse SQL once at prepare time and retain the compiled
+/// plan. Subsequent executions use the plan directly, bypassing normalize,
+/// hash, and cache-lookup overhead on every call.
 ///
 /// # Thread Safety
 ///
@@ -68,30 +71,54 @@ pub struct Statement {
     /// Weak reference to database - doesn't prevent cleanup
     db_weak: Weak<DatabaseInnerHandle>,
     sql: String,
+    /// Pre-compiled plan for single-statement queries (the common case).
+    /// `None` for multi-statement SQL, which falls back to the SQL-based path.
+    plan: Option<CachedPlanRef>,
 }
 
 impl Statement {
-    /// Create a new prepared statement
+    /// Create a new prepared statement.
     ///
-    /// This validates the SQL syntax by pre-warming the query cache.
+    /// Parses the SQL and retains the compiled plan so that subsequent
+    /// executions bypass cache lookup entirely. Returns an error if the
+    /// SQL is invalid.
     pub(crate) fn new(
         db_weak: Weak<DatabaseInnerHandle>,
         sql: String,
         db: &Database,
     ) -> Result<Self> {
-        // Pre-warm the cache by executing with empty params check
-        // This validates the SQL syntax
-        {
+        let plan = {
             let executor = db
                 .executor()
                 .lock()
                 .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
-            // Just touch the cache to pre-parse
-            let _ = executor.query_cache().get(&sql);
-        }
+            // Check if already cached (e.g. same SQL prepared twice)
+            if let Some(cached) = executor.query_cache().get(&sql) {
+                Some(cached)
+            } else {
+                let mut parser = Parser::new(&sql);
+                let mut program = parser
+                    .parse_program()
+                    .map_err(|e| Error::parse(e.to_string()))?;
 
-        Ok(Self { db_weak, sql })
+                if program.statements.len() == 1 {
+                    let stmt = program.statements.pop().unwrap();
+                    let (has_params, param_count) = crate::executor::count_parameters(&stmt);
+                    let stmt_arc = Arc::new(stmt);
+                    let cached =
+                        executor
+                            .query_cache()
+                            .put(&sql, stmt_arc, has_params, param_count);
+                    Some(cached)
+                } else {
+                    // Multi-statement SQL: validated but not cacheable
+                    None
+                }
+            }
+        };
+
+        Ok(Self { db_weak, sql, plan })
     }
 
     /// Get the database, upgrading the weak reference.
@@ -116,7 +143,18 @@ impl Statement {
     /// stmt.execute((2, "Bob"))?;
     /// ```
     pub fn execute<P: Params>(&self, params: P) -> Result<i64> {
-        self.get_db()?.execute(&self.sql, params)
+        let db = self.get_db()?;
+        if let Some(plan) = &self.plan {
+            let executor = db
+                .executor()
+                .lock()
+                .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+            let ctx = ExecutionContext::with_params(params.into_params());
+            let result = executor.execute_with_cached_plan(plan, &ctx)?;
+            Ok(result.rows_affected())
+        } else {
+            db.execute(&self.sql, params)
+        }
     }
 
     /// Query using the prepared statement
@@ -134,7 +172,18 @@ impl Statement {
     /// }
     /// ```
     pub fn query<P: Params>(&self, params: P) -> Result<Rows> {
-        self.get_db()?.query(&self.sql, params)
+        let db = self.get_db()?;
+        if let Some(plan) = &self.plan {
+            let executor = db
+                .executor()
+                .lock()
+                .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+            let ctx = ExecutionContext::with_params(params.into_params());
+            let result = executor.execute_with_cached_plan(plan, &ctx)?;
+            Ok(Rows::new(result))
+        } else {
+            db.query(&self.sql, params)
+        }
     }
 
     /// Query and return a single value
@@ -146,7 +195,8 @@ impl Statement {
     /// let name: String = stmt.query_one((1,))?;
     /// ```
     pub fn query_one<T: FromValue, P: Params>(&self, params: P) -> Result<T> {
-        self.get_db()?.query_one(&self.sql, params)
+        let row = self.query(params)?.next().ok_or(Error::NoRowsReturned)??;
+        row.get(0)
     }
 
     /// Query and return an optional single value
@@ -158,7 +208,11 @@ impl Statement {
     /// let name: Option<String> = stmt.query_opt((999,))?;
     /// ```
     pub fn query_opt<T: FromValue, P: Params>(&self, params: P) -> Result<Option<T>> {
-        self.get_db()?.query_opt(&self.sql, params)
+        match self.query(params)?.next() {
+            None => Ok(None),
+            Some(Err(e)) => Err(e),
+            Some(Ok(row)) => Ok(Some(row.get(0)?)),
+        }
     }
 
     /// Get the SQL text of this statement
