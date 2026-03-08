@@ -116,6 +116,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ./stoolap --db "file://./mydb"
 ```
 
+## Stoolap Studio
+
+[Stoolap Studio](https://github.com/stoolap/stoolap-studio) is a web-based database management interface with a SQL editor, schema browser, interactive data grid, vector search, and backup/restore.
+
+<img src="docs/assets/img/studio/studio-light.png#gh-light-mode-only" alt="Stoolap Studio" width="100%">
+<img src="docs/assets/img/studio/studio-dark.png#gh-dark-mode-only" alt="Stoolap Studio" width="100%">
+
+```bash
+git clone https://github.com/stoolap/stoolap-studio.git
+cd stoolap-studio && npm install && npm run dev
+```
+
 ## Core SQL Capabilities
 
 ### Transactions and Time-Travel
