@@ -516,6 +516,48 @@ The C API is designed so that callers never need to free individual strings. All
 - Always call `stoolap_close()` on every `StoolapDB` handle.
 - Transaction handles are freed by `stoolap_tx_commit()` or `stoolap_tx_rollback()`.
 
+## Bulk Fetch
+
+`stoolap_rows_fetch_all()` consumes all remaining rows from a result set into a single packed binary buffer. This is useful for language bindings that need to transfer entire result sets across the FFI boundary in one call, avoiding per-row overhead.
+
+```c
+StoolapRows* rows = NULL;
+stoolap_query(db, "SELECT id, name, age FROM users", &rows);
+
+uint8_t* buf = NULL;
+int64_t buf_len = 0;
+if (stoolap_rows_fetch_all(rows, &buf, &buf_len) == STOOLAP_OK) {
+    /* Parse the binary buffer (see format below) */
+    /* ... */
+    stoolap_buffer_free(buf, buf_len);
+}
+stoolap_rows_close(rows);
+```
+
+### Binary Format
+
+The buffer layout is:
+
+```
+[column_count: u32 LE]
+[for each column: name_len:u16 LE, name_bytes:u8[name_len]]
+[row_count: u32 LE]
+[for each row, for each column:
+  type_tag: u8
+  payload:
+    NULL(0):      (empty)
+    INTEGER(1):   i64 LE (8 bytes)
+    FLOAT(2):     f64 LE (8 bytes)
+    TEXT(3):      len:u32 LE + bytes
+    BOOLEAN(4):   u8 (0 or 1)
+    TIMESTAMP(5): i64 LE (8 bytes, nanos since epoch)
+    JSON(6):      len:u32 LE + bytes
+    BLOB(7):      len:u32 LE + bytes (packed f32 for vectors)
+]
+```
+
+The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The rows handle must still be closed with `stoolap_rows_close()` after the fetch.
+
 ## API Reference
 
 ### Library
@@ -591,6 +633,13 @@ The C API is designed so that callers never need to free individual strings. All
 | `stoolap_rows_affected(rows)` | `int64_t` | Rows affected (for DML results) |
 | `stoolap_rows_close(rows)` | `void` | Close and free (NULL-safe, must always be called) |
 | `stoolap_rows_errmsg(rows)` | `const char*` | Last error message |
+
+### Bulk Fetch
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `stoolap_rows_fetch_all(rows, &buf, &len)` | `int32_t` | Fetch all remaining rows into a packed binary buffer |
+| `stoolap_buffer_free(buf, len)` | `void` | Free a buffer from `stoolap_rows_fetch_all` (NULL-safe) |
 
 ### Memory
 

@@ -112,7 +112,7 @@ typedef struct StoolapValue {
  * ========================================================================= */
 
 /**
- * Returns the stoolap version string (e.g. "0.3.3").
+ * Returns the stoolap version string (e.g. "0.3.4").
  * The returned pointer is static and must NOT be freed.
  */
 const char* stoolap_version(void);
@@ -433,6 +433,46 @@ void stoolap_rows_close(StoolapRows* rows);
 
 /** Get the last error message for a rows handle. */
 const char* stoolap_rows_errmsg(const StoolapRows* rows);
+
+/* =========================================================================
+ * Bulk fetch
+ * ========================================================================= */
+
+/**
+ * Fetch all remaining rows into a packed binary buffer (single call).
+ *
+ * Format:
+ *   [column_count: u32 LE]
+ *   [for each column: name_len:u16 LE, name_bytes:u8[name_len]]
+ *   [row_count: u32 LE]
+ *   [for each row, for each column:
+ *     type_tag: u8
+ *     payload (varies):
+ *       NULL(0):      (empty)
+ *       INTEGER(1):   i64 LE (8 bytes)
+ *       FLOAT(2):     f64 LE (8 bytes)
+ *       TEXT(3):      len:u32 LE + bytes
+ *       BOOLEAN(4):   u8 (0 or 1)
+ *       TIMESTAMP(5): i64 LE (8 bytes, nanos since epoch)
+ *       JSON(6):      len:u32 LE + bytes
+ *       BLOB(7):      len:u32 LE + bytes (packed f32 for vectors)
+ *   ]
+ *
+ * On success, *out_buf receives a heap-allocated buffer and *out_len its
+ * byte length.  Caller MUST free with stoolap_buffer_free().
+ * The rows handle's data is consumed; call stoolap_rows_close() afterward.
+ */
+int32_t stoolap_rows_fetch_all(
+    StoolapRows* rows,
+    uint8_t** out_buf,
+    int64_t* out_len
+);
+
+/**
+ * Free a buffer allocated by stoolap_rows_fetch_all().
+ * Safe to call with NULL (no-op).
+ */
+void stoolap_buffer_free(uint8_t* buf, int64_t len);
 
 /* =========================================================================
  * Memory management

@@ -1990,3 +1990,581 @@ fn test_empty_vector_round_trip() {
         stoolap_close(db);
     }
 }
+
+// =========================================================================
+// Aggregate functions via FFI
+// =========================================================================
+
+/// Helper: open db, create a populated table, return db handle.
+unsafe fn setup_aggregate_test_db() -> *mut StoolapDB {
+    let mut db: *mut StoolapDB = std::ptr::null_mut();
+    let rc = stoolap_open_in_memory(&mut db);
+    assert_eq!(rc, STOOLAP_OK);
+
+    let sql = cstr(
+        "CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            customer TEXT NOT NULL,
+            product TEXT,
+            quantity INTEGER NOT NULL,
+            price FLOAT NOT NULL,
+            region TEXT
+        )",
+    );
+    let rc = stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut());
+    assert_eq!(rc, STOOLAP_OK);
+
+    let inserts = [
+        "INSERT INTO orders VALUES (1, 'Alice', 'Widget', 10, 9.99, 'East')",
+        "INSERT INTO orders VALUES (2, 'Bob', 'Gadget', 5, 24.50, 'West')",
+        "INSERT INTO orders VALUES (3, 'Alice', 'Widget', 3, 9.99, 'East')",
+        "INSERT INTO orders VALUES (4, 'Charlie', 'Gizmo', 7, 15.00, 'East')",
+        "INSERT INTO orders VALUES (5, 'Bob', 'Widget', 12, 9.99, 'West')",
+        "INSERT INTO orders VALUES (6, 'Alice', 'Gadget', 1, 24.50, 'North')",
+        "INSERT INTO orders VALUES (7, 'Charlie', 'Widget', 20, 9.99, 'East')",
+        "INSERT INTO orders VALUES (8, 'Bob', 'Gizmo', 2, 15.00, 'West')",
+        "INSERT INTO orders VALUES (9, 'Alice', 'Gizmo', 8, 15.00, 'North')",
+        "INSERT INTO orders VALUES (10, 'Charlie', 'Gadget', 4, 24.50, 'East')",
+    ];
+    for insert in &inserts {
+        let sql = cstr(insert);
+        let rc = stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut());
+        assert_eq!(rc, STOOLAP_OK, "Failed: {}", insert);
+    }
+
+    db
+}
+
+/// Helper: run a query that returns a single integer result.
+unsafe fn query_single_int(db: *mut StoolapDB, sql_str: &str) -> i64 {
+    let sql = cstr(sql_str);
+    let mut rows: *mut StoolapRows = std::ptr::null_mut();
+    let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
+    assert_eq!(
+        rc,
+        STOOLAP_OK,
+        "Query failed: {} — {}",
+        sql_str,
+        read_cstr(stoolap_errmsg(db))
+    );
+
+    let rc = stoolap_rows_next(rows);
+    assert_eq!(rc, STOOLAP_ROW, "No row returned for: {}", sql_str);
+    let val = stoolap_rows_column_int64(rows, 0);
+    stoolap_rows_close(rows);
+    val
+}
+
+/// Helper: run a query that returns a single float result.
+unsafe fn query_single_float(db: *mut StoolapDB, sql_str: &str) -> f64 {
+    let sql = cstr(sql_str);
+    let mut rows: *mut StoolapRows = std::ptr::null_mut();
+    let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
+    assert_eq!(
+        rc,
+        STOOLAP_OK,
+        "Query failed: {} — {}",
+        sql_str,
+        read_cstr(stoolap_errmsg(db))
+    );
+
+    let rc = stoolap_rows_next(rows);
+    assert_eq!(rc, STOOLAP_ROW, "No row returned for: {}", sql_str);
+    let val = stoolap_rows_column_double(rows, 0);
+    stoolap_rows_close(rows);
+    val
+}
+
+#[test]
+fn test_ffi_count_star() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+        assert_eq!(query_single_int(db, "SELECT COUNT(*) FROM orders"), 10);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_count_with_where() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        assert_eq!(
+            query_single_int(db, "SELECT COUNT(*) FROM orders WHERE customer = 'Alice'"),
+            4
+        );
+        assert_eq!(
+            query_single_int(db, "SELECT COUNT(*) FROM orders WHERE price > 10.0"),
+            6
+        );
+        // East rows: id 1(9.99), 3(9.99), 4(15.00), 7(9.99), 10(24.50) -> price < 20: 1,3,4,7 = 4
+        assert_eq!(
+            query_single_int(
+                db,
+                "SELECT COUNT(*) FROM orders WHERE region = 'East' AND price < 20.0"
+            ),
+            4
+        );
+
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_count_column_and_distinct() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        assert_eq!(
+            query_single_int(db, "SELECT COUNT(product) FROM orders"),
+            10
+        );
+        assert_eq!(
+            query_single_int(db, "SELECT COUNT(DISTINCT customer) FROM orders"),
+            3
+        );
+        assert_eq!(
+            query_single_int(db, "SELECT COUNT(DISTINCT product) FROM orders"),
+            3
+        );
+        assert_eq!(
+            query_single_int(db, "SELECT COUNT(DISTINCT region) FROM orders"),
+            3
+        );
+
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_sum_avg_min_max() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        assert_eq!(query_single_int(db, "SELECT SUM(quantity) FROM orders"), 72);
+
+        let avg = query_single_float(db, "SELECT AVG(quantity) FROM orders");
+        assert!((avg - 7.2).abs() < 0.01, "AVG expected 7.2, got {}", avg);
+
+        assert_eq!(query_single_int(db, "SELECT MIN(quantity) FROM orders"), 1);
+        assert_eq!(query_single_int(db, "SELECT MAX(quantity) FROM orders"), 20);
+
+        let min_price = query_single_float(db, "SELECT MIN(price) FROM orders");
+        assert!(
+            (min_price - 9.99).abs() < 0.01,
+            "MIN(price) expected 9.99, got {}",
+            min_price
+        );
+        let max_price = query_single_float(db, "SELECT MAX(price) FROM orders");
+        assert!(
+            (max_price - 24.50).abs() < 0.01,
+            "MAX(price) expected 24.50, got {}",
+            max_price
+        );
+
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_group_by_count() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        let sql = cstr("SELECT customer, COUNT(*) FROM orders GROUP BY customer ORDER BY customer");
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
+        assert_eq!(rc, STOOLAP_OK, "{}", read_cstr(stoolap_errmsg(db)));
+
+        // Alice: 4
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Alice"
+        );
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 4);
+
+        // Bob: 3
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Bob"
+        );
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 3);
+
+        // Charlie: 3
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Charlie"
+        );
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 3);
+
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_DONE);
+
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_group_by_sum_avg() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        let sql = cstr(
+            "SELECT customer, SUM(quantity), AVG(price) FROM orders GROUP BY customer ORDER BY customer",
+        );
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
+        assert_eq!(rc, STOOLAP_OK, "{}", read_cstr(stoolap_errmsg(db)));
+
+        // Alice: qty=10+3+1+8=22
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Alice"
+        );
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 22);
+
+        // Bob: qty=5+12+2=19
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Bob"
+        );
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 19);
+
+        // Charlie: qty=7+20+4=31
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Charlie"
+        );
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 31);
+
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_DONE);
+
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_having_clause() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        let sql = cstr(
+            "SELECT customer, COUNT(*) AS cnt FROM orders GROUP BY customer HAVING COUNT(*) >= 4 ORDER BY customer",
+        );
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
+        assert_eq!(rc, STOOLAP_OK, "{}", read_cstr(stoolap_errmsg(db)));
+
+        // Only Alice has 4 orders
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Alice"
+        );
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 4);
+
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_DONE);
+
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_multiple_aggregates_in_select() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        let sql = cstr(
+            "SELECT COUNT(*), SUM(quantity), AVG(price), MIN(quantity), MAX(quantity) FROM orders",
+        );
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
+        assert_eq!(rc, STOOLAP_OK, "{}", read_cstr(stoolap_errmsg(db)));
+
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+
+        assert_eq!(stoolap_rows_column_int64(rows, 0), 10); // COUNT(*)
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 72); // SUM(quantity)
+        let avg = stoolap_rows_column_double(rows, 2);
+        assert!(
+            (avg - 15.846).abs() < 0.01,
+            "AVG(price) expected ~15.846, got {}",
+            avg
+        );
+        assert_eq!(stoolap_rows_column_int64(rows, 3), 1); // MIN(quantity)
+        assert_eq!(stoolap_rows_column_int64(rows, 4), 20); // MAX(quantity)
+
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_DONE);
+
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_count_with_join() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        let sql = cstr(
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, city TEXT, tier TEXT)",
+        );
+        let rc = stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut());
+        assert_eq!(rc, STOOLAP_OK, "{}", read_cstr(stoolap_errmsg(db)));
+
+        for ins in &[
+            "INSERT INTO customers VALUES (1, 'Alice', 'New York', 'Gold')",
+            "INSERT INTO customers VALUES (2, 'Bob', 'Chicago', 'Silver')",
+            "INSERT INTO customers VALUES (3, 'Charlie', 'Boston', 'Gold')",
+        ] {
+            let sql = cstr(ins);
+            let rc = stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut());
+            assert_eq!(rc, STOOLAP_OK, "Failed: {}", ins);
+        }
+
+        // COUNT with JOIN
+        let val = query_single_int(
+            db,
+            "SELECT COUNT(*) FROM orders o JOIN customers c ON o.customer = c.name WHERE c.tier = 'Gold'",
+        );
+        assert_eq!(val, 7); // Alice(4) + Charlie(3)
+
+        // GROUP BY with JOIN
+        let sql = cstr(
+            "SELECT c.tier, COUNT(*), SUM(o.quantity) FROM orders o JOIN customers c ON o.customer = c.name GROUP BY c.tier ORDER BY c.tier",
+        );
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
+        assert_eq!(rc, STOOLAP_OK, "{}", read_cstr(stoolap_errmsg(db)));
+
+        // Gold: 7 orders, qty=53
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Gold"
+        );
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 7);
+        assert_eq!(stoolap_rows_column_int64(rows, 2), 53);
+
+        // Silver: 3 orders, qty=19
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Silver"
+        );
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 3);
+        assert_eq!(stoolap_rows_column_int64(rows, 2), 19);
+
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_DONE);
+
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_count_in_subquery() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        // Scalar subquery with AVG
+        let sql = cstr(
+            "SELECT customer FROM orders WHERE quantity > (SELECT AVG(quantity) FROM orders) GROUP BY customer ORDER BY customer",
+        );
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
+        assert_eq!(rc, STOOLAP_OK, "{}", read_cstr(stoolap_errmsg(db)));
+
+        // AVG(quantity) = 7.2, so quantity > 7.2: ids 1(10), 5(12), 7(20), 9(8)
+        // customers: Alice, Bob, Charlie
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Alice"
+        );
+
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Bob"
+        );
+
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(
+            read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut())),
+            "Charlie"
+        );
+
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_DONE);
+
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_count_with_in_clause() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        // COUNT with IN literal list — exercises IN-list fast path guard
+        let val = query_single_int(
+            db,
+            "SELECT COUNT(*) FROM orders WHERE id IN (1, 3, 5, 7, 9)",
+        );
+        assert_eq!(val, 5);
+
+        // COUNT with IN subquery — exercises IN-subquery fast path guard
+        let val = query_single_int(
+            db,
+            "SELECT COUNT(*) FROM orders WHERE customer IN (SELECT customer FROM orders WHERE region = 'East')",
+        );
+        // East: Alice(1,3), Charlie(4,7,10) -> all orders by Alice(4) + Charlie(3) = 7
+        assert_eq!(val, 7);
+
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_prepared_stmt_with_aggregates() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        let sql = cstr("SELECT COUNT(*), SUM(quantity) FROM orders WHERE customer = $1");
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        let rc = stoolap_prepare(db, sql.as_ptr(), &mut stmt);
+        assert_eq!(rc, STOOLAP_OK, "{}", read_cstr(stoolap_errmsg(db)));
+
+        // Alice
+        let alice = cstr("Alice");
+        let params = [StoolapValue {
+            value_type: STOOLAP_TYPE_TEXT,
+            _padding: 0,
+            v: StoolapValueData {
+                text: StoolapTextData {
+                    ptr: alice.as_ptr(),
+                    len: 5,
+                },
+            },
+        }];
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_stmt_query(stmt, params.as_ptr(), 1, &mut rows);
+        assert_eq!(rc, STOOLAP_OK, "{}", read_cstr(stoolap_stmt_errmsg(stmt)));
+
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(stoolap_rows_column_int64(rows, 0), 4);
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 22);
+        stoolap_rows_close(rows);
+
+        // Bob
+        let bob = cstr("Bob");
+        let params = [StoolapValue {
+            value_type: STOOLAP_TYPE_TEXT,
+            _padding: 0,
+            v: StoolapValueData {
+                text: StoolapTextData {
+                    ptr: bob.as_ptr(),
+                    len: 3,
+                },
+            },
+        }];
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_stmt_query(stmt, params.as_ptr(), 1, &mut rows);
+        assert_eq!(rc, STOOLAP_OK);
+
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW);
+        assert_eq!(stoolap_rows_column_int64(rows, 0), 3);
+        assert_eq!(stoolap_rows_column_int64(rows, 1), 19);
+        stoolap_rows_close(rows);
+
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_count_after_mutations() {
+    unsafe {
+        let db = setup_aggregate_test_db();
+
+        assert_eq!(query_single_int(db, "SELECT COUNT(*) FROM orders"), 10);
+
+        // Delete Bob's orders
+        let sql = cstr("DELETE FROM orders WHERE customer = 'Bob'");
+        let mut affected: i64 = 0;
+        stoolap_exec(db, sql.as_ptr(), &mut affected);
+        assert_eq!(affected, 3);
+
+        assert_eq!(query_single_int(db, "SELECT COUNT(*) FROM orders"), 7);
+        assert_eq!(query_single_int(db, "SELECT SUM(quantity) FROM orders"), 53);
+
+        // Update and recheck
+        let sql = cstr("UPDATE orders SET quantity = 100 WHERE id = 1");
+        stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut());
+
+        assert_eq!(
+            query_single_int(db, "SELECT SUM(quantity) FROM orders"),
+            143 // 53 - 10 + 100
+        );
+        assert_eq!(
+            query_single_int(db, "SELECT MAX(quantity) FROM orders"),
+            100
+        );
+
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_ffi_count_empty_table() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+
+        let sql = cstr("CREATE TABLE empty_t (id INTEGER PRIMARY KEY, val TEXT)");
+        stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut());
+
+        assert_eq!(query_single_int(db, "SELECT COUNT(*) FROM empty_t"), 0);
+        assert_eq!(query_single_int(db, "SELECT COUNT(val) FROM empty_t"), 0);
+
+        // SUM on empty table returns NULL
+        let sql = cstr("SELECT SUM(id) FROM empty_t");
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        stoolap_query(db, sql.as_ptr(), &mut rows);
+        stoolap_rows_next(rows);
+        assert_eq!(stoolap_rows_column_is_null(rows, 0), 1);
+        stoolap_rows_close(rows);
+
+        stoolap_close(db);
+    }
+}

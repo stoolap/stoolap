@@ -7,7 +7,7 @@ order: 1
 
 # Node.js Driver
 
-High-performance Node.js driver for Stoolap. Built with [NAPI-RS](https://napi.rs) for native performance with both async and sync APIs.
+High-performance Node.js driver for Stoolap. Built with a native N-API C addon for minimal overhead. Provides both async and sync APIs.
 
 ## Installation
 
@@ -15,10 +15,15 @@ High-performance Node.js driver for Stoolap. Built with [NAPI-RS](https://napi.r
 npm install @stoolap/node
 ```
 
-Pre-built binaries are available for:
+The stoolap engine shared library is pre-built for:
 - macOS (x64, ARM64)
 - Linux (x64, ARM64 GNU)
 - Windows (x64 MSVC)
+
+A C compiler is required to build the thin N-API addon on install (compiled automatically via `node-gyp`):
+- **macOS**: `xcode-select --install`
+- **Linux**: `sudo apt-get install build-essential` (or equivalent)
+- **Windows**: [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with "Desktop development with C++"
 
 ## Quick Start
 
@@ -61,7 +66,7 @@ const users = await db.query('SELECT * FROM users ORDER BY id');
 const user = await db.queryOne('SELECT * FROM users WHERE id = $1', [1]);
 // { id: 1, name: 'Alice', email: 'alice@example.com' }
 
-// Query in raw columnar format (faster)
+// Query in raw columnar format (faster, no per-row object creation)
 const raw = await db.queryRaw('SELECT id, name FROM users ORDER BY id');
 // { columns: ['id', 'name'], rows: [[1, 'Alice'], [2, 'Bob']] }
 
@@ -85,8 +90,9 @@ const db = await Database.open('file:///absolute/path/to/db');
 
 | Method | Returns | Description |
 |--------|---------|-------------|
+| `Database.open(path)` | `Promise<Database>` | Open a database |
 | `execute(sql, params?)` | `Promise<RunResult>` | Execute DML statement |
-| `exec(sql)` | `Promise<void>` | Execute one or more statements |
+| `exec(sql)` | `Promise<void>` | Execute a DDL statement |
 | `query(sql, params?)` | `Promise<Object[]>` | Query rows as objects |
 | `queryOne(sql, params?)` | `Promise<Object \| null>` | Query single row |
 | `queryRaw(sql, params?)` | `Promise<{columns, rows}>` | Query in columnar format |
@@ -99,14 +105,16 @@ Sync methods run on the main thread. Faster for simple operations but blocks the
 
 | Method | Returns | Description |
 |--------|---------|-------------|
+| `Database.openSync(path)` | `Database` | Open a database |
 | `executeSync(sql, params?)` | `RunResult` | Execute DML statement |
-| `execSync(sql)` | `void` | Execute one or more statements |
+| `execSync(sql)` | `void` | Execute a DDL statement |
 | `querySync(sql, params?)` | `Object[]` | Query rows as objects |
 | `queryOneSync(sql, params?)` | `Object \| null` | Query single row |
 | `queryRawSync(sql, params?)` | `{columns, rows}` | Query in columnar format |
 | `executeBatchSync(sql, paramsArray)` | `RunResult` | Execute with multiple param sets |
 | `beginSync()` | `Transaction` | Begin a transaction |
 | `prepare(sql)` | `PreparedStatement` | Create a prepared statement |
+| `closeSync()` | `void` | Close the database |
 
 `RunResult` is `{ changes: number }`:
 
@@ -230,6 +238,7 @@ All methods mirror `Database` but without the `sql` parameter (it's bound at pre
 | `queryOne(params?)` | `queryOneSync(params?)` | Query single row |
 | `queryRaw(params?)` | `queryRawSync(params?)` | Query in columnar format |
 | | `executeBatchSync(paramsArray)` | Execute with multiple param sets |
+| | `finalize()` | Release the prepared statement |
 
 Property: `sql` returns the SQL text of this prepared statement.
 
@@ -422,29 +431,18 @@ Available distance functions: `VEC_DISTANCE_L2`, `VEC_DISTANCE_COSINE`, `VEC_DIS
 
 See [Vector Search]({% link _docs/data-types/vector-search.md %}) for full details on HNSW indexes, distance metrics, and configuration.
 
-## Runtime Compatibility
-
-`@stoolap/node` uses direct V8 APIs for high-performance result set construction (~5x faster than pure NAPI). This means it is **Node.js only**.
-
-| Runtime | Engine | Supported |
-|---------|--------|-----------|
-| Node.js | V8 | Yes |
-| Deno | V8 | No — V8 symbols not exposed to addons |
-| Bun | JavaScriptCore | No — no V8 |
-
-For Deno or Bun, consider the [WASM driver]({% link _docs/drivers/wasm.md %}).
-
 ## Building from Source
 
 Requires:
-- [Rust](https://rustup.rs) (stable)
-- [Node.js](https://nodejs.org) >= 22 (with development headers)
-- C++ compiler (for V8 helpers)
+- [Node.js](https://nodejs.org) >= 18
+- C compiler (gcc, clang, or MSVC)
+- [node-gyp](https://github.com/nodejs/node-gyp) and its prerequisites
+
+The stoolap shared library (`libstoolap.dylib` / `libstoolap.so` / `stoolap.dll`) must be available, either via a platform package or built from the [Stoolap](https://github.com/stoolap/stoolap) repository.
 
 ```bash
 git clone https://github.com/stoolap/stoolap-node.git
 cd stoolap-node
 npm install
-npm run build
 npm test
 ```

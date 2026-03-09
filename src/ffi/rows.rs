@@ -22,7 +22,7 @@ use crate::core::Value;
 
 use super::types::StoolapRows;
 use super::{
-    STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_ROW, STOOLAP_TYPE_BLOB, STOOLAP_TYPE_BOOLEAN,
+    STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW, STOOLAP_TYPE_BLOB, STOOLAP_TYPE_BOOLEAN,
     STOOLAP_TYPE_FLOAT, STOOLAP_TYPE_INTEGER, STOOLAP_TYPE_JSON, STOOLAP_TYPE_NULL,
     STOOLAP_TYPE_TEXT, STOOLAP_TYPE_TIMESTAMP,
 };
@@ -415,6 +415,206 @@ pub unsafe extern "C" fn stoolap_rows_affected(rows: *const StoolapRows) -> i64 
     match rows.as_ref() {
         Some(handle) => handle.rows_affected,
         None => 0,
+    }
+}
+
+/// Fetch all remaining rows into a packed binary buffer.
+///
+/// Binary format:
+/// ```text
+/// [column_count: u32 LE]
+/// [for each column: name_len:u16 LE, name_bytes:u8[name_len]]
+/// [row_count: u32 LE]
+/// [for each row, for each column:
+///   type_tag: u8
+///   payload (varies by type):
+///     NULL(0): empty
+///     INTEGER(1): i64 LE (8 bytes)
+///     FLOAT(2): f64 LE (8 bytes)
+///     TEXT(3): len:u32 LE + bytes:u8[len]
+///     BOOLEAN(4): u8 (0 or 1)
+///     TIMESTAMP(5): i64 LE (8 bytes, nanos since epoch)
+///     JSON(6): len:u32 LE + bytes:u8[len]
+///     BLOB(7): len:u32 LE + bytes:u8[len]
+/// ]
+/// ```
+///
+/// On success, `*out_buf` receives a heap-allocated buffer and `*out_len`
+/// its byte length. The caller MUST free it with `stoolap_buffer_free()`.
+/// The rows handle is consumed and closed by this call.
+///
+/// # Safety
+///
+/// `rows` must be a valid `StoolapRows` pointer. `out_buf` and `out_len` must not be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_rows_fetch_all(
+    rows: *mut StoolapRows,
+    out_buf: *mut *mut u8,
+    out_len: *mut i64,
+) -> i32 {
+    if out_buf.is_null() || out_len.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out_buf = std::ptr::null_mut();
+    *out_len = 0;
+
+    let handle = match rows.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let rows_inner = match &mut handle.rows {
+            Some(r) => r,
+            None => {
+                // Already exhausted — return empty buffer with just headers
+                let col_count = handle.column_names.len() as u32;
+                let mut buf = Vec::with_capacity(8);
+                buf.extend_from_slice(&col_count.to_le_bytes());
+                for name in handle.column_names.iter() {
+                    let name_bytes = name.to_bytes();
+                    buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(name_bytes);
+                }
+                buf.extend_from_slice(&0u32.to_le_bytes()); // 0 rows
+                                                            // into_boxed_slice guarantees len == capacity (unlike shrink_to_fit)
+                let boxed = buf.into_boxed_slice();
+                let len = boxed.len();
+                let ptr = Box::into_raw(boxed) as *mut u8;
+                *out_buf = ptr;
+                *out_len = len as i64;
+                return STOOLAP_OK;
+            }
+        };
+
+        let mut buf = Vec::with_capacity(4096);
+
+        // Write column count
+        let col_count = handle.column_names.len() as u32;
+        buf.extend_from_slice(&col_count.to_le_bytes());
+
+        // Write column names
+        for name in handle.column_names.iter() {
+            let name_bytes = name.to_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+        }
+
+        // Reserve space for row count (fill in later)
+        let row_count_offset = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut row_count: u32 = 0;
+
+        while rows_inner.advance() {
+            let row = rows_inner.current_row();
+            for i in 0..col_count as usize {
+                match row.get(i) {
+                    None => {
+                        buf.push(0); // TYPE_NULL
+                    }
+                    Some(val) if val.is_null() => {
+                        buf.push(0); // TYPE_NULL
+                    }
+                    Some(val) => match val.data_type() {
+                        DataType::Null => {
+                            buf.push(0);
+                        }
+                        DataType::Integer => {
+                            buf.push(1);
+                            let v = val.as_int64().unwrap_or(0);
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                        DataType::Float => {
+                            buf.push(2);
+                            let v = val.as_float64().unwrap_or(0.0);
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                        DataType::Text => {
+                            buf.push(3);
+                            let s = val.as_str().unwrap_or("");
+                            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(s.as_bytes());
+                        }
+                        DataType::Boolean => {
+                            buf.push(4);
+                            buf.push(if val.as_boolean().unwrap_or(false) {
+                                1
+                            } else {
+                                0
+                            });
+                        }
+                        DataType::Timestamp => {
+                            buf.push(5);
+                            let nanos = val
+                                .as_timestamp()
+                                .map(|ts| ts.timestamp_nanos_opt().unwrap_or(0))
+                                .unwrap_or(0);
+                            buf.extend_from_slice(&nanos.to_le_bytes());
+                        }
+                        DataType::Json => {
+                            buf.push(6);
+                            let s = val.as_str().unwrap_or("");
+                            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(s.as_bytes());
+                        }
+                        DataType::Vector => {
+                            buf.push(7);
+                            if let Value::Extension(data) = val {
+                                if data.first() == Some(&(DataType::Vector as u8)) {
+                                    let payload = &data[1..];
+                                    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                                    buf.extend_from_slice(payload);
+                                } else {
+                                    buf.extend_from_slice(&0u32.to_le_bytes());
+                                }
+                            } else {
+                                buf.extend_from_slice(&0u32.to_le_bytes());
+                            }
+                        }
+                    },
+                }
+            }
+            row_count += 1;
+        }
+
+        // Fill in row count
+        buf[row_count_offset..row_count_offset + 4].copy_from_slice(&row_count.to_le_bytes());
+
+        // Transfer ownership to caller.
+        // into_boxed_slice guarantees len == capacity (unlike shrink_to_fit
+        // which is only a hint). This makes stoolap_buffer_free safe.
+        let boxed = buf.into_boxed_slice();
+        let len = boxed.len();
+        let ptr = Box::into_raw(boxed) as *mut u8;
+
+        *out_buf = ptr;
+        *out_len = len as i64;
+        STOOLAP_OK
+    }));
+
+    // Close rows handle after fetching
+    handle.rows = None;
+    handle.has_row = false;
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_rows_fetch_all");
+        STOOLAP_ERROR
+    })
+}
+
+/// Free a buffer allocated by `stoolap_rows_fetch_all()`.
+///
+/// # Safety
+///
+/// `buf` must be a pointer returned by `stoolap_rows_fetch_all`, or NULL.
+/// `len` must be the exact length returned alongside the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_buffer_free(buf: *mut u8, len: i64) {
+    if !buf.is_null() && len > 0 {
+        // The buffer was created via Box::into_raw(Vec::into_boxed_slice()),
+        // so len == capacity is guaranteed. Reconstruct and drop.
+        let _ = Vec::from_raw_parts(buf, len as usize, len as usize);
     }
 }
 

@@ -156,8 +156,8 @@ impl Parser {
                 statements.push(stmt);
             }
 
-            // Skip optional semicolon
-            if self.peek_token_is_punctuator(";") {
+            // Skip optional semicolons (handles trailing `;;` etc.)
+            while self.peek_token_is_punctuator(";") {
                 self.next_token();
             }
 

@@ -104,6 +104,14 @@ impl Statement {
 
                 if program.statements.len() == 1 {
                     let stmt = program.statements.pop().unwrap();
+                    // Reject bare expression statements — they indicate
+                    // unrecognised SQL (e.g. "SELECTX INVALID").
+                    if matches!(stmt, crate::parser::ast::Statement::Expression(_)) {
+                        return Err(Error::parse(format!(
+                            "invalid SQL: unrecognised statement: {}",
+                            sql
+                        )));
+                    }
                     let (has_params, param_count) = crate::executor::count_parameters(&stmt);
                     let stmt_arc = Arc::new(stmt);
                     let cached =
@@ -112,6 +120,16 @@ impl Statement {
                             .put(&sql, stmt_arc, has_params, param_count);
                     Some(cached)
                 } else {
+                    // Reject if any statement is a bare expression
+                    // (indicates unrecognised SQL tokens).
+                    for s in &program.statements {
+                        if matches!(s, crate::parser::ast::Statement::Expression(_)) {
+                            return Err(Error::parse(format!(
+                                "invalid SQL: unrecognised statement: {}",
+                                sql
+                            )));
+                        }
+                    }
                     // Multi-statement SQL: validated but not cacheable
                     None
                 }
