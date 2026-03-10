@@ -772,8 +772,9 @@ impl Executor {
                     column_sources.push(ColumnSource::AggColumn(id.value_lower.to_string()));
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    let name = format!("{}.{}", qid.qualifier.value, qid.name.value);
-                    final_columns.push(name.clone());
+                    // Use only the base column name (strip table alias prefix)
+                    // e.g., u.username -> username
+                    final_columns.push(qid.name.value.to_string());
                     // Try qualified name first, then fall back to unqualified column name
                     let qualified_lower =
                         format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);

@@ -4707,7 +4707,7 @@ impl Executor {
         let mut result: Box<dyn QueryResult> = result;
         if let Some(ref where_clause) = stmt.where_clause {
             let filter_expr = where_clause.as_ref().clone();
-            result = Box::new(FilteredResult::with_defaults(result, filter_expr));
+            result = Box::new(FilteredResult::with_defaults(result, filter_expr)?);
         }
 
         // Handle aggregation: if outer query has aggregates, materialize view result and aggregate
@@ -4725,6 +4725,33 @@ impl Executor {
                 self.execute_select_with_aggregation(stmt, ctx, rows, &view_columns)?;
             let columns = CompactArc::new(agg_result.columns().to_vec());
             return Ok((agg_result, columns, false, None));
+        }
+
+        // Handle window functions: materialize view result and delegate
+        if classification.has_window_functions {
+            let mut rows = RowVec::with_capacity(64);
+            let mut idx = 0i64;
+            while result.next() {
+                rows.push((idx, result.take_row()));
+                idx += 1;
+            }
+
+            if classification.has_aggregation {
+                // Aggregation + window functions: aggregate first, then apply window functions
+                let agg_result =
+                    self.execute_aggregation_for_window(stmt, ctx, &rows, &view_columns)?;
+                let agg_columns = agg_result.0.clone();
+                let agg_rows = agg_result.1;
+                let result =
+                    self.execute_select_with_window_functions(stmt, ctx, &agg_rows, &agg_columns)?;
+                let columns = CompactArc::new(result.columns().to_vec());
+                return Ok((result, columns, false, None));
+            }
+
+            let result =
+                self.execute_select_with_window_functions(stmt, ctx, &rows, &view_columns)?;
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, None));
         }
 
         // Handle projection: apply outer query's column selection
@@ -4861,7 +4888,7 @@ impl Executor {
                 result,
                 stmt.columns.clone(),
                 final_output_columns.clone(),
-            ))
+            )?)
         } else {
             // Simple column references only: use fast StreamingProjectionResult
             Box::new(StreamingProjectionResult::new(

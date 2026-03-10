@@ -485,20 +485,16 @@ impl FilteredResult {
     }
 
     /// Create with default function registry (static lifetime)
-    ///
-    /// This is a convenience method that panics on compilation errors.
-    /// For fallible construction, use `new()` instead.
-    pub fn with_defaults(inner: Box<dyn QueryResult>, filter_expr: Expression) -> Self {
+    pub fn with_defaults(inner: Box<dyn QueryResult>, filter_expr: Expression) -> Result<Self> {
         let columns = inner.columns().to_vec();
-        let filter =
-            RowFilter::new(&filter_expr, &columns).expect("Failed to compile filter expression");
+        let filter = RowFilter::new(&filter_expr, &columns)?;
 
-        Self {
+        Ok(Self {
             inner,
             filter,
             current_row: None,
             columns,
-        }
+        })
     }
 }
 
@@ -660,16 +656,12 @@ impl ExprMappedResult {
     }
 
     /// Create with default function registry (static lifetime)
-    ///
-    /// This is a convenience method that panics on compilation errors.
-    /// For fallible construction, use `new()` instead.
     pub fn with_defaults(
         inner: Box<dyn QueryResult>,
         expressions: Vec<Expression>,
         output_columns: Vec<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new(inner, expressions, output_columns)
-            .expect("Failed to compile projection expressions")
     }
 }
 
@@ -2015,7 +2007,7 @@ mod tests {
             })),
         });
 
-        let mut result = FilteredResult::with_defaults(inner, filter_expr);
+        let mut result = FilteredResult::with_defaults(inner, filter_expr).unwrap();
 
         // Should get rows with value 20 and 30
         assert!(result.next());
