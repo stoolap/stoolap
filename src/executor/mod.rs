@@ -656,6 +656,28 @@ impl Executor {
         }
     }
 
+    /// Install an external storage transaction as the active transaction.
+    ///
+    /// Used by the programmatic Transaction API to delegate SELECT queries
+    /// to the full executor pipeline (aggregates, JOINs, window functions, etc.)
+    /// while keeping the transaction's uncommitted changes visible.
+    pub fn install_transaction(&self, tx: Box<dyn Transaction>) {
+        let mut active_tx = self.active_transaction.lock().unwrap();
+        *active_tx = Some(ActiveTransaction {
+            transaction: tx,
+            tables: FxHashMap::default(),
+        });
+    }
+
+    /// Take back the storage transaction from the active transaction slot.
+    ///
+    /// Returns the transaction so the caller can continue using it for
+    /// further DML operations after the SELECT delegation completes.
+    pub fn take_transaction(&self) -> Option<Box<dyn Transaction>> {
+        let mut active_tx = self.active_transaction.lock().unwrap();
+        active_tx.take().map(|at| at.transaction)
+    }
+
     /// Begin a new transaction
     pub fn begin_transaction(&self) -> Result<Box<dyn Transaction>> {
         self.engine.begin_transaction()

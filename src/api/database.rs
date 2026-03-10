@@ -906,7 +906,8 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let tx = executor.begin_transaction_with_isolation(isolation)?;
-        Ok(Transaction::new(tx))
+        let engine = executor.engine().clone();
+        Ok(Transaction::new(tx, engine))
     }
 
     /// Get the underlying storage engine
