@@ -155,18 +155,9 @@ required-features = ["ann-benchmark"]
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 opt-level = 3
 debug = true  # Enable debug symbols for profiling
-
-# Release profile for the C FFI shared library.
-# Inherits all release settings but uses panic = "unwind" so that
-# catch_unwind() can turn panics into STOOLAP_ERROR instead of aborting
-# the host process.
-# Build:  cargo build --profile release-ffi --features ffi
-[profile.release-ffi]
-inherits = "release"
-panic = "unwind"
 
 [[bench]]
 name = "select_by_id"

@@ -11,7 +11,7 @@ MCP ([Model Context Protocol](https://modelcontextprotocol.io)) server for Stool
 
 Works with any MCP-compatible AI client: Claude Desktop, Claude Code, Cursor, Windsurf, Cline, and others.
 
-The server provides 30 tools, 1 resource, and 1 prompt. On connection, it sends built-in instructions so the AI can write correct Stoolap SQL from the first query.
+The server provides 30 tools, 2 resources, and 1 prompt. On connection, it sends built-in instructions so the AI can write correct Stoolap SQL from the first query.
 
 ## Installation
 
@@ -162,12 +162,13 @@ The server exposes 30 tools organized into five categories.
 | URI | Description |
 |-----|-------------|
 | `stoolap://schema` | Full database schema with all tables, views, columns, indexes, and DDL statements |
+| `stoolap://sql-reference` | Live database schema plus complete Stoolap SQL reference: data types, 130+ functions with signatures, operators, joins, indexes, window functions, CTEs, transactions, temporal queries, vector search, and known limitations |
 
 ## Prompts
 
 | Prompt | Description |
 |--------|-------------|
-| `sql-assistant` | Injects the live database schema and a complete Stoolap SQL reference. Provides deeper detail than the auto-injected instructions. |
+| `sql-assistant` | Same content as `stoolap://sql-reference` delivered as an MCP prompt. Use whichever your client supports. |
 
 ## Auto-injected Instructions
 
