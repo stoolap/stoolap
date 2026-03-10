@@ -31,7 +31,7 @@ docs/
 │   └── post.html             # Blog post
 ├── _docs/                    # 55 documentation pages in 8 categories
 │   ├── getting-started/      # Installation, quickstart, API reference
-│   ├── drivers/              # Node.js, Python, and WASM integrations
+│   ├── drivers/              # Node.js, Python, PHP, WASM, and C integrations
 │   ├── architecture/         # MVCC, storage engine, indexes, persistence
 │   ├── data-types/           # Types overview, date/time, JSON
 │   ├── sql-commands/         # SQL reference, SHOW, PRAGMA, DESCRIBE

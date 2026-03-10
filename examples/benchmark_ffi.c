@@ -569,7 +569,7 @@ int main(void) {
     print_result("Complex JOIN+GROUP+HAVING", elapsed, 20);
     stoolap_stmt_finalize(stmt);
 
-    /* ── Batch INSERT in transaction (prepared stmt + SQL BEGIN/COMMIT, matches Rust) ── */
+    /* ── Batch INSERT in transaction (prepared stmt + tx handle) ── */
     {
         StoolapStmt* batch_stmt = NULL;
         rc = stoolap_prepare(db,
@@ -580,7 +580,9 @@ int main(void) {
         t0 = now_nanos();
         for (i = 0; i < ITERATIONS; i++) {
             int64_t base_id = (int64_t)(ROW_COUNT * 10 + i * 100);
-            stoolap_exec(db, "BEGIN", NULL);
+            StoolapTx* tx = NULL;
+            rc = stoolap_begin(db, &tx);
+            CHECK(rc, "begin batch tx");
             int j;
             for (j = 0; j < 100; j++) {
                 StoolapValue p[5] = {
@@ -590,9 +592,14 @@ int main(void) {
                     { .value_type = STOOLAP_TYPE_TEXT, 0, { .text = { "pending", 7 } } },
                     { .value_type = STOOLAP_TYPE_TEXT, 0, { .text = { "2024-02-01", 10 } } },
                 };
-                stoolap_stmt_exec(batch_stmt, p, 5, NULL);
+                rc = stoolap_tx_stmt_exec(tx, batch_stmt, p, 5, NULL);
+                CHECK_TX(rc, tx, "batch insert row");
             }
-            stoolap_exec(db, "COMMIT", NULL);
+            rc = stoolap_tx_commit(tx);
+            if (rc != STOOLAP_OK) {
+                fprintf(stderr, "FATAL: batch commit failed\n");
+                exit(1);
+            }
         }
         elapsed = now_nanos() - t0;
         print_result("Batch INSERT (100 rows)", elapsed, ITERATIONS);

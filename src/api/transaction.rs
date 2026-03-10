@@ -129,6 +129,23 @@ impl Transaction {
         Ok(result.rows_affected())
     }
 
+    /// Query using a pre-parsed statement with parameters.
+    ///
+    /// Avoids re-parsing SQL on every call — ideal for batch read operations
+    /// where the same query is executed many times with different params.
+    pub fn query_prepared<P: Params>(&mut self, statement: &Statement, params: P) -> Result<Rows> {
+        self.check_active()?;
+
+        let param_values = params.into_params();
+        let ctx = if param_values.is_empty() {
+            ExecutionContext::new()
+        } else {
+            ExecutionContext::with_params(param_values)
+        };
+        let result = self.execute_statement(statement, &ctx)?;
+        Ok(Rows::new(result))
+    }
+
     /// Execute a query within the transaction
     ///
     /// # Examples

@@ -343,6 +343,46 @@ int32_t stoolap_tx_query_params(
 );
 
 /**
+ * Execute a prepared statement within a transaction (with parameters).
+ *
+ * Combines parse-once performance with transaction atomicity.
+ * The statement must have been created via stoolap_prepare().
+ *
+ * @param tx             Transaction handle.
+ * @param stmt           Prepared statement handle (not consumed).
+ * @param params         Array of parameter values. May be NULL if params_len is 0.
+ * @param params_len     Number of parameters.
+ * @param rows_affected  If non-NULL, receives the number of affected rows.
+ */
+int32_t stoolap_tx_stmt_exec(
+    StoolapTx* tx,
+    const StoolapStmt* stmt,
+    const StoolapValue* params,
+    int32_t params_len,
+    int64_t* rows_affected
+);
+
+/**
+ * Query using a prepared statement within a transaction (with parameters).
+ *
+ * Combines parse-once performance with transaction atomicity.
+ * On success, *out_rows must be closed with stoolap_rows_close().
+ *
+ * @param tx          Transaction handle.
+ * @param stmt        Prepared statement handle (not consumed).
+ * @param params      Array of parameter values. May be NULL if params_len is 0.
+ * @param params_len  Number of parameters.
+ * @param out_rows    On success, receives the result set handle.
+ */
+int32_t stoolap_tx_stmt_query(
+    StoolapTx* tx,
+    const StoolapStmt* stmt,
+    const StoolapValue* params,
+    int32_t params_len,
+    StoolapRows** out_rows
+);
+
+/**
  * Commit a transaction.
  * The tx handle is consumed (freed) regardless of success or failure.
  */

@@ -344,19 +344,24 @@ Transactions auto-rollback on drop if not committed.
 For batch operations, parse SQL once and execute many times within a transaction.
 
 ```rust
-use stoolap::parser::Parser;
-
-let stmt = Parser::new("INSERT INTO users VALUES ($1, $2, $3)")
-    .parse_program()?
-    .statements
-    .into_iter()
-    .next()
-    .unwrap();
+// Prepare once (via Database)
+let insert = db.prepare("INSERT INTO users VALUES ($1, $2, $3)")?;
 
 let mut tx = db.begin()?;
 for (id, name, age) in data {
-    tx.execute_prepared(&stmt, (id, name, age))?;
+    tx.execute_prepared(&insert, (id, name, age))?;
 }
+tx.commit()?;
+```
+
+Query with a prepared statement inside a transaction:
+
+```rust
+let lookup = db.prepare("SELECT * FROM users WHERE id = $1")?;
+
+let mut tx = db.begin()?;
+// Reads within the transaction see uncommitted changes
+let rows = tx.query_prepared(&lookup, (42,))?;
 tx.commit()?;
 ```
 
@@ -669,6 +674,7 @@ fn main() -> Result<()> {
 | `execute_named(sql, params)` | `Result<i64>` | Execute with named params |
 | `query_named(sql, params)` | `Result<Rows>` | Query with named params |
 | `execute_prepared(stmt, params)` | `Result<i64>` | Execute pre-parsed statement |
+| `query_prepared(stmt, params)` | `Result<Rows>` | Query with pre-parsed statement |
 | `commit()` | `Result<()>` | Commit |
 | `rollback()` | `Result<()>` | Rollback |
 | `id()` | `i64` | Transaction ID |

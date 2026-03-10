@@ -25,6 +25,21 @@ fn main() {
         }
     }
 
+    // Set dylib version on macOS (current_version and compatibility_version)
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "macos" {
+        let version = env!("CARGO_PKG_VERSION");
+        // compatibility_version: minor-level (consumers linked against 0.3.x work with any 0.3.y)
+        let parts: Vec<&str> = version.split('.').collect();
+        let compat = if parts.len() >= 2 {
+            format!("{}.{}.0", parts[0], parts[1])
+        } else {
+            version.to_string()
+        };
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-current_version,{version}");
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-compatibility_version,{compat}");
+    }
+
     // Only re-run if HEAD changes or env var is set
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads/");

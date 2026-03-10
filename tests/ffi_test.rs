@@ -2568,3 +2568,256 @@ fn test_ffi_count_empty_table() {
         stoolap_close(db);
     }
 }
+
+// =========================================================================
+// Transaction + prepared statement (stoolap_tx_stmt_exec / _query)
+// =========================================================================
+
+#[test]
+fn test_tx_stmt_exec_insert_commit() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open_in_memory(&mut db), STOOLAP_OK);
+
+        let create = cstr("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price FLOAT)");
+        stoolap_exec(db, create.as_ptr(), std::ptr::null_mut());
+
+        // Prepare insert statement
+        let insert_sql = cstr("INSERT INTO items VALUES ($1, $2, $3)");
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(
+            stoolap_prepare(db, insert_sql.as_ptr(), &mut stmt),
+            STOOLAP_OK
+        );
+
+        // Begin transaction
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+
+        // Insert 3 rows using prepared statement within transaction
+        for (id, name, price) in [
+            (1i64, "Widget", 9.99),
+            (2, "Gadget", 19.99),
+            (3, "Doohickey", 4.99),
+        ] {
+            let name_c = cstr(name);
+            let params = [
+                StoolapValue {
+                    value_type: STOOLAP_TYPE_INTEGER,
+                    _padding: 0,
+                    v: StoolapValueData { integer: id },
+                },
+                StoolapValue {
+                    value_type: STOOLAP_TYPE_TEXT,
+                    _padding: 0,
+                    v: StoolapValueData {
+                        text: StoolapTextData {
+                            ptr: name_c.as_ptr(),
+                            len: name.len() as i64,
+                        },
+                    },
+                },
+                StoolapValue {
+                    value_type: STOOLAP_TYPE_FLOAT,
+                    _padding: 0,
+                    v: StoolapValueData { float64: price },
+                },
+            ];
+            let mut affected: i64 = 0;
+            assert_eq!(
+                stoolap_tx_stmt_exec(tx, stmt, params.as_ptr(), 3, &mut affected),
+                STOOLAP_OK,
+                "tx_stmt_exec failed: {}",
+                read_cstr(stoolap_tx_errmsg(tx))
+            );
+            assert_eq!(affected, 1);
+        }
+
+        // Commit
+        assert_eq!(stoolap_tx_commit(tx), STOOLAP_OK);
+
+        // Verify all 3 rows are visible after commit
+        let count = query_single_int(db, "SELECT COUNT(*) FROM items");
+        assert_eq!(count, 3);
+
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_tx_stmt_exec_insert_rollback() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open_in_memory(&mut db), STOOLAP_OK);
+
+        let create = cstr("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)");
+        stoolap_exec(db, create.as_ptr(), std::ptr::null_mut());
+
+        // Insert one row outside the transaction
+        let seed = cstr("INSERT INTO items VALUES (0, 'seed')");
+        stoolap_exec(db, seed.as_ptr(), std::ptr::null_mut());
+
+        // Prepare insert
+        let insert_sql = cstr("INSERT INTO items VALUES ($1, $2)");
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(
+            stoolap_prepare(db, insert_sql.as_ptr(), &mut stmt),
+            STOOLAP_OK
+        );
+
+        // Begin transaction, insert 2 rows, rollback
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+
+        for (id, name) in [(1i64, "A"), (2, "B")] {
+            let name_c = cstr(name);
+            let params = [
+                StoolapValue {
+                    value_type: STOOLAP_TYPE_INTEGER,
+                    _padding: 0,
+                    v: StoolapValueData { integer: id },
+                },
+                StoolapValue {
+                    value_type: STOOLAP_TYPE_TEXT,
+                    _padding: 0,
+                    v: StoolapValueData {
+                        text: StoolapTextData {
+                            ptr: name_c.as_ptr(),
+                            len: name.len() as i64,
+                        },
+                    },
+                },
+            ];
+            assert_eq!(
+                stoolap_tx_stmt_exec(tx, stmt, params.as_ptr(), 2, std::ptr::null_mut()),
+                STOOLAP_OK
+            );
+        }
+
+        // Rollback — the 2 inserts should be undone
+        assert_eq!(stoolap_tx_rollback(tx), STOOLAP_OK);
+
+        // Only the seed row should remain
+        let count = query_single_int(db, "SELECT COUNT(*) FROM items");
+        assert_eq!(count, 1);
+
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_tx_stmt_query() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open_in_memory(&mut db), STOOLAP_OK);
+
+        let create = cstr("CREATE TABLE kv (k INTEGER PRIMARY KEY, val TEXT)");
+        stoolap_exec(db, create.as_ptr(), std::ptr::null_mut());
+        let seed = cstr("INSERT INTO kv VALUES (1, 'one'), (2, 'two'), (3, 'three')");
+        stoolap_exec(db, seed.as_ptr(), std::ptr::null_mut());
+
+        // Prepare a query
+        let query_sql = cstr("SELECT val FROM kv WHERE k = $1");
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        let rc = stoolap_prepare(db, query_sql.as_ptr(), &mut stmt);
+        assert_eq!(
+            rc,
+            STOOLAP_OK,
+            "prepare failed: {}",
+            read_cstr(stoolap_errmsg(db))
+        );
+
+        // Begin transaction
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+
+        // Insert a row within the transaction
+        let insert = cstr("INSERT INTO kv VALUES (4, 'four')");
+        stoolap_tx_exec(tx, insert.as_ptr(), std::ptr::null_mut());
+
+        // Query using prepared statement within transaction — should see uncommitted row
+        let params = [StoolapValue {
+            value_type: STOOLAP_TYPE_INTEGER,
+            _padding: 0,
+            v: StoolapValueData { integer: 4 },
+        }];
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(
+            stoolap_tx_stmt_query(tx, stmt, params.as_ptr(), 1, &mut rows),
+            STOOLAP_OK,
+            "tx_stmt_query failed: {}",
+            read_cstr(stoolap_tx_errmsg(tx))
+        );
+
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_ROW);
+        let val = read_cstr(stoolap_rows_column_text(rows, 0, std::ptr::null_mut()));
+        assert_eq!(val, "four");
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_DONE);
+        stoolap_rows_close(rows);
+
+        stoolap_tx_commit(tx);
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_tx_stmt_exec_batch_performance() {
+    // Verifies that prepared statement + transaction gives correct results
+    // for a larger batch (the original use case from benchmark_ffi.c)
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open_in_memory(&mut db), STOOLAP_OK);
+
+        let create = cstr("CREATE TABLE bench (id INTEGER PRIMARY KEY, val INTEGER)");
+        stoolap_exec(db, create.as_ptr(), std::ptr::null_mut());
+
+        let insert_sql = cstr("INSERT INTO bench VALUES ($1, $2)");
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(
+            stoolap_prepare(db, insert_sql.as_ptr(), &mut stmt),
+            STOOLAP_OK
+        );
+
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+
+        let n = 1000;
+        for i in 0..n {
+            let params = [
+                StoolapValue {
+                    value_type: STOOLAP_TYPE_INTEGER,
+                    _padding: 0,
+                    v: StoolapValueData { integer: i },
+                },
+                StoolapValue {
+                    value_type: STOOLAP_TYPE_INTEGER,
+                    _padding: 0,
+                    v: StoolapValueData { integer: i * 10 },
+                },
+            ];
+            let rc = stoolap_tx_stmt_exec(tx, stmt, params.as_ptr(), 2, std::ptr::null_mut());
+            assert_eq!(
+                rc,
+                STOOLAP_OK,
+                "insert {} failed: {}",
+                i,
+                read_cstr(stoolap_tx_errmsg(tx))
+            );
+        }
+
+        assert_eq!(stoolap_tx_commit(tx), STOOLAP_OK);
+
+        let count = query_single_int(db, "SELECT COUNT(*) FROM bench");
+        assert_eq!(count, n);
+
+        let sum = query_single_int(db, "SELECT SUM(val) FROM bench");
+        // sum of i*10 for i=0..999 = 10 * (999*1000/2) = 4995000
+        assert_eq!(sum, 4_995_000);
+
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}

@@ -2,7 +2,7 @@
 layout: doc
 title: C API (FFI)
 category: Drivers
-order: 4
+order: 5
 ---
 
 # C API (FFI)
@@ -346,6 +346,51 @@ stoolap_tx_exec_params(tx, "INSERT INTO t VALUES ($1, $2)", params, 2, NULL);
 stoolap_tx_commit(tx);
 ```
 
+### Prepared Statements in Transactions
+
+Use `stoolap_tx_stmt_exec()` and `stoolap_tx_stmt_query()` to execute a prepared statement within a transaction. This gives both parse-once performance and transactional atomicity (all-or-nothing commit/rollback).
+
+**Important**: Do not use `stoolap_stmt_exec()` inside a transaction block. It creates its own standalone auto-committing transaction per call, so rollback will not undo those operations.
+
+```c
+StoolapStmt* stmt = NULL;
+stoolap_prepare(db, "INSERT INTO orders VALUES ($1, $2, $3)", &stmt);
+
+StoolapTx* tx = NULL;
+stoolap_begin(db, &tx);
+
+for (int i = 0; i < 1000; i++) {
+    StoolapValue params[3] = {
+        { .value_type = STOOLAP_TYPE_INTEGER, 0, { .integer = i } },
+        { .value_type = STOOLAP_TYPE_INTEGER, 0, { .integer = 1 } },
+        { .value_type = STOOLAP_TYPE_FLOAT,   0, { .float64 = 99.99 } },
+    };
+    stoolap_tx_stmt_exec(tx, stmt, params, 3, NULL);
+}
+
+stoolap_tx_commit(tx);   /* all 1000 rows committed atomically */
+stoolap_stmt_finalize(stmt);
+```
+
+Queries work the same way:
+
+```c
+StoolapStmt* lookup = NULL;
+stoolap_prepare(db, "SELECT name FROM users WHERE id = $1", &lookup);
+
+StoolapTx* tx = NULL;
+stoolap_begin(db, &tx);
+
+StoolapValue p = { .value_type = STOOLAP_TYPE_INTEGER, 0, { .integer = 42 } };
+StoolapRows* rows = NULL;
+stoolap_tx_stmt_query(tx, lookup, &p, 1, &rows);
+/* ... iterate rows ... */
+stoolap_rows_close(rows);
+
+stoolap_tx_commit(tx);
+stoolap_stmt_finalize(lookup);
+```
+
 ### Transaction Functions
 
 | Function | Returns | Description |
@@ -356,6 +401,8 @@ stoolap_tx_commit(tx);
 | `stoolap_tx_exec_params(tx, sql, params, len, &affected)` | `int32_t` | Execute with params |
 | `stoolap_tx_query(tx, sql, &rows)` | `int32_t` | Query without params |
 | `stoolap_tx_query_params(tx, sql, params, len, &rows)` | `int32_t` | Query with params |
+| `stoolap_tx_stmt_exec(tx, stmt, params, len, &affected)` | `int32_t` | Execute prepared statement in transaction |
+| `stoolap_tx_stmt_query(tx, stmt, params, len, &rows)` | `int32_t` | Query with prepared statement in transaction |
 | `stoolap_tx_commit(tx)` | `int32_t` | Commit and free handle |
 | `stoolap_tx_rollback(tx)` | `int32_t` | Rollback and free handle |
 | `stoolap_tx_errmsg(tx)` | `const char*` | Last error message |
@@ -611,6 +658,8 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 | `stoolap_tx_exec_params(tx, sql, params, len, &affected)` | `int32_t` | Execute with parameters in transaction |
 | `stoolap_tx_query(tx, sql, &rows)` | `int32_t` | Query in transaction |
 | `stoolap_tx_query_params(tx, sql, params, len, &rows)` | `int32_t` | Query with parameters in transaction |
+| `stoolap_tx_stmt_exec(tx, stmt, params, len, &affected)` | `int32_t` | Execute prepared statement in transaction |
+| `stoolap_tx_stmt_query(tx, stmt, params, len, &rows)` | `int32_t` | Query with prepared statement in transaction |
 | `stoolap_tx_commit(tx)` | `int32_t` | Commit and free handle |
 | `stoolap_tx_rollback(tx)` | `int32_t` | Rollback and free handle |
 | `stoolap_tx_errmsg(tx)` | `const char*` | Last error message |
