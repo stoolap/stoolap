@@ -24,8 +24,11 @@ Go driver for Stoolap built on the Rust engine via C FFI (cgo). Provides two way
 go get github.com/stoolap/stoolap-go
 ```
 
-Prebuilt static libraries for macOS (arm64), Linux (x64), and Windows (x64) are bundled
-in the module. No extra downloads or environment variables needed.
+Prebuilt shared libraries for macOS (arm64), Linux (x64), and Windows (x64) are bundled
+in the module. No extra downloads or environment variables needed, just `go get` and build.
+
+The compiled Go binary dynamically links against `libstoolap`. For deployment, place the
+shared library next to your executable or in a system library path.
 
 ### Other Platforms
 
@@ -68,8 +71,9 @@ func main() {
     defer rows.Close()
 
     for rows.Next() {
-        var id, age int64
+        var id int64
         var name string
+        var age int64
         rows.Scan(&id, &name, &age)
         fmt.Printf("id=%d name=%s age=%d\n", id, name, age)
     }
@@ -105,8 +109,9 @@ func main() {
     defer rows.Close()
 
     for rows.Next() {
-        var id, age int64
+        var id int64
         var name string
+        var age int64
         rows.Scan(&id, &name, &age)
         fmt.Printf("id=%d name=%s age=%d\n", id, name, age)
     }
@@ -216,9 +221,15 @@ for i := int64(1); i <= 1000; i++ {
 
 ### Prepared Statements in Transactions
 
-For transactional atomicity with parse-once performance, prepare statements via `Tx.Prepare()`. This ensures all operations participate in the transaction's commit/rollback.
+For transactional atomicity with parse-once performance, prepare statements via `Tx.Prepare()`. This uses `stoolap_tx_stmt_exec`/`stoolap_tx_stmt_query` internally, ensuring all operations participate in the transaction's commit/rollback.
 
 ```go
+stmt, err := db.Prepare("INSERT INTO orders VALUES ($1, $2, $3)")
+if err != nil {
+    panic(err)
+}
+defer stmt.Close()
+
 tx, err := db.Begin()
 if err != nil {
     panic(err)
@@ -265,6 +276,19 @@ if name.Valid {
     fmt.Println("Name:", name.String)
 } else {
     fmt.Println("Name is NULL")
+}
+```
+
+## Scanning into `any`
+
+```go
+rows, _ := db.Query(ctx, "SELECT id, name, age FROM users")
+defer rows.Close()
+
+for rows.Next() {
+    var id, name, age any
+    rows.Scan(&id, &name, &age)
+    fmt.Printf("id=%v name=%v age=%v\n", id, name, age)
 }
 ```
 
@@ -369,7 +393,7 @@ The `database/sql` driver handles this automatically. Each connection in the poo
 | BOOLEAN | `bool` | `sql.NullBool` |
 | TIMESTAMP | `time.Time` | `sql.NullTime` |
 | JSON | `string` | `sql.NullString` |
-| VECTOR | `[]byte` | `[]byte` (nil for NULL) |
+| VECTOR/BLOB | `[]byte` | `[]byte` (nil for NULL) |
 
 Scan supports type coercion: INTEGER columns can scan into `*string`, FLOAT into `*int64`, etc.
 
