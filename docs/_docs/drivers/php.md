@@ -16,8 +16,8 @@ High-performance PHP driver for Stoolap. Built as a native PHP extension (C) for
 Download a package matching your PHP version and platform from [GitHub Releases](https://github.com/stoolap/stoolap-php/releases). Each archive contains both the PHP extension and the stoolap library.
 
 ```bash
-tar xzf stoolap-v0.3.4-php8.4-linux-x86_64.tar.gz
-cd stoolap-v0.3.4-php8.4-linux-x86_64
+tar xzf stoolap-v0.3.5-php8.4-linux-x86_64.tar.gz
+cd stoolap-v0.3.5-php8.4-linux-x86_64
 
 # Install the shared library
 sudo cp libstoolap.so /usr/local/lib/

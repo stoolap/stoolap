@@ -112,7 +112,7 @@ typedef struct StoolapValue {
  * ========================================================================= */
 
 /**
- * Returns the stoolap version string (e.g. "0.3.4").
+ * Returns the stoolap version string (e.g. "0.3.5").
  * The returned pointer is static and must NOT be freed.
  */
 const char* stoolap_version(void);
