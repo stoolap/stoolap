@@ -152,12 +152,22 @@ required-features = ["semantic"]
 name = "ann_benchmark"
 required-features = ["ann-benchmark"]
 
+[profile.dev]
+debug = "line-tables-only"       # Faster incremental builds, keeps file:line backtraces
+split-debuginfo = "unpacked"     # Faster incremental linking on macOS
+
 [profile.release]
-lto = true
+lto = "thin"
 codegen-units = 1
-panic = "unwind"
+panic = "abort"
 opt-level = 3
-debug = true  # Enable debug symbols for profiling
+debug = "line-tables-only"  # Backtraces with file:line, skip variable info
+
+# Maximum optimization profile (for published binaries / benchmarks)
+[profile.max]
+inherits = "release"
+lto = true            # Fat LTO for maximum runtime performance
+debug = false
 
 [[bench]]
 name = "select_by_id"
@@ -184,13 +194,12 @@ name = "delete_complex"
 harness = false
 
 [profile.bench]
-lto = true
+lto = "thin"
 codegen-units = 1
 
 # CI test profile: faster compile, less disk usage
 [profile.ci]
 inherits = "release"
-lto = "thin"          # Much faster than full LTO
 codegen-units = 16    # Parallel codegen
 debug = false         # No debug symbols needed for tests
 

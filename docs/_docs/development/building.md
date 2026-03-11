@@ -96,11 +96,17 @@ The release profile is configured for maximum performance:
 
 ```toml
 [profile.release]
-lto = true           # Full Link-Time Optimization
-codegen-units = 1    # Single codegen unit for better optimization
-panic = "unwind"     # Unwind on panic (required for FFI catch_unwind)
-opt-level = 3        # Maximum optimization
-debug = true         # Debug symbols for profiling
+lto = "thin"              # Thin LTO (95-100% of fat LTO perf, much faster compile)
+codegen-units = 1         # Single codegen unit for better optimization
+panic = "abort"           # Abort on panic (maximum performance)
+opt-level = 3             # Maximum optimization
+debug = "line-tables-only"  # File:line backtraces without full debug info
+```
+
+For maximum runtime performance (published binaries), use the `max` profile:
+
+```bash
+cargo build --profile max
 ```
 
 ## WebAssembly Build

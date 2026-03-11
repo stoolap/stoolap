@@ -269,42 +269,65 @@ impl FunctionRegistry {
     }
 
     /// Register an aggregate function
+    #[inline]
     pub fn register_aggregate<F: AggregateFunction + Default + 'static>(&self) {
         let instance = F::default();
-        let name = instance.name().to_uppercase();
-        let info = instance.info();
+        self.register_aggregate_inner(
+            instance.name().to_uppercase(),
+            instance.info(),
+            Arc::new(|| Box::new(F::default())),
+        );
+    }
 
-        let mut funcs = self.aggregate_functions.write().unwrap();
-        funcs.insert(name.clone(), Arc::new(|| Box::new(F::default())));
-
-        let mut infos = self.function_info.write().unwrap();
-        infos.insert(name, info);
+    fn register_aggregate_inner(
+        &self,
+        name: String,
+        info: FunctionInfo,
+        factory: AggregateFnFactory,
+    ) {
+        self.aggregate_functions
+            .write()
+            .unwrap()
+            .insert(name.clone(), factory);
+        self.function_info.write().unwrap().insert(name, info);
     }
 
     /// Register a scalar function
+    #[inline]
     pub fn register_scalar<F: ScalarFunction + Default + 'static>(&self) {
         let instance = F::default();
-        let name = instance.name().to_uppercase();
-        let info = instance.info();
+        self.register_scalar_inner(
+            instance.name().to_uppercase(),
+            instance.info(),
+            Arc::new(|| Box::new(F::default())),
+        );
+    }
 
-        let mut funcs = self.scalar_functions.write().unwrap();
-        funcs.insert(name.clone(), Arc::new(|| Box::new(F::default())));
-
-        let mut infos = self.function_info.write().unwrap();
-        infos.insert(name, info);
+    fn register_scalar_inner(&self, name: String, info: FunctionInfo, factory: ScalarFnFactory) {
+        self.scalar_functions
+            .write()
+            .unwrap()
+            .insert(name.clone(), factory);
+        self.function_info.write().unwrap().insert(name, info);
     }
 
     /// Register a window function
+    #[inline]
     pub fn register_window<F: WindowFunction + Default + 'static>(&self) {
         let instance = F::default();
-        let name = instance.name().to_uppercase();
-        let info = instance.info();
+        self.register_window_inner(
+            instance.name().to_uppercase(),
+            instance.info(),
+            Arc::new(|| Box::new(F::default())),
+        );
+    }
 
-        let mut funcs = self.window_functions.write().unwrap();
-        funcs.insert(name.clone(), Arc::new(|| Box::new(F::default())));
-
-        let mut infos = self.function_info.write().unwrap();
-        infos.insert(name, info);
+    fn register_window_inner(&self, name: String, info: FunctionInfo, factory: WindowFnFactory) {
+        self.window_functions
+            .write()
+            .unwrap()
+            .insert(name.clone(), factory);
+        self.function_info.write().unwrap().insert(name, info);
     }
 
     /// Get a new instance of an aggregate function by name
