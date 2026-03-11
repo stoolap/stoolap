@@ -273,9 +273,11 @@ impl Transaction {
     ) -> Result<Box<dyn QueryResult>> {
         use crate::executor::result::ExecResult;
 
-        // For SELECT, we delegate to the full executor pipeline.
+        // For SELECT and INSERT, delegate to the full executor pipeline.
+        // INSERT delegation is required for correct handling of partial column lists,
+        // default values, type coercion, RETURNING, ON DUPLICATE KEY, and FK validation.
         // Must handle before borrowing self.tx since we need to take ownership.
-        if matches!(statement, Statement::Select(_)) {
+        if matches!(statement, Statement::Select(_) | Statement::Insert(_)) {
             let tx = self.tx.take().ok_or(Error::TransactionNotStarted)?;
             let executor = Executor::new(self.engine.clone());
             executor.install_transaction(tx);
@@ -288,27 +290,6 @@ impl Transaction {
         let tx = self.tx.as_mut().ok_or(Error::TransactionNotStarted)?;
 
         match statement {
-            Statement::Insert(stmt) => {
-                let table_name = &stmt.table_name.value;
-                let mut table = tx.get_table(table_name)?;
-
-                let mut total_inserted = 0i64;
-
-                for row_values in &stmt.values {
-                    let mut values = Vec::with_capacity(row_values.len());
-                    for expr in row_values {
-                        // Use ExpressionEval for value expression evaluation
-                        let mut eval = ExpressionEval::compile(expr, &[])?.with_context(ctx);
-                        values.push(eval.eval_slice(&Row::new())?);
-                    }
-
-                    let row = Row::from_values(values);
-                    let _ = table.insert(row)?;
-                    total_inserted += 1;
-                }
-
-                Ok(Box::new(ExecResult::with_rows_affected(total_inserted)))
-            }
             Statement::Update(stmt) => {
                 use crate::executor::expression::{
                     compile_expression, ExecuteContext, ExprVM, RowFilter, SharedProgram,
@@ -419,7 +400,9 @@ impl Transaction {
                     deleted_count as i64,
                 )))
             }
-            Statement::Select(_) => unreachable!("SELECT handled above"),
+            Statement::Select(_) | Statement::Insert(_) => {
+                unreachable!("SELECT and INSERT handled above via executor delegation")
+            }
             _ => Err(Error::NotSupported(
                 "Only DML statements are supported in transactions".to_string(),
             )),

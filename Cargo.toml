@@ -15,7 +15,7 @@ categories = ["database", "database-implementations"]
 [lib]
 name = "stoolap"
 path = "src/lib.rs"
-crate-type = ["cdylib", "staticlib", "rlib"]
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "stoolap"

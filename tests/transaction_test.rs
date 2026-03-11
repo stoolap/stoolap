@@ -341,6 +341,93 @@ fn test_commit_without_begin() {
 }
 
 #[test]
+fn test_transaction_insert_partial_columns() {
+    // Regression test: transaction INSERT with partial column list (omitting AUTO_INCREMENT)
+    // Previously failed because the transaction path validated param count against total
+    // table columns instead of the columns specified in the INSERT statement.
+    let db = Database::open("memory://txn_partial_cols").expect("Failed to create database");
+
+    db.execute(
+        "CREATE TABLE customers (
+            id INTEGER PRIMARY KEY AUTO_INCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            country TEXT NOT NULL
+        )",
+        (),
+    )
+    .expect("Failed to create table");
+
+    // Non-transaction insert with partial columns (omitting id) - should work
+    db.execute(
+        "INSERT INTO customers (name, email, country) VALUES ('Alice', 'alice@example.com', 'US')",
+        (),
+    )
+    .expect("Non-transaction partial column insert should work");
+
+    // Transaction insert with partial columns (omitting id) - this was the bug
+    db.execute("BEGIN", ()).expect("Failed to begin");
+    db.execute(
+        "INSERT INTO customers (name, email, country) VALUES ('Bob', 'bob@example.com', 'UK')",
+        (),
+    )
+    .expect("Transaction partial column insert should work");
+    db.execute(
+        "INSERT INTO customers (name, email, country) VALUES ('Clara', 'clara@example.com', 'DE')",
+        (),
+    )
+    .expect("Second transaction insert should work");
+    db.execute("COMMIT", ()).expect("Failed to commit");
+
+    // Verify all 3 rows exist with auto-generated IDs
+    let count: i64 = db
+        .query_one("SELECT COUNT(*) FROM customers", ())
+        .expect("Failed to count");
+    assert_eq!(count, 3, "All 3 rows should be inserted");
+
+    // Verify auto-increment IDs are sequential
+    let max_id: i64 = db
+        .query_one("SELECT MAX(id) FROM customers", ())
+        .expect("Failed to get max id");
+    assert_eq!(max_id, 3, "Auto-increment IDs should be 1, 2, 3");
+}
+
+#[test]
+fn test_transaction_insert_with_defaults() {
+    // Verify transaction INSERT respects DEFAULT values
+    let db = Database::open("memory://txn_defaults").expect("Failed to create database");
+
+    db.execute(
+        "CREATE TABLE products (
+            id INTEGER PRIMARY KEY AUTO_INCREMENT,
+            name TEXT NOT NULL,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            category TEXT NOT NULL DEFAULT 'General'
+        )",
+        (),
+    )
+    .expect("Failed to create table");
+
+    db.execute("BEGIN", ()).expect("Failed to begin");
+    db.execute(
+        "INSERT INTO products (name) VALUES ('Widget')",
+        (),
+    )
+    .expect("Transaction insert with defaults should work");
+    db.execute("COMMIT", ()).expect("Failed to commit");
+
+    let category: String = db
+        .query_one("SELECT category FROM products WHERE name = 'Widget'", ())
+        .expect("Failed to query");
+    assert_eq!(category, "General", "Default value should be applied");
+
+    let active: bool = db
+        .query_one("SELECT is_active FROM products WHERE name = 'Widget'", ())
+        .expect("Failed to query");
+    assert!(active, "Default boolean should be true");
+}
+
+#[test]
 fn test_autocommit_mode() {
     let db = Database::open("memory://txn_autocommit").expect("Failed to create database");
 
