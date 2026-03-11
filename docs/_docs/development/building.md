@@ -84,7 +84,7 @@ cargo build --release --features mimalloc
 cargo build --release --features sqlite
 
 # C FFI shared library (libstoolap.so / .dylib / .dll)
-cargo build --profile release-ffi --features ffi
+cargo build --release --features ffi
 
 # Minimal build (no CLI, no parallel)
 cargo build --release --no-default-features
@@ -98,7 +98,7 @@ The release profile is configured for maximum performance:
 [profile.release]
 lto = true           # Full Link-Time Optimization
 codegen-units = 1    # Single codegen unit for better optimization
-panic = "abort"      # Abort on panic (smaller binaries)
+panic = "unwind"     # Unwind on panic (required for FFI catch_unwind)
 opt-level = 3        # Maximum optimization
 debug = true         # Debug symbols for profiling
 ```

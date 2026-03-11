@@ -17,7 +17,7 @@
 //! Provides a C API with opaque handles, step-based iteration,
 //! and per-handle error storage. Enable with `--features ffi`.
 //!
-//! Build: `cargo build --profile release-ffi --features ffi` produces `libstoolap.{so,dylib,dll}`
+//! Build: `cargo build --release --features ffi` produces `libstoolap.{so,dylib,dll}`
 
 mod database;
 mod error;

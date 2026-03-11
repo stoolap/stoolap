@@ -18,11 +18,11 @@
  * C FFI benchmark matching examples/benchmark.rs exactly.
  *
  * Build & run:
- *   cargo build --profile release-ffi --features ffi
+ *   cargo build --release --features ffi
  *   cc -O2 -o benchmark_ffi examples/benchmark_ffi.c \
- *      -I include -L target/release-ffi -lstoolap
- *   DYLD_LIBRARY_PATH=target/release-ffi ./benchmark_ffi      # macOS
- *   LD_LIBRARY_PATH=target/release-ffi ./benchmark_ffi         # Linux
+ *      -I include -L target/release -lstoolap
+ *   DYLD_LIBRARY_PATH=target/release ./benchmark_ffi      # macOS
+ *   LD_LIBRARY_PATH=target/release ./benchmark_ffi         # Linux
  */
 
 #include "stoolap.h"

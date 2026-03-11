@@ -12,28 +12,28 @@ C API for Stoolap with opaque handles, step-based result iteration, and per-hand
 ## Building
 
 ```bash
-cargo build --profile release-ffi --features ffi
+cargo build --release --features ffi
 ```
 
 This produces a shared library and a C header:
 
 | Platform | Library | Header |
 |----------|---------|--------|
-| Linux | `target/release-ffi/libstoolap.so` | `include/stoolap.h` |
-| macOS | `target/release-ffi/libstoolap.dylib` | `include/stoolap.h` |
-| Windows | `target/release-ffi/stoolap.dll` | `include/stoolap.h` |
+| Linux | `target/release/libstoolap.so` | `include/stoolap.h` |
+| macOS | `target/release/libstoolap.dylib` | `include/stoolap.h` |
+| Windows | `target/release/stoolap.dll` | `include/stoolap.h` |
 
 ## Linking
 
 ```bash
 # Compile and link
-cc -O2 -o myapp myapp.c -I include -L target/release-ffi -lstoolap
+cc -O2 -o myapp myapp.c -I include -L target/release -lstoolap
 
 # Run (set library path)
 # macOS:
-DYLD_LIBRARY_PATH=target/release-ffi ./myapp
+DYLD_LIBRARY_PATH=target/release ./myapp
 # Linux:
-LD_LIBRARY_PATH=target/release-ffi ./myapp
+LD_LIBRARY_PATH=target/release ./myapp
 ```
 
 For system-wide installation, copy the shared library to `/usr/local/lib` and the header to `/usr/local/include`, then run `ldconfig` (Linux) or no extra step (macOS).

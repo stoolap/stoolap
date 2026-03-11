@@ -21,7 +21,7 @@
  * C interface with opaque handles, step-based result iteration,
  * and per-handle error messages.
  *
- * Build: cargo build --profile release-ffi --features ffi
+ * Build: cargo build --release --features ffi
  * Link:  -lstoolap (libstoolap.so / libstoolap.dylib / stoolap.dll)
  */
 
