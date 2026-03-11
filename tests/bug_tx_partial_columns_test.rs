@@ -23,8 +23,7 @@ use stoolap::Database;
 
 #[test]
 fn test_reproduce_execute_batch_bug() {
-    let db =
-        Database::open("memory://reproduce_execute_batch").expect("Failed to create database");
+    let db = Database::open("memory://reproduce_execute_batch").expect("Failed to create database");
 
     // Step 1: Create tables (exact schema from reproduction)
     db.execute(
@@ -197,10 +196,7 @@ fn test_transaction_insert_default_values() {
     db.execute("COMMIT", ()).expect("Failed to commit");
 
     let active: bool = db
-        .query_one(
-            "SELECT is_active FROM products WHERE name = 'Widget'",
-            (),
-        )
+        .query_one("SELECT is_active FROM products WHERE name = 'Widget'", ())
         .expect("Failed to query");
     assert!(active, "DEFAULT TRUE should be applied for omitted column");
 }

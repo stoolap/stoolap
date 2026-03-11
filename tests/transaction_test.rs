@@ -409,11 +409,8 @@ fn test_transaction_insert_with_defaults() {
     .expect("Failed to create table");
 
     db.execute("BEGIN", ()).expect("Failed to begin");
-    db.execute(
-        "INSERT INTO products (name) VALUES ('Widget')",
-        (),
-    )
-    .expect("Transaction insert with defaults should work");
+    db.execute("INSERT INTO products (name) VALUES ('Widget')", ())
+        .expect("Transaction insert with defaults should work");
     db.execute("COMMIT", ()).expect("Failed to commit");
 
     let category: String = db
