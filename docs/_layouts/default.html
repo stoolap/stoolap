@@ -132,7 +132,7 @@
             <button class="docs-nav-toggle" aria-expanded="true" aria-controls="nav-{{ cat_id }}">{{ category.name }}</button>
             <ul id="nav-{{ cat_id }}">
               {% for doc in category_docs %}
-              <li><a href="{{ doc.url | relative_url }}" {% if page.url == doc.url %}aria-current="page"{% endif %}>{{ doc.title }}</a></li>
+              <li><a href="{{ doc.url | relative_url }}" {% if page.url == doc.url %}aria-current="page"{% endif %}>{% if doc.icon %}{% include driver-icons.html icon=doc.icon %}{% endif %}{{ doc.title }}</a></li>
               {% endfor %}
             </ul>
           </div>

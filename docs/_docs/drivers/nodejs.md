@@ -3,6 +3,7 @@ layout: doc
 title: Node.js Driver
 category: Drivers
 order: 1
+icon: nodejs
 ---
 
 # Node.js Driver

@@ -3,6 +3,7 @@ layout: doc
 title: Python Driver
 category: Drivers
 order: 2
+icon: python
 ---
 
 # Python Driver

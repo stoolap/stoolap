@@ -784,6 +784,30 @@ img {
   background-color: rgba(var(--color-primary-rgb), 0.12);
 }
 
+.driver-icon {
+  width: 1em;
+  height: 1em;
+  vertical-align: -0.125em;
+  margin-right: 0.4em;
+  flex-shrink: 0;
+}
+
+.docs-nav a:has(.driver-icon) {
+  display: flex;
+  align-items: center;
+}
+
+.doc-title-with-icon {
+  display: flex;
+  align-items: center;
+}
+
+.doc-title-with-icon .driver-icon {
+  width: 1.1em;
+  height: 1.1em;
+  margin-right: 0.35em;
+}
+
 /* ============================================
    Main Content
    ============================================ */

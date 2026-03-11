@@ -13,6 +13,22 @@ layout: default
     {{ content }}
   </div>
 
+  {% if page.icon %}
+  <template id="page-icon">{% include driver-icons.html icon=page.icon %}</template>
+  <script>
+  (function() {
+    var t = document.getElementById('page-icon');
+    var h = document.querySelector('.doc-content h1');
+    if (t && h) {
+      var icon = t.content.firstElementChild.cloneNode(true);
+      icon.classList.add('doc-heading-icon');
+      h.classList.add('doc-title-with-icon');
+      h.prepend(icon);
+    }
+  })();
+  </script>
+  {% endif %}
+
   <footer class="doc-footer">
     {% comment %}
     Build prev/next navigation within the same category, sorted by order

@@ -3,6 +3,7 @@ layout: doc
 title: C API (FFI)
 category: Drivers
 order: 6
+icon: c
 ---
 
 # C API (FFI)

@@ -3,6 +3,7 @@ layout: doc
 title: PHP Driver
 category: Drivers
 order: 3
+icon: php
 ---
 
 # PHP Driver

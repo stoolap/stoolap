@@ -241,6 +241,7 @@ impl Statement {
     /// Get the AST statement from the cached plan (if available).
     ///
     /// Returns `None` for multi-statement SQL which doesn't cache a plan.
+    #[cfg(feature = "ffi")]
     pub(crate) fn ast_statement(&self) -> Option<&Arc<crate::parser::ast::Statement>> {
         self.plan.as_ref().map(|p| &p.statement)
     }

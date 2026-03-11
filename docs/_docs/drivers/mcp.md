@@ -3,6 +3,7 @@ layout: doc
 title: MCP Server
 category: Drivers
 order: 7
+icon: mcp
 ---
 
 # MCP Server
