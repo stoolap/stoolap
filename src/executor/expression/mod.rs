@@ -42,11 +42,11 @@ mod ops;
 mod program;
 mod vm;
 
-pub use compiler::{CompileContext, CompileError, ExprCompiler};
+pub use compiler::{is_non_foldable_function, CompileContext, CompileError, ExprCompiler};
 pub use evaluator_bridge::{
     clear_program_cache, compile_expression, compile_expression_with_context,
-    compute_expression_hash, CompiledEvaluator, ExpressionEval, JoinFilter, MultiExpressionEval,
-    RowFilter, SharedProgram,
+    compute_expression_hash, try_eval_constant_expr, CompiledEvaluator, ExpressionEval, JoinFilter,
+    MultiExpressionEval, RowFilter, SharedProgram,
 };
 pub use ops::Op;
 pub use program::{Constant, Program};

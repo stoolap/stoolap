@@ -23,6 +23,16 @@ use super::parser::Parser;
 use super::precedence::Precedence;
 use super::token::{Token, TokenType};
 
+/// Parsed conflict clause (ON DUPLICATE KEY UPDATE or ON CONFLICT)
+#[derive(Default)]
+struct ConflictClause {
+    on_duplicate: bool,
+    update_columns: Vec<Identifier>,
+    update_expressions: Vec<Expression>,
+    do_nothing: bool,
+    conflict_target: Vec<Identifier>,
+}
+
 /// Keywords that cannot be used as implicit table aliases in FROM clauses.
 /// Shared by SimpleTableSource, FunctionTableSource, and ValuesTableSource parsing.
 const RESERVED_ALIAS_KEYWORDS: &[&str] = &[
@@ -428,7 +438,7 @@ impl Parser {
             return Some(Expression::Aliased(AliasedExpression {
                 token: self.cur_token.clone(),
                 expression: Box::new(expr),
-                alias: Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone()),
+                alias: self.cur_token_as_column_identifier(),
             }));
         }
 
@@ -899,6 +909,9 @@ impl Parser {
             self.next_token(); // consume SELECT (we're now on SELECT)
             let select_stmt = self.parse_select_statement()?;
 
+            // Check for ON DUPLICATE KEY UPDATE or ON CONFLICT
+            let conflict = self.parse_conflict_clause();
+
             // Parse optional RETURNING clause
             let returning = self.parse_returning_clause();
 
@@ -908,9 +921,11 @@ impl Parser {
                 columns,
                 values: Vec::new(),
                 select: Some(Box::new(select_stmt)),
-                on_duplicate: false,
-                update_columns: Vec::new(),
-                update_expressions: Vec::new(),
+                on_duplicate: conflict.on_duplicate,
+                update_columns: conflict.update_columns,
+                update_expressions: conflict.update_expressions,
+                do_nothing: conflict.do_nothing,
+                conflict_target: conflict.conflict_target,
                 returning,
             });
         }
@@ -931,6 +946,9 @@ impl Parser {
             // Attach the WITH clause to the SELECT
             select_stmt.with = Some(with_clause);
 
+            // Check for ON DUPLICATE KEY UPDATE or ON CONFLICT
+            let conflict = self.parse_conflict_clause();
+
             // Parse optional RETURNING clause
             let returning = self.parse_returning_clause();
 
@@ -940,9 +958,11 @@ impl Parser {
                 columns,
                 values: Vec::new(),
                 select: Some(Box::new(select_stmt)),
-                on_duplicate: false,
-                update_columns: Vec::new(),
-                update_expressions: Vec::new(),
+                on_duplicate: conflict.on_duplicate,
+                update_columns: conflict.update_columns,
+                update_expressions: conflict.update_expressions,
+                do_nothing: conflict.do_nothing,
+                conflict_target: conflict.conflict_target,
                 returning,
             });
         }
@@ -955,47 +975,8 @@ impl Parser {
         // Parse value lists
         let values = self.parse_value_lists()?;
 
-        // Check for ON DUPLICATE KEY UPDATE
-        let mut on_duplicate = false;
-        let mut update_columns = Vec::new();
-        let mut update_expressions = Vec::new();
-
-        if self.peek_token_is_keyword("ON") {
-            self.next_token(); // consume ON
-            if !self.expect_keyword("DUPLICATE") {
-                return None;
-            }
-            if !self.expect_keyword("KEY") {
-                return None;
-            }
-            if !self.expect_keyword("UPDATE") {
-                return None;
-            }
-
-            on_duplicate = true;
-
-            loop {
-                if !self.expect_peek(TokenType::Identifier) {
-                    return None;
-                }
-                let col = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
-                update_columns.push(col);
-
-                if !self.expect_peek(TokenType::Operator) || self.cur_token.literal != "=" {
-                    self.add_error(format!("expected '=' at {}", self.cur_token.position));
-                    return None;
-                }
-
-                self.next_token();
-                let expr = self.parse_expression(Precedence::Lowest)?;
-                update_expressions.push(expr);
-
-                if !self.peek_token_is_punctuator(",") {
-                    break;
-                }
-                self.next_token(); // consume comma
-            }
-        }
+        // Check for ON DUPLICATE KEY UPDATE or ON CONFLICT
+        let conflict = self.parse_conflict_clause();
 
         // Parse optional RETURNING clause
         let returning = self.parse_returning_clause();
@@ -1006,11 +987,139 @@ impl Parser {
             columns,
             values,
             select: None,
-            on_duplicate,
-            update_columns,
-            update_expressions,
+            on_duplicate: conflict.on_duplicate,
+            update_columns: conflict.update_columns,
+            update_expressions: conflict.update_expressions,
+            do_nothing: conflict.do_nothing,
+            conflict_target: conflict.conflict_target,
             returning,
         })
+    }
+
+    /// Parse conflict clause: ON DUPLICATE KEY UPDATE (MySQL) or ON CONFLICT (PostgreSQL)
+    /// Returns ConflictClause with all parsed fields.
+    fn parse_conflict_clause(&mut self) -> ConflictClause {
+        if !self.peek_token_is_keyword("ON") {
+            return ConflictClause::default();
+        }
+        self.next_token(); // consume ON
+
+        // Determine MySQL vs PostgreSQL style
+        if self.peek_token_is_keyword("DUPLICATE") {
+            // MySQL: ON DUPLICATE KEY UPDATE ...
+            self.next_token(); // consume DUPLICATE
+            if !self.expect_keyword("KEY") {
+                return ConflictClause::default();
+            }
+            if !self.expect_keyword("UPDATE") {
+                return ConflictClause::default();
+            }
+            let (update_columns, update_expressions) = self.parse_update_assignments();
+            ConflictClause {
+                on_duplicate: true,
+                update_columns,
+                update_expressions,
+                ..Default::default()
+            }
+        } else if self.peek_token_is_keyword("CONFLICT") {
+            // PostgreSQL: ON CONFLICT [(columns)] DO UPDATE SET ... | DO NOTHING
+            self.next_token(); // consume CONFLICT
+
+            // Optional conflict target: (col1, col2, ...)
+            let conflict_target = if self.peek_token_is_punctuator("(") {
+                self.next_token(); // consume (
+                let cols = self.parse_identifier_list();
+                if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+                    self.add_error(format!(
+                        "expected ')' after conflict target at {}",
+                        self.cur_token.position
+                    ));
+                    return ConflictClause::default();
+                }
+                cols
+            } else {
+                Vec::new()
+            };
+
+            // Expect DO
+            if !self.expect_keyword("DO") {
+                return ConflictClause::default();
+            }
+
+            // DO NOTHING or DO UPDATE SET
+            if self.peek_token_is_keyword("NOTHING") {
+                self.next_token(); // consume NOTHING
+                ConflictClause {
+                    do_nothing: true,
+                    conflict_target,
+                    ..Default::default()
+                }
+            } else if self.peek_token_is_keyword("UPDATE") {
+                self.next_token(); // consume UPDATE
+                if !self.expect_keyword("SET") {
+                    return ConflictClause::default();
+                }
+                let (update_columns, update_expressions) = self.parse_update_assignments();
+                ConflictClause {
+                    on_duplicate: true,
+                    update_columns,
+                    update_expressions,
+                    conflict_target,
+                    do_nothing: false,
+                }
+            } else {
+                self.add_error(format!(
+                    "expected NOTHING or UPDATE after DO, got {}",
+                    Self::format_token_for_error(&self.peek_token)
+                ));
+                ConflictClause::default()
+            }
+        } else {
+            self.add_error(format!(
+                "expected DUPLICATE or CONFLICT after ON, got {}",
+                Self::format_token_for_error(&self.peek_token)
+            ));
+            ConflictClause::default()
+        }
+    }
+
+    /// Parse column = expression assignment list (used by both MySQL and PostgreSQL upsert)
+    fn parse_update_assignments(&mut self) -> (Vec<Identifier>, Vec<Expression>) {
+        let mut update_columns = Vec::new();
+        let mut update_expressions = Vec::new();
+
+        loop {
+            // Accept both identifiers and keywords as column names (e.g., level, key, order)
+            if !self.peek_token_is(TokenType::Identifier) && !self.peek_token_is(TokenType::Keyword)
+            {
+                self.add_error(format!(
+                    "expected column name, got {}",
+                    Self::format_token_for_error(&self.peek_token)
+                ));
+                return (update_columns, update_expressions);
+            }
+            self.next_token();
+            update_columns.push(self.cur_token_as_column_identifier());
+
+            if !self.expect_peek(TokenType::Operator) || self.cur_token.literal != "=" {
+                self.add_error(format!("expected '=' at {}", self.cur_token.position));
+                return (update_columns, update_expressions);
+            }
+
+            self.next_token();
+            if let Some(expr) = self.parse_expression(Precedence::Lowest) {
+                update_expressions.push(expr);
+            } else {
+                return (update_columns, update_expressions);
+            }
+
+            if !self.peek_token_is_punctuator(",") {
+                break;
+            }
+            self.next_token(); // consume comma
+        }
+
+        (update_columns, update_expressions)
     }
 
     /// Parse RETURNING clause for INSERT/UPDATE/DELETE statements
@@ -1271,7 +1380,9 @@ impl Parser {
         // Parse column-value pairs
         let mut updates = FxHashMap::default();
         loop {
-            if !self.peek_token_is(TokenType::Identifier) {
+            // Accept both identifiers and keywords as column names (e.g., level, key, order)
+            if !self.peek_token_is(TokenType::Identifier) && !self.peek_token_is(TokenType::Keyword)
+            {
                 self.add_error(format!(
                     "expected column name in SET clause, got {}",
                     Self::format_token_for_error(&self.peek_token)
@@ -1279,7 +1390,8 @@ impl Parser {
                 return None;
             }
             self.next_token();
-            let column_name = self.cur_token.literal.clone();
+            let column_name = self.cur_token_as_column_identifier();
+            let column_name = column_name.value;
 
             if !self.expect_peek(TokenType::Operator) || self.cur_token.literal != "=" {
                 self.add_error(format!("expected '=' at {}", self.cur_token.position));
@@ -1669,10 +1781,7 @@ impl Parser {
             ));
             return None;
         }
-        identifiers.push(Identifier::new(
-            self.cur_token.clone(),
-            self.cur_token.literal.clone(),
-        ));
+        identifiers.push(self.cur_token_as_column_identifier());
 
         while self.peek_token_is_punctuator(",") {
             self.next_token(); // consume comma
@@ -1684,10 +1793,7 @@ impl Parser {
                 ));
                 return None;
             }
-            identifiers.push(Identifier::new(
-                self.cur_token.clone(),
-                self.cur_token.literal.clone(),
-            ));
+            identifiers.push(self.cur_token_as_column_identifier());
         }
 
         Some(identifiers)
@@ -1777,7 +1883,7 @@ impl Parser {
             return None;
         }
 
-        let name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
+        let name = self.cur_token_as_column_identifier();
 
         // Parse data type
         if !self.expect_peek(TokenType::Keyword) {
@@ -2780,10 +2886,7 @@ impl Parser {
         self.next_token();
         // Accept both identifiers and keywords as column names
         if self.cur_token_is(TokenType::Identifier) || self.cur_token_is(TokenType::Keyword) {
-            list.push(Identifier::new(
-                self.cur_token.clone(),
-                self.cur_token.literal.clone(),
-            ));
+            list.push(self.cur_token_as_column_identifier());
         }
 
         while self.peek_token_is_punctuator(",") {
@@ -2791,10 +2894,7 @@ impl Parser {
             self.next_token(); // move to identifier/keyword
                                // Accept both identifiers and keywords as column names
             if self.cur_token_is(TokenType::Identifier) || self.cur_token_is(TokenType::Keyword) {
-                list.push(Identifier::new(
-                    self.cur_token.clone(),
-                    self.cur_token.literal.clone(),
-                ));
+                list.push(self.cur_token_as_column_identifier());
             } else {
                 self.add_error(format!(
                     "expected Identifier, got {:?} at {}",

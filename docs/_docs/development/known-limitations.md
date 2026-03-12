@@ -56,11 +56,12 @@ See [Views]({{ '/docs/sql-features/views/' | relative_url }}) for view documenta
 
 See [ALTER TABLE]({{ '/docs/sql-features/alter-table/' | relative_url }}) for full syntax.
 
-## ON DUPLICATE KEY UPDATE
+## Upsert (ON CONFLICT / ON DUPLICATE KEY)
 
-- **No inserted value reference**: Unlike MySQL's `VALUES()` function, Stoolap does not provide special syntax to reference values from the failed insert.
+- **No MySQL VALUES() syntax**: Stoolap uses `EXCLUDED.column` (PostgreSQL-style) instead of MySQL's `VALUES(column)` to reference incoming insert values.
+- **No WHERE on conflict action**: PostgreSQL's `ON CONFLICT ... DO UPDATE SET ... WHERE ...` conditional update is not yet supported.
 
-See [ON DUPLICATE KEY UPDATE]({{ '/docs/sql-features/on-duplicate-key-update/' | relative_url }}) for upsert documentation.
+See [Upsert]({{ '/docs/sql-features/on-duplicate-key-update/' | relative_url }}) for full upsert documentation.
 
 ## WebAssembly (WASM)
 

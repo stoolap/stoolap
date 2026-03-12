@@ -440,6 +440,18 @@ impl FunctionRegistry {
         infos.get(&name).cloned()
     }
 
+    /// Check if a function is deterministic (safe to constant-fold).
+    /// Returns false for non-deterministic functions (NOW, RANDOM, SLEEP, etc.)
+    /// and for unknown functions (conservative default).
+    pub fn is_deterministic(&self, name: &str) -> bool {
+        let infos = self.function_info.read().unwrap();
+        if let Some(info) = infos.get(name) {
+            return info.deterministic;
+        }
+        let upper = name.to_uppercase();
+        infos.get(&upper).is_some_and(|info| info.deterministic)
+    }
+
     /// List all aggregate function names
     pub fn list_aggregates(&self) -> Vec<String> {
         let funcs = self.aggregate_functions.read().unwrap();

@@ -3101,9 +3101,9 @@ fn test_safe_truncation_three_snapshots() {
 
 #[test]
 fn test_safe_truncation_keep_count_one() {
-    // With keep_snapshots=1, Phase 6 deletes the fallback snapshot after each PRAGMA SNAPSHOT.
-    // The safe truncation logic must account for this: since only 1 snapshot survives cleanup,
-    // WAL should NEVER be truncated (no fallback snapshot to recover from).
+    // With keep_snapshots=1, the engine internally keeps 2 snapshots (the minimum
+    // required for safe WAL truncation). This allows truncation to proceed while
+    // maintaining a fallback snapshot for corruption recovery.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let dsn = format!("file://{}?keep_snapshots=1", db_path.display());
@@ -3130,7 +3130,7 @@ fn test_safe_truncation_keep_count_one() {
         let _ = db.execute("PRAGMA SNAPSHOT", ());
 
         // Phase 2: Insert 10 more rows, snapshot 2
-        // With keep_snapshots=1, snapshot 1 will be deleted after this
+        // With effective_keep=2, both snapshots survive (not just 1)
         for i in 11..=20 {
             db.execute(
                 &format!(
@@ -3158,31 +3158,28 @@ fn test_safe_truncation_keep_count_one() {
 
     remove_lock_file(&db_path);
 
-    // Only 1 snapshot should remain (keep_snapshots=1 cleaned up the first)
+    // 2 snapshots should remain (internal minimum of 2 for truncation safety)
     let snap_files = find_snapshot_files(&db_path, "keep1_test");
     assert_eq!(
         snap_files.len(),
-        1,
-        "Should have exactly 1 snapshot after cleanup"
+        2,
+        "Should have 2 snapshots (internal minimum for safe truncation)"
     );
 
-    // WAL should NOT have been truncated (only 1 surviving snapshot)
-    let wal_size = total_wal_size(&db_path);
-    assert!(wal_size > 0, "WAL should still have data");
-
-    // Corrupt the only snapshot
-    let mut data = fs::read(&snap_files[0]).unwrap();
+    // Corrupt the latest snapshot (last in sorted order)
+    let latest = &snap_files[snap_files.len() - 1];
+    let mut data = fs::read(latest).unwrap();
     if data.len() > 10 {
         zero_range(&mut data, 0, 10);
-        fs::write(&snap_files[0], &data).unwrap();
+        fs::write(latest, &data).unwrap();
     }
 
-    // Reopen — should recover everything from WAL
+    // Reopen — should recover from the fallback (second-to-last) snapshot + WAL
     let db = Database::open(&dsn).unwrap();
     let count: i64 = db.query_one("SELECT COUNT(*) FROM keep1_test", ()).unwrap();
     assert_eq!(
         count, 30,
-        "All 30 rows should be recovered from WAL (not truncated with keep_snapshots=1)"
+        "All 30 rows should be recovered (fallback snapshot + WAL replay)"
     );
 }
 

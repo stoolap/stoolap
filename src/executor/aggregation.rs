@@ -3581,6 +3581,14 @@ impl Executor {
                         .cloned()
                         .unwrap_or_else(Value::null_unknown);
 
+                    // Early termination: skip rows that would create new groups beyond the limit
+                    if has_limit
+                        && single_col_groups.len() >= group_limit
+                        && !single_col_groups.contains_key(&key_value)
+                    {
+                        continue;
+                    }
+
                     // Use entry API with proper Value equality
                     single_col_groups
                         .entry(key_value)
@@ -3617,6 +3625,14 @@ impl Executor {
                             .unwrap_or_else(Value::null_unknown),
                     );
 
+                    // Early termination: skip rows that would create new groups beyond the limit
+                    if has_limit
+                        && two_col_groups.len() >= group_limit
+                        && !two_col_groups.contains_key(&key)
+                    {
+                        continue;
+                    }
+
                     two_col_groups.entry(key).or_default().push(row_idx);
                 }
 
@@ -3630,56 +3646,74 @@ impl Executor {
                             row_indices,
                         });
                 }
-            } else {
-                // 3+ columns: use Vec<Value> with hash-based collision handling
+            } else if column_indices.len() == 3 {
+                // OPTIMIZATION: 3-column GROUP BY uses tuple keys (no Vec heap allocation)
+                let col_idx0 = column_indices[0];
+                let col_idx1 = column_indices[1];
+                let col_idx2 = column_indices[2];
+                let mut three_col_groups: ahash::AHashMap<(Value, Value, Value), Vec<usize>> =
+                    ahash::AHashMap::default();
+
                 for (row_idx, (_, row)) in rows.iter().enumerate() {
-                    // Build key values for this row
+                    let key = (
+                        row.get(col_idx0)
+                            .cloned()
+                            .unwrap_or_else(Value::null_unknown),
+                        row.get(col_idx1)
+                            .cloned()
+                            .unwrap_or_else(Value::null_unknown),
+                        row.get(col_idx2)
+                            .cloned()
+                            .unwrap_or_else(Value::null_unknown),
+                    );
+
+                    // Early termination: skip rows that would create new groups beyond the limit
+                    if has_limit
+                        && three_col_groups.len() >= group_limit
+                        && !three_col_groups.contains_key(&key)
+                    {
+                        continue;
+                    }
+
+                    three_col_groups.entry(key).or_default().push(row_idx);
+                }
+
+                for ((v0, v1, v2), row_indices) in three_col_groups {
+                    groups.entry(0).or_default().push(GroupEntry {
+                        key_values: vec![v0, v1, v2],
+                        row_indices,
+                    });
+                }
+            } else {
+                // 4+ columns: use AHashMap<Vec<Value>> directly (no collision handling needed)
+                let mut multi_col_groups: ahash::AHashMap<Vec<Value>, Vec<usize>> =
+                    ahash::AHashMap::default();
+
+                for (row_idx, (_, row)) in rows.iter().enumerate() {
                     key_buffer.clear();
                     for &idx in &column_indices {
                         key_buffer.push(row.get(idx).cloned().unwrap_or_else(Value::null_unknown));
                     }
 
-                    // Compute hash once (8-byte key instead of cloning entire Vec<Value>)
-                    let hash = hash_group_key(&key_buffer);
-
-                    // OPTIMIZATION: Single scan to find existing group OR check limit
-                    // Previously we scanned twice: once for key_exists check, once for find()
-                    match groups.entry(hash) {
-                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                            let bucket = e.get_mut();
-                            // Single scan: find position of matching group
-                            let existing_idx = bucket
-                                .iter()
-                                .position(|entry| entry.key_values == key_buffer);
-
-                            if let Some(idx) = existing_idx {
-                                // Existing group - just add this row to it
-                                bucket[idx].row_indices.push(row_idx);
-                            } else {
-                                // Hash collision: different key with same hash
-                                // Check limit before creating new group
-                                if has_limit && current_group_count >= group_limit {
-                                    continue;
-                                }
-                                bucket.push(GroupEntry {
-                                    key_values: key_buffer.clone(),
-                                    row_indices: vec![row_idx],
-                                });
-                                current_group_count += 1;
-                            }
-                        }
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            // First entry for this hash - check limit before creating
-                            if has_limit && current_group_count >= group_limit {
-                                continue;
-                            }
-                            e.insert(vec![GroupEntry {
-                                key_values: key_buffer.clone(),
-                                row_indices: vec![row_idx],
-                            }]);
-                            current_group_count += 1;
-                        }
+                    // Early termination: skip rows that would create new groups beyond the limit
+                    if has_limit
+                        && multi_col_groups.len() >= group_limit
+                        && !multi_col_groups.contains_key(&key_buffer)
+                    {
+                        continue;
                     }
+
+                    multi_col_groups
+                        .entry(key_buffer.clone())
+                        .or_default()
+                        .push(row_idx);
+                }
+
+                for (key_values, row_indices) in multi_col_groups {
+                    groups.entry(0).or_default().push(GroupEntry {
+                        key_values,
+                        row_indices,
+                    });
                 }
             }
         } else {

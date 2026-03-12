@@ -3081,6 +3081,14 @@ impl Index for HnswIndex {
         Some(self.metric.as_u8())
     }
 
+    fn hnsw_m(&self) -> Option<u16> {
+        Some(self.m as u16)
+    }
+
+    fn hnsw_ef_construction(&self) -> Option<u16> {
+        Some(self.ef_construction as u16)
+    }
+
     fn default_ef_search(&self) -> Option<usize> {
         Some(self.ef_search)
     }

@@ -23,6 +23,7 @@
 // 3. Handle short-circuit evaluation with jumps
 // 4. Pre-compute constant expressions where possible
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::common::CompactArc;
@@ -32,7 +33,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::ops::{CompareOp, CompiledPattern, Op};
 use super::program::{Program, ProgramBuilder};
-use crate::core::{DataType, Value, ValueSet};
+use super::vm::{ExecuteContext, ExprVM};
+use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::utils::{expression_to_string, string_to_datatype};
 use crate::functions::{global_registry, FunctionRegistry};
 use crate::parser::ast::*;
@@ -283,11 +285,16 @@ impl<'a> CompileContext<'a> {
 /// Expression compiler
 pub struct ExprCompiler<'a> {
     ctx: &'a CompileContext<'a>,
+    /// Guard flag to prevent recursive constant folding
+    folding: Cell<bool>,
 }
 
 impl<'a> ExprCompiler<'a> {
     pub fn new(ctx: &'a CompileContext<'a>) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            folding: Cell::new(false),
+        }
     }
 
     /// Compile an expression into a Program
@@ -335,6 +342,41 @@ impl<'a> ExprCompiler<'a> {
         }
     }
 
+    /// Try to fold a column-free expression into a constant at compile time.
+    /// Compiles the expression into a temporary program, executes it with an empty
+    /// row context, and returns the result if successful.
+    fn try_fold_constant(&self, expr: &Expression) -> Option<Value> {
+        use std::cell::RefCell;
+
+        thread_local! {
+            static FOLD_VM: RefCell<ExprVM> = RefCell::new(ExprVM::new());
+            static FOLD_ROW: Row = Row::new();
+        }
+
+        self.folding.set(true);
+
+        let empty_cols: &[String] = &[];
+        let ctx = CompileContext::new(empty_cols, self.ctx.functions);
+        let compiler = ExprCompiler::new(&ctx);
+        compiler.folding.set(true);
+
+        let mut builder = ProgramBuilder::new();
+        let ok = compiler.compile_expr(expr, &mut builder);
+        self.folding.set(false);
+
+        ok.ok()?;
+        builder.emit(Op::Return);
+        let program = builder.build_unoptimized();
+
+        FOLD_ROW.with(|empty_row| {
+            let exec_ctx = ExecuteContext::new(empty_row);
+            FOLD_VM.with(|vm_cell| {
+                let mut vm = vm_cell.borrow_mut();
+                vm.execute(&program, &exec_ctx).ok()
+            })
+        })
+    }
+
     /// Compile an expression, emitting ops to the builder
     fn compile_expr(
         &self,
@@ -345,6 +387,18 @@ impl<'a> ExprCompiler<'a> {
         if let Some(idx) = self.ctx.check_expression_alias(expr) {
             builder.emit(Op::LoadAggregateResult(idx));
             return Ok(());
+        }
+
+        // Constant folding: if not already folding and expression is column-free
+        // and non-trivial, evaluate once at compile time and emit as LoadConst.
+        // This optimizes deterministic expressions like ABS(-5) + 1 or UPPER('text').
+        // Non-deterministic functions (NOW, RANDOM, etc.) are excluded by is_foldable_expr
+        // and handled separately by pushdown's try_eval_constant_expr at query time.
+        if !self.folding.get() && is_foldable_expr(expr) {
+            if let Some(value) = self.try_fold_constant(expr) {
+                builder.emit(Op::LoadConst(value));
+                return Ok(());
+            }
         }
 
         match expr {
@@ -1483,6 +1537,129 @@ impl<'a> ExprCompiler<'a> {
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+
+/// Check if a function must NOT be constant-folded.
+///
+/// Looks up the function in the global registry and checks `FunctionInfo.deterministic`.
+/// Functions not in the registry (CURRENT_TRANSACTION_ID, UUID, RAND — handled as
+/// special compiler ops or aliases) are hardcoded here.
+///
+/// Also used by `query_classification.rs` to detect non-deterministic functions
+/// for semantic cache bypass, and by `evaluator_bridge.rs` to reject pushdown
+/// of expressions containing non-deterministic functions.
+pub fn is_non_foldable_function(name: &str) -> bool {
+    let upper = name.to_uppercase();
+
+    // Functions handled as special compiler ops, not in the registry
+    match upper.as_str() {
+        "CURRENT_TRANSACTION_ID" | "UUID" | "RAND" => return true,
+        _ => {}
+    }
+
+    // Registry-based check: non-deterministic functions declare it via FunctionInfo
+    let registry = crate::functions::registry::global_registry();
+    !registry.is_deterministic(&upper)
+}
+
+/// Check if an expression is column-free AND non-trivial (worth folding).
+/// Returns true for expressions like `NOW()`, `1 + 2`, `NOW() - INTERVAL '24 hours'`
+/// that can be evaluated once at compile time instead of per-row.
+/// Simple literals return false (already handled efficiently by LoadConst).
+fn is_foldable_expr(expr: &Expression) -> bool {
+    match expr {
+        // Simple literals are already constants — no folding benefit
+        Expression::IntegerLiteral(_)
+        | Expression::FloatLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_) => false,
+
+        // INTERVAL literals alone are already LoadConst — no folding benefit
+        Expression::IntervalLiteral(_) => false,
+
+        // Binary operations: foldable if BOTH sides are column-free
+        Expression::Infix(infix) => is_column_free(&infix.left) && is_column_free(&infix.right),
+
+        // Unary operations: foldable if operand is column-free
+        Expression::Prefix(prefix) => is_column_free(&prefix.right),
+
+        // Function calls: foldable if ALL arguments are column-free
+        // This covers NOW(), CURRENT_DATE, UPPER('text'), ABS(-5), etc.
+        // Excludes context-dependent and non-deterministic-per-call functions
+        Expression::FunctionCall(func) => {
+            if is_non_foldable_function(&func.function) {
+                return false;
+            }
+            func.arguments.iter().all(is_column_free)
+        }
+
+        // CAST: foldable if inner expression is column-free
+        Expression::Cast(cast) => is_column_free(&cast.expr),
+
+        // Everything else: not foldable
+        _ => false,
+    }
+}
+
+/// Check if an expression references no columns (is entirely self-contained).
+fn is_column_free(expr: &Expression) -> bool {
+    match expr {
+        // Literals are always column-free
+        Expression::IntegerLiteral(_)
+        | Expression::FloatLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::IntervalLiteral(_) => true,
+
+        // Identifiers reference columns (not column-free)
+        Expression::Identifier(_) | Expression::QualifiedIdentifier { .. } => false,
+
+        // Parameters: values aren't known at compile time
+        Expression::Parameter(_) => false,
+
+        // Binary operations
+        Expression::Infix(infix) => is_column_free(&infix.left) && is_column_free(&infix.right),
+
+        // Unary operations
+        Expression::Prefix(prefix) => is_column_free(&prefix.right),
+
+        // Function calls (NOW(), UPPER('text'), etc.)
+        // Exclude context-dependent and non-deterministic-per-call functions
+        Expression::FunctionCall(func) => {
+            if is_non_foldable_function(&func.function) {
+                return false;
+            }
+            func.arguments.iter().all(is_column_free)
+        }
+
+        // CAST
+        Expression::Cast(cast) => is_column_free(&cast.expr),
+
+        // CASE WHEN
+        Expression::Case(case) => {
+            case.value.as_ref().is_none_or(|e| is_column_free(e))
+                && case
+                    .when_clauses
+                    .iter()
+                    .all(|wc| is_column_free(&wc.condition) && is_column_free(&wc.then_result))
+                && case.else_value.as_ref().is_none_or(|e| is_column_free(e))
+        }
+
+        // Subqueries, EXISTS — not column-free
+        Expression::ScalarSubquery(_) | Expression::Exists(_) => false,
+
+        // Between
+        Expression::Between(between) => {
+            is_column_free(&between.expr)
+                && is_column_free(&between.lower)
+                && is_column_free(&between.upper)
+        }
+
+        // Anything else: conservatively assume it references columns
+        _ => false,
+    }
+}
 
 /// Try to evaluate a constant expression at compile time
 fn try_eval_constant(expr: &Expression) -> Option<Value> {

@@ -233,6 +233,7 @@ impl ScalarFunction for EmbedFunction {
             "Convert text to a 384-dim semantic embedding vector (MiniLM-L6-v2)",
             FunctionSignature::new(FunctionDataType::Any, vec![FunctionDataType::Any], 1, 1),
         )
+        .non_deterministic()
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {

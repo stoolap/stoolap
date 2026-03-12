@@ -183,6 +183,31 @@ impl ScalarFunction for DateTruncFunction {
 pub struct TimeTruncFunction;
 
 impl TimeTruncFunction {
+    /// Parse duration with thread-local cache. The duration string (e.g. "15m") is
+    /// typically a constant literal repeated for every row. Caching avoids redundant
+    /// char-by-char parsing on each call.
+    fn cached_parse_duration(duration_str: &str) -> Result<i64> {
+        use std::cell::RefCell;
+        thread_local! {
+            static CACHE: RefCell<(String, Option<i64>)> = const { RefCell::new((String::new(), None)) };
+        }
+        CACHE.with(|cell| {
+            let cached = cell.borrow();
+            if cached.0 == duration_str {
+                if let Some(nanos) = cached.1 {
+                    return Ok(nanos);
+                }
+            }
+            drop(cached);
+            let nanos = Self::parse_duration(duration_str)?;
+            let mut cached = cell.borrow_mut();
+            cached.0.clear();
+            cached.0.push_str(duration_str);
+            cached.1 = Some(nanos);
+            Ok(nanos)
+        })
+    }
+
     /// Parse a duration string like "15m", "1h", "30s"
     fn parse_duration(duration_str: &str) -> Result<i64> {
         // Handle common duration formats
@@ -310,8 +335,8 @@ impl ScalarFunction for TimeTruncFunction {
             }
         };
 
-        // Parse the duration
-        let duration_nanos = Self::parse_duration(&duration_str)?;
+        // Parse the duration (cached for repeated calls with the same string)
+        let duration_nanos = Self::cached_parse_duration(&duration_str)?;
 
         // Truncate the timestamp
         let ts_nanos = ts.timestamp_nanos_opt().unwrap_or(0);
@@ -1082,6 +1107,7 @@ impl ScalarFunction for CurrentDateFunction {
             "Returns the current date (at midnight UTC)",
             FunctionSignature::new(FunctionDataType::Timestamp, vec![], 0, 0),
         )
+        .non_deterministic()
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
@@ -1121,6 +1147,7 @@ impl ScalarFunction for CurrentTimestampFunction {
             "Returns the current timestamp",
             FunctionSignature::new(FunctionDataType::Timestamp, vec![], 0, 0),
         )
+        .non_deterministic()
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
@@ -1155,6 +1182,7 @@ impl ScalarFunction for CurrentTimeFunction {
             "Returns the current time as HH:MM:SS",
             FunctionSignature::new(FunctionDataType::String, vec![], 0, 0),
         )
+        .non_deterministic()
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {

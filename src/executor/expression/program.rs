@@ -590,6 +590,11 @@ impl ProgramBuilder {
     pub fn build(self) -> Program {
         Program::new(self.ops)
     }
+
+    /// Build without peephole optimization (for tiny fold programs)
+    pub fn build_unoptimized(self) -> Program {
+        Program::new_unoptimized(self.ops)
+    }
 }
 
 impl Default for ProgramBuilder {

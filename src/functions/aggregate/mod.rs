@@ -62,6 +62,41 @@ pub use string_agg::{GroupConcatFunction, StringAggFunction};
 pub use sum::SumFunction;
 
 use crate::core::{Value, ValueSet};
+use std::cmp::Ordering;
+
+/// Compare two Values for ordering (used by FIRST/LAST with ORDER BY).
+/// NULLs sort last (greater than all non-NULL values).
+pub(crate) fn compare_sort_keys(a: &[Value], b: &[Value], directions: &[bool]) -> Ordering {
+    for (i, (key_a, key_b)) in a.iter().zip(b.iter()).enumerate() {
+        let is_asc = directions.get(i).copied().unwrap_or(true);
+        let cmp = compare_values_for_sort(key_a, key_b);
+        if cmp != Ordering::Equal {
+            return if is_asc { cmp } else { cmp.reverse() };
+        }
+    }
+    Ordering::Equal
+}
+
+/// Compare two Values for sorting. NULLs sort last.
+fn compare_values_for_sort(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Null(_), Value::Null(_)) => Ordering::Equal,
+        (Value::Null(_), _) => Ordering::Greater,
+        (_, Value::Null(_)) => Ordering::Less,
+        (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Integer(a), Value::Float(b)) => {
+            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
+        }
+        (Value::Float(a), Value::Integer(b)) => {
+            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
+        }
+        (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        _ => Ordering::Equal,
+    }
+}
 
 /// Helper struct for tracking distinct values
 ///

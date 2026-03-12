@@ -386,6 +386,18 @@ pub trait Index: Send + Sync {
         None
     }
 
+    /// Returns the HNSW M parameter (max connections per node per layer).
+    /// Non-HNSW indexes return None.
+    fn hnsw_m(&self) -> Option<u16> {
+        None
+    }
+
+    /// Returns the HNSW ef_construction parameter (build beam width).
+    /// Non-HNSW indexes return None.
+    fn hnsw_ef_construction(&self) -> Option<u16> {
+        None
+    }
+
     /// Returns the default ef_search for HNSW indexes.
     /// Non-HNSW indexes return None.
     fn default_ef_search(&self) -> Option<usize> {

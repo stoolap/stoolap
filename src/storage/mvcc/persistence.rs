@@ -604,6 +604,11 @@ impl PersistenceManager {
         self.snapshot_interval
     }
 
+    /// Get the last snapshot time in Unix nanoseconds
+    pub fn last_snapshot_time(&self) -> i64 {
+        self.meta.last_snapshot_time.load(Ordering::Acquire)
+    }
+
     /// Get the number of snapshots to keep
     pub fn keep_count(&self) -> usize {
         self.keep_count

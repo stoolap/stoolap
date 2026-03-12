@@ -202,6 +202,12 @@ impl Parser {
         }
     }
 
+    /// Create an Identifier from the current token.
+    /// Identifier::new automatically lowercases keyword tokens.
+    pub(crate) fn cur_token_as_column_identifier(&self) -> Identifier {
+        Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone())
+    }
+
     /// Check if a keyword is truly reserved and cannot be used as an identifier
     /// Note: Some keywords like LEFT, RIGHT, FIRST, LAST are handled specially in
     /// parse_keyword_prefix() where they can be functions or identifiers.

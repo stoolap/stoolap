@@ -1405,7 +1405,7 @@ impl Parser {
         Some(Expression::Aliased(AliasedExpression {
             token,
             expression: Box::new(left),
-            alias: Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone()),
+            alias: self.cur_token_as_column_identifier(),
         }))
     }
 

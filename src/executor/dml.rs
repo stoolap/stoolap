@@ -40,6 +40,50 @@ use super::result::ExecResult;
 use super::utils::dummy_token_clone;
 use super::Executor;
 use std::sync::RwLock;
+
+/// Check whether a constraint violation matches the ON CONFLICT target columns.
+/// Returns true if the conflict should be handled (DO UPDATE / DO NOTHING).
+/// Returns false if the violation is on a different constraint, meaning the
+/// error should be re-raised.
+///
+/// When `conflict_target` is empty (MySQL ON DUPLICATE KEY UPDATE style),
+/// all conflicts match. When specified (PostgreSQL ON CONFLICT (cols) style),
+/// only violations on matching columns are handled.
+fn conflict_matches_target(conflict_target: &[Identifier], schema: &Schema, error: &Error) -> bool {
+    // Empty target = match all conflicts (MySQL semantics)
+    if conflict_target.is_empty() {
+        return true;
+    }
+
+    // Build normalized set of target column names
+    let target_set: rustc_hash::FxHashSet<&str> = conflict_target
+        .iter()
+        .map(|id| id.value_lower.as_str())
+        .collect();
+
+    match error {
+        Error::PrimaryKeyConstraint { .. } => {
+            // Collect PK column names from schema
+            let pk_cols: rustc_hash::FxHashSet<&str> = schema
+                .columns
+                .iter()
+                .filter(|c| c.primary_key)
+                .map(|c| c.name_lower.as_str())
+                .collect();
+            target_set == pk_cols
+        }
+        Error::UniqueConstraint { column, .. } => {
+            // `column` is comma-separated (e.g. "a" or "a, b")
+            let violated_cols: rustc_hash::FxHashSet<&str> =
+                column.split(", ").map(|s| s.trim()).collect();
+            // Compare lowercase: conflict_target is already lowered by Identifier::new;
+            // UniqueConstraint.column comes from index column_names which are lowercase
+            target_set == violated_cols
+        }
+        _ => false,
+    }
+}
+
 /// Validate type coercion didn't silently fail.
 /// Returns an error if a non-null value became null during coercion.
 fn validate_coercion(
@@ -367,6 +411,13 @@ impl Executor {
 
         // Check if this is INSERT ... SELECT
         if let Some(ref select_stmt) = stmt.select {
+            // Get schema for conflict handling (needed for duplicate row lookup and target matching)
+            let select_schema = if stmt.on_duplicate || stmt.do_nothing {
+                Some(self.engine.get_table_schema(table_name)?)
+            } else {
+                None
+            };
+
             // Execute the SELECT query
             let mut select_result = self.execute_select(select_stmt, ctx)?;
 
@@ -412,7 +463,23 @@ impl Executor {
                     row_values[column_indices[i]] = coerced;
                 }
 
-                // Create row and insert
+                // Validate CHECK constraints (must happen before insert)
+                for (col_idx, col_name, check_expr) in &check_exprs {
+                    let col_type = all_column_types[*col_idx];
+                    self.validate_check_constraint(
+                        check_expr,
+                        col_name,
+                        &row_values[*col_idx],
+                        col_type,
+                    )?;
+                }
+
+                // Save row_values for ON DUPLICATE KEY UPDATE before moving into Row
+                let saved_row_values = if stmt.on_duplicate {
+                    Some(row_values.clone())
+                } else {
+                    None
+                };
                 let row = Row::from_values(row_values);
 
                 // FK parent validation (zero-cost if no FKs)
@@ -425,15 +492,114 @@ impl Executor {
                     )?;
                 }
 
-                if has_returning {
+                if stmt.do_nothing {
+                    let schema_ref = select_schema.as_ref().unwrap();
+                    // ON CONFLICT DO NOTHING — silently skip duplicates
+                    let insert_result: Result<Option<Row>> = if has_returning {
+                        table.insert(row).map(Some)
+                    } else {
+                        table.insert_discard(row).map(|()| None)
+                    };
+                    match insert_result {
+                        Ok(opt_row) => {
+                            if let Some(inserted) = opt_row {
+                                returning_rows.push(inserted);
+                            }
+                            rows_affected += 1;
+                        }
+                        Err(ref e @ Error::PrimaryKeyConstraint { .. })
+                        | Err(ref e @ Error::UniqueConstraint { .. }) => {
+                            if !conflict_matches_target(&stmt.conflict_target, schema_ref, e) {
+                                return Err(e.clone());
+                            }
+                            // DO NOTHING: conflict skipped, no RETURNING row
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else if stmt.on_duplicate {
+                    let row_values = saved_row_values.as_ref().unwrap();
+                    let schema_ref = select_schema.as_ref().unwrap();
+                    // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE
+                    let insert_result: Result<Option<Row>> = if has_returning {
+                        table.insert(row).map(Some)
+                    } else {
+                        table.insert_discard(row).map(|()| None)
+                    };
+                    match insert_result {
+                        Ok(opt_row) => {
+                            if let Some(inserted) = opt_row {
+                                returning_rows.push(inserted);
+                            }
+                            rows_affected += 1;
+                        }
+                        Err(ref e @ Error::PrimaryKeyConstraint { row_id }) => {
+                            if !conflict_matches_target(&stmt.conflict_target, schema_ref, e) {
+                                return Err(Error::PrimaryKeyConstraint { row_id });
+                            }
+                            if let Some(updated_row) = self.apply_on_duplicate_update(
+                                &mut table,
+                                schema_ref,
+                                row_id,
+                                None,
+                                row_values,
+                                stmt,
+                                ctx,
+                                has_returning,
+                            )? {
+                                returning_rows.push(updated_row);
+                            }
+                            rows_affected += 1;
+                        }
+                        Err(
+                            ref e @ Error::UniqueConstraint {
+                                ref index,
+                                ref column,
+                                ref value,
+                            },
+                        ) => {
+                            if !conflict_matches_target(&stmt.conflict_target, schema_ref, e) {
+                                return Err(Error::UniqueConstraint {
+                                    index: index.clone(),
+                                    column: column.clone(),
+                                    value: value.clone(),
+                                });
+                            }
+                            if let Some(row_id) = self.find_row_by_unique_index(
+                                &*table, schema_ref, index, column, row_values,
+                            )? {
+                                if let Some(updated_row) = self.apply_on_duplicate_update(
+                                    &mut table,
+                                    schema_ref,
+                                    row_id,
+                                    Some(column),
+                                    row_values,
+                                    stmt,
+                                    ctx,
+                                    has_returning,
+                                )? {
+                                    returning_rows.push(updated_row);
+                                }
+                                rows_affected += 1;
+                            } else {
+                                return Err(Error::UniqueConstraint {
+                                    index: index.clone(),
+                                    column: column.clone(),
+                                    value: value.clone(),
+                                });
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else if has_returning {
                     // Use insert() which returns row (for RETURNING clause)
                     let inserted_row = table.insert(row)?;
                     returning_rows.push(inserted_row);
+                    rows_affected += 1;
                 } else {
                     // Use insert_discard() to avoid clone overhead
                     table.insert_discard(row)?;
+                    rows_affected += 1;
                 }
-                rows_affected += 1;
             }
 
             // Invalidate semantic cache for this table BEFORE commit
@@ -467,8 +633,8 @@ impl Executor {
             return Ok(Box::new(ExecResult::with_rows_affected(rows_affected)));
         }
 
-        // Process each row of values - use fast path for normal INSERT, slow path for ON DUPLICATE KEY
-        if stmt.on_duplicate {
+        // Process each row of values - use fast path for normal INSERT, slow path for conflict handling
+        if stmt.do_nothing || stmt.on_duplicate {
             // ON DUPLICATE KEY UPDATE requires schema (CompactArc ref-count bump, not deep clone)
             let schema = self.engine.get_table_schema(table_name)?;
 
@@ -522,6 +688,17 @@ impl Executor {
                     row_values[column_indices[i]] = coerced;
                 }
 
+                // Validate CHECK constraints (must happen before insert)
+                for (col_idx, col_name, check_expr) in &check_exprs {
+                    let col_type = all_column_types[*col_idx];
+                    self.validate_check_constraint(
+                        check_expr,
+                        col_name,
+                        &row_values[*col_idx],
+                        col_type,
+                    )?;
+                }
+
                 // Create row from values (ON DUPLICATE KEY needs values for error handling)
                 let row = Row::from_values(row_values.clone());
 
@@ -535,51 +712,105 @@ impl Executor {
                     )?;
                 }
 
-                match table.insert_discard(row) {
-                    Ok(()) => {
-                        rows_affected += 1;
+                if stmt.do_nothing {
+                    // ON CONFLICT DO NOTHING — silently skip duplicates
+                    let insert_result: Result<Option<Row>> = if has_returning {
+                        table.insert(row).map(Some)
+                    } else {
+                        table.insert_discard(row).map(|()| None)
+                    };
+                    match insert_result {
+                        Ok(opt_row) => {
+                            if let Some(inserted) = opt_row {
+                                returning_rows.push(inserted);
+                            }
+                            rows_affected += 1;
+                        }
+                        Err(ref e @ Error::PrimaryKeyConstraint { .. })
+                        | Err(ref e @ Error::UniqueConstraint { .. }) => {
+                            if !conflict_matches_target(&stmt.conflict_target, &schema, e) {
+                                return Err(e.clone());
+                            }
+                            // DO NOTHING: conflict skipped, no RETURNING row
+                        }
+                        Err(e) => return Err(e),
                     }
-                    Err(Error::PrimaryKeyConstraint { row_id }) => {
-                        self.apply_on_duplicate_update(
-                            &mut table,
-                            &schema,
-                            row_id,
-                            &row_values,
-                            stmt,
-                            ctx,
-                        )?;
-                        rows_affected += 1;
-                    }
-                    Err(Error::UniqueConstraint {
-                        index,
-                        column,
-                        value: _,
-                    }) => {
-                        if let Some(row_id) = self.find_row_by_unique_index(
-                            &*table,
-                            &schema,
-                            &index,
-                            &column,
-                            &row_values,
-                        )? {
-                            self.apply_on_duplicate_update(
+                } else {
+                    // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE
+                    let insert_result: Result<Option<Row>> = if has_returning {
+                        table.insert(row).map(Some)
+                    } else {
+                        table.insert_discard(row).map(|()| None)
+                    };
+                    match insert_result {
+                        Ok(opt_row) => {
+                            if let Some(inserted) = opt_row {
+                                returning_rows.push(inserted);
+                            }
+                            rows_affected += 1;
+                        }
+                        Err(ref e @ Error::PrimaryKeyConstraint { row_id }) => {
+                            if !conflict_matches_target(&stmt.conflict_target, &schema, e) {
+                                return Err(Error::PrimaryKeyConstraint { row_id });
+                            }
+                            if let Some(updated_row) = self.apply_on_duplicate_update(
                                 &mut table,
                                 &schema,
                                 row_id,
+                                None,
                                 &row_values,
                                 stmt,
                                 ctx,
-                            )?;
+                                has_returning,
+                            )? {
+                                returning_rows.push(updated_row);
+                            }
                             rows_affected += 1;
-                        } else {
-                            return Err(Error::UniqueConstraint {
+                        }
+                        Err(
+                            ref e @ Error::UniqueConstraint {
+                                ref index,
+                                ref column,
+                                ref value,
+                            },
+                        ) => {
+                            if !conflict_matches_target(&stmt.conflict_target, &schema, e) {
+                                return Err(Error::UniqueConstraint {
+                                    index: index.clone(),
+                                    column: column.clone(),
+                                    value: value.clone(),
+                                });
+                            }
+                            if let Some(row_id) = self.find_row_by_unique_index(
+                                &*table,
+                                &schema,
                                 index,
                                 column,
-                                value: "unknown".to_string(),
-                            });
+                                &row_values,
+                            )? {
+                                if let Some(updated_row) = self.apply_on_duplicate_update(
+                                    &mut table,
+                                    &schema,
+                                    row_id,
+                                    Some(column),
+                                    &row_values,
+                                    stmt,
+                                    ctx,
+                                    has_returning,
+                                )? {
+                                    returning_rows.push(updated_row);
+                                }
+                                rows_affected += 1;
+                            } else {
+                                return Err(Error::UniqueConstraint {
+                                    index: index.clone(),
+                                    column: column.clone(),
+                                    value: value.clone(),
+                                });
+                            }
                         }
+                        Err(e) => return Err(e),
                     }
-                    Err(e) => return Err(e),
                 }
             }
         } else {
@@ -711,8 +942,8 @@ impl Executor {
         ctx: &ExecutionContext,
         compiled_cache: &Arc<RwLock<CompiledExecution>>,
     ) -> Result<Box<dyn QueryResult>> {
-        // ON DUPLICATE KEY UPDATE requires special handling - fall back to non-cached path
-        if stmt.on_duplicate {
+        // Conflict handling requires special handling - fall back to non-cached path
+        if stmt.on_duplicate || stmt.do_nothing {
             return self.execute_insert(stmt, ctx);
         }
 
@@ -2206,27 +2437,64 @@ impl Executor {
         )))
     }
 
-    /// Apply ON DUPLICATE KEY UPDATE to an existing row
+    /// Apply ON DUPLICATE KEY UPDATE to an existing row.
+    /// `insert_values` contains the attempted insert row — accessible via `EXCLUDED.column`
+    /// in update expressions (PostgreSQL-style).
+    /// `conflict_column` is the unique constraint column(s) that caused the conflict (comma-separated).
+    /// Used to build WHERE clause when the table has no primary key.
+    /// When `capture_row` is true, returns the post-update row for RETURNING clauses.
+    #[allow(clippy::too_many_arguments)]
     fn apply_on_duplicate_update(
         &self,
         table: &mut Box<dyn Table>,
         schema: &crate::core::Schema,
         row_id: i64,
-        _insert_values: &[Value],
+        conflict_column: Option<&str>,
+        insert_values: &[Value],
         stmt: &InsertStatement,
         ctx: &ExecutionContext,
-    ) -> Result<()> {
-        // Build a WHERE clause to find the specific row by primary key
+        capture_row: bool,
+    ) -> Result<Option<Row>> {
+        // Build a WHERE clause to find the specific row
         // Use schema's cached pk_column_index for O(1) lookup
         let pk_col = schema
             .pk_column_index()
             .map(|idx| schema.columns[idx].name.clone());
 
         let where_expr: Option<Box<dyn StorageExpr>> = if let Some(pk_name) = pk_col {
+            // Table has PK — target by primary key value
             let mut expr =
                 ComparisonExpr::new(pk_name, crate::core::Operator::Eq, Value::Integer(row_id));
             expr.prepare_for_schema(schema);
             Some(Box::new(expr))
+        } else if let Some(conflict_cols) = conflict_column {
+            // No PK — target by the unique constraint columns that caused the conflict
+            use crate::storage::expression::AndExpr;
+            let col_names: Vec<&str> = conflict_cols.split(", ").collect();
+            let col_map = schema.column_index_map();
+            let mut comparisons: Vec<Box<dyn StorageExpr>> = Vec::with_capacity(col_names.len());
+            for col_name in &col_names {
+                let col_lower = col_name.to_lowercase();
+                if let Some(&idx) = col_map.get(col_lower.as_str()) {
+                    let value = insert_values
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or(Value::null_unknown());
+                    let mut expr =
+                        ComparisonExpr::new(col_name.to_string(), crate::core::Operator::Eq, value);
+                    expr.prepare_for_schema(schema);
+                    comparisons.push(Box::new(expr));
+                }
+            }
+            if comparisons.len() == 1 {
+                Some(comparisons.pop().unwrap())
+            } else if comparisons.len() > 1 {
+                let mut and_expr = AndExpr::new(comparisons);
+                and_expr.prepare_for_schema(schema);
+                Some(Box::new(and_expr))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -2252,17 +2520,62 @@ impl Executor {
 
         let column_names: Vec<String> = schema.column_names_owned().to_vec();
 
-        // Pre-compile update expressions for efficient evaluation
-        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
-        let compiled_updates: Vec<(usize, crate::core::DataType, u16, SharedProgram)> =
-            update_specs
-                .iter()
-                .filter_map(|(idx, col_type, vec_dims, expr)| {
-                    compile_expression(expr, &column_names)
-                        .ok()
-                        .map(|program| (*idx, *col_type, *vec_dims, program))
+        // Build EXCLUDED columns for the second row source (insert values)
+        // This allows EXCLUDED.column to reference the attempted insert values
+        let excluded_columns: Vec<String> = column_names
+            .iter()
+            .map(|c| format!("excluded.{}", c))
+            .collect();
+
+        // Pre-compile update expressions with EXCLUDED as a second row source
+        use super::expression::{
+            CompileContext, ExecuteContext, ExprCompiler, ExprVM, SharedProgram,
+        };
+        use crate::functions::registry::global_registry;
+
+        let mut compiled_updates: Vec<(usize, crate::core::DataType, u16, SharedProgram)> =
+            Vec::with_capacity(update_specs.len());
+        for (idx, col_type, vec_dims, expr) in &update_specs {
+            let ctx = CompileContext::new(&column_names, global_registry())
+                .with_second_row(&excluded_columns);
+            let compiler = ExprCompiler::new(&ctx);
+            match compiler.compile(expr) {
+                Ok(program) => {
+                    compiled_updates.push((*idx, *col_type, *vec_dims, CompactArc::new(program)));
+                }
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "failed to compile ON CONFLICT update expression: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        // Pre-compile CHECK constraints for columns being updated (once, not per-row)
+        use super::expression::ExpressionEval;
+        use crate::parser::parse_sql;
+        let mut compiled_checks: Vec<(usize, String, String, ExpressionEval)> = update_specs
+            .iter()
+            .filter_map(|(idx, _, _, _)| {
+                let col = &schema.columns[*idx];
+                col.check_expr.as_ref().and_then(|check_expr| {
+                    let sql = format!("SELECT {}", check_expr);
+                    let stmts = parse_sql(&sql).ok()?;
+                    if let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() {
+                        let expr = select.columns.first()?;
+                        let columns = vec![col.name.to_string()];
+                        let eval = ExpressionEval::compile(expr, &columns).ok()?;
+                        Some((*idx, col.name.to_string(), check_expr.to_string(), eval))
+                    } else {
+                        None
+                    }
                 })
-                .collect();
+            })
+            .collect();
+
+        // Build the EXCLUDED row from insert_values
+        let excluded_row = Row::from_values(insert_values.to_vec());
 
         // Create VM once and reuse for all rows
         let mut vm = ExprVM::new();
@@ -2271,11 +2584,15 @@ impl Executor {
         let params = ctx.params();
         let named_params = ctx.named_params();
 
+        // Capture the post-update row for RETURNING clause
+        let mut captured_row: Option<Row> = None;
+
         // Create a setter function that applies the ON DUPLICATE KEY UPDATE
         let mut setter = |mut row: Row| -> Result<(Row, bool)> {
             // Collect all updates first to avoid borrow conflicts
             let updates_to_apply: Vec<(usize, Value)> = {
-                let mut exec_ctx = ExecuteContext::new(&row);
+                // Use for_join to make EXCLUDED columns available as row2
+                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row);
                 if !params.is_empty() {
                     exec_ctx = exec_ctx.with_params(params);
                 }
@@ -2308,10 +2625,37 @@ impl Executor {
                 updates
             };
 
-            // Now apply updates
+            // Apply updates and validate CHECK constraints on each new value
             let changed = !updates_to_apply.is_empty();
             for (idx, new_value) in updates_to_apply {
+                // Validate CHECK constraint using pre-compiled evaluator
+                for (check_idx, col_name, check_expr, eval) in &mut compiled_checks {
+                    if *check_idx == idx && !new_value.is_null() {
+                        let check_row = Row::from_values(vec![new_value.clone()]);
+                        if let Ok(result) = eval.eval(&check_row) {
+                            let is_truthy = match &result {
+                                Value::Boolean(b) => *b,
+                                Value::Null(_) => true, // NULL passes CHECK (SQL standard)
+                                Value::Integer(i) => *i != 0,
+                                Value::Float(f) => *f != 0.0,
+                                Value::Text(s) => !s.is_empty(),
+                                _ => false,
+                            };
+                            if !is_truthy {
+                                return Err(Error::CheckConstraintViolation {
+                                    column: col_name.clone(),
+                                    expression: check_expr.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
                 let _ = row.set(idx, new_value);
+            }
+
+            // Capture post-update row for RETURNING
+            if capture_row {
+                captured_row = Some(row.clone());
             }
 
             Ok((row, changed))
@@ -2320,49 +2664,83 @@ impl Executor {
         // Update the row
         table.update(where_expr.as_deref(), &mut setter)?;
 
-        Ok(())
+        Ok(captured_row)
     }
 
-    /// Find a row by unique index value
+    /// Find a row by unique index value (supports single and composite unique constraints).
+    /// Uses direct index lookup (O(1) hash) instead of full table scan.
     fn find_row_by_unique_index(
         &self,
         table: &dyn Table,
         schema: &crate::core::Schema,
-        _index_name: &str,
+        index_name: &str,
         column_name: &str,
         row_values: &[Value],
     ) -> Result<Option<i64>> {
-        // Find the column index using cached map for O(1) lookup
-        let col_lower = column_name.to_lowercase();
-        let col_idx = match schema.column_index_map().get(&col_lower) {
-            Some(&idx) => idx,
-            None => return Ok(None),
+        // Try direct index lookup first (O(1) for hash/multi-column indexes)
+        if let Some(index) = table.get_index(index_name) {
+            // Build the value array in the index's column order
+            let col_ids = index.column_ids();
+            let mut lookup_values: Vec<Value> = Vec::with_capacity(col_ids.len());
+            for &col_id in col_ids {
+                let value = row_values
+                    .get(col_id as usize)
+                    .cloned()
+                    .unwrap_or(Value::null_unknown());
+                lookup_values.push(value);
+            }
+
+            let row_ids = index.get_row_ids_equal(&lookup_values);
+            if let Some(&row_id) = row_ids.first() {
+                return Ok(Some(row_id));
+            }
+            return Ok(None);
+        }
+
+        // Fallback: scan with filter expression (only if index not found by name)
+        let col_names: Vec<&str> = column_name.split(", ").collect();
+
+        let mut comparisons: Vec<Box<dyn StorageExpr>> = Vec::with_capacity(col_names.len());
+        for col_name in &col_names {
+            let col_lower = col_name.to_lowercase();
+            let col_idx = match schema.column_index_map().get(&col_lower) {
+                Some(&idx) => idx,
+                None => return Ok(None),
+            };
+            let value = row_values
+                .get(col_idx)
+                .cloned()
+                .unwrap_or(Value::null_unknown());
+
+            let mut expr =
+                ComparisonExpr::new(col_name.to_string(), crate::core::Operator::Eq, value);
+            expr.prepare_for_schema(schema);
+            comparisons.push(Box::new(expr));
+        }
+
+        let scan_expr: Box<dyn StorageExpr> = if comparisons.len() == 1 {
+            comparisons.pop().unwrap()
+        } else {
+            use crate::storage::expression::AndExpr;
+            let mut and_expr = AndExpr::new(comparisons);
+            and_expr.prepare_for_schema(schema);
+            Box::new(and_expr)
         };
-        let value = row_values
-            .get(col_idx)
-            .cloned()
-            .unwrap_or(Value::null_unknown());
 
-        // Create a search expression for this value
-        let mut expr =
-            ComparisonExpr::new(column_name.to_string(), crate::core::Operator::Eq, value);
-        expr.prepare_for_schema(schema);
-
-        // Scan for the row
         let column_indices: Vec<usize> = (0..schema.columns.len()).collect();
-        let mut scanner = table.scan(&column_indices, Some(&expr))?;
+        let mut scanner = table.scan(&column_indices, Some(&*scan_expr))?;
 
-        // Get the first matching row's ID
         let result = if scanner.next() {
             let row = scanner.take_row();
-            // Use schema's cached pk_column_index for O(1) lookup
-            schema.pk_column_index().and_then(|pk_idx| {
+            if let Some(pk_idx) = schema.pk_column_index() {
                 if let Some(Value::Integer(id)) = row.get(pk_idx) {
                     Some(*id)
                 } else {
                     None
                 }
-            })
+            } else {
+                Some(i64::MIN)
+            }
         } else {
             None
         };

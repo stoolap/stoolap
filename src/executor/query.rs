@@ -1869,6 +1869,7 @@ impl Executor {
             && !has_outer_context
             && !has_subqueries_in_where
             && !has_parameters_in_where // Parameters can't be cached (values not in AST)
+            && !classification.has_nondeterministic_functions // NOW(), RANDOM(), etc. return different values per execution
             && !classification.has_order_by
             && !classification.has_distinct
             && !classification.has_limit

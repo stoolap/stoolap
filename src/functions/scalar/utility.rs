@@ -87,6 +87,7 @@ impl ScalarFunction for NowFunction {
             "Returns the current date and time",
             FunctionSignature::new(FunctionDataType::DateTime, vec![], 0, 0),
         )
+        .non_deterministic()
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
@@ -969,6 +970,7 @@ impl ScalarFunction for SleepFunction {
             "Pauses execution for a specified number of seconds",
             FunctionSignature::new(FunctionDataType::Integer, vec![FunctionDataType::Any], 1, 1),
         )
+        .non_deterministic()
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {

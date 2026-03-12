@@ -420,6 +420,27 @@ fn serialize_snapshot_schema(schema: &Schema) -> Vec<u8> {
         buf.push(fk.on_update.as_u8());
     }
 
+    // Default values section (after FK constraints for backward compatibility).
+    // Old snapshots end at FK constraints; new code detects this section by
+    // checking if data remains after FKs.
+    // Format: column_count (u16) + per-column val_len (u16) + val_bytes
+    {
+        use super::persistence::serialize_value;
+        buf.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
+        for col in &schema.columns {
+            if let Some(ref default_value) = col.default_value {
+                if let Ok(val_bytes) = serialize_value(default_value) {
+                    buf.extend_from_slice(&(val_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(&val_bytes);
+                } else {
+                    buf.extend_from_slice(&0u16.to_le_bytes());
+                }
+            } else {
+                buf.extend_from_slice(&0u16.to_le_bytes());
+            }
+        }
+    }
+
     buf
 }
 
@@ -695,6 +716,26 @@ fn deserialize_snapshot_schema(data: &[u8]) -> Result<Schema> {
                 on_delete,
                 on_update,
             });
+        }
+    }
+
+    // Default values section (after FK constraints, for backward compatibility).
+    // Old snapshots won't have this section; columns keep default_value = None
+    // and populate_schema_defaults() fills them from default_expr at startup.
+    if pos + 2 <= data.len() {
+        let dv_count = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        for i in 0..dv_count.min(columns.len()) {
+            if pos + 2 > data.len() {
+                break;
+            }
+            let val_len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            if val_len > 0 && pos + val_len <= data.len() {
+                use super::persistence::deserialize_value;
+                columns[i].default_value = deserialize_value(&data[pos..pos + val_len]).ok();
+                pos += val_len;
+            }
         }
     }
 

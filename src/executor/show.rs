@@ -281,14 +281,21 @@ impl Executor {
             "Extra".to_string(),
         ];
 
-        // Build unique column set from indexes (matching MySQL's UNI key type)
+        // Build unique/multi-column key sets from indexes (matching MySQL conventions)
+        // Single-column UNIQUE -> UNI, composite UNIQUE first col -> MUL
         let mut unique_columns: FxHashSet<String> = FxHashSet::default();
+        let mut mul_columns: FxHashSet<String> = FxHashSet::default();
         if let Ok(indexes) = self.engine.list_table_indexes(table_name) {
             for index_name in indexes.keys() {
                 if let Some(index) = table.get_index(index_name) {
                     let col_names = index.column_names();
                     if index.is_unique() && col_names.len() == 1 {
                         unique_columns.insert(col_names[0].to_lowercase());
+                    } else if col_names.len() > 1 {
+                        // MySQL shows MUL for columns that are part of a composite index
+                        for name in col_names {
+                            mul_columns.insert(name.to_lowercase());
+                        }
                     }
                 }
             }
@@ -307,7 +314,9 @@ impl Executor {
                 "PRI"
             } else if unique_columns.contains(&col.name_lower) {
                 "UNI"
-            } else if schema.foreign_keys.iter().any(|fk| fk.column_index == i) {
+            } else if schema.foreign_keys.iter().any(|fk| fk.column_index == i)
+                || mul_columns.contains(&col.name_lower)
+            {
                 "MUL"
             } else {
                 ""

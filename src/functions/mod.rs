@@ -141,6 +141,12 @@ pub struct FunctionInfo {
     pub description: String,
     /// Signature
     pub signature: FunctionSignature,
+    /// Whether the function is deterministic (same inputs always produce same output,
+    /// no side effects, no dependency on external state like time or transactions).
+    /// Non-deterministic functions (NOW, RANDOM, SLEEP, etc.) must not be
+    /// constant-folded at compile time or served from the semantic query cache.
+    /// Defaults to `true`.
+    pub deterministic: bool,
 }
 
 impl FunctionInfo {
@@ -156,7 +162,14 @@ impl FunctionInfo {
             function_type,
             description: description.into(),
             signature,
+            deterministic: true,
         }
+    }
+
+    /// Mark this function as non-deterministic
+    pub fn non_deterministic(mut self) -> Self {
+        self.deterministic = false;
+        self
     }
 
     /// Get the function name

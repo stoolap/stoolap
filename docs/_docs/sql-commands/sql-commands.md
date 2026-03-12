@@ -266,12 +266,28 @@ VALUES
   (value1_1, value1_2, ...),
   (value2_1, value2_2, ...);
 
--- With ON DUPLICATE KEY UPDATE
+-- PostgreSQL-style upsert (ON CONFLICT)
+INSERT INTO table_name [(column1, column2, ...)]
+VALUES (value1, value2, ...)
+ON CONFLICT (conflict_columns) DO UPDATE SET
+  column1 = EXCLUDED.column1;
+
+-- Skip duplicates silently
+INSERT INTO table_name [(column1, column2, ...)]
+VALUES (value1, value2, ...)
+ON CONFLICT DO NOTHING;
+
+-- MySQL-style upsert (ON DUPLICATE KEY UPDATE)
 INSERT INTO table_name [(column1, column2, ...)]
 VALUES (value1, value2, ...)
 ON DUPLICATE KEY UPDATE
-  column1 = new_value1,
-  column2 = new_value2;
+  column1 = EXCLUDED.column1;
+
+-- INSERT ... SELECT with upsert
+INSERT INTO table_name [(column1, column2, ...)]
+SELECT column1, column2, ... FROM source_table
+ON CONFLICT (conflict_columns) DO UPDATE SET
+  column1 = EXCLUDED.column1;
 ```
 
 #### Examples
@@ -292,11 +308,20 @@ INSERT INTO users (name, email)
 VALUES ('Alice', 'alice@example.com')
 RETURNING id, name;
 
--- Upsert with ON DUPLICATE KEY UPDATE
+-- Upsert with ON CONFLICT (PostgreSQL-style)
 INSERT INTO inventory (product_id, quantity)
 VALUES (101, 50)
-ON DUPLICATE KEY UPDATE
-  quantity = quantity + 50;
+ON CONFLICT (product_id) DO UPDATE SET
+  quantity = quantity + EXCLUDED.quantity;
+
+-- Skip duplicates
+INSERT INTO items VALUES (1, 'apple')
+ON CONFLICT DO NOTHING;
+
+-- Bulk upsert from another table
+INSERT INTO metrics (host, metric, value)
+SELECT host, metric, value FROM staging
+ON CONFLICT (host, metric) DO UPDATE SET value = EXCLUDED.value;
 ```
 
 See [ON DUPLICATE KEY UPDATE]({% link _docs/sql-features/on-duplicate-key-update.md %}) for detailed documentation.

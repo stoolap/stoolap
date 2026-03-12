@@ -33,7 +33,9 @@ use crate::common::{CompactArc, SmartString};
 const TIMESTAMP_FORMATS: &[&str] = &[
     "%Y-%m-%dT%H:%M:%S%.f%:z", // RFC3339 with fractional seconds
     "%Y-%m-%dT%H:%M:%S%:z",    // RFC3339
+    "%Y-%m-%dT%H:%M:%S%.fZ",   // RFC3339 UTC with fractional seconds
     "%Y-%m-%dT%H:%M:%SZ",      // RFC3339 UTC
+    "%Y-%m-%dT%H:%M:%S%.f",    // ISO with fractional seconds, no timezone
     "%Y-%m-%dT%H:%M:%S",       // ISO without timezone
     "%Y-%m-%d %H:%M:%S%.f",    // SQL-style with fractional seconds
     "%Y-%m-%d %H:%M:%S",       // SQL-style

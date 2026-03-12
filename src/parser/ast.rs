@@ -17,7 +17,7 @@
 //! This module defines the AST node types that represent parsed SQL statements
 //! and expressions.
 
-use super::token::{Position, Token};
+use super::token::{Position, Token, TokenType};
 use crate::common::SmartString;
 use rustc_hash::FxHashMap;
 use std::fmt;
@@ -216,15 +216,28 @@ pub struct Identifier {
 }
 
 impl Identifier {
-    /// Create a new identifier with pre-computed lowercase value
+    /// Create a new identifier with pre-computed lowercase value.
+    /// Keywords are uppercased by the lexer for parsing; when used as identifiers
+    /// (column names, aliases, table names), fold to lowercase like PostgreSQL.
     #[inline]
     pub fn new(token: Token, value: impl Into<SmartString>) -> Self {
         let value = value.into();
-        let value_lower = value.to_lowercase();
-        Self {
-            token,
-            value,
-            value_lower,
+        if token.token_type == TokenType::Keyword {
+            // Keywords are uppercased by the lexer; fold to lowercase like PostgreSQL.
+            // value and value_lower are identical, so avoid double lowercasing.
+            let lowered = value.to_lowercase();
+            Self {
+                token,
+                value_lower: lowered.clone(),
+                value: lowered,
+            }
+        } else {
+            let value_lower = value.to_lowercase();
+            Self {
+                token,
+                value,
+                value_lower,
+            }
         }
     }
 }
@@ -1546,9 +1559,14 @@ pub struct InsertStatement {
     pub values: Vec<Vec<Expression>>,
     /// SELECT statement for INSERT INTO ... SELECT (None if using VALUES)
     pub select: Option<Box<SelectStatement>>,
+    /// ON DUPLICATE KEY UPDATE (MySQL-style) or ON CONFLICT DO UPDATE (PostgreSQL-style)
     pub on_duplicate: bool,
     pub update_columns: Vec<Identifier>,
     pub update_expressions: Vec<Expression>,
+    /// ON CONFLICT DO NOTHING (skip duplicates silently)
+    pub do_nothing: bool,
+    /// Conflict target columns for ON CONFLICT (col1, col2, ...)
+    pub conflict_target: Vec<Identifier>,
     /// RETURNING clause expressions
     pub returning: Vec<Expression>,
 }
@@ -1576,8 +1594,25 @@ impl fmt::Display for InsertStatement {
                 .collect();
             result.push_str(&rows.join(", "));
         }
-        if self.on_duplicate {
-            result.push_str(" ON DUPLICATE KEY UPDATE ");
+        if self.do_nothing {
+            result.push_str(" ON CONFLICT");
+            if !self.conflict_target.is_empty() {
+                let cols: Vec<String> =
+                    self.conflict_target.iter().map(|c| c.to_string()).collect();
+                result.push_str(&format!(" ({})", cols.join(", ")));
+            }
+            result.push_str(" DO NOTHING");
+        } else if self.on_duplicate {
+            if !self.conflict_target.is_empty() {
+                let cols: Vec<String> =
+                    self.conflict_target.iter().map(|c| c.to_string()).collect();
+                result.push_str(&format!(
+                    " ON CONFLICT ({}) DO UPDATE SET ",
+                    cols.join(", ")
+                ));
+            } else {
+                result.push_str(" ON DUPLICATE KEY UPDATE ");
+            }
             let updates: Vec<String> = self
                 .update_columns
                 .iter()
@@ -2450,6 +2485,8 @@ mod tests {
             on_duplicate: false,
             update_columns: vec![],
             update_expressions: vec![],
+            do_nothing: false,
+            conflict_target: vec![],
             returning: vec![],
         };
         assert_eq!(

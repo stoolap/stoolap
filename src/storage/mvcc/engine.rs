@@ -41,7 +41,7 @@ fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
 
 use super::file_lock::FileLock;
 
-use crate::core::{DataType, Error, ForeignKeyConstraint, IsolationLevel, Result, Schema};
+use crate::core::{DataType, Error, ForeignKeyConstraint, IsolationLevel, Result, Schema, Value};
 use crate::storage::config::Config;
 use crate::storage::mvcc::wal_manager::WALOperationType;
 #[cfg(test)]
@@ -125,6 +125,50 @@ fn strip_fk_references(
             }
         }
     }
+}
+
+/// Try to parse a default expression as a simple literal value.
+/// Handles integers, floats, booleans, strings, and NULL without requiring the full SQL parser.
+/// Returns None for complex expressions (function calls, etc.) that can't be precomputed.
+fn try_parse_default_literal(expr: &str, data_type: DataType) -> Option<Value> {
+    let expr = expr.trim();
+
+    // NULL
+    if expr.eq_ignore_ascii_case("null") {
+        return Some(Value::null(data_type));
+    }
+
+    // Boolean
+    if expr.eq_ignore_ascii_case("true") {
+        return Some(Value::Boolean(true));
+    }
+    if expr.eq_ignore_ascii_case("false") {
+        return Some(Value::Boolean(false));
+    }
+
+    // String literal (single-quoted) — coerce to target data type so that
+    // e.g. TIMESTAMP DEFAULT '2024-01-01' is restored as a Timestamp, not Text.
+    if expr.len() >= 2 && expr.starts_with('\'') && expr.ends_with('\'') {
+        let inner = &expr[1..expr.len() - 1];
+        // Unescape doubled single quotes
+        let unescaped = inner.replace("''", "'");
+        let text_val = Value::from(unescaped.as_str());
+        return Some(text_val.coerce_to_type(data_type));
+    }
+
+    // Integer — coerce to target type (e.g. FLOAT DEFAULT 42 should be Float(42.0))
+    if let Ok(v) = expr.parse::<i64>() {
+        return Some(Value::Integer(v).coerce_to_type(data_type));
+    }
+
+    // Float — coerce to target type
+    if let Ok(v) = expr.parse::<f64>() {
+        return Some(Value::Float(v).coerce_to_type(data_type));
+    }
+
+    // Complex expressions (NOW(), CURRENT_TIMESTAMP, etc.) cannot be recovered
+    // from old WAL/snapshot formats — they require default_value persistence.
+    None
 }
 
 /// Register a virtual PkIndex on an INTEGER PRIMARY KEY column.
@@ -284,10 +328,9 @@ fn read_snapshot_lsn(snapshot_dir: &std::path::Path) -> u64 {
 /// across all tables. This ensures that if the latest snapshot is corrupted, the
 /// previous snapshot + WAL entries from that point can fully reconstruct the database.
 ///
-/// `keep_count` is the number of snapshots that Phase 6 cleanup will retain.
+/// `keep_count` is the number of snapshots that Phase 7 cleanup will retain.
 /// Only the `keep_count` newest snapshots per table will survive cleanup, so we must
-/// only consider those when computing the safe truncation point. If `keep_count < 2`
-/// (or 0 meaning "keep all"), the function adjusts accordingly.
+/// only consider those when computing the safe truncation point.
 fn find_safe_truncation_lsn(
     snapshot_dir: &std::path::Path,
     keep_count: usize,
@@ -337,7 +380,7 @@ fn find_safe_truncation_lsn(
         };
         snap_files.sort();
 
-        // Only consider snapshots that will survive Phase 6 cleanup.
+        // Only consider snapshots that will survive Phase 7 cleanup.
         // keep_count == 0 means "no cleanup" (keep all), otherwise keep the newest N.
         let surviving = if keep_count > 0 && snap_files.len() > keep_count {
             &snap_files[snap_files.len() - keep_count..]
@@ -565,6 +608,11 @@ impl MVCCEngine {
                 // Replay WAL entries after the snapshot LSN
                 self.replay_wal(snapshot_lsn)?;
 
+                // Populate pre-computed default_value from default_expr for schema evolution.
+                // Neither snapshots nor WAL persist the cached default_value, so old rows
+                // read via normalize_row_to_schema would get NULL instead of the column default.
+                self.populate_schema_defaults();
+
                 // Clear the loading flag
                 self.loading_from_disk.store(false, Ordering::Release);
             }
@@ -618,12 +666,28 @@ impl MVCCEngine {
         let stop_flag_clone = Arc::clone(&stop_flag);
         let engine = Arc::clone(self);
 
+        // Read snapshot interval from persistence manager (if persistence is enabled)
+        let snapshot_interval = (*engine.persistence)
+            .as_ref()
+            .map(|pm| pm.snapshot_interval())
+            .unwrap_or(std::time::Duration::ZERO);
+
+        // Use the shorter of cleanup and snapshot intervals as the loop sleep
+        // so that snapshot checks aren't delayed by a longer cleanup interval.
+        let loop_interval = if !snapshot_interval.is_zero() {
+            interval.min(snapshot_interval)
+        } else {
+            interval
+        };
+
         let handle = thread::spawn(move || {
+            let mut time_since_cleanup = std::time::Duration::ZERO;
+
             while !stop_flag_clone.load(Ordering::Acquire) {
-                // Sleep for the interval (check stop flag periodically)
+                // Sleep for the loop interval (check stop flag periodically)
                 let check_interval = std::time::Duration::from_millis(100);
                 let mut elapsed = std::time::Duration::ZERO;
-                while elapsed < interval && !stop_flag_clone.load(Ordering::Acquire) {
+                while elapsed < loop_interval && !stop_flag_clone.load(Ordering::Acquire) {
                     thread::sleep(check_interval);
                     elapsed += check_interval;
                 }
@@ -632,10 +696,30 @@ impl MVCCEngine {
                     break;
                 }
 
-                // Perform cleanup
-                let _txn_count = engine.cleanup_old_transactions(txn_retention);
-                let _row_count = engine.cleanup_deleted_rows(deleted_row_retention);
-                let _prev_version_count = engine.cleanup_old_previous_versions();
+                // Perform cleanup at the original cleanup interval
+                time_since_cleanup += loop_interval;
+                if time_since_cleanup >= interval {
+                    time_since_cleanup = std::time::Duration::ZERO;
+                    let _txn_count = engine.cleanup_old_transactions(txn_retention);
+                    let _row_count = engine.cleanup_deleted_rows(deleted_row_retention);
+                    let _prev_version_count = engine.cleanup_old_previous_versions();
+                }
+
+                // Auto-snapshot: create snapshot if snapshot_interval has elapsed
+                if !snapshot_interval.is_zero() {
+                    if let Some(ref pm) = *engine.persistence {
+                        let last = pm.last_snapshot_time();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as i64)
+                            .unwrap_or(0);
+                        let elapsed_nanos = now.saturating_sub(last);
+                        let interval_nanos = snapshot_interval.as_nanos() as i64;
+                        if elapsed_nanos >= interval_nanos {
+                            let _ = engine.create_snapshot();
+                        }
+                    }
+                }
             }
         });
 
@@ -873,6 +957,47 @@ impl MVCCEngine {
         let stores = self.version_stores.read().unwrap();
         for store in stores.values() {
             store.populate_all_indexes();
+        }
+    }
+
+    /// Populate pre-computed `default_value` from `default_expr` on all schema columns.
+    ///
+    /// Neither snapshot nor WAL serialization persists `default_value` (only the expression
+    /// string `default_expr` is stored). After recovery, `normalize_row_to_schema` uses
+    /// `default_value` for schema-evolved rows (ALTER TABLE ADD COLUMN). Without this,
+    /// old rows would get NULL instead of the configured DEFAULT.
+    fn populate_schema_defaults(&self) {
+        let stores = self.version_stores.read().unwrap();
+        for store in stores.values() {
+            let mut schema_guard = store.schema_mut();
+            let needs_update = schema_guard
+                .columns
+                .iter()
+                .any(|col| col.default_value.is_none() && col.default_expr.is_some());
+            if !needs_update {
+                continue;
+            }
+            let schema = CompactArc::make_mut(&mut *schema_guard);
+            for col in &mut schema.columns {
+                if col.default_value.is_none() {
+                    if let Some(ref expr) = col.default_expr {
+                        // Backward-compat fallback for WAL/snapshots written before
+                        // default_value persistence was added. Only handles simple
+                        // literals (integers, floats, booleans, strings, NULL).
+                        // Non-deterministic expressions (NOW(), CURRENT_TIMESTAMP)
+                        // cannot be recovered here — they require the new format.
+                        col.default_value = try_parse_default_literal(expr, col.data_type);
+                    }
+                }
+            }
+        }
+        drop(stores);
+
+        // Sync engine schema cache from version stores
+        let stores = self.version_stores.read().unwrap();
+        let mut schemas = self.schemas.write().unwrap();
+        for (name, store) in stores.iter() {
+            schemas.insert(name.clone(), store.schema().clone());
         }
     }
 
@@ -1282,6 +1407,25 @@ impl MVCCEngine {
                     on_delete,
                     on_update,
                 });
+            }
+        }
+
+        // Default values section (after FK constraints, for backward compatibility).
+        // Old WAL entries won't have this; populate_schema_defaults() fills from default_expr.
+        if pos + 2 <= data.len() {
+            let dv_count = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            for i in 0..dv_count.min(columns.len()) {
+                if pos + 2 > data.len() {
+                    break;
+                }
+                let val_len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+                pos += 2;
+                if val_len > 0 && pos + val_len <= data.len() {
+                    use super::persistence::deserialize_value;
+                    columns[i].default_value = deserialize_value(&data[pos..pos + val_len]).ok();
+                    pos += val_len;
+                }
             }
         }
 
@@ -1701,6 +1845,26 @@ impl MVCCEngine {
             buf.extend_from_slice(fk.referenced_column.as_bytes());
             buf.push(fk.on_delete.as_u8());
             buf.push(fk.on_update.as_u8());
+        }
+
+        // Default values section (after FK constraints for backward compatibility).
+        // Old WAL readers stop after FKs; new readers detect this section by
+        // checking if data remains.
+        {
+            use super::persistence::serialize_value;
+            buf.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
+            for col in &schema.columns {
+                if let Some(ref default_value) = col.default_value {
+                    if let Ok(val_bytes) = serialize_value(default_value) {
+                        buf.extend_from_slice(&(val_bytes.len() as u16).to_le_bytes());
+                        buf.extend_from_slice(&val_bytes);
+                    } else {
+                        buf.extend_from_slice(&0u16.to_le_bytes());
+                    }
+                } else {
+                    buf.extend_from_slice(&0u16.to_le_bytes());
+                }
+            }
         }
 
         buf
@@ -2639,10 +2803,22 @@ impl Engine for MVCCEngine {
             _ => return Ok(()), // No persistence, nothing to snapshot
         };
 
+        // Skip snapshot if WAL hasn't grown since the last one.
+        // read_snapshot_lsn returns the LSN committed in the previous metadata.
+        // If the current WAL head matches, no new data was written.
+        let snapshot_dir = pm.path().join("snapshots");
+        let prev_lsn = read_snapshot_lsn(&snapshot_dir);
+
         // Create checkpoint and capture the LSN atomically.
         // create_checkpoint() flushes and syncs all pending WAL entries, then returns
         // the LSN at the exact checkpoint point.
         let snapshot_lsn = pm.create_checkpoint(vec![])?;
+
+        if snapshot_lsn > 0 && snapshot_lsn == prev_lsn {
+            // WAL hasn't grown since the last snapshot — skip entirely.
+            // This avoids re-writing snapshot files and re-recording DDL to WAL.
+            return Ok(());
+        }
 
         // CRITICAL: Capture the commit sequence AFTER the checkpoint.
         // This ensures any transaction that committed before checkpoint.lsn will
@@ -2658,8 +2834,7 @@ impl Engine for MVCCEngine {
         // The duplicate is harmless since WAL replay is idempotent.
         let snapshot_commit_seq = self.registry.current_commit_sequence();
 
-        // Create snapshot directory
-        let snapshot_dir = pm.path().join("snapshots");
+        // Create snapshot directory (snapshot_dir already set above for LSN check)
         if let Err(e) = std::fs::create_dir_all(&snapshot_dir) {
             return Err(Error::internal(format!(
                 "failed to create snapshot directory: {}",
@@ -2871,38 +3046,113 @@ impl Engine for MVCCEngine {
         }
 
         // CRITICAL: Order of operations for crash safety:
-        // 1. Write metadata FIRST (atomic via temp file + rename)
-        // 2. Truncate WAL (safe because metadata is now durable)
-        // 3. Cleanup old snapshots LAST (safe because we have new snapshots + metadata)
         //
-        // This order ensures that if crash happens:
-        // - After step 1: Metadata exists, WAL has all data, recovery is safe
-        // - After step 2: Metadata exists, new snapshots have data, recovery uses snapshot
-        // - After step 3: Complete, old snapshots cleaned up
+        // 1. Re-record non-snapshot DDL (indexes, views) to WAL
+        // 2. Write metadata (atomic via temp file + rename) — commits snapshot_lsn
+        // 3. Truncate WAL (safe because metadata + DDL are now durable)
+        // 4. Cleanup old snapshots LAST
+        //
+        // Steps 1→2 ordering is critical: metadata sets the snapshot_lsn from which
+        // recovery replays WAL. DDL entries before that LSN are invisible to replay.
+        // By writing DDL entries FIRST, they land at the WAL head (after snapshot_lsn),
+        // so they survive even if a crash occurs between steps 1 and 2 (metadata not
+        // yet written → recovery uses old snapshot_lsn → replays everything including
+        // the new DDL entries as harmless duplicates).
         //
         // Note: Each snapshot file also embeds source_lsn in its header (v3 format),
         // providing a fallback if metadata file is corrupted. load_snapshots() uses
         // min(metadata_lsn, min_header_lsn) to handle this case safely.
 
-        // Phase 4: Write snapshot metadata BEFORE cleanup and truncation
-        // Using binary format with magic number and checksum for data integrity
+        // Phase 4: Re-record non-snapshot DDL to WAL.
+        // Snapshots store schema + rows but NOT index metadata or views.
+        // Recovery replays WAL from snapshot_lsn onwards, so any CreateIndex/
+        // CreateView entries before that LSN are effectively invisible.
+        // Re-recording places fresh entries after snapshot_lsn.
+        let mut index_entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for (table_name, _schema) in schemas.iter() {
+            if let Some(store) = stores.get(table_name) {
+                let _ = store.for_each_index(|index| {
+                    // Skip PK indexes — they are auto-created from schema
+                    if index.index_type() == crate::core::IndexType::PrimaryKey {
+                        return Ok(());
+                    }
+                    let index_meta = super::persistence::IndexMetadata {
+                        name: index.name().to_string(),
+                        table_name: table_name.clone(),
+                        column_names: index.column_names().to_vec(),
+                        column_ids: index.column_ids().to_vec(),
+                        data_types: index.data_types().to_vec(),
+                        is_unique: index.is_unique(),
+                        index_type: index.index_type(),
+                        hnsw_m: index.hnsw_m(),
+                        hnsw_ef_construction: index.hnsw_ef_construction(),
+                        hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
+                        hnsw_distance_metric: index.hnsw_distance_metric(),
+                    };
+                    index_entries.push((table_name.clone(), index_meta.serialize()));
+                    Ok(())
+                });
+            }
+        }
+
+        // Collect view definitions
+        let view_entries: Vec<(String, Vec<u8>)> = {
+            let views = self.views.read().unwrap();
+            views
+                .iter()
+                .map(|(name, view_def)| (name.clone(), view_def.serialize()))
+                .collect()
+        };
+
+        // Drop read locks before writing to WAL (record_ddl acquires no schema locks)
+        drop(stores);
+
+        for (table_name, data) in &index_entries {
+            if let Err(e) = self.record_ddl(table_name, WALOperationType::CreateIndex, data) {
+                eprintln!(
+                    "Warning: Failed to re-record index for {}: {}. Aborting snapshot.",
+                    table_name, e
+                );
+                return Ok(());
+            }
+        }
+
+        for (view_name, data) in &view_entries {
+            if let Err(e) = self.record_ddl(view_name, WALOperationType::CreateView, data) {
+                eprintln!(
+                    "Warning: Failed to re-record view {}: {}. Aborting snapshot.",
+                    view_name, e
+                );
+                return Ok(());
+            }
+        }
+
+        // Phase 5: Write snapshot metadata AFTER DDL re-recording.
+        // This commits the new snapshot_lsn. Until this point, recovery uses the
+        // old snapshot_lsn and replays the full WAL (including original DDL).
         let meta_path = snapshot_dir.join("snapshot_meta.bin");
         if let Err(e) = write_snapshot_metadata(&meta_path, snapshot_lsn) {
             eprintln!("Warning: Failed to write snapshot metadata: {}", e);
             return Ok(()); // Don't truncate WAL or cleanup if metadata write failed
         }
 
-        // Phase 5: Safe WAL truncation — only truncate to second-to-last verified snapshot
-        // that will SURVIVE Phase 6 cleanup. This ensures the previous snapshot + WAL can
-        // always recover if the latest snapshot is damaged.
-        // With keep_count=1, no truncation ever happens (only 1 snapshot survives cleanup).
-        // With keep_count=0 (no cleanup) or keep_count>=2, truncation uses the second-to-last
-        // of the surviving snapshots.
+        // Phase 6: Safe WAL truncation — only truncate to second-to-last verified
+        // snapshot that will SURVIVE Phase 7 cleanup. DDL was already re-recorded
+        // above, so the new entries are safe from truncation (they're at the WAL head).
+        //
+        // Minimum 2 retained snapshots: truncation requires a second-to-last snapshot
+        // as a fallback if the latest is corrupted. Without this floor, keep_snapshots=1
+        // would prevent truncation entirely, causing unbounded WAL growth from
+        // DDL re-recording on every snapshot cycle.
+        let effective_keep = if pm.keep_count() > 0 {
+            pm.keep_count().max(2)
+        } else {
+            0 // 0 means "keep all"
+        };
         if snapshot_lsn > 0 {
-            let keep_count = pm.keep_count();
             let active_tables: FxHashSet<&str> = schemas.keys().map(|k| k.as_str()).collect();
             if let Some(safe_lsn) =
-                find_safe_truncation_lsn(&snapshot_dir, keep_count, &active_tables)
+                find_safe_truncation_lsn(&snapshot_dir, effective_keep, &active_tables)
             {
                 if let Err(e) = pm.truncate_wal(safe_lsn) {
                     eprintln!("Warning: Failed to truncate WAL after snapshot: {}", e);
@@ -2910,19 +3160,16 @@ impl Engine for MVCCEngine {
             }
         }
 
-        // Phase 6: Cleanup old snapshots LAST (only after metadata is durable)
-        // This is safe because we now have:
-        // - New snapshots with embedded source_lsn
-        // - Metadata pointing to new snapshot_lsn
-        // - WAL truncated (or still present if truncation failed)
-        let keep_count = pm.keep_count();
-        if keep_count > 0 {
+        // Phase 7: Cleanup old snapshots LAST (only after metadata is durable).
+        // Uses the same effective_keep as Phase 6 to ensure at least 2 snapshots
+        // survive, matching the truncation safety requirement.
+        if effective_keep > 0 {
             for (_, _, table_name) in &pending_snapshots {
                 if let Some(schema) = schemas.get(table_name) {
                     let disk_store =
                         super::snapshot::DiskVersionStore::new(&snapshot_dir, table_name, schema);
                     if let Ok(disk_store) = disk_store {
-                        if let Err(e) = disk_store.cleanup_old_snapshots(keep_count) {
+                        if let Err(e) = disk_store.cleanup_old_snapshots(effective_keep) {
                             eprintln!(
                                 "Warning: Failed to cleanup old snapshots for {}: {}",
                                 table_name, e
@@ -2933,9 +3180,7 @@ impl Engine for MVCCEngine {
             }
         }
 
-        // Phase 7: Remove orphaned snapshot directories from dropped tables.
-        // Without this, a dropped table's directory would waste disk space and
-        // (before the active_tables filter in Phase 5) could block WAL truncation.
+        // Phase 8: Remove orphaned snapshot directories from dropped tables.
         if let Ok(entries) = std::fs::read_dir(&snapshot_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();

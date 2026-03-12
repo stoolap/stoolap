@@ -860,6 +860,7 @@ impl ScalarFunction for RandomFunction {
             "Returns a random float between 0 (inclusive) and 1 (exclusive)",
             FunctionSignature::new(FunctionDataType::Float, vec![], 0, 0),
         )
+        .non_deterministic()
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
