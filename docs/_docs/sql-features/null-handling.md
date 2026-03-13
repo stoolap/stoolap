@@ -150,14 +150,20 @@ NULL is considered a single value for grouping and distinct operations:
 
 ```sql
 -- NULLs are grouped together
-SELECT category, COUNT(*) 
-FROM products 
+SELECT category, COUNT(*)
+FROM products
 GROUP BY category;
 -- All NULL categories form a single group
 
 -- NULLs count as one distinct value
 SELECT COUNT(DISTINCT category) FROM products;
 -- Counts NULL as one distinct value if present
+
+-- DISTINCT ON treats NULL keys as equal (one group for all NULLs)
+SELECT DISTINCT ON (category) category, name
+FROM products
+ORDER BY category, name;
+-- All NULL-category rows form one group, the first row is kept
 ```
 
 ## NULL in Aggregation Functions

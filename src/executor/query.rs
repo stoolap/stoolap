@@ -85,9 +85,9 @@ use super::parallel::{self, ParallelConfig};
 use super::pushdown;
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
-    DistinctResult, ExecResult, ExecutorResult, ExprMappedResult, FilteredResult, LimitedResult,
-    OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult, StreamingProjectionResult,
-    TopNResult,
+    DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, ExprMappedResult, FilteredResult,
+    LimitedResult, OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult,
+    StreamingProjectionResult, TopNResult,
 };
 use super::utils::compute_join_projection;
 use super::utils::{
@@ -342,10 +342,10 @@ impl Executor {
         // Count expected SELECT columns (before any extra ORDER BY columns)
         let expected_columns = self.count_select_columns(stmt);
 
-        // Apply DISTINCT
+        // Apply DISTINCT (skip for DISTINCT ON — it's applied after ORDER BY)
         // When ORDER BY references columns not in SELECT, we add extra columns for sorting.
         // DISTINCT should only consider the original SELECT columns, not the extra ORDER BY columns.
-        if stmt.distinct {
+        if stmt.distinct && stmt.distinct_on.is_empty() {
             if columns.len() > expected_columns && expected_columns > 0 {
                 // Extra ORDER BY columns present - only hash SELECT columns for distinctness
                 result = Box::new(DistinctResult::with_column_count(
@@ -679,9 +679,11 @@ impl Executor {
                 });
 
                 // Reorder rows using sorted indices
-                // OPTIMIZATION: For LIMIT queries, only collect needed rows
+                // OPTIMIZATION: For LIMIT queries without DISTINCT ON, only collect needed rows
                 // For full results, use in-place cycle-based permutation
-                let final_rows: RowVec = if limit.is_some() || offset > 0 {
+                // When DISTINCT ON is active, skip early LIMIT (applied after dedup)
+                let has_distinct_on = !stmt.distinct_on.is_empty();
+                let final_rows: RowVec = if (limit.is_some() || offset > 0) && !has_distinct_on {
                     // With LIMIT/OFFSET: Only collect the rows we actually need
                     let take_count = limit.unwrap_or(usize::MAX);
                     indices
@@ -692,8 +694,7 @@ impl Executor {
                         .map(|(new_idx, i)| (new_idx as i64, std::mem::take(&mut rows[i].1)))
                         .collect()
                 } else {
-                    // No LIMIT: Use in-place cycle-based permutation (no cloning!)
-                    // This follows permutation cycles and swaps elements in place
+                    // No LIMIT or DISTINCT ON active: Use in-place cycle-based permutation
                     let n = rows.len();
                     for start in 0..n {
                         // Skip if already in correct position or already processed
@@ -719,23 +720,49 @@ impl Executor {
                 };
 
                 // Project to expected columns if needed
+                // When DISTINCT ON is active, keep extra columns until after dedup
                 let mut result_rows = final_rows;
-                if columns.len() > expected_columns && expected_columns > 0 {
+                let needs_extra_col_removal =
+                    columns.len() > expected_columns && expected_columns > 0;
+                if needs_extra_col_removal && !has_distinct_on {
                     for (_, row) in result_rows.iter_mut() {
                         row.truncate(expected_columns);
                     }
                 }
 
                 // Use original column names if expected_columns matches
-                let output_columns = if expected_columns > 0 && expected_columns <= columns.len() {
+                let output_columns = if needs_extra_col_removal && !has_distinct_on {
                     CompactArc::new(columns[..expected_columns].to_vec())
                 } else {
                     CompactArc::clone(&columns)
                 };
-                return Ok(Box::new(ExecutorResult::with_arc_columns(
-                    output_columns,
+                let mut result: Box<dyn QueryResult> = Box::new(ExecutorResult::with_arc_columns(
+                    CompactArc::clone(&output_columns),
                     result_rows,
-                )));
+                ));
+
+                // Apply DISTINCT ON if active
+                if has_distinct_on {
+                    let result_cols = result.columns().to_vec();
+                    let key_indices = Self::resolve_distinct_on_indices(
+                        &stmt.distinct_on,
+                        &result_cols,
+                        Some(&stmt.columns),
+                    );
+                    result = Box::new(DistinctOnResult::new(result, key_indices));
+
+                    // Remove extra columns after DISTINCT ON dedup
+                    if needs_extra_col_removal {
+                        result = Box::new(ProjectedResult::new(result, expected_columns));
+                    }
+
+                    // Apply LIMIT/OFFSET after DISTINCT ON
+                    if limit.is_some() || offset > 0 {
+                        result = Box::new(LimitedResult::new(result, limit, offset));
+                    }
+                }
+
+                return Ok(result);
             }
 
             // Pre-compute column indices to avoid string comparisons during sort
@@ -749,31 +776,37 @@ impl Executor {
 
             // TOP-N OPTIMIZATION: Use bounded heap when LIMIT is present
             // This is O(n log k) instead of O(n log n), where k = limit
+            // Skip when DISTINCT ON is active: DISTINCT ON must happen between ORDER BY and LIMIT
             if let Some(lim) = limit {
-                // Use TopNResult for ORDER BY + LIMIT (5-50x faster for large datasets)
-                result = Box::new(TopNResult::new(
-                    result,
-                    move |a, b| Self::compare_rows_with_indices(a, b, &order_specs),
-                    lim,
-                    offset,
-                ));
-
-                // Apply deferred projection if applicable
-                // This reduces allocations from O(matched_rows) to O(limit)
-                if let Some((col_indices, output_names)) = deferred_projection {
-                    result = Box::new(StreamingProjectionResult::new(
+                if stmt.distinct_on.is_empty() {
+                    // Use TopNResult for ORDER BY + LIMIT (5-50x faster for large datasets)
+                    result = Box::new(TopNResult::new(
                         result,
-                        col_indices,
-                        output_names,
+                        move |a, b| Self::compare_rows_with_indices(a, b, &order_specs),
+                        lim,
+                        offset,
                     ));
-                } else if columns.len() > expected_columns && expected_columns > 0 {
-                    // Remove extra ORDER BY columns if needed (no deferred projection)
-                    result = Box::new(ProjectedResult::new(result, expected_columns));
-                }
 
-                // LIMIT/OFFSET already applied by TopNResult
-                return Ok(result);
-            } else {
+                    // Apply deferred projection if applicable
+                    // This reduces allocations from O(matched_rows) to O(limit)
+                    if let Some((col_indices, output_names)) = deferred_projection {
+                        result = Box::new(StreamingProjectionResult::new(
+                            result,
+                            col_indices,
+                            output_names,
+                        ));
+                    } else if columns.len() > expected_columns && expected_columns > 0 {
+                        // Remove extra ORDER BY columns if needed (no deferred projection)
+                        result = Box::new(ProjectedResult::new(result, expected_columns));
+                    }
+
+                    // LIMIT/OFFSET already applied by TopNResult
+                    return Ok(result);
+                }
+                // DISTINCT ON with LIMIT: fall through to full sort
+                // (DISTINCT ON is applied after ORDER BY, LIMIT after DISTINCT ON)
+            }
+            {
                 // No LIMIT - use full sort
                 // OPTIMIZATION: Try radix sort for integer columns (O(n) vs O(n log n))
                 // Build RadixOrderSpec only if all columns have valid indices
@@ -805,6 +838,19 @@ impl Executor {
             }
         }
 
+        // Apply DISTINCT ON before removing extra columns, so keys can reference
+        // columns not in SELECT (they may be among the extra ORDER BY columns or
+        // the full source columns).
+        if !stmt.distinct_on.is_empty() {
+            let result_columns = result.columns().to_vec();
+            let key_indices = Self::resolve_distinct_on_indices(
+                &stmt.distinct_on,
+                &result_columns,
+                Some(&stmt.columns),
+            );
+            result = Box::new(DistinctOnResult::new(result, key_indices));
+        }
+
         // Remove extra ORDER BY columns that were added for sorting
         // This happens when ORDER BY references columns not in SELECT
         if columns.len() > expected_columns && expected_columns > 0 {
@@ -817,6 +863,82 @@ impl Executor {
         }
 
         Ok(result)
+    }
+
+    /// Resolve DISTINCT ON expressions to column indices in the result set.
+    /// Also checks original SELECT expressions to handle aliased columns
+    /// (e.g., `SELECT DISTINCT ON (customer) customer AS c` — matches `customer`
+    /// against the original identifier behind the `c` alias).
+    fn resolve_distinct_on_indices(
+        distinct_on: &[Expression],
+        result_columns: &[String],
+        select_exprs: Option<&[Expression]>,
+    ) -> Vec<usize> {
+        distinct_on
+            .iter()
+            .filter_map(|expr| {
+                match expr {
+                    Expression::Identifier(id) => {
+                        // First: direct match against result column names
+                        let direct = result_columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(&id.value_lower));
+                        if direct.is_some() {
+                            return direct;
+                        }
+                        // Second: check if any SELECT expression is an alias over this identifier
+                        if let Some(sel_exprs) = select_exprs {
+                            for (i, sel) in sel_exprs.iter().enumerate() {
+                                if let Expression::Aliased(aliased) = sel {
+                                    match &*aliased.expression {
+                                        Expression::Identifier(sel_id) => {
+                                            if sel_id.value_lower == id.value_lower {
+                                                return Some(i);
+                                            }
+                                        }
+                                        Expression::QualifiedIdentifier(qid) => {
+                                            if qid.name.value_lower == id.value_lower {
+                                                return Some(i);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    }
+                    Expression::QualifiedIdentifier(qi) => {
+                        // Match table.column — try full qualified name first, then just column
+                        let full = format!("{}.{}", qi.qualifier, qi.name);
+                        result_columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(&full))
+                            .or_else(|| {
+                                result_columns
+                                    .iter()
+                                    .position(|c| c.eq_ignore_ascii_case(&qi.name.value))
+                            })
+                    }
+                    Expression::IntegerLiteral(lit) => {
+                        // 1-based positional reference
+                        let pos = lit.value as usize;
+                        if pos >= 1 && pos <= result_columns.len() {
+                            Some(pos - 1)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => {
+                        // Expression — match by Display representation
+                        let expr_str = expr.to_string();
+                        result_columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(&expr_str))
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Count the number of columns in the SELECT clause
@@ -1392,10 +1514,10 @@ impl Executor {
         ))
     }
 
-    /// Check if ORDER BY references columns not in SELECT
+    /// Check if ORDER BY or DISTINCT ON references columns not in SELECT
     /// OPTIMIZATION: Use HashSet for O(1) lookup and eq_ignore_ascii_case to avoid allocations
     fn order_by_needs_extra_columns(&self, stmt: &SelectStatement, all_columns: &[String]) -> bool {
-        if stmt.order_by.is_empty() {
+        if stmt.order_by.is_empty() && stmt.distinct_on.is_empty() {
             return false;
         }
 
@@ -1454,6 +1576,34 @@ impl Executor {
             }
         }
 
+        // Check if any DISTINCT ON column is not in SELECT
+        for expr in &stmt.distinct_on {
+            match expr {
+                Expression::Identifier(id) => {
+                    if !select_columns.contains(id.value_lower.as_str())
+                        && all_columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(id.value_lower.as_str()))
+                    {
+                        return true;
+                    }
+                }
+                Expression::QualifiedIdentifier(qi) => {
+                    if !select_columns.contains(qi.name.value_lower.as_str())
+                        && all_columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(qi.name.value_lower.as_str()))
+                    {
+                        return true;
+                    }
+                }
+                _ => {
+                    // Computed expression (e.g., amount + 0) — always needs extra column
+                    return true;
+                }
+            }
+        }
+
         false
     }
 
@@ -1490,6 +1640,11 @@ impl Executor {
 
         // No aggregation or window functions (these are handled separately)
         if classification.has_aggregation || classification.has_window_functions {
+            return None;
+        }
+
+        // No DISTINCT ON — deferred projection would bypass the DISTINCT ON step
+        if classification.has_distinct_on {
             return None;
         }
 
@@ -1593,6 +1748,11 @@ impl Executor {
     ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
         // Must be DISTINCT
         if !stmt.distinct {
+            return Ok(None);
+        }
+
+        // DISTINCT ON uses key-based dedup, not full-row dedup — cannot use index pushdown
+        if !stmt.distinct_on.is_empty() {
             return Ok(None);
         }
 
@@ -3259,6 +3419,7 @@ impl Executor {
             let (projected_rows, _) = self.project_rows_with_order_by(
                 &stmt.columns,
                 &stmt.order_by,
+                &stmt.distinct_on,
                 rows,
                 &all_columns,
                 ctx,
@@ -3275,6 +3436,37 @@ impl Executor {
                         .any(|c| c.eq_ignore_ascii_case(&id.value_lower))
                     {
                         output_columns.push(id.value.to_string());
+                    }
+                }
+            }
+            // Append DISTINCT ON columns not already in output
+            for expr in &stmt.distinct_on {
+                match expr {
+                    Expression::Identifier(id) => {
+                        if !output_columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower))
+                        {
+                            output_columns.push(id.value.to_string());
+                        }
+                    }
+                    Expression::QualifiedIdentifier(qi) => {
+                        if !output_columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&qi.name.value_lower))
+                        {
+                            output_columns.push(qi.name.value.to_string());
+                        }
+                    }
+                    _ => {
+                        // Computed expression — use Display representation as column name
+                        let expr_name = expr.to_string();
+                        if !output_columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&expr_name))
+                        {
+                            output_columns.push(expr_name);
+                        }
                     }
                 }
             }
@@ -5357,6 +5549,7 @@ impl Executor {
                 let select_all = SelectStatement {
                     token: dummy_token("SELECT", TokenType::Keyword),
                     distinct: false,
+                    distinct_on: vec![],
                     columns: vec![Expression::Star(StarExpression {
                         token: dummy_token("*", TokenType::Punctuator),
                     })],
@@ -5395,6 +5588,7 @@ impl Executor {
                 let select_all = SelectStatement {
                     token: dummy_token("SELECT", TokenType::Keyword),
                     distinct: false,
+                    distinct_on: vec![],
                     columns: vec![Expression::Star(StarExpression {
                         token: dummy_token("*", TokenType::Punctuator),
                     })],
@@ -5454,6 +5648,7 @@ impl Executor {
                 let select_all = SelectStatement {
                     token: dummy_token("SELECT", TokenType::Keyword),
                     distinct: false,
+                    distinct_on: vec![],
                     columns: vec![Expression::Star(StarExpression {
                         token: dummy_token("*", TokenType::Punctuator),
                     })],
@@ -5546,6 +5741,7 @@ impl Executor {
             let select_all = SelectStatement {
                 token: dummy_token("SELECT", TokenType::Keyword),
                 distinct: false,
+                distinct_on: vec![],
                 columns: vec![Expression::Star(StarExpression {
                     token: dummy_token("*", TokenType::Punctuator),
                 })],
@@ -6776,6 +6972,7 @@ impl Executor {
         &self,
         select_exprs: &[Expression],
         order_by: &[crate::parser::ast::OrderByExpression],
+        distinct_on: &[Expression],
         mut rows: RowVec,
         all_columns: &[String],
         ctx: &ExecutionContext,
@@ -6814,6 +7011,42 @@ impl Executor {
             }
         }
 
+        // Find DISTINCT ON columns not in SELECT and not already in extra ORDER BY columns
+        // Also collect computed DISTINCT ON expressions that need evaluation
+        let mut computed_distinct_on: Vec<&Expression> = Vec::new();
+        for expr in distinct_on {
+            match expr {
+                Expression::Identifier(id) => {
+                    if !select_column_names
+                        .iter()
+                        .any(|s| s == id.value_lower.as_str())
+                    {
+                        if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
+                            if !extra_order_indices.contains(&idx) {
+                                extra_order_indices.push(idx);
+                            }
+                        }
+                    }
+                }
+                Expression::QualifiedIdentifier(qi) => {
+                    if !select_column_names
+                        .iter()
+                        .any(|s| s == qi.name.value_lower.as_str())
+                    {
+                        if let Some(&idx) = col_index_map_lower.get(qi.name.value_lower.as_str()) {
+                            if !extra_order_indices.contains(&idx) {
+                                extra_order_indices.push(idx);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // Computed expression — needs evaluation and appending
+                    computed_distinct_on.push(expr);
+                }
+            }
+        }
+
         // Build column indices for SELECT expressions
         let mut select_column_indices: Vec<Option<usize>> = Vec::with_capacity(select_exprs.len());
         for expr in select_exprs.iter() {
@@ -6847,8 +7080,9 @@ impl Executor {
             }
         }
 
-        // Check if we can use fast path (all simple column refs)
-        let all_simple = select_column_indices.iter().all(|idx| idx.is_some());
+        // Check if we can use fast path (all simple column refs, no computed DISTINCT ON)
+        let all_simple = select_column_indices.iter().all(|idx| idx.is_some())
+            && computed_distinct_on.is_empty();
 
         if all_simple {
             // Fast path
@@ -6884,9 +7118,11 @@ impl Executor {
             evaluator = evaluator.with_context(ctx);
             evaluator.init_columns(all_columns);
 
+            let total_extra = extra_order_indices.len() + computed_distinct_on.len();
+
             // OPTIMIZATION: Reuse col_index_map_lower for O(1) lookup
             for (row_id, row) in rows.drain_rows().enumerate() {
-                let mut values = Vec::with_capacity(select_exprs.len() + extra_order_indices.len());
+                let mut values = Vec::with_capacity(select_exprs.len() + total_extra);
 
                 evaluator.set_row_array(&row);
 
@@ -6904,6 +7140,14 @@ impl Executor {
                 // Add extra ORDER BY columns
                 for &idx in &extra_order_indices {
                     values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
+                }
+
+                // Evaluate computed DISTINCT ON expressions
+                for expr in &computed_distinct_on {
+                    let value = evaluator
+                        .evaluate(expr)
+                        .unwrap_or_else(|_| Value::null_unknown());
+                    values.push(value);
                 }
 
                 projected.push((row_id as i64, Row::from_values(values)));

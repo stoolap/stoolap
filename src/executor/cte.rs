@@ -388,6 +388,7 @@ impl Executor {
         let anchor_stmt = SelectStatement {
             token: stmt.token.clone(),
             distinct: stmt.distinct,
+            distinct_on: stmt.distinct_on.clone(),
             columns: stmt.columns.clone(),
             with: None,
             table_expr: stmt.table_expr.clone(),
@@ -532,6 +533,7 @@ impl Executor {
         let stmt_without_with = SelectStatement {
             token: stmt.token.clone(),
             distinct: stmt.distinct,
+            distinct_on: stmt.distinct_on.clone(),
             columns: stmt.columns.clone(),
             with: None,
             table_expr: stmt.table_expr.clone(),
@@ -1869,6 +1871,7 @@ impl Executor {
         Some(SelectStatement {
             token: stmt.token.clone(),
             distinct: stmt.distinct,
+            distinct_on: stmt.distinct_on.clone(),
             columns: stmt.columns.clone(),
             with: None, // Remove WITH clause
             table_expr: Some(Box::new(inlined_expr)),

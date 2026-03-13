@@ -1095,6 +1095,7 @@ impl Executor {
             limit: None,
             offset: None,
             distinct: false,
+            distinct_on: vec![],
             with: None,
             window_defs: vec![],
             set_operations: vec![],
@@ -3038,6 +3039,7 @@ impl Executor {
             // additional hashing/sorting overhead. Instead, we collect into HashSet
             // which deduplicates more efficiently for this use case.
             distinct: false,
+            distinct_on: vec![],
             columns: vec![inner_col_expr],
             with: None,
             table_expr: Some(Box::new(table_source)),
@@ -4454,6 +4456,7 @@ mod tests {
         SelectStatement {
             token: tok(),
             distinct: false,
+            distinct_on: vec![],
             columns: vec![],
             with: None,
             table_expr: None,

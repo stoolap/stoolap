@@ -185,7 +185,7 @@ Reads within a transaction see uncommitted changes. Writes are atomic on `COMMIT
 
 The WASM build includes the full SQL engine:
 
-- All SQL features: joins, subqueries, CTEs (including recursive), window functions, aggregations (ROLLUP, CUBE, GROUPING SETS), set operations
+- All SQL features: joins, subqueries, CTEs (including recursive), window functions, aggregations (ROLLUP, CUBE, GROUPING SETS), DISTINCT ON, set operations
 - All data types: INTEGER, FLOAT, TEXT, BOOLEAN, TIMESTAMP, JSON, VECTOR
 - All 127+ built-in functions (string, math, date/time, JSON, hash, vector, aggregate, window)
 - MVCC transactions with snapshot isolation

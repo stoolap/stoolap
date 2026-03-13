@@ -18,7 +18,7 @@ The SELECT statement retrieves data from one or more tables.
 #### Basic Syntax
 
 ```sql
-SELECT [DISTINCT] column1, column2, ...
+SELECT [DISTINCT [ON (expr1, expr2, ...)]] column1, column2, ...
 FROM table_name
 [WHERE condition]
 [GROUP BY column1, ... | ROLLUP(column1, ...) | CUBE(column1, ...) | GROUPING SETS((col1), (col2), ...)]
@@ -30,6 +30,7 @@ FROM table_name
 #### Parameters
 
 - **DISTINCT**: Removes duplicate rows from the result
+- **DISTINCT ON (expr, ...)**: Keeps only the first row per unique combination of the given expressions (PostgreSQL-inspired). Unlike PostgreSQL, Stoolap does not require the DISTINCT ON expressions to match the leftmost ORDER BY columns
 - **column1, column2, ...**: Columns to retrieve; use `*` for all columns
 - **table_name**: The table to query
 - **WHERE condition**: Filter condition
@@ -57,6 +58,11 @@ SELECT * FROM customers LIMIT 10 OFFSET 20;
 
 -- Unique values
 SELECT DISTINCT category FROM products;
+
+-- First row per group (DISTINCT ON)
+SELECT DISTINCT ON (customer_id) customer_id, order_date, total
+FROM orders
+ORDER BY customer_id, order_date DESC;
 
 -- Aggregation
 SELECT category, AVG(price) AS avg_price, COUNT(*) as count

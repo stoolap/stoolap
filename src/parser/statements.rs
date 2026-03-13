@@ -128,6 +128,7 @@ impl Parser {
         let mut stmt = SelectStatement {
             token,
             distinct: false,
+            distinct_on: vec![],
             columns: Vec::new(),
             with: None,
             table_expr: None,
@@ -141,10 +142,11 @@ impl Parser {
             set_operations: Vec::new(),
         };
 
-        // Check for DISTINCT
+        // Check for DISTINCT / DISTINCT ON (expr, ...)
         if self.peek_token_is_keyword("DISTINCT") {
             self.next_token();
             stmt.distinct = true;
+            self.parse_distinct_on(&mut stmt);
         }
 
         // Parse column list
@@ -332,6 +334,7 @@ impl Parser {
         let mut stmt = SelectStatement {
             token,
             distinct: false,
+            distinct_on: vec![],
             columns: Vec::new(),
             with: None,
             table_expr: None,
@@ -345,10 +348,11 @@ impl Parser {
             set_operations: Vec::new(),
         };
 
-        // Check for DISTINCT
+        // Check for DISTINCT / DISTINCT ON (expr, ...)
         if self.peek_token_is_keyword("DISTINCT") {
             self.next_token();
             stmt.distinct = true;
+            self.parse_distinct_on(&mut stmt);
         }
 
         // Parse column list
@@ -1120,6 +1124,47 @@ impl Parser {
         }
 
         (update_columns, update_expressions)
+    }
+
+    /// Parse DISTINCT ON (expr1, expr2, ...) if present after DISTINCT keyword.
+    fn parse_distinct_on(&mut self, stmt: &mut SelectStatement) {
+        if self.peek_token_is_keyword("ON") {
+            self.next_token(); // consume ON
+            if self.peek_token_is_punctuator("(") {
+                self.next_token(); // consume (
+                stmt.distinct_on = self.parse_distinct_on_columns();
+                if !self.peek_token_is_punctuator(")") {
+                    self.add_error(format!(
+                        "expected ')' after DISTINCT ON columns at {}",
+                        self.peek_token.position
+                    ));
+                    return;
+                }
+                self.next_token(); // consume )
+            } else {
+                self.add_error(format!(
+                    "expected '(' after DISTINCT ON at {}",
+                    self.peek_token.position
+                ));
+            }
+        }
+    }
+
+    /// Parse comma-separated expression list inside DISTINCT ON (...)
+    fn parse_distinct_on_columns(&mut self) -> Vec<Expression> {
+        let mut exprs = Vec::new();
+        self.next_token();
+        if let Some(expr) = self.parse_expression(Precedence::Lowest) {
+            exprs.push(expr);
+        }
+        while self.peek_token_is_punctuator(",") {
+            self.next_token(); // consume comma
+            self.next_token(); // move to next expression
+            if let Some(expr) = self.parse_expression(Precedence::Lowest) {
+                exprs.push(expr);
+            }
+        }
+        exprs
     }
 
     /// Parse RETURNING clause for INSERT/UPDATE/DELETE statements

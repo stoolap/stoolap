@@ -68,6 +68,8 @@ pub struct QueryClassification {
     pub has_offset: bool,
     /// Whether the query has DISTINCT
     pub has_distinct: bool,
+    /// Whether the query has DISTINCT ON (expr, ...)
+    pub has_distinct_on: bool,
     /// Whether the query has CTEs (WITH clause)
     pub has_cte: bool,
     /// Whether the query has set operations (UNION, etc.)
@@ -143,6 +145,7 @@ impl QueryClassification {
         let has_limit = stmt.limit.is_some();
         let has_offset = stmt.offset.is_some();
         let has_distinct = stmt.distinct;
+        let has_distinct_on = !stmt.distinct_on.is_empty();
         let has_cte = stmt.with.is_some();
         let has_set_operations = !stmt.set_operations.is_empty();
         let has_having = stmt.having.is_some();
@@ -223,6 +226,7 @@ impl QueryClassification {
             has_limit,
             has_offset,
             has_distinct,
+            has_distinct_on,
             has_cte,
             has_set_operations,
             has_having,
@@ -1132,6 +1136,7 @@ mod tests {
             token: dummy_token(),
             with: None,
             distinct: false,
+            distinct_on: vec![],
             columns: vec![Expression::Star(StarExpression {
                 token: dummy_token(),
             })],

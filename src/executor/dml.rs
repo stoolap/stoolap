@@ -218,6 +218,7 @@ impl Executor {
         let select_stmt = SelectStatement {
             token: dummy_token_clone(),
             distinct: false,
+            distinct_on: vec![],
             columns: vec![Expression::Identifier(Identifier::new(
                 dummy_token_clone(),
                 pk_column_name.clone(),

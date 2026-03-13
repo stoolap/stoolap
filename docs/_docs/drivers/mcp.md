@@ -320,6 +320,7 @@ The MCP server exposes the full Stoolap SQL surface:
 - **Index types**: BTree, Hash, Bitmap, HNSW (vector), Unique, Composite
 - **Vector search**: k-NN with L2, cosine, inner product distances and HNSW indexing
 - **EXPLAIN / EXPLAIN ANALYZE** for query plan inspection
+- **DISTINCT ON**: Per-group deduplication (PostgreSQL-inspired, no leading ORDER BY restriction)
 - **Set operations**: UNION [ALL], INTERSECT [ALL], EXCEPT [ALL]
 
 ## Safety

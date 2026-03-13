@@ -1371,6 +1371,122 @@ impl QueryResult for DistinctResult {
     }
 }
 
+/// DISTINCT ON result — keeps only the first row per unique combination
+/// of the specified key columns. Uses hash-based deduplication so the input
+/// does not need to be sorted by the key columns (ORDER BY controls which
+/// row is "first" because the input stream preserves ORDER BY order).
+/// Memory usage is O(groups) where groups is the number of unique key
+/// combinations, not total rows.
+pub struct DistinctOnResult {
+    inner: Box<dyn QueryResult>,
+    columns: Vec<String>,
+    /// Column indices that form the DISTINCT ON key
+    key_indices: Vec<usize>,
+    /// Seen keys: hash -> list of key values (for collision handling)
+    seen: FxHashMap<u64, Vec<Vec<Value>>>,
+    current_row: Row,
+    has_current: bool,
+}
+
+impl DistinctOnResult {
+    pub fn new(inner: Box<dyn QueryResult>, key_indices: Vec<usize>) -> Self {
+        let columns = inner.columns().to_vec();
+        Self {
+            inner,
+            columns,
+            key_indices,
+            seen: FxHashMap::default(),
+            current_row: Row::new(),
+            has_current: false,
+        }
+    }
+
+    fn extract_key(&self, row: &Row) -> Vec<Value> {
+        self.key_indices
+            .iter()
+            .map(|&i| row.get(i).cloned().unwrap_or_else(Value::null_unknown))
+            .collect()
+    }
+
+    fn hash_key(&self, key: &[Value]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = FxHasher::default();
+        for value in key {
+            value.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+}
+
+impl QueryResult for DistinctOnResult {
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    fn next(&mut self) -> bool {
+        while self.inner.next() {
+            let row = self.inner.row();
+            let key = self.extract_key(row);
+            let hash = self.hash_key(&key);
+
+            // Check if we've seen this key before
+            let is_dup = if let Some(seen_keys) = self.seen.get(&hash) {
+                seen_keys.contains(&key)
+            } else {
+                false
+            };
+
+            if is_dup {
+                continue; // already emitted a row for this group
+            }
+
+            self.seen.entry(hash).or_default().push(key);
+            self.current_row = self.inner.take_row();
+            self.has_current = true;
+            return true;
+        }
+        self.has_current = false;
+        false
+    }
+
+    fn scan(&self, dest: &mut [Value]) -> Result<()> {
+        if !self.has_current {
+            return Ok(());
+        }
+        let len = dest.len().min(self.current_row.len());
+        for (i, v) in self.current_row.iter().take(len).enumerate() {
+            dest[i] = v.clone();
+        }
+        Ok(())
+    }
+
+    fn row(&self) -> &Row {
+        &self.current_row
+    }
+
+    fn take_row(&mut self) -> Row {
+        self.has_current = false;
+        std::mem::take(&mut self.current_row)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.seen.clear();
+        self.inner.close()
+    }
+
+    fn rows_affected(&self) -> i64 {
+        0
+    }
+
+    fn last_insert_id(&self) -> i64 {
+        0
+    }
+
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
+        Box::new(AliasedResult::new(self, aliases))
+    }
+}
+
 /// Aliased result that renames columns
 pub struct AliasedResult {
     /// Underlying result

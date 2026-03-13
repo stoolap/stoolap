@@ -604,6 +604,7 @@ mod tests {
             token: dummy_token(),
             with: None,
             distinct: false,
+            distinct_on: vec![],
             columns: vec![Expression::Star(StarExpression {
                 token: star_token(),
             })],

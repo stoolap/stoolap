@@ -1488,6 +1488,8 @@ impl fmt::Display for GroupByClause {
 pub struct SelectStatement {
     pub token: Token,
     pub distinct: bool,
+    /// DISTINCT ON (expr1, expr2, ...) expressions. Empty for regular DISTINCT or no DISTINCT.
+    pub distinct_on: Vec<Expression>,
     pub columns: Vec<Expression>,
     pub with: Option<WithClause>,
     pub table_expr: Option<Box<Expression>>,
@@ -1510,7 +1512,10 @@ impl fmt::Display for SelectStatement {
             result.push_str(&format!("{} ", with));
         }
         result.push_str("SELECT ");
-        if self.distinct {
+        if !self.distinct_on.is_empty() {
+            let on_cols: Vec<String> = self.distinct_on.iter().map(|e| e.to_string()).collect();
+            result.push_str(&format!("DISTINCT ON ({}) ", on_cols.join(", ")));
+        } else if self.distinct {
             result.push_str("DISTINCT ");
         }
         let cols: Vec<String> = self.columns.iter().map(|c| c.to_string()).collect();
@@ -2410,6 +2415,7 @@ mod tests {
         let stmt = SelectStatement {
             token: make_token(TokenType::Keyword, "SELECT"),
             distinct: false,
+            distinct_on: vec![],
             columns: vec![Expression::Star(StarExpression {
                 token: make_token(TokenType::Operator, "*"),
             })],

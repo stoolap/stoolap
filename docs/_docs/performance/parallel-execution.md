@@ -32,6 +32,7 @@ Stoolap automatically parallelizes operations based on data size:
 | **Hash Join** | 10,000 rows | Parallel hash build and probe |
 | **ORDER BY** | 50,000 rows | Parallel sorting |
 | **DISTINCT** | 10,000 rows | Two-phase parallel deduplication |
+| **DISTINCT ON** | N/A | Hash-based O(groups) dedup after sort (not parallelized) |
 
 ## Architecture Components
 
