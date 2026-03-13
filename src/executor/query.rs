@@ -441,11 +441,18 @@ impl Executor {
                                 _ => {}
                             }
                         }
-                        // Fallback: try matching against column names
-                        let base_name = qid.name.value_lower.clone();
+                        // Fallback: try full qualified name first, then unqualified
+                        let full_name =
+                            format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                        if let Some(pos) = columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(&full_name))
+                        {
+                            return Some(pos);
+                        }
                         columns
                             .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&base_name))
+                            .position(|c| c.eq_ignore_ascii_case(&qid.name.value_lower))
                     }
                     Expression::IntegerLiteral(lit) => Some((lit.value as usize).saturating_sub(1)),
                     Expression::FunctionCall(func) => {
@@ -909,16 +916,55 @@ impl Executor {
                         None
                     }
                     Expression::QualifiedIdentifier(qi) => {
-                        // Match table.column — try full qualified name first, then just column
+                        // Match table.column — try full qualified name first
                         let full = format!("{}.{}", qi.qualifier, qi.name);
-                        result_columns
+                        let qualified_match = result_columns
                             .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&full))
-                            .or_else(|| {
-                                result_columns
-                                    .iter()
-                                    .position(|c| c.eq_ignore_ascii_case(&qi.name.value))
-                            })
+                            .position(|c| c.eq_ignore_ascii_case(&full));
+                        if qualified_match.is_some() {
+                            return qualified_match;
+                        }
+                        // Second: check SELECT expressions for the source column behind
+                        // aliases or projections (e.g., c.name AS customer, or bare c.name
+                        // projected as "name")
+                        if let Some(sel_exprs) = select_exprs {
+                            for (i, sel) in sel_exprs.iter().enumerate() {
+                                match sel {
+                                    Expression::QualifiedIdentifier(sel_qi) => {
+                                        if sel_qi.qualifier.value_lower == qi.qualifier.value_lower
+                                            && sel_qi.name.value_lower == qi.name.value_lower
+                                        {
+                                            return Some(i);
+                                        }
+                                    }
+                                    Expression::Aliased(aliased) => {
+                                        if let Expression::QualifiedIdentifier(sel_qi) =
+                                            &*aliased.expression
+                                        {
+                                            if sel_qi.qualifier.value_lower
+                                                == qi.qualifier.value_lower
+                                                && sel_qi.name.value_lower == qi.name.value_lower
+                                            {
+                                                return Some(i);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        // Last resort: unqualified only if unambiguous (exactly one match)
+                        let unqualified_matches: Vec<usize> = result_columns
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.eq_ignore_ascii_case(&qi.name.value))
+                            .map(|(i, _)| i)
+                            .collect();
+                        if unqualified_matches.len() == 1 {
+                            Some(unqualified_matches[0])
+                        } else {
+                            None
+                        }
                     }
                     Expression::IntegerLiteral(lit) => {
                         // 1-based positional reference
@@ -1554,25 +1600,58 @@ impl Executor {
         }
 
         // Get SELECT column names (lowercase) using HashSet for O(1) lookup
-        let select_columns: FxHashSet<String> = stmt
+        // Include both unqualified and fully qualified names for disambiguation
+        let mut select_columns: FxHashSet<String> = stmt
             .columns
             .iter()
             .filter_map(|expr| self.extract_select_column_name(expr))
             .map(|s| s.to_lowercase())
             .collect();
+        // Also add qualified names for join column disambiguation
+        for expr in &stmt.columns {
+            match expr {
+                Expression::QualifiedIdentifier(qi) => {
+                    select_columns.insert(format!(
+                        "{}.{}",
+                        qi.qualifier.value_lower, qi.name.value_lower
+                    ));
+                }
+                Expression::Aliased(a) => {
+                    if let Expression::QualifiedIdentifier(qi) = &*a.expression {
+                        select_columns.insert(format!(
+                            "{}.{}",
+                            qi.qualifier.value_lower, qi.name.value_lower
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
 
         // Check if any ORDER BY column is not in SELECT
         for ob in &stmt.order_by {
-            if let Expression::Identifier(id) = &ob.expression {
-                if !select_columns.contains(id.value_lower.as_str()) {
-                    // Verify this column exists in the table (use eq_ignore_ascii_case to avoid allocation)
-                    if all_columns
-                        .iter()
-                        .any(|c| c.eq_ignore_ascii_case(id.value_lower.as_str()))
+            match &ob.expression {
+                Expression::Identifier(id) => {
+                    if !select_columns.contains(id.value_lower.as_str())
+                        && all_columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(id.value_lower.as_str()))
                     {
                         return true;
                     }
                 }
+                Expression::QualifiedIdentifier(qi) => {
+                    let full_name = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
+                    if !select_columns.contains(full_name.as_str())
+                        && all_columns.iter().any(|c| {
+                            c.eq_ignore_ascii_case(&full_name)
+                                || c.eq_ignore_ascii_case(qi.name.value_lower.as_str())
+                        })
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -1589,10 +1668,14 @@ impl Executor {
                     }
                 }
                 Expression::QualifiedIdentifier(qi) => {
-                    if !select_columns.contains(qi.name.value_lower.as_str())
-                        && all_columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(qi.name.value_lower.as_str()))
+                    let full_name = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
+                    // For qualified identifiers, only match the fully qualified name
+                    // to avoid ambiguity when both tables have the same column name
+                    if !select_columns.contains(full_name.as_str())
+                        && all_columns.iter().any(|c| {
+                            c.eq_ignore_ascii_case(&full_name)
+                                || c.eq_ignore_ascii_case(qi.name.value_lower.as_str())
+                        })
                     {
                         return true;
                     }
@@ -3451,11 +3534,15 @@ impl Executor {
                         }
                     }
                     Expression::QualifiedIdentifier(qi) => {
+                        let full_name =
+                            format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
+                        // Only match full qualified name to avoid ambiguity
                         if !output_columns
                             .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&qi.name.value_lower))
+                            .any(|c| c.eq_ignore_ascii_case(&full_name))
                         {
-                            output_columns.push(qi.name.value.to_string());
+                            output_columns
+                                .push(format!("{}.{}", qi.qualifier.value, qi.name.value));
                         }
                     }
                     _ => {
@@ -4699,21 +4786,117 @@ impl Executor {
             return Ok((result, columns, false, None));
         }
 
-        // Project rows according to SELECT expressions
-        let projected_rows = self.project_rows_with_alias(
-            &stmt.columns,
-            final_rows,
-            &final_columns,
-            None,
-            ctx,
-            None,
-        )?;
+        // Check if ORDER BY or DISTINCT ON references columns not in SELECT
+        let join_needs_extra_columns = self.order_by_needs_extra_columns(stmt, &final_columns);
 
-        // Determine output column names
-        // Note: For JOIN results, columns are already qualified (e.g., "a.id", "b.id"),
-        // so we pass None for table_alias - the prefix matching will work
-        let output_columns =
-            CompactArc::new(self.get_output_column_names(&stmt.columns, &final_columns, None));
+        // Project rows according to SELECT expressions
+        let (projected_rows, output_columns) = if join_needs_extra_columns {
+            // Use projection that preserves extra ORDER BY / DISTINCT ON columns
+            let (projected_rows, _) = self.project_rows_with_order_by(
+                &stmt.columns,
+                &stmt.order_by,
+                &stmt.distinct_on,
+                final_rows,
+                &final_columns,
+                ctx,
+            )?;
+            let mut output_columns =
+                self.get_output_column_names(&stmt.columns, &final_columns, None);
+            // Build a set of qualified names from SELECT for accurate "already present" checks.
+            // This mirrors the select_column_names logic in project_rows_with_order_by.
+            let mut select_qualified_names: Vec<String> = Vec::new();
+            for expr in &stmt.columns {
+                match expr {
+                    Expression::QualifiedIdentifier(qi) => {
+                        select_qualified_names.push(format!(
+                            "{}.{}",
+                            qi.qualifier.value_lower, qi.name.value_lower
+                        ));
+                    }
+                    Expression::Aliased(a) => {
+                        if let Expression::QualifiedIdentifier(qi) = &*a.expression {
+                            select_qualified_names.push(format!(
+                                "{}.{}",
+                                qi.qualifier.value_lower, qi.name.value_lower
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Append extra ORDER BY columns not in SELECT
+            for ob in &stmt.order_by {
+                match &ob.expression {
+                    Expression::Identifier(id) => {
+                        if !output_columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower))
+                        {
+                            output_columns.push(id.value.to_string());
+                        }
+                    }
+                    Expression::QualifiedIdentifier(qi) => {
+                        let full = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
+                        // Check both output_columns and select qualified names
+                        if !output_columns.iter().any(|c| c.eq_ignore_ascii_case(&full))
+                            && !select_qualified_names.contains(&full)
+                        {
+                            output_columns
+                                .push(format!("{}.{}", qi.qualifier.value, qi.name.value));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Append extra DISTINCT ON columns not in SELECT
+            for expr in &stmt.distinct_on {
+                match expr {
+                    Expression::Identifier(id) => {
+                        if !output_columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower))
+                        {
+                            output_columns.push(id.value.to_string());
+                        }
+                    }
+                    Expression::QualifiedIdentifier(qi) => {
+                        let full = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
+                        // Check both output_columns and select qualified names
+                        if !output_columns.iter().any(|c| c.eq_ignore_ascii_case(&full))
+                            && !select_qualified_names.contains(&full)
+                        {
+                            output_columns
+                                .push(format!("{}.{}", qi.qualifier.value, qi.name.value));
+                        }
+                    }
+                    _ => {
+                        let expr_name = expr.to_string();
+                        if !output_columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&expr_name))
+                        {
+                            output_columns.push(expr_name);
+                        }
+                    }
+                }
+            }
+            (projected_rows, CompactArc::new(output_columns))
+        } else {
+            let projected_rows = self.project_rows_with_alias(
+                &stmt.columns,
+                final_rows,
+                &final_columns,
+                None,
+                ctx,
+                None,
+            )?;
+            // Determine output column names
+            // Note: For JOIN results, columns are already qualified (e.g., "a.id", "b.id"),
+            // so we pass None for table_alias - the prefix matching will work
+            let output_columns =
+                CompactArc::new(self.get_output_column_names(&stmt.columns, &final_columns, None));
+            (projected_rows, output_columns)
+        };
 
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
@@ -6990,24 +7173,66 @@ impl Executor {
         // Get SELECT column names (lowercase) for checking duplicates
         let select_column_names: Vec<String> = select_exprs
             .iter()
-            .filter_map(|expr| self.extract_select_column_name(expr))
-            .map(|s| s.to_lowercase())
+            .flat_map(|expr| {
+                let mut names = Vec::new();
+                // Add unqualified name
+                if let Some(name) = self.extract_select_column_name(expr) {
+                    names.push(name.to_lowercase());
+                }
+                // Also add fully qualified name for disambiguation
+                match expr {
+                    Expression::QualifiedIdentifier(qi) => {
+                        names.push(format!(
+                            "{}.{}",
+                            qi.qualifier.value_lower, qi.name.value_lower
+                        ));
+                    }
+                    Expression::Aliased(a) => {
+                        if let Expression::QualifiedIdentifier(qi) = &*a.expression {
+                            names.push(format!(
+                                "{}.{}",
+                                qi.qualifier.value_lower, qi.name.value_lower
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                names
+            })
             .collect();
 
         // Find ORDER BY columns not in SELECT
         let mut extra_order_indices: Vec<usize> = Vec::new();
         for ob in order_by {
-            if let Expression::Identifier(id) = &ob.expression {
-                if !select_column_names
-                    .iter()
-                    .any(|s| s == id.value_lower.as_str())
-                {
-                    if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
-                        if !extra_order_indices.contains(&idx) {
-                            extra_order_indices.push(idx);
+            match &ob.expression {
+                Expression::Identifier(id) => {
+                    if !select_column_names
+                        .iter()
+                        .any(|s| s == id.value_lower.as_str())
+                    {
+                        if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
+                            if !extra_order_indices.contains(&idx) {
+                                extra_order_indices.push(idx);
+                            }
                         }
                     }
                 }
+                Expression::QualifiedIdentifier(qi) => {
+                    let full_name = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
+                    // Only match against full qualified name in SELECT to avoid ambiguity
+                    if !select_column_names.contains(&full_name) {
+                        // Prefer fully qualified lookup
+                        let idx_opt = col_index_map_lower
+                            .get(full_name.as_str())
+                            .or_else(|| col_index_map_lower.get(qi.name.value_lower.as_str()));
+                        if let Some(&idx) = idx_opt {
+                            if !extra_order_indices.contains(&idx) {
+                                extra_order_indices.push(idx);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -7029,11 +7254,15 @@ impl Executor {
                     }
                 }
                 Expression::QualifiedIdentifier(qi) => {
-                    if !select_column_names
-                        .iter()
-                        .any(|s| s == qi.name.value_lower.as_str())
-                    {
-                        if let Some(&idx) = col_index_map_lower.get(qi.name.value_lower.as_str()) {
+                    let full_name = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
+                    // For qualified identifiers, only match against the full qualified name
+                    // in SELECT to avoid ambiguity (e.g., c.name vs p.name)
+                    if !select_column_names.contains(&full_name) {
+                        // Prefer fully qualified lookup to avoid binding to wrong column
+                        let idx_opt = col_index_map_lower
+                            .get(full_name.as_str())
+                            .or_else(|| col_index_map_lower.get(qi.name.value_lower.as_str()));
+                        if let Some(&idx) = idx_opt {
                             if !extra_order_indices.contains(&idx) {
                                 extra_order_indices.push(idx);
                             }
@@ -7056,9 +7285,12 @@ impl Executor {
                         .push(col_index_map_lower.get(id.value_lower.as_str()).copied());
                 }
                 Expression::QualifiedIdentifier(qid) => {
+                    // Prefer full qualified name to handle same-named columns across tables
+                    let full = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
                     select_column_indices.push(
                         col_index_map_lower
-                            .get(qid.name.value_lower.as_str())
+                            .get(full.as_str())
+                            .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))
                             .copied(),
                     );
                 }
@@ -7068,9 +7300,12 @@ impl Executor {
                             .push(col_index_map_lower.get(id.value_lower.as_str()).copied());
                     }
                     Expression::QualifiedIdentifier(qid) => {
+                        let full =
+                            format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
                         select_column_indices.push(
                             col_index_map_lower
-                                .get(qid.name.value_lower.as_str())
+                                .get(full.as_str())
+                                .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))
                                 .copied(),
                         );
                     }

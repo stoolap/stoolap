@@ -948,6 +948,7 @@ fn compute_classification_key(stmt: &SelectStatement) -> u64 {
 
     // Hash structural properties
     stmt.distinct.hash(&mut hasher);
+    stmt.distinct_on.len().hash(&mut hasher);
     stmt.columns.len().hash(&mut hasher);
     stmt.group_by.columns.len().hash(&mut hasher);
     stmt.order_by.len().hash(&mut hasher);
@@ -956,6 +957,11 @@ fn compute_classification_key(stmt: &SelectStatement) -> u64 {
     stmt.having.is_some().hash(&mut hasher);
     stmt.with.is_some().hash(&mut hasher);
     stmt.set_operations.len().hash(&mut hasher);
+
+    // Hash DISTINCT ON expression structures
+    for expr in &stmt.distinct_on {
+        hash_expression_structure(expr, &mut hasher);
+    }
 
     // Hash column expression types (not values)
     for col in &stmt.columns {

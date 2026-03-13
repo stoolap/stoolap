@@ -715,3 +715,243 @@ fn test_distinct_on_alias_shadow_ambiguity() {
     assert_eq!(rows[1][0], "Bob");
     assert_eq!(rows[1][1], "30");
 }
+
+#[test]
+fn test_distinct_on_qualified_key_not_in_select_join() {
+    let db = Database::open("memory://distinct_on_qual_key_join").unwrap();
+
+    db.execute(
+        "CREATE TABLE customers2 (id INTEGER PRIMARY KEY, name TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE purchases2 (id INTEGER PRIMARY KEY, customer_id INTEGER, amount FLOAT)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO customers2 VALUES (1, 'Alice')", ())
+        .unwrap();
+    db.execute("INSERT INTO customers2 VALUES (2, 'Bob')", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases2 VALUES (1, 1, 100.0)", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases2 VALUES (2, 1, 200.0)", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases2 VALUES (3, 2, 150.0)", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases2 VALUES (4, 2, 300.0)", ())
+        .unwrap();
+
+    // DISTINCT ON (c.name) where c.name is NOT in SELECT — only p.amount is selected.
+    // The qualified key must be materialized as an extra column for dedup.
+    let rows = collect_rows(
+        &db,
+        "SELECT DISTINCT ON (c.name) p.amount \
+         FROM customers2 c JOIN purchases2 p ON c.id = p.customer_id \
+         ORDER BY c.name, p.amount DESC",
+    );
+
+    assert_eq!(rows.len(), 2, "One row per customer");
+    // Alice's highest = 200, Bob's highest = 300
+    assert_eq!(rows[0], vec!["200"]);
+    assert_eq!(rows[1], vec!["300"]);
+}
+
+#[test]
+fn test_distinct_on_qualified_key_same_column_name_join() {
+    let db = Database::open("memory://distinct_on_qual_same_name").unwrap();
+
+    db.execute(
+        "CREATE TABLE customers3 (id INTEGER PRIMARY KEY, name TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE purchases3 (id INTEGER PRIMARY KEY, customer_id INTEGER, name TEXT)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO customers3 VALUES (1, 'Alice')", ())
+        .unwrap();
+    db.execute("INSERT INTO customers3 VALUES (2, 'Bob')", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases3 VALUES (1, 1, 'X')", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases3 VALUES (2, 1, 'Y')", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases3 VALUES (3, 2, 'Z')", ())
+        .unwrap();
+
+    // Both tables have a "name" column. DISTINCT ON (c.name) must bind to customers3.name,
+    // NOT purchases3.name. Should return one row per customer (Alice, Bob).
+    let rows = collect_rows(
+        &db,
+        "SELECT DISTINCT ON (c.name) p.name \
+         FROM customers3 c JOIN purchases3 p ON c.id = p.customer_id \
+         ORDER BY c.name, p.name DESC",
+    );
+
+    assert_eq!(rows.len(), 2, "One row per customer");
+    // Alice (c.name='Alice'): purchases Y, X -> DESC -> first is Y
+    // Bob (c.name='Bob'): purchase Z -> Z
+    assert_eq!(rows[0], vec!["Y"]);
+    assert_eq!(rows[1], vec!["Z"]);
+}
+
+#[test]
+fn test_distinct_on_qualified_key_both_selected_join() {
+    // Regression: DISTINCT ON (c.name) when both c.name and p.name are in SELECT.
+    // Both project as bare "name" in result_columns, so resolve_distinct_on_indices
+    // must fall back to select_exprs to find the correct column position.
+    let db = Database::open("memory://distinct_on_qual_both_sel").unwrap();
+
+    db.execute(
+        "CREATE TABLE customers5 (id INTEGER PRIMARY KEY, name TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE purchases5 (id INTEGER PRIMARY KEY, customer_id INTEGER, name TEXT)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO customers5 VALUES (1, 'Alice')", ())
+        .unwrap();
+    db.execute("INSERT INTO customers5 VALUES (2, 'Bob')", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases5 VALUES (1, 1, 'X')", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases5 VALUES (2, 1, 'Y')", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases5 VALUES (3, 2, 'Z')", ())
+        .unwrap();
+
+    // Both c.name and p.name selected — dedup must be on c.name (column 0), not p.name
+    let rows = collect_rows(
+        &db,
+        "SELECT DISTINCT ON (c.name) c.name, p.name \
+         FROM customers5 c JOIN purchases5 p ON c.id = p.customer_id \
+         ORDER BY c.name, p.name DESC",
+    );
+
+    assert_eq!(rows.len(), 2, "One row per customer");
+    assert_eq!(rows[0], vec!["Alice", "Y"]); // Alice's highest p.name DESC
+    assert_eq!(rows[1], vec!["Bob", "Z"]);
+}
+
+#[test]
+fn test_distinct_on_qualified_key_aliased_join() {
+    // Regression: DISTINCT ON (c.name) when c.name is aliased as "customer".
+    // result_columns has "customer", not "c.name", so resolve_distinct_on_indices
+    // must check select_exprs to find the aliased source.
+    let db = Database::open("memory://distinct_on_qual_alias").unwrap();
+
+    db.execute(
+        "CREATE TABLE customers6 (id INTEGER PRIMARY KEY, name TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE purchases6 (id INTEGER PRIMARY KEY, customer_id INTEGER, name TEXT)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO customers6 VALUES (1, 'Alice')", ())
+        .unwrap();
+    db.execute("INSERT INTO customers6 VALUES (2, 'Bob')", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases6 VALUES (1, 1, 'X')", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases6 VALUES (2, 1, 'Y')", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases6 VALUES (3, 2, 'Z')", ())
+        .unwrap();
+
+    let rows = collect_rows(
+        &db,
+        "SELECT DISTINCT ON (c.name) c.name AS customer, p.name \
+         FROM customers6 c JOIN purchases6 p ON c.id = p.customer_id \
+         ORDER BY c.name, p.name DESC",
+    );
+
+    assert_eq!(rows.len(), 2, "One row per customer");
+    assert_eq!(rows[0], vec!["Alice", "Y"]);
+    assert_eq!(rows[1], vec!["Bob", "Z"]);
+}
+
+#[test]
+fn test_qualified_order_by_extra_columns_join() {
+    // Regression: ORDER BY c.name (QualifiedIdentifier not in SELECT) must be
+    // materialized as an extra column so the sort sees c.name, not just p.amount.
+    let db = Database::open("memory://qual_ob_extra_join").unwrap();
+
+    db.execute(
+        "CREATE TABLE customers4 (id INTEGER PRIMARY KEY, name TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE purchases4 (id INTEGER PRIMARY KEY, customer_id INTEGER, amount FLOAT)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO customers4 VALUES (1, 'Alice')", ())
+        .unwrap();
+    db.execute("INSERT INTO customers4 VALUES (2, 'Bob')", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases4 VALUES (1, 1, 100.0)", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases4 VALUES (2, 1, 200.0)", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases4 VALUES (3, 2, 150.0)", ())
+        .unwrap();
+    db.execute("INSERT INTO purchases4 VALUES (4, 2, 300.0)", ())
+        .unwrap();
+
+    // ORDER BY c.name ASC, p.amount DESC — c.name is NOT in SELECT
+    let rows = collect_rows(
+        &db,
+        "SELECT p.amount \
+         FROM customers4 c JOIN purchases4 p ON c.id = p.customer_id \
+         ORDER BY c.name, p.amount DESC",
+    );
+
+    // Alice(200, 100), Bob(300, 150)
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0], vec!["200"]);
+    assert_eq!(rows[1], vec!["100"]);
+    assert_eq!(rows[2], vec!["300"]);
+    assert_eq!(rows[3], vec!["150"]);
+}
+
+#[test]
+fn test_distinct_on_classification_cache_separation() {
+    let db = setup_db("distinct_on_cache_sep");
+
+    // Run plain DISTINCT first — this populates the classification cache
+    let rows1 = collect_rows(
+        &db,
+        "SELECT DISTINCT customer, amount FROM orders ORDER BY customer LIMIT 2",
+    );
+    // Should return 2 distinct (customer, amount) pairs
+    assert_eq!(rows1.len(), 2);
+
+    // Now run DISTINCT ON with the same columns — must NOT reuse the cached
+    // classification from the plain DISTINCT query
+    let rows2 = collect_rows(
+        &db,
+        "SELECT DISTINCT ON (customer) customer, amount FROM orders ORDER BY customer, amount DESC LIMIT 2",
+    );
+
+    assert_eq!(rows2.len(), 2, "Should return first 2 customers");
+    assert_eq!(rows2[0][0], "Alice");
+    assert_eq!(rows2[0][1], "200"); // Alice's highest
+    assert_eq!(rows2[1][0], "Bob");
+    assert_eq!(rows2[1][1], "300"); // Bob's highest
+}
