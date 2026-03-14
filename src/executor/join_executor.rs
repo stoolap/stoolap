@@ -712,7 +712,7 @@ impl JoinExecutor {
                 // For INNER joins, simply filter rows
                 for cond in &analysis.residual_conditions {
                     let filter = RowFilter::new(cond, all_columns)?.with_context(ctx);
-                    rows.retain(|(_, row)| filter.matches(row));
+                    filter.retain_checked(&mut rows)?;
                 }
             } else {
                 // For OUTER joins, need special NULL-padding handling
@@ -915,20 +915,32 @@ impl JoinExecutor {
             // Apply residual filters - specialized unrolling for common cases (1-4 filters)
             if has_filters {
                 let pass = match residual_filters.len() {
-                    1 => residual_filters[0].matches(&row),
-                    2 => residual_filters[0].matches(&row) && residual_filters[1].matches(&row),
+                    1 => residual_filters[0].matches_checked(&row)?,
+                    2 => {
+                        residual_filters[0].matches_checked(&row)?
+                            && residual_filters[1].matches_checked(&row)?
+                    }
                     3 => {
-                        residual_filters[0].matches(&row)
-                            && residual_filters[1].matches(&row)
-                            && residual_filters[2].matches(&row)
+                        residual_filters[0].matches_checked(&row)?
+                            && residual_filters[1].matches_checked(&row)?
+                            && residual_filters[2].matches_checked(&row)?
                     }
                     4 => {
-                        residual_filters[0].matches(&row)
-                            && residual_filters[1].matches(&row)
-                            && residual_filters[2].matches(&row)
-                            && residual_filters[3].matches(&row)
+                        residual_filters[0].matches_checked(&row)?
+                            && residual_filters[1].matches_checked(&row)?
+                            && residual_filters[2].matches_checked(&row)?
+                            && residual_filters[3].matches_checked(&row)?
                     }
-                    _ => residual_filters.iter().all(|f| f.matches(&row)),
+                    _ => {
+                        let mut all_pass = true;
+                        for f in residual_filters {
+                            if !f.matches_checked(&row)? {
+                                all_pass = false;
+                                break;
+                            }
+                        }
+                        all_pass
+                    }
                 };
                 if !pass {
                     continue;
@@ -972,39 +984,36 @@ impl JoinExecutor {
 
             if is_left_outer || is_right_outer || is_full_outer {
                 // For OUTER joins, replace non-matching rows with NULL-padded versions
-                rows = rows
-                    .into_iter()
-                    .map(|(row_id, row)| {
-                        if filter.matches(&row) {
-                            (row_id, row)
+                let mut new_rows = RowVec::with_capacity(rows.len());
+                for (row_id, row) in rows {
+                    if filter.matches_checked(&row)? {
+                        new_rows.push((row_id, row));
+                    } else {
+                        // Convert to NULL-padded row
+                        if is_left_outer {
+                            // Keep left, NULL right
+                            let mut new_values: CompactVec<Value> =
+                                CompactVec::with_capacity(left_col_count + right_col_count);
+                            new_values.extend(row.iter().take(left_col_count).cloned());
+                            new_values.extend(std::iter::repeat_n(NULL_VALUE, right_col_count));
+                            new_rows.push((row_id, Row::from_compact_vec(new_values)));
+                        } else if is_right_outer {
+                            // NULL left, keep right
+                            let mut new_values: CompactVec<Value> =
+                                CompactVec::with_capacity(left_col_count + right_col_count);
+                            new_values.extend(std::iter::repeat_n(NULL_VALUE, left_col_count));
+                            new_values.extend(row.iter().skip(left_col_count).cloned());
+                            new_rows.push((row_id, Row::from_compact_vec(new_values)));
                         } else {
-                            // Convert to NULL-padded row
-                            if is_left_outer {
-                                // Keep left, NULL right
-                                // Use CompactVec directly to avoid Vec→CompactVec conversion
-                                let mut new_values: CompactVec<Value> =
-                                    CompactVec::with_capacity(left_col_count + right_col_count);
-                                new_values.extend(row.iter().take(left_col_count).cloned());
-                                new_values.extend(std::iter::repeat_n(NULL_VALUE, right_col_count));
-                                (row_id, Row::from_compact_vec(new_values))
-                            } else if is_right_outer {
-                                // NULL left, keep right
-                                // Use CompactVec directly to avoid Vec→CompactVec conversion
-                                let mut new_values: CompactVec<Value> =
-                                    CompactVec::with_capacity(left_col_count + right_col_count);
-                                new_values.extend(std::iter::repeat_n(NULL_VALUE, left_col_count));
-                                new_values.extend(row.iter().skip(left_col_count).cloned());
-                                (row_id, Row::from_compact_vec(new_values))
-                            } else {
-                                // FULL OUTER - keep original for now
-                                (row_id, row)
-                            }
+                            // FULL OUTER - keep original for now
+                            new_rows.push((row_id, row));
                         }
-                    })
-                    .collect();
+                    }
+                }
+                rows = new_rows;
             } else {
                 // INNER join - just filter
-                rows.retain(|(_, row)| filter.matches(row));
+                filter.retain_checked(&mut rows)?;
             }
         }
 

@@ -46,7 +46,9 @@ thread_local! {
 #[inline]
 pub fn clear_row_vec_pool() {
     ROW_VEC_POOL.with(|pool| {
-        pool.borrow_mut().clear();
+        if let Ok(mut p) = pool.try_borrow_mut() {
+            p.clear();
+        }
     });
 }
 
@@ -284,7 +286,9 @@ impl RowVec {
     /// Takes the largest available buffer (end of sorted list).
     #[inline]
     pub fn new() -> Self {
-        let v = ROW_VEC_POOL.with(|pool| pool.borrow_mut().pop());
+        // Use try_borrow_mut to avoid panic on re-entrant access
+        // (can happen if Drop triggers nested RowVec creation on the same thread)
+        let v = ROW_VEC_POOL.with(|pool| pool.try_borrow_mut().ok().and_then(|mut p| p.pop()));
         match v {
             Some(buf) => {
                 track_hit!(buf.capacity());
@@ -303,8 +307,12 @@ impl RowVec {
     /// Uses binary search to find smallest buffer >= requested capacity.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
+        // Use try_borrow_mut to avoid panic on re-entrant access
         let v = ROW_VEC_POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
+            let mut pool = match pool.try_borrow_mut() {
+                Ok(p) => p,
+                Err(_) => return None, // Pool already borrowed — allocate fresh
+            };
             if pool.is_empty() {
                 return None;
             }
@@ -462,7 +470,11 @@ impl Drop for RowVec {
             }
             v.clear();
             ROW_VEC_POOL.with(|pool| {
-                let mut pool = pool.borrow_mut();
+                // Use try_borrow_mut to avoid panic on re-entrant access
+                let mut pool = match pool.try_borrow_mut() {
+                    Ok(p) => p,
+                    Err(_) => return, // Pool already borrowed — let buffer deallocate
+                };
                 if pool.len() < POOL_SIZE {
                     // Pool has room - insert in sorted position (by capacity, ascending)
                     let insert_idx = pool.partition_point(|b| b.capacity() < cap);
@@ -645,7 +657,9 @@ thread_local! {
 #[inline]
 pub fn clear_row_id_vec_pool() {
     ROW_ID_VEC_POOL.with(|pool| {
-        pool.borrow_mut().clear();
+        if let Ok(mut p) = pool.try_borrow_mut() {
+            p.clear();
+        }
     });
 }
 
@@ -663,7 +677,7 @@ impl RowIdVec {
     /// Takes the largest available buffer (end of sorted list).
     #[inline]
     pub fn new() -> Self {
-        let v = ROW_ID_VEC_POOL.with(|pool| pool.borrow_mut().pop());
+        let v = ROW_ID_VEC_POOL.with(|pool| pool.try_borrow_mut().ok().and_then(|mut p| p.pop()));
         match v {
             Some(buf) => Self { inner: Some(buf) },
             None => Self {
@@ -677,7 +691,10 @@ impl RowIdVec {
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         let v = ROW_ID_VEC_POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
+            let mut pool = match pool.try_borrow_mut() {
+                Ok(p) => p,
+                Err(_) => return None,
+            };
             if pool.is_empty() {
                 return None;
             }
@@ -832,7 +849,10 @@ impl Drop for RowIdVec {
             }
             v.clear();
             ROW_ID_VEC_POOL.with(|pool| {
-                let mut pool = pool.borrow_mut();
+                let mut pool = match pool.try_borrow_mut() {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
                 if pool.len() < ROW_ID_POOL_SIZE {
                     // Pool has room - insert in sorted position (by capacity, ascending)
                     let insert_idx = pool.partition_point(|b| b.capacity() < cap);

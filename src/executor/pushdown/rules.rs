@@ -487,6 +487,11 @@ impl LikeRule {
             return PushdownResult::CannotPush;
         }
 
+        // ESCAPE clause requires special processing not supported in pushdown
+        if like.escape.is_some() {
+            return PushdownResult::CannotPush;
+        }
+
         // Check for UPPER(col) or LOWER(col) LIKE pattern -> case-insensitive LIKE
         let (column, force_ilike) = if let Some(col) = extract_column_name(&like.left) {
             (col, false)

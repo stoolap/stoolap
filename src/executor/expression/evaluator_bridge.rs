@@ -520,6 +520,8 @@ pub struct RowFilter {
     params: CompactArc<ParamVec>,
     /// Named parameters (shared)
     named_params: Arc<FxHashMap<String, Value>>,
+    /// Transaction ID for CURRENT_TRANSACTION_ID()
+    transaction_id: Option<u64>,
 }
 
 impl RowFilter {
@@ -534,6 +536,7 @@ impl RowFilter {
             program,
             params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
+            transaction_id: None,
         })
     }
 
@@ -582,6 +585,7 @@ impl RowFilter {
             program,
             params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
+            transaction_id: None,
         })
     }
 
@@ -605,6 +609,7 @@ impl RowFilter {
         self.params = CompactArc::clone(ctx.params_arc());
         // Share named_params Arc - no cloning needed
         self.named_params = Arc::clone(ctx.named_params_arc());
+        self.transaction_id = ctx.transaction_id();
         self
     }
 
@@ -614,6 +619,7 @@ impl RowFilter {
             program,
             params: CompactArc::new(ParamVec::new()),
             named_params: Arc::new(FxHashMap::default()),
+            transaction_id: None,
         }
     }
 
@@ -637,6 +643,7 @@ impl RowFilter {
             if !self.named_params.is_empty() {
                 ctx = ctx.with_named_params(&self.named_params);
             }
+            ctx = ctx.with_transaction_id(self.transaction_id);
 
             // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
             // If the VM is already borrowed, create a temporary one for this call.
@@ -648,6 +655,60 @@ impl RowFilter {
                 temp_vm.execute_bool(&self.program, &ctx)
             }
         })
+    }
+
+    /// Like matches() but returns errors instead of swallowing them.
+    ///
+    /// Returns `Err` when the VM encounters a runtime error (e.g. invalid
+    /// REGEXP pattern supplied via a parameter). Used by FilteredResult
+    /// to surface errors through the Rows iterator.
+    #[inline]
+    pub fn matches_checked(&self, row: &Row) -> Result<bool> {
+        thread_local! {
+            static VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
+        }
+
+        VM.with(|vm| {
+            let mut ctx = ExecuteContext::new(row);
+
+            if !self.params.is_empty() {
+                ctx = ctx.with_params(&self.params);
+            }
+            if !self.named_params.is_empty() {
+                ctx = ctx.with_named_params(&self.named_params);
+            }
+            ctx = ctx.with_transaction_id(self.transaction_id);
+
+            if let Ok(mut borrowed_vm) = vm.try_borrow_mut() {
+                borrowed_vm.execute_bool_checked(&self.program, &ctx)
+            } else {
+                let mut temp_vm = ExprVM::new();
+                temp_vm.execute_bool_checked(&self.program, &ctx)
+            }
+        })
+    }
+
+    /// Filter a RowVec in-place, removing rows that don't match.
+    /// Returns Err if the filter expression produces a runtime error
+    /// (e.g. invalid REGEXP pattern supplied via a parameter).
+    pub fn retain_checked(&self, rows: &mut crate::core::RowVec) -> Result<()> {
+        let mut error: Option<crate::core::Error> = None;
+        rows.retain(|(_, row)| {
+            if error.is_some() {
+                return false;
+            }
+            match self.matches_checked(row) {
+                Ok(b) => b,
+                Err(e) => {
+                    error = Some(e);
+                    false
+                }
+            }
+        });
+        match error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Evaluate the filter expression and return the value.
@@ -666,6 +727,7 @@ impl RowFilter {
             if !self.named_params.is_empty() {
                 ctx = ctx.with_named_params(&self.named_params);
             }
+            ctx = ctx.with_transaction_id(self.transaction_id);
 
             // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
             // If the VM is already borrowed, create a temporary one for this call.
@@ -1011,6 +1073,25 @@ impl ExpressionEval {
         ctx = ctx.with_transaction_id(self.transaction_id);
 
         self.vm.execute_bool(&self.program, &ctx)
+    }
+
+    /// Like eval_bool but returns errors instead of swallowing them.
+    #[inline]
+    pub fn eval_bool_checked(&mut self, row: &Row) -> Result<bool> {
+        let mut ctx = ExecuteContext::new(row);
+
+        if !self.params.is_empty() {
+            ctx = ctx.with_params(&self.params);
+        }
+        if !self.named_params.is_empty() {
+            ctx = ctx.with_named_params(&self.named_params);
+        }
+        if let Some(ref outer) = self.outer_row {
+            ctx = ctx.with_outer_row(outer);
+        }
+        ctx = ctx.with_transaction_id(self.transaction_id);
+
+        self.vm.execute_bool_checked(&self.program, &ctx)
     }
 
     /// Evaluate with two rows (for joins).

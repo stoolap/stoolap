@@ -139,10 +139,14 @@ impl CompiledPattern {
         let has_trailing_percent = pattern.ends_with('%');
         let inner = pattern.trim_matches('%');
 
+        // If pattern contains backslash escape sequences, skip fast paths
+        // and use regex which handles \%, \_, \\ correctly via like_to_regex
+        let has_escape = pattern.contains('\\');
+
         // Check if inner part has any wildcards
         let has_inner_wildcards = inner.contains('%') || inner.contains('_');
 
-        if !has_inner_wildcards {
+        if !has_inner_wildcards && !has_escape {
             match (has_leading_percent, has_trailing_percent) {
                 (false, false) => CompiledPattern::Exact(CompactArc::from(inner)),
                 (false, true) => CompiledPattern::Prefix(CompactArc::from(inner)),
@@ -157,8 +161,9 @@ impl CompiledPattern {
         } else {
             // Check for simple underscore patterns without middle % (e.g., "User_1%", "User_1")
             // These can use direct character comparison instead of regex
+            // Skip when escape sequences are present (backslash changes wildcard interpretation)
             let has_middle_percent = inner.contains('%');
-            if !has_middle_percent && !case_insensitive {
+            if !has_escape && !has_middle_percent && !case_insensitive {
                 // Pattern only has _ wildcards (and possibly trailing %)
                 // Build a template for direct character matching
                 let template: Vec<Option<char>> = inner
@@ -174,7 +179,8 @@ impl CompiledPattern {
 
             // Check for patterns with a literal prefix before wildcards (e.g., "User_1%")
             // This allows fast rejection via starts_with before falling back to regex
-            if !has_leading_percent {
+            // Skip when escape sequences are present (backslash changes prefix boundary)
+            if !has_escape && !has_leading_percent {
                 // Find the literal prefix (characters before first wildcard)
                 let prefix_end = pattern
                     .chars()
@@ -346,10 +352,12 @@ fn like_to_regex(pattern: &str) -> String {
             '%' => result.push_str(".*"),
             '_' => result.push('.'),
             '\\' => {
-                // Escape sequence
+                // Escape sequence: \% = literal %, \_ = literal _, \\ = literal \
                 if let Some(&next) = chars.peek() {
                     if next == '%' || next == '_' || next == '\\' {
-                        result.push(chars.next().unwrap());
+                        chars.next();
+                        // Must regex-escape the character (\ is a regex metachar)
+                        result.push_str(&regex::escape(&next.to_string()));
                         continue;
                     }
                 }

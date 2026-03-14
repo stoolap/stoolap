@@ -515,6 +515,9 @@ impl Executor {
                     rows.push((row_id_counter, result.take_row()));
                     row_id_counter += 1;
                 }
+                if let Some(err) = result.last_error() {
+                    return Err(err);
+                }
 
                 // Create evaluator for ORDER BY expressions
                 let mut evaluator = CompiledEvaluator::new(&self.function_registry);
@@ -792,7 +795,7 @@ impl Executor {
                         move |a, b| Self::compare_rows_with_indices(a, b, &order_specs),
                         lim,
                         offset,
-                    ));
+                    )?);
 
                     // Apply deferred projection if applicable
                     // This reduces allocations from O(matched_rows) to O(limit)
@@ -835,12 +838,12 @@ impl Executor {
                         result,
                         &radix_specs,
                         move |a, b| Self::compare_rows_with_indices(a, b, &order_specs),
-                    ));
+                    )?);
                 } else {
                     // Some columns missing - use comparison sort
                     result = Box::new(OrderedResult::new(result, move |a, b| {
                         Self::compare_rows_with_indices(a, b, &order_specs)
-                    }));
+                    })?);
                 }
             }
         }
@@ -1107,7 +1110,7 @@ impl Executor {
 
         if let Some(filter_expr) = filter {
             let row_filter = RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
-            result_rows.retain(|(_, row)| row_filter.matches(row));
+            row_filter.retain_checked(&mut result_rows)?;
         }
 
         let result: Box<dyn QueryResult> = Box::new(ExecutorResult::new(column_names, result_rows));
@@ -2029,8 +2032,9 @@ impl Executor {
         // Check if ORDER BY references columns not in SELECT
         let order_by_needs_extra_columns = self.order_by_needs_extra_columns(stmt, &all_columns);
 
-        // Build alias map from SELECT columns for alias substitution in WHERE clause
-        let alias_map = Self::build_alias_map(&stmt.columns);
+        // Build alias map from SELECT columns for alias substitution in WHERE clause.
+        // Exclude aliases that shadow real table columns (WHERE references columns, not aliases).
+        let alias_map = Self::build_alias_map_excluding(&stmt.columns, Some(&all_columns));
 
         // Substitute column aliases in WHERE clause if any - avoid clone when no substitution needed
         let resolved_where_clause: Option<Box<Expression>> = if !alias_map.is_empty() {
@@ -2932,7 +2936,7 @@ impl Executor {
 
                             // Apply full WHERE filter (includes both pushed and non-pushed parts)
                             for (row_id, row) in batch {
-                                if memory_eval.eval_bool(&row) {
+                                if memory_eval.eval_bool_checked(&row)? {
                                     result_rows.push((row_id, row));
                                     if result_rows.len() >= target {
                                         break;
@@ -2992,6 +2996,7 @@ impl Executor {
                     &all_columns,
                     &self.function_registry,
                     &parallel_config,
+                    ctx,
                 )?;
                 (filtered, None, None)
             } else {
@@ -4118,7 +4123,7 @@ impl Executor {
                     // Apply cross-table WHERE filters if any
                     if let Some(ref cross) = cross_filter {
                         let filter = RowFilter::new(cross, &all_columns)?.with_context(ctx);
-                        final_rows.retain(|(_, row)| filter.matches(row));
+                        filter.retain_checked(&mut final_rows)?;
                     }
 
                     // Apply ORDER BY if present
@@ -4653,8 +4658,8 @@ impl Executor {
         let join_result = join_executor.execute(join_request)?;
         let result_rows = join_result.rows;
 
-        // Build alias map for alias substitution
-        let alias_map = Self::build_alias_map(&stmt.columns);
+        // Build alias map for alias substitution, excluding aliases that shadow real columns.
+        let alias_map = Self::build_alias_map_excluding(&stmt.columns, Some(&all_columns));
 
         // Apply remaining WHERE clause if present (after filter pushdown)
         // IMPORTANT: When predicates were pushed to left/right (left_filter or right_filter is Some),
@@ -4691,10 +4696,13 @@ impl Executor {
             // Create RowFilter once and reuse
             let where_filter = RowFilter::new(&processed_where, &all_columns)?.with_context(ctx);
 
-            result_rows
-                .into_iter()
-                .filter(|(_, row)| where_filter.matches(row))
-                .collect()
+            let mut filtered = RowVec::with_capacity(result_rows.len());
+            for (id, row) in result_rows {
+                if where_filter.matches_checked(&row)? {
+                    filtered.push((id, row));
+                }
+            }
+            filtered
         } else {
             result_rows
         };
@@ -4944,6 +4952,9 @@ impl Executor {
                 rows.push((row_id, result.take_row()));
                 row_id += 1;
             }
+            if let Some(err) = result.last_error() {
+                return Err(err);
+            }
 
             let agg_result = self.execute_select_with_aggregation(stmt, ctx, rows, &columns)?;
             let out_columns = CompactArc::new(agg_result.columns().to_vec());
@@ -4958,14 +4969,21 @@ impl Executor {
             rows.push((row_id, result.take_row()));
             row_id += 1;
         }
+        if let Some(err) = result.last_error() {
+            return Err(err);
+        }
 
         // Apply WHERE clause if present
         let filtered_rows: RowVec = if let Some(ref where_clause) = stmt.where_clause {
             let where_filter = RowFilter::new(where_clause, &columns)?.with_context(ctx);
 
-            rows.into_iter()
-                .filter(|(_, row)| where_filter.matches(row))
-                .collect()
+            let mut filtered = RowVec::with_capacity(rows.len());
+            for (id, row) in rows {
+                if where_filter.matches_checked(&row)? {
+                    filtered.push((id, row));
+                }
+            }
+            filtered
         } else {
             rows
         };
@@ -5080,10 +5098,11 @@ impl Executor {
         // Apply outer query's WHERE clause if present
         // OPTIMIZATION: FilteredResult owns a pre-compiled RowFilter and reuses it for each row,
         // avoiding repeated expression compilation per row.
+        // CRITICAL: Must pass ctx for parameter resolution ($1, named params, etc.)
         let mut result: Box<dyn QueryResult> = result;
         if let Some(ref where_clause) = stmt.where_clause {
-            let filter_expr = where_clause.as_ref().clone();
-            result = Box::new(FilteredResult::with_defaults(result, filter_expr)?);
+            let filter = RowFilter::new(where_clause, &view_columns)?.with_context(ctx);
+            result = Box::new(FilteredResult::from_filter(result, filter));
         }
 
         // Handle aggregation: if outer query has aggregates, materialize view result and aggregate
@@ -5094,6 +5113,9 @@ impl Executor {
             while result.next() {
                 rows.push((idx, result.take_row()));
                 idx += 1;
+            }
+            if let Some(err) = result.last_error() {
+                return Err(err);
             }
 
             // Execute aggregation on the view's rows
@@ -5110,6 +5132,9 @@ impl Executor {
             while result.next() {
                 rows.push((idx, result.take_row()));
                 idx += 1;
+            }
+            if let Some(err) = result.last_error() {
+                return Err(err);
             }
 
             if classification.has_aggregation {
@@ -5386,7 +5411,7 @@ impl Executor {
             // Apply WHERE clause filtering
             if let (Some(wf), Some(qf)) = (&where_filter, &qualified_filter) {
                 // Try with simple column names first, then qualified
-                if wf.matches(&row) || qf.matches(&row) {
+                if wf.matches_checked(&row)? || qf.matches_checked(&row)? {
                     result_rows.push((row_id, row));
                     row_id += 1;
                 }
@@ -5671,11 +5696,12 @@ impl Executor {
                         let row_filter =
                             RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
                         // CTE stores CompactArc<Vec<(i64, Row)>>, filter on the Row part
-                        let filtered_rows: RowVec = rows
-                            .iter()
-                            .filter(|(_, row)| row_filter.matches(row))
-                            .cloned()
-                            .collect();
+                        let mut filtered_rows = RowVec::with_capacity(rows.len());
+                        for (id, row) in rows.iter() {
+                            if row_filter.matches_checked(row)? {
+                                filtered_rows.push((*id, row.clone()));
+                            }
+                        }
                         Box::new(super::result::ExecutorResult::new(
                             columns.to_vec(),
                             filtered_rows,
@@ -5818,7 +5844,7 @@ impl Executor {
                         RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
                     // Materialize and filter - materialized is RowVec = Vec<(i64, Row)>
                     let mut materialized = Self::materialize_result(result)?;
-                    materialized.retain(|(_, row)| row_filter.matches(row));
+                    row_filter.retain_checked(&mut materialized)?;
                     let filtered_result: Box<dyn QueryResult> =
                         Box::new(super::result::ExecutorResult::new(columns, materialized));
                     return Ok((filtered_result, qualified_columns));
@@ -5983,6 +6009,10 @@ impl Executor {
             rows.push((row_id, result.take_row()));
             row_id += 1;
         }
+        // Surface runtime filter errors (e.g., invalid parameterized REGEXP)
+        if let Some(err) = result.last_error() {
+            return Err(err);
+        }
         Ok(rows)
     }
 
@@ -6006,6 +6036,10 @@ impl Executor {
         };
         while result.next() {
             rows.push(result.take_row());
+        }
+        // Surface runtime filter errors (e.g., invalid parameterized REGEXP)
+        if let Some(err) = result.last_error() {
+            return Err(err);
         }
         Ok(CompactArc::new(rows))
     }
@@ -8159,7 +8193,7 @@ impl Executor {
             if let Some(where_expr) = &stmt.where_clause {
                 let where_filter = RowFilter::new(where_expr, &all_columns)?.with_context(ctx);
 
-                rows.retain(|(_, row)| where_filter.matches(row));
+                where_filter.retain_checked(&mut rows)?;
             }
         }
 
@@ -8326,7 +8360,15 @@ impl Executor {
     }
 
     /// Build a map of column aliases to their underlying expressions from SELECT columns
-    fn build_alias_map(columns: &[Expression]) -> FxHashMap<String, &Expression> {
+    /// Build alias map, optionally excluding aliases that shadow real table columns.
+    ///
+    /// In SQL, WHERE is evaluated before SELECT, so WHERE references table columns,
+    /// not SELECT aliases. When an alias name matches a real column name, the column
+    /// must take priority in WHERE context. Pass `base_columns` to exclude such aliases.
+    fn build_alias_map_excluding<'a>(
+        columns: &'a [Expression],
+        base_columns: Option<&[String]>,
+    ) -> FxHashMap<String, &'a Expression> {
         // Count aliases first to pre-size HashMap and avoid rehashing
         let alias_count = columns
             .iter()
@@ -8341,6 +8383,25 @@ impl Executor {
         for col_expr in columns {
             if let Expression::Aliased(aliased) = col_expr {
                 let alias_name = aliased.alias.value_lower.to_string();
+
+                // Skip aliases that shadow real table column names.
+                // In standard SQL, WHERE references FROM columns, not SELECT aliases.
+                // When alias "time" shadows column "time", WHERE time >= '...' must
+                // reference the column, not the aliased expression.
+                if let Some(base_cols) = base_columns {
+                    // Check both fully qualified ("t.time") and unqualified ("time") names.
+                    // Join columns are qualified (e.g., "t1.time"), but aliases are
+                    // unqualified (e.g., "time"), so we must also compare against
+                    // the part after the dot.
+                    if base_cols.iter().any(|c| {
+                        c.eq_ignore_ascii_case(&alias_name)
+                            || c.rsplit_once('.')
+                                .is_some_and(|(_, base)| base.eq_ignore_ascii_case(&alias_name))
+                    }) {
+                        continue;
+                    }
+                }
+
                 // Store reference instead of clone - avoids expensive Expression clone/drop
                 alias_map.insert(alias_name, aliased.expression.as_ref());
             }

@@ -26,7 +26,7 @@ use std::borrow::Cow;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use super::ops::{CompareOp, Op};
+use super::ops::{CompareOp, CompiledPattern, Op};
 use super::program::Program;
 use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
@@ -217,6 +217,18 @@ pub struct ExprVM {
     /// Reusable buffer for function arguments (avoids allocation per call)
     /// Uses SmallVec to avoid heap allocation for functions with <= 8 args
     args_buffer: SmallVec<[Value; ARGS_BUFFER_CAPACITY]>,
+
+    /// Cache for dynamic LIKE patterns (avoids recompilation per row)
+    /// Stores (pattern_string, case_insensitive, escape_char, compiled_pattern)
+    cached_like: Option<(SmartString, bool, Option<char>, CompiledPattern)>,
+
+    /// Cache for dynamic GLOB patterns (separate from LIKE to avoid cross-contamination)
+    /// Stores (pattern_string, compiled_pattern)
+    cached_glob: Option<(SmartString, CompiledPattern)>,
+
+    /// Cache for dynamic REGEXP patterns (avoids recompilation per row)
+    /// Stores (pattern_string, compiled_regex)
+    cached_regexp: Option<(SmartString, regex::Regex)>,
 }
 
 impl ExprVM {
@@ -226,6 +238,9 @@ impl ExprVM {
         Self {
             stack: SmallVec::new(),
             args_buffer: SmallVec::new(),
+            cached_like: None,
+            cached_glob: None,
+            cached_regexp: None,
         }
     }
 
@@ -235,6 +250,9 @@ impl ExprVM {
         Self {
             stack: SmallVec::with_capacity(capacity),
             args_buffer: SmallVec::new(),
+            cached_like: None,
+            cached_glob: None,
+            cached_regexp: None,
         }
     }
 
@@ -1102,6 +1120,126 @@ impl ExprVM {
                     let result = match &v {
                         Value::Text(s) => Value::Boolean(pattern.matches(s, *case_insensitive)),
                         Value::Null(_) => Value::Null(DataType::Boolean),
+                        _ => Value::Boolean(false),
+                    };
+                    self.stack.push(result);
+                    pc += 1;
+                }
+
+                Op::LikeDynamic(case_insensitive) => {
+                    let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let ci = *case_insensitive;
+                    let result = match (&text_val, &pattern_val) {
+                        (Value::Text(text), Value::Text(pat)) => {
+                            // Cache compiled pattern: parameters are constant per query,
+                            // so recompiling every row is wasteful
+                            let need_compile = match &self.cached_like {
+                                Some((cached_pat, cached_ci, cached_esc, _)) => {
+                                    cached_pat.as_str() != pat.as_str()
+                                        || *cached_ci != ci
+                                        || cached_esc.is_some()
+                                }
+                                None => true,
+                            };
+                            if need_compile {
+                                let compiled = CompiledPattern::compile(pat, ci);
+                                self.cached_like = Some((pat.clone(), ci, None, compiled));
+                            }
+                            let (_, _, _, ref compiled) = self.cached_like.as_ref().unwrap();
+                            Value::Boolean(compiled.matches(text, ci))
+                        }
+                        (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
+                        _ => Value::Boolean(false),
+                    };
+                    self.stack.push(result);
+                    pc += 1;
+                }
+
+                Op::LikeDynamicEscape(case_insensitive, escape_char) => {
+                    let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let result = match (&text_val, &pattern_val) {
+                        (Value::Text(text), Value::Text(pat)) => {
+                            let ci = *case_insensitive;
+                            let esc = *escape_char;
+                            let need_compile = match &self.cached_like {
+                                Some((cached_pat, cached_ci, cached_esc, _)) => {
+                                    cached_pat.as_str() != pat.as_str()
+                                        || *cached_ci != ci
+                                        || *cached_esc != Some(esc)
+                                }
+                                None => true,
+                            };
+                            if need_compile {
+                                // Pre-process the escape character in the pattern at runtime,
+                                // converting e.g. !% -> \% so CompiledPattern treats it as literal
+                                let processed = process_like_escape_runtime(pat, esc);
+                                let compiled = CompiledPattern::compile(&processed, ci);
+                                self.cached_like = Some((pat.clone(), ci, Some(esc), compiled));
+                            }
+                            let (_, _, _, ref compiled) = self.cached_like.as_ref().unwrap();
+                            Value::Boolean(compiled.matches(text, ci))
+                        }
+                        (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
+                        _ => Value::Boolean(false),
+                    };
+                    self.stack.push(result);
+                    pc += 1;
+                }
+
+                Op::GlobDynamic => {
+                    let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let result = match (&text_val, &pattern_val) {
+                        (Value::Text(text), Value::Text(pat)) => {
+                            let need_compile = match &self.cached_glob {
+                                Some((cached_pat, _)) => cached_pat.as_str() != pat.as_str(),
+                                None => true,
+                            };
+                            if need_compile {
+                                let compiled = CompiledPattern::compile_glob(pat);
+                                self.cached_glob = Some((pat.clone(), compiled));
+                            }
+                            let (_, ref compiled) = self.cached_glob.as_ref().unwrap();
+                            Value::Boolean(compiled.matches(text, false))
+                        }
+                        (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
+                        _ => Value::Boolean(false),
+                    };
+                    self.stack.push(result);
+                    pc += 1;
+                }
+
+                Op::RegexpDynamic => {
+                    let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let result = match (&text_val, &pattern_val) {
+                        (Value::Text(text), Value::Text(pat)) => {
+                            let need_compile = match &self.cached_regexp {
+                                Some((cached_pat, _)) => cached_pat.as_str() != pat.as_str(),
+                                None => true,
+                            };
+                            if need_compile {
+                                match regex::Regex::new(pat) {
+                                    Ok(re) => {
+                                        self.cached_regexp = Some((pat.clone(), re));
+                                    }
+                                    Err(e) => {
+                                        self.cached_regexp = None;
+                                        // Return error for invalid regex, matching literal
+                                        // REGEXP behavior where bad patterns fail at compile time
+                                        return Err(crate::core::Error::invalid_argument(format!(
+                                            "Invalid regular expression '{}': {}",
+                                            pat, e
+                                        )));
+                                    }
+                                }
+                            }
+                            let (_, ref re) = self.cached_regexp.as_ref().unwrap();
+                            Value::Boolean(re.is_match(text))
+                        }
+                        (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
                         _ => Value::Boolean(false),
                     };
                     self.stack.push(result);
@@ -2595,6 +2733,55 @@ impl ExprVM {
         }
     }
 
+    /// Like execute_bool but returns errors instead of swallowing them.
+    ///
+    /// Used by RowFilter::matches_checked to propagate VM errors (e.g. invalid
+    /// REGEXP patterns) through the query result iterator.
+    #[inline]
+    pub fn execute_bool_checked(
+        &mut self,
+        program: &Program,
+        ctx: &ExecuteContext,
+    ) -> crate::core::Result<bool> {
+        let ops = program.ops();
+
+        // Fast path: Single comparison + Return (most common filter)
+        if ops.len() == 2 {
+            if let Op::Return = &ops[1] {
+                return Ok(Self::eval_single_op_bool(&ops[0], ctx));
+            }
+        }
+
+        // Fast path: Two comparisons with AND/OR
+        if ops.len() == 5 {
+            if let (Op::And(_), Op::AndFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
+                let a = Self::eval_single_op_tribool(&ops[0], ctx);
+                if a == Some(false) {
+                    return Ok(false);
+                }
+                let b = Self::eval_single_op_tribool(&ops[2], ctx);
+                return Ok(a == Some(true) && b == Some(true));
+            }
+            if let (Op::Or(_), Op::OrFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
+                let a = Self::eval_single_op_tribool(&ops[0], ctx);
+                if a == Some(true) {
+                    return Ok(true);
+                }
+                let b = Self::eval_single_op_tribool(&ops[2], ctx);
+                return Ok(a == Some(true) || b == Some(true));
+            }
+        }
+
+        // General path: full VM execution
+        match self.execute_cow(program, ctx) {
+            Ok(Value::Boolean(b)) => Ok(b),
+            Ok(Value::Integer(i)) => Ok(i != 0),
+            Ok(Value::Null(_)) => Ok(false),
+            Ok(_) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Evaluate a single comparison op and return bool (for fast path)
     #[inline]
     fn eval_single_op_bool(op: &Op, ctx: &ExecuteContext) -> bool {
@@ -3399,6 +3586,35 @@ impl Default for ExprVM {
 }
 
 /// Extract raw LE f32 bytes from a vector Value, zero-copy for Extension.
+/// Process a LIKE pattern with a custom escape character at runtime.
+///
+/// Converts escaped wildcards (e.g. `!%` with escape `!`) into the
+/// default `\%` escape form that `CompiledPattern::compile` understands.
+fn process_like_escape_runtime(pattern: &str, escape: char) -> String {
+    let mut result = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == escape {
+            if let Some(&next) = chars.peek() {
+                if next == '%' || next == '_' || next == escape {
+                    // Convert to default escape form: \% or \_ or \\
+                    result.push('\\');
+                    result.push(chars.next().unwrap());
+                } else {
+                    result.push(c);
+                }
+            } else {
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 /// For Text values, parses and writes into `buf` as fallback.
 #[inline]
 fn extract_vector_bytes<'a>(v: &'a Value, buf: &'a mut Vec<u8>) -> Option<&'a [u8]> {

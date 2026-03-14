@@ -931,9 +931,8 @@ impl<'a> ExprCompiler<'a> {
                     let pattern = CompiledPattern::compile(&s, false);
                     builder.emit(Op::Like(Arc::new(pattern), false));
                 } else {
-                    return Err(CompileError::UnsupportedExpression(
-                        "Dynamic LIKE patterns not yet supported in VM".to_string(),
-                    ));
+                    self.compile_expr(&infix.right, builder)?;
+                    builder.emit(Op::LikeDynamic(false));
                 }
             }
 
@@ -944,9 +943,8 @@ impl<'a> ExprCompiler<'a> {
                     let pattern = CompiledPattern::compile(&s, true);
                     builder.emit(Op::Like(Arc::new(pattern), true));
                 } else {
-                    return Err(CompileError::UnsupportedExpression(
-                        "Dynamic ILIKE patterns not yet supported in VM".to_string(),
-                    ));
+                    self.compile_expr(&infix.right, builder)?;
+                    builder.emit(Op::LikeDynamic(true));
                 }
             }
 
@@ -958,9 +956,9 @@ impl<'a> ExprCompiler<'a> {
                     builder.emit(Op::Like(Arc::new(pattern), false));
                     builder.emit(Op::Not);
                 } else {
-                    return Err(CompileError::UnsupportedExpression(
-                        "Dynamic NOT LIKE patterns not yet supported in VM".to_string(),
-                    ));
+                    self.compile_expr(&infix.right, builder)?;
+                    builder.emit(Op::LikeDynamic(false));
+                    builder.emit(Op::Not);
                 }
             }
 
@@ -972,9 +970,9 @@ impl<'a> ExprCompiler<'a> {
                     builder.emit(Op::Like(Arc::new(pattern), true));
                     builder.emit(Op::Not);
                 } else {
-                    return Err(CompileError::UnsupportedExpression(
-                        "Dynamic NOT ILIKE patterns not yet supported in VM".to_string(),
-                    ));
+                    self.compile_expr(&infix.right, builder)?;
+                    builder.emit(Op::LikeDynamic(true));
+                    builder.emit(Op::Not);
                 }
             }
 
@@ -984,13 +982,12 @@ impl<'a> ExprCompiler<'a> {
                 if let Some(s) = pattern_str {
                     let pattern = CompiledPattern::compile_glob(&s);
                     builder.emit(Op::Glob(Arc::new(pattern)));
-                    if matches!(infix.op_type, InfixOperator::NotGlob) {
-                        builder.emit(Op::Not);
-                    }
                 } else {
-                    return Err(CompileError::UnsupportedExpression(
-                        "Dynamic GLOB patterns not yet supported in VM".to_string(),
-                    ));
+                    self.compile_expr(&infix.right, builder)?;
+                    builder.emit(Op::GlobDynamic);
+                }
+                if matches!(infix.op_type, InfixOperator::NotGlob) {
+                    builder.emit(Op::Not);
                 }
             }
 
@@ -1002,13 +999,12 @@ impl<'a> ExprCompiler<'a> {
                         CompileError::InvalidExpression(format!("Invalid regex: {}", e))
                     })?;
                     builder.emit(Op::Regexp(Arc::new(regex)));
-                    if matches!(infix.op_type, InfixOperator::NotRegexp) {
-                        builder.emit(Op::Not);
-                    }
                 } else {
-                    return Err(CompileError::UnsupportedExpression(
-                        "Dynamic REGEXP patterns not yet supported in VM".to_string(),
-                    ));
+                    self.compile_expr(&infix.right, builder)?;
+                    builder.emit(Op::RegexpDynamic);
+                }
+                if matches!(infix.op_type, InfixOperator::NotRegexp) {
+                    builder.emit(Op::Not);
                 }
             }
 
@@ -1304,9 +1300,21 @@ impl<'a> ExprCompiler<'a> {
                 builder.emit(Op::Not);
             }
         } else {
-            return Err(CompileError::UnsupportedExpression(
-                "Dynamic LIKE patterns not yet supported in VM".to_string(),
-            ));
+            // Dynamic pattern (e.g. parameter $1) — compile the pattern expression
+            // onto the stack and use the dynamic op
+            self.compile_expr(&like.pattern, builder)?;
+            if is_regexp {
+                builder.emit(Op::RegexpDynamic);
+            } else if is_glob {
+                builder.emit(Op::GlobDynamic);
+            } else if let Some(esc) = escape_char {
+                builder.emit(Op::LikeDynamicEscape(case_insensitive, esc));
+            } else {
+                builder.emit(Op::LikeDynamic(case_insensitive));
+            }
+            if negated {
+                builder.emit(Op::Not);
+            }
         }
 
         Ok(())

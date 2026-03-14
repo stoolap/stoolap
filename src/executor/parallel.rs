@@ -48,6 +48,7 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::Expression;
 
+use super::context::ExecutionContext;
 use super::expression::ExpressionEval;
 #[cfg(feature = "parallel")]
 use super::expression::RowFilter;
@@ -177,35 +178,34 @@ pub fn parallel_filter(
     columns: &[String],
     _function_registry: &FunctionRegistry,
     config: &ParallelConfig,
+    ctx: &ExecutionContext,
 ) -> Result<RowVec> {
     #[cfg(feature = "parallel")]
     {
         let row_count = rows.len();
         if config.should_parallel_filter(row_count) {
-            // Calculate optimal chunk size based on available parallelism
-            // Goal: Create ~2-4 chunks per thread for good load balancing
-            let n_threads = num_threads();
-            let target_chunks = n_threads * 4;
-            let chunk_size = (row_count / target_chunks).max(config.chunk_size).max(512);
-
             // Pre-compile the filter expression once (RowFilter is Send+Sync)
             let columns_vec: Vec<String> = columns.to_vec();
-            let filter = RowFilter::new(filter_expr, &columns_vec)?;
+            let filter = RowFilter::new(filter_expr, &columns_vec)?.with_context(ctx);
 
-            // Process chunks in parallel, using plain Vec inside workers to avoid
-            // thread-local cache churn (each Rayon worker has its own cache)
-            let row_vec: Vec<(i64, Row)> = rows.into_vec();
-            let filtered: Vec<(i64, Row)> = row_vec
-                .into_par_iter()
-                .chunks(chunk_size)
-                .flat_map(|chunk| {
-                    // Use plain Vec, not RowVec - avoids worker thread cache allocations
-                    chunk
-                        .into_iter()
-                        .filter(|(_, row)| filter.matches(row))
-                        .collect::<Vec<_>>()
-                })
+            // Mark-and-extract: compute a parallel boolean mask (1 byte per row),
+            // then single-pass extract kept rows in original order.
+            // This avoids materializing an N-sized Option<(i64,Row)> intermediate.
+            let mut row_vec: Vec<(i64, Row)> = rows.into_vec();
+            let keep: Result<Vec<bool>> = row_vec
+                .par_iter()
+                .map(|(_, row)| filter.matches_checked(row))
                 .collect();
+            let keep = keep?;
+
+            // Single-pass extract: move kept rows into result, preserving order
+            let kept_count = keep.iter().filter(|&&b| b).count();
+            let mut filtered = Vec::with_capacity(kept_count);
+            for (i, entry) in row_vec.drain(..).enumerate() {
+                if keep[i] {
+                    filtered.push(entry);
+                }
+            }
 
             // Wrap final result in RowVec (uses main thread's cache)
             return Ok(RowVec::from_vec(filtered));
@@ -214,18 +214,26 @@ pub fn parallel_filter(
 
     // Sequential fallback (always compiled)
     let _ = config; // suppress unused warning when parallel feature is disabled
-    sequential_filter(rows, filter_expr, columns)
+    sequential_filter(rows, filter_expr, columns, ctx)
 }
 
 /// Sequential filter for small datasets or when parallel is disabled
-fn sequential_filter(rows: RowVec, filter_expr: &Expression, columns: &[String]) -> Result<RowVec> {
+fn sequential_filter(
+    rows: RowVec,
+    filter_expr: &Expression,
+    columns: &[String],
+    ctx: &ExecutionContext,
+) -> Result<RowVec> {
     let columns_vec: Vec<String> = columns.to_vec();
-    let mut eval = ExpressionEval::compile(filter_expr, &columns_vec)?;
+    let mut eval = ExpressionEval::compile(filter_expr, &columns_vec)?.with_context(ctx);
 
-    Ok(rows
-        .into_iter()
-        .filter(|(_, row)| eval.eval_bool(row))
-        .collect())
+    let mut result = RowVec::with_capacity(rows.len());
+    for (id, row) in rows {
+        if eval.eval_bool_checked(&row)? {
+            result.push((id, row));
+        }
+    }
+    Ok(result)
 }
 
 /// Parallel filter with ownership transfer (more efficient for large results)
@@ -1200,6 +1208,7 @@ pub fn parallel_filter_with_stats(
     columns: &[String],
     function_registry: &FunctionRegistry,
     config: &ParallelConfig,
+    ctx: &ExecutionContext,
 ) -> Result<(RowVec, ParallelStats)> {
     let row_count = rows.len();
     let parallel_used = config.should_parallel_filter(row_count);
@@ -1214,7 +1223,7 @@ pub fn parallel_filter_with_stats(
     let chunks_used = row_count.div_ceil(chunk_size);
 
     // CRITICAL: Propagate errors with ? instead of silently swallowing them
-    let result = parallel_filter(rows, filter_expr, columns, function_registry, config)?;
+    let result = parallel_filter(rows, filter_expr, columns, function_registry, config, ctx)?;
 
     let stats = ParallelStats {
         rows_processed: row_count,

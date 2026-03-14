@@ -115,6 +115,15 @@ pub trait QueryResult: Send {
         None
     }
 
+    /// Returns a pending error from the last `next()` call, if any.
+    ///
+    /// When `next()` returns false due to a runtime error (e.g. invalid REGEXP
+    /// pattern), this method returns the error so callers can surface it.
+    /// Default returns None (no error).
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        None
+    }
+
     /// Sets column aliases for this result
     ///
     /// The map keys are alias names, values are original column names.

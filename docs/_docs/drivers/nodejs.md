@@ -92,6 +92,7 @@ const db = await Database.open('file:///absolute/path/to/db');
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `Database.open(path)` | `Promise<Database>` | Open a database |
+| `clone()` | `Database` | Clone handle (shared engine, own state) |
 | `execute(sql, params?)` | `Promise<RunResult>` | Execute DML statement |
 | `exec(sql)` | `Promise<void>` | Execute a DDL statement |
 | `query(sql, params?)` | `Promise<Object[]>` | Query rows as objects |
@@ -107,6 +108,7 @@ Sync methods run on the main thread. Faster for simple operations but blocks the
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `Database.openSync(path)` | `Database` | Open a database |
+| `clone()` | `Database` | Clone handle (shared engine, own state) |
 | `executeSync(sql, params?)` | `RunResult` | Execute DML statement |
 | `execSync(sql)` | `void` | Execute a DDL statement |
 | `querySync(sql, params?)` | `Object[]` | Query rows as objects |
@@ -117,7 +119,7 @@ Sync methods run on the main thread. Faster for simple operations but blocks the
 | `prepare(sql)` | `PreparedStatement` | Create a prepared statement |
 | `closeSync()` | `void` | Close the database |
 
-`RunResult` is `{ changes: number }`:
+`RunResult` is `{ changes: number }`. It can be imported as a type:
 
 ```ts
 import { Database, RunResult } from '@stoolap/node';
@@ -146,10 +148,10 @@ await db2.close();
 Pass configuration as query parameters in the path:
 
 ```js
-// Maximum durability (fsync on every WAL write)
+// Maximum durability: fsync on every WAL write
 const db = await Database.open('./mydata?sync=full');
 
-// High throughput (no fsync, larger buffers)
+// High throughput: no fsync, larger buffers
 const db = await Database.open('./mydata?sync=none&wal_buffer_size=131072');
 
 // Custom snapshot interval with compression
@@ -167,7 +169,7 @@ Controls the durability vs. performance trade-off:
 
 | Mode | Value | Description |
 |------|-------|-------------|
-| `none` | `sync=none` | No fsync. Fastest, but data may be lost on crash |
+| `none` | `sync=none` | No fsync. Fastest, data may be lost on crash |
 | `normal` | `sync=normal` | Fsync on commit batches. Good balance (default) |
 | `full` | `sync=full` | Fsync on every WAL write. Slowest, maximum durability |
 
@@ -185,8 +187,26 @@ Controls the durability vs. performance trade-off:
 | `sync_interval_ms` | `10` | Minimum ms between syncs (normal mode) |
 | `wal_compression` | `on` | LZ4 compression for WAL entries |
 | `snapshot_compression` | `on` | LZ4 compression for snapshots |
-| `compression` | -- | Set both `wal_compression` and `snapshot_compression` |
+| `compression` | | Set both `wal_compression` and `snapshot_compression` |
 | `compression_threshold` | `64` | Minimum bytes before compressing an entry |
+
+## Cloning
+
+`clone()` creates a new `Database` handle that shares the same underlying engine (data, indexes, transactions) but has its own executor and error state. Useful for concurrent access patterns such as worker threads.
+
+```js
+const db = await Database.open('./mydata');
+const db2 = db.clone();
+
+// Both see the same data
+await db.execute('INSERT INTO users VALUES ($1, $2)', [1, 'Alice']);
+const row = db2.queryOneSync('SELECT * FROM users WHERE id = $1', [1]);
+// { id: 1, name: 'Alice' }
+
+// Each clone must be closed independently
+await db2.close();
+await db.close();
+```
 
 ## Raw Query Format
 
@@ -413,7 +433,7 @@ await db.exec('CREATE TABLE embeddings (id INTEGER PRIMARY KEY, vec VECTOR(3))')
 // Insert vectors via SQL string literals
 await db.execute("INSERT INTO embeddings VALUES (1, '[0.1, 0.2, 0.3]')");
 
-// Query — vectors are returned as Float32Array
+// Query: vectors are returned as Float32Array
 const row = await db.queryOne('SELECT vec FROM embeddings WHERE id = 1');
 console.log(row.vec);              // Float32Array(3) [0.1, 0.2, 0.3]
 console.log(row.vec instanceof Float32Array); // true

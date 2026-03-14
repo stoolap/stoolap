@@ -381,8 +381,14 @@ impl Executor {
         let mut result = self.execute_select(subquery, &subquery_ctx)?;
 
         // Check if there's at least one row
-        let exists = result.next();
-        Ok(exists)
+        if result.next() {
+            return Ok(true);
+        }
+        // Check for runtime filter errors before treating as "no rows"
+        if let Some(err) = result.last_error() {
+            return Err(err);
+        }
+        Ok(false)
     }
 
     /// Try to execute EXISTS using index-nested-loop optimization.
@@ -597,6 +603,10 @@ impl Executor {
             }
         };
 
+        // Apply execution context for parameter resolution ($1, named params, etc.)
+        // The filter is cached without context, so we clone and apply per-probe.
+        let predicate_filter = predicate_filter.with_context(ctx);
+
         // Get or create a cached row fetcher for this table
         let row_fetcher = match self.get_or_create_row_fetcher(&correlation.inner_table) {
             Some(f) => f,
@@ -610,7 +620,7 @@ impl Executor {
 
             // Check each row against the predicate
             for (_row_id, row) in fetched {
-                if predicate_filter.matches(&row) {
+                if predicate_filter.matches_checked(&row)? {
                     return Ok(Some(true));
                 }
             }
@@ -1120,6 +1130,9 @@ impl Executor {
                     }
                 }
             }
+        }
+        if let Some(err) = result.last_error() {
+            return Err(err);
         }
 
         // Cache the results
@@ -1729,6 +1742,10 @@ impl Executor {
 
         // Get the first row
         if !result.next() {
+            // Check for runtime filter errors before treating as empty result
+            if let Some(err) = result.last_error() {
+                return Err(err);
+            }
             let null_value = crate::core::Value::null_unknown();
             // Cache the result for non-correlated subqueries
             if let Some(key) = cache_key {
@@ -1763,6 +1780,9 @@ impl Executor {
             return Err(Error::Internal {
                 message: "scalar subquery returned more than one row".to_string(),
             });
+        }
+        if let Some(err) = result.last_error() {
+            return Err(err);
         }
 
         // Cache the result for non-correlated subqueries
@@ -1814,6 +1834,9 @@ impl Executor {
                 values.push(value);
             }
         }
+        if let Some(err) = result.last_error() {
+            return Err(err);
+        }
 
         // Cache the result for non-correlated subqueries
         if let Some(key) = cache_key {
@@ -1841,6 +1864,9 @@ impl Executor {
                 // into_values() uses Arc::try_unwrap() to move without cloning when sole owner
                 rows.push(row.into_values());
             }
+        }
+        if let Some(err) = result.last_error() {
+            return Err(err);
         }
 
         Ok(rows)
@@ -3073,6 +3099,9 @@ impl Executor {
                     values_vec.push(value.clone());
                 }
             }
+        }
+        if let Some(err) = result.last_error() {
+            return Err(err);
         }
         // Build FxHashSet from Vec - this deduplicates automatically
         let hash_set: ValueSet = values_vec.into_iter().collect();

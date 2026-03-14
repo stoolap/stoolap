@@ -498,6 +498,9 @@ impl Executor {
         while result.next() {
             rows.push(result.take_row());
         }
+        if let Some(err) = result.last_error() {
+            return Err(err);
+        }
 
         // Infer schema from the result columns and first row (if available)
         let mut schema_builder = SchemaBuilder::new(table_name);

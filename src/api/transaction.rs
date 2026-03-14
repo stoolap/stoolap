@@ -336,7 +336,7 @@ impl Transaction {
                 let mut setter = |row: Row| -> Result<(Row, bool)> {
                     // Check WHERE clause if present (uses thread-local VM internally)
                     if let Some(ref filter) = where_filter {
-                        if !filter.matches(&row) {
+                        if !filter.matches_checked(&row)? {
                             return Ok((row, false));
                         }
                     }

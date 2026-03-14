@@ -141,20 +141,40 @@ impl LikeExpr {
     }
 
     /// Compile SQL LIKE pattern to regex (with caching)
+    ///
+    /// Handles `\` as the SQL LIKE escape character:
+    /// - `\%` matches a literal `%`
+    /// - `\_` matches a literal `_`
+    /// - `\\` matches a literal `\`
     pub fn compile_pattern(pattern: &str, case_insensitive: bool) -> Option<Regex> {
         // Build regex pattern character by character
         // We need to handle % and _ specially while escaping everything else
         let mut regex_pattern = String::with_capacity(pattern.len() * 2);
         regex_pattern.push('^'); // Anchor start
 
-        let chars = pattern.chars();
-        for c in chars {
+        let mut chars = pattern.chars().peekable();
+        while let Some(c) = chars.next() {
             match c {
                 '%' => regex_pattern.push_str(".*"),
                 '_' => regex_pattern.push('.'),
+                '\\' => {
+                    // Backslash escapes the next character in LIKE
+                    if let Some(&next) = chars.peek() {
+                        if next == '%' || next == '_' || next == '\\' {
+                            // Escaped LIKE special char or literal backslash
+                            regex_pattern.push_str(&regex::escape(&next.to_string()));
+                            chars.next();
+                        } else {
+                            // Backslash followed by non-special char: literal backslash
+                            regex_pattern.push_str("\\\\");
+                        }
+                    } else {
+                        // Trailing backslash: literal
+                        regex_pattern.push_str("\\\\");
+                    }
+                }
                 // Escape regex special characters
-                '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
-                | '\\' => {
+                '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' => {
                     regex_pattern.push('\\');
                     regex_pattern.push(c);
                 }

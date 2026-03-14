@@ -798,7 +798,7 @@ impl Executor {
 
             let mut rows = RowVec::with_capacity(result_rows.len());
             for (row_id, row) in result_rows {
-                if where_eval.eval_bool(&row) {
+                if where_eval.eval_bool_checked(&row)? {
                     rows.push((row_id, row));
                 }
             }
@@ -1123,7 +1123,7 @@ impl Executor {
             let mut result = RowVec::new();
             let mut row_id = 0i64;
             for (_, row) in cte_rows {
-                if eval.eval_bool(&row) {
+                if eval.eval_bool_checked(&row)? {
                     result.push((row_id, row));
                     row_id += 1;
                 }
@@ -2296,7 +2296,7 @@ impl Executor {
 
             let mut rows = RowVec::with_capacity(result_rows.len());
             for (row_id, row) in result_rows {
-                if where_eval.eval_bool(&row) {
+                if where_eval.eval_bool_checked(&row)? {
                     rows.push((row_id, row));
                 }
             }

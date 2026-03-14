@@ -1199,7 +1199,7 @@ impl Executor {
 
             // Filter rows using the pre-compiled filter
             for (id, row) in result_rows {
-                if having_filter.matches(&row) {
+                if having_filter.matches_checked(&row)? {
                     result_rows_with_ids.push((id, row));
                 }
             }
@@ -4736,7 +4736,7 @@ impl Executor {
         let mut filtered_rows = RowVec::new();
         let mut new_id = 0i64;
         for (_, row) in rows {
-            if having_filter.matches(&row) {
+            if having_filter.matches_checked(&row)? {
                 filtered_rows.push((new_id, row));
                 new_id += 1;
             }
@@ -5741,6 +5741,9 @@ impl Executor {
 
         // Sample first row to detect key type
         if !result.next() {
+            if let Some(err) = result.last_error() {
+                return Err(err);
+            }
             // Empty result - return empty aggregation
             let mut result_columns = Vec::with_capacity(1 + aggregations.len());
             result_columns.push(group_col_name.clone());
@@ -5874,6 +5877,9 @@ impl Executor {
             while result.next() {
                 let row = result.row();
                 process_row(row, &mut groups, &mut null_group, &state_template);
+            }
+            if let Some(err) = result.last_error() {
+                return Err(err);
             }
 
             // Build result columns

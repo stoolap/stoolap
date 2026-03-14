@@ -226,6 +226,8 @@ pub struct Rows {
     /// Shared column names (Arc to avoid cloning per row)
     columns: CompactArc<Vec<String>>,
     closed: bool,
+    /// Pending error from a filter runtime failure (e.g., invalid REGEXP)
+    pending_error: Option<crate::core::Error>,
 }
 
 impl Rows {
@@ -239,6 +241,7 @@ impl Rows {
             result,
             columns,
             closed: false,
+            pending_error: None,
         }
     }
 
@@ -269,7 +272,26 @@ impl Rows {
         if self.closed {
             return false;
         }
-        self.result.next()
+        if self.result.next() {
+            return true;
+        }
+        // Check for runtime filter errors (e.g., invalid REGEXP)
+        if let Some(err) = self.result.last_error() {
+            self.pending_error = Some(err);
+        }
+        // Clean up resources (scanner close, etc.) now that iteration is done
+        self.close();
+        false
+    }
+
+    /// Return any runtime error that caused `advance()` to return false.
+    ///
+    /// After `advance()` returns `false`, call this to distinguish between
+    /// normal end-of-stream (returns `None`) and a runtime filter error
+    /// like an invalid parameterized REGEXP (returns `Some(error)`).
+    #[inline]
+    pub fn error(&mut self) -> Option<crate::core::Error> {
+        self.pending_error.take()
     }
 
     /// Get a reference to the current row (after a successful `advance()`).
@@ -318,6 +340,11 @@ impl Iterator for Rows {
             let row = self.result.take_row();
             // Arc clone is O(1) - just increments reference count
             Some(Ok(ResultRow::new(row, CompactArc::clone(&self.columns))))
+        } else if let Some(err) = self.result.last_error() {
+            // Surface runtime errors (e.g. invalid REGEXP pattern).
+            // close() forwards to result.close() for proper scanner cleanup
+            self.close();
+            Some(Err(err))
         } else {
             None
         }

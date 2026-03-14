@@ -259,8 +259,13 @@ impl Program {
                 // Pop 3, push 1 (-2)
                 Op::Between | Op::NotBetween => -2,
 
+                // Dynamic pattern ops: Pop 2, push 1 (-1)
+                Op::LikeDynamic(_)
+                | Op::LikeDynamicEscape(_, _)
+                | Op::GlobDynamic
+                | Op::RegexpDynamic
                 // JSON/Timestamp binary ops: Pop 2, push 1 (-1)
-                Op::JsonAccess
+                | Op::JsonAccess
                 | Op::JsonAccessText
                 | Op::TimestampAddInterval
                 | Op::TimestampSubInterval

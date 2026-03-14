@@ -82,6 +82,9 @@ SELECT * FROM products WHERE name LIKE '%Pro%';       -- Contains 'Pro'
 
 -- _ matches any single character
 SELECT * FROM products WHERE code LIKE 'A_C';         -- Matches 'ABC', 'A1C', etc.
+
+-- NOT LIKE
+SELECT * FROM products WHERE name NOT LIKE '%test%';
 ```
 
 #### ILIKE (Case-Insensitive)
@@ -90,7 +93,24 @@ SELECT * FROM products WHERE code LIKE 'A_C';         -- Matches 'ABC', 'A1C', e
 -- Same as LIKE but ignores case
 SELECT * FROM products WHERE name ILIKE 'apple%';     -- Matches 'Apple', 'APPLE', 'apple'
 SELECT * FROM users WHERE email ILIKE '%@gmail.com';
+
+-- NOT ILIKE
+SELECT * FROM users WHERE name NOT ILIKE 'admin%';
 ```
+
+#### LIKE with ESCAPE
+
+Use the ESCAPE clause when your pattern needs to match literal `%` or `_` characters:
+
+```sql
+-- Match values containing a literal '%' character
+SELECT * FROM metrics WHERE label LIKE '%!%%' ESCAPE '!';
+
+-- Match values containing a literal '_' character
+SELECT * FROM codes WHERE code LIKE 'A!_B' ESCAPE '!';
+```
+
+The escape character can be any single character. The character immediately after the escape is treated as a literal instead of a wildcard.
 
 #### GLOB (Shell-Style Patterns)
 
@@ -103,15 +123,38 @@ SELECT * FROM files WHERE name GLOB 'file?.dat';
 
 -- [...] matches any character in the set
 SELECT * FROM files WHERE name GLOB '[abc]*';
+
+-- NOT GLOB
+SELECT * FROM files WHERE name NOT GLOB '*.tmp';
 ```
 
 #### REGEXP (Regular Expressions)
 
 ```sql
--- Full regex pattern matching
+-- Full regex pattern matching (Rust regex syntax)
 SELECT * FROM logs WHERE message REGEXP 'error|warning';
 SELECT * FROM users WHERE email REGEXP '^[a-z]+@[a-z]+\.[a-z]+$';
 SELECT * FROM data WHERE value REGEXP '[0-9]{3}-[0-9]{4}';
+
+-- NOT REGEXP
+SELECT * FROM logs WHERE message NOT REGEXP 'debug|trace';
+```
+
+Invalid regex patterns return an error instead of silently matching nothing.
+
+#### Parameterized Patterns
+
+All pattern matching operators support parameterized patterns. The pattern is compiled once and reused for every row:
+
+```sql
+-- LIKE with parameter
+SELECT * FROM products WHERE name LIKE $1;
+
+-- REGEXP with parameter
+SELECT * FROM logs WHERE message REGEXP $1;
+
+-- GLOB with parameter
+SELECT * FROM files WHERE name GLOB $1;
 ```
 
 ## Range Operators

@@ -61,6 +61,9 @@ impl Executor {
                     return Ok(Box::new(ExecutorResult::new(columns, rows)));
                 }
             }
+            if let Some(err) = left_result.last_error() {
+                return Err(err);
+            }
             rows
         } else {
             Self::materialize_result(left_result)?
@@ -157,6 +160,11 @@ impl Executor {
                                 result_rows.push((row_id, right_result.take_row()));
                                 row_id += 1;
                                 count += 1;
+                            }
+                            if count < needed {
+                                if let Some(err) = right_result.last_error() {
+                                    return Err(err);
+                                }
                             }
                         }
                     } else {

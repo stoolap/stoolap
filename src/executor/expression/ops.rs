@@ -61,42 +61,51 @@ impl CompiledPattern {
         // Check for simple patterns that don't need regex
         let has_percent = pat.contains('%');
         let has_underscore = pat.contains('_');
+        let has_escape = pat.contains('\\');
 
-        if !has_percent && !has_underscore {
+        if !has_percent && !has_underscore && !has_escape {
             return CompiledPattern::Exact(pat);
         }
 
-        if pat == "%" {
-            return CompiledPattern::MatchAll;
-        }
-
-        if pat == "_" {
-            return CompiledPattern::SingleChar;
-        }
-
-        // Check for prefix pattern: "abc%"
-        if pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') && !has_underscore {
-            return CompiledPattern::Prefix(pat[..pat.len() - 1].to_string());
-        }
-
-        // Check for suffix pattern: "%abc"
-        if pat.starts_with('%') && !pat[1..].contains('%') && !has_underscore {
-            return CompiledPattern::Suffix(pat[1..].to_string());
-        }
-
-        // Check for contains pattern: "%abc%"
-        if pat.starts_with('%') && pat.ends_with('%') && pat.len() > 2 {
-            let middle = &pat[1..pat.len() - 1];
-            if !middle.contains('%') && !middle.contains('_') {
-                return CompiledPattern::Contains(middle.to_string());
+        // When backslash escapes are present (e.g. \% for literal %), skip all fast
+        // paths — they don't understand escape sequences. Fall through to regex which
+        // correctly handles them via like_to_regex().
+        if !has_escape {
+            if pat == "%" {
+                return CompiledPattern::MatchAll;
             }
-        }
 
-        // Check for prefix+suffix: "abc%xyz"
-        if has_percent && !has_underscore {
-            let parts: Vec<&str> = pat.split('%').collect();
-            if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                return CompiledPattern::PrefixSuffix(parts[0].to_string(), parts[1].to_string());
+            if pat == "_" {
+                return CompiledPattern::SingleChar;
+            }
+
+            // Check for prefix pattern: "abc%"
+            if pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') && !has_underscore {
+                return CompiledPattern::Prefix(pat[..pat.len() - 1].to_string());
+            }
+
+            // Check for suffix pattern: "%abc"
+            if pat.starts_with('%') && !pat[1..].contains('%') && !has_underscore {
+                return CompiledPattern::Suffix(pat[1..].to_string());
+            }
+
+            // Check for contains pattern: "%abc%"
+            if pat.starts_with('%') && pat.ends_with('%') && pat.len() > 2 {
+                let middle = &pat[1..pat.len() - 1];
+                if !middle.contains('%') && !middle.contains('_') {
+                    return CompiledPattern::Contains(middle.to_string());
+                }
+            }
+
+            // Check for prefix+suffix: "abc%xyz"
+            if has_percent && !has_underscore {
+                let parts: Vec<&str> = pat.split('%').collect();
+                if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                    return CompiledPattern::PrefixSuffix(
+                        parts[0].to_string(),
+                        parts[1].to_string(),
+                    );
+                }
             }
         }
 
@@ -219,19 +228,17 @@ impl CompiledPattern {
                 '%' => result.push_str(".*"),
                 '_' => result.push('.'),
                 '\\' => {
-                    // Escape sequence
+                    // Escape sequence: \% → literal %, \_ → literal _, \\ → literal \
                     if let Some(&next) = chars.peek() {
                         if next == '%' || next == '_' || next == '\\' {
-                            result.push(
-                                regex::escape(&next.to_string())
-                                    .chars()
-                                    .next()
-                                    .unwrap_or(next),
-                            );
                             chars.next();
+                            result.push_str(&regex::escape(&next.to_string()));
                         } else {
                             result.push_str(&regex::escape("\\"));
                         }
+                    } else {
+                        // Trailing backslash: emit literal backslash
+                        result.push_str(&regex::escape("\\"));
                     }
                 }
                 _ => result.push_str(&regex::escape(&c.to_string())),
@@ -531,6 +538,22 @@ pub enum Op {
     /// LIKE with ESCAPE character
     /// Stack: [text] -> [bool]
     LikeEscape(Arc<CompiledPattern>, bool, char), // pattern, case_insensitive, escape_char
+
+    /// Dynamic LIKE: pattern is on the stack (e.g. from a parameter)
+    /// Stack: [text, pattern_text] -> [bool]
+    LikeDynamic(bool), // case_insensitive
+
+    /// Dynamic LIKE with ESCAPE: pattern is on the stack, escape char is compiled in
+    /// Stack: [text, pattern_text] -> [bool]
+    LikeDynamicEscape(bool, char), // case_insensitive, escape_char
+
+    /// Dynamic GLOB: pattern is on the stack
+    /// Stack: [text, pattern_text] -> [bool]
+    GlobDynamic,
+
+    /// Dynamic REGEXP: pattern is on the stack
+    /// Stack: [text, pattern_text] -> [bool]
+    RegexpDynamic,
 
     // =========================================================================
     // JSON OPERATIONS
@@ -894,6 +917,16 @@ impl std::fmt::Debug for Op {
             Op::LikeEscape(_, ci, esc) => {
                 write!(f, "LikeEscape(case_insensitive={}, escape='{}')", ci, esc)
             }
+            Op::LikeDynamic(ci) => write!(f, "LikeDynamic(case_insensitive={})", ci),
+            Op::LikeDynamicEscape(ci, esc) => {
+                write!(
+                    f,
+                    "LikeDynamicEscape(case_insensitive={}, escape='{}')",
+                    ci, esc
+                )
+            }
+            Op::GlobDynamic => write!(f, "GlobDynamic"),
+            Op::RegexpDynamic => write!(f, "RegexpDynamic"),
             Op::JsonAccess => write!(f, "JsonAccess"),
             Op::JsonAccessText => write!(f, "JsonAccessText"),
             Op::TimestampAddInterval => write!(f, "TimestampAddInterval"),

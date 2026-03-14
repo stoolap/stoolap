@@ -74,6 +74,11 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
             STOOLAP_ROW
         } else {
             handle.has_row = false;
+            // Check for runtime filter errors (e.g., invalid parameterized REGEXP)
+            if let Some(err) = rows_inner.error() {
+                handle.set_error(&err.to_string());
+                return STOOLAP_ERROR;
+            }
             STOOLAP_DONE
         }
     }));

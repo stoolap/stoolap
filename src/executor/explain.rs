@@ -68,6 +68,9 @@ impl Executor {
             while result.next() {
                 row_count += 1;
             }
+            if let Some(err) = result.last_error() {
+                return Err(err);
+            }
             let duration = start.elapsed();
 
             // Format duration nicely

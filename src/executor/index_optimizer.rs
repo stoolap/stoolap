@@ -848,6 +848,9 @@ impl Executor {
                     );
                 }
             }
+            if let Some(err) = result.last_error() {
+                return Err(err);
+            }
             // Cache for future use
             cache_in_subquery(
                 cache_key,
@@ -1048,7 +1051,7 @@ impl Executor {
                 RowFilter::new(&processed_remaining, &columns_slice)?.with_context(ctx);
 
             // Filter rows (retain works on (i64, Row) tuples via Deref)
-            rows.retain(|(_, row)| row_filter.matches(row));
+            row_filter.retain_checked(&mut rows)?;
         }
 
         // Apply LIMIT/OFFSET if present (and no ORDER BY)
@@ -1269,7 +1272,7 @@ impl Executor {
                 RowFilter::new(&processed_remaining, &columns_slice)?.with_context(ctx);
 
             // Filter rows (retain works on (i64, Row) tuples via Deref)
-            rows.retain(|(_, row)| row_filter.matches(row));
+            row_filter.retain_checked(&mut rows)?;
         }
 
         // Apply LIMIT/OFFSET if present (and no ORDER BY)
@@ -1665,7 +1668,7 @@ impl Executor {
             let row_filter = RowFilter::new(remaining, &columns_slice)?.with_context(ctx);
 
             // Filter rows (retain works on (i64, Row) tuples via Deref)
-            rows.retain(|(_, row)| row_filter.matches(row));
+            row_filter.retain_checked(&mut rows)?;
         }
 
         // Apply LIMIT/OFFSET if present (and no ORDER BY)
@@ -1972,7 +1975,7 @@ impl Executor {
                 let mut filtered_rows = RowVec::with_capacity(k);
                 for (rid, dist) in &results {
                     if let Some(row) = row_map.get(rid) {
-                        if filter.matches(row) {
+                        if filter.matches_checked(row)? {
                             filtered_nn.push((*rid, *dist));
                             filtered_rows.push((*rid, (*row).clone()));
                             if filtered_nn.len() >= k {
@@ -2028,9 +2031,13 @@ impl Executor {
                 let rows = table.collect_all_rows(storage_expr.as_deref())?;
                 // Storage may not handle all predicates — apply residual in-memory filter
                 if let Some(ref filter) = where_filter {
-                    rows.into_iter()
-                        .filter(|(_, row)| filter.matches(row))
-                        .collect()
+                    let mut filtered = RowVec::with_capacity(rows.len());
+                    for (id, row) in rows {
+                        if filter.matches_checked(&row)? {
+                            filtered.push((id, row));
+                        }
+                    }
+                    filtered
                 } else {
                     rows
                 }

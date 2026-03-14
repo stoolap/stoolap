@@ -770,7 +770,13 @@ impl SemanticCache {
         // CRITICAL: Propagate compilation errors instead of returning unfiltered data
         let mut eval = ExpressionEval::compile(filter, &columns_vec)?;
 
-        Ok(rows.into_iter().filter(|row| eval.eval_bool(row)).collect())
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            if eval.eval_bool_checked(&row)? {
+                result.push(row);
+            }
+        }
+        Ok(result)
     }
 
     // Private helpers

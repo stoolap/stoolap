@@ -253,6 +253,9 @@ impl Executor {
                 row_ids.push(*id);
             }
         }
+        if let Some(err) = result.last_error() {
+            return Err(err);
+        }
 
         // Sort for cache locality
         row_ids.sort_unstable();
@@ -419,13 +422,23 @@ impl Executor {
                 None
             };
 
-            // Execute the SELECT query
+            // For explicit transactions, materialize the SELECT BEFORE any inserts
+            // to ensure statement atomicity: a late runtime error (e.g., invalid REGEXP)
+            // won't leave partial inserts pending for commit. Auto-commit transactions
+            // stream rows directly since the standalone transaction rolls back on drop.
             let mut select_result = self.execute_select(select_stmt, ctx)?;
+            if !should_auto_commit {
+                // Explicit tx: fully materialize before writes for atomicity.
+                // A late runtime error (e.g., invalid REGEXP) will fail here
+                // before any inserts, preventing partial writes in the transaction.
+                let columns = select_result.columns().to_vec();
+                let rows = Self::materialize_result(select_result)?;
+                select_result = Box::new(super::result::ExecutorResult::new(columns, rows));
+            }
 
-            // Process each row from the SELECT result
+            // Process each row from the SELECT result (streaming or materialized)
             while select_result.next() {
                 let select_row = select_result.row();
-
                 if select_row.len() != column_indices.len() {
                     return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but SELECT returns {} columns",
@@ -601,6 +614,10 @@ impl Executor {
                     table.insert_discard(row)?;
                     rows_affected += 1;
                 }
+            }
+            // For streaming (auto-commit) path, check for runtime filter errors
+            if let Some(err) = select_result.last_error() {
+                return Err(err);
             }
 
             // Invalidate semantic cache for this table BEFORE commit
@@ -1168,13 +1185,17 @@ impl Executor {
 
         // Check if this is INSERT ... SELECT
         if let Some(ref select_stmt) = stmt.select {
-            // Execute the SELECT query
             let mut select_result = self.execute_select(select_stmt, ctx)?;
+            if !should_auto_commit {
+                // Explicit tx: fully materialize before writes for atomicity
+                let columns = select_result.columns().to_vec();
+                let rows = Self::materialize_result(select_result)?;
+                select_result = Box::new(super::result::ExecutorResult::new(columns, rows));
+            }
 
             // Process each row from the SELECT result
             while select_result.next() {
                 let select_row = select_result.row();
-
                 if select_row.len() != column_indices.len() {
                     return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but SELECT returns {} columns",
@@ -1236,6 +1257,9 @@ impl Executor {
                     table.insert_discard(row)?;
                 }
                 rows_affected += 1;
+            }
+            if let Some(err) = select_result.last_error() {
+                return Err(err);
             }
         } else {
             // Regular INSERT with VALUES

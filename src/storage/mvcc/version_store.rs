@@ -3731,7 +3731,7 @@ impl VersionStore {
                 // OPTIMIZATION: Cache visibility result for repeated txn_ids
                 // When rows are inserted in batches, consecutive rows often have the same txn_id.
                 // Caching avoids repeated thread-local access overhead (~27ms per 100K rows).
-                let mut last_txn_id: i64 = -1;
+                let mut last_txn_id: i64 = 0;
                 let mut last_visible: bool = false;
 
                 let mut idx = 0;
@@ -3766,7 +3766,7 @@ impl VersionStore {
         let versions = self.versions.read().clone();
 
         // Cache visibility for slow path too
-        let mut last_txn_id: i64 = -1;
+        let mut last_txn_id: i64 = 0;
         let mut last_visible: bool = false;
 
         for chain in versions.values() {
@@ -3840,7 +3840,7 @@ impl VersionStore {
 
             if uncommitted_empty && arena_len > 0 && !checker.needs_snapshot_isolation(txn_id) {
                 // OPTIMIZATION: Cache visibility result for repeated txn_ids
-                let mut last_txn_id: i64 = -1;
+                let mut last_txn_id: i64 = 0;
                 let mut last_visible: bool = false;
 
                 let mut idx = 0;
@@ -3874,7 +3874,7 @@ impl VersionStore {
         let versions = self.versions.read().clone();
 
         // Cache visibility for slow path too
-        let mut last_txn_id: i64 = -1;
+        let mut last_txn_id: i64 = 0;
         let mut last_visible: bool = false;
 
         for chain in versions.values() {
@@ -3947,7 +3947,7 @@ impl VersionStore {
 
             if uncommitted_empty && arena_len > 0 && !checker.needs_snapshot_isolation(txn_id) {
                 // OPTIMIZATION: Cache visibility result for repeated txn_ids
-                let mut last_txn_id: i64 = -1;
+                let mut last_txn_id: i64 = 0;
                 let mut last_visible: bool = false;
 
                 let mut idx = 0;
@@ -3981,7 +3981,7 @@ impl VersionStore {
         let versions = self.versions.read().clone();
 
         // Cache visibility for slow path too
-        let mut last_txn_id: i64 = -1;
+        let mut last_txn_id: i64 = 0;
         let mut last_visible: bool = false;
 
         for chain in versions.values() {

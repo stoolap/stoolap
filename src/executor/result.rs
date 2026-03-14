@@ -442,6 +442,8 @@ pub struct FilteredResult {
     current_row: Option<Row>,
     /// Columns cached
     columns: Vec<String>,
+    /// Pending error from filter evaluation (e.g. invalid REGEXP pattern)
+    pending_error: Option<crate::core::Error>,
 }
 
 // SAFETY: FilteredResult is Send because all fields are Send:
@@ -467,6 +469,7 @@ impl FilteredResult {
             filter,
             current_row: None,
             columns,
+            pending_error: None,
         })
     }
 
@@ -481,6 +484,7 @@ impl FilteredResult {
             filter,
             current_row: None,
             columns,
+            pending_error: None,
         }
     }
 
@@ -494,6 +498,7 @@ impl FilteredResult {
             filter,
             current_row: None,
             columns,
+            pending_error: None,
         })
     }
 }
@@ -507,10 +512,18 @@ impl QueryResult for FilteredResult {
         // Keep advancing until we find a row that passes the filter
         while self.inner.next() {
             let row = self.inner.row();
-            // Use pre-compiled filter - thread-safe and efficient
-            if self.filter.matches(row) {
-                self.current_row = Some(self.inner.take_row());
-                return true;
+            // Use checked filter to propagate runtime errors (e.g. invalid REGEXP)
+            match self.filter.matches_checked(row) {
+                Ok(true) => {
+                    self.current_row = Some(self.inner.take_row());
+                    return true;
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    self.pending_error = Some(e);
+                    self.current_row = None;
+                    return false;
+                }
             }
         }
         self.current_row = None;
@@ -559,6 +572,13 @@ impl QueryResult for FilteredResult {
 
     fn last_insert_id(&self) -> i64 {
         self.inner.last_insert_id()
+    }
+
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        // Return own error first, then check inner for nested FilteredResult chains
+        self.pending_error
+            .take()
+            .or_else(|| self.inner.last_error())
     }
 
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
@@ -756,6 +776,10 @@ impl QueryResult for ExprMappedResult {
         0
     }
 
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        self.inner.last_error()
+    }
+
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
@@ -859,6 +883,10 @@ impl QueryResult for LimitedResult {
         self.inner.last_insert_id()
     }
 
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        self.inner.last_error()
+    }
+
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
@@ -886,7 +914,7 @@ pub struct RadixOrderSpec {
 
 impl OrderedResult {
     /// Create a new ordered result by materializing and sorting the inner result
-    pub fn new<F>(mut inner: Box<dyn QueryResult>, compare: F) -> Self
+    pub fn new<F>(mut inner: Box<dyn QueryResult>, compare: F) -> Result<Self>
     where
         F: Fn(&Row, &Row) -> std::cmp::Ordering,
     {
@@ -899,6 +927,9 @@ impl OrderedResult {
             rows.push((idx, inner.take_row()));
             idx += 1;
         }
+        if let Some(err) = inner.last_error() {
+            return Err(err);
+        }
 
         // Sort rows (comparing only the Row part, ignoring IDs)
         rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
@@ -906,9 +937,9 @@ impl OrderedResult {
         // Create memory result
         let memory_result = ExecutorResult::new(columns, rows);
 
-        Self {
+        Ok(Self {
             inner: memory_result,
-        }
+        })
     }
 
     /// Create an ordered result using radix sort for integer columns
@@ -924,7 +955,7 @@ impl OrderedResult {
         mut inner: Box<dyn QueryResult>,
         order_specs: &[RadixOrderSpec],
         fallback_compare: F,
-    ) -> Self
+    ) -> Result<Self>
     where
         F: Fn(&Row, &Row) -> std::cmp::Ordering,
     {
@@ -937,6 +968,9 @@ impl OrderedResult {
             rows.push((idx, inner.take_row()));
             idx += 1;
         }
+        if let Some(err) = inner.last_error() {
+            return Err(err);
+        }
 
         // Check if any column has explicit NULLS FIRST/LAST setting
         // If so, skip radix sort (which uses fixed NULL ordering) and use comparison sort
@@ -947,26 +981,26 @@ impl OrderedResult {
             if order_specs.len() == 1 {
                 let spec = &order_specs[0];
                 if Self::try_radix_sort_single_int(&mut rows, spec.col_idx, spec.ascending) {
-                    return Self {
+                    return Ok(Self {
                         inner: ExecutorResult::new(columns, rows),
-                    };
+                    });
                 }
             }
 
             // Try radix sort for multiple integer columns
             if order_specs.len() <= 4 && Self::try_radix_sort_multi_int(&mut rows, order_specs) {
-                return Self {
+                return Ok(Self {
                     inner: ExecutorResult::new(columns, rows),
-                };
+                });
             }
         }
 
         // Fallback to comparison sort (use sort_unstable_by for better performance)
         rows.sort_unstable_by(|(_, a), (_, b)| fallback_compare(a, b));
 
-        Self {
+        Ok(Self {
             inner: ExecutorResult::new(columns, rows),
-        }
+        })
     }
 
     /// Try to sort by a single integer column using radix sort
@@ -1100,7 +1134,12 @@ impl TopNResult {
     /// * `compare` - Comparison function for ordering (returns Less if a should come before b)
     /// * `limit` - Maximum number of rows to return
     /// * `offset` - Number of rows to skip (we need limit + offset rows in heap)
-    pub fn new<F>(mut inner: Box<dyn QueryResult>, compare: F, limit: usize, offset: usize) -> Self
+    pub fn new<F>(
+        mut inner: Box<dyn QueryResult>,
+        compare: F,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Self>
     where
         F: Fn(&Row, &Row) -> std::cmp::Ordering + Clone,
     {
@@ -1111,9 +1150,9 @@ impl TopNResult {
 
         // If no limit, fall back to empty result
         if heap_capacity == 0 {
-            return Self {
+            return Ok(Self {
                 inner: ExecutorResult::new(columns, RowVec::new()),
-            };
+            });
         }
 
         // Use Arc to wrap compare function - cloning Arc is O(1)
@@ -1167,6 +1206,9 @@ impl TopNResult {
                 }
             }
         }
+        if let Some(err) = inner.last_error() {
+            return Err(err);
+        }
 
         // Extract rows from heap and sort them
         let mut rows: Vec<Row> = heap.into_iter().map(|hr| hr.row).collect();
@@ -1186,9 +1228,9 @@ impl TopNResult {
             .map(|(i, row)| (i as i64, row))
             .collect();
 
-        Self {
+        Ok(Self {
             inner: ExecutorResult::new(columns, result_rows),
-        }
+        })
     }
 }
 
@@ -1366,6 +1408,10 @@ impl QueryResult for DistinctResult {
         0
     }
 
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        self.inner.last_error()
+    }
+
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
@@ -1482,6 +1528,10 @@ impl QueryResult for DistinctOnResult {
         0
     }
 
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        self.inner.last_error()
+    }
+
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
@@ -1550,6 +1600,10 @@ impl QueryResult for AliasedResult {
 
     fn last_insert_id(&self) -> i64 {
         self.inner.last_insert_id()
+    }
+
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        self.inner.last_error()
     }
 
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
@@ -1641,6 +1695,10 @@ impl QueryResult for ProjectedResult {
         0
     }
 
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        self.inner.last_error()
+    }
+
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         Box::new(AliasedResult::new(self, aliases))
     }
@@ -1725,6 +1783,10 @@ impl QueryResult for ScannerResult {
 
     fn close(&mut self) -> Result<()> {
         self.scanner.close()
+    }
+
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        self.scanner.err().cloned()
     }
 
     fn rows_affected(&self) -> i64 {
@@ -1845,6 +1907,10 @@ impl QueryResult for StreamingProjectionResult {
 
     fn last_insert_id(&self) -> i64 {
         0
+    }
+
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        self.inner.last_error()
     }
 
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
@@ -2175,7 +2241,8 @@ mod tests {
             let a_id = a.get(0).and_then(|v| v.as_int64()).unwrap_or(0);
             let b_id = b.get(0).and_then(|v| v.as_int64()).unwrap_or(0);
             a_id.cmp(&b_id)
-        });
+        })
+        .unwrap();
 
         assert!(result.next());
         assert_eq!(result.row().get(0), Some(&Value::Integer(1)));
