@@ -861,16 +861,37 @@ impl SegmentManager {
         let mut manifest = self.manifest.write();
         let mut ts_guard = self.tombstones.write();
         let ts = Arc::make_mut(&mut *ts_guard);
-        let mut added = false;
+        let mut changed = false;
         for &rid in row_ids {
             use std::collections::hash_map::Entry;
-            if let Entry::Vacant(e) = ts.entry(rid) {
-                e.insert(commit_seq);
-                manifest.tombstones.push((rid, commit_seq));
-                added = true;
+            match ts.entry(rid) {
+                Entry::Vacant(e) => {
+                    e.insert(commit_seq);
+                    manifest.tombstones.push((rid, commit_seq));
+                    changed = true;
+                }
+                Entry::Occupied(mut e) => {
+                    // Update existing tombstone if the new commit_seq is
+                    // different. This ensures repeated seal-skip tombstones
+                    // get a fresh sequence that won't match an older
+                    // compaction snapshot.
+                    if *e.get() != commit_seq {
+                        let old_seq = *e.get();
+                        e.insert(commit_seq);
+                        // Update the manifest entry in-place.
+                        if let Some(entry) = manifest
+                            .tombstones
+                            .iter_mut()
+                            .find(|(r, s)| *r == rid && *s == old_seq)
+                        {
+                            entry.1 = commit_seq;
+                        }
+                        changed = true;
+                    }
+                }
             }
         }
-        if added {
+        if changed {
             self.cached_deduped_count
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         }
@@ -901,6 +922,41 @@ impl SegmentManager {
             manifest
                 .tombstones
                 .retain(|&(rid, _)| !row_ids.contains(&rid));
+            self.cached_deduped_count
+                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Remove only tombstones that match both row_id AND commit_seq from a
+    /// prior snapshot. Tombstones added after the snapshot (e.g., by a
+    /// concurrent seal) are preserved.
+    pub fn remove_tombstones_matching_snapshot(
+        &self,
+        snapshot: &FxHashMap<i64, u64>,
+        row_ids: &FxHashSet<i64>,
+    ) {
+        if row_ids.is_empty() || snapshot.is_empty() {
+            return;
+        }
+        let mut manifest = self.manifest.write();
+        let mut ts_guard = self.tombstones.write();
+        let ts = Arc::make_mut(&mut *ts_guard);
+        let before = ts.len();
+        ts.retain(|rid, seq| {
+            if !row_ids.contains(rid) {
+                return true; // not in merged volumes, keep
+            }
+            // Only remove if the commit_seq matches the snapshot.
+            // If a newer tombstone was added (different seq), keep it.
+            !matches!(snapshot.get(rid), Some(snap_seq) if *snap_seq == *seq)
+        });
+        if ts.len() != before {
+            manifest.tombstones.retain(|&(rid, seq)| {
+                if !row_ids.contains(&rid) {
+                    return true;
+                }
+                !matches!(snapshot.get(&rid), Some(snap_seq) if *snap_seq == seq)
+            });
             self.cached_deduped_count
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         }

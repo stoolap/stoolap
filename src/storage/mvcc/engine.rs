@@ -462,6 +462,19 @@ pub struct MVCCEngine {
     /// This prevents compaction from running every checkpoint cycle when multiple
     /// tables stagger their volume accumulation.
     last_compaction_time: Mutex<Instant>,
+    /// True while a background compaction thread is running.
+    /// Background checkpoint skips compaction when set. Forced compaction
+    /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
+    compaction_running: Arc<AtomicBool>,
+}
+
+/// RAII guard that clears an AtomicBool on drop. Used to release the
+/// compaction_running flag even on early returns or panics.
+struct AtomicBoolGuard<'a>(&'a AtomicBool);
+impl Drop for AtomicBoolGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Parse a volume ID from a `.vol` filename (e.g., `vol_00065f1a2b3c4d5e.vol` -> `0x00065f1a2b3c4d5e`).
@@ -517,6 +530,7 @@ impl MVCCEngine {
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             // Initialize to epoch so the first compaction is not delayed
             last_compaction_time: Mutex::new(Instant::now() - std::time::Duration::from_secs(3600)),
+            compaction_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -791,8 +805,16 @@ impl MVCCEngine {
                         let elapsed_nanos = now.saturating_sub(last);
                         let interval_nanos = current_checkpoint_interval.as_nanos() as i64;
                         if elapsed_nanos >= interval_nanos {
-                            if let Err(e) = engine.checkpoint_cycle() {
-                                eprintln!("Warning: checkpoint cycle failed: {}", e);
+                            // Call checkpoint_cycle_inner directly (not
+                            // checkpoint_cycle) so compaction is spawned on
+                            // a separate thread instead of running synchronously.
+                            match engine.checkpoint_cycle_inner(false) {
+                                Ok(()) => {
+                                    engine.spawn_compaction();
+                                }
+                                Err(e) => {
+                                    eprintln!("Warning: checkpoint cycle failed: {}", e);
+                                }
                             }
                         }
                     }
@@ -2016,6 +2038,13 @@ impl MVCCEngine {
                 }
             }
         } // checkpoint_on_close
+
+        // Wait for any background compaction to finish before releasing
+        // resources. Without this, a detached compaction thread could still
+        // be rewriting manifests and deleting volume files after close returns.
+        while self.compaction_running.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         // Close all version stores
         let stores = self.version_stores.read().unwrap();
@@ -3684,8 +3713,20 @@ impl MVCCEngine {
             )));
         }
 
+        // Block background compaction for the duration of the snapshot.
+        // Compaction can swap segments and clear tombstones concurrently,
+        // yielding a backup that mixes old tombstones with new volumes.
+        while self
+            .compaction_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _compaction_guard = AtomicBoolGuard(&self.compaction_running);
+
         // Hold checkpoint_mutex for the entire snapshot operation.
-        // This prevents concurrent seal/compact from mutating cold state
+        // This prevents concurrent seal from mutating cold state
         // (volumes, tombstones) while we read it, ensuring the backup is
         // a true point-in-time snapshot consistent with snapshot_commit_seq.
         let _checkpoint_guard = self.checkpoint_mutex.lock().unwrap();
@@ -4278,6 +4319,20 @@ impl MVCCEngine {
             return Err(Error::internal("No snapshots directory found"));
         }
 
+        // Claim the compaction slot so no background compaction can start
+        // during restore. A detached compaction thread holds old
+        // SegmentManager Arcs and could persist pre-restore segments
+        // after we clear the segment manager map.
+        while self
+            .compaction_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Drop guard: release the compaction slot on any early return.
+        let _compaction_guard = AtomicBoolGuard(&self.compaction_running);
+
         // Acquire checkpoint_mutex to prevent concurrent seal/compact/snapshot
         let _checkpoint_guard = self.checkpoint_mutex.lock().unwrap();
 
@@ -4615,6 +4670,11 @@ impl MVCCEngine {
         // since it acquires the same mutex internally
         drop(_checkpoint_guard);
 
+        // Release the compaction slot before the forced compaction call.
+        // The destructive restore phase is complete — segment managers are
+        // repopulated, so a compaction here is safe.
+        drop(_compaction_guard);
+
         // Force checkpoint to persist restored data to volumes BEFORE accepting
         // transactions. WAL was truncated, so data is only in memory until this
         // checkpoint. A crash before this would lose the restored data.
@@ -4646,9 +4706,11 @@ impl MVCCEngine {
     /// Otherwise, unsealed rows' INSERT entries must survive in the WAL.
     fn checkpoint_cycle(&self) -> Result<()> {
         self.checkpoint_cycle_inner(false)?;
-        // Compaction runs outside the checkpoint critical path.
-        // checkpoint_mutex is released, so new checkpoints aren't blocked.
-        self.compact_after_checkpoint();
+        // Run compaction synchronously so direct callers (Rust API,
+        // trait users) get the full seal + compact behavior.
+        // The background thread bypasses this by calling
+        // checkpoint_cycle_inner + spawn_compaction directly.
+        self.compact_after_checkpoint_forced();
         Ok(())
     }
 
@@ -4797,64 +4859,84 @@ impl MVCCEngine {
         Ok(())
     }
 
-    /// Run compaction outside the checkpoint critical path.
-    /// Merges old volumes into fewer, larger files.
-    /// Called after checkpoint_cycle_inner returns (checkpoint_mutex released).
-    fn compact_after_checkpoint(&self) {
-        self.compact_after_checkpoint_inner(false);
-    }
-
-    fn compact_after_checkpoint_forced(&self) {
-        self.compact_after_checkpoint_inner(true);
-    }
-
-    fn compact_after_checkpoint_inner(&self, force: bool) {
-        if !force {
-            // Dynamic cooldown: skip if no table has a backlog.
-            // When any table exceeds compact_threshold, compact immediately.
-            // Otherwise, use cooldown to avoid unnecessary work.
-            let should_skip = {
-                let compact_threshold = self
-                    .config
-                    .read()
-                    .map(|c| c.persistence.compact_threshold as usize)
-                    .unwrap_or(4)
-                    .max(2);
-                let max_segments = {
-                    let mgrs = self.segment_managers.read().unwrap();
-                    mgrs.values().map(|m| m.segment_count()).max().unwrap_or(0)
-                };
-                if max_segments > compact_threshold {
-                    false // backlog exists — compact immediately
-                } else {
-                    let last = self.last_compaction_time.lock().unwrap();
-                    let cooldown = {
-                        let config = self.config.read();
-                        let threshold = config
-                            .as_ref()
-                            .map(|c| c.persistence.compact_threshold as u64)
-                            .unwrap_or(4)
-                            .max(2);
-                        let interval = config
-                            .as_ref()
-                            .map(|c| c.persistence.checkpoint_interval as u64)
-                            .unwrap_or(60)
-                            .max(10);
-                        std::time::Duration::from_secs(threshold * interval)
-                    };
-                    last.elapsed() < cooldown
-                }
-            };
-            if should_skip {
-                return;
-            }
+    /// Check whether compaction should run (cooldown + backlog check).
+    /// Returns true if compaction should proceed.
+    fn should_compact(&self) -> bool {
+        let (compact_threshold, checkpoint_interval) = {
+            let config = self.config.read();
+            let ct = config
+                .as_ref()
+                .map(|c| c.persistence.compact_threshold as usize)
+                .unwrap_or(4)
+                .max(2);
+            let ci = config
+                .as_ref()
+                .map(|c| c.persistence.checkpoint_interval as u64)
+                .unwrap_or(60)
+                .max(10);
+            (ct, ci)
+        }; // config lock dropped
+        let max_segments = {
+            let mgrs = self.segment_managers.read().unwrap();
+            mgrs.values().map(|m| m.segment_count()).max().unwrap_or(0)
+        };
+        if max_segments > compact_threshold {
+            return true; // backlog exists — compact immediately
         }
+        let last = self.last_compaction_time.lock().unwrap();
+        let cooldown =
+            std::time::Duration::from_secs(compact_threshold as u64 * checkpoint_interval);
+        last.elapsed() >= cooldown
+    }
 
+    /// Run compaction synchronously under the compaction_running flag.
+    /// The flag prevents concurrent compaction from background and forced
+    /// callers. Clears the flag on exit (including panics via drop guard).
+    fn run_compaction_guarded(&self) {
+        let _guard = AtomicBoolGuard(&self.compaction_running);
         if let Err(e) = self.compact_volumes() {
             eprintln!("Warning: compact_volumes failed: {}", e);
             return;
         }
         *self.last_compaction_time.lock().unwrap() = Instant::now();
+    }
+
+    /// Spawn compaction on a background thread. If compaction is already
+    /// running, this is a no-op (the next checkpoint cycle will retry).
+    /// Called from the background cleanup thread which owns Arc<Self>.
+    fn spawn_compaction(self: &Arc<Self>) {
+        if !self.should_compact() {
+            return;
+        }
+        // Try to claim the compaction slot. If already running, skip.
+        if self
+            .compaction_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || {
+            engine.run_compaction_guarded();
+        });
+    }
+
+    /// Run compaction synchronously, waiting for any in-flight background
+    /// compaction to finish first. Used by PRAGMA CHECKPOINT, close_engine,
+    /// restore, and v0.3.7 migration.
+    fn compact_after_checkpoint_forced(&self) {
+        // Claim the compaction slot, waiting for any background compaction.
+        // CAS loop: if background thread holds the flag, spin until it clears.
+        // Once we claim it, no background thread can start a new compaction.
+        while self
+            .compaction_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.run_compaction_guarded();
     }
 
     /// Re-record all DDL entries to WAL after checkpoint.
@@ -4989,7 +5071,15 @@ impl MVCCEngine {
                 let manifest = mgr.manifest();
                 let segs = mgr.segments_snapshot();
 
-                // Sort segments by row_count (smallest first), keep manifest index
+                // Adaptive compaction with three phases:
+                //
+                // 1. Space amplification: if physical rows > 2x logical,
+                //    merge ALL volumes to eliminate duplicates.
+                // 2. Convergence: merge at least (excess + 1) volumes so
+                //    the count drops to threshold in one cycle.
+                // 3. Opportunistic: keep including volumes as long as each
+                //    is no larger than the running average (sweeps up
+                //    similarly-sized small volumes cheaply).
                 let mut by_size: Vec<(usize, usize)> = manifest
                     .segments
                     .iter()
@@ -4998,11 +5088,56 @@ impl MVCCEngine {
                     .collect();
                 by_size.sort_by_key(|&(_, rows)| rows);
 
-                // Take the smallest compact_threshold * 2 volumes.
-                // This bounds I/O per cycle while making steady progress.
-                let limit = (compact_threshold * 2).min(by_size.len());
+                let seg_count = by_size.len();
+                let excess = seg_count.saturating_sub(compact_threshold);
+
+                // Convergence floor: merge enough volumes so the count
+                // drops to threshold in one cycle. Merging N into 1
+                // removes N-1 from the count, so min_merge = excess + 1.
+                let min_merge = (excess + 1).max(2).min(seg_count);
+
+                // Phase 1: include min_merge volumes (mandatory).
+                let mut merge_count = min_merge.min(by_size.len());
+                let mut row_total: usize = by_size[..merge_count].iter().map(|(_, r)| *r).sum();
+
+                // Phase 2: opportunistic — keep including volumes as long
+                // as each one is no larger than the running average. This
+                // sweeps up similarly-sized small volumes cheaply but
+                // stops at the first volume that's significantly bigger.
+                while merge_count < by_size.len() {
+                    let avg = row_total / merge_count.max(1);
+                    let next_rows = by_size[merge_count].1;
+                    if next_rows > avg {
+                        break;
+                    }
+                    row_total += next_rows;
+                    merge_count += 1;
+                }
+
+                // Phase 3: incremental dedup — if the selected volumes
+                // collectively hold enough rows relative to the largest
+                // volume (which is the "base" from a previous compaction),
+                // include it too. This deduplicates overlapping rows
+                // incrementally instead of waiting for a full-table rewrite.
+                //
+                // Triggers when selected rows > largest / 4 (25%). This
+                // means the base is only rewritten when enough new data
+                // has accumulated to justify the I/O. Fully adaptive:
+                // low write rate → rarely triggers, high rate → triggers
+                // proportionally.
+                if merge_count < seg_count {
+                    let largest_rows = by_size[seg_count - 1].1;
+                    if largest_rows > 0 && row_total > largest_rows / 4 {
+                        // Include all remaining volumes (including the largest).
+                        for &(_, rows) in &by_size[merge_count..] {
+                            row_total += rows;
+                        }
+                        merge_count = seg_count;
+                    }
+                }
+
                 let merge_indices: Vec<usize> =
-                    by_size[..limit].iter().map(|&(idx, _)| idx).collect();
+                    by_size[..merge_count].iter().map(|&(idx, _)| idx).collect();
 
                 if merge_indices.len() < 2 {
                     continue;
@@ -5065,7 +5200,9 @@ impl MVCCEngine {
                     .flat_map(|(_, vol)| vol.row_ids.iter().copied())
                     .collect();
                 mgr.replace_segments_atomic_remove_only(&old_ids);
-                mgr.remove_tombstones_for_rows(&merged_row_ids);
+                // Only clear tombstones that existed at snapshot time.
+                // Tombstones added later (by concurrent seal) are preserved.
+                mgr.remove_tombstones_matching_snapshot(&tombstones, &merged_row_ids);
 
                 // Persist manifest BEFORE deleting files (same safety as non-empty path).
                 if let Err(e) = mgr.persist_manifest_only() {
@@ -5161,16 +5298,16 @@ impl MVCCEngine {
                             &old_ids,
                         );
                     }
-                    // Clear only tombstones for row_ids in the merged volumes.
-                    // When compacting a subset, tombstones for unmerged volumes
-                    // must remain. Compaction deduped newest-first so the merged
-                    // result already excluded tombstoned rows.
+                    // Clear only tombstones that existed at snapshot time for
+                    // row_ids in the merged volumes. Tombstones added after the
+                    // snapshot (by concurrent seal) are preserved — they are
+                    // needed for WAL replay correctness.
                     {
                         let merged_row_ids: FxHashSet<i64> = volumes
                             .iter()
                             .flat_map(|(_, vol)| vol.row_ids.iter().copied())
                             .collect();
-                        mgr.remove_tombstones_for_rows(&merged_row_ids);
+                        mgr.remove_tombstones_matching_snapshot(&tombstones, &merged_row_ids);
                     }
 
                     // CRITICAL: Persist manifest BEFORE deleting old files.
@@ -5396,6 +5533,8 @@ impl MVCCEngine {
                     // Register the cold segment BEFORE removing rows from hot.
                     // Rows are visible in BOTH hot and cold briefly. Skip-set
                     // dedup (newest-first wins) handles this at scan time.
+                    // Registration MUST happen before tombstone clearing so
+                    // unique enforcement can see the new values immediately.
                     let mgr = self.get_or_create_segment_manager(&table_name);
                     mgr.set_seal_overlap(total_rows);
                     self.register_volume_with_id(&table_name, Arc::clone(&volume), volume_id);
@@ -5424,7 +5563,14 @@ impl MVCCEngine {
                     //    INSERT → applies the WAL entry to hot)
                     // 3. row_count() is correct (tombstoned cold rows are excluded)
                     if !all_skipped.is_empty() {
-                        mgr.add_tombstones(&all_skipped, 0);
+                        // Use the current commit sequence as the tombstone's
+                        // commit_seq. This makes each seal's tombstones
+                        // distinguishable from previous seals, so concurrent
+                        // compaction (which snapshots tombstones at start)
+                        // won't accidentally clear a tombstone re-added by
+                        // a later seal.
+                        let seal_seq = self.registry.get_current_sequence() as u64;
+                        mgr.add_tombstones(&all_skipped, seal_seq);
                     }
 
                     // Sync auto-increment so new inserts don't collide
@@ -5445,33 +5591,22 @@ impl MVCCEngine {
                         store.remove_sealed_index_entries(cleanup);
                     }
 
-                    // Clear tombstones for row_ids that are now in the new volume,
-                    // EXCEPT for skipped row_ids. Skipped rows have a stale copy in
-                    // the volume and a live version in hot — their tombstone must
-                    // survive so recovery applies the WAL entry and scans use hot.
-                    let skip_set: FxHashSet<i64> = all_skipped.iter().copied().collect();
+                    // Clear tombstones for row_ids that are now in the new
+                    // volume, EXCEPT for skipped row_ids. Skipped rows have
+                    // a stale copy in the volume and a live version in hot —
+                    // their tombstone must survive for recovery and row_count.
                     {
-                        let mgr = self.get_or_create_segment_manager(&table_name);
+                        let skip_set: FxHashSet<i64> = all_skipped.iter().copied().collect();
                         let ts = mgr.tombstone_set_arc();
                         if !ts.is_empty() {
-                            let sealed_ids: Vec<i64> = volume
+                            let sealed_ids: FxHashSet<i64> = volume
                                 .row_ids
                                 .iter()
                                 .copied()
                                 .filter(|rid| ts.contains_key(rid) && !skip_set.contains(rid))
                                 .collect();
                             if !sealed_ids.is_empty() {
-                                // Remove from both runtime set and manifest
-                                // Lock order: manifest FIRST, then tombstones
-                                let mut manifest = mgr.manifest_mut();
-                                let mut ts_guard = mgr.tombstones_write();
-                                let ts = Arc::make_mut(&mut *ts_guard);
-                                for &rid in &sealed_ids {
-                                    ts.remove(&rid);
-                                }
-                                manifest
-                                    .tombstones
-                                    .retain(|&(rid, _)| ts.contains_key(&rid));
+                                mgr.remove_tombstones_for_rows(&sealed_ids);
                             }
                         }
                     }
