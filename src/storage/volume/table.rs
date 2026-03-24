@@ -576,7 +576,8 @@ impl SegmentedTable {
                 scanner.set_skip_sets(Arc::clone(&tombstones_arc), dynamic);
                 scanner.snapshot_seq = self.snapshot_seq;
                 let current_schema = self.hot.schema();
-                scanner.set_schema(current_schema.clone());
+                let mapping = super::writer::compute_column_mapping(current_schema, vol);
+                scanner.set_column_mapping(mapping);
                 if let Some(expr) = where_expr {
                     let filter = expr.with_aliases(&Default::default());
                     let mut prepared = filter;
@@ -628,7 +629,8 @@ impl SegmentedTable {
             scanner.set_skip_sets(Arc::clone(&tombstones_arc), dynamic_for_this_volume);
             scanner.snapshot_seq = self.snapshot_seq;
             let current_schema = self.hot.schema();
-            scanner.set_schema(current_schema.clone());
+            let mapping = super::writer::compute_column_mapping(current_schema, vol);
+            scanner.set_column_mapping(mapping);
 
             if let Some(expr) = where_expr {
                 let filter = expr.with_aliases(&Default::default());
@@ -708,12 +710,7 @@ impl SegmentedTable {
             }
 
             let current_schema = self.hot.schema();
-            let needs_normalize = vol.column_names.len() != current_schema.columns.len()
-                || vol
-                    .column_names
-                    .iter()
-                    .zip(current_schema.columns.iter())
-                    .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
+            let mapping = super::writer::compute_column_mapping(current_schema, vol);
 
             // Process rows BEFORE adding this volume's IDs to dynamic_skip.
             // dynamic_skip has hot row_ids + all newer volumes' row_ids (no clone needed).
@@ -740,10 +737,10 @@ impl SegmentedTable {
                     }
                 }
 
-                let row = if needs_normalize {
-                    vol.get_row_normalized(i, current_schema)
-                } else {
+                let row = if mapping.is_identity {
                     vol.get_row(i)
+                } else {
+                    vol.get_row_mapped(i, &mapping)
                 };
                 if let Some(expr) = where_expr {
                     if !expr.evaluate_fast(&row) {
@@ -939,12 +936,7 @@ impl Table for SegmentedTable {
         let schema_clone = self.hot.schema().clone();
 
         for (_, vol) in volumes.iter() {
-            let needs_normalize = vol.column_names.len() != schema_clone.columns.len()
-                || vol
-                    .column_names
-                    .iter()
-                    .zip(schema_clone.columns.iter())
-                    .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
+            let mapping = super::writer::compute_column_mapping(&schema_clone, vol);
 
             for i in 0..vol.row_count {
                 let row_id = vol.row_ids[i];
@@ -952,10 +944,10 @@ impl Table for SegmentedTable {
                 {
                     continue;
                 }
-                let row = if needs_normalize {
-                    vol.get_row_normalized(i, &schema_clone)
-                } else {
+                let row = if mapping.is_identity {
                     vol.get_row(i)
+                } else {
+                    vol.get_row_mapped(i, &mapping)
                 };
                 if let Some(expr) = where_expr {
                     if !expr.evaluate_fast(&row) {
@@ -1023,18 +1015,27 @@ impl Table for SegmentedTable {
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
 
+        let mut cached_mapping: Option<(
+            *const super::writer::FrozenVolume,
+            super::writer::ColumnMapping,
+        )> = None;
         for &row_id in row_ids {
             if let Some((vol, idx)) = self.find_segment_row(row_id) {
-                let needs_normalize = vol.column_names.len() != schema.columns.len()
-                    || vol
-                        .column_names
-                        .iter()
-                        .zip(schema.columns.iter())
-                        .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
-                let row = if needs_normalize {
-                    vol.get_row_normalized(idx, &schema)
-                } else {
+                let vol_ptr = &*vol as *const super::writer::FrozenVolume;
+                let mapping = match &cached_mapping {
+                    Some((ptr, m)) if *ptr == vol_ptr => m,
+                    _ => {
+                        cached_mapping = Some((
+                            vol_ptr,
+                            super::writer::compute_column_mapping(&schema, &vol),
+                        ));
+                        &cached_mapping.as_ref().unwrap().1
+                    }
+                };
+                let row = if mapping.is_identity {
                     vol.get_row(idx)
+                } else {
+                    vol.get_row_mapped(idx, mapping)
                 };
                 let old_row = row.clone();
                 let (new_row, changed) = setter(row)?;
@@ -1169,12 +1170,7 @@ impl Table for SegmentedTable {
 
         let mut deleted_cold_ids: Vec<i64> = Vec::new();
         for (_, vol) in volumes.iter() {
-            let needs_normalize = vol.column_names.len() != schema_clone.columns.len()
-                || vol
-                    .column_names
-                    .iter()
-                    .zip(schema_clone.columns.iter())
-                    .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
+            let mapping = super::writer::compute_column_mapping(&schema_clone, vol);
 
             // Process rows before adding this volume's IDs (no clone needed)
             for i in 0..vol.row_count {
@@ -1183,10 +1179,10 @@ impl Table for SegmentedTable {
                 {
                     continue;
                 }
-                let row = if needs_normalize {
-                    vol.get_row_normalized(i, &schema_clone)
-                } else {
+                let row = if mapping.is_identity {
                     vol.get_row(i)
+                } else {
+                    vol.get_row_mapped(i, &mapping)
                 };
                 if let Some(expr) = where_expr {
                     if !expr.evaluate_fast(&row) {
@@ -1316,19 +1312,28 @@ impl Table for SegmentedTable {
         let schema = self.hot.schema().clone();
         let mut result = RowVec::with_capacity(row_ids.len());
         let mut hot_ids = Vec::new();
+        let mut cached_mapping: Option<(
+            *const super::writer::FrozenVolume,
+            super::writer::ColumnMapping,
+        )> = None;
 
         for &row_id in row_ids {
             if let Some((vol, idx)) = self.find_segment_row(row_id) {
-                let needs_normalize = vol.column_names.len() != schema.columns.len()
-                    || vol
-                        .column_names
-                        .iter()
-                        .zip(schema.columns.iter())
-                        .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
-                let row = if needs_normalize {
-                    vol.get_row_normalized(idx, &schema)
-                } else {
+                let vol_ptr = &*vol as *const super::writer::FrozenVolume;
+                let mapping = match &cached_mapping {
+                    Some((ptr, m)) if *ptr == vol_ptr => m,
+                    _ => {
+                        cached_mapping = Some((
+                            vol_ptr,
+                            super::writer::compute_column_mapping(&schema, &vol),
+                        ));
+                        &cached_mapping.as_ref().unwrap().1
+                    }
+                };
+                let row = if mapping.is_identity {
                     vol.get_row(idx)
+                } else {
+                    vol.get_row_mapped(idx, mapping)
                 };
                 result.push((row_id, row));
             } else {
@@ -1365,21 +1370,26 @@ impl Table for SegmentedTable {
 
         let mut hot_ids = Vec::new();
         let schema = self.hot.schema();
+        let mut cached_mapping: Option<(
+            *const super::writer::FrozenVolume,
+            super::writer::ColumnMapping,
+        )> = None;
 
         for &row_id in row_ids {
             if let Some((vol, idx)) = self.find_segment_row(row_id) {
-                // Schema normalization check is cheap (len comparison) but
-                // the full string comparison only runs if lengths differ.
-                let needs_normalize = vol.column_names.len() != schema.columns.len()
-                    || vol
-                        .column_names
-                        .iter()
-                        .zip(schema.columns.iter())
-                        .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
-                let row = if needs_normalize {
-                    vol.get_row_normalized(idx, schema)
-                } else {
+                let vol_ptr = &*vol as *const super::writer::FrozenVolume;
+                let mapping = match &cached_mapping {
+                    Some((ptr, m)) if *ptr == vol_ptr => m,
+                    _ => {
+                        cached_mapping =
+                            Some((vol_ptr, super::writer::compute_column_mapping(schema, &vol)));
+                        &cached_mapping.as_ref().unwrap().1
+                    }
+                };
+                let row = if mapping.is_identity {
                     vol.get_row(idx)
+                } else {
+                    vol.get_row_mapped(idx, mapping)
                 };
                 if filter.evaluate_fast(&row) {
                     buffer.push((row_id, row));
@@ -1456,7 +1466,6 @@ impl Table for SegmentedTable {
         let remaining = target - hot_rows.len();
         let mut cold_rows = RowVec::with_capacity(remaining.min(1024));
         let current_schema = self.hot.schema();
-        let schema_cols = current_schema.columns.len();
 
         // Zone-map + bloom filter setup for pruning
         let comparisons = where_expr
@@ -1473,22 +1482,17 @@ impl Table for SegmentedTable {
                 }
             }
 
-            let needs_normalize = vol.column_names.len() != schema_cols
-                || vol
-                    .column_names
-                    .iter()
-                    .zip(current_schema.columns.iter())
-                    .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
+            let mapping = super::writer::compute_column_mapping(current_schema, vol);
 
             for i in 0..vol.row_count {
                 let rid = vol.row_ids[i];
                 if authority.get(&rid) != Some(&nf_idx) {
                     continue;
                 }
-                let row = if needs_normalize {
-                    vol.get_row_normalized(i, current_schema)
-                } else {
+                let row = if mapping.is_identity {
                     vol.get_row(i)
+                } else {
+                    vol.get_row_mapped(i, &mapping)
                 };
                 if let Some(expr) = where_expr {
                     if !expr.evaluate_fast(&row) {
@@ -1564,12 +1568,7 @@ impl Table for SegmentedTable {
                 continue;
             }
 
-            let needs_normalize = vol.column_names.len() != current_schema.columns.len()
-                || vol
-                    .column_names
-                    .iter()
-                    .zip(current_schema.columns.iter())
-                    .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
+            let mapping = super::writer::compute_column_mapping(current_schema, vol);
 
             for i in 0..vol.row_count {
                 let row_id = vol.row_ids[i];
@@ -1577,10 +1576,10 @@ impl Table for SegmentedTable {
                 {
                     continue;
                 }
-                let row = if needs_normalize {
-                    vol.get_row_normalized(i, current_schema)
-                } else {
+                let row = if mapping.is_identity {
                     vol.get_row(i)
+                } else {
+                    vol.get_row_mapped(i, &mapping)
                 };
                 if let Some(expr) = where_expr {
                     if !expr.evaluate_fast(&row) {
@@ -2131,34 +2130,32 @@ impl Table for SegmentedTable {
         let default_val = self.column_default(col_idx);
         let has_non_null_default = !default_val.is_null();
         for (_, vol) in volumes.iter() {
-            let vol_has_col = col_idx < vol.columns.len();
-            let needs_normalize = vol.column_names.len() != current_schema.columns.len()
-                || vol
-                    .column_names
-                    .iter()
-                    .zip(current_schema.columns.iter())
-                    .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
+            let mapping = super::writer::compute_column_mapping(current_schema, vol);
+            // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
+            let phys_col = match &mapping.sources[col_idx] {
+                super::writer::ColSource::Volume(idx) => Some(*idx),
+                super::writer::ColSource::Default(_) => None,
+            };
 
             for i in 0..vol.row_count {
                 let rid = vol.row_ids[i];
                 if self.is_row_tombstoned(&tombstones_arc, rid) || !seen_row_ids.insert(rid) {
                     continue;
                 }
-                let val = if vol_has_col {
-                    if vol.columns[col_idx].is_null(i) {
+                let val = if let Some(pc) = phys_col {
+                    if vol.columns[pc].is_null(i) {
                         continue;
                     }
-                    vol.columns[col_idx].get_value(i)
+                    vol.columns[pc].get_value(i)
                 } else if has_non_null_default {
                     default_val.clone()
                 } else {
                     continue;
                 };
-                // Always normalize — old volumes may be missing columns
-                let row = if needs_normalize || !vol_has_col {
-                    vol.get_row_normalized(i, current_schema)
-                } else {
+                let row = if mapping.is_identity {
                     vol.get_row(i)
+                } else {
+                    vol.get_row_mapped(i, &mapping)
                 };
                 groups.entry(val).or_default().push((rid, row));
             }
@@ -2206,39 +2203,37 @@ impl Table for SegmentedTable {
         let default_val = self.column_default(col_idx);
         let has_non_null_default = !default_val.is_null();
         for (_, vol) in volumes.iter() {
-            let vol_has_col = col_idx < vol.columns.len();
+            let mapping = super::writer::compute_column_mapping(current_schema, vol);
+            // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
+            let phys_col = match &mapping.sources[col_idx] {
+                super::writer::ColSource::Volume(idx) => Some(*idx),
+                super::writer::ColSource::Default(_) => None,
+            };
             // Skip volume if missing column and default doesn't match target
-            if !vol_has_col && (!has_non_null_default || &default_val != partition_value) {
+            if phys_col.is_none() && (!has_non_null_default || &default_val != partition_value) {
                 continue;
             }
-
-            let needs_normalize = vol.column_names.len() != current_schema.columns.len()
-                || vol
-                    .column_names
-                    .iter()
-                    .zip(current_schema.columns.iter())
-                    .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
 
             for i in 0..vol.row_count {
                 let rid = vol.row_ids[i];
                 if self.is_row_tombstoned(&tombstones_arc, rid) || !seen_row_ids.insert(rid) {
                     continue;
                 }
-                let matches = if vol_has_col {
-                    if vol.columns[col_idx].is_null(i) {
+                let matches = if let Some(pc) = phys_col {
+                    if vol.columns[pc].is_null(i) {
                         false
                     } else {
-                        &vol.columns[col_idx].get_value(i) == partition_value
+                        &vol.columns[pc].get_value(i) == partition_value
                     }
                 } else {
                     // Missing column → all rows have default, already checked match above
                     true
                 };
                 if matches {
-                    let row = if needs_normalize || !vol_has_col {
-                        vol.get_row_normalized(i, current_schema)
-                    } else {
+                    let row = if mapping.is_identity {
                         vol.get_row(i)
+                    } else {
+                        vol.get_row_mapped(i, &mapping)
                     };
                     result.push((rid, row));
                 }
@@ -2662,12 +2657,7 @@ impl Table for SegmentedTable {
                 .insert_pending_tombstones_into(self.txn_id(), &mut dynamic_skip);
 
             for (_, vol) in volumes.iter() {
-                let needs_normalize = vol.column_names.len() != schema.columns.len()
-                    || vol
-                        .column_names
-                        .iter()
-                        .zip(schema.columns.iter())
-                        .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
+                let mapping = super::writer::compute_column_mapping(&schema, vol);
                 for i in 0..vol.row_count {
                     let row_id = vol.row_ids[i];
                     if self.is_row_tombstoned(&tombstones_arc, row_id)
@@ -2690,10 +2680,10 @@ impl Table for SegmentedTable {
                             }
                         }
                     }
-                    let row = if needs_normalize {
-                        vol.get_row_normalized(i, &schema)
-                    } else {
+                    let row = if mapping.is_identity {
                         vol.get_row(i)
+                    } else {
+                        vol.get_row_mapped(i, &mapping)
                     };
                     if let Some(e) = expr {
                         if !e.evaluate_fast(&row) {
@@ -2904,22 +2894,17 @@ impl Table for SegmentedTable {
         let current_schema = self.hot.schema();
 
         for (_, vol) in volumes.iter() {
-            let needs_normalize = vol.column_names.len() != current_schema.columns.len()
-                || vol
-                    .column_names
-                    .iter()
-                    .zip(current_schema.columns.iter())
-                    .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
+            let mapping = super::writer::compute_column_mapping(current_schema, vol);
 
             for i in 0..vol.row_count {
                 let rid = vol.row_ids[i];
                 if self.is_row_tombstoned(&tombstones_arc, rid) || !seen.insert(rid) {
                     continue;
                 }
-                let row = if needs_normalize {
-                    vol.get_row_normalized(i, current_schema)
-                } else {
+                let row = if mapping.is_identity {
                     vol.get_row(i)
+                } else {
+                    vol.get_row_mapped(i, &mapping)
                 };
 
                 let key = row

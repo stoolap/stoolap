@@ -481,7 +481,148 @@ impl VolumeBuilder {
     }
 }
 
+/// Source for a single schema column when reading from a frozen volume.
+/// Precomputed once per volume per scan, then used for every row.
+#[derive(Clone)]
+pub enum ColSource {
+    /// Schema column maps to this volume column index.
+    Volume(usize),
+    /// Schema column was added after this volume was sealed.
+    /// Use this default value (NULL or DEFAULT from ALTER TABLE).
+    Default(Value),
+}
+
+/// Precomputed mapping from current schema to a frozen volume's columns.
+/// Computed once per volume per scan. Eliminates per-row name lookups.
+#[derive(Clone)]
+pub struct ColumnMapping {
+    /// For each schema column position, how to get the value.
+    pub sources: Vec<ColSource>,
+    /// True when every schema column maps 1:1 to the same volume column
+    /// in the same order. When true, callers can skip the mapping and
+    /// use get_row()/get_row_projected() directly.
+    pub is_identity: bool,
+}
+
+/// Compute the column mapping from current schema to a frozen volume.
+/// O(schema_cols * volume_cols) but runs once per volume per scan.
+pub fn compute_column_mapping(schema: &Schema, volume: &FrozenVolume) -> ColumnMapping {
+    let mut sources = Vec::with_capacity(schema.columns.len());
+    let mut is_identity = schema.columns.len() == volume.columns.len();
+
+    for (pos, col) in schema.columns.iter().enumerate() {
+        if let Some(vol_idx) = volume.column_index(&col.name_lower) {
+            if is_identity && vol_idx != pos {
+                is_identity = false;
+            }
+            sources.push(ColSource::Volume(vol_idx));
+        } else if pos < volume.columns.len()
+            && pos < volume.column_types.len()
+            && volume.column_types[pos] == col.data_type
+        {
+            // Positional fallback: same position + same type = likely a rename
+            sources.push(ColSource::Volume(pos));
+        } else {
+            is_identity = false;
+            if let Some(ref default_val) = col.default_value {
+                sources.push(ColSource::Default(default_val.clone()));
+            } else {
+                sources.push(ColSource::Default(Value::Null(col.data_type)));
+            }
+        }
+    }
+
+    ColumnMapping {
+        sources,
+        is_identity,
+    }
+}
+
 impl FrozenVolume {
+    /// Get a row using a precomputed column mapping.
+    /// Materializes all schema columns through the mapping.
+    pub fn get_row_mapped(&self, idx: usize, mapping: &ColumnMapping) -> Row {
+        let values: Vec<Value> = mapping
+            .sources
+            .iter()
+            .map(|src| match src {
+                ColSource::Volume(vol_idx) => self.columns[*vol_idx].get_value(idx),
+                ColSource::Default(val) => val.clone(),
+            })
+            .collect();
+        Row::from_values(values)
+    }
+
+    /// Get specific columns of a row using a precomputed column mapping.
+    /// Only materializes the requested schema columns — skips the rest.
+    pub fn get_row_mapped_projected(
+        &self,
+        idx: usize,
+        mapping: &ColumnMapping,
+        col_indices: &[usize],
+    ) -> Row {
+        let values: Vec<Value> = col_indices
+            .iter()
+            .map(|&ci| match &mapping.sources[ci] {
+                ColSource::Volume(vol_idx) => self.columns[*vol_idx].get_value(idx),
+                ColSource::Default(val) => val.clone(),
+            })
+            .collect();
+        Row::from_values(values)
+    }
+
+    /// Get a row materializing only columns marked true in the mask.
+    /// Other columns get typed Null (stack-only, zero allocation).
+    /// The row has full schema width so filter column indices work.
+    #[inline]
+    pub fn get_row_needed(&self, idx: usize, needed: &[bool]) -> Row {
+        let values: Vec<Value> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ci, col)| {
+                if ci < needed.len() && needed[ci] {
+                    col.get_value(idx)
+                } else {
+                    Value::Null(col.data_type())
+                }
+            })
+            .collect();
+        Row::from_values(values)
+    }
+
+    /// Get a row using a mapping, materializing only needed columns.
+    /// Combines schema evolution (mapping) with column pruning (mask).
+    #[inline]
+    pub fn get_row_mapped_needed(
+        &self,
+        idx: usize,
+        mapping: &ColumnMapping,
+        needed: &[bool],
+    ) -> Row {
+        let values: Vec<Value> = mapping
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(ci, src)| {
+                if ci < needed.len() && needed[ci] {
+                    match src {
+                        ColSource::Volume(vol_idx) => self.columns[*vol_idx].get_value(idx),
+                        ColSource::Default(val) => val.clone(),
+                    }
+                } else {
+                    match src {
+                        ColSource::Volume(vol_idx) => {
+                            Value::Null(self.columns[*vol_idx].data_type())
+                        }
+                        ColSource::Default(val) => Value::Null(val.data_type()),
+                    }
+                }
+            })
+            .collect();
+        Row::from_values(values)
+    }
+
     /// Get a row as a Vec of Values (for executor compatibility).
     pub fn get_row(&self, idx: usize) -> Row {
         let values: Vec<Value> = self.columns.iter().map(|col| col.get_value(idx)).collect();

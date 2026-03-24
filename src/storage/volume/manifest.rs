@@ -456,11 +456,14 @@ impl SegmentManager {
 
     /// Get segments in order (by segment_id, oldest first).
     pub fn get_segments_ordered(&self) -> Vec<Arc<FrozenVolume>> {
-        let seg_ids: Vec<u64> = {
+        // Hold manifest lock while cloning segments Arc to prevent
+        // compaction from swapping the map between the two reads.
+        let (seg_ids, segments) = {
             let manifest = self.manifest.read();
-            manifest.segments.iter().map(|m| m.segment_id).collect()
+            let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+            let segments = Arc::clone(&*self.segments.read());
+            (seg_ids, segments)
         };
-        let segments = Arc::clone(&*self.segments.read());
         seg_ids
             .iter()
             .filter_map(|id| segments.get(id).cloned())
@@ -472,15 +475,15 @@ impl SegmentManager {
     /// Segments are always appended in ascending order, so reverse gives
     /// newest-first in O(n) instead of O(n log n) sort.
     pub fn get_volumes_newest_first(&self) -> Arc<Vec<(u64, Arc<FrozenVolume>)>> {
-        // CoW snapshot: acquire manifest + segments locks briefly (nanoseconds)
-        // to build the list, then release. No caching layer — the Arc<FxHashMap>
-        // on segments already serves as the CoW mechanism. This avoids the
-        // thundering herd effect from cache invalidation.
-        let seg_ids: Vec<u64> = {
+        // Hold manifest lock while cloning segments Arc to prevent
+        // compaction's replace_segments_atomic from swapping the map
+        // between the two reads (TOCTOU → missing rows in scan).
+        let (seg_ids, segs) = {
             let manifest = self.manifest.read();
-            manifest.segments.iter().map(|m| m.segment_id).collect()
+            let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+            let segs = Arc::clone(&*self.segments.read());
+            (seg_ids, segs)
         };
-        let segs = Arc::clone(&*self.segments.read());
         let mut result: Vec<(u64, Arc<FrozenVolume>)> = seg_ids
             .iter()
             .filter_map(|&id| segs.get(&id).map(|v| (id, Arc::clone(v))))
@@ -509,20 +512,21 @@ impl SegmentManager {
         col_idx: usize,
         value: &crate::core::Value,
     ) -> Option<i64> {
-        // CoW snapshot: clone segment IDs from manifest (small Vec copy),
-        // Arc-clone the segments map + tombstones. Each lock held for
-        // nanoseconds, then scan is entirely lock-free.
-        let seg_ids: Vec<u64> = {
+        // Atomic snapshot: read seg_ids and segments map under the manifest
+        // lock so compaction's replace_segments_atomic (which holds manifest
+        // write → segments write) cannot swap them between the two reads.
+        let (seg_ids, segs, ts) = {
             let manifest = self.manifest.read();
-            manifest
+            let seg_ids: Vec<u64> = manifest
                 .segments
                 .iter()
                 .rev()
                 .map(|m| m.segment_id)
-                .collect()
+                .collect();
+            let segs = Arc::clone(&*self.segments.read());
+            let ts = Arc::clone(&*self.tombstones.read());
+            (seg_ids, segs, ts)
         };
-        let segs = Arc::clone(&*self.segments.read());
-        let ts = Arc::clone(&*self.tombstones.read());
 
         // Collect row_ids we've already seen across volumes (newest-first dedup).
         // For PK checks this is typically small because PK values are unique per volume.
@@ -618,18 +622,21 @@ impl SegmentManager {
             return None;
         }
 
-        // CoW snapshot: nanosecond lock holds, then scan lock-free.
-        let seg_ids: Vec<u64> = {
+        // Atomic snapshot: read seg_ids and segments map under the manifest
+        // lock so compaction's replace_segments_atomic cannot swap them
+        // between the two reads (TOCTOU race → false unique-miss → dupes).
+        let (seg_ids, segs, ts) = {
             let manifest = self.manifest.read();
-            manifest
+            let seg_ids: Vec<u64> = manifest
                 .segments
                 .iter()
                 .rev()
                 .map(|m| m.segment_id)
-                .collect()
+                .collect();
+            let segs = Arc::clone(&*self.segments.read());
+            let ts = Arc::clone(&*self.tombstones.read());
+            (seg_ids, segs, ts)
         };
-        let segs = Arc::clone(&*self.segments.read());
-        let ts = Arc::clone(&*self.tombstones.read());
 
         if seg_ids.is_empty() {
             return None;
@@ -1065,20 +1072,20 @@ impl SegmentManager {
     ///
     /// Used for constraint checking (PK/UNIQUE).
     pub fn row_exists(&self, row_id: i64) -> bool {
-        // CoW snapshot: nanosecond lock holds, then scan lock-free.
         let ts = Arc::clone(&*self.tombstones.read());
         if ts.contains_key(&row_id) {
             return false;
         }
-        let seg_ids: Vec<(u64, i64, i64)> = {
+        let (seg_ids, segments) = {
             let manifest = self.manifest.read();
-            manifest
+            let seg_ids: Vec<(u64, i64, i64)> = manifest
                 .segments
                 .iter()
                 .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
-                .collect()
+                .collect();
+            let segments = Arc::clone(&*self.segments.read());
+            (seg_ids, segments)
         };
-        let segments = Arc::clone(&*self.segments.read());
         for (seg_id, min_id, max_id) in &seg_ids {
             if row_id < *min_id || row_id > *max_id {
                 continue;
@@ -1095,21 +1102,23 @@ impl SegmentManager {
     /// Get a cold row by row_id. Returns the Row if found and not tombstoned.
     /// Iterates newest-first so overlapping row_ids return the newest version.
     pub fn get_cold_row(&self, row_id: i64) -> Option<crate::core::Row> {
-        // CoW snapshot: nanosecond lock holds, then scan lock-free.
         let ts = Arc::clone(&*self.tombstones.read());
         if ts.contains_key(&row_id) {
             return None;
         }
-        let seg_ids: Vec<(u64, i64, i64)> = {
+        // Hold manifest lock while cloning segments Arc to prevent
+        // compaction from swapping the map between the two reads.
+        let (seg_ids, segments) = {
             let manifest = self.manifest.read();
-            manifest
+            let seg_ids: Vec<(u64, i64, i64)> = manifest
                 .segments
                 .iter()
                 .rev()
                 .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
-                .collect()
+                .collect();
+            let segments = Arc::clone(&*self.segments.read());
+            (seg_ids, segments)
         };
-        let segments = Arc::clone(&*self.segments.read());
         for (seg_id, min_id, max_id) in &seg_ids {
             if row_id < *min_id || row_id > *max_id {
                 continue;
@@ -1132,37 +1141,34 @@ impl SegmentManager {
         row_id: i64,
         schema: &crate::core::Schema,
     ) -> Option<crate::core::Row> {
-        // CoW snapshot: nanosecond lock holds, then scan lock-free.
         let ts = Arc::clone(&*self.tombstones.read());
         if ts.contains_key(&row_id) {
             return None;
         }
-        let seg_ids: Vec<(u64, i64, i64)> = {
+        // Hold manifest lock while cloning segments Arc to prevent
+        // compaction from swapping the map between the two reads.
+        let (seg_ids, segments) = {
             let manifest = self.manifest.read();
-            manifest
+            let seg_ids: Vec<(u64, i64, i64)> = manifest
                 .segments
                 .iter()
                 .rev()
                 .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
-                .collect()
+                .collect();
+            let segments = Arc::clone(&*self.segments.read());
+            (seg_ids, segments)
         };
-        let segments = Arc::clone(&*self.segments.read());
         for (seg_id, min_id, max_id) in &seg_ids {
             if row_id < *min_id || row_id > *max_id {
                 continue;
             }
             if let Some(vol) = segments.get(seg_id) {
                 if let Ok(idx) = vol.row_ids.binary_search(&row_id) {
-                    let needs_normalize = vol.column_names.len() != schema.columns.len()
-                        || vol
-                            .column_names
-                            .iter()
-                            .zip(schema.columns.iter())
-                            .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
-                    if needs_normalize {
-                        return Some(vol.get_row_normalized(idx, schema));
+                    let mapping = super::writer::compute_column_mapping(schema, vol);
+                    if mapping.is_identity {
+                        return Some(vol.get_row(idx));
                     }
-                    return Some(vol.get_row(idx));
+                    return Some(vol.get_row_mapped(idx, &mapping));
                 }
             }
         }
@@ -1173,15 +1179,16 @@ impl SegmentManager {
     /// Does NOT check tombstones. Used for idempotent WAL replay.
     /// Uses binary search on the volume's row_ids for O(log n) per segment.
     pub fn is_row_id_in_volume(&self, row_id: i64) -> bool {
-        let seg_ids: Vec<(u64, i64, i64)> = {
+        let (seg_ids, segments) = {
             let manifest = self.manifest.read();
-            manifest
+            let seg_ids: Vec<(u64, i64, i64)> = manifest
                 .segments
                 .iter()
                 .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
-                .collect()
+                .collect();
+            let segments = Arc::clone(&*self.segments.read());
+            (seg_ids, segments)
         };
-        let segments = Arc::clone(&*self.segments.read());
         for (seg_id, min_id, max_id) in &seg_ids {
             if row_id < *min_id || row_id > *max_id {
                 continue;
@@ -1222,17 +1229,17 @@ impl SegmentManager {
 
     /// Scan all row_ids, deduplicate (newest-first wins), and exclude tombstones.
     fn compute_deduped_row_count(&self) -> usize {
-        // CoW snapshot: nanosecond lock holds, then count lock-free.
-        let seg_ids: Vec<u64> = {
+        let (seg_ids, segments) = {
             let manifest = self.manifest.read();
-            manifest
+            let seg_ids: Vec<u64> = manifest
                 .segments
                 .iter()
                 .rev()
                 .map(|m| m.segment_id)
-                .collect()
+                .collect();
+            let segments = Arc::clone(&*self.segments.read());
+            (seg_ids, segments)
         };
-        let segments = Arc::clone(&*self.segments.read());
         if segments.is_empty() {
             return 0;
         }

@@ -76,8 +76,10 @@ pub struct VolumeScanner {
     current_rid: i64,
     /// Whether we have a valid current row
     has_current: bool,
-    /// Current schema for normalization (None = volume schema matches current)
-    current_schema: Option<crate::core::Schema>,
+    /// Precomputed column mapping (None = volume matches current schema).
+    /// When set and not identity, replaces per-row name-based normalization
+    /// with per-row index lookup through the mapping.
+    column_mapping: Option<super::writer::ColumnMapping>,
     /// Any error that occurred
     error: Option<Error>,
     /// Optional predicate filter (from WHERE clause pushdown)
@@ -103,6 +105,11 @@ pub struct VolumeScanner {
     /// Typed pre-filter predicates extracted from the WHERE clause.
     /// Evaluated directly on column data without Value construction.
     typed_predicates: Vec<ColumnPredicate>,
+    /// Precomputed set of columns needed for filter + projection.
+    /// When set, the filter path materializes only these columns instead
+    /// of all columns. Built in set_filter() from filter's referenced
+    /// columns ∪ project_cols. None = materialize all (fallback).
+    needed_cols: Option<Vec<bool>>,
 }
 
 impl VolumeScanner {
@@ -136,7 +143,7 @@ impl VolumeScanner {
             has_current: false,
             error: None,
             filter: None,
-            current_schema: None,
+            column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
             match_idx: 0,
@@ -144,6 +151,7 @@ impl VolumeScanner {
             committed_tombstones: None,
             snapshot_seq: None,
             typed_predicates: Vec::new(),
+            needed_cols: None,
         }
     }
 
@@ -172,7 +180,7 @@ impl VolumeScanner {
             has_current: false,
             error: None,
             filter: None,
-            current_schema: None,
+            column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
             match_idx: 0,
@@ -180,6 +188,7 @@ impl VolumeScanner {
             committed_tombstones: None,
             snapshot_seq: None,
             typed_predicates: Vec::new(),
+            needed_cols: None,
         }
     }
 
@@ -227,7 +236,7 @@ impl VolumeScanner {
             has_current: false,
             error: None,
             filter: None,
-            current_schema: None,
+            column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
             match_idx: 0,
@@ -235,6 +244,7 @@ impl VolumeScanner {
             committed_tombstones: None,
             snapshot_seq: None,
             typed_predicates: Vec::new(),
+            needed_cols: None,
         }
     }
 
@@ -331,6 +341,36 @@ impl VolumeScanner {
             });
         }
 
+        // Try to extract which columns the filter references.
+        // If successful, combine with project_cols to build a bitmask
+        // of columns needed during filter evaluation. This enables
+        // column pruning: only those columns are materialized from the
+        // column store, skipping expensive Text/JSON clones for
+        // unreferenced columns.
+        let mut filter_cols = Vec::new();
+        if filter.collect_column_indices(&mut filter_cols) {
+            let num_cols = self.volume.columns.len();
+            // Use the larger of volume columns and mapping sources length
+            // to handle schema-evolved volumes.
+            let mask_len = if let Some(ref m) = self.column_mapping {
+                m.sources.len().max(num_cols)
+            } else {
+                num_cols
+            };
+            let mut mask = vec![false; mask_len];
+            for &ci in &filter_cols {
+                if ci < mask_len {
+                    mask[ci] = true;
+                }
+            }
+            for &ci in &self.project_cols {
+                if ci < mask_len {
+                    mask[ci] = true;
+                }
+            }
+            self.needed_cols = Some(mask);
+        }
+
         self.filter = Some(filter);
     }
 
@@ -387,18 +427,12 @@ impl VolumeScanner {
         true
     }
 
-    /// Set the current schema for normalization.
-    /// When set, rows are normalized to this schema instead of the volume's.
-    pub fn set_schema(&mut self, schema: crate::core::Schema) {
-        // Only set if schema actually differs from volume
-        if schema.columns.len() != self.volume.column_names.len()
-            || schema
-                .columns
-                .iter()
-                .zip(self.volume.column_names.iter())
-                .any(|(c, n)| !c.name.eq_ignore_ascii_case(n))
-        {
-            self.current_schema = Some(schema);
+    /// Set a precomputed column mapping for schema-evolved volumes.
+    /// Only stores it if the mapping is non-identity (avoids overhead
+    /// when the volume matches the current schema).
+    pub fn set_column_mapping(&mut self, mapping: super::writer::ColumnMapping) {
+        if !mapping.is_identity {
+            self.column_mapping = Some(mapping);
         }
     }
 }
@@ -440,42 +474,52 @@ impl Scanner for VolumeScanner {
                     continue;
                 }
 
-                // When a filter is present or schema normalization is needed, build the
-                // full row so the filter can evaluate all columns. Otherwise, read only
-                // the projected columns directly from the column store.
-                if self.filter.is_some() || self.current_schema.is_some() {
-                    let full_row = if let Some(ref schema) = self.current_schema {
-                        self.volume.get_row_normalized(idx, schema)
-                    } else {
-                        self.volume.get_row(idx)
-                    };
-
-                    // Apply remaining filter predicates (non-dictionary ones)
-                    if let Some(ref filter) = self.filter {
-                        if !filter.evaluate_fast(&full_row) {
-                            continue;
+                // Materialize the row. Four paths, fastest first:
+                // 1. No filter, no mapping, partial projection → projected read
+                // 2. No filter, no mapping, full projection → full read
+                // 3. Has filter → full row for filter, then project
+                // 4. Has mapping (schema evolved) → mapped read
+                if let Some(ref filter) = self.filter {
+                    // Build the row for filter evaluation. When needed_cols
+                    // is set, only materialize filter + output columns.
+                    let full_row = match (&self.needed_cols, &self.column_mapping) {
+                        (Some(mask), Some(mapping)) => {
+                            self.volume.get_row_mapped_needed(idx, mapping, mask)
                         }
+                        (Some(mask), None) => self.volume.get_row_needed(idx, mask),
+                        (None, Some(mapping)) => self.volume.get_row_mapped(idx, mapping),
+                        (None, None) => self.volume.get_row(idx),
+                    };
+                    if !filter.evaluate_fast(&full_row) {
+                        continue;
                     }
-
                     if self.is_full_projection {
                         self.current_row = full_row;
                     } else {
-                        let values: Vec<Value> = self
-                            .project_cols
-                            .iter()
-                            .map(|&col| {
-                                full_row
-                                    .get(col)
-                                    .cloned()
-                                    .unwrap_or(Value::Null(crate::core::DataType::Null))
-                            })
-                            .collect();
-                        self.current_row = Row::from_values(values);
+                        self.current_row = Row::from_values(
+                            self.project_cols
+                                .iter()
+                                .map(|&col| {
+                                    full_row
+                                        .get(col)
+                                        .cloned()
+                                        .unwrap_or(Value::Null(crate::core::DataType::Null))
+                                })
+                                .collect(),
+                        );
+                    }
+                } else if let Some(ref mapping) = self.column_mapping {
+                    // Schema evolved, no filter → use mapped projection.
+                    if self.is_full_projection {
+                        self.current_row = self.volume.get_row_mapped(idx, mapping);
+                    } else {
+                        self.current_row =
+                            self.volume
+                                .get_row_mapped_projected(idx, mapping, &self.project_cols);
                     }
                 } else if self.is_full_projection {
                     self.current_row = self.volume.get_row(idx);
                 } else {
-                    // Projection without filter: read only the needed columns directly.
                     self.current_row = self.volume.get_row_projected(idx, &self.project_cols);
                 }
 
@@ -534,43 +578,46 @@ impl Scanner for VolumeScanner {
                 continue;
             }
 
-            // When a filter is present or schema normalization is needed, build the
-            // full row so the filter can evaluate all columns. Otherwise, read only
-            // the projected columns directly from the column store.
-            if self.filter.is_some() || self.current_schema.is_some() {
-                let full_row = if let Some(ref schema) = self.current_schema {
-                    self.volume.get_row_normalized(idx, schema)
-                } else {
-                    self.volume.get_row(idx)
-                };
-
-                // Apply filter if present
-                if let Some(ref filter) = self.filter {
-                    if !filter.evaluate_fast(&full_row) {
-                        self.current_idx += 1;
-                        continue;
+            // Materialize the row. Same paths as matching_indices above.
+            if let Some(ref filter) = self.filter {
+                let full_row = match (&self.needed_cols, &self.column_mapping) {
+                    (Some(mask), Some(mapping)) => {
+                        self.volume.get_row_mapped_needed(idx, mapping, mask)
                     }
+                    (Some(mask), None) => self.volume.get_row_needed(idx, mask),
+                    (None, Some(mapping)) => self.volume.get_row_mapped(idx, mapping),
+                    (None, None) => self.volume.get_row(idx),
+                };
+                if !filter.evaluate_fast(&full_row) {
+                    self.current_idx += 1;
+                    continue;
                 }
-
                 if self.is_full_projection {
                     self.current_row = full_row;
                 } else {
-                    let values: Vec<Value> = self
-                        .project_cols
-                        .iter()
-                        .map(|&col| {
-                            full_row
-                                .get(col)
-                                .cloned()
-                                .unwrap_or(Value::Null(crate::core::DataType::Null))
-                        })
-                        .collect();
-                    self.current_row = Row::from_values(values);
+                    self.current_row = Row::from_values(
+                        self.project_cols
+                            .iter()
+                            .map(|&col| {
+                                full_row
+                                    .get(col)
+                                    .cloned()
+                                    .unwrap_or(Value::Null(crate::core::DataType::Null))
+                            })
+                            .collect(),
+                    );
+                }
+            } else if let Some(ref mapping) = self.column_mapping {
+                if self.is_full_projection {
+                    self.current_row = self.volume.get_row_mapped(idx, mapping);
+                } else {
+                    self.current_row =
+                        self.volume
+                            .get_row_mapped_projected(idx, mapping, &self.project_cols);
                 }
             } else if self.is_full_projection {
                 self.current_row = self.volume.get_row(idx);
             } else {
-                // Projection without filter: read only the needed columns directly.
                 self.current_row = self.volume.get_row_projected(idx, &self.project_cols);
             }
 

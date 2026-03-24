@@ -107,6 +107,19 @@ impl ColumnData {
         }
     }
 
+    /// Get the DataType for this column.
+    #[inline]
+    pub fn data_type(&self) -> DataType {
+        match self {
+            ColumnData::Int64 { .. } => DataType::Integer,
+            ColumnData::Float64 { .. } => DataType::Float,
+            ColumnData::TimestampNanos { .. } => DataType::Timestamp,
+            ColumnData::Boolean { .. } => DataType::Boolean,
+            ColumnData::Dictionary { .. } => DataType::Text,
+            ColumnData::Bytes { ext_type, .. } => *ext_type,
+        }
+    }
+
     /// Check if the column is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {

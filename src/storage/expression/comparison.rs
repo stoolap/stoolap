@@ -411,6 +411,15 @@ impl Expression for ComparisonExpr {
         Some(&self.column)
     }
 
+    fn collect_column_indices(&self, out: &mut Vec<usize>) -> bool {
+        if let Some(idx) = self.col_index {
+            out.push(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     fn can_use_index(&self) -> bool {
         matches!(
             self.operator,

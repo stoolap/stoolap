@@ -3874,12 +3874,8 @@ impl MVCCEngine {
                 let schema_cols = schema.columns.len();
 
                 for (_seg_id, vol) in volumes.iter() {
-                    let needs_normalize = vol.column_names.len() != schema_cols
-                        || vol
-                            .column_names
-                            .iter()
-                            .zip(schema.columns.iter())
-                            .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
+                    let mapping =
+                        crate::storage::volume::writer::compute_column_mapping(schema, vol);
 
                     for i in 0..vol.row_count {
                         let row_id = vol.row_ids[i];
@@ -3896,10 +3892,10 @@ impl MVCCEngine {
                             continue;
                         }
 
-                        let mut row = if needs_normalize {
-                            vol.get_row_normalized(i, schema)
-                        } else {
+                        let mut row = if mapping.is_identity {
                             vol.get_row(i)
+                        } else {
+                            vol.get_row_mapped(i, &mapping)
                         };
 
                         if row.len() < schema_cols {
@@ -5177,7 +5173,6 @@ impl MVCCEngine {
             let mut seen = FxHashSet::default();
             let mut live_refs: Vec<(i64, usize, usize)> = Vec::new(); // (row_id, vol_idx, row_idx)
 
-            let schema_cols = schema.columns.len();
             for (vol_idx, (_seg_id, vol)) in volumes.iter().enumerate() {
                 for i in 0..vol.row_count {
                     let row_id = vol.row_ids[i];
@@ -5238,29 +5233,21 @@ impl MVCCEngine {
                 &schema,
                 live_refs.len(),
             );
+            // Precompute column mapping per volume (once each, not per row).
+            let vol_mappings: Vec<crate::storage::volume::writer::ColumnMapping> = volumes
+                .iter()
+                .map(|(_, vol)| {
+                    crate::storage::volume::writer::compute_column_mapping(&schema, vol)
+                })
+                .collect();
             for &(row_id, vol_idx, row_idx) in &live_refs {
                 let vol = &volumes[vol_idx].1;
-                let needs_normalize = vol.column_names.len() != schema_cols
-                    || vol
-                        .column_names
-                        .iter()
-                        .zip(schema.columns.iter())
-                        .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
-                let mut row = if needs_normalize {
-                    vol.get_row_normalized(row_idx, &schema)
-                } else {
+                let mapping = &vol_mappings[vol_idx];
+                let row = if mapping.is_identity {
                     vol.get_row(row_idx)
+                } else {
+                    vol.get_row_mapped(row_idx, mapping)
                 };
-                if row.len() < schema_cols {
-                    for ci in row.len()..schema_cols {
-                        let col = &schema.columns[ci];
-                        if let Some(ref default_val) = col.default_value {
-                            row.push(default_val.clone());
-                        } else {
-                            row.push(crate::core::Value::null(col.data_type));
-                        }
-                    }
-                }
                 builder.add_row(row_id, &row);
             }
             let compacted = builder.finish();
