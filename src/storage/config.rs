@@ -86,6 +86,10 @@ pub struct PersistenceConfig {
     /// Default: true
     pub wal_compression: bool,
 
+    /// Enable LZ4 compression for cold volume files
+    /// Default: true
+    pub volume_compression: bool,
+
     /// Minimum data size (bytes) before attempting compression
     /// Default: 64
     pub compression_threshold: usize,
@@ -112,6 +116,7 @@ impl Default for PersistenceConfig {
             commit_batch_size: 100,         // Batch 100 commits
             sync_interval_ms: 10,           // 10ms minimum interval
             wal_compression: true,          // Enable WAL compression
+            volume_compression: true,       // Enable volume LZ4 compression
             compression_threshold: 64,      // Compress entries >= 64 bytes
             keep_snapshots: 3,              // Keep 3 backup snapshots per table
             checkpoint_on_close: true,      // Seal all data on clean shutdown
@@ -138,6 +143,7 @@ impl PersistenceConfig {
             commit_batch_size: 1,           // No batching
             sync_interval_ms: 0,            // Immediate sync
             wal_compression: true,
+            volume_compression: true,
             compression_threshold: 64,
             keep_snapshots: 3,
             checkpoint_on_close: true,
@@ -157,6 +163,7 @@ impl PersistenceConfig {
             commit_batch_size: 500,          // Batch more commits
             sync_interval_ms: 100,           // Less frequent sync
             wal_compression: true,
+            volume_compression: true,
             compression_threshold: 64,
             keep_snapshots: 3,
             checkpoint_on_close: true,
@@ -187,9 +194,16 @@ impl PersistenceConfig {
         self
     }
 
-    /// Builder method to enable/disable all compression
+    /// Builder method to enable/disable volume LZ4 compression
+    pub fn with_volume_compression(mut self, enabled: bool) -> Self {
+        self.volume_compression = enabled;
+        self
+    }
+
+    /// Builder method to enable/disable all compression (WAL + volume)
     pub fn with_compression(mut self, enabled: bool) -> Self {
         self.wal_compression = enabled;
+        self.volume_compression = enabled;
         self
     }
 
@@ -388,10 +402,16 @@ mod tests {
         // Test disabling all compression
         let config = PersistenceConfig::new().with_compression(false);
         assert!(!config.wal_compression);
+        assert!(!config.volume_compression);
 
         // Test individual compression settings
         let config = PersistenceConfig::new().with_wal_compression(false);
         assert!(!config.wal_compression);
+        assert!(config.volume_compression); // volume unaffected
+
+        let config = PersistenceConfig::new().with_volume_compression(false);
+        assert!(config.wal_compression); // WAL unaffected
+        assert!(!config.volume_compression);
 
         // Test compression threshold
         let config = PersistenceConfig::new().with_compression_threshold(128);

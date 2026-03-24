@@ -442,12 +442,18 @@ impl Database {
                         config.persistence.wal_compression =
                             matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
                     }
-                    // Both compressions: compression=on|off
+                    // Volume LZ4 compression: volume_compression=on|off
+                    "volume_compression" => {
+                        config.persistence.volume_compression =
+                            matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
+                    }
+                    // All compressions (WAL + volume): compression=on|off
                     // Also accepts snapshot_compression for backward compatibility
                     "compression" | "snapshot_compression" => {
                         let enabled =
                             matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
                         config.persistence.wal_compression = enabled;
+                        config.persistence.volume_compression = enabled;
                     }
                     // Compression threshold in bytes: compression_threshold=64
                     "compression_threshold" => {

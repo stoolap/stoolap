@@ -29,6 +29,12 @@ use super::writer::FrozenVolume;
 /// Volume file extension
 const VOLUME_EXT: &str = "vol";
 
+/// Magic bytes for LZ4-compressed volumes. Uncompressed volumes start with
+/// b"STVL" (the format magic). On read we check the first 4 bytes: STVZ
+/// means decompress first, STVL means read directly. This keeps compression
+/// fully transparent to the format module.
+const COMPRESSED_MAGIC: [u8; 4] = *b"STVZ";
+
 /// Volume catalog filename
 const CATALOG_FILE: &str = "volumes.catalog";
 
@@ -42,6 +48,21 @@ pub fn write_volume_to_disk(
     volume_id: u64,
     volume: &FrozenVolume,
 ) -> Result<PathBuf> {
+    write_volume_to_disk_opts(dir, table_name, volume_id, volume, true)
+}
+
+/// Write a frozen volume to disk atomically, with optional LZ4 compression.
+///
+/// When `compress` is true, the serialized bytes are LZ4-compressed and
+/// prefixed with the STVZ magic. When false (or compression doesn't shrink
+/// the data), the raw STVL format is written.
+pub fn write_volume_to_disk_opts(
+    dir: &Path,
+    table_name: &str,
+    volume_id: u64,
+    volume: &FrozenVolume,
+    compress: bool,
+) -> Result<PathBuf> {
     let table_dir = dir.join(table_name);
     std::fs::create_dir_all(&table_dir)
         .map_err(|e| crate::core::Error::internal(format!("failed to create volume dir: {}", e)))?;
@@ -50,8 +71,27 @@ pub fn write_volume_to_disk(
     let final_path = table_dir.join(&filename);
     let tmp_path = table_dir.join(format!("{}.tmp", filename));
 
-    let data = serialize_volume(volume)
+    let raw = serialize_volume(volume)
         .map_err(|e| crate::core::Error::internal(format!("failed to serialize volume: {}", e)))?;
+
+    // LZ4 compress when enabled and it actually shrinks the data.
+    // Wrap with STVZ magic so the reader can detect compressed vs uncompressed.
+    // Drop raw before building output to avoid holding both in memory.
+    let data = if compress {
+        let raw_len = raw.len();
+        let compressed = lz4_flex::compress_prepend_size(&raw);
+        if COMPRESSED_MAGIC.len() + compressed.len() < raw_len {
+            drop(raw);
+            let mut out = Vec::with_capacity(COMPRESSED_MAGIC.len() + compressed.len());
+            out.extend_from_slice(&COMPRESSED_MAGIC);
+            out.extend_from_slice(&compressed);
+            out
+        } else {
+            raw
+        }
+    } else {
+        raw
+    };
 
     // Write to tmp file, fsync BEFORE rename for crash safety.
     // Without fsync-before-rename, a power failure after rename could leave
@@ -84,14 +124,26 @@ pub fn write_volume_to_disk(
 }
 
 /// Read a frozen volume from disk.
+///
+/// Detects LZ4-compressed files (STVZ magic) and decompresses transparently.
+/// Uncompressed files (STVL magic) are read directly.
 pub fn read_volume_from_disk(path: &Path) -> Result<FrozenVolume> {
     let data = std::fs::read(path).map_err(|e| {
         crate::core::Error::internal(format!("failed to read volume file {:?}: {}", path, e))
     })?;
 
-    deserialize_volume(&data).map_err(|e| {
-        crate::core::Error::internal(format!("failed to deserialize volume {:?}: {}", path, e))
-    })
+    if data.len() >= 4 && data[..4] == COMPRESSED_MAGIC {
+        let raw = lz4_flex::decompress_size_prepended(&data[4..]).map_err(|e| {
+            crate::core::Error::internal(format!("failed to decompress volume {:?}: {}", path, e))
+        })?;
+        deserialize_volume(&raw).map_err(|e| {
+            crate::core::Error::internal(format!("failed to deserialize volume {:?}: {}", path, e))
+        })
+    } else {
+        deserialize_volume(&data).map_err(|e| {
+            crate::core::Error::internal(format!("failed to deserialize volume {:?}: {}", path, e))
+        })
+    }
 }
 
 /// List all volume files for a table, sorted by volume ID (oldest first).

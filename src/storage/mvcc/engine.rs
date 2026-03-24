@@ -5255,11 +5255,17 @@ impl MVCCEngine {
             // Write to disk with a stable volume_id for filename and registration.
             let vol_dir = pm.path().join("volumes");
             let compact_vol_id = crate::storage::volume::io::next_volume_id();
-            match crate::storage::volume::io::write_volume_to_disk(
+            let compress = self
+                .config
+                .read()
+                .map(|c| c.persistence.volume_compression)
+                .unwrap_or(true);
+            match crate::storage::volume::io::write_volume_to_disk_opts(
                 &vol_dir,
                 table_name,
                 compact_vol_id,
                 &compacted,
+                compress,
             ) {
                 Ok(_path) => {
                     // Atomic swap: replace old segments with compacted volume
@@ -5510,11 +5516,17 @@ impl MVCCEngine {
             // Build ONE volume from ALL rows for this table.
             // Previous design created one .vol per 50K batch, causing compaction
             // to explode (17 batches = 17 volumes to merge = 25s compaction).
-            match crate::storage::volume::seal::seal_and_persist(
+            let compress = self
+                .config
+                .read()
+                .map(|c| c.persistence.volume_compression)
+                .unwrap_or(true);
+            match crate::storage::volume::seal::seal_and_persist_opts(
                 &schema,
                 &all_rows,
                 &vol_dir,
                 &table_name,
+                compress,
             ) {
                 Ok((volume, _path, volume_id)) => {
                     // Register the cold segment BEFORE removing rows from hot.

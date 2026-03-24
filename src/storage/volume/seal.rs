@@ -68,9 +68,20 @@ pub fn seal_and_persist(
     volume_dir: &std::path::Path,
     table_name: &str,
 ) -> Result<(Arc<FrozenVolume>, std::path::PathBuf, u64)> {
+    seal_and_persist_opts(schema, rows, volume_dir, table_name, true)
+}
+
+/// Seal rows into a frozen volume with optional LZ4 compression.
+pub fn seal_and_persist_opts(
+    schema: &Schema,
+    rows: &[(i64, Row)],
+    volume_dir: &std::path::Path,
+    table_name: &str,
+    compress: bool,
+) -> Result<(Arc<FrozenVolume>, std::path::PathBuf, u64)> {
     let volume = seal_rows(schema, rows);
     let volume_id = io::next_volume_id();
-    let path = io::write_volume_to_disk(volume_dir, table_name, volume_id, &volume)?;
+    let path = io::write_volume_to_disk_opts(volume_dir, table_name, volume_id, &volume, compress)?;
     Ok((Arc::new(volume), path, volume_id))
 }
 

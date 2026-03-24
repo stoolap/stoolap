@@ -40,6 +40,7 @@ Stoolap is designed around practical embedded database needs:
 |---------|:-------:|:------:|:------:|:----------:|
 | AS OF Time-Travel Queries | ✅ | ❌ | ❌ | ❌* |
 | MVCC Transactions | ✅ | ❌ | ✅ | ✅ |
+| Hot/Cold Columnar Storage | ✅ | ❌ | ✅ | ❌ |
 | Cost-Based Optimizer | ✅ | ❌ | ✅ | ✅ |
 | Adaptive Query Execution | ✅ | ❌ | ❌ | ❌ |
 | Semantic Query Caching | ✅ | ❌ | ❌ | ❌ |
@@ -218,10 +219,26 @@ See [Vector Search](https://stoolap.io/docs/data-types/vector-search/) and [Sema
 
 ## Storage and Durability
 
-- Write-Ahead Logging (WAL)
-- Periodic snapshots
-- Crash recovery and index persistence
-- Configurable sync and compression behavior
+Stoolap uses a hot/cold volume storage architecture inspired by Apache Iceberg and Delta Lake:
+
+- **Hot buffer**: in-memory MVCC store with WAL for active writes
+- **Cold volumes**: immutable columnar files with zone maps, bloom filters, dictionary encoding, and LZ4 compression
+- **Adaptive compaction**: background thread merges cold volumes with size-aware, fully dynamic merge strategy
+- **Crash recovery**: atomic manifest writes, fsync-before-rename, WAL replay from checkpoint LSN
+- **Column pruning**: cold scans materialize only columns referenced by filters and projections
+
+```
+file://./mydb?sync_mode=normal&compression=on&checkpoint_interval=60
+```
+
+| DSN Parameter | Default | Description |
+|---------------|---------|-------------|
+| `sync_mode` | `normal` | WAL sync: `none`, `normal`, `full` |
+| `compression` | `on` | LZ4 for both WAL and volumes |
+| `wal_compression` | `on` | LZ4 for WAL entries only |
+| `volume_compression` | `on` | LZ4 for cold volume files only |
+| `checkpoint_interval` | `60` | Seconds between checkpoint cycles |
+| `compact_threshold` | `4` | Volume count that triggers compaction |
 
 ## Performance
 
