@@ -1772,7 +1772,10 @@ fn test_hnsw_graph_serialization() {
 #[test]
 fn test_hnsw_graph_snapshot_recovery() {
     let dir = tempfile::tempdir().expect("tmpdir");
-    let db_path = format!("file://{}/hnsw_snap", dir.path().display());
+    let db_path = format!(
+        "file://{}/hnsw_snap?checkpoint_on_close=off",
+        dir.path().display()
+    );
 
     // Phase 1: Create DB, insert data, create HNSW index, snapshot
     {

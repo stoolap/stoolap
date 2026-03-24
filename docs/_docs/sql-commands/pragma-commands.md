@@ -31,25 +31,31 @@ PRAGMA [pragma_name];
 
 Stoolap currently supports the following PRAGMA commands:
 
-### Snapshot and WAL Configuration
+### Checkpoint and WAL Configuration
 
 | PRAGMA | Description | Default |
 |--------|-------------|---------|
-| `snapshot_interval` | Seconds between automatic snapshots | 300 |
+| `checkpoint_interval` | Seconds between automatic checkpoints | 60 |
 | `sync_mode` | WAL sync mode (0=None, 1=Normal, 2=Full) | 1 |
-| `keep_snapshots` | Number of snapshots to retain per table | 5 |
+| `compact_threshold` | Volume count before compaction triggers | 4 |
+| `keep_snapshots` | Backup snapshots to retain per table | 3 |
 | `wal_flush_trigger` | Buffer size in bytes before WAL flush | 32768 |
-| `snapshot` | Manually create a snapshot (no value) | - |
-| `checkpoint` | Alias for `snapshot` (SQLite-compatible) | - |
+| `checkpoint_on_close` | Seal all hot rows on clean shutdown | on |
+| `snapshot` | Create a full backup snapshot | - |
+| `restore` | Restore database from a backup snapshot | - |
+| `checkpoint` | Run checkpoint cycle (seal + compact + WAL truncate) | - |
 | `vacuum` | Manual cleanup of deleted rows and index compaction | - |
 
-#### snapshot_interval
+#### checkpoint_interval
 
-Controls how often the database creates snapshots of the data (in seconds). Default: 300.
+Controls how often the background checkpoint cycle runs (in seconds). The checkpoint seals hot buffer rows into immutable cold volumes, persists manifests, and truncates the WAL. Default: 60.
 
 ```sql
+PRAGMA checkpoint_interval = 60;
+PRAGMA checkpoint_interval;       -- read current value
+
+-- Legacy alias (backward compatible)
 PRAGMA snapshot_interval = 60;
-PRAGMA snapshot_interval;       -- read current value
 ```
 
 #### sync_mode
@@ -66,44 +72,138 @@ Supported values:
 - 1: Normal sync (balances performance and durability)
 - 2: Full sync (maximum durability, slowest performance)
 
-#### keep_snapshots
+#### compact_threshold
 
-Controls how many snapshots to retain for each table. Default: 5.
+Controls how many cold volumes accumulate per table before compaction triggers. Compaction merges the smallest volumes first, bounded per cycle. Default: 4.
 
 ```sql
-PRAGMA keep_snapshots = 5;
-PRAGMA keep_snapshots;          -- read current value
+PRAGMA compact_threshold = 4;
+PRAGMA compact_threshold;          -- read current value
 ```
+
+Note: `compact_threshold` and `keep_snapshots` are separate settings. `compact_threshold` controls cold volume compaction. `keep_snapshots` controls backup snapshot file retention.
 
 #### wal_flush_trigger
 
-Controls the number of operations before the WAL is flushed to disk. Default: 32768.
+Controls the buffer size in bytes before the WAL is flushed to disk. Default: 32768.
 
 ```sql
 PRAGMA wal_flush_trigger = 1000;
 PRAGMA wal_flush_trigger;       -- read current value
 ```
 
-### Manual Snapshot Control
+#### keep_snapshots
+
+Controls how many backup snapshots are retained per table. Older snapshots beyond this count are automatically deleted after each `PRAGMA snapshot`. Default: 3.
+
+```sql
+PRAGMA keep_snapshots = 5;
+PRAGMA keep_snapshots;              -- read current value
+```
+
+#### checkpoint_on_close
+
+Controls whether all hot rows are sealed to cold volumes on clean shutdown. When enabled (default), the engine runs a force checkpoint during `close()`, ensuring fast startup because no WAL replay is needed. Set to `off` only for crash simulation in tests.
+
+```sql
+PRAGMA checkpoint_on_close = on;
+PRAGMA checkpoint_on_close;         -- read current value
+```
+
+### Manual Snapshot and Checkpoint Control
 
 #### snapshot
 
-Creates an immediate snapshot of all tables in the database:
+Creates a full backup snapshot of all tables. Snapshot files (.bin) are stored in the `snapshots/` directory alongside a `ddl.bin` file containing index and view definitions. The `keep_snapshots` setting limits how many snapshot files are retained per table.
 
 ```sql
--- Create a snapshot immediately
+-- Create a full backup snapshot
 PRAGMA snapshot;
+```
 
--- SQLite-compatible alias
+The snapshot captures a consistent point-in-time view of all tables. This is useful for:
+- Creating consistent backup points before critical operations
+- Manual full-database backup for disaster recovery
+- Ensuring data is persisted before shutting down
+
+Note: This PRAGMA cannot run inside an explicit transaction.
+
+#### checkpoint
+
+Runs the checkpoint cycle, which is the core persistence mechanism for the hot/cold volume architecture:
+
+```sql
+-- Run the checkpoint cycle
 PRAGMA checkpoint;
 ```
 
-This command is useful for:
-- Creating consistent backup points
-- Ensuring data is persisted before critical operations
-- Manual control over snapshot timing instead of relying on `snapshot_interval`
+The checkpoint cycle performs these steps in order:
 
-Note: This PRAGMA does not accept any values.
+1. **Seal**: Move eligible hot buffer rows to immutable cold volumes (.vol files)
+2. **Persist**: Write manifests (volume list, tombstones, checkpoint LSN) to disk
+3. **Compact**: Merge the smallest volumes when count exceeds `compact_threshold`
+4. **WAL truncate**: Remove WAL entries before checkpoint LSN (only when all hot data is sealed)
+
+The background thread runs this cycle automatically every `checkpoint_interval` seconds. On clean shutdown, a force checkpoint seals ALL remaining hot rows regardless of threshold.
+
+This command is useful for:
+- Ensuring data is persisted to volumes before critical operations
+- Reclaiming memory by moving hot data to columnar cold segments
+- Manual control over checkpoint timing instead of relying on `checkpoint_interval`
+
+Note: This PRAGMA cannot run inside an explicit transaction.
+
+#### restore
+
+Restores the database state from backup snapshots created by `PRAGMA snapshot`. This is a destructive operation that replaces all current data with the snapshot data.
+
+```sql
+-- Restore from the latest backup snapshot
+PRAGMA restore;
+
+-- Restore from a specific snapshot by timestamp
+PRAGMA restore = '20260315-120000.000';
+```
+
+The restore operation:
+
+1. **Validates** all snapshot files before making any changes
+2. **Reads** `ddl.bin` for index and view definitions (if available, falls back to saving current in-memory definitions)
+3. **Truncates** WAL to prevent post-snapshot entries from overwriting restored data
+4. **Clears** all current data (hot buffer, cold volumes, in-memory state)
+5. **Loads** snapshot data for each table
+6. **Recreates** indexes and views from `ddl.bin` or fallback
+7. **Syncs** auto-increment counters with restored data
+8. **Re-records** DDL to WAL for crash safety
+9. **Checkpoints** the restored data into volumes for immediate durability
+
+This command is useful for:
+- Rolling back to a known good state after accidental data corruption
+- Point-in-time recovery from a backup
+- Testing with a consistent dataset
+
+The timestamp format matches the snapshot filename: `YYYYMMDD-HHMMSS.fff` (e.g. `20260315-120000.000`). You can find available timestamps by listing the snapshot files in the `snapshots/<table>/` directory.
+
+Important notes:
+- This PRAGMA cannot run inside an explicit transaction
+- Indexes and views are automatically preserved via `ddl.bin` saved by `PRAGMA SNAPSHOT`
+- If no `ddl.bin` exists (snapshots from older versions), indexes and views are saved from the current in-memory state before the destructive step
+- Tables created after the snapshot will not exist after restore
+- Backup snapshots in `snapshots/` are preserved (not deleted) for future restores
+
+For recovery from corrupted databases where `Database::open()` fails, use the CLI `--restore` flag instead, which works at the filesystem level:
+
+```bash
+stoolap -d "file:///path/to/db" --restore
+```
+
+#### dedup_segments
+
+Previously used to fix ghost duplicate rows across cold segments. Deduplication is now handled automatically during the seal/compact cycle, so this pragma is a no-op.
+
+```sql
+PRAGMA dedup_segments;
+```
 
 ### Maintenance
 
@@ -112,124 +212,17 @@ Note: This PRAGMA does not accept any values.
 Performs manual cleanup of deleted rows, old version chains, stale transaction metadata, and triggers index compaction (e.g., HNSW graph rebuild when tombstone ratio exceeds 20%).
 
 ```sql
--- Vacuum all tables
-PRAGMA vacuum;
-
--- Also available as a standalone SQL command
-VACUUM;
-
--- Vacuum a specific table
-VACUUM table_name;
-```
-
-Returns a result row with three columns:
-
-| Column | Description |
-|--------|-------------|
-| `deleted_rows_cleaned` | Number of tombstoned rows reclaimed |
-| `old_versions_cleaned` | Number of old version chains pruned |
-| `transactions_cleaned` | Number of stale transaction entries removed |
-
-This is especially useful on WASM where the background cleanup thread is unavailable, but can be called on any platform for on-demand maintenance.
-
-**Warning:** VACUUM uses zero retention, meaning all historical row versions not needed by currently active transactions are permanently removed. This destroys AS OF TIMESTAMP history. Temporal queries referencing timestamps before the VACUUM will no longer return results. If you rely on time-travel queries, consider using the background cleanup (which preserves a 5-minute retention window) instead of VACUUM.
-
-Note: This PRAGMA does not accept any values.
-
-## Examples
-
-### Basic PRAGMA Usage
-
-```sql
--- Set snapshot interval to 60 seconds
-PRAGMA snapshot_interval = 60;
-
--- Verify the setting
-PRAGMA snapshot_interval;
-```
-
-### Multiple PRAGMA Commands
-
-```sql
--- Set sync mode to full
-PRAGMA sync_mode = 2;
-
--- Keep 10 snapshots per table
-PRAGMA keep_snapshots = 10;
-
--- Set WAL flush trigger to 1000 operations
-PRAGMA wal_flush_trigger = 1000;
-```
-
-### Manual Snapshot Example
-
-```sql
--- Insert some data
-INSERT INTO users (id, name) VALUES (1, 'John');
-
--- Create a snapshot immediately to ensure data is persisted
-PRAGMA snapshot;
-
--- Continue with more operations
-UPDATE users SET name = 'Jane' WHERE id = 1;
-
--- Create another snapshot after the update
-PRAGMA snapshot;
-```
-
-### VACUUM Example
-
-```sql
--- Delete some data
-DELETE FROM orders WHERE status = 'cancelled';
-
--- Run vacuum to reclaim storage and compact indexes
-VACUUM;
-
--- Or vacuum a specific table
-VACUUM orders;
-
--- Or use PRAGMA syntax
 PRAGMA vacuum;
 ```
 
-## PRAGMA Persistence
+## Connection String Parameters
 
-PRAGMA settings affect the current engine instance in memory. They are not saved to disk, so they reset when the database is closed and reopened. To apply custom settings consistently, execute PRAGMA commands after opening the connection.
+All PRAGMA values can also be set via the connection string:
 
-## Best Practices
+```
+file:///path/to/db?checkpoint_interval=60&compact_threshold=4&keep_snapshots=3&sync_mode=1
+```
 
-1. **Tune Snapshot Interval**: Adjust `snapshot_interval` based on your workload. Lower values provide better durability but more I/O overhead.
-
-2. **Choose Appropriate Sync Mode**: 
-   - Use `sync_mode = 2` for critical data where durability is paramount
-   - Use `sync_mode = 1` for most applications (good balance)
-   - Use `sync_mode = 0` only for non-critical data or testing
-
-3. **Manage Snapshots**: Set `keep_snapshots` based on your backup needs and disk space constraints.
-
-4. **Apply PRAGMA at Startup**: Run important PRAGMA commands right after opening the database connection.
-
-5. **Configure Cleanup via DSN**: Set cleanup retention values in the connection string for consistent behavior across connections:
-   ```
-   file:///data/mydb?cleanup_interval=30&deleted_row_retention=60&transaction_retention=1800
-   ```
-
-6. **Use VACUUM on WASM**: The background cleanup thread is unavailable on WASM. Use `VACUUM` or `PRAGMA vacuum` for manual cleanup instead.
-
-## Cleanup Configuration (DSN Options)
-
-Background cleanup settings can be configured via connection string query parameters:
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `cleanup` | on | Enable/disable the background cleanup thread |
-| `cleanup_interval` | 60 | Seconds between automatic cleanup runs |
-| `deleted_row_retention` | 300 | Seconds before deleted rows are permanently removed |
-| `transaction_retention` | 3600 | Seconds before stale transaction metadata is removed |
-
-See [Connection Strings]({% link _docs/getting-started/connection-strings.md %}) for the full list of DSN options.
-
-## Implementation Details
-
-PRAGMA commands are handled directly by the storage engine and affect the persistence behavior of the database. They do not require transactions and take effect immediately after being set.
+Legacy parameter names are accepted for backward compatibility:
+- `snapshot_interval` maps to `checkpoint_interval`
+- `snapshot_compression` maps to `wal_compression`

@@ -36,8 +36,8 @@ use crate::storage::mvcc::version_store::RowVersion;
 use crate::storage::mvcc::wal_manager::{WALEntry, WALManager, WALOperationType};
 use crate::storage::PersistenceConfig;
 
-/// Default snapshot interval (5 minutes)
-pub const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
+/// Default checkpoint interval (1 minute)
+pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default number of snapshots to keep
 pub const DEFAULT_KEEP_SNAPSHOTS: usize = 3;
@@ -284,8 +284,8 @@ impl IndexMetadata {
 /// Persistence metadata for tracking state
 #[derive(Debug, Default)]
 pub struct PersistenceMeta {
-    /// Last snapshot time (Unix nanoseconds)
-    pub last_snapshot_time: AtomicI64,
+    /// Last checkpoint time (Unix nanoseconds)
+    pub last_checkpoint_time: AtomicI64,
     /// LSN covered by the last snapshot
     pub last_snapshot_lsn: AtomicU64,
     /// Last WAL LSN (used during recovery)
@@ -302,8 +302,8 @@ pub struct PersistenceManager {
     meta: PersistenceMeta,
     /// Whether persistence is enabled
     enabled: AtomicBool,
-    /// Snapshot interval
-    snapshot_interval: Duration,
+    /// Checkpoint interval
+    checkpoint_interval: Duration,
     /// Number of snapshots to keep
     keep_count: usize,
     /// Running flag for background tasks
@@ -322,7 +322,7 @@ impl PersistenceManager {
                 wal: None,
                 meta: PersistenceMeta::default(),
                 enabled: AtomicBool::new(false),
-                snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
+                checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
                 keep_count: DEFAULT_KEEP_SNAPSHOTS,
                 running: AtomicBool::new(false),
                 schemas: RwLock::new(FxHashMap::default()),
@@ -344,10 +344,10 @@ impl PersistenceManager {
         let initial_lsn = wal.current_lsn();
 
         // Configure intervals
-        let snapshot_interval = if config.snapshot_interval > 0 {
-            Duration::from_secs(config.snapshot_interval as u64)
+        let checkpoint_interval = if config.checkpoint_interval > 0 {
+            Duration::from_secs(config.checkpoint_interval as u64)
         } else {
-            DEFAULT_SNAPSHOT_INTERVAL
+            DEFAULT_CHECKPOINT_INTERVAL
         };
 
         let keep_count = if config.keep_snapshots > 0 {
@@ -361,7 +361,7 @@ impl PersistenceManager {
             wal: Some(wal),
             meta: PersistenceMeta::default(),
             enabled: AtomicBool::new(true),
-            snapshot_interval,
+            checkpoint_interval,
             keep_count,
             running: AtomicBool::new(false),
             schemas: RwLock::new(FxHashMap::default()),
@@ -567,12 +567,12 @@ impl PersistenceManager {
 
         let checkpoint_lsn = wal.create_checkpoint(active_transactions)?;
 
-        // Update last snapshot time
+        // Update last checkpoint time
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
-        self.meta.last_snapshot_time.store(now, Ordering::Release);
+        self.meta.last_checkpoint_time.store(now, Ordering::Release);
 
         Ok(checkpoint_lsn)
     }
@@ -599,14 +599,14 @@ impl PersistenceManager {
         }
     }
 
-    /// Get the snapshot interval
-    pub fn snapshot_interval(&self) -> Duration {
-        self.snapshot_interval
+    /// Get the checkpoint interval
+    pub fn checkpoint_interval(&self) -> Duration {
+        self.checkpoint_interval
     }
 
-    /// Get the last snapshot time in Unix nanoseconds
-    pub fn last_snapshot_time(&self) -> i64 {
-        self.meta.last_snapshot_time.load(Ordering::Acquire)
+    /// Get the last checkpoint time in Unix nanoseconds
+    pub fn last_checkpoint_time(&self) -> i64 {
+        self.meta.last_checkpoint_time.load(Ordering::Acquire)
     }
 
     /// Get the number of snapshots to keep
@@ -679,12 +679,17 @@ pub fn serialize_row_version(version: &RowVersion) -> Result<Vec<u8>> {
     buf.extend_from_slice(&version.create_time.to_le_bytes());
 
     // Data (Row - which is Vec<Value>)
-    let values: Vec<&Value> = version.data.iter().collect();
-    buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
-    for value in values {
-        let value_bytes = serialize_value(value)?;
-        buf.extend_from_slice(&(value_bytes.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&value_bytes);
+    // Serialize values directly into buf using length-prefix-then-patch pattern
+    // to avoid per-value Vec<u8> allocation.
+    let value_count = version.data.len();
+    buf.extend_from_slice(&(value_count as u32).to_le_bytes());
+    for value in version.data.iter() {
+        let len_pos = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes()); // placeholder for length
+        let start = buf.len();
+        serialize_value_into(&mut buf, value);
+        let written = (buf.len() - start) as u32;
+        buf[len_pos..len_pos + 4].copy_from_slice(&written.to_le_bytes());
     }
 
     Ok(buf)
@@ -814,7 +819,14 @@ fn deserialize_row_version_v2(data: &[u8]) -> Result<RowVersion> {
 /// Serialize a Value to binary format
 pub fn serialize_value(value: &Value) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
+    serialize_value_into(&mut buf, value);
+    Ok(buf)
+}
 
+/// Serialize a Value directly into an existing buffer (zero per-value allocation).
+/// Used on the hot WAL path where per-value Vec allocation is wasteful.
+#[inline]
+pub fn serialize_value_into(buf: &mut Vec<u8>, value: &Value) {
     match value {
         Value::Null(dt) => {
             buf.push(0); // Type tag for Null
@@ -838,8 +850,6 @@ pub fn serialize_value(value: &Value) -> Result<Vec<u8>> {
             buf.extend_from_slice(s.as_bytes());
         }
         Value::Timestamp(ts) => {
-            // Use type tag 8 for binary timestamp format (seconds + subsec_nanos)
-            // More efficient and preserves full nanosecond precision
             buf.push(8);
             buf.extend_from_slice(&ts.timestamp().to_le_bytes());
             buf.extend_from_slice(&ts.timestamp_subsec_nanos().to_le_bytes());
@@ -848,18 +858,15 @@ pub fn serialize_value(value: &Value) -> Result<Vec<u8>> {
             let tag = data.first().copied().unwrap_or(0);
             let payload = &data[1..];
             if tag == DataType::Json as u8 {
-                // Tag 6: Json (wire-compatible with old Json variant)
                 buf.push(6);
                 buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 buf.extend_from_slice(payload);
             } else if tag == DataType::Vector as u8 {
-                // Tag 10: new binary vector format (dim_count + raw LE f32 bytes)
                 buf.push(10);
                 let dim = (payload.len() / 4) as u32;
                 buf.extend_from_slice(&dim.to_le_bytes());
                 buf.extend_from_slice(payload);
             } else {
-                // Tag 11: generic extension (dt_u8 + len + raw bytes)
                 buf.push(11);
                 buf.push(tag);
                 buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -867,8 +874,6 @@ pub fn serialize_value(value: &Value) -> Result<Vec<u8>> {
             }
         }
     }
-
-    Ok(buf)
 }
 
 /// Deserialize a Value from binary format

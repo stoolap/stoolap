@@ -899,11 +899,12 @@ PRAGMA name;
 | PRAGMA | Description | Default |
 |--------|-------------|---------|
 | sync_mode | WAL sync mode (0=None, 1=Normal, 2=Full) | 1 |
-| snapshot_interval | Snapshot interval in seconds | 300 |
-| keep_snapshots | Number of snapshots to retain | 5 |
+| checkpoint_interval | Seconds between automatic checkpoint cycles | 60 |
+| compact_threshold | Volume count before compaction triggers | 4 |
+| keep_snapshots | Backup snapshots to retain per table | 3 |
 | wal_flush_trigger | Buffer size in bytes before WAL flush | 32768 |
-| snapshot | Manually create a snapshot | - |
-| checkpoint | Alias for snapshot (SQLite-compatible) | - |
+| snapshot | Create a full backup snapshot | - |
+| checkpoint | Run checkpoint cycle (seal + compact + WAL truncate) | - |
 | vacuum | Manual cleanup of deleted rows and index compaction | - |
 
 See [PRAGMA Commands]({% link _docs/sql-commands/pragma-commands.md %}) for detailed documentation.

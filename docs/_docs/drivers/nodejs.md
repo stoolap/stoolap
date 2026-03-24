@@ -154,12 +154,12 @@ const db = await Database.open('./mydata?sync=full');
 // High throughput: no fsync, larger buffers
 const db = await Database.open('./mydata?sync=none&wal_buffer_size=131072');
 
-// Custom snapshot interval with compression
-const db = await Database.open('./mydata?snapshot_interval=60&compression=on');
+// Custom checkpoint interval with compression
+const db = await Database.open('./mydata?checkpoint_interval=60&compression=on');
 
 // Multiple options
 const db = await Database.open(
-  './mydata?sync=full&snapshot_interval=120&keep_snapshots=10&wal_max_size=134217728'
+  './mydata?sync=full&checkpoint_interval=120&compact_threshold=8&wal_max_size=134217728'
 );
 ```
 
@@ -178,16 +178,16 @@ Controls the durability vs. performance trade-off:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `sync` | `normal` | Sync mode: `none`, `normal`, or `full` |
-| `snapshot_interval` | `300` | Seconds between automatic snapshots (5 min) |
-| `keep_snapshots` | `5` | Number of snapshot files to retain |
+| `checkpoint_interval` | `60` | Seconds between automatic checkpoint cycles |
+| `compact_threshold` | `4` | Volume count before compaction triggers |
+| `keep_snapshots` | `3` | Backup snapshots to retain per table |
 | `wal_flush_trigger` | `32768` | WAL flush trigger size in bytes (32 KB) |
 | `wal_buffer_size` | `65536` | WAL buffer size in bytes (64 KB) |
 | `wal_max_size` | `67108864` | Max WAL file size before rotation (64 MB) |
 | `commit_batch_size` | `100` | Commits to batch before syncing (normal mode) |
 | `sync_interval_ms` | `10` | Minimum ms between syncs (normal mode) |
 | `wal_compression` | `on` | LZ4 compression for WAL entries |
-| `snapshot_compression` | `on` | LZ4 compression for snapshots |
-| `compression` | | Set both `wal_compression` and `snapshot_compression` |
+| `compression` | | Alias for `wal_compression` |
 | `compression_threshold` | `64` | Minimum bytes before compressing an entry |
 
 ## Cloning

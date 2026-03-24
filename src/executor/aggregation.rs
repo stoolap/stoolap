@@ -6469,9 +6469,15 @@ impl Executor {
             }
         };
 
-        // Extract table name
+        // Extract table name (bail out for AS OF temporal queries)
         let table_name = match stmt.table_expr.as_deref() {
-            Some(Expression::TableSource(ts)) => ts.name.value_lower.clone(),
+            Some(Expression::TableSource(ts)) => {
+                if ts.as_of.is_some() {
+                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    return None;
+                }
+                ts.name.value_lower.clone()
+            }
             _ => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
@@ -6781,9 +6787,15 @@ impl Executor {
             }
         };
 
-        // Extract table name
+        // Extract table name (bail out for AS OF temporal queries)
         let table_name = match stmt.table_expr.as_deref() {
-            Some(Expression::TableSource(ts)) => ts.name.value_lower.clone(),
+            Some(Expression::TableSource(ts)) => {
+                if ts.as_of.is_some() {
+                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    return None;
+                }
+                ts.name.value_lower.clone()
+            }
             _ => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;

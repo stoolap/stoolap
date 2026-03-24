@@ -82,12 +82,16 @@ impl FileLock {
         // This must happen BEFORE any file content modification.
         acquire_lock(&file)?;
 
-        // Now that we hold the lock, clear and rewrite with our PID
-        file.set_len(0)
-            .map_err(|e| Error::internal(format!("failed to truncate lock file: {}", e)))?;
-        let pid = std::process::id();
-        write!(file, "{}", pid).ok();
-        file.sync_all().ok();
+        // Now that we hold the lock, clear and rewrite with our PID.
+        // std::process::id() is not supported on WASI, so skip on that target.
+        #[cfg(not(target_os = "wasi"))]
+        {
+            file.set_len(0)
+                .map_err(|e| Error::internal(format!("failed to truncate lock file: {}", e)))?;
+            let pid = std::process::id();
+            write!(file, "{}", pid).ok();
+            file.sync_all().ok();
+        }
 
         Ok(Self {
             file,
@@ -103,13 +107,12 @@ impl FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        // Lock is automatically released when the file is closed
-        // We don't remove the lock file as it will be reused on next open
-        #[cfg(windows)]
-        {
-            // Windows file handles may take a moment to be fully released
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        // Do NOT delete db.lock here. On Unix, flock protects the inode, not
+        // the path. Deleting while holding the lock lets another process create
+        // a new db.lock (different inode) and acquire its own flock, admitting
+        // two writers. The lock file is harmless on disk — acquire_lock handles
+        // stale files by simply re-flocking the existing inode.
+        // The OS flock is released automatically when the File handle is dropped.
     }
 }
 

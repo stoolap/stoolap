@@ -154,7 +154,7 @@ The server exposes 30 tools organized into five categories.
 |------|-------------|
 | `analyze_table` | Collect optimizer statistics for better query plans |
 | `vacuum` | Clean up deleted rows, old MVCC versions, and compact indexes |
-| `pragma` | Get/set database config: sync_mode, snapshot_interval, keep_snapshots, wal_flush_trigger |
+| `pragma` | Get/set database config: sync_mode, checkpoint_interval, compact_threshold, keep_snapshots, wal_flush_trigger |
 | `version` | Get the Stoolap engine version |
 | `list_functions` | List all 130+ built-in SQL functions with signatures, grouped by category |
 

@@ -445,6 +445,23 @@ pub trait VisibilityChecker: Send + Sync {
     }
 }
 
+/// Opaque snapshot of the version store at extraction time.
+/// Used by `remove_sealed_rows` to detect concurrent commits.
+pub struct ExtractionSnapshot {
+    inner: crate::common::CowBTree<VersionChainEntry>,
+}
+
+/// Token holding pre-removal snapshot data needed for deferred index cleanup.
+/// Created by `remove_sealed_rows`, consumed by `remove_sealed_index_entries`.
+#[derive(Default)]
+pub struct SealedIndexCleanup {
+    /// Row IDs that were removed from the version store.
+    pub removed_ids: Vec<i64>,
+    /// CowBTree snapshot taken BEFORE version removal. Contains the row data
+    /// needed to compute index values for removal.
+    snapshot: Option<crate::common::CowBTree<VersionChainEntry>>,
+}
+
 /// VersionStore tracks the latest committed version of each row for a table
 ///
 /// Uses CowBTreeMap (RwLock<CowBTree>) for the version store because:
@@ -493,6 +510,10 @@ pub struct VersionStore {
     /// Updated on commit: +1 for INSERT, -1 for DELETE.
     /// This is an optimization for the common case of autocommit queries.
     committed_row_count: AtomicUsize,
+    /// Per-table mutex for ON CONFLICT INSERT serialization.
+    /// Only acquired for upsert statements to prevent TOCTOU races.
+    /// Plain INSERTs (no ON CONFLICT) proceed lock-free.
+    upsert_mutex: Arc<parking_lot::Mutex<()>>,
 }
 
 impl VersionStore {
@@ -528,6 +549,7 @@ impl VersionStore {
             zone_maps: RwLock::new(None),
             max_version_history: 10, // Default: keep up to 10 previous versions
             committed_row_count: AtomicUsize::new(0),
+            upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
         }
     }
 
@@ -555,6 +577,7 @@ impl VersionStore {
             zone_maps: RwLock::new(None),
             max_version_history: 10,
             committed_row_count: AtomicUsize::new(0),
+            upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
         }
     }
 
@@ -1279,7 +1302,14 @@ impl VersionStore {
         let arena_meta = arena_guard.meta();
         let arena_data = arena_guard.data();
 
-        let mut results = RowVec::with_capacity(row_ids.len());
+        // Fast path: if both arena and version tree are empty, no rows can match.
+        // This avoids iterating millions of phantom row_ids from volume-populated indexes.
+        if arena_meta.is_empty() && versions.is_empty() {
+            return RowVec::new();
+        }
+
+        // Don't over-allocate: most row_ids may be phantom (from volume indexes)
+        let mut results = RowVec::with_capacity(row_ids.len().min(4096));
 
         for &row_id in row_ids {
             // Speculative arena probe: O(1) for auto-increment PKs
@@ -1752,6 +1782,19 @@ impl VersionStore {
         versions.keys().collect()
     }
 
+    /// Populate a FxHashSet with all hot row_ids. Iterates the B-tree under
+    /// read lock without cloning — much cheaper than get_all_row_ids() + collect()
+    /// for skip-set construction.
+    pub fn collect_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let versions = self.versions.read();
+        for key in versions.keys() {
+            dest.insert(key);
+        }
+    }
+
     /// Returns all row IDs that are visible to the given transaction
     ///
     /// OPTIMIZATION: Single-pass iteration with O(1) lock acquisition instead of O(N).
@@ -1913,6 +1956,38 @@ impl VersionStore {
         self.committed_row_count.load(Ordering::Relaxed)
     }
 
+    /// Check if a row_id exists in the committed version store (B-tree).
+    /// Used during WAL replay to distinguish sealed INSERTs from post-seal UPDATEs.
+    pub fn has_committed_row(&self, row_id: i64) -> bool {
+        self.versions.read().contains_key(row_id)
+    }
+
+    /// Atomically subtract sealed rows from committed_row_count.
+    ///
+    /// After seal batch-removes rows from the B-tree, committed_row_count must
+    /// decrease by the sealed amount. Using fetch_sub (not store) preserves
+    /// concurrent fetch_add/fetch_sub from other threads committing INSERTs or
+    /// DELETEs during the seal window. A plain store() would race with those
+    /// concurrent updates, causing the counter to drift by ~N (where N is the
+    /// number of rows committed during the seal operation).
+    pub fn subtract_committed_row_count(&self, sealed: usize) {
+        // Use saturating arithmetic to avoid wrapping if concurrent deletes
+        // already reduced the counter below the sealed amount.
+        loop {
+            let current = self.committed_row_count.load(Ordering::Relaxed);
+            let new_val = current.saturating_sub(sealed);
+            match self.committed_row_count.compare_exchange_weak(
+                current,
+                new_val,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+    }
+
     /// Check if a transaction requires snapshot isolation visibility checks.
     /// When true, the O(1) committed_row_count is inaccurate because it includes
     /// rows committed after this transaction's snapshot point.
@@ -1994,6 +2069,15 @@ impl VersionStore {
     #[inline]
     pub fn get_all_visible_rows(&self, txn_id: i64) -> RowVec {
         self.get_all_visible_rows_internal(txn_id)
+    }
+
+    /// Extract visible rows AND the CowBTree snapshot at extraction time.
+    /// Used by seal: the snapshot records each row's `txn_id` so that
+    /// `remove_sealed_rows` can detect concurrent commits and skip them.
+    pub fn extract_for_seal(&self, txn_id: i64) -> (RowVec, ExtractionSnapshot) {
+        let snapshot = self.versions.read().clone();
+        let rows = self.get_all_visible_rows_internal(txn_id);
+        (rows, ExtractionSnapshot { inner: snapshot })
     }
 
     /// Internal implementation for getting all visible rows
@@ -4360,7 +4444,6 @@ impl VersionStore {
                         row_id, existing_txn
                     )));
                 }
-                // Same transaction already owns it
                 Ok(())
             }
             Entry::Vacant(e) => {
@@ -4443,6 +4526,13 @@ impl VersionStore {
             }
         }
         Ok(())
+    }
+
+    /// Acquire the per-table upsert mutex. Returns an owned guard.
+    /// Only used for ON CONFLICT statements to serialize check+insert+commit.
+    #[inline]
+    pub fn acquire_upsert_lock(&self) -> parking_lot::ArcMutexGuard<parking_lot::RawMutex, ()> {
+        parking_lot::Mutex::lock_arc(&self.upsert_mutex)
     }
 
     /// Add an index
@@ -4530,6 +4620,14 @@ impl VersionStore {
     pub fn get_all_indexes(&self) -> SmallVec<[Arc<dyn Index>; 4]> {
         let indexes = self.indexes.read();
         indexes.values().cloned().collect()
+    }
+
+    /// Borrow the indexes map under a read lock — no Arc clones, no allocations.
+    #[inline]
+    pub fn indexes_read(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, FxHashMap<String, Arc<dyn Index>>> {
+        self.indexes.read()
     }
 
     // =========================================================================
@@ -5090,11 +5188,217 @@ impl VersionStore {
         }
     }
 
+    /// Populate HNSW indexes from external rows (e.g., cold segment data).
+    ///
+    /// Regular indexes (B-tree, Hash, Bitmap) are hot-only by design and use
+    /// zone maps/bloom filters for cold data. HNSW indexes are different:
+    /// vector similarity search cannot fall back to zone maps, so HNSW must
+    /// contain all rows (hot + cold) to return correct results.
+    ///
+    /// HnswInner::insert skips duplicate row_ids, so calling this after
+    /// populate_all_indexes() is safe (hot rows already in the index).
+    pub fn populate_hnsw_from_rows(&self, rows: &[(i64, crate::core::Row)]) {
+        let indexes = self.indexes.read();
+        if indexes.is_empty() || rows.is_empty() {
+            return;
+        }
+
+        // Collect only HNSW indexes with their column indices
+        let hnsw_infos: Vec<(Vec<usize>, Arc<dyn Index>)> = indexes
+            .values()
+            .filter(|idx| idx.index_type() == crate::core::IndexType::Hnsw)
+            .filter_map(|idx| {
+                let col_ids = idx.column_ids();
+                if col_ids.is_empty() {
+                    return None;
+                }
+                let col_indices: Vec<usize> = col_ids.iter().map(|&id| id as usize).collect();
+                Some((col_indices, Arc::clone(idx)))
+            })
+            .collect();
+
+        drop(indexes);
+
+        if hnsw_infos.is_empty() {
+            return;
+        }
+
+        // Pre-allocate per-index batch vectors
+        let mut batches: Vec<Vec<(i64, Vec<crate::core::Value>)>> = (0..hnsw_infos.len())
+            .map(|_| Vec::with_capacity(rows.len()))
+            .collect();
+
+        for &(row_id, ref row) in rows {
+            for (idx, (col_indices, _)) in hnsw_infos.iter().enumerate() {
+                if col_indices.len() == 1 {
+                    if let Some(value) = row.get(col_indices[0]) {
+                        batches[idx].push((row_id, vec![value.clone()]));
+                    }
+                } else {
+                    let values: Vec<crate::core::Value> = col_indices
+                        .iter()
+                        .map(|&col_idx| {
+                            row.get(col_idx)
+                                .cloned()
+                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
+                        })
+                        .collect();
+                    batches[idx].push((row_id, values));
+                }
+            }
+        }
+
+        for (idx, (_, index)) in hnsw_infos.iter().enumerate() {
+            if !batches[idx].is_empty() {
+                let entry_refs: Vec<(i64, &[crate::core::Value])> = batches[idx]
+                    .iter()
+                    .map(|(row_id, values)| (*row_id, values.as_slice()))
+                    .collect();
+                let _ = index.add_batch_slice(&entry_refs);
+            }
+        }
+    }
+
     // =========================================================================
     // Cleanup Functions
     // =========================================================================
 
-    /// Cleanup deleted rows that are older than the retention period
+    /// Remove sealed rows from the hot version store (phase 1 of seal).
+    /// Removes version data and arena slots but KEEPS hot index entries.
+    /// The stale index entries act as a safety net: unique constraint checks
+    /// still find them, preventing duplicate inserts during the seal window
+    /// when the row has moved to cold but might not yet be visible to a
+    /// cold check that took a snapshot before register_volume.
+    ///
+    /// Callers MUST also call `subtract_committed_row_count(n)` with the
+    /// returned count to keep the committed row count accurate.
+    ///
+    /// `extraction_snapshot` is an O(1) CowBTree clone taken at the moment
+    /// rows were extracted. For each row_id, the removal compares the
+    /// current head version's `txn_id` against the extraction snapshot's
+    /// `txn_id`. If they differ, a concurrent commit published a newer
+    /// version after extraction — that row is skipped (stays in hot,
+    /// sealed next cycle). This prevents discarding concurrent updates
+    /// that the sealed volume doesn't contain.
+    /// Returns `(removed_count, index_cleanup, skipped_row_ids)`.
+    /// Skipped row_ids are rows that were modified after extraction — the
+    /// caller must tombstone them so recovery and row_count are correct.
+    pub fn remove_sealed_rows(
+        &self,
+        row_ids: &[i64],
+        extraction_snapshot: &ExtractionSnapshot,
+    ) -> (usize, SealedIndexCleanup, Vec<i64>) {
+        if row_ids.is_empty() {
+            return (0, SealedIndexCleanup::default(), Vec::new());
+        }
+
+        // Snapshot version data BEFORE removal for later index cleanup.
+        // O(1) Arc clone of CowBTree.
+        let snapshot = self.versions.read().clone();
+
+        // Remove rows in small sub-batches to reduce write lock hold time.
+        // Each sub-batch acquires versions.write() briefly, then releases it,
+        // giving concurrent commits a chance to proceed between sub-batches.
+        // Without this, a 50K-row seal batch holds the write lock for the
+        // entire removal, blocking all commits on this table for ~100ms+.
+        const SUB_BATCH_SIZE: usize = 2_000;
+        let mut removed_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
+        let mut skipped_ids: Vec<i64> = Vec::new();
+        let mut arena_indices_to_clear: Vec<usize> = Vec::new();
+
+        for chunk in row_ids.chunks(SUB_BATCH_SIZE) {
+            let uncommitted = self.uncommitted_writes.read();
+            let mut versions = self.versions.write();
+            for &row_id in chunk {
+                if uncommitted.contains_key(row_id) {
+                    skipped_ids.push(row_id);
+                    continue;
+                }
+                if let Some(entry) = versions.get(row_id) {
+                    // Compare current txn_id against extraction-time txn_id.
+                    // If they differ, a concurrent commit changed this row
+                    // after we extracted it — the sealed volume has stale data
+                    // for this row. Keep the newer version in hot.
+                    let extracted_txn_id = extraction_snapshot
+                        .inner
+                        .get(row_id)
+                        .map(|e| e.version.txn_id)
+                        .unwrap_or(0);
+                    if entry.version.txn_id != extracted_txn_id {
+                        skipped_ids.push(row_id);
+                        continue;
+                    }
+                    if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
+                        arena_indices_to_clear.push(idx);
+                    }
+                    versions.remove(row_id);
+                    removed_ids.push(row_id);
+                }
+            }
+            // Locks released here — concurrent commits can proceed
+        }
+
+        // Invalidate sealed arena slots so speculative probes don't return
+        // stale data. This sets row_id=0 in the meta, making the probe fail.
+        if !arena_indices_to_clear.is_empty() {
+            self.arena.clear_batch(&arena_indices_to_clear);
+        }
+
+        let count = removed_ids.len();
+        (
+            count,
+            SealedIndexCleanup {
+                removed_ids,
+                snapshot: Some(snapshot),
+            },
+            skipped_ids,
+        )
+    }
+
+    /// Remove stale hot index entries for sealed rows (phase 2 of seal).
+    /// Called AFTER clear_seal_overlap so that the cold check sees the
+    /// newly registered volume before we remove the hot index safety net.
+    pub fn remove_sealed_index_entries(&self, cleanup: SealedIndexCleanup) {
+        if cleanup.removed_ids.is_empty() {
+            return;
+        }
+
+        let indexes = self.indexes.read();
+        let hot_only_indexes: Vec<_> = indexes
+            .values()
+            .enumerate()
+            .filter(|(_, idx)| idx.index_type() != crate::core::IndexType::Hnsw)
+            .collect();
+
+        if hot_only_indexes.is_empty() {
+            return;
+        }
+
+        let Some(ref snap) = cleanup.snapshot else {
+            return;
+        };
+
+        for &row_id in &cleanup.removed_ids {
+            if let Some(entry) = snap.get(row_id) {
+                let row = &entry.version.data;
+                for (_, index) in &hot_only_indexes {
+                    let col_ids = index.column_ids();
+                    let values: Vec<crate::core::Value> = col_ids
+                        .iter()
+                        .map(|&col_id| {
+                            row.get(col_id as usize)
+                                .cloned()
+                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
+                        })
+                        .collect();
+                    let _ = index.remove(&values, row_id, row_id);
+                }
+            }
+        }
+        drop(indexes);
+    }
+
+    /// Cleanup deleted rows that are older than the retention period.
     ///
     /// This removes soft-deleted rows that are no longer visible to any active
     /// transaction and are older than the specified retention period.
@@ -5933,6 +6237,11 @@ impl TransactionVersionStore {
         self.txn_id
     }
 
+    /// Read-only access to local versions for rollback cleanup.
+    pub fn local_versions_ref(&self) -> Option<&I64Map<VersionList>> {
+        self.local_versions.as_ref()
+    }
+
     /// Ensures local_versions map is allocated, returning a mutable reference.
     /// Uses pooled maps when available to reduce allocation overhead.
     #[inline]
@@ -6358,50 +6667,56 @@ impl TransactionVersionStore {
             .map(|v| v.data.clone())
     }
 
-    /// Detect conflicts before commit
+    /// OCC validation that tolerates seal-removed rows.
     ///
-    /// Optimized to skip redundant checks for rows we've successfully claimed.
-    /// Since try_claim_row() prevents other transactions from modifying claimed rows,
-    /// we only need to verify conflicts for:
-    /// 1. New inserts (read_version is None) - check if row was inserted by another txn
-    /// 2. Unclaimed rows (shouldn't happen with current code paths)
-    pub fn detect_conflicts(&self) -> Result<(), Error> {
-        // Fast path: no write set means no writes, no conflicts possible
+    /// If a row is missing from the hot B-tree, it was moved to cold by seal.
+    /// This is not a conflict for READ COMMITTED transactions. The transaction
+    /// read the row data into its local txn_versions before seal removed it.
+    /// On commit, the updated version is re-inserted into hot, and the
+    /// skip-set dedup mechanism ensures the stale cold version is shadowed.
+    /// Seal also skips rows claimed by active transactions (uncommitted_writes).
+    ///
+    /// For INSERT paths (read_version is None), we still check whether another
+    /// transaction concurrently inserted the same row_id to prevent lost writes
+    /// when explicit PK values are used.
+    pub fn detect_conflicts_safe(&self) -> Result<(), Error> {
         let Some(write_set) = self.write_set.as_ref() else {
             return Ok(());
         };
 
         for (row_id, write_entry) in write_set.iter() {
             if let Some(read_version) = &write_entry.read_version {
-                // UPDATE Conflict Check
-                // Ensure the version we read is still the latest committed version.
-                // If get_latest_version_id returns a different txn_id, it means
-                // another transaction committed an update after we read.
-                if let Some(latest_txn_id) = self.parent_store.get_latest_version_id(row_id) {
-                    if latest_txn_id != read_version.txn_id {
-                        return Err(Error::internal(format!(
-                            "write conflict: row {} was modified by another transaction",
-                            row_id
-                        )));
+                // UPDATE path: check that the row hasn't been modified concurrently
+                match self.parent_store.get_latest_version_id(row_id) {
+                    Some(latest_txn_id) => {
+                        if latest_txn_id != read_version.txn_id {
+                            return Err(Error::internal(format!(
+                                "write conflict: row {} was modified by another transaction",
+                                row_id
+                            )));
+                        }
                     }
-                } else {
-                    // Row vanished (e.g. GC'd) - treat as conflict
-                    return Err(Error::internal(format!(
-                        "write conflict: row {} was deleted by another transaction",
-                        row_id
-                    )));
+                    None => {
+                        // Row is absent from the hot B-tree. This happens when seal
+                        // moved the row to cold storage between our read and commit.
+                        // This is NOT a real conflict — the row data is unchanged,
+                        // just relocated. Skip the conflict check for this row.
+                        // The commit will add the updated version to hot, and the
+                        // skip-set mechanism at scan time handles dedup with cold.
+                    }
                 }
             } else {
-                // INSERT Conflict Check
-                // Check if row matches any existing version visible to us
-                // Note: unique indexes handle strict uniqueness, this handles MVCC row overlaps
+                // INSERT path: check that no other transaction concurrently inserted
+                // the same row_id. This guards against TOCTOU races with explicit PK values.
+                // For auto-increment IDs this is effectively a no-op (AtomicI64 guarantees
+                // uniqueness), but it is the safety net for user-supplied PKs.
                 if self
                     .parent_store
                     .has_any_visible_version(&[row_id], self.txn_id)
                     .is_some()
                 {
                     return Err(Error::internal(format!(
-                        "write conflict: row {} was inserted by another transaction",
+                        "write conflict: row {} was concurrently inserted by another transaction",
                         row_id
                     )));
                 }
@@ -6433,52 +6748,53 @@ impl TransactionVersionStore {
     /// RowVersion values, avoiding expensive clones. The transaction is
     /// consumed after commit anyway, so this is safe.
     pub fn commit(&mut self) -> Result<(), Error> {
-        // Detect conflicts first
-        self.detect_conflicts()?;
+        // OCC validation: detect concurrent write conflicts.
+        // Rows removed by seal (missing from hot B-tree) are not conflicts —
+        // they were moved to cold segments, not modified by another transaction.
+        self.detect_conflicts_safe()?;
 
         // Update indexes BEFORE committing versions
-        // This ensures indexes reflect the committed data
-        // Errors (e.g., unique constraint violations) must propagate
         self.update_indexes_on_commit()?;
 
-        // OPTIMIZATION: Single-row fast path (common auto-commit INSERT case)
-        // Avoids Vec allocation for both local_versions and write_set
+        // Commit local versions to parent store
         if let Some(local_versions) = self.local_versions.as_mut() {
             if local_versions.len() == 1 {
-                // Single-row commit - no Vec allocation needed
+                // Single-row fast path: avoid Vec allocation
                 if let Some((row_id, mut versions)) = local_versions.drain().next() {
                     if let Some(version) = versions.pop() {
                         self.parent_store.add_version_single(row_id, version);
                     }
                 }
-                // Release single claim directly
-                if let Some(write_set) = self.write_set.as_mut() {
-                    if let Some((row_id, _)) = write_set.drain().next() {
-                        self.parent_store.release_row_claim(row_id, self.txn_id);
-                    }
-                }
-                return Ok(());
+            } else {
+                // Multi-row path: collect into Vec
+                let mut batch: Vec<(i64, RowVersion)> = local_versions
+                    .drain()
+                    .filter_map(|(row_id, mut versions)| versions.pop().map(|v| (row_id, v)))
+                    .collect();
+
+                // Sort by row_id to ensure deterministic locking order
+                batch.sort_by_key(|(row_id, _)| *row_id);
+
+                self.parent_store.add_versions_batch(batch);
             }
-
-            // Multi-row path: collect into Vec
-            let mut batch: Vec<(i64, RowVersion)> = local_versions
-                .drain()
-                .filter_map(|(row_id, mut versions)| versions.pop().map(|v| (row_id, v)))
-                .collect();
-
-            // Sort by row_id to ensure deterministic locking order
-            batch.sort_by_key(|(row_id, _)| *row_id);
-
-            self.parent_store.add_versions_batch(batch);
         }
 
-        // Release all claims - drain write_set to get row_ids
+        // Release ALL claims from write_set (includes both local and external claims).
+        // Must drain the entire write_set — external claims from track_external_claim()
+        // have no corresponding local_versions entry.
         if let Some(write_set) = self.write_set.as_mut() {
-            let mut row_ids: Vec<i64> = write_set.drain().map(|(row_id, _)| row_id).collect();
-            // Sort by row_id to ensure deterministic locking order
-            row_ids.sort_unstable();
-            self.parent_store
-                .release_row_claims_batch(&row_ids, self.txn_id);
+            if write_set.len() == 1 {
+                // Single-claim fast path: avoid Vec allocation
+                if let Some((row_id, _)) = write_set.drain().next() {
+                    self.parent_store.release_row_claim(row_id, self.txn_id);
+                }
+            } else {
+                let mut row_ids: Vec<i64> = write_set.drain().map(|(row_id, _)| row_id).collect();
+                // Sort by row_id to ensure deterministic locking order
+                row_ids.sort_unstable();
+                self.parent_store
+                    .release_row_claims_batch(&row_ids, self.txn_id);
+            }
         }
 
         Ok(())
@@ -6992,6 +7308,24 @@ impl TransactionVersionStore {
             if let Some(write_set) = self.write_set.as_mut() {
                 write_set.remove(*row_id);
             }
+        }
+    }
+
+    /// Track a claim made directly on the parent VersionStore (not through put()).
+    /// Used by SegmentedTable for cold row UPDATE/DELETE claims that bypass
+    /// TransactionVersionStore's put methods. Without tracking, these claims
+    /// leak because commit() only releases claims found in write_set.
+    pub fn track_external_claim(&mut self, row_id: i64) {
+        let write_set = self.ensure_write_set();
+        // Only add if not already tracked (idempotent).
+        // Use empty read_version since this is a cold-only claim — the actual
+        // row data lives in cold storage, not in the hot version store.
+        use crate::common::i64_map::Entry;
+        if let Entry::Vacant(e) = write_set.entry(row_id) {
+            e.insert(WriteSetEntry {
+                read_version: None,
+                read_version_seq: 0,
+            });
         }
     }
 

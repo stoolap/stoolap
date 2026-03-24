@@ -388,13 +388,20 @@ impl Database {
                             _ => SyncMode::Normal,
                         };
                     }
-                    // Snapshot interval in seconds: snapshot_interval=300
-                    "snapshot_interval" => {
+                    // Checkpoint interval in seconds: checkpoint_interval=60
+                    // Also accepts snapshot_interval for backward compatibility
+                    "checkpoint_interval" | "snapshot_interval" => {
                         if let Ok(secs) = value.parse::<u32>() {
-                            config.persistence.snapshot_interval = secs;
+                            config.persistence.checkpoint_interval = secs;
                         }
                     }
-                    // Number of snapshots to keep: keep_snapshots=5
+                    // Compaction threshold: compact_threshold=4
+                    "compact_threshold" => {
+                        if let Ok(count) = value.parse::<u32>() {
+                            config.persistence.compact_threshold = count;
+                        }
+                    }
+                    // Number of backup snapshots to keep: keep_snapshots=3
                     "keep_snapshots" => {
                         if let Ok(count) = value.parse::<u32>() {
                             config.persistence.keep_snapshots = count;
@@ -435,23 +442,24 @@ impl Database {
                         config.persistence.wal_compression =
                             matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
                     }
-                    // Snapshot compression: snapshot_compression=on|off
-                    "snapshot_compression" => {
-                        config.persistence.snapshot_compression =
-                            matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
-                    }
                     // Both compressions: compression=on|off
-                    "compression" => {
+                    // Also accepts snapshot_compression for backward compatibility
+                    "compression" | "snapshot_compression" => {
                         let enabled =
                             matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
                         config.persistence.wal_compression = enabled;
-                        config.persistence.snapshot_compression = enabled;
                     }
                     // Compression threshold in bytes: compression_threshold=64
                     "compression_threshold" => {
                         if let Ok(bytes) = value.parse::<usize>() {
                             config.persistence.compression_threshold = bytes;
                         }
+                    }
+                    // Checkpoint on close: checkpoint_on_close=off
+                    // Set to off to simulate crashes in tests (WAL not truncated)
+                    "checkpoint_on_close" => {
+                        config.persistence.checkpoint_on_close =
+                            matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
                     }
                     // Cleanup interval in seconds: cleanup_interval=60
                     "cleanup_interval" => {
@@ -1045,6 +1053,30 @@ impl Database {
         self.inner.engine.create_snapshot()
     }
 
+    /// Restore the database from a backup snapshot.
+    ///
+    /// If no timestamp is provided, restores from the latest snapshot.
+    /// If a timestamp is provided (format: "YYYYMMDD-HHMMSS.fff"),
+    /// restores from that specific snapshot.
+    ///
+    /// This is a destructive operation that replaces all current data
+    /// with the snapshot data. User-created indexes and views are lost.
+    pub fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
+        use crate::storage::Engine;
+        let result = self.inner.engine.restore_snapshot(timestamp)?;
+        // Clear all query caches since all data has changed.
+        let executor = self
+            .inner
+            .executor
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        executor.clear_semantic_cache();
+        crate::executor::context::clear_scalar_subquery_cache();
+        crate::executor::context::clear_in_subquery_cache();
+        crate::executor::context::clear_semi_join_cache();
+        Ok(result)
+    }
+
     /// Get the internal executor (for Statement use)
     pub(crate) fn executor(&self) -> &Mutex<Executor> {
         &self.inner.executor
@@ -1085,6 +1117,12 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
         executor.clear_semantic_cache();
         Ok(())
+    }
+
+    /// Get the oldest snapshot timestamp loaded during startup.
+    /// Returns None if no snapshots were loaded.
+    pub fn oldest_loaded_snapshot_timestamp(&self) -> Option<String> {
+        self.inner.engine.oldest_loaded_snapshot_timestamp()
     }
 }
 

@@ -1768,6 +1768,15 @@ impl DiskVersionStore {
                     snap_file, e
                 );
             }
+            // Delete companion .vol and .promoted marker ONLY if the .vol was
+            // already promoted to standalone volumes (marker exists).
+            // Without the marker, the .vol may be the only copy of cold data.
+            let vol_path = snap_file.with_extension("vol");
+            let marker_path = snap_file.with_extension("vol.promoted");
+            if marker_path.exists() {
+                let _ = fs::remove_file(&vol_path);
+                let _ = fs::remove_file(&marker_path);
+            }
         }
 
         // Clean up HNSW graph files not matching any surviving snapshot.

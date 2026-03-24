@@ -7866,15 +7866,24 @@ impl Executor {
 
         match pragma_name.as_str() {
             "SNAPSHOT" => {
-                // Handle PRAGMA SNAPSHOT - creates a manual snapshot
+                // PRAGMA SNAPSHOT: Create a full backup snapshot of all tables.
+                // Writes .bin files to snapshots/ directory. keep_snapshots limits retention.
                 if stmt.value.is_some() {
                     return Err(Error::internal("PRAGMA SNAPSHOT does not accept values"));
                 }
 
-                // Create a snapshot
+                {
+                    let active_tx = self.active_transaction.lock().unwrap();
+                    if active_tx.is_some() {
+                        return Err(Error::internal(
+                            "PRAGMA SNAPSHOT cannot run inside a transaction. \
+                             Commit or rollback first.",
+                        ));
+                    }
+                }
+
                 self.engine.create_snapshot()?;
 
-                // Return success result
                 let columns = vec!["result".to_string()];
                 let mut rows = RowVec::with_capacity(1);
                 rows.push((
@@ -7884,54 +7893,115 @@ impl Executor {
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
             "CHECKPOINT" => {
-                // Alias for SNAPSHOT (SQLite-style)
+                // PRAGMA CHECKPOINT: Run the checkpoint cycle (seal hot to volumes,
+                // persist manifests, compact, WAL truncate).
                 if stmt.value.is_some() {
                     return Err(Error::internal("PRAGMA CHECKPOINT does not accept values"));
                 }
 
-                self.engine.create_snapshot()?;
+                {
+                    let active_tx = self.active_transaction.lock().unwrap();
+                    if active_tx.is_some() {
+                        return Err(Error::internal(
+                            "PRAGMA CHECKPOINT cannot run inside a transaction. \
+                             Commit or rollback first.",
+                        ));
+                    }
+                }
+
+                self.engine.force_checkpoint_cycle()?;
 
                 let columns = vec!["result".to_string()];
                 let mut rows = RowVec::with_capacity(1);
                 rows.push((
                     0,
-                    Row::from_values(vec![Value::text("Checkpoint created successfully")]),
+                    Row::from_values(vec![Value::text("Checkpoint completed successfully")]),
                 ));
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
-            "SNAPSHOT_INTERVAL" => {
+            "RESTORE" => {
+                // PRAGMA RESTORE: Restore database from latest backup snapshot.
+                // PRAGMA RESTORE = 'YYYYMMDD-HHMMSS.fff': Restore from specific snapshot.
+                {
+                    let active_tx = self.active_transaction.lock().unwrap();
+                    if active_tx.is_some() {
+                        return Err(Error::internal(
+                            "PRAGMA RESTORE cannot run inside a transaction. \
+                             Commit or rollback first.",
+                        ));
+                    }
+                }
+
+                let timestamp = if let Some(ref value) = stmt.value {
+                    Some(self.extract_pragma_string_value(value)?)
+                } else {
+                    None
+                };
+
+                let result_msg = self.engine.restore_snapshot(timestamp.as_deref())?;
+
+                // Clear all query caches since all data has changed
+                self.semantic_cache.clear();
+                self.query_cache.clear();
+                crate::executor::context::clear_scalar_subquery_cache();
+                crate::executor::context::clear_in_subquery_cache();
+                crate::executor::context::clear_semi_join_cache();
+
+                let columns = vec!["result".to_string()];
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((0, Row::from_values(vec![Value::text(&result_msg)])));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
+            "DEDUP_SEGMENTS" => {
+                let columns = vec!["message".to_string()];
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![Value::text(
+                        "Dedup segments is no longer needed (handled automatically)",
+                    )]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
+            "SNAPSHOT_INTERVAL" | "CHECKPOINT_INTERVAL" => {
                 let config = self.engine.config();
                 let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
                 if let Some(ref value) = stmt.value {
-                    // Set mode: PRAGMA snapshot_interval = 60
+                    // Set mode: PRAGMA checkpoint_interval = 60
                     let new_value = self.extract_pragma_int_value(value)?;
+                    if new_value < 0 {
+                        return Err(Error::internal("checkpoint_interval must be non-negative"));
+                    }
                     let mut new_config = config.clone();
-                    new_config.persistence.snapshot_interval = new_value as u32;
+                    new_config.persistence.checkpoint_interval = new_value as u32;
                     self.engine.update_engine_config(new_config)?;
                     let mut rows = RowVec::with_capacity(1);
                     rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
                 } else {
-                    // Read mode: PRAGMA snapshot_interval
+                    // Read mode: PRAGMA checkpoint_interval
                     let mut rows = RowVec::with_capacity(1);
                     rows.push((
                         0,
                         Row::from_values(vec![Value::Integer(
-                            config.persistence.snapshot_interval as i64,
+                            config.persistence.checkpoint_interval as i64,
                         )]),
                     ));
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
             }
-            "KEEP_SNAPSHOTS" => {
+            "COMPACT_THRESHOLD" => {
                 let config = self.engine.config();
                 let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
                 if let Some(ref value) = stmt.value {
                     let new_value = self.extract_pragma_int_value(value)?;
+                    if new_value < 0 {
+                        return Err(Error::internal("compact_threshold must be non-negative"));
+                    }
                     let mut new_config = config.clone();
-                    new_config.persistence.keep_snapshots = new_value as u32;
+                    new_config.persistence.compact_threshold = new_value as u32;
                     self.engine.update_engine_config(new_config)?;
                     let mut rows = RowVec::with_capacity(1);
                     rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
@@ -7941,7 +8011,7 @@ impl Executor {
                     rows.push((
                         0,
                         Row::from_values(vec![Value::Integer(
-                            config.persistence.keep_snapshots as i64,
+                            config.persistence.compact_threshold as i64,
                         )]),
                     ));
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
@@ -7995,6 +8065,32 @@ impl Executor {
                         0,
                         Row::from_values(vec![Value::Integer(
                             config.persistence.wal_flush_trigger as i64,
+                        )]),
+                    ));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
+                }
+            }
+            "KEEP_SNAPSHOTS" => {
+                let config = self.engine.config();
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
+
+                if let Some(ref value) = stmt.value {
+                    let new_value = self.extract_pragma_int_value(value)?;
+                    if new_value < 0 {
+                        return Err(Error::internal("keep_snapshots must be non-negative"));
+                    }
+                    let mut new_config = config.clone();
+                    new_config.persistence.keep_snapshots = new_value as u32;
+                    self.engine.update_engine_config(new_config)?;
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
+                } else {
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((
+                        0,
+                        Row::from_values(vec![Value::Integer(
+                            config.persistence.keep_snapshots as i64,
                         )]),
                     ));
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
@@ -8071,6 +8167,15 @@ impl Executor {
             crate::parser::Expression::IntegerLiteral(lit) => Ok(lit.value),
             crate::parser::Expression::FloatLiteral(lit) => Ok(lit.value as i64),
             _ => Err(Error::internal("PRAGMA value must be an integer")),
+        }
+    }
+
+    fn extract_pragma_string_value(&self, value: &crate::parser::Expression) -> Result<String> {
+        match value {
+            crate::parser::Expression::StringLiteral(lit) => Ok(lit.value.to_string()),
+            _ => Err(Error::internal(
+                "PRAGMA value must be a quoted string, e.g. 'YYYYMMDD-HHMMSS.fff'",
+            )),
         }
     }
 

@@ -238,6 +238,98 @@ WHERE p.price > cs.avg_price
 ORDER BY pct_above_avg DESC;
 ```
 
+## Persistence and Backup
+
+When using a persistent database (`file://`), Stoolap automatically manages data durability through WAL and cold volumes. You can also create manual backups:
+
+### Checkpoint
+
+Seal hot data to cold volumes and truncate the WAL:
+
+```sql
+PRAGMA CHECKPOINT;
+```
+
+### Backup Snapshot
+
+Create a point-in-time backup:
+
+```sql
+PRAGMA SNAPSHOT;
+```
+
+Or from the command line:
+
+```bash
+stoolap -d "file:///path/to/data" --snapshot
+```
+
+### Restore from Backup
+
+If your database is corrupted or you need to roll back, restore from a backup snapshot:
+
+```bash
+# Restore from latest backup (works even with corrupted volumes)
+stoolap -d "file:///path/to/data" --restore
+
+# Restore from a specific backup by timestamp
+stoolap -d "file:///path/to/data" --restore "20260315-100000.000"
+```
+
+The `--restore` command works at the filesystem level. It removes corrupted volumes and WAL files, then rebuilds from the backup snapshot. No running database is required.
+
+### Configuration
+
+```sql
+-- Set checkpoint interval (seconds)
+PRAGMA checkpoint_interval = 60;
+
+-- Set WAL sync mode (0=none, 1=normal, 2=full)
+PRAGMA sync_mode = 2;
+
+-- Read current configuration
+PRAGMA checkpoint_interval;
+PRAGMA sync_mode;
+```
+
+See the [Connection Strings]({% link _docs/getting-started/connection-strings.md %}) reference for all configuration options.
+
+## CLI Reference
+
+```bash
+# Start interactive mode
+stoolap -d "file:///path/to/data"
+
+# Execute a single query
+stoolap -d "file:///path/to/data" -e "SELECT COUNT(*) FROM users"
+
+# Execute from a SQL file
+stoolap -d "file:///path/to/data" -f script.sql
+
+# JSON output mode
+stoolap -d "file:///path/to/data" -j -e "SELECT * FROM users"
+
+# Create backup snapshot
+stoolap -d "file:///path/to/data" --snapshot
+
+# Restore from backup
+stoolap -d "file:///path/to/data" --restore
+
+# Recovery from corrupted volumes
+stoolap -d "file:///path/to/data" --reset-volumes --restore
+
+# Set persistence options
+stoolap -d "file:///path/to/data" --sync full --checkpoint-interval 30
+
+# Query timeout (milliseconds)
+stoolap -d "file:///path/to/data" -t 5000 -e "SELECT * FROM large_table"
+
+# Suppress connection messages
+stoolap -d "file:///path/to/data" -q -e "SELECT 1"
+```
+
+Run `stoolap --help` for the full list of options.
+
 ## Next Steps
 
 Now that you've learned the basics, you might want to explore:

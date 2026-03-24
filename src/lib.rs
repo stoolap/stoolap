@@ -125,8 +125,8 @@ pub use storage::{
 // Re-export Persistence types
 pub use storage::{
     deserialize_row_version, deserialize_value, serialize_row_version, serialize_value,
-    IndexMetadata, PersistenceManager, PersistenceMeta, DEFAULT_KEEP_SNAPSHOTS,
-    DEFAULT_SNAPSHOT_INTERVAL,
+    serialize_value_into, IndexMetadata, PersistenceManager, PersistenceMeta,
+    DEFAULT_CHECKPOINT_INTERVAL, DEFAULT_KEEP_SNAPSHOTS,
 };
 
 // Re-export function types

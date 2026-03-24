@@ -376,6 +376,29 @@ pub trait Table: Send + Sync {
     /// Used for NOT IN (anti-join) optimization.
     fn get_active_row_ids(&self) -> Vec<i64>;
 
+    /// Populate a FxHashSet with all hot row_ids. Avoids the intermediate Vec
+    /// allocation of get_active_row_ids() when building skip sets.
+    fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
+        for id in self.get_active_row_ids() {
+            dest.insert(id);
+        }
+    }
+
+    /// Check if a specific row_id exists in the hot buffer.
+    /// O(log n) lookup instead of collecting all row_ids.
+    fn has_row_id(&self, _row_id: i64) -> bool {
+        false
+    }
+
+    /// Claim a row for update to prevent concurrent cold-row modifications.
+    /// When two transactions update the same cold row, both mirror it into hot
+    /// via insert_discard. Without claiming, neither detects the other because
+    /// the row starts absent from hot. This method uses the VersionStore's
+    /// uncommitted_writes map to serialize access.
+    fn try_claim_row(&self, _row_id: i64) -> Result<()> {
+        Ok(())
+    }
+
     /// Deletes rows matching the given expression
     ///
     /// # Arguments
@@ -710,6 +733,55 @@ pub trait Table: Send + Sync {
     fn get_index_on_column(&self, column_name: &str) -> Option<std::sync::Arc<dyn Index>> {
         let _ = column_name;
         None // Default implementation - override in concrete tables
+    }
+
+    /// Gets all unique indexes on the table (for constraint checking).
+    ///
+    /// Returns a list of (index_name, column_names) for each unique index.
+    /// Used by SegmentedTable to check volume data during inserts.
+    fn get_unique_indexes(&self) -> Vec<(String, Vec<String>)> {
+        Vec::new() // Default: no unique indexes
+    }
+
+    /// Finds a conflicting row ID for a unique-key lookup.
+    ///
+    /// Volume-backed tables can override this to probe cold storage directly
+    /// after the hot index path misses, avoiding a full table scan on upserts.
+    fn find_unique_conflict_row_id(
+        &self,
+        _index_name: &str,
+        _column_name: &str,
+        _row_values: &[Value],
+    ) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    /// Iterate unique non-PK indexes by reference, avoiding per-call String allocations.
+    ///
+    /// The callback receives `(&str, &[String])` — the index name and its column names —
+    /// without cloning.  Implementations that hold an `RwLock<FxHashMap<String, Arc<dyn Index>>>`
+    /// can iterate the lock guard directly.
+    ///
+    /// The default implementation falls back to `get_unique_indexes()`.
+    fn for_each_unique_non_pk_index(
+        &self,
+        f: &mut dyn FnMut(&str, &[String]) -> Result<()>,
+    ) -> Result<()> {
+        for (name, cols) in self.get_unique_indexes() {
+            f(&name, &cols)?;
+        }
+        Ok(())
+    }
+
+    /// Check if the table has any unique indexes that are NOT the PK column.
+    /// Used as a fast bail-out to avoid allocating get_unique_indexes().
+    fn has_unique_non_pk_indexes(&self) -> bool {
+        false // Default: no
+    }
+
+    /// Acquire per-table upsert mutex for ON CONFLICT serialization.
+    fn acquire_upsert_lock(&self) -> Option<Box<dyn std::any::Any>> {
+        None
     }
 
     /// Gets an index by name

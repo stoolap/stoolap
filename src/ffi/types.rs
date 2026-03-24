@@ -120,7 +120,8 @@ pub struct StoolapRows {
 
 impl StoolapDB {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        self.last_error = CString::new(msg).ok();
+        let sanitized = msg.replace('\0', "\\0");
+        self.last_error = CString::new(sanitized).ok();
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
@@ -133,7 +134,8 @@ impl StoolapDB {
 
 impl StoolapStmt {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        self.last_error = CString::new(msg).ok();
+        let sanitized = msg.replace('\0', "\\0");
+        self.last_error = CString::new(sanitized).ok();
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
@@ -146,7 +148,8 @@ impl StoolapStmt {
 
 impl StoolapTx {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        self.last_error = CString::new(msg).ok();
+        let sanitized = msg.replace('\0', "\\0");
+        self.last_error = CString::new(sanitized).ok();
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
@@ -159,7 +162,8 @@ impl StoolapTx {
 
 impl StoolapRows {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        self.last_error = CString::new(msg).ok();
+        let sanitized = msg.replace('\0', "\\0");
+        self.last_error = CString::new(sanitized).ok();
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {

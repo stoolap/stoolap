@@ -74,6 +74,28 @@ See [Upsert]({{ '/docs/sql-features/on-duplicate-key-update/' | relative_url }})
 
 See [WebAssembly]({{ '/docs/drivers/wasm/' | relative_url }}) for WASM usage.
 
+## Cold Segments (Frozen Volumes)
+
+- **AS OF on cold rows**: Historical point-in-time queries (AS OF TRANSACTION) are not supported on tables with cold segments because cold rows lack version chains. AS OF CURRENT queries work correctly.
+- **Compaction memory**: Compaction materializes the full cold dataset in memory before rewriting. For tables with millions of cold rows, this causes a temporary memory spike.
+- **Concurrent explicit PK inserts**: Two concurrent explicit transactions inserting the same user-supplied primary key value can both succeed, with the second silently overwriting the first. Auto-increment PKs and auto-commit transactions are not affected.
+- **Skip-set cloning**: Each scan builds per-volume skip sets by cloning cumulative row_id sets. For tables with many volumes, this is O(N*V). Compaction keeps volume counts low (default threshold: 4).
+- **WAL growth under continuous writes**: WAL truncation requires all hot buffers to be empty. Under continuous writes, new rows may arrive between the seal pass and the truncation check. The checkpoint cycle force-seals small tables below the normal threshold, but truly continuous writes can delay truncation until a quiet period or clean close.
+- **Seal blocked by snapshot transactions**: Any active snapshot isolation transaction prevents sealing for ALL tables (not just the tables the transaction touches), keeping data in the hot buffer and blocking WAL truncation until all snapshot transactions complete. Cold volumes now support versioned tombstones for snapshot isolation on existing cold rows, but newly sealed rows from concurrent transactions lack per-row commit sequence visibility in the volume format.
+
+See [Persistence]({{ '/docs/architecture/persistence/' | relative_url }}) for full details.
+
+## Cold Segments (Accepted Tradeoffs)
+
+These are deliberate design decisions, not bugs:
+
+- **Binary search only for Integer/Timestamp columns**: Float, Text, and Boolean columns in cold segments fall back to linear scan with zone map pruning. Binary search is only available on sorted i64-based columns.
+- **ALTER TABLE only modifies hot schema**: Cold volumes retain their original schema. Column additions, drops, and renames are normalized at scan time. DROP COLUMN does not reclaim cold storage space until the next compaction cycle.
+
+## Transactions
+
+- **Multi-table partial commit**: If a transaction modifies multiple tables and one table's commit fails (e.g., write conflict or unique constraint violation), tables that already committed cannot be rolled back. The transaction is force-completed and the error is returned to the caller. Single-table transactions are not affected.
+
 ## General SQL
 
 - **No stored procedures or triggers**: Only built-in functions and SQL statements are supported.

@@ -54,13 +54,13 @@ pub struct PersistenceConfig {
     /// Default: Normal
     pub sync_mode: SyncMode,
 
-    /// Time between snapshots in seconds
-    /// Default: 300 (5 minutes)
-    pub snapshot_interval: u32,
+    /// Time between checkpoint cycles in seconds
+    /// Default: 60 (1 minute)
+    pub checkpoint_interval: u32,
 
-    /// Number of snapshots to keep
-    /// Default: 5
-    pub keep_snapshots: u32,
+    /// Number of cold segments that triggers compaction
+    /// Default: 4
+    pub compact_threshold: u32,
 
     /// Size in bytes that triggers a WAL flush
     /// Default: 32768 (32KB)
@@ -86,13 +86,17 @@ pub struct PersistenceConfig {
     /// Default: true
     pub wal_compression: bool,
 
-    /// Enable LZ4 compression for snapshot rows
-    /// Default: true
-    pub snapshot_compression: bool,
-
     /// Minimum data size (bytes) before attempting compression
     /// Default: 64
     pub compression_threshold: usize,
+
+    /// Number of backup snapshots to keep per table
+    /// Default: 3
+    pub keep_snapshots: u32,
+
+    /// Whether to run a final checkpoint (seal all hot rows to volumes) on close.
+    /// Default: true. Set to false when simulating crashes in tests.
+    pub checkpoint_on_close: bool,
 }
 
 impl Default for PersistenceConfig {
@@ -100,16 +104,17 @@ impl Default for PersistenceConfig {
         Self {
             enabled: true,
             sync_mode: SyncMode::Normal,
-            snapshot_interval: 300,         // 5 minutes
-            keep_snapshots: 5,              // Keep 5 snapshots
+            checkpoint_interval: 60,        // 1 minute
+            compact_threshold: 4,           // Compact after 4 segments
             wal_flush_trigger: 32 * 1024,   // 32KB
             wal_buffer_size: 64 * 1024,     // 64KB
             wal_max_size: 64 * 1024 * 1024, // 64MB
             commit_batch_size: 100,         // Batch 100 commits
             sync_interval_ms: 10,           // 10ms minimum interval
             wal_compression: true,          // Enable WAL compression
-            snapshot_compression: true,     // Enable snapshot compression
             compression_threshold: 64,      // Compress entries >= 64 bytes
+            keep_snapshots: 3,              // Keep 3 backup snapshots per table
+            checkpoint_on_close: true,      // Seal all data on clean shutdown
         }
     }
 }
@@ -125,16 +130,17 @@ impl PersistenceConfig {
         Self {
             enabled: true,
             sync_mode: SyncMode::Full,
-            snapshot_interval: 60, // 1 minute
-            keep_snapshots: 10,
+            checkpoint_interval: 30, // 30 seconds
+            compact_threshold: 4,
             wal_flush_trigger: 8 * 1024,    // 8KB - flush more often
             wal_buffer_size: 32 * 1024,     // 32KB
             wal_max_size: 32 * 1024 * 1024, // 32MB - smaller files
             commit_batch_size: 1,           // No batching
             sync_interval_ms: 0,            // Immediate sync
             wal_compression: true,
-            snapshot_compression: true,
             compression_threshold: 64,
+            keep_snapshots: 3,
+            checkpoint_on_close: true,
         }
     }
 
@@ -143,16 +149,17 @@ impl PersistenceConfig {
         Self {
             enabled: true,
             sync_mode: SyncMode::None,
-            snapshot_interval: 600, // 10 minutes
-            keep_snapshots: 3,
+            checkpoint_interval: 120, // 2 minutes
+            compact_threshold: 8,
             wal_flush_trigger: 64 * 1024,    // 64KB
             wal_buffer_size: 128 * 1024,     // 128KB
             wal_max_size: 128 * 1024 * 1024, // 128MB
             commit_batch_size: 500,          // Batch more commits
             sync_interval_ms: 100,           // Less frequent sync
             wal_compression: true,
-            snapshot_compression: true,
             compression_threshold: 64,
+            keep_snapshots: 3,
+            checkpoint_on_close: true,
         }
     }
 
@@ -162,15 +169,15 @@ impl PersistenceConfig {
         self
     }
 
-    /// Builder method to set snapshot interval
-    pub fn with_snapshot_interval(mut self, seconds: u32) -> Self {
-        self.snapshot_interval = seconds;
+    /// Builder method to set checkpoint interval
+    pub fn with_checkpoint_interval(mut self, seconds: u32) -> Self {
+        self.checkpoint_interval = seconds;
         self
     }
 
-    /// Builder method to set number of snapshots to keep
-    pub fn with_keep_snapshots(mut self, count: u32) -> Self {
-        self.keep_snapshots = count;
+    /// Builder method to set compaction threshold (number of segments)
+    pub fn with_compact_threshold(mut self, count: u32) -> Self {
+        self.compact_threshold = count;
         self
     }
 
@@ -180,22 +187,21 @@ impl PersistenceConfig {
         self
     }
 
-    /// Builder method to enable/disable snapshot compression
-    pub fn with_snapshot_compression(mut self, enabled: bool) -> Self {
-        self.snapshot_compression = enabled;
-        self
-    }
-
     /// Builder method to enable/disable all compression
     pub fn with_compression(mut self, enabled: bool) -> Self {
         self.wal_compression = enabled;
-        self.snapshot_compression = enabled;
         self
     }
 
     /// Builder method to set compression threshold
     pub fn with_compression_threshold(mut self, bytes: usize) -> Self {
         self.compression_threshold = bytes;
+        self
+    }
+
+    /// Builder method to set keep count for backup snapshots
+    pub fn with_keep_snapshots(mut self, count: u32) -> Self {
+        self.keep_snapshots = count;
         self
     }
 }
@@ -338,16 +344,16 @@ mod tests {
         let config = PersistenceConfig::default();
         assert!(config.enabled);
         assert_eq!(config.sync_mode, SyncMode::Normal);
-        assert_eq!(config.snapshot_interval, 300);
-        assert_eq!(config.keep_snapshots, 5);
+        assert_eq!(config.checkpoint_interval, 60);
+        assert_eq!(config.compact_threshold, 4);
         assert_eq!(config.wal_flush_trigger, 32 * 1024);
         assert_eq!(config.wal_buffer_size, 64 * 1024);
         assert_eq!(config.wal_max_size, 64 * 1024 * 1024);
         assert_eq!(config.commit_batch_size, 100);
         assert_eq!(config.sync_interval_ms, 10);
         assert!(config.wal_compression);
-        assert!(config.snapshot_compression);
         assert_eq!(config.compression_threshold, 64);
+        assert_eq!(config.keep_snapshots, 3);
     }
 
     #[test]
@@ -369,12 +375,12 @@ mod tests {
     fn test_persistence_config_builder() {
         let config = PersistenceConfig::new()
             .with_sync_mode(SyncMode::Full)
-            .with_snapshot_interval(120)
-            .with_keep_snapshots(10);
+            .with_checkpoint_interval(120)
+            .with_compact_threshold(8);
 
         assert_eq!(config.sync_mode, SyncMode::Full);
-        assert_eq!(config.snapshot_interval, 120);
-        assert_eq!(config.keep_snapshots, 10);
+        assert_eq!(config.checkpoint_interval, 120);
+        assert_eq!(config.compact_threshold, 8);
     }
 
     #[test]
@@ -382,14 +388,10 @@ mod tests {
         // Test disabling all compression
         let config = PersistenceConfig::new().with_compression(false);
         assert!(!config.wal_compression);
-        assert!(!config.snapshot_compression);
 
         // Test individual compression settings
-        let config = PersistenceConfig::new()
-            .with_wal_compression(false)
-            .with_snapshot_compression(true);
+        let config = PersistenceConfig::new().with_wal_compression(false);
         assert!(!config.wal_compression);
-        assert!(config.snapshot_compression);
 
         // Test compression threshold
         let config = PersistenceConfig::new().with_compression_threshold(128);

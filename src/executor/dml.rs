@@ -300,6 +300,19 @@ impl Executor {
         // Drop the lock before doing work
         drop(active_tx);
 
+        // Acquire per-table upsert mutex for ON CONFLICT DO UPDATE only.
+        // Serializes check+insert+commit to prevent TOCTOU races where two
+        // concurrent upserts both detect the same conflict and try to UPDATE
+        // the same row (second would hit an unhandled WriteConflict).
+        // DO NOTHING needs no lock: it never writes to the conflicting row,
+        // and commit-time unique violations are handled by returning 0 rows.
+        // Plain INSERTs proceed lock-free (UniqueConstraint error is correct).
+        let _upsert_guard = if stmt.on_duplicate {
+            table.acquire_upsert_lock()
+        } else {
+            None
+        };
+
         // Pre-compute schema information to avoid repeated borrows during insert
         let schema_column_count: usize;
         let column_indices: Vec<usize>;
@@ -550,7 +563,7 @@ impl Executor {
                             if !conflict_matches_target(&stmt.conflict_target, schema_ref, e) {
                                 return Err(Error::PrimaryKeyConstraint { row_id });
                             }
-                            if let Some(updated_row) = self.apply_on_duplicate_update(
+                            match self.apply_on_duplicate_update(
                                 &mut table,
                                 schema_ref,
                                 row_id,
@@ -559,16 +572,23 @@ impl Executor {
                                 stmt,
                                 ctx,
                                 has_returning,
-                            )? {
-                                returning_rows.push(updated_row);
+                            ) {
+                                Ok(Some(updated_row)) => {
+                                    returning_rows.push(updated_row);
+                                    rows_affected += 1;
+                                }
+                                Ok(None) => {
+                                    rows_affected += 1;
+                                }
+                                Err(e) => return Err(e),
                             }
-                            rows_affected += 1;
                         }
                         Err(
                             ref e @ Error::UniqueConstraint {
                                 ref index,
                                 ref column,
                                 ref value,
+                                row_id: conflict_rid,
                             },
                         ) => {
                             if !conflict_matches_target(&stmt.conflict_target, schema_ref, e) {
@@ -576,30 +596,50 @@ impl Executor {
                                     index: index.clone(),
                                     column: column.clone(),
                                     value: value.clone(),
+                                    row_id: conflict_rid,
                                 });
                             }
-                            if let Some(row_id) = self.find_row_by_unique_index(
-                                &*table, schema_ref, index, column, row_values,
-                            )? {
-                                if let Some(updated_row) = self.apply_on_duplicate_update(
-                                    &mut table,
-                                    schema_ref,
-                                    row_id,
-                                    Some(column),
-                                    row_values,
-                                    stmt,
-                                    ctx,
-                                    has_returning,
-                                )? {
-                                    returning_rows.push(updated_row);
-                                }
-                                rows_affected += 1;
+                            // Use row_id from the error if available (cold segment check
+                            // already found it). Only fall back to re-search if row_id < 0
+                            // (hot index path sets row_id = -1 when unknown).
+                            let found_row_id = if conflict_rid >= 0 {
+                                Ok(Some(conflict_rid))
                             } else {
-                                return Err(Error::UniqueConstraint {
-                                    index: index.clone(),
-                                    column: column.clone(),
-                                    value: value.clone(),
-                                });
+                                self.find_row_by_unique_index(
+                                    &*table, schema_ref, index, column, row_values,
+                                )
+                            };
+                            match found_row_id {
+                                Ok(Some(row_id)) => {
+                                    match self.apply_on_duplicate_update(
+                                        &mut table,
+                                        schema_ref,
+                                        row_id,
+                                        Some(column),
+                                        row_values,
+                                        stmt,
+                                        ctx,
+                                        has_returning,
+                                    ) {
+                                        Ok(Some(updated_row)) => {
+                                            returning_rows.push(updated_row);
+                                            rows_affected += 1;
+                                        }
+                                        Ok(None) => {
+                                            rows_affected += 1;
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                                Ok(None) => {
+                                    return Err(Error::UniqueConstraint {
+                                        index: index.clone(),
+                                        column: column.clone(),
+                                        value: value.clone(),
+                                        row_id: -1,
+                                    });
+                                }
+                                Err(e) => return Err(e),
                             }
                         }
                         Err(e) => return Err(e),
@@ -632,9 +672,30 @@ impl Executor {
 
             // Commit if this is a standalone (auto-commit) transaction
             if should_auto_commit {
-                // Just commit the transaction - it will commit all tables via commit_all_tables()
                 if let Some(mut tx) = standalone_tx {
-                    tx.commit()?;
+                    match tx.commit() {
+                        Ok(()) => {}
+                        Err(e)
+                            if (stmt.on_duplicate || stmt.do_nothing)
+                                && e.is_pk_or_unique_violation() =>
+                        {
+                            if stmt.on_duplicate && ctx.query_depth == 0 {
+                                // Commit-time PK/unique violation during upsert:
+                                // a concurrent plain INSERT committed first. Retry once.
+                                drop(_upsert_guard);
+                                let retry_ctx = ctx.with_incremented_query_depth();
+                                return self.execute_insert(stmt, &retry_ctx);
+                            }
+                            if stmt.do_nothing {
+                                // DO NOTHING: returning 0 rows is the correct semantic
+                                rows_affected = 0;
+                                returning_rows.clear();
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
 
@@ -771,7 +832,7 @@ impl Executor {
                             if !conflict_matches_target(&stmt.conflict_target, &schema, e) {
                                 return Err(Error::PrimaryKeyConstraint { row_id });
                             }
-                            if let Some(updated_row) = self.apply_on_duplicate_update(
+                            match self.apply_on_duplicate_update(
                                 &mut table,
                                 &schema,
                                 row_id,
@@ -780,16 +841,23 @@ impl Executor {
                                 stmt,
                                 ctx,
                                 has_returning,
-                            )? {
-                                returning_rows.push(updated_row);
+                            ) {
+                                Ok(Some(updated_row)) => {
+                                    returning_rows.push(updated_row);
+                                    rows_affected += 1;
+                                }
+                                Ok(None) => {
+                                    rows_affected += 1;
+                                }
+                                Err(e) => return Err(e),
                             }
-                            rows_affected += 1;
                         }
                         Err(
                             ref e @ Error::UniqueConstraint {
                                 ref index,
                                 ref column,
                                 ref value,
+                                row_id: conflict_rid,
                             },
                         ) => {
                             if !conflict_matches_target(&stmt.conflict_target, &schema, e) {
@@ -797,34 +865,51 @@ impl Executor {
                                     index: index.clone(),
                                     column: column.clone(),
                                     value: value.clone(),
+                                    row_id: conflict_rid,
                                 });
                             }
-                            if let Some(row_id) = self.find_row_by_unique_index(
-                                &*table,
-                                &schema,
-                                index,
-                                column,
-                                &row_values,
-                            )? {
-                                if let Some(updated_row) = self.apply_on_duplicate_update(
-                                    &mut table,
-                                    &schema,
-                                    row_id,
-                                    Some(column),
-                                    &row_values,
-                                    stmt,
-                                    ctx,
-                                    has_returning,
-                                )? {
-                                    returning_rows.push(updated_row);
-                                }
-                                rows_affected += 1;
+                            let found_row_id = if conflict_rid >= 0 {
+                                Ok(Some(conflict_rid))
                             } else {
-                                return Err(Error::UniqueConstraint {
-                                    index: index.clone(),
-                                    column: column.clone(),
-                                    value: value.clone(),
-                                });
+                                self.find_row_by_unique_index(
+                                    &*table,
+                                    &schema,
+                                    index,
+                                    column,
+                                    &row_values,
+                                )
+                            };
+                            match found_row_id {
+                                Ok(Some(row_id)) => {
+                                    match self.apply_on_duplicate_update(
+                                        &mut table,
+                                        &schema,
+                                        row_id,
+                                        Some(column),
+                                        &row_values,
+                                        stmt,
+                                        ctx,
+                                        has_returning,
+                                    ) {
+                                        Ok(Some(updated_row)) => {
+                                            returning_rows.push(updated_row);
+                                            rows_affected += 1;
+                                        }
+                                        Ok(None) => {
+                                            rows_affected += 1;
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                                Ok(None) => {
+                                    return Err(Error::UniqueConstraint {
+                                        index: index.clone(),
+                                        column: column.clone(),
+                                        value: value.clone(),
+                                        row_id: -1,
+                                    });
+                                }
+                                Err(e) => return Err(e),
                             }
                         }
                         Err(e) => return Err(e),
@@ -932,9 +1017,28 @@ impl Executor {
 
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
-            // Commit the transaction - it will commit all tables via commit_all_tables()
             if let Some(mut tx) = standalone_tx {
-                tx.commit()?;
+                match tx.commit() {
+                    Ok(()) => {}
+                    Err(e)
+                        if (stmt.on_duplicate || stmt.do_nothing)
+                            && e.is_pk_or_unique_violation() =>
+                    {
+                        if stmt.on_duplicate && ctx.query_depth == 0 {
+                            drop(_upsert_guard);
+                            let retry_ctx = ctx.with_incremented_query_depth();
+                            return self.execute_insert(stmt, &retry_ctx);
+                        }
+                        if stmt.do_nothing {
+                            // DO NOTHING: returning 0 rows is the correct semantic
+                            rows_affected = 0;
+                            returning_rows.clear();
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
 
@@ -2686,8 +2790,14 @@ impl Executor {
             Ok((row, changed))
         };
 
-        // Update the row
-        table.update(where_expr.as_deref(), &mut setter)?;
+        // Prefer direct row_id lookup when we have a concrete conflicting row_id.
+        // This avoids a second scan on non-PK upserts after conflict resolution.
+        // row_id < 0 means "unknown" (sentinel from UniqueConstraint error).
+        if row_id >= 0 {
+            table.update_by_row_ids(&[row_id], &mut setter)?;
+        } else {
+            table.update(where_expr.as_deref(), &mut setter)?;
+        }
 
         Ok(captured_row)
     }
@@ -2719,10 +2829,17 @@ impl Executor {
             if let Some(&row_id) = row_ids.first() {
                 return Ok(Some(row_id));
             }
-            return Ok(None);
+            // Hot index didn't find it — fall through to scan-based lookup
+            // which searches both hot buffer AND cold segments.
         }
 
-        // Fallback: scan with filter expression (only if index not found by name)
+        if let Some(row_id) =
+            table.find_unique_conflict_row_id(index_name, column_name, row_values)?
+        {
+            return Ok(Some(row_id));
+        }
+
+        // Fallback: scan with filter expression (searches hot + cold via SegmentedTable)
         let col_names: Vec<&str> = column_name.split(", ").collect();
 
         let mut comparisons: Vec<Box<dyn StorageExpr>> = Vec::with_capacity(col_names.len());
@@ -2752,19 +2869,30 @@ impl Executor {
             Box::new(and_expr)
         };
 
-        let column_indices: Vec<usize> = (0..schema.columns.len()).collect();
+        // Only project the PK column (if any) — we only need the row_id,
+        // not the full row. This avoids materializing all columns.
+        let pk_idx = schema.pk_column_index();
+        let column_indices: Vec<usize> = if let Some(pk) = pk_idx {
+            vec![pk]
+        } else {
+            vec![0]
+        };
         let mut scanner = table.scan(&column_indices, Some(&*scan_expr))?;
 
         let result = if scanner.next() {
-            let row = scanner.take_row();
-            if let Some(pk_idx) = schema.pk_column_index() {
-                if let Some(Value::Integer(id)) = row.get(pk_idx) {
+            let row_id = scanner.current_row_id();
+            if row_id >= 0 {
+                Some(row_id)
+            } else if pk_idx.is_some() {
+                // PK column is at index 0 in our minimal projection
+                let row = scanner.row();
+                if let Some(Value::Integer(id)) = row.get(0) {
                     Some(*id)
                 } else {
-                    None
+                    Some(row_id)
                 }
             } else {
-                Some(i64::MIN)
+                Some(row_id)
             }
         } else {
             None

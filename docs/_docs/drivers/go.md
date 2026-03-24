@@ -13,6 +13,8 @@ Go driver for Stoolap built on the Rust engine via C FFI (cgo). Provides two way
 - **Direct API** for maximum performance and control
 - **`database/sql`** driver for standard Go database access
 
+For a pure Go driver with no CGO dependency, see [Go WASM Driver]({{ '/docs/drivers/go-wasm/' | relative_url }}).
+
 ## Requirements
 
 - Go 1.24+

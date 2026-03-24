@@ -34,7 +34,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Concurrency
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 dashmap = "6"
 crossbeam = "0.8"
 rayon = { version = "1.8", optional = true }

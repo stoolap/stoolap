@@ -356,22 +356,28 @@ impl WALEntry {
     /// │ CRC32 (4 bytes): checksum of header + data                      │
     /// └─────────────────────────────────────────────────────────────────┘
     pub fn encode(&self) -> Vec<u8> {
-        // Determine if we should compress the data payload
-        // Only compress if data is large enough to benefit
-        let (payload_data, use_compression) = if self.data.len() >= COMPRESSION_THRESHOLD {
+        // Determine if we should compress the data payload.
+        // Avoid cloning self.data for the uncompressed case — write it
+        // directly into buf via extend_from_slice instead.
+        let compressed_data: Option<Vec<u8>>;
+        let use_compression;
+        if self.data.len() >= COMPRESSION_THRESHOLD {
             let compressed = lz4_flex::compress_prepend_size(&self.data);
-            // Only use compression if it actually reduces size
             if compressed.len() < self.data.len() {
-                (compressed, true)
+                compressed_data = Some(compressed);
+                use_compression = true;
             } else {
-                (self.data.clone(), false)
+                compressed_data = None;
+                use_compression = false;
             }
         } else {
-            (self.data.clone(), false)
-        };
+            compressed_data = None;
+            use_compression = false;
+        }
+        let payload: &[u8] = compressed_data.as_deref().unwrap_or(&self.data);
 
         // Calculate data portion size: txnID(8) + tableNameLen(2) + tableName + rowID(8) + op(1) + ts(8) + dataLen(4) + data
-        let data_size = 8 + 2 + self.table_name.len() + 8 + 1 + 8 + 4 + payload_data.len();
+        let data_size = 8 + 2 + self.table_name.len() + 8 + 1 + 8 + 4 + payload.len();
 
         // Total buffer: header(32) + data + CRC(4)
         let mut buf = Vec::with_capacity(WAL_HEADER_SIZE as usize + data_size + 4);
@@ -424,8 +430,8 @@ impl WALEntry {
 
         // Data length (4 bytes) + data (possibly compressed)
         // When compressed, lz4_flex::compress_prepend_size includes the original size
-        buf.extend_from_slice(&(payload_data.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&payload_data);
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(payload);
 
         // ========== CRC32 (4 bytes) ==========
         // Calculate CRC over data portion only (starting after 32-byte header)
@@ -893,18 +899,24 @@ impl CheckpointMetadata {
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
 
-        // Write atomically using temp file + rename
-        let temp_path = path.with_extension("meta.tmp");
+        // Write atomically using temp file + rename (unique name to avoid races)
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp_path = path.with_extension(format!("meta.{}.tmp", unique_suffix));
 
         let mut file = File::create(&temp_path).map_err(|e| {
             Error::internal(format!("failed to create checkpoint temp file: {}", e))
         })?;
 
-        file.write_all(&buf)
-            .map_err(|e| Error::internal(format!("failed to write checkpoint: {}", e)))?;
-
-        file.sync_all()
-            .map_err(|e| Error::internal(format!("failed to sync checkpoint: {}", e)))?;
+        if let Err(e) = file.write_all(&buf).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(Error::internal(format!(
+                "failed to write checkpoint: {}",
+                e
+            )));
+        }
 
         // Atomic rename
         fs::rename(&temp_path, path)
@@ -1447,15 +1459,10 @@ impl WALManager {
             let checkpoint_path = self.path.join("checkpoint.meta");
             let existing_lsn = match CheckpointMetadata::read_from_file(&checkpoint_path) {
                 Ok(c) => c.lsn,
-                Err(e) => {
-                    // Warning: checkpoint read failed during rotation, will use LSN 0
-                    // This means a full WAL replay will be needed on next recovery
-                    eprintln!(
-                        "Warning: Failed to read existing checkpoint during WAL rotation: {}. \
-                         Recovery will replay full WAL.",
-                        e
-                    );
-                    0 // If no checkpoint exists, LSN should be 0 for full recovery
+                Err(_) => {
+                    // No checkpoint.meta yet (fresh DB or first rotation).
+                    // LSN 0 means full WAL replay on recovery, which is correct.
+                    0
                 }
             };
 
@@ -2040,11 +2047,13 @@ impl WALManager {
             return Ok(()); // Already closed
         }
 
-        // Flush buffer (while still running)
-        let _ = self.flush();
+        // Flush buffer to file (while still running)
+        self.flush()?;
 
-        // Sync to disk (while still running)
-        let _ = self.sync_locked();
+        // Fsync to ensure all WAL data is durable on disk.
+        // Without this, a power failure or kill -9 after close
+        // could lose buffered WAL entries.
+        self.sync_locked()?;
 
         // Now mark as not running
         self.running.store(false, Ordering::SeqCst);
@@ -2326,7 +2335,7 @@ impl WALManager {
             // This is more explicit than pointing to a non-existent LSN
             const CHAIN_BREAK_MARKER: u64 = 0;
             let marker_entry = WALEntry {
-                lsn: up_to_lsn + 1,
+                lsn: up_to_lsn.saturating_add(1),
                 previous_lsn: CHAIN_BREAK_MARKER, // Explicit chain break marker
                 flags: WalFlags::NONE,
                 txn_id: MARKER_TXN_ID, // Special marker transaction
@@ -2345,7 +2354,7 @@ impl WALManager {
                 .map_err(|e| Error::internal(format!("failed to write marker entry: {}", e)))?;
 
             // Track marker's LSN and size for chain continuity
-            last_copied_lsn = up_to_lsn + 1;
+            last_copied_lsn = up_to_lsn.saturating_add(1);
             new_file_size = encoded.len() as u64;
         }
 
@@ -2563,7 +2572,7 @@ mod tests {
             WALOperationType::from_u8(13),
             Some(WALOperationType::TruncateTable)
         );
-        assert_eq!(WALOperationType::from_u8(14), None); // Invalid value
+        assert_eq!(WALOperationType::from_u8(14), None); // ColdDelete removed
 
         assert!(WALOperationType::CreateTable.is_ddl());
         assert!(WALOperationType::CreateView.is_ddl());

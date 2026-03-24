@@ -7,7 +7,7 @@ order: 18
 
 # ALTER TABLE
 
-ALTER TABLE modifies the structure of an existing table. All ALTER TABLE operations are crash-safe with full WAL durability and snapshot recovery support.
+ALTER TABLE modifies the structure of an existing table. All ALTER TABLE operations are crash-safe with full WAL durability and volume recovery support.
 
 ## ADD COLUMN
 
@@ -82,3 +82,4 @@ This means ALTER TABLE changes persist correctly even if the database crashes im
 - ALTER TABLE operations may temporarily block concurrent writes
 - MODIFY COLUMN can change nullability (add or remove NOT NULL), but does not validate that existing data satisfies the new constraint
 - Composite primary key modifications are not supported
+- **Frozen volume tables**: ALTER TABLE works on tables with frozen volumes. Volume data is normalized on read (new columns return NULL/DEFAULT, dropped columns are skipped). The volume is rebuilt automatically on the next checkpoint cycle

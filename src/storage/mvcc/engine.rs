@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use std::path::Path;
+use std::time::Instant;
 
 /// Returns lowercase version of string, avoiding allocation if already lowercase.
 /// This is a hot-path optimization - most table names are already lowercase.
@@ -47,7 +48,7 @@ use crate::storage::mvcc::wal_manager::WALOperationType;
 #[cfg(test)]
 use crate::storage::mvcc::VisibilityChecker;
 use crate::storage::mvcc::{
-    MVCCTable, MvccTransaction, PersistenceManager, PkIndex, RowVersion,
+    MVCCTable, MvccTransaction, PersistenceManager, PkIndex, RowVersion, SealFenceGuard,
     TransactionEngineOperations, TransactionRegistry, TransactionVersionStore, VersionStore,
     INVALID_TRANSACTION_ID,
 };
@@ -199,7 +200,47 @@ const SNAPSHOT_META_MAGIC: u32 = 0x50414E53; // "SNAP" in little-endian
 /// Current version of the snapshot metadata format
 const SNAPSHOT_META_VERSION: u32 = 1;
 
-/// Write binary snapshot metadata with magic number and checksum
+/// Read binary snapshot metadata, returns the LSN or 0 if invalid/not found
+fn read_snapshot_metadata(path: &std::path::Path) -> u64 {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+
+    // Minimum size: 28 bytes
+    if data.len() < 28 {
+        return 0;
+    }
+
+    // Verify magic
+    let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    if magic != SNAPSHOT_META_MAGIC {
+        return 0;
+    }
+
+    // Verify version (must be compatible)
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if version > SNAPSHOT_META_VERSION {
+        eprintln!(
+            "Warning: Snapshot metadata version {} is newer than supported {}",
+            version, SNAPSHOT_META_VERSION
+        );
+        return 0;
+    }
+
+    // Verify CRC32
+    let stored_crc = u32::from_le_bytes(data[24..28].try_into().unwrap());
+    let computed_crc = crc32fast::hash(&data[0..24]);
+    if stored_crc != computed_crc {
+        eprintln!("Warning: Snapshot metadata checksum mismatch");
+        return 0;
+    }
+
+    // Extract LSN
+    u64::from_le_bytes(data[8..16].try_into().unwrap())
+}
+
+/// Write binary snapshot metadata (atomic via temp file + rename)
 fn write_snapshot_metadata(path: &std::path::Path, lsn: u64) -> Result<()> {
     use std::io::Write;
 
@@ -255,46 +296,6 @@ fn write_snapshot_metadata(path: &std::path::Path, lsn: u64) -> Result<()> {
     Ok(())
 }
 
-/// Read binary snapshot metadata, returns the LSN or 0 if invalid/not found
-fn read_snapshot_metadata(path: &std::path::Path) -> u64 {
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(_) => return 0,
-    };
-
-    // Minimum size: 28 bytes
-    if data.len() < 28 {
-        return 0;
-    }
-
-    // Verify magic
-    let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    if magic != SNAPSHOT_META_MAGIC {
-        return 0;
-    }
-
-    // Verify version (must be compatible)
-    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-    if version > SNAPSHOT_META_VERSION {
-        eprintln!(
-            "Warning: Snapshot metadata version {} is newer than supported {}",
-            version, SNAPSHOT_META_VERSION
-        );
-        return 0;
-    }
-
-    // Verify CRC32
-    let stored_crc = u32::from_le_bytes(data[24..28].try_into().unwrap());
-    let computed_crc = crc32fast::hash(&data[0..24]);
-    if stored_crc != computed_crc {
-        eprintln!("Warning: Snapshot metadata checksum mismatch");
-        return 0;
-    }
-
-    // Extract LSN
-    u64::from_le_bytes(data[8..16].try_into().unwrap())
-}
-
 /// Read snapshot LSN from either binary or JSON format (backward compatibility)
 fn read_snapshot_lsn(snapshot_dir: &std::path::Path) -> u64 {
     // First try new binary format
@@ -320,94 +321,6 @@ fn read_snapshot_lsn(snapshot_dir: &std::path::Path) -> u64 {
     }
 
     0
-}
-
-/// Determine the safe WAL truncation LSN based on verified snapshots.
-/// Returns None if truncation is not safe (< 2 surviving snapshots for any table).
-/// Returns Some(lsn) where lsn is the minimum second-to-last verified snapshot's LSN
-/// across all tables. This ensures that if the latest snapshot is corrupted, the
-/// previous snapshot + WAL entries from that point can fully reconstruct the database.
-///
-/// `keep_count` is the number of snapshots that Phase 7 cleanup will retain.
-/// Only the `keep_count` newest snapshots per table will survive cleanup, so we must
-/// only consider those when computing the safe truncation point.
-fn find_safe_truncation_lsn(
-    snapshot_dir: &std::path::Path,
-    keep_count: usize,
-    active_tables: &rustc_hash::FxHashSet<&str>,
-) -> Option<u64> {
-    // Enumerate table subdirectories, skipping orphaned directories from dropped tables.
-    // Without this filter, a dropped table's snapshot directory (with < 2 snapshots)
-    // would permanently block WAL truncation for the entire database.
-    let entries = match std::fs::read_dir(snapshot_dir) {
-        Ok(e) => e,
-        Err(_) => return None,
-    };
-
-    let mut table_dirs: Vec<std::path::PathBuf> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                if active_tables.contains(dir_name) {
-                    table_dirs.push(path);
-                }
-            }
-        }
-    }
-
-    if table_dirs.is_empty() {
-        return None;
-    }
-
-    let mut min_second_to_last_lsn: Option<u64> = None;
-
-    for table_dir in &table_dirs {
-        // Collect all snapshot-*.bin files sorted by name (timestamp)
-        let mut snap_files: Vec<std::path::PathBuf> = match std::fs::read_dir(table_dir) {
-            Ok(entries) => entries
-                .flatten()
-                .filter_map(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if name.starts_with("snapshot-") && name.ends_with(".bin") {
-                        Some(e.path())
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            Err(_) => return None,
-        };
-        snap_files.sort();
-
-        // Only consider snapshots that will survive Phase 7 cleanup.
-        // keep_count == 0 means "no cleanup" (keep all), otherwise keep the newest N.
-        let surviving = if keep_count > 0 && snap_files.len() > keep_count {
-            &snap_files[snap_files.len() - keep_count..]
-        } else {
-            &snap_files[..]
-        };
-
-        // Need at least 2 surviving snapshots for safe truncation
-        if surviving.len() < 2 {
-            return None;
-        }
-
-        // CRC-verify the second-to-last surviving snapshot
-        let second_to_last = &surviving[surviving.len() - 2];
-        let lsn = match super::snapshot::verify_snapshot_integrity(second_to_last) {
-            Ok(lsn) => lsn,
-            Err(_) => return None, // Second-to-last fails CRC → skip truncation
-        };
-
-        // Track the minimum across all tables
-        min_second_to_last_lsn = Some(match min_second_to_last_lsn {
-            Some(current_min) => current_min.min(lsn),
-            None => lsn,
-        });
-    }
-
-    min_second_to_last_lsn
 }
 
 /// View definition storing the query that defines the view
@@ -529,6 +442,35 @@ pub struct MVCCEngine {
     /// Snapshot timestamps loaded per table — used to pair HNSW graph files with their
     /// matching data snapshots during WAL replay.
     snapshot_timestamps: RwLock<FxHashMap<String, String>>,
+    /// Per-table segment managers (owns segments, delete vectors, manifest).
+    /// Key: lowercase table name. Replaces frozen_volumes + volume_tombstones.
+    segment_managers:
+        Arc<RwLock<FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>>>,
+    /// When true, seal_hot_buffers bypasses thresholds and seals all rows.
+    /// Set during close_engine to ensure all data is in volumes before shutdown.
+    force_seal_all: AtomicBool,
+    /// Prevents concurrent checkpoint cycles (background thread vs PRAGMA SNAPSHOT).
+    /// Without this, two concurrent seal+compact runs can each read the same old
+    /// segments, produce overlapping compacted volumes, and delete each other's data.
+    checkpoint_mutex: Mutex<()>,
+    /// Seal fence: commits acquire READ (shared, ~5ns), micro-seal acquires WRITE
+    /// (exclusive, brief ~100ms) to create a quiet moment where all_hot_empty can
+    /// be true. This enables WAL truncation under continuous writes.
+    seal_fence: Arc<parking_lot::RwLock<()>>,
+    /// Last compaction timestamp. Compaction is skipped if less than
+    /// `compact_threshold * checkpoint_interval` has passed since the last one.
+    /// This prevents compaction from running every checkpoint cycle when multiple
+    /// tables stagger their volume accumulation.
+    last_compaction_time: Mutex<Instant>,
+}
+
+/// Parse a volume ID from a `.vol` filename (e.g., `vol_00065f1a2b3c4d5e.vol` -> `0x00065f1a2b3c4d5e`).
+fn parse_volume_id(path: &std::path::Path) -> Option<u64> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("vol_"))
+        .and_then(|name| name.strip_suffix(".vol"))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
 }
 
 impl MVCCEngine {
@@ -569,6 +511,12 @@ impl MVCCEngine {
             cleanup_handle: Mutex::new(None),
             fk_reverse_cache: RwLock::new((u64::MAX, StringMap::default())),
             snapshot_timestamps: RwLock::new(FxHashMap::default()),
+            segment_managers: Arc::new(RwLock::new(FxHashMap::default())),
+            force_seal_all: AtomicBool::new(false),
+            checkpoint_mutex: Mutex::new(()),
+            seal_fence: Arc::new(parking_lot::RwLock::new(())),
+            // Initialize to epoch so the first compaction is not delayed
+            last_compaction_time: Mutex::new(Instant::now() - std::time::Duration::from_secs(3600)),
         }
     }
 
@@ -602,16 +550,143 @@ impl MVCCEngine {
                 // Mark that we're loading from disk to prevent WAL writes during recovery
                 self.loading_from_disk.store(true, Ordering::Release);
 
-                // Try to load from snapshots first (for faster recovery)
-                let snapshot_lsn = self.load_snapshots()?;
+                // Determine recovery mode:
+                // 1. If snapshots/ exists with snapshot files -> legacy snapshot recovery
+                // 2. If volumes/ exists with manifests -> new checkpoint-to-volume recovery
+                // 3. Otherwise -> pure WAL replay from beginning
+                let snapshot_dir = pm.path().join("snapshots");
+                let vol_dir = pm.path().join("volumes");
 
-                // Replay WAL entries after the snapshot LSN
-                self.replay_wal(snapshot_lsn)?;
+                // Check for volumes/ with manifests (new architecture).
+                // This takes priority over snapshots/ because PRAGMA SNAPSHOT
+                // now creates backup .bin files in snapshots/ alongside volumes/.
+                let has_volumes = vol_dir.exists()
+                    && std::fs::read_dir(&vol_dir)
+                        .ok()
+                        .map(|entries| {
+                            entries
+                                .flatten()
+                                .any(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+                        })
+                        .unwrap_or(false);
+
+                // Legacy snapshots: only used when volumes/ does NOT exist.
+                // This handles migration from pre-volume databases.
+                let has_legacy_snapshots = !has_volumes
+                    && snapshot_dir.exists()
+                    && std::fs::read_dir(&snapshot_dir)
+                        .ok()
+                        .map(|entries| {
+                            entries
+                                .flatten()
+                                .any(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+                        })
+                        .unwrap_or(false);
+
+                let replay_from_lsn = if has_volumes {
+                    // New path: load manifests + volumes BEFORE WAL replay.
+                    // Volumes must be loaded so is_row_id_in_volume() can check
+                    // row_ids for idempotent INSERT during replay.
+                    let lsn = self.load_manifests_from_volumes();
+                    self.load_standalone_volumes_no_schema_check();
+                    lsn
+                } else if has_legacy_snapshots {
+                    // Legacy path: load snapshots (creates schemas + version stores)
+                    let snapshot_lsn = self.load_snapshots()?;
+                    self.load_standalone_volumes();
+                    snapshot_lsn
+                } else {
+                    0
+                };
+
+                // Clean up stale .dv files from previous versions
+                self.cleanup_stale_dv_files();
+
+                // Replay WAL entries after the checkpoint/snapshot LSN
+                self.replay_wal(replay_from_lsn)?;
 
                 // Populate pre-computed default_value from default_expr for schema evolution.
                 // Neither snapshots nor WAL persist the cached default_value, so old rows
                 // read via normalize_row_to_schema would get NULL instead of the column default.
                 self.populate_schema_defaults();
+
+                // Sync auto-increment counters from segment data so the next
+                // generated row_id doesn't collide with cold rows.
+                self.sync_auto_increment_from_segments();
+
+                // Migration: if we loaded from legacy snapshots, seal all data
+                // into volumes and remove the old snapshots/ directory.
+                if has_legacy_snapshots {
+                    // Clear loading flag temporarily so checkpoint can write WAL
+                    self.loading_from_disk.store(false, Ordering::Release);
+
+                    // Force seal ALL hot rows into volumes
+                    if let Err(e) = self.checkpoint_cycle_inner(true) {
+                        eprintln!("Warning: snapshot-to-volume conversion failed: {}", e);
+                    }
+                    self.compact_after_checkpoint_forced();
+
+                    // Only remove snapshots/ if this is a real v0.3.7 migration
+                    // (no ddl-*.bin). If DDL metadata exists, these are user-created
+                    // backup snapshots from PRAGMA SNAPSHOT that should be kept.
+                    let snapshot_dir = pm.path().join("snapshots");
+                    let is_user_backup =
+                        std::fs::read_dir(&snapshot_dir)
+                            .ok()
+                            .is_some_and(|entries| {
+                                entries.filter_map(|e| e.ok()).any(|e| {
+                                    e.file_name().to_str().is_some_and(|n| {
+                                        (n.starts_with("ddl-") && n.ends_with(".bin"))
+                                            || n == "ddl.bin"
+                                    })
+                                })
+                            });
+                    if !is_user_backup {
+                        if let Err(e) = std::fs::remove_dir_all(&snapshot_dir) {
+                            eprintln!("Warning: failed to remove snapshots/: {}", e);
+                        }
+                    }
+
+                    // Set loading flag back so the code below clears it
+                    self.loading_from_disk.store(true, Ordering::Release);
+                }
+
+                // After recovery, seal hot rows immediately before accepting
+                // queries. Without this, a dirty shutdown that loads 1M+ rows
+                // into hot via WAL replay makes ALL queries O(hot_size) until
+                // the first background checkpoint fires (up to 60s later).
+                // Sealing here drains the hot buffer while no concurrent reads
+                // exist, so there's no seal_overlap performance impact.
+                {
+                    self.loading_from_disk.store(false, Ordering::Release);
+                    let has_hot_rows = {
+                        let stores = self.version_stores.read().unwrap();
+                        stores.values().any(|s| s.committed_row_count() > 0)
+                    };
+                    if has_hot_rows {
+                        self.force_seal_all.store(true, Ordering::Release);
+                        if let Err(e) = self.seal_hot_buffers() {
+                            eprintln!("Warning: post-recovery seal failed: {}", e);
+                        }
+                        self.force_seal_all.store(false, Ordering::Release);
+
+                        // Persist manifests so sealed volumes survive another
+                        // crash. Don't advance checkpoint_lsn or truncate WAL
+                        // here — the WAL may be corrupt (that's why recovery
+                        // ran). The first clean checkpoint (background thread
+                        // or close_engine) will advance and truncate safely.
+                        {
+                            let mgr_arcs: Vec<_> = {
+                                let mgrs = self.segment_managers.read().unwrap();
+                                mgrs.values().cloned().collect()
+                            };
+                            for mgr in &mgr_arcs {
+                                let _ = mgr.persist_manifest_only();
+                            }
+                        }
+                    }
+                    self.loading_from_disk.store(true, Ordering::Release);
+                }
 
                 // Clear the loading flag
                 self.loading_from_disk.store(false, Ordering::Release);
@@ -666,25 +741,25 @@ impl MVCCEngine {
         let stop_flag_clone = Arc::clone(&stop_flag);
         let engine = Arc::clone(self);
 
-        // Read snapshot interval from persistence manager (if persistence is enabled)
-        let snapshot_interval = (*engine.persistence)
-            .as_ref()
-            .map(|pm| pm.snapshot_interval())
-            .unwrap_or(std::time::Duration::ZERO);
-
-        // Use the shorter of cleanup and snapshot intervals as the loop sleep
-        // so that snapshot checks aren't delayed by a longer cleanup interval.
-        let loop_interval = if !snapshot_interval.is_zero() {
-            interval.min(snapshot_interval)
-        } else {
-            interval
-        };
-
         let handle = thread::spawn(move || {
             let mut time_since_cleanup = std::time::Duration::ZERO;
 
             while !stop_flag_clone.load(Ordering::Acquire) {
-                // Sleep for the loop interval (check stop flag periodically)
+                // Read config once per outer iteration (not per 100ms tick)
+                let current_checkpoint_interval = {
+                    let cfg = engine.config.read().unwrap();
+                    if cfg.persistence.checkpoint_interval > 0 {
+                        std::time::Duration::from_secs(cfg.persistence.checkpoint_interval as u64)
+                    } else {
+                        std::time::Duration::ZERO
+                    }
+                };
+                let loop_interval = if !current_checkpoint_interval.is_zero() {
+                    interval.min(current_checkpoint_interval)
+                } else {
+                    interval
+                };
+
                 let check_interval = std::time::Duration::from_millis(100);
                 let mut elapsed = std::time::Duration::ZERO;
                 while elapsed < loop_interval && !stop_flag_clone.load(Ordering::Acquire) {
@@ -705,18 +780,20 @@ impl MVCCEngine {
                     let _prev_version_count = engine.cleanup_old_previous_versions();
                 }
 
-                // Auto-snapshot: create snapshot if snapshot_interval has elapsed
-                if !snapshot_interval.is_zero() {
+                // Auto-checkpoint using the cached interval
+                if !current_checkpoint_interval.is_zero() {
                     if let Some(ref pm) = *engine.persistence {
-                        let last = pm.last_snapshot_time();
+                        let last = pm.last_checkpoint_time();
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_nanos() as i64)
                             .unwrap_or(0);
                         let elapsed_nanos = now.saturating_sub(last);
-                        let interval_nanos = snapshot_interval.as_nanos() as i64;
+                        let interval_nanos = current_checkpoint_interval.as_nanos() as i64;
                         if elapsed_nanos >= interval_nanos {
-                            let _ = engine.create_snapshot();
+                            if let Err(e) = engine.checkpoint_cycle() {
+                                eprintln!("Warning: checkpoint cycle failed: {}", e);
+                            }
                         }
                     }
                 }
@@ -785,7 +862,21 @@ impl MVCCEngine {
             // we can load the previous one and replay WAL from its LSN.
             let snapshot_paths = Self::find_snapshots_newest_first(&entry.path());
             for snapshot_path in &snapshot_paths {
-                match self.load_table_snapshot(&table_name, snapshot_path) {
+                let vol_path = snapshot_path.with_extension("vol");
+                let has_vol = vol_path.exists();
+
+                // Use volume loading for large snapshots (>16MB) or if a .vol file exists
+                let file_size = std::fs::metadata(snapshot_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let use_volume = has_vol || file_size > 16 * 1024 * 1024;
+
+                let load_result = if use_volume {
+                    self.load_table_snapshot_as_volume(&table_name, snapshot_path)
+                } else {
+                    self.load_table_snapshot(&table_name, snapshot_path)
+                };
+                match load_result {
                     Ok(source_lsn) => {
                         any_snapshot_loaded = true;
                         if source_lsn < min_header_lsn {
@@ -916,6 +1007,237 @@ impl MVCCEngine {
         Ok(source_lsn)
     }
 
+    /// Load a table's snapshot as a frozen volume instead of into the arena.
+    ///
+    /// Fast-startup path:
+    /// 1. Check for a pre-built `.vol` file next to the snapshot — load directly
+    /// 2. If no `.vol` file, convert from snapshot and save the `.vol` for next time
+    ///
+    /// The VersionStore is created empty (only WAL-replayed rows go into the arena).
+    /// Returns the source_lsn from the snapshot header.
+    fn load_table_snapshot_as_volume(
+        &self,
+        _table_name: &str,
+        snapshot_path: &std::path::Path,
+    ) -> Result<u64> {
+        // Derive the volume file path from the snapshot path:
+        // snapshot-20260314-001020.947.bin → snapshot-20260314-001020.947.vol
+        let vol_path = snapshot_path.with_extension("vol");
+
+        // Try loading a pre-built volume file first (instant startup)
+        if vol_path.exists() {
+            let volume = crate::storage::volume::io::read_volume_from_disk(&vol_path)?;
+            let vol_row_count = volume.row_count;
+
+            // We still need the schema from the snapshot header
+            let reader = super::snapshot::SnapshotReader::open(snapshot_path)?;
+            let source_lsn = reader.source_lsn();
+            let schema = reader.schema().clone();
+            let table_name_lower = schema.table_name_lower.clone();
+
+            // Create empty version store (hot buffer for WAL data only)
+            let version_store = Arc::new(VersionStore::with_visibility_checker(
+                schema.table_name.clone(),
+                schema.clone(),
+                registry_as_visibility_checker(&self.registry),
+            ));
+            register_pk_index(&schema, &version_store);
+
+            // Store schema and version store
+            {
+                let mut schemas = self.schemas.write().unwrap();
+                schemas.insert(table_name_lower.clone(), CompactArc::new(schema));
+            }
+            {
+                let mut stores = self.version_stores.write().unwrap();
+                stores.insert(table_name_lower.clone(), version_store);
+            }
+
+            // Store the frozen volume in the segment manager.
+            // Promote to standalone FIRST to get the stable volume_id, then
+            // register with that same ID so load_standalone_volumes skips it.
+            if vol_row_count > 0 {
+                let volume = Arc::new(volume);
+                let stable_id =
+                    self.promote_snapshot_vol_to_standalone(&table_name_lower, &vol_path);
+                if let Some(id) = stable_id {
+                    self.register_volume_with_id(&table_name_lower, volume, id);
+                } else {
+                    self.register_volume(&table_name_lower, volume);
+                }
+            }
+
+            return Ok(source_lsn);
+        }
+
+        // No pre-built volume — convert from snapshot
+        let mut reader = super::snapshot::SnapshotReader::open(snapshot_path)?;
+        let source_lsn = reader.source_lsn();
+        let schema = reader.schema().clone();
+        let table_name_lower = schema.table_name_lower.clone();
+
+        // Create an empty version store (hot buffer for WAL data only)
+        let version_store = Arc::new(VersionStore::with_visibility_checker(
+            schema.table_name.clone(),
+            schema.clone(),
+            registry_as_visibility_checker(&self.registry),
+        ));
+        register_pk_index(&schema, &version_store);
+
+        // Build a frozen volume from the snapshot rows
+        let mut builder = crate::storage::volume::writer::VolumeBuilder::new(&schema);
+        reader.for_each(|row_id, version| {
+            if !version.is_deleted() {
+                builder.add_row(row_id, &version.data);
+            }
+            true
+        })?;
+        let volume = builder.finish();
+        let vol_row_count = volume.row_count;
+
+        // Write volume file to disk for next startup (atomic write)
+        if vol_row_count > 0 {
+            if let Err(e) = (|| -> Result<()> {
+                let data =
+                    crate::storage::volume::format::serialize_volume(&volume).map_err(|e| {
+                        crate::core::Error::internal(format!("failed to serialize volume: {}", e))
+                    })?;
+                let tmp_path = vol_path.with_extension("vol.tmp");
+                std::fs::write(&tmp_path, &data).map_err(|e| {
+                    crate::core::Error::internal(format!("failed to write volume: {}", e))
+                })?;
+                // Ensure data is durable before rename, preventing zero-length files after crash
+                std::fs::File::open(&tmp_path)
+                    .and_then(|f| f.sync_all())
+                    .map_err(|e| {
+                        crate::core::Error::internal(format!("failed to sync volume: {}", e))
+                    })?;
+                std::fs::rename(&tmp_path, &vol_path).map_err(|e| {
+                    crate::core::Error::internal(format!("failed to rename volume: {}", e))
+                })?;
+                Ok(())
+            })() {
+                eprintln!(
+                    "Warning: Failed to save volume file for {}: {}",
+                    table_name_lower, e
+                );
+                // Non-fatal: volume stays in RAM, next startup will re-convert
+            }
+        }
+
+        let volume = Arc::new(volume);
+
+        // Store schema and empty version store
+        {
+            let mut schemas = self.schemas.write().unwrap();
+            schemas.insert(table_name_lower.clone(), CompactArc::new(schema));
+        }
+        {
+            let mut stores = self.version_stores.write().unwrap();
+            stores.insert(table_name_lower.clone(), version_store);
+        }
+
+        // Promote to standalone FIRST, then register with the stable ID
+        if vol_row_count > 0 {
+            let stable_id = self.promote_snapshot_vol_to_standalone(&table_name_lower, &vol_path);
+            if let Some(id) = stable_id {
+                self.register_volume_with_id(&table_name_lower, volume, id);
+            } else {
+                self.register_volume(&table_name_lower, volume);
+            }
+        }
+
+        Ok(source_lsn)
+    }
+
+    /// Copy a snapshot-adjacent .vol file into the standalone volumes directory.
+    ///
+    /// This makes the cold data durable across snapshot rotations: once a newer
+    /// snapshot is created and old snapshots are cleaned up, the .vol that was
+    /// written next to the old snapshot would be orphaned. By copying it into
+    /// `volumes/<table>/`, `load_standalone_volumes` can find it on every future
+    /// restart regardless of which snapshot is current.
+    ///
+    /// The copy is skipped if the standalone directory already contains any .vol
+    /// files for this table, to avoid duplicating data on every restart.
+    /// Promotes a snapshot .vol to standalone volumes/. Returns the volume_id
+    /// used for the standalone file so the caller can register the segment with
+    /// the same ID (preventing double-load by load_standalone_volumes).
+    fn promote_snapshot_vol_to_standalone(
+        &self,
+        table_name: &str,
+        vol_path: &std::path::Path,
+    ) -> Option<u64> {
+        let pm = match self.persistence.as_ref() {
+            Some(pm) if pm.is_enabled() => pm,
+            _ => return None,
+        };
+
+        if !vol_path.exists() {
+            return None;
+        }
+
+        // Marker file stores the volume_id from the previous promotion.
+        // On subsequent opens, return that ID so the caller registers with
+        // the same segment_id as the standalone copy — preventing double-load.
+        let marker_path = vol_path.with_extension("vol.promoted");
+        if marker_path.exists() {
+            return std::fs::read_to_string(&marker_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok());
+        }
+
+        let vol_dir = pm.path().join("volumes");
+        let table_vol_dir = vol_dir.join(table_name);
+
+        if let Err(e) = std::fs::create_dir_all(&table_vol_dir) {
+            eprintln!(
+                "Warning: Failed to create standalone volume dir for {}: {}",
+                table_name, e
+            );
+            return None;
+        }
+
+        let volume_id = crate::storage::volume::io::next_volume_id();
+        let dest_name = format!("vol_{:016x}.vol", volume_id);
+        let dest_path = table_vol_dir.join(&dest_name);
+        let tmp_path = table_vol_dir.join(format!("{}.tmp", dest_name));
+
+        // Use fs::copy for streaming kernel-level copy (no userspace memory spike)
+        if let Err(e) = std::fs::copy(vol_path, &tmp_path) {
+            eprintln!(
+                "Warning: Failed to copy snapshot vol for {}: {}",
+                table_name, e
+            );
+            return None;
+        }
+        // Ensure data is durable before rename, preventing zero-length files after crash
+        if let Err(e) = std::fs::File::open(&tmp_path).and_then(|f| f.sync_all()) {
+            eprintln!(
+                "Warning: Failed to sync standalone volume for {}: {}",
+                table_name, e
+            );
+            let _ = std::fs::remove_file(&tmp_path);
+            return None;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &dest_path) {
+            eprintln!(
+                "Warning: Failed to rename standalone volume for {}: {}",
+                table_name, e
+            );
+            let _ = std::fs::remove_file(&tmp_path);
+            return None;
+        }
+
+        // Write marker with the volume_id so subsequent opens register
+        // with the same segment_id as the standalone copy.
+        // Fsync the marker to prevent re-promotion (and duplicate volumes) after crash.
+        if std::fs::write(&marker_path, volume_id.to_string()).is_ok() {
+            let _ = std::fs::File::open(&marker_path).and_then(|f| f.sync_all());
+        }
+        Some(volume_id)
+    }
+
     /// Replay WAL entries to recover database state starting from a specific LSN
     ///
     /// Uses two-phase recovery to ensure crash consistency:
@@ -946,6 +1268,10 @@ impl MVCCEngine {
                 // This is O(N + M) instead of O(N * M) when populating each index separately
                 self.populate_all_indexes();
 
+                // HNSW indexes need cold segment data too — vector similarity search
+                // cannot fall back to zone maps like other index types.
+                self.populate_hnsw_from_segments();
+
                 Ok(())
             }
             Err(e) => Err(e),
@@ -957,6 +1283,138 @@ impl MVCCEngine {
         let stores = self.version_stores.read().unwrap();
         for store in stores.values() {
             store.populate_all_indexes();
+        }
+    }
+
+    /// Populate HNSW indexes from cold segment data.
+    ///
+    /// After WAL replay + populate_all_indexes(), HNSW indexes only contain hot rows.
+    /// Cold segment rows must also be added because vector similarity search cannot
+    /// fall back to zone maps like B-tree/Hash indexes can.
+    ///
+    /// Uses newest-first volume ordering with row_id dedup so that when the same
+    /// row_id exists in multiple overlapping volumes, only the newest version is
+    /// added to the HNSW graph. Also skips row_ids that are in the hot buffer
+    /// (already indexed by populate_all_indexes).
+    fn populate_hnsw_from_segments(&self) {
+        let stores = self.version_stores.read().unwrap();
+        let mgrs = self.segment_managers.read().unwrap();
+
+        for (table_name, store) in stores.iter() {
+            if let Some(mgr) = mgrs.get(table_name) {
+                if !mgr.has_segments() {
+                    continue;
+                }
+
+                // Collect HNSW index info before iterating volumes
+                let indexes = store.get_all_indexes();
+                let hnsw_infos: Vec<(Vec<usize>, std::sync::Arc<dyn Index>)> = indexes
+                    .iter()
+                    .filter(|idx| idx.index_type() == crate::core::IndexType::Hnsw)
+                    .filter_map(|idx| {
+                        let col_ids = idx.column_ids();
+                        if col_ids.is_empty() {
+                            return None;
+                        }
+                        let col_indices: Vec<usize> =
+                            col_ids.iter().map(|&id| id as usize).collect();
+                        Some((col_indices, std::sync::Arc::clone(idx)))
+                    })
+                    .collect();
+
+                if hnsw_infos.is_empty() {
+                    continue;
+                }
+
+                let tombstones = mgr.tombstone_set_arc();
+                // Use newest-first ordering so overlapping row_ids resolve to newest version
+                let volumes = mgr.get_volumes_newest_first();
+
+                // Seed seen set with hot row_ids (already indexed by populate_all_indexes)
+                let mut seen: rustc_hash::FxHashSet<i64> = store
+                    .get_all_visible_row_ids(INVALID_TRANSACTION_ID + 1)
+                    .into_iter()
+                    .collect();
+
+                // Stream directly from volumes into per-index batches.
+                // Pre-allocate a reusable buffer to avoid per-row Vec allocations.
+                let max_cols = hnsw_infos
+                    .iter()
+                    .map(|(cols, _)| cols.len())
+                    .max()
+                    .unwrap_or(0);
+                let mut batches: Vec<Vec<(i64, Vec<crate::core::Value>)>> =
+                    (0..hnsw_infos.len()).map(|_| Vec::new()).collect();
+                let mut values_buf: Vec<crate::core::Value> = Vec::with_capacity(max_cols);
+
+                const HNSW_FLUSH_THRESHOLD: usize = 8192;
+
+                for (_, vol) in volumes.iter() {
+                    for i in 0..vol.row_count {
+                        let row_id = vol.row_ids[i];
+                        if tombstones.contains_key(&row_id) || !seen.insert(row_id) {
+                            continue;
+                        }
+                        for (batch_idx, (col_indices, _)) in hnsw_infos.iter().enumerate() {
+                            values_buf.clear();
+                            let mut has_null = false;
+                            for &ci in col_indices {
+                                let v = if ci < vol.columns.len() {
+                                    vol.columns[ci].get_value(i)
+                                } else {
+                                    crate::core::Value::Null(crate::core::DataType::Null)
+                                };
+                                if v.is_null() {
+                                    has_null = true;
+                                    break;
+                                }
+                                values_buf.push(v);
+                            }
+                            if !has_null {
+                                // Move ownership instead of cloning to avoid per-row allocation
+                                let owned = std::mem::replace(
+                                    &mut values_buf,
+                                    Vec::with_capacity(max_cols),
+                                );
+                                batches[batch_idx].push((row_id, owned));
+                            }
+                        }
+                    }
+
+                    // Flush large batches to limit peak memory
+                    for (idx, (_, index)) in hnsw_infos.iter().enumerate() {
+                        if batches[idx].len() >= HNSW_FLUSH_THRESHOLD {
+                            let entry_refs: Vec<(i64, &[crate::core::Value])> = batches[idx]
+                                .iter()
+                                .map(|(row_id, values)| (*row_id, values.as_slice()))
+                                .collect();
+                            if let Err(e) = index.add_batch_slice(&entry_refs) {
+                                eprintln!(
+                                    "Warning: HNSW index population failed for {}: {}",
+                                    table_name, e
+                                );
+                            }
+                            batches[idx].clear();
+                        }
+                    }
+                }
+
+                // Flush remaining entries
+                for (idx, (_, index)) in hnsw_infos.iter().enumerate() {
+                    if !batches[idx].is_empty() {
+                        let entry_refs: Vec<(i64, &[crate::core::Value])> = batches[idx]
+                            .iter()
+                            .map(|(row_id, values)| (*row_id, values.as_slice()))
+                            .collect();
+                        if let Err(e) = index.add_batch_slice(&entry_refs) {
+                            eprintln!(
+                                "Warning: HNSW index population failed for {}: {}",
+                                table_name, e
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1049,6 +1507,14 @@ impl MVCCEngine {
                         store.close();
                     }
                 }
+                // Clear segments for dropped table
+                {
+                    let mut mgrs = self.segment_managers.write().unwrap();
+                    if let Some(mgr) = mgrs.get(&table_name) {
+                        mgr.clear();
+                    }
+                    mgrs.remove(&table_name);
+                }
             }
             WALOperationType::CreateIndex => {
                 // Deserialize index metadata
@@ -1124,20 +1590,63 @@ impl MVCCEngine {
                 }
             }
             WALOperationType::Insert | WALOperationType::Update => {
-                // Deserialize row version and apply to version store
+                // Deserialize row version and apply to version store.
                 if let Ok(row_version) = deserialize_row_version(&entry.data) {
                     let table_name = entry.table_name.to_lowercase();
-                    if let Ok(store) = self.get_version_store(&table_name) {
-                        // Apply the version to the store
-                        store.apply_recovered_version(entry.row_id, row_version);
+                    let mgr = self.get_or_create_segment_manager(&table_name);
+                    let in_volume = mgr.is_row_id_in_volume(entry.row_id);
+
+                    if in_volume {
+                        // Row exists in a cold volume. Two cases:
+                        // 1. Sealed INSERT: original data, already in volume → skip
+                        // 2. Post-seal UPDATE: new data supersedes cold → apply + tombstone
+                        //
+                        // Distinguish by checking if the row_id is already tombstoned.
+                        // If tombstoned, a previous WAL entry already marked it as
+                        // superseded (UPDATE or DELETE), so this entry is a later
+                        // version that should be applied. If not tombstoned, this is
+                        // the first (original sealed) INSERT → skip.
+                        //
+                        // ORDERING INVARIANT: commit_all_tables writes tombstone
+                        // DELETE entries BEFORE the corresponding INSERT entries.
+                        // This guarantees `already_tombstoned` is true for post-seal
+                        // UPDATEs (which are recorded as Insert in the WAL).
+                        // The `WALOperationType::Update` arm is a safety net for
+                        // any future code path that records with the Update op type.
+                        let already_tombstoned = mgr.is_tombstoned(entry.row_id);
+
+                        if already_tombstoned || entry.operation == WALOperationType::Update {
+                            // Post-seal change: apply to hot. The hot version
+                            // shadows the cold version via skip set (hot_row_ids
+                            // in the cumulative skip set at scan time). No tombstone
+                            // needed here — the hot version IS the dedup mechanism.
+                            if let Ok(store) = self.get_version_store(&table_name) {
+                                store.apply_recovered_version(entry.row_id, row_version);
+                            }
+                        }
+                        // else: sealed INSERT, volume has authoritative data → skip
+                    } else {
+                        // Row not in any volume: standard hot insert
+                        if let Ok(store) = self.get_version_store(&table_name) {
+                            store.apply_recovered_version(entry.row_id, row_version);
+                        }
                     }
                 }
             }
             WALOperationType::Delete => {
-                // For deletes, we need to mark the row as deleted
+                // For deletes, mark the row as deleted in the hot store.
                 let table_name = entry.table_name.to_lowercase();
                 if let Ok(store) = self.get_version_store(&table_name) {
                     store.mark_deleted(entry.row_id, entry.txn_id);
+                }
+                // If the deleted row_id lives in a cold segment, add a tombstone
+                // so it is excluded from scans and point lookups.
+                let mgr = self.get_or_create_segment_manager(&table_name);
+                if mgr.is_row_id_in_volume(entry.row_id) {
+                    // Recovery tombstones get commit_seq=0, which is always visible
+                    // to all new snapshots (any begin_seq > 0). This is correct:
+                    // these tombstones were committed before the restart.
+                    mgr.add_tombstones(&[entry.row_id], 0);
                 }
             }
             WALOperationType::Commit => {
@@ -1179,6 +1688,21 @@ impl MVCCEngine {
                 let table_name = entry.table_name.to_lowercase();
                 if let Ok(store) = self.get_version_store(&table_name) {
                     let _ = store.truncate_all();
+                }
+                // Clear segments (truncate removes everything)
+                {
+                    let mgrs = self.segment_managers.read().unwrap();
+                    if let Some(mgr) = mgrs.get(&table_name) {
+                        mgr.clear();
+                    }
+                }
+                // Delete standalone volume files from disk
+                if let Some(ref pm) = *self.persistence {
+                    if pm.is_enabled() {
+                        let vol_dir = pm.path().join("volumes");
+                        let _ =
+                            crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_name);
+                    }
                 }
             }
         }
@@ -1457,6 +1981,41 @@ impl MVCCEngine {
 
         // Stop accepting new transactions
         self.registry.stop_accepting_transactions();
+
+        // Run a final checkpoint to seal ALL remaining hot rows into volumes.
+        // Use force_seal=true to bypass thresholds — on close, we want all data
+        // in volumes so startup is fast and doesn't depend on WAL replay.
+        // Skipped when checkpoint_on_close is false (crash simulation in tests).
+        let checkpoint_on_close = self.config.read().unwrap().persistence.checkpoint_on_close;
+        if checkpoint_on_close {
+            if let Some(ref pm) = *self.persistence {
+                if pm.is_enabled() {
+                    // Retry checkpoint until all hot buffers are empty.
+                    // After stop_accepting_transactions(), no new writes can start,
+                    // but in-flight commits may still add rows between seal passes.
+                    // Retry ensures WAL truncation happens and startup is fast.
+                    for attempt in 0..5 {
+                        if let Err(e) = self.checkpoint_cycle_inner(true) {
+                            eprintln!("Warning: final checkpoint during close failed: {}", e);
+                            break;
+                        }
+                        let all_empty = self
+                            .version_stores
+                            .read()
+                            .unwrap()
+                            .values()
+                            .all(|s| s.committed_row_count() == 0);
+                        if all_empty {
+                            break;
+                        }
+                        if attempt < 4 {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                    self.compact_after_checkpoint_forced();
+                }
+            }
+        } // checkpoint_on_close
 
         // Close all version stores
         let stores = self.version_stores.read().unwrap();
@@ -2032,8 +2591,26 @@ impl MVCCEngine {
             }
         }
 
-        // Record DDL to WAL only after successful removal
+        // WAL FIRST: record the drop before deleting segment files.
+        // If crash happens after WAL but before file deletion, WAL replay
+        // will re-execute the drop. Orphan files are harmless.
         self.record_ddl(name, WALOperationType::DropTable, &[])?;
+
+        // Clear in-memory segment state
+        {
+            let mut mgrs = self.segment_managers.write().unwrap();
+            if let Some(mgr) = mgrs.get(&table_name) {
+                mgr.clear();
+            }
+            mgrs.remove(&table_name);
+        }
+        // Delete volume files from disk
+        if let Some(ref pm) = *self.persistence {
+            if pm.is_enabled() {
+                let vol_dir = pm.path().join("volumes");
+                let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_name);
+            }
+        }
 
         // Increment schema epoch for cache invalidation
         self.schema_epoch.fetch_add(1, Ordering::Release);
@@ -2215,6 +2792,380 @@ impl MVCCEngine {
         self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
+    }
+
+    /// Get or create a segment manager for a table.
+    fn get_or_create_segment_manager(
+        &self,
+        table_name: &str,
+    ) -> Arc<crate::storage::volume::manifest::SegmentManager> {
+        // Fast path: read lock (common case during WAL replay — manager already exists)
+        {
+            let mgrs = self.segment_managers.read().unwrap();
+            if let Some(mgr) = mgrs.get(table_name) {
+                return Arc::clone(mgr);
+            }
+        }
+        // Slow path: write lock (first access, creates new manager)
+        let mut mgrs = self.segment_managers.write().unwrap();
+        mgrs.entry(table_name.to_string())
+            .or_insert_with(|| {
+                let vol_dir = self
+                    .persistence
+                    .as_ref()
+                    .as_ref()
+                    .map(|pm| pm.path().join("volumes"));
+                Arc::new(crate::storage::volume::manifest::SegmentManager::new(
+                    table_name, vol_dir,
+                ))
+            })
+            .clone()
+    }
+
+    /// Clean up stale .dv files from disk left over by previous versions.
+    /// In the new design, delete vectors are no longer used. Hot versions
+    /// shadow cold versions via skip sets at scan time.
+    fn cleanup_stale_dv_files(&self) {
+        let pm = match self.persistence.as_ref() {
+            Some(pm) if pm.is_enabled() => pm,
+            _ => return,
+        };
+
+        let vol_dir = pm.path().join("volumes");
+
+        // Collect table names under read lock, then process without holding it
+        let table_names: Vec<String> = {
+            let mgrs = self.segment_managers.read().unwrap();
+            mgrs.keys().cloned().collect()
+        };
+
+        for table_name in &table_names {
+            let table_dir = vol_dir.join(table_name);
+            if let Ok(entries) = std::fs::read_dir(&table_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("dv") {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Register a frozen volume into a table's segment manager.
+    /// Uses a fresh auto-assigned segment ID.
+    fn register_volume(
+        &self,
+        table_name: &str,
+        volume: Arc<crate::storage::volume::writer::FrozenVolume>,
+    ) {
+        let mgr = self.get_or_create_segment_manager(table_name);
+        let seg_id = mgr.manifest_mut().allocate_segment_id();
+        self.register_volume_with_id(table_name, volume, seg_id);
+    }
+
+    /// Register a frozen volume with a specific segment ID.
+    /// Used during startup to restore stable IDs from volume filenames,
+    /// ensuring .dv files match their segments across restarts.
+    fn register_volume_with_id(
+        &self,
+        table_name: &str,
+        volume: Arc<crate::storage::volume::writer::FrozenVolume>,
+        seg_id: u64,
+    ) {
+        use crate::storage::volume::manifest::SegmentMeta;
+        let mgr = self.get_or_create_segment_manager(table_name);
+        let min_id = volume.row_ids.first().copied().unwrap_or(0);
+        let max_id = volume.row_ids.last().copied().unwrap_or(0);
+        let row_count = volume.row_count;
+        mgr.register_segment(
+            seg_id,
+            volume,
+            SegmentMeta {
+                segment_id: seg_id,
+                file_path: std::path::PathBuf::new(),
+                row_count,
+                min_row_id: min_id,
+                max_row_id: max_id,
+                creation_lsn: 0,
+            },
+        );
+    }
+
+    /// Load manifests from the volumes/ directory for checkpoint-to-volume recovery.
+    ///
+    /// This is called during startup when no snapshot files exist but volumes/ has
+    /// manifest.bin files from a previous checkpoint cycle. Loads manifest metadata
+    /// (segment list, tombstones, checkpoint_lsn) into segment managers so that:
+    /// - WAL replay can check `is_row_id_in_volume_range()` for tombstone creation
+    /// - The minimum checkpoint_lsn determines where WAL replay starts
+    ///
+    /// Returns the minimum checkpoint_lsn across all loaded manifests (0 if none found).
+    /// Actual .vol files are loaded later by `load_standalone_volumes()` after WAL replay
+    /// creates the required schemas and version stores.
+    fn load_manifests_from_volumes(&self) -> u64 {
+        let pm = match self.persistence.as_ref() {
+            Some(pm) if pm.is_enabled() => pm,
+            _ => return 0,
+        };
+
+        let vol_dir = pm.path().join("volumes");
+        if !vol_dir.exists() {
+            return 0;
+        }
+
+        let entries = match std::fs::read_dir(&vol_dir) {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+
+        let mut min_checkpoint_lsn: u64 = u64::MAX;
+        let mut any_loaded = false;
+
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+
+            let table_name = entry.file_name().to_string_lossy().to_lowercase();
+
+            // Try to load manifest from this table directory
+            match crate::storage::volume::manifest::SegmentManager::load_from_disk(
+                &table_name,
+                &vol_dir,
+            ) {
+                Ok(Some(mgr)) => {
+                    let lsn = mgr.manifest().checkpoint_lsn;
+                    if lsn > 0 && lsn < min_checkpoint_lsn {
+                        min_checkpoint_lsn = lsn;
+                    }
+                    any_loaded = true;
+
+                    // Store the segment manager so WAL replay can use
+                    // is_row_id_in_volume_range() for tombstone creation.
+                    let mut mgrs = self.segment_managers.write().unwrap();
+                    mgrs.insert(table_name, Arc::new(mgr));
+                }
+                Ok(None) => {
+                    // No manifest.bin in this directory, skip
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to load manifest for {}: {}", table_name, e);
+                }
+            }
+        }
+
+        if !any_loaded {
+            // No manifests found, remove checkpoint.meta if present
+            // to ensure full WAL replay
+            let checkpoint_path = pm.path().join("wal").join("checkpoint.meta");
+            let _ = std::fs::remove_file(checkpoint_path);
+            return 0;
+        }
+
+        if min_checkpoint_lsn == u64::MAX {
+            0
+        } else {
+            min_checkpoint_lsn
+        }
+    }
+
+    /// Load standalone volumes from the volumes/ directory.
+    ///
+    /// These are created by seal_hot_buffers and compact_volumes during runtime.
+    /// They supplement the snapshot-adjacent .vol files loaded during load_snapshots.
+    fn load_standalone_volumes(&self) {
+        let pm = match self.persistence.as_ref() {
+            Some(pm) if pm.is_enabled() => pm,
+            _ => return,
+        };
+
+        let vol_dir = pm.path().join("volumes");
+        if !vol_dir.exists() {
+            return;
+        }
+
+        let entries = match std::fs::read_dir(&vol_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+
+            let table_name = entry.file_name().to_string_lossy().to_lowercase();
+
+            {
+                let schemas = self.schemas.read().unwrap();
+                if !schemas.contains_key(&table_name) {
+                    continue;
+                }
+            }
+
+            let paths = crate::storage::volume::io::list_volumes(&vol_dir, &table_name);
+            if paths.is_empty() {
+                continue;
+            }
+
+            let mut standalone: Vec<(u64, Arc<crate::storage::volume::writer::FrozenVolume>)> =
+                Vec::new();
+
+            for path in paths {
+                let volume_id = parse_volume_id(&path);
+                let volume = match crate::storage::volume::io::read_volume_from_disk(&path) {
+                    Ok(volume) => Arc::new(volume),
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to read volume {:?}: {}. Skipping file.",
+                            path, e
+                        );
+                        continue;
+                    }
+                };
+
+                let stable_id = volume_id.unwrap_or(0);
+                standalone.push((stable_id, volume));
+            }
+
+            if standalone.is_empty() {
+                continue;
+            }
+
+            // Load volumes that are listed in the manifest. Orphan files
+            // (not in manifest) are cleaned up.
+            let mgr = self.get_or_create_segment_manager(&table_name);
+            for (stable_id, vol) in standalone {
+                if stable_id > 0 {
+                    if mgr.has_segment(stable_id) {
+                        continue;
+                    }
+                    // Only load if manifest lists this segment_id.
+                    if !mgr.load_volume_for_existing_segment(stable_id, Arc::clone(&vol)) {
+                        // Orphan — not in manifest. Skip (file cleanup handled elsewhere).
+                    }
+                }
+                // Volumes without parseable IDs are orphans — skip.
+            }
+        }
+    }
+
+    /// Load standalone volumes without requiring schemas to exist.
+    ///
+    /// Used during the new volume-only recovery path where volumes are loaded
+    /// BEFORE WAL replay (which creates schemas). Volumes carry their own schema
+    /// in the file format, so no external schema lookup is needed.
+    fn load_standalone_volumes_no_schema_check(&self) {
+        let pm = match self.persistence.as_ref() {
+            Some(pm) if pm.is_enabled() => pm,
+            _ => return,
+        };
+
+        let vol_dir = pm.path().join("volumes");
+        if !vol_dir.exists() {
+            return;
+        }
+
+        let entries = match std::fs::read_dir(&vol_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+
+            let table_name = entry.file_name().to_string_lossy().to_lowercase();
+
+            let paths = crate::storage::volume::io::list_volumes(&vol_dir, &table_name);
+            if paths.is_empty() {
+                continue;
+            }
+
+            let mgr = self.get_or_create_segment_manager(&table_name);
+            for path in paths {
+                let volume_id = parse_volume_id(&path);
+                let stable_id = volume_id.unwrap_or(0);
+
+                // Check manifest membership BEFORE expensive disk I/O.
+                // Orphan .vol files (from compaction or crash) are cleaned up
+                // without being deserialized.
+                if stable_id == 0 {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if mgr.has_segment(stable_id) {
+                    continue;
+                }
+                if !mgr.manifest_has_segment(stable_id) {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+
+                // Segment is in manifest but not yet loaded — read from disk.
+                let volume = match crate::storage::volume::io::read_volume_from_disk(&path) {
+                    Ok(volume) => Arc::new(volume),
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to read volume {:?}: {}. Skipping file.",
+                            path, e
+                        );
+                        continue;
+                    }
+                };
+                mgr.load_volume_for_existing_segment(stable_id, volume);
+            }
+        }
+    }
+
+    /// Sync auto-increment counters from segment data.
+    ///
+    /// After WAL replay, ensure auto-increment counters account for
+    /// the max row_id in segments (which may be higher than hot buffer).
+    /// Normal secondary indexes are NOT populated from cold data.
+    /// HNSW is the one cold index that needs explicit graph rebuild.
+    fn sync_auto_increment_from_segments(&self) {
+        // Collect segment data under segment_managers lock, then drop it
+        // before acquiring version_stores lock to avoid multi-lock deadlock.
+        let segment_data: Vec<(String, i64)> = {
+            let mgrs = self.segment_managers.read().unwrap();
+            if mgrs.is_empty() {
+                return;
+            }
+            mgrs.iter()
+                .filter_map(|(table_name, mgr)| {
+                    let segments = mgr.get_segments_ordered();
+                    let mut max_vol_row_id: i64 = 0;
+                    for vol in &segments {
+                        // Row IDs are sorted (from B-tree iteration during seal).
+                        // Use last() for O(1) instead of iterating all row_ids.
+                        if let Some(&last_id) = vol.row_ids.last() {
+                            if last_id > max_vol_row_id {
+                                max_vol_row_id = last_id;
+                            }
+                        }
+                    }
+                    if max_vol_row_id > 0 {
+                        Some((table_name.clone(), max_vol_row_id))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        if segment_data.is_empty() {
+            return;
+        }
+
+        let stores = self.version_stores.read().unwrap();
+        for (table_name, max_vol_row_id) in &segment_data {
+            if let Some(store) = stores.get(table_name) {
+                store.set_auto_increment_counter(*max_vol_row_id);
+            }
+        }
     }
 
     /// Drops a column from a table
@@ -2476,7 +3427,70 @@ impl MVCCEngine {
                     schema.table_name = new_name.to_string();
                     schema.table_name_lower = new_name_lower.clone();
                 }
-                stores.insert(new_name_lower, store);
+                stores.insert(new_name_lower.clone(), store);
+            }
+        }
+
+        // Move segment manager to new name and update its manifest table_name
+        // (persist() uses manifest.table_name for the on-disk directory)
+        {
+            let mut mgrs = self.segment_managers.write().unwrap();
+            if let Some(mgr) = mgrs.remove(&old_name_lower) {
+                mgr.manifest_mut().table_name =
+                    crate::common::SmartString::from(new_name_lower.as_str());
+                mgrs.insert(new_name_lower.clone(), mgr);
+            }
+        }
+        // Rename on-disk volume directory and tombstones so they survive restart
+        if let Some(ref pm) = *self.persistence {
+            if pm.is_enabled() {
+                let vol_dir = pm.path().join("volumes");
+                let old_dir = vol_dir.join(&old_name_lower);
+                let new_dir = vol_dir.join(&new_name_lower);
+                if old_dir.exists() {
+                    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                        // Revert in-memory segment manager rename on disk failure
+                        let mut mgrs = self.segment_managers.write().unwrap();
+                        if let Some(mgr) = mgrs.remove(&new_name_lower) {
+                            mgr.manifest_mut().table_name =
+                                crate::common::SmartString::from(old_name_lower.as_str());
+                            mgrs.insert(old_name_lower.clone(), mgr);
+                        }
+                        drop(mgrs);
+                        // Revert version stores
+                        let mut stores = self.version_stores.write().unwrap();
+                        if let Some(store) = stores.remove(&new_name_lower) {
+                            {
+                                let mut vs_schema_guard = store.schema_mut();
+                                let schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                                schema.table_name = old_name.to_string();
+                                schema.table_name_lower = old_name_lower.clone();
+                            }
+                            stores.insert(old_name_lower.clone(), store);
+                        }
+                        drop(stores);
+                        // Revert schemas
+                        let mut schemas = self.schemas.write().unwrap();
+                        if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
+                            let schema = CompactArc::make_mut(&mut schema_arc);
+                            schema.table_name = old_name.to_string();
+                            schema.table_name_lower = old_name_lower.clone();
+                            schemas.insert(old_name_lower, schema_arc);
+                        }
+                        drop(schemas);
+                        return Err(Error::Internal {
+                            message: format!("Failed to rename volume directory: {}", e),
+                        });
+                    }
+                }
+                let snap_dir = pm.path().join("snapshots");
+                let old_ts = snap_dir.join(&old_name_lower).join("tombstones.dat");
+                let new_ts_dir = snap_dir.join(&new_name_lower);
+                let new_ts = new_ts_dir.join("tombstones.dat");
+                if old_ts.exists() {
+                    let _ = std::fs::create_dir_all(&new_ts_dir);
+                    let _ = std::fs::rename(&old_ts, &new_ts);
+                }
             }
         }
 
@@ -2638,6 +3652,1841 @@ impl MVCCEngine {
         let views = self.views.read().unwrap();
         Ok(views.values().map(|v| v.original_name.clone()).collect())
     }
+
+    /// No-op: in the new tombstone design, deduplication is handled at scan
+    /// time via skip sets. Newer volumes shadow older volumes by row_id.
+    /// Returns 0 (no explicit dedup performed).
+    fn dedup_segments(&self) -> usize {
+        0
+    }
+
+    /// Creates a full backup snapshot of all tables to .bin files.
+    ///
+    /// Writes all committed data (hot buffer + cold volumes) to snapshot .bin files
+    /// in the snapshots/ directory. Each table gets its own subdirectory with
+    /// timestamped snapshot files. The keep_snapshots config limits how many backup
+    /// files are retained per table.
+    fn create_backup_snapshot(&self) -> Result<()> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+
+        let pm = match self.persistence.as_ref() {
+            Some(pm) if pm.is_enabled() => pm,
+            _ => return Ok(()),
+        };
+
+        let snapshot_dir = pm.path().join("snapshots");
+        if let Err(e) = std::fs::create_dir_all(&snapshot_dir) {
+            return Err(Error::internal(format!(
+                "failed to create snapshot directory: {}",
+                e
+            )));
+        }
+
+        // Hold checkpoint_mutex for the entire snapshot operation.
+        // This prevents concurrent seal/compact from mutating cold state
+        // (volumes, tombstones) while we read it, ensuring the backup is
+        // a true point-in-time snapshot consistent with snapshot_commit_seq.
+        let _checkpoint_guard = self.checkpoint_mutex.lock().unwrap();
+
+        // Wait for all in-flight commits to complete before capturing state.
+        // The commit path is: start_commit (alloc seq) → commit_all_tables
+        // (apply versions + tombstones) → complete_commit (make visible).
+        // Between start_commit and complete_commit, tombstones can be in the
+        // shared set while hot versions are invisible. If we capture state in
+        // that window, a cold row can be hidden by a tombstone whose txn is
+        // excluded from the hot export. By waiting, we guarantee the tombstone
+        // set and registry are fully consistent: every tombstone corresponds
+        // to a visible commit, and the cutoff includes all of them.
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if self.registry.safe_snapshot_cutoff() == self.registry.current_commit_sequence() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(crate::core::Error::internal(
+                        "PRAGMA SNAPSHOT timed out waiting for in-flight commits to complete",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+        }
+
+        // No in-flight commits at this point. Capture tombstones FIRST, then
+        // cutoff. The commit path ordering is: start_commit (alloc seq) →
+        // commit_all_tables (apply tombstones). So any tombstone in the shared
+        // set was placed by a txn whose seq was already incremented. Our
+        // subsequent current_commit_sequence() read will be ≥ that seq,
+        // guaranteeing every frozen tombstone is within the cutoff.
+        //
+        // A new commit starting after our tombstone read but before our cutoff
+        // read can only ADD to the cutoff (making it higher), never subtract.
+        // Its tombstones won't be in our frozen set (captured before it started).
+        let frozen_tombstones: ahash::AHashMap<String, Arc<FxHashMap<i64, u64>>> = {
+            let mgrs = self.segment_managers.read().unwrap();
+            mgrs.iter()
+                .map(|(name, mgr)| (name.clone(), mgr.tombstone_set_arc()))
+                .collect()
+        };
+
+        let snapshot_commit_seq = self.registry.current_commit_sequence();
+
+        let schemas = self.schemas.read().unwrap();
+        let stores = self.version_stores.read().unwrap();
+
+        // Generate consistent timestamp for all snapshots in this batch
+        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f").to_string();
+
+        // Phase 1: Write all snapshots to temp files
+        let mut pending_snapshots: Vec<(std::path::PathBuf, std::path::PathBuf, String)> =
+            Vec::new();
+        let mut all_succeeded = true;
+
+        for (table_name, schema) in schemas.iter() {
+            let table_snapshot_dir = snapshot_dir.join(table_name);
+            if let Err(e) = std::fs::create_dir_all(&table_snapshot_dir) {
+                eprintln!(
+                    "Warning: Failed to create snapshot directory for {}: {}",
+                    table_name, e
+                );
+                all_succeeded = false;
+                break;
+            }
+
+            let final_path = table_snapshot_dir.join(format!("snapshot-{}.bin", timestamp));
+            let temp_path = table_snapshot_dir.join(format!("snapshot-{}.bin.tmp", timestamp));
+
+            let mut writer = match super::snapshot::SnapshotWriter::new(&temp_path) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to create snapshot writer for {}: {}",
+                        table_name, e
+                    );
+                    all_succeeded = false;
+                    break;
+                }
+            };
+
+            if let Err(e) = writer.write_schema(schema) {
+                eprintln!("Warning: Failed to write schema for {}: {}", table_name, e);
+                writer.fail();
+                all_succeeded = false;
+                break;
+            }
+
+            let mut write_error = false;
+
+            // Snapshot-consistent skip set: hot row_ids committed at or before
+            // snapshot_commit_seq. Built during the hot-row write pass below to
+            // avoid a redundant second B-tree traversal.
+            let mut seen = FxHashSet::default();
+
+            // Write hot committed rows (single pass: write + collect row_ids)
+            if let Some(store) = stores.get(table_name) {
+                seen.reserve(store.committed_row_count());
+                store.for_each_committed_version_with_cutoff(
+                    |row_id, version| {
+                        seen.insert(row_id);
+                        let mut snapshot_version = version.clone();
+                        snapshot_version.txn_id = -1;
+                        if let Err(e) = writer.append_row(row_id, &snapshot_version) {
+                            eprintln!(
+                                "Warning: Failed to write hot row {} to snapshot: {}",
+                                row_id, e
+                            );
+                            write_error = true;
+                            return false;
+                        }
+                        true
+                    },
+                    snapshot_commit_seq,
+                );
+            }
+
+            if write_error {
+                writer.fail();
+                all_succeeded = false;
+                break;
+            }
+
+            // Write cold volume rows (skip rows already written from hot buffer)
+            let mgr = {
+                let mgrs = self.segment_managers.read().unwrap();
+                mgrs.get(table_name).cloned()
+            };
+
+            if let Some(mgr) = mgr {
+                let volumes = mgr.get_volumes_newest_first();
+
+                // Use the frozen tombstone snapshot captured immediately after
+                // commit_seq. The commit path increments seq BEFORE applying
+                // tombstones, so every tombstone in this set was committed at
+                // seq ≤ snapshot_commit_seq. No post-cutoff tombstones can leak.
+                let tombstones = frozen_tombstones
+                    .get(table_name)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let schema_cols = schema.columns.len();
+
+                for (_seg_id, vol) in volumes.iter() {
+                    let needs_normalize = vol.column_names.len() != schema_cols
+                        || vol
+                            .column_names
+                            .iter()
+                            .zip(schema.columns.iter())
+                            .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
+
+                    for i in 0..vol.row_count {
+                        let row_id = vol.row_ids[i];
+
+                        // Skip tombstoned rows not already in hot snapshot.
+                        // For int-PK tables, pre-cutoff deletes are in `seen`.
+                        // For non-int-PK tables, tombstones are the only signal.
+                        if tombstones.contains_key(&row_id) && !seen.contains(&row_id) {
+                            continue;
+                        }
+                        // Skip rows already written from hot (cutoff-consistent)
+                        // or already seen from a newer volume (dedup).
+                        if !seen.insert(row_id) {
+                            continue;
+                        }
+
+                        let mut row = if needs_normalize {
+                            vol.get_row_normalized(i, schema)
+                        } else {
+                            vol.get_row(i)
+                        };
+
+                        if row.len() < schema_cols {
+                            for ci in row.len()..schema_cols {
+                                let col = &schema.columns[ci];
+                                if let Some(ref default_val) = col.default_value {
+                                    row.push(default_val.clone());
+                                } else {
+                                    row.push(crate::core::Value::null(col.data_type));
+                                }
+                            }
+                        }
+
+                        let snapshot_version = super::version_store::RowVersion {
+                            txn_id: -1,
+                            deleted_at_txn_id: 0,
+                            data: row,
+                            create_time: 0,
+                        };
+
+                        if let Err(e) = writer.append_row(row_id, &snapshot_version) {
+                            eprintln!(
+                                "Warning: Failed to write cold row {} to snapshot: {}",
+                                row_id, e
+                            );
+                            write_error = true;
+                            break;
+                        }
+                    }
+
+                    if write_error {
+                        break;
+                    }
+                }
+            }
+
+            if write_error {
+                writer.fail();
+                all_succeeded = false;
+                break;
+            }
+
+            if let Err(e) = writer.finalize() {
+                eprintln!(
+                    "Warning: Failed to finalize snapshot for {}: {}",
+                    table_name, e
+                );
+                writer.fail();
+                all_succeeded = false;
+                break;
+            }
+
+            pending_snapshots.push((temp_path, final_path, table_name.clone()));
+        }
+
+        // Phase 2: Atomic rename of all temp files
+        let mut renamed_successfully: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+
+        if all_succeeded {
+            let mut dirs_to_sync: FxHashSet<std::path::PathBuf> = FxHashSet::default();
+
+            for (temp_path, final_path, table_name) in &pending_snapshots {
+                if let Err(e) = std::fs::rename(temp_path, final_path) {
+                    eprintln!(
+                        "Warning: Failed to rename snapshot for {}: {}",
+                        table_name, e
+                    );
+                    for (orig_temp, renamed_final) in renamed_successfully.iter().rev() {
+                        if let Err(rollback_err) = std::fs::rename(renamed_final, orig_temp) {
+                            eprintln!(
+                                "Critical: Failed to rollback snapshot rename {:?} -> {:?}: {}",
+                                renamed_final, orig_temp, rollback_err
+                            );
+                        }
+                    }
+                    all_succeeded = false;
+                    break;
+                }
+                renamed_successfully.push((temp_path.clone(), final_path.clone()));
+                if let Some(parent) = final_path.parent() {
+                    dirs_to_sync.insert(parent.to_path_buf());
+                }
+            }
+
+            if all_succeeded {
+                for dir in &dirs_to_sync {
+                    if let Ok(dir_file) = std::fs::File::open(dir) {
+                        let _ = dir_file.sync_all();
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Cleanup on failure
+        if !all_succeeded {
+            for (temp_path, _, _) in &pending_snapshots {
+                let _ = std::fs::remove_file(temp_path);
+            }
+            return Err(Error::internal(
+                "snapshot creation failed, all temp files cleaned up",
+            ));
+        }
+
+        // Phase 4: Write snapshot metadata
+        let meta_path = snapshot_dir.join("snapshot_meta.bin");
+        if let Err(e) = write_snapshot_metadata(&meta_path, 0) {
+            eprintln!("Warning: Failed to write snapshot metadata: {}", e);
+        }
+
+        // Phase 4b: Save index and view definitions so --restore can recreate them.
+        // Snapshot .bin files only contain row data + schema, not DDL objects.
+        {
+            let mut ddl_buf: Vec<u8> = Vec::new();
+            // Magic + version
+            ddl_buf.extend_from_slice(b"SDDL");
+            ddl_buf.push(1); // version
+
+            // Collect indexes
+            let mut index_entries: Vec<Vec<u8>> = Vec::new();
+            for (table_name, store) in stores.iter() {
+                let _ = store.for_each_index(|index| {
+                    if index.index_type() == crate::core::IndexType::PrimaryKey {
+                        return Ok(());
+                    }
+                    let meta = super::persistence::IndexMetadata {
+                        name: index.name().to_string(),
+                        table_name: table_name.clone(),
+                        column_names: index.column_names().to_vec(),
+                        column_ids: index.column_ids().to_vec(),
+                        data_types: index.data_types().to_vec(),
+                        is_unique: index.is_unique(),
+                        index_type: index.index_type(),
+                        hnsw_m: index.hnsw_m(),
+                        hnsw_ef_construction: index.hnsw_ef_construction(),
+                        hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
+                        hnsw_distance_metric: index.hnsw_distance_metric(),
+                    };
+                    index_entries.push(meta.serialize());
+                    Ok(())
+                });
+            }
+            ddl_buf.extend_from_slice(&(index_entries.len() as u32).to_le_bytes());
+            for entry in &index_entries {
+                ddl_buf.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+                ddl_buf.extend_from_slice(entry);
+            }
+
+            // Collect views
+            let view_entries: Vec<Vec<u8>> = {
+                let views = self.views.read().unwrap();
+                views.values().map(|v| v.serialize()).collect()
+            };
+            ddl_buf.extend_from_slice(&(view_entries.len() as u32).to_le_bytes());
+            for entry in &view_entries {
+                ddl_buf.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+                ddl_buf.extend_from_slice(entry);
+            }
+
+            // Append CRC32 checksum of the entire buffer
+            let crc = crc32fast::hash(&ddl_buf);
+            ddl_buf.extend_from_slice(&crc.to_le_bytes());
+
+            // Write per-timestamp DDL file so timestamped restores get the correct
+            // indexes/views that existed at that snapshot point.
+            let ddl_path = snapshot_dir.join(format!("ddl-{}.bin", timestamp));
+            let ddl_tmp = snapshot_dir.join(format!("ddl-{}.bin.tmp", timestamp));
+            let ddl_result = (|| -> std::io::Result<()> {
+                std::fs::write(&ddl_tmp, &ddl_buf)?;
+                std::fs::File::open(&ddl_tmp)?.sync_all()?;
+                std::fs::rename(&ddl_tmp, &ddl_path)?;
+                if let Ok(dir) = std::fs::File::open(&snapshot_dir) {
+                    let _ = dir.sync_all();
+                }
+                Ok(())
+            })();
+            if let Err(e) = ddl_result {
+                eprintln!("Warning: Failed to write DDL metadata: {}", e);
+                let _ = std::fs::remove_file(&ddl_tmp);
+            }
+
+            // Write per-batch manifest listing all tables in this snapshot.
+            // Used by CLI restore to select a complete, coherent snapshot set
+            // instead of guessing from individual table directories.
+            let manifest_path = snapshot_dir.join(format!("manifest-{}.json", timestamp));
+            let manifest_tmp = snapshot_dir.join(format!("manifest-{}.json.tmp", timestamp));
+            let table_list: Vec<&str> = pending_snapshots
+                .iter()
+                .map(|(_, _, name)| name.as_str())
+                .collect();
+            let manifest_json = format!(
+                "{{\"timestamp\":\"{}\",\"tables\":[{}]}}",
+                timestamp,
+                table_list
+                    .iter()
+                    .map(|t| format!("\"{}\"", t))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let manifest_result = (|| -> std::io::Result<()> {
+                std::fs::write(&manifest_tmp, manifest_json.as_bytes())?;
+                std::fs::File::open(&manifest_tmp)?.sync_all()?;
+                std::fs::rename(&manifest_tmp, &manifest_path)?;
+                Ok(())
+            })();
+            if let Err(e) = manifest_result {
+                eprintln!("Warning: Failed to write snapshot manifest: {}", e);
+                let _ = std::fs::remove_file(&manifest_tmp);
+            }
+        }
+
+        // Phase 5: Cleanup old snapshots (read from live config, not immutable PM)
+        let keep_snapshots = self
+            .config
+            .read()
+            .unwrap()
+            .persistence
+            .keep_snapshots
+            .max(1) as usize;
+        for (_, _, table_name) in &pending_snapshots {
+            if let Some(schema) = schemas.get(table_name) {
+                let disk_store =
+                    super::snapshot::DiskVersionStore::new(&snapshot_dir, table_name, schema);
+                if let Ok(disk_store) = disk_store {
+                    if let Err(e) = disk_store.cleanup_old_snapshots(keep_snapshots) {
+                        eprintln!(
+                            "Warning: Failed to cleanup old snapshots for {}: {}",
+                            table_name, e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Snapshot directories for dropped tables are intentionally preserved.
+        // Deleting them would make point-in-time restore unable to reconstruct
+        // the database state from before the table was dropped.
+
+        // Phase 6: Cleanup old ddl-*.bin files to match keep_snapshots limit.
+        // Each snapshot writes a ddl-{timestamp}.bin; without cleanup these grow unbounded.
+        {
+            let mut ddl_files: Vec<std::path::PathBuf> = std::fs::read_dir(&snapshot_dir)
+                .ok()
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|n| n.starts_with("ddl-") && n.ends_with(".bin"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ddl_files.len() > keep_snapshots {
+                ddl_files.sort();
+                for old_ddl in &ddl_files[..ddl_files.len() - keep_snapshots] {
+                    let _ = std::fs::remove_file(old_ddl);
+                }
+            }
+        }
+
+        // Cleanup old manifest-*.json files to match keep_snapshots limit.
+        {
+            let mut manifest_files: Vec<std::path::PathBuf> = std::fs::read_dir(&snapshot_dir)
+                .ok()
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|n| n.starts_with("manifest-") && n.ends_with(".json"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if manifest_files.len() > keep_snapshots {
+                manifest_files.sort();
+                for old_m in &manifest_files[..manifest_files.len() - keep_snapshots] {
+                    let _ = std::fs::remove_file(old_m);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Restore the database state from backup snapshots.
+    /// If timestamp is None, restores from the latest valid snapshot per table.
+    /// If timestamp is Some("YYYYMMDD-HHMMSS.fff"), restores from that specific snapshot.
+    ///
+    /// This is a destructive operation: all current data (hot buffer + volumes) is
+    /// Restore indexes and views from a ddl.bin file saved by PRAGMA SNAPSHOT.
+    /// Format: "SDDL" (4) + version (1) + index_count (u32) + entries + view_count (u32) + entries
+    fn restore_ddl_from_bin(&self, data: &[u8]) {
+        // Minimum: magic(4) + version(1) + crc(4)
+        if data.len() < 9 || &data[0..4] != b"SDDL" {
+            return;
+        }
+
+        // Verify CRC32: last 4 bytes are checksum of everything before
+        let payload = &data[..data.len() - 4];
+        let stored_crc = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+        let computed_crc = crc32fast::hash(payload);
+        if stored_crc != computed_crc {
+            eprintln!("Warning: ddl.bin CRC mismatch, skipping DDL restore");
+            return;
+        }
+
+        let mut pos = 5; // skip magic + version
+
+        // Read indexes
+        if pos + 4 > data.len() {
+            return;
+        }
+        let index_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        let stores = self.version_stores.read().unwrap();
+        for _ in 0..index_count {
+            if pos + 4 > data.len() {
+                break;
+            }
+            let entry_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + entry_len > data.len() {
+                break;
+            }
+            let entry_data = &data[pos..pos + entry_len];
+            pos += entry_len;
+
+            if let Ok(meta) = super::persistence::IndexMetadata::deserialize(entry_data) {
+                let table_lower = meta.table_name.to_lowercase();
+                if let Some(store) = stores.get(&table_lower) {
+                    if let Err(e) = store.create_index_from_metadata_with_graph(&meta, false, None)
+                    {
+                        eprintln!(
+                            "Warning: Failed to recreate index '{}' on '{}': {}",
+                            meta.name, meta.table_name, e
+                        );
+                    }
+                }
+            }
+        }
+        drop(stores);
+
+        // Read views
+        if pos + 4 > data.len() {
+            return;
+        }
+        let view_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        for _ in 0..view_count {
+            if pos + 4 > data.len() {
+                break;
+            }
+            let entry_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + entry_len > data.len() {
+                break;
+            }
+            let entry_data = &data[pos..pos + entry_len];
+            pos += entry_len;
+
+            // ViewDefinition format: name_len(u16) + name + query_len(u32) + query
+            let mut vpos = 0;
+            if vpos + 2 > entry_data.len() {
+                continue;
+            }
+            let name_len =
+                u16::from_le_bytes(entry_data[vpos..vpos + 2].try_into().unwrap()) as usize;
+            vpos += 2;
+            if vpos + name_len > entry_data.len() {
+                continue;
+            }
+            let view_name = String::from_utf8_lossy(&entry_data[vpos..vpos + name_len]).to_string();
+            vpos += name_len;
+            if vpos + 4 > entry_data.len() {
+                continue;
+            }
+            let query_len =
+                u32::from_le_bytes(entry_data[vpos..vpos + 4].try_into().unwrap()) as usize;
+            vpos += 4;
+            if vpos + query_len > entry_data.len() {
+                continue;
+            }
+            let query = String::from_utf8_lossy(&entry_data[vpos..vpos + query_len]).to_string();
+
+            let view_def = Arc::new(ViewDefinition::new(&view_name, query));
+            self.views
+                .write()
+                .unwrap()
+                .insert(view_name.to_lowercase(), view_def);
+        }
+    }
+
+    /// Restore the database from a backup snapshot, replacing all current data.
+    fn restore_from_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+
+        let pm = match self.persistence.as_ref() {
+            Some(pm) if pm.is_enabled() => pm,
+            _ => {
+                return Err(Error::internal(
+                    "PRAGMA RESTORE requires a persistent database",
+                ))
+            }
+        };
+
+        let snapshot_dir = pm.path().join("snapshots");
+        if !snapshot_dir.exists() {
+            return Err(Error::internal("No snapshots directory found"));
+        }
+
+        // Acquire checkpoint_mutex to prevent concurrent seal/compact/snapshot
+        let _checkpoint_guard = self.checkpoint_mutex.lock().unwrap();
+
+        // Stop accepting new transactions and wait for active ones to drain
+        self.registry.stop_accepting_transactions();
+        let remaining = self
+            .registry
+            .wait_for_active_transactions(std::time::Duration::from_secs(5));
+        if remaining > 0 {
+            self.registry.start_accepting_transactions();
+            return Err(Error::internal(format!(
+                "Cannot restore: {} active transactions still running",
+                remaining
+            )));
+        }
+
+        // Find matching snapshot files per table
+        let mut snapshot_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let table_dirs = match std::fs::read_dir(&snapshot_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                self.registry.start_accepting_transactions();
+                return Err(Error::internal(format!(
+                    "Cannot read snapshots directory: {}",
+                    e
+                )));
+            }
+        };
+
+        for entry in table_dirs.flatten() {
+            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let table_name = entry.file_name().to_string_lossy().to_string();
+            let paths = Self::find_snapshots_newest_first(&entry.path());
+
+            if let Some(ts) = timestamp {
+                let target = format!("snapshot-{}.bin", ts);
+                if let Some(path) = paths
+                    .iter()
+                    .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(target.as_str()))
+                {
+                    snapshot_files.push((table_name, path.clone()));
+                }
+            } else if let Some(path) = paths.first() {
+                snapshot_files.push((table_name, path.clone()));
+            }
+        }
+
+        if snapshot_files.is_empty() {
+            self.registry.start_accepting_transactions();
+            return Err(Error::internal("No matching snapshots found"));
+        }
+
+        // Pre-validate: open all readers AND companion .vol files to catch corruption
+        // before the destructive step. Without this, a corrupt .vol would fail after
+        // WAL/volumes are already deleted, causing total data loss.
+        for (table_name, path) in &snapshot_files {
+            if let Err(e) = super::snapshot::SnapshotReader::open(path) {
+                self.registry.start_accepting_transactions();
+                return Err(Error::internal(format!(
+                    "Snapshot validation failed for table {}: {}",
+                    table_name, e
+                )));
+            }
+            // Also validate companion .vol if it exists (will be used by load_table_snapshot_as_volume)
+            let vol_path = path.with_extension("vol");
+            if vol_path.exists() {
+                match std::fs::read(&vol_path) {
+                    Ok(data) => {
+                        if let Err(e) = crate::storage::volume::format::deserialize_volume(&data) {
+                            self.registry.start_accepting_transactions();
+                            return Err(Error::internal(format!(
+                                "Snapshot volume validation failed for table {}: {}",
+                                table_name, e
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        self.registry.start_accepting_transactions();
+                        return Err(Error::internal(format!(
+                            "Cannot read snapshot volume for table {}: {}",
+                            table_name, e
+                        )));
+                    }
+                }
+            }
+        }
+
+        // === Load DDL metadata (indexes + views) ===
+        // Use per-timestamp DDL file (ddl-{ts}.bin) matching the snapshot data.
+        // For timestamped restore: use exact match. For latest restore: extract the
+        // oldest timestamp from the selected snapshot files (conservative — ensures
+        // DDL is never newer than any table data being restored).
+        let ddl_data = {
+            let effective_ts = if timestamp.is_some() {
+                timestamp.map(|s| s.to_string())
+            } else {
+                // Extract oldest timestamp from selected snapshot filenames.
+                // Format: "snapshot-YYYYMMDD-HHMMSS.fff.bin"
+                snapshot_files
+                    .iter()
+                    .filter_map(|(_, path)| {
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .and_then(|n| n.strip_prefix("snapshot-"))
+                            .and_then(|n| n.strip_suffix(".bin"))
+                            .map(|ts| ts.to_string())
+                    })
+                    .min()
+            };
+            let ddl_path = match &effective_ts {
+                Some(ts) => snapshot_dir.join(format!("ddl-{}.bin", ts)),
+                None => snapshot_dir.join("ddl.bin"),
+            };
+            if ddl_path.exists() {
+                std::fs::read(&ddl_path).ok()
+            } else if timestamp.is_some() {
+                // Timestamped restore with missing DDL: fail rather than silently
+                // using current indexes/views which may not match the snapshot data.
+                self.registry.start_accepting_transactions();
+                return Err(Error::internal(format!(
+                    "DDL metadata file not found for timestamp '{}'. Cannot restore indexes/views accurately.",
+                    timestamp.unwrap()
+                )));
+            } else {
+                None
+            }
+        };
+
+        // Fallback: if no DDL file (latest restore only), save current indexes from memory
+        let saved_indexes: Vec<(String, super::persistence::IndexMetadata)> = if ddl_data.is_some()
+        {
+            Vec::new() // Will use DDL file instead
+        } else {
+            let stores = self.version_stores.read().unwrap();
+            let mut indexes = Vec::new();
+            for (table_name, store) in stores.iter() {
+                let _ = store.for_each_index(|index| {
+                    if index.index_type() == crate::core::IndexType::PrimaryKey {
+                        return Ok(());
+                    }
+                    indexes.push((
+                        table_name.clone(),
+                        super::persistence::IndexMetadata {
+                            name: index.name().to_string(),
+                            table_name: table_name.clone(),
+                            column_names: index.column_names().to_vec(),
+                            column_ids: index.column_ids().to_vec(),
+                            data_types: index.data_types().to_vec(),
+                            is_unique: index.is_unique(),
+                            index_type: index.index_type(),
+                            hnsw_m: index.hnsw_m(),
+                            hnsw_ef_construction: index.hnsw_ef_construction(),
+                            hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
+                            hnsw_distance_metric: index.hnsw_distance_metric(),
+                        },
+                    ));
+                    Ok(())
+                });
+            }
+            indexes
+        };
+
+        // Save current views as fallback (if no ddl.bin)
+        let saved_views: Vec<(String, String)> = if ddl_data.is_some() {
+            Vec::new()
+        } else {
+            let views = self.views.read().unwrap();
+            views
+                .values()
+                .map(|v| (v.original_name.clone(), v.query.clone()))
+                .collect()
+        };
+
+        // === Destructive step: clear current state ===
+
+        // Close all version stores
+        {
+            let stores = self.version_stores.read().unwrap();
+            for store in stores.values() {
+                store.close();
+            }
+        }
+
+        // Clear segment managers and delete volume files on disk
+        {
+            let mut mgrs = self.segment_managers.write().unwrap();
+            for (_, mgr) in mgrs.iter() {
+                mgr.clear();
+            }
+            mgrs.clear();
+        }
+
+        // Delete all volume directories on disk
+        let vol_dir = pm.path().join("volumes");
+        if vol_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&vol_dir) {
+                for entry in entries.flatten() {
+                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+        }
+
+        // Reset WAL: old entries contain post-snapshot DML that would
+        // overwrite restored data if replayed on next open.
+        // Truncate with LSN=1 to create a fresh WAL starting from the beginning.
+        // The post-restore checkpoint will re-record DDL with correct LSNs.
+        if let Err(e) = pm.truncate_wal(1) {
+            eprintln!("Warning: WAL reset during restore: {}", e);
+        }
+
+        // Clear all in-memory state
+        self.schemas.write().unwrap().clear();
+        self.version_stores.write().unwrap().clear();
+        self.views.write().unwrap().clear();
+        self.txn_version_stores.write().unwrap().clear();
+        self.snapshot_timestamps.write().unwrap().clear();
+        {
+            let mut fk_cache = self.fk_reverse_cache.write().unwrap();
+            *fk_cache = (u64::MAX, crate::common::StringMap::default());
+        }
+
+        // === Load snapshot data ===
+        let mut total_tables = 0u32;
+        let mut total_rows = 0u64;
+
+        for (table_name, snapshot_path) in &snapshot_files {
+            let file_size = std::fs::metadata(snapshot_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let vol_path = snapshot_path.with_extension("vol");
+            let use_volume = vol_path.exists() || file_size > 16 * 1024 * 1024;
+
+            let load_result = if use_volume {
+                self.load_table_snapshot_as_volume(table_name, snapshot_path)
+            } else {
+                self.load_table_snapshot(table_name, snapshot_path)
+            };
+
+            match load_result {
+                Ok(_source_lsn) => {
+                    total_tables += 1;
+                    if let Ok(stores) = self.version_stores.read() {
+                        if let Some(store) = stores.get(table_name.as_str()) {
+                            total_rows += store.committed_row_count() as u64;
+                        }
+                    }
+                    // Also count rows in segment managers (loaded as volume)
+                    if let Ok(mgrs) = self.segment_managers.read() {
+                        if let Some(mgr) = mgrs.get(table_name.as_str()) {
+                            total_rows += mgr.total_row_count() as u64;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Partial restore failure: some tables loaded, others not.
+                    // Persist what we have so a crash doesn't lose everything.
+                    if total_tables > 0 {
+                        eprintln!(
+                            "Warning: partial restore ({} tables loaded), persisting before error return",
+                            total_tables
+                        );
+                        // Drop checkpoint_mutex before calling checkpoint_cycle_inner
+                        // to avoid deadlock (it acquires the same mutex internally).
+                        drop(_checkpoint_guard);
+                        let _ = self.checkpoint_cycle_inner(true);
+                    } else {
+                        drop(_checkpoint_guard);
+                    }
+                    self.registry.start_accepting_transactions();
+                    return Err(Error::internal(format!(
+                        "Failed to restore table {}: {}",
+                        table_name, e
+                    )));
+                }
+            }
+        }
+
+        // === Post-restore ===
+
+        // Recreate indexes and views from ddl.bin or fallback saved state.
+        if let Some(ref data) = ddl_data {
+            self.restore_ddl_from_bin(data);
+        } else {
+            // Fallback: recreate indexes from in-memory saved state
+            let stores = self.version_stores.read().unwrap();
+            for (table_name, index_meta) in &saved_indexes {
+                if let Some(store) = stores.get(table_name.as_str()) {
+                    if let Err(e) =
+                        store.create_index_from_metadata_with_graph(index_meta, false, None)
+                    {
+                        eprintln!(
+                            "Warning: Failed to recreate index '{}' on '{}': {}",
+                            index_meta.name, table_name, e
+                        );
+                    }
+                }
+            }
+            drop(stores);
+
+            // Fallback: recreate views from in-memory saved state
+            for (name, query) in &saved_views {
+                let view_def = Arc::new(ViewDefinition::new(name, query.clone()));
+                self.views
+                    .write()
+                    .unwrap()
+                    .insert(name.to_lowercase(), view_def);
+            }
+        }
+
+        // Populate default values from DEFAULT expressions
+        self.populate_schema_defaults();
+
+        // Sync auto-increment counters from segment managers.
+        // Without this, tables loaded as volumes would have stale counters
+        // and new INSERTs could collide with existing row IDs.
+        self.sync_auto_increment_from_segments();
+
+        // Increment schema epoch to invalidate all caches
+        self.schema_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+        // Re-record DDL to WAL so table schemas survive WAL truncation
+        if let Err(e) = self.rerecord_ddl_to_wal() {
+            eprintln!(
+                "Warning: Failed to re-record DDL to WAL after restore: {}",
+                e
+            );
+        }
+
+        // Drop the checkpoint guard BEFORE calling checkpoint_cycle_inner
+        // since it acquires the same mutex internally
+        drop(_checkpoint_guard);
+
+        // Force checkpoint to persist restored data to volumes BEFORE accepting
+        // transactions. WAL was truncated, so data is only in memory until this
+        // checkpoint. A crash before this would lose the restored data.
+        if let Err(e) = self.checkpoint_cycle_inner(true) {
+            eprintln!("Warning: Post-restore checkpoint failed: {}", e);
+        }
+        self.compact_after_checkpoint_forced();
+
+        // Resume accepting transactions only after data is persisted
+        self.registry.start_accepting_transactions();
+
+        Ok(format!(
+            "Restored {} tables ({} rows) from snapshot",
+            total_tables, total_rows
+        ))
+    }
+
+    /// Checkpoint-to-volume cycle: replaces the old snapshot-based persistence.
+    ///
+    /// Instead of serializing the entire hot buffer to a snapshot .bin file,
+    /// this cycle seals committed hot rows into frozen volumes, re-records all DDL
+    /// to WAL (so recovery can recreate schemas after WAL truncation), persists
+    /// manifests, and optionally truncates the WAL.
+    ///
+    /// Recovery loads manifests + volumes from disk, replays WAL from 0 (skipping
+    /// INSERT entries for rows already in volumes), and rebuilds hot state.
+    ///
+    /// WAL truncation is only safe when ALL committed hot rows have been sealed.
+    /// Otherwise, unsealed rows' INSERT entries must survive in the WAL.
+    fn checkpoint_cycle(&self) -> Result<()> {
+        self.checkpoint_cycle_inner(false)?;
+        // Compaction runs outside the checkpoint critical path.
+        // checkpoint_mutex is released, so new checkpoints aren't blocked.
+        self.compact_after_checkpoint();
+        Ok(())
+    }
+
+    /// Inner checkpoint implementation. When `force` is true, seals ALL hot rows
+    /// regardless of threshold (used by PRAGMA CHECKPOINT and close_engine).
+    /// When false, respects the normal seal thresholds (used by background thread).
+    fn checkpoint_cycle_inner(&self, force: bool) -> Result<()> {
+        if let Some(ref pm) = *self.persistence {
+            if !pm.is_enabled() {
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
+
+        // Serialize the entire cycle: prevent concurrent seal+compact from
+        // the background thread and explicit PRAGMA CHECKPOINT.
+        let _checkpoint_guard = self.checkpoint_mutex.lock().unwrap();
+
+        // Step 1: Seal hot rows into frozen volumes (the actual checkpoint).
+        // Sealed rows are written to .vol files and removed from the hot buffer.
+        // When force=true, bypass thresholds so ALL hot rows are sealed.
+        if force {
+            self.force_seal_all.store(true, Ordering::Release);
+        }
+        if let Err(e) = self.seal_hot_buffers() {
+            eprintln!("Warning: seal_hot_buffers failed: {}", e);
+        }
+        if force {
+            self.force_seal_all.store(false, Ordering::Release);
+        }
+        // Step 2: Force-seal any remaining small tables so all hot buffers
+        // are empty. The first seal pass (Step 1) uses incremental thresholds
+        // and may leave small tables (metrics, logs, etc.) unsealed. Without
+        // draining them, all_hot_empty is never true and WAL never truncates.
+        let all_hot_empty = {
+            let stores = self.version_stores.read().unwrap();
+            stores
+                .values()
+                .all(|store| store.committed_row_count() == 0)
+        };
+
+        if !all_hot_empty && !force {
+            // Force-seal the stragglers (small tables below threshold)
+            self.force_seal_all.store(true, Ordering::Release);
+            if let Err(e) = self.seal_hot_buffers() {
+                eprintln!("Warning: force-seal stragglers failed: {}", e);
+            }
+            self.force_seal_all.store(false, Ordering::Release);
+        }
+
+        // Step 3: Brief fence — block commits just long enough to check if all
+        // hot buffers are empty and capture checkpoint_lsn. NO disk I/O inside
+        // the fence. Previously this ran a full seal_hot_buffers() (with volume
+        // building + disk writes) while blocking all commits, causing 1-2s INSERT
+        // stalls. Now the fence is held for microseconds (atomic counter reads).
+        // If hot buffers aren't empty after steps 1-2, we skip WAL truncation
+        // this cycle and let the next cycle's bulk seal drain them.
+        let checkpoint_lsn = match self
+            .seal_fence
+            .try_write_for(std::time::Duration::from_secs(5))
+        {
+            Some(_fence) => {
+                // Fence acquired — no new commits can start. In-flight commits
+                // finished (they held the read lock, which is now released).
+                // Just check if bulk seal (steps 1-2) drained everything.
+                let all_hot_empty = {
+                    let stores = self.version_stores.read().unwrap();
+                    stores
+                        .values()
+                        .all(|store| store.committed_row_count() == 0)
+                };
+
+                if all_hot_empty {
+                    // All data is in volumes. Safe to advance the WAL checkpoint.
+                    if let Some(ref pm) = *self.persistence {
+                        pm.create_checkpoint(vec![])?
+                    } else {
+                        0
+                    }
+                } else {
+                    // Continuous writes kept hot buffers non-empty.
+                    // Skip WAL truncation — next cycle's bulk seal will drain them.
+                    0
+                }
+                // _fence dropped here — commits resume
+            }
+            None => {
+                // Couldn't acquire fence within 5s (long-running commit).
+                // Skip WAL truncation this cycle, try again next time.
+                eprintln!("Warning: seal_fence timeout, skipping WAL truncation");
+                0
+            }
+        };
+
+        // Re-record DDL OUTSIDE the fence. DDL writes to WAL (append-only,
+        // thread-safe) and doesn't need to block commits.
+        if checkpoint_lsn > 0 {
+            if let Err(e) = self.rerecord_ddl_to_wal() {
+                eprintln!("Warning: Failed to re-record DDL to WAL: {}", e);
+                return Ok(());
+            }
+        }
+
+        // Step 4: Persist manifests (includes tombstones + checkpoint_lsn).
+        // checkpoint_lsn is > 0 only when all hot buffers are empty (fully sealed).
+        // Track success: WAL truncation is only safe if ALL manifests are durable.
+        let mut all_manifests_persisted = true;
+        {
+            // Collect Arc clones under the read lock, then drop the lock
+            // before doing file I/O to avoid blocking writers.
+            let mgr_arcs: Vec<_> = {
+                let mgrs = self.segment_managers.read().unwrap();
+                mgrs.values().cloned().collect()
+            };
+            for mgr in &mgr_arcs {
+                if checkpoint_lsn > 0 {
+                    mgr.manifest_mut().checkpoint_lsn = checkpoint_lsn;
+                }
+                if let Err(e) = mgr.persist_manifest_only() {
+                    eprintln!(
+                        "Warning: Failed to persist manifest for {}: {}",
+                        mgr.table_name(),
+                        e
+                    );
+                    all_manifests_persisted = false;
+                }
+            }
+        }
+
+        // Step 5: Truncate WAL BEFORE compaction.
+        // WAL truncation only depends on seal + manifest persist, not compaction.
+        // Running compaction first (30+ seconds) delays truncation and extends
+        // the checkpoint window unnecessarily.
+        // checkpoint_lsn > 0 already guarantees all_hot_empty was true inside
+        // the fence. Don't re-check the outer all_hot_empty (stale, checked
+        // before fence when continuous inserts make it always false).
+        if checkpoint_lsn > 0 && all_manifests_persisted {
+            if let Some(ref pm) = *self.persistence {
+                if let Err(e) = pm.truncate_wal(checkpoint_lsn) {
+                    eprintln!("Warning: Failed to truncate WAL: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run compaction outside the checkpoint critical path.
+    /// Merges old volumes into fewer, larger files.
+    /// Called after checkpoint_cycle_inner returns (checkpoint_mutex released).
+    fn compact_after_checkpoint(&self) {
+        self.compact_after_checkpoint_inner(false);
+    }
+
+    fn compact_after_checkpoint_forced(&self) {
+        self.compact_after_checkpoint_inner(true);
+    }
+
+    fn compact_after_checkpoint_inner(&self, force: bool) {
+        if !force {
+            // Dynamic cooldown: skip if no table has a backlog.
+            // When any table exceeds compact_threshold, compact immediately.
+            // Otherwise, use cooldown to avoid unnecessary work.
+            let should_skip = {
+                let compact_threshold = self
+                    .config
+                    .read()
+                    .map(|c| c.persistence.compact_threshold as usize)
+                    .unwrap_or(4)
+                    .max(2);
+                let max_segments = {
+                    let mgrs = self.segment_managers.read().unwrap();
+                    mgrs.values().map(|m| m.segment_count()).max().unwrap_or(0)
+                };
+                if max_segments > compact_threshold {
+                    false // backlog exists — compact immediately
+                } else {
+                    let last = self.last_compaction_time.lock().unwrap();
+                    let cooldown = {
+                        let config = self.config.read();
+                        let threshold = config
+                            .as_ref()
+                            .map(|c| c.persistence.compact_threshold as u64)
+                            .unwrap_or(4)
+                            .max(2);
+                        let interval = config
+                            .as_ref()
+                            .map(|c| c.persistence.checkpoint_interval as u64)
+                            .unwrap_or(60)
+                            .max(10);
+                        std::time::Duration::from_secs(threshold * interval)
+                    };
+                    last.elapsed() < cooldown
+                }
+            };
+            if should_skip {
+                return;
+            }
+        }
+
+        if let Err(e) = self.compact_volumes() {
+            eprintln!("Warning: compact_volumes failed: {}", e);
+            return;
+        }
+        *self.last_compaction_time.lock().unwrap() = Instant::now();
+    }
+
+    /// Re-record all DDL entries to WAL after checkpoint.
+    ///
+    /// After WAL truncation, any CreateTable/CreateIndex/CreateView entries before
+    /// the checkpoint LSN are lost. Re-recording them places fresh entries at
+    /// the WAL head so they survive truncation and are replayed on recovery.
+    ///
+    /// Order matters: CreateTable must come before CreateIndex for the same table,
+    /// because index replay needs the version store to exist.
+    fn rerecord_ddl_to_wal(&self) -> Result<()> {
+        // Collect CreateTable entries and table names in a single schemas lock
+        let (table_entries, table_names_for_indexes): (Vec<(String, Vec<u8>)>, Vec<String>) = {
+            let schemas = self.schemas.read().unwrap();
+            let entries = schemas
+                .values()
+                .map(|schema| (schema.table_name.clone(), Self::serialize_schema(schema)))
+                .collect();
+            let names = schemas.keys().cloned().collect();
+            (entries, names)
+        };
+
+        // Collect CreateIndex entries under version_stores lock, then drop
+        let index_entries: Vec<(String, Vec<u8>)> = {
+            let stores = self.version_stores.read().unwrap();
+            let mut entries = Vec::new();
+            for table_name in &table_names_for_indexes {
+                if let Some(store) = stores.get(table_name) {
+                    let _ = store.for_each_index(|index| {
+                        // Skip PK indexes, they are auto-created from schema
+                        if index.index_type() == crate::core::IndexType::PrimaryKey {
+                            return Ok(());
+                        }
+                        let index_meta = super::persistence::IndexMetadata {
+                            name: index.name().to_string(),
+                            table_name: table_name.clone(),
+                            column_names: index.column_names().to_vec(),
+                            column_ids: index.column_ids().to_vec(),
+                            data_types: index.data_types().to_vec(),
+                            is_unique: index.is_unique(),
+                            index_type: index.index_type(),
+                            hnsw_m: index.hnsw_m(),
+                            hnsw_ef_construction: index.hnsw_ef_construction(),
+                            hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
+                            hnsw_distance_metric: index.hnsw_distance_metric(),
+                        };
+                        entries.push((table_name.clone(), index_meta.serialize()));
+                        Ok(())
+                    });
+                }
+            }
+            entries
+        };
+
+        // Collect CreateView entries under views lock, then drop
+        let view_entries: Vec<(String, Vec<u8>)> = {
+            let views = self.views.read().unwrap();
+            views
+                .iter()
+                .map(|(name, view_def)| (name.clone(), view_def.serialize()))
+                .collect()
+        };
+
+        // Write CreateTable entries first (schemas must exist before indexes)
+        for (table_name, data) in &table_entries {
+            self.record_ddl(table_name, WALOperationType::CreateTable, data)?;
+        }
+
+        for (table_name, data) in &index_entries {
+            self.record_ddl(table_name, WALOperationType::CreateIndex, data)?;
+        }
+
+        for (view_name, data) in &view_entries {
+            self.record_ddl(view_name, WALOperationType::CreateView, data)?;
+        }
+
+        Ok(())
+    }
+
+    fn compact_volumes(&self) -> Result<()> {
+        let pm = match self.persistence.as_ref() {
+            Some(pm) if pm.is_enabled() => pm,
+            _ => return Ok(()),
+        };
+
+        let compact_threshold = self
+            .config
+            .read()
+            .map(|c| c.persistence.compact_threshold as usize)
+            .unwrap_or(4)
+            .max(2);
+
+        // Skip compaction entirely when snapshot transactions are active.
+        // Compaction physically removes rows from old volumes. A snapshot
+        // that began before a tombstone's commit_seq should still see the
+        // old cold row, but compaction drops it unconditionally. Same guard
+        // as seal_hot_buffers uses.
+        if !self.registry.get_snapshot_transaction_ids().is_empty() {
+            return Ok(());
+        }
+
+        let tables_to_compact: Vec<String> = {
+            let mgrs = self.segment_managers.read().unwrap();
+            mgrs.iter()
+                .filter(|(_, mgr)| mgr.segment_count() >= compact_threshold)
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+
+        if tables_to_compact.is_empty() {
+            return Ok(());
+        }
+
+        for table_name in &tables_to_compact {
+            let schema = {
+                let schemas = self.schemas.read().unwrap();
+                match schemas.get(table_name) {
+                    Some(s) => s.clone(),
+                    None => continue,
+                }
+            };
+
+            let mgr = self.get_or_create_segment_manager(table_name);
+
+            // Size-sorted compaction: sort segments by row_count, merge the
+            // smallest cluster. This naturally groups similar-sized volumes
+            // without artificial tier boundaries:
+            // - Bounded I/O (small volumes merged first, large ones left alone)
+            // - No arbitrary tier boundaries (adapts to any workload)
+            // - Logarithmic convergence (merged result is larger, eventually merges too)
+            let (old_ids, volumes, tombstones) = {
+                let manifest = mgr.manifest();
+                let segs = mgr.segments_snapshot();
+
+                // Sort segments by row_count (smallest first), keep manifest index
+                let mut by_size: Vec<(usize, usize)> = manifest
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, seg)| (idx, seg.row_count))
+                    .collect();
+                by_size.sort_by_key(|&(_, rows)| rows);
+
+                // Take the smallest compact_threshold * 2 volumes.
+                // This bounds I/O per cycle while making steady progress.
+                let limit = (compact_threshold * 2).min(by_size.len());
+                let merge_indices: Vec<usize> =
+                    by_size[..limit].iter().map(|&(idx, _)| idx).collect();
+
+                if merge_indices.len() < 2 {
+                    continue;
+                }
+
+                let old_ids: Vec<u64> = merge_indices
+                    .iter()
+                    .map(|&i| manifest.segments[i].segment_id)
+                    .collect();
+                let mut vols: Vec<(u64, Arc<crate::storage::volume::writer::FrozenVolume>)> =
+                    merge_indices
+                        .iter()
+                        .filter_map(|&i| {
+                            let seg = &manifest.segments[i];
+                            segs.get(&seg.segment_id)
+                                .map(|v| (seg.segment_id, Arc::clone(v)))
+                        })
+                        .collect();
+                // Every manifest entry must have a loaded volume. If any are
+                // missing (startup load failure), skip this table to avoid
+                // dropping unloaded segments from the manifest permanently.
+                if vols.len() != old_ids.len() {
+                    continue;
+                }
+                // Sort by segment_id descending (newest first) for correct dedup.
+                // The merge_indices were sorted by size, not age — reversing
+                // would give largest-first, not newest-first.
+                vols.sort_by(|a, b| b.0.cmp(&a.0));
+                let ts = mgr.tombstone_set_arc();
+                (old_ids, Arc::new(vols), ts)
+            };
+
+            // Streaming compaction: iterate volumes newest-first, dedup by row_id,
+            // collect only (row_id, volume_index, row_index) references, then sort
+            // and stream into VolumeBuilder. This avoids materializing all Row objects
+            // at once (which would be 2-3x the table size for large tables).
+            let mut seen = FxHashSet::default();
+            let mut live_refs: Vec<(i64, usize, usize)> = Vec::new(); // (row_id, vol_idx, row_idx)
+
+            let schema_cols = schema.columns.len();
+            for (vol_idx, (_seg_id, vol)) in volumes.iter().enumerate() {
+                for i in 0..vol.row_count {
+                    let row_id = vol.row_ids[i];
+                    if tombstones.contains_key(&row_id) && !seen.contains(&row_id) {
+                        continue;
+                    }
+                    if seen.insert(row_id) {
+                        live_refs.push((row_id, vol_idx, i));
+                    }
+                }
+            }
+
+            live_refs.sort_unstable_by_key(|(id, _, _)| *id);
+
+            if live_refs.is_empty() {
+                // All rows in merged volumes are tombstoned. Remove those
+                // volumes and their tombstones, but keep unmerged volumes intact.
+                let merged_row_ids: FxHashSet<i64> = volumes
+                    .iter()
+                    .flat_map(|(_, vol)| vol.row_ids.iter().copied())
+                    .collect();
+                mgr.replace_segments_atomic_remove_only(&old_ids);
+                mgr.remove_tombstones_for_rows(&merged_row_ids);
+
+                // Persist manifest BEFORE deleting files (same safety as non-empty path).
+                if let Err(e) = mgr.persist_manifest_only() {
+                    eprintln!(
+                        "Warning: Failed to persist manifest after compaction for {}: {}",
+                        table_name, e
+                    );
+                    continue;
+                }
+
+                let vol_dir = pm.path().join("volumes");
+                let vol_table_dir = vol_dir.join(table_name);
+                let old_filenames: FxHashSet<String> = old_ids
+                    .iter()
+                    .map(|id| format!("vol_{:016x}.vol", id))
+                    .collect();
+                if let Ok(entries) = std::fs::read_dir(&vol_table_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                            if old_filenames.contains(fname) {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Build compacted volume by streaming from volume references.
+            // Only one Row is materialized at a time, avoiding O(N) memory.
+            let mut builder = crate::storage::volume::writer::VolumeBuilder::with_capacity(
+                &schema,
+                live_refs.len(),
+            );
+            for &(row_id, vol_idx, row_idx) in &live_refs {
+                let vol = &volumes[vol_idx].1;
+                let needs_normalize = vol.column_names.len() != schema_cols
+                    || vol
+                        .column_names
+                        .iter()
+                        .zip(schema.columns.iter())
+                        .any(|(vn, sc)| !vn.eq_ignore_ascii_case(&sc.name));
+                let mut row = if needs_normalize {
+                    vol.get_row_normalized(row_idx, &schema)
+                } else {
+                    vol.get_row(row_idx)
+                };
+                if row.len() < schema_cols {
+                    for ci in row.len()..schema_cols {
+                        let col = &schema.columns[ci];
+                        if let Some(ref default_val) = col.default_value {
+                            row.push(default_val.clone());
+                        } else {
+                            row.push(crate::core::Value::null(col.data_type));
+                        }
+                    }
+                }
+                builder.add_row(row_id, &row);
+            }
+            let compacted = builder.finish();
+
+            // Write to disk with a stable volume_id for filename and registration.
+            let vol_dir = pm.path().join("volumes");
+            let compact_vol_id = crate::storage::volume::io::next_volume_id();
+            match crate::storage::volume::io::write_volume_to_disk(
+                &vol_dir,
+                table_name,
+                compact_vol_id,
+                &compacted,
+            ) {
+                Ok(_path) => {
+                    // Atomic swap: replace old segments with compacted volume
+                    // under a single lock hold. This prevents the window where
+                    // both old and new segments are visible, which caused queries
+                    // to scan duplicated data during compaction.
+                    {
+                        use crate::storage::volume::manifest::SegmentMeta;
+                        let min_id = live_refs.first().map(|(id, _, _)| *id).unwrap_or(0);
+                        let max_id = live_refs.last().map(|(id, _, _)| *id).unwrap_or(0);
+                        let row_count = live_refs.len();
+                        mgr.replace_segments_atomic(
+                            compact_vol_id,
+                            Arc::new(compacted),
+                            SegmentMeta {
+                                segment_id: compact_vol_id,
+                                file_path: std::path::PathBuf::new(),
+                                row_count,
+                                min_row_id: min_id,
+                                max_row_id: max_id,
+                                creation_lsn: 0,
+                            },
+                            &old_ids,
+                        );
+                    }
+                    // Clear only tombstones for row_ids in the merged volumes.
+                    // When compacting a subset, tombstones for unmerged volumes
+                    // must remain. Compaction deduped newest-first so the merged
+                    // result already excluded tombstoned rows.
+                    {
+                        let merged_row_ids: FxHashSet<i64> = volumes
+                            .iter()
+                            .flat_map(|(_, vol)| vol.row_ids.iter().copied())
+                            .collect();
+                        mgr.remove_tombstones_for_rows(&merged_row_ids);
+                    }
+
+                    // CRITICAL: Persist manifest BEFORE deleting old files.
+                    // Without this, a crash between file deletion and manifest
+                    // persist leaves the manifest referencing deleted files,
+                    // causing data loss on restart (24M → 9M rows).
+                    if let Err(e) = mgr.persist_manifest_only() {
+                        eprintln!(
+                            "Warning: Failed to persist manifest after compaction for {}: {}",
+                            table_name, e
+                        );
+                        // Don't delete old files if manifest persist failed.
+                        // The old manifest still references them, so they're
+                        // needed for recovery.
+                        continue;
+                    }
+
+                    // Now safe to delete old volume files + stale .dv files.
+                    // Manifest is durable on disk with the new segment list.
+                    let vol_table_dir = vol_dir.join(table_name);
+                    let old_filenames: FxHashSet<String> = old_ids
+                        .iter()
+                        .map(|id| format!("vol_{:016x}.vol", id))
+                        .collect();
+                    if let Ok(entries) = std::fs::read_dir(&vol_table_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            let ext = path.extension().and_then(|e| e.to_str());
+                            if ext == Some("dv") {
+                                let _ = std::fs::remove_file(&path);
+                            } else if ext == Some("vol") {
+                                if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                                    if old_filenames.contains(fname) {
+                                        let _ = std::fs::remove_file(&path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to write compacted volume for {}: {}",
+                        table_name, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Seal hot buffer rows into frozen volumes and reclaim memory.
+    ///
+    /// Called automatically in the background. For each table with enough
+    /// VISIBLE rows in the hot buffer, extracts them, writes a frozen volume
+    /// to disk, then marks the sealed rows as deleted in the VersionStore.
+    ///
+    /// Uses actual visible row count (not committed_row_count which includes
+    /// deleted rows and is never decremented).
+    ///
+    /// This is safe for concurrent queries because:
+    /// - mark_deleted creates a new version (doesn't modify existing data)
+    /// - In-flight scans that already read the row see the pre-delete version
+    /// - New scans see the delete and skip the row (read from volume instead)
+    ///
+    /// Threshold: 100K rows (first seal) or 10K rows (subsequent seals).
+    fn seal_hot_buffers(&self) -> Result<()> {
+        const SEAL_ROW_THRESHOLD: usize = 100_000;
+        const SEAL_INCREMENTAL_THRESHOLD: usize = 10_000;
+
+        let pm = match self.persistence.as_ref() {
+            Some(pm) if pm.is_enabled() => pm,
+            _ => return Ok(()),
+        };
+
+        // Snapshot transaction IDs (computed once, used per-table below)
+        let snapshot_txn_ids = self.registry.get_snapshot_transaction_ids();
+        let has_snapshot_txns = !snapshot_txn_ids.is_empty();
+
+        // Collect table names that might need sealing.
+        // Acquire each lock separately and drop before the next to avoid
+        // holding multiple RwLocks simultaneously (deadlock prevention).
+        let force_seal = self.force_seal_all.load(Ordering::Acquire);
+
+        // Step 1: Collect candidates from version_stores (row count check)
+        let candidates: Vec<(String, Arc<VersionStore>)> = {
+            let stores = self.version_stores.read().unwrap();
+            stores
+                .iter()
+                .filter_map(|(table_name, store)| {
+                    let row_count = store.committed_row_count();
+                    if force_seal {
+                        if row_count == 0 {
+                            return None;
+                        }
+                    } else if row_count == 0 {
+                        return None;
+                    }
+                    Some((table_name.clone(), Arc::clone(store)))
+                })
+                .collect()
+        };
+
+        // Step 2: Filter by threshold using segment_managers.
+        // Cache has_segments per table to avoid re-acquiring the lock later.
+        let candidates: Vec<(String, Arc<VersionStore>, bool)> = if force_seal {
+            let mgrs = self.segment_managers.read().unwrap();
+            candidates
+                .into_iter()
+                .map(|(table_name, store)| {
+                    let has_seg = mgrs
+                        .get(&table_name)
+                        .map(|m| m.has_segments())
+                        .unwrap_or(false);
+                    (table_name, store, has_seg)
+                })
+                .collect()
+        } else {
+            let mgrs = self.segment_managers.read().unwrap();
+            candidates
+                .into_iter()
+                .filter_map(|(table_name, store)| {
+                    let row_count = store.committed_row_count();
+                    let has_seg = mgrs
+                        .get(&table_name)
+                        .map(|m| m.has_segments())
+                        .unwrap_or(false);
+                    let threshold = if has_seg {
+                        SEAL_INCREMENTAL_THRESHOLD
+                    } else {
+                        SEAL_ROW_THRESHOLD
+                    };
+                    if row_count >= threshold {
+                        Some((table_name, store, has_seg))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        // Step 3: Skip ALL tables when snapshot transactions are active.
+        // Cold volumes have no MVCC visibility information, so rows sealed
+        // during a snapshot transaction would become visible to it on the
+        // cold scan path, violating snapshot isolation.
+        if has_snapshot_txns {
+            return Ok(());
+        }
+
+        // Step 4: Look up schemas (separate lock acquisition)
+        let table_names: Vec<(String, CompactArc<Schema>, Arc<VersionStore>, bool)> = {
+            let schemas = self.schemas.read().unwrap();
+            candidates
+                .into_iter()
+                .filter_map(|(table_name, store, has_seg)| {
+                    let schema = schemas.get(&table_name)?.clone();
+                    Some((table_name, schema, store, has_seg))
+                })
+                .collect()
+        };
+
+        // Batch size for hot removal only. Volume is built once per table.
+        // Smaller batches = shorter write lock hold time per batch.
+        const REMOVE_BATCH_SIZE: usize = 50_000;
+
+        for (table_name, schema, store, has_segments) in table_names {
+            let read_txn_id = INVALID_TRANSACTION_ID + 1;
+            // Extract rows AND a CowBTree snapshot (O(1) Arc clone).
+            // The snapshot records each row's txn_id at extraction time.
+            // remove_sealed_rows compares against it to detect concurrent
+            // commits that modified a row after extraction.
+            let (mut all_rows, extraction_snapshot) = store.extract_for_seal(read_txn_id);
+            // On close (force_seal_all), seal ALL rows regardless of threshold.
+            if !self.force_seal_all.load(Ordering::Acquire) {
+                let threshold = if has_segments {
+                    SEAL_INCREMENTAL_THRESHOLD
+                } else {
+                    SEAL_ROW_THRESHOLD
+                };
+                if all_rows.len() < threshold {
+                    continue;
+                }
+            }
+            if all_rows.is_empty() {
+                continue;
+            }
+
+            let total_rows = all_rows.len();
+
+            // Normalize rows to current schema before sealing.
+            // After ALTER TABLE ADD COLUMN ... DEFAULT ..., old rows have
+            // fewer columns. Without normalization, the default is lost
+            // permanently in the cold segment (stored as NULL).
+            let schema_cols = schema.columns.len();
+            for (_row_id, row) in &mut all_rows {
+                if row.len() < schema_cols {
+                    for i in row.len()..schema_cols {
+                        let col = &schema.columns[i];
+                        if let Some(ref default_val) = col.default_value {
+                            row.push(default_val.clone());
+                        } else {
+                            row.push(crate::core::Value::null(col.data_type));
+                        }
+                    }
+                } else if row.len() > schema_cols {
+                    row.truncate(schema_cols);
+                }
+            }
+
+            let vol_dir = pm.path().join("volumes");
+
+            // Build ONE volume from ALL rows for this table.
+            // Previous design created one .vol per 50K batch, causing compaction
+            // to explode (17 batches = 17 volumes to merge = 25s compaction).
+            match crate::storage::volume::seal::seal_and_persist(
+                &schema,
+                &all_rows,
+                &vol_dir,
+                &table_name,
+            ) {
+                Ok((volume, _path, volume_id)) => {
+                    // Register the cold segment BEFORE removing rows from hot.
+                    // Rows are visible in BOTH hot and cold briefly. Skip-set
+                    // dedup (newest-first wins) handles this at scan time.
+                    let mgr = self.get_or_create_segment_manager(&table_name);
+                    mgr.set_seal_overlap(total_rows);
+                    self.register_volume_with_id(&table_name, Arc::clone(&volume), volume_id);
+
+                    // Phase 1: Remove sealed rows from hot version store in batches.
+                    // Index entries are KEPT to prevent unique constraint violations
+                    // during the seal window (stale index entries still trigger
+                    // UniqueConstraint errors, which is correct — the value exists in cold).
+                    let mut index_cleanups = Vec::new();
+                    let mut all_skipped: Vec<i64> = Vec::new();
+                    let all_row_ids: Vec<i64> = all_rows.iter().map(|(id, _)| *id).collect();
+                    for batch in all_row_ids.chunks(REMOVE_BATCH_SIZE) {
+                        let (removed, cleanup, skipped) =
+                            store.remove_sealed_rows(batch, &extraction_snapshot);
+                        store.subtract_committed_row_count(removed);
+                        index_cleanups.push(cleanup);
+                        all_skipped.extend(skipped);
+                    }
+
+                    // Tombstone skipped row_ids. These rows were modified by a
+                    // concurrent commit after extraction — the sealed volume has
+                    // stale data for them. Tombstones ensure:
+                    // 1. Scans skip the stale cold copy (hot version wins via skip set,
+                    //    but tombstone is the authoritative marker for deduped_row_count)
+                    // 2. WAL recovery applies the update (sees tombstone → not a sealed
+                    //    INSERT → applies the WAL entry to hot)
+                    // 3. row_count() is correct (tombstoned cold rows are excluded)
+                    if !all_skipped.is_empty() {
+                        mgr.add_tombstones(&all_skipped, 0);
+                    }
+
+                    // Sync auto-increment so new inserts don't collide
+                    // with row_ids in the newly sealed segment.
+                    if let Some(&(max_id, _)) = all_rows.last() {
+                        let current = store.get_auto_increment_counter();
+                        if max_id > current {
+                            store.set_auto_increment_counter(max_id);
+                        }
+                    }
+
+                    mgr.clear_seal_overlap();
+
+                    // Remove stale hot index entries. These existed as a safety net
+                    // during the seal window but are now safe to clean since
+                    // seal_overlap is cleared and new cold checks get fresh snapshots.
+                    for cleanup in index_cleanups {
+                        store.remove_sealed_index_entries(cleanup);
+                    }
+
+                    // Clear tombstones for row_ids that are now in the new volume,
+                    // EXCEPT for skipped row_ids. Skipped rows have a stale copy in
+                    // the volume and a live version in hot — their tombstone must
+                    // survive so recovery applies the WAL entry and scans use hot.
+                    let skip_set: FxHashSet<i64> = all_skipped.iter().copied().collect();
+                    {
+                        let mgr = self.get_or_create_segment_manager(&table_name);
+                        let ts = mgr.tombstone_set_arc();
+                        if !ts.is_empty() {
+                            let sealed_ids: Vec<i64> = volume
+                                .row_ids
+                                .iter()
+                                .copied()
+                                .filter(|rid| ts.contains_key(rid) && !skip_set.contains(rid))
+                                .collect();
+                            if !sealed_ids.is_empty() {
+                                // Remove from both runtime set and manifest
+                                // Lock order: manifest FIRST, then tombstones
+                                let mut manifest = mgr.manifest_mut();
+                                let mut ts_guard = mgr.tombstones_write();
+                                let ts = Arc::make_mut(&mut *ts_guard);
+                                for &rid in &sealed_ids {
+                                    ts.remove(&rid);
+                                }
+                                manifest
+                                    .tombstones
+                                    .retain(|&(rid, _)| ts.contains_key(&rid));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to seal hot buffer for {}: {}",
+                        table_name, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Engine for MVCCEngine {
@@ -2792,409 +5641,26 @@ impl Engine for MVCCEngine {
         self.update_engine_config(config)
     }
 
-    fn create_snapshot(&self) -> Result<()> {
-        if !self.is_open() {
-            return Err(Error::EngineNotOpen);
-        }
+    fn dedup_segments(&self) -> usize {
+        MVCCEngine::dedup_segments(self)
+    }
 
-        // Check if persistence is enabled
-        let pm = match self.persistence.as_ref() {
-            Some(pm) if pm.is_enabled() => pm,
-            _ => return Ok(()), // No persistence, nothing to snapshot
-        };
+    fn checkpoint_cycle(&self) -> Result<()> {
+        MVCCEngine::checkpoint_cycle(self)
+    }
 
-        // Skip snapshot if WAL hasn't grown since the last one.
-        // read_snapshot_lsn returns the LSN committed in the previous metadata.
-        // If the current WAL head matches, no new data was written.
-        let snapshot_dir = pm.path().join("snapshots");
-        let prev_lsn = read_snapshot_lsn(&snapshot_dir);
-
-        // Create checkpoint and capture the LSN atomically.
-        // create_checkpoint() flushes and syncs all pending WAL entries, then returns
-        // the LSN at the exact checkpoint point.
-        let snapshot_lsn = pm.create_checkpoint(vec![])?;
-
-        if snapshot_lsn > 0 && snapshot_lsn == prev_lsn {
-            // WAL hasn't grown since the last snapshot — skip entirely.
-            // This avoids re-writing snapshot files and re-recording DDL to WAL.
-            return Ok(());
-        }
-
-        // CRITICAL: Capture the commit sequence AFTER the checkpoint.
-        // This ensures any transaction that committed before checkpoint.lsn will
-        // have commit_seq <= snapshot_commit_seq, so its data IS in the snapshot.
-        // If we captured commit_seq BEFORE checkpoint, a transaction committing
-        // between the two would have its WAL entries included in the checkpoint
-        // range (LSN <= checkpoint.lsn) but NOT in the snapshot (commit_seq was
-        // too early), causing data loss after WAL truncation.
-        //
-        // With this order (checkpoint → commit_seq), a transaction committing
-        // between the two has: WAL entries with LSN > checkpoint.lsn (survive
-        // truncation) AND commit_seq <= snapshot_commit_seq (data in snapshot).
-        // The duplicate is harmless since WAL replay is idempotent.
-        let snapshot_commit_seq = self.registry.current_commit_sequence();
-
-        // Create snapshot directory (snapshot_dir already set above for LSN check)
-        if let Err(e) = std::fs::create_dir_all(&snapshot_dir) {
-            return Err(Error::internal(format!(
-                "failed to create snapshot directory: {}",
-                e
-            )));
-        }
-
-        // Get all table schemas and version stores
-        let schemas = self.schemas.read().unwrap();
-        let stores = self.version_stores.read().unwrap();
-
-        // ATOMIC SNAPSHOT STRATEGY:
-        // 1. Write all snapshots to .tmp files first
-        // 2. After ALL succeed, rename all .tmp files to final names
-        // 3. If any fails, cleanup all .tmp files
-        // This ensures we never have a partially complete snapshot set
-
-        // Collect (temp_path, final_path, table_name) for atomic rename
-        let mut pending_snapshots: Vec<(std::path::PathBuf, std::path::PathBuf, String)> =
-            Vec::new();
-        let mut all_succeeded = true;
-
-        // Generate a consistent timestamp for all snapshots in this batch
-        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f").to_string();
-
-        // Phase 1: Write all snapshots to temp files
-        for (table_name, schema) in schemas.iter() {
-            if let Some(store) = stores.get(table_name) {
-                // Create table-specific snapshot directory
-                let table_snapshot_dir = snapshot_dir.join(table_name);
-                if let Err(e) = std::fs::create_dir_all(&table_snapshot_dir) {
-                    eprintln!(
-                        "Warning: Failed to create snapshot directory for {}: {}",
-                        table_name, e
-                    );
-                    all_succeeded = false;
-                    break;
-                }
-
-                // Write to .tmp file first, will rename after all succeed
-                let final_path = table_snapshot_dir.join(format!("snapshot-{}.bin", timestamp));
-                let temp_path = table_snapshot_dir.join(format!("snapshot-{}.bin.tmp", timestamp));
-
-                // Create snapshot writer for temp file with captured LSN
-                let mut writer = match super::snapshot::SnapshotWriter::with_source_lsn(
-                    &temp_path,
-                    snapshot_lsn,
-                ) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to create snapshot writer for {}: {}",
-                            table_name, e
-                        );
-                        all_succeeded = false;
-                        break;
-                    }
-                };
-
-                // Write schema
-                if let Err(e) = writer.write_schema(schema) {
-                    eprintln!("Warning: Failed to write schema for {}: {}", table_name, e);
-                    writer.fail();
-                    all_succeeded = false;
-                    break;
-                }
-
-                // Write all committed versions using commit sequence cutoff for consistency.
-                // This ensures that transactions that commit after the checkpoint but before
-                // iteration completes are excluded from the snapshot, maintaining consistency
-                // between the WAL checkpoint and the snapshot contents.
-                let mut write_error = false;
-                store.for_each_committed_version_with_cutoff(
-                    |row_id, version| {
-                        // Clone version with snapshot TxnID marker
-                        let mut snapshot_version = version.clone();
-                        snapshot_version.txn_id = -1; // Mark as snapshot version
-
-                        if let Err(e) = writer.append_row(row_id, &snapshot_version) {
-                            eprintln!("Warning: Failed to write row {} to snapshot: {}", row_id, e);
-                            write_error = true;
-                            return false; // Stop iteration
-                        }
-                        true
-                    },
-                    snapshot_commit_seq,
-                );
-
-                if write_error {
-                    writer.fail();
-                    all_succeeded = false;
-                    break;
-                }
-
-                // Finalize the snapshot (writes CRC32, syncs to disk)
-                if let Err(e) = writer.finalize() {
-                    eprintln!(
-                        "Warning: Failed to finalize snapshot for {}: {}",
-                        table_name, e
-                    );
-                    writer.fail();
-                    all_succeeded = false;
-                    break;
-                }
-
-                // Save HNSW graph files for this table (timestamped to match data snapshot)
-                if let Some(store) = stores.get(table_name) {
-                    let mut graph_error = false;
-                    for idx in store.get_all_indexes() {
-                        if idx.index_type() == crate::core::IndexType::Hnsw {
-                            if let Some(hnsw_idx) = idx
-                                .as_any()
-                                .downcast_ref::<crate::storage::index::HnswIndex>()
-                            {
-                                if hnsw_idx.node_count() > 0 {
-                                    let graph_path = table_snapshot_dir.join(format!(
-                                        "hnsw_{}-{}.bin",
-                                        idx.name(),
-                                        timestamp
-                                    ));
-                                    if let Err(e) = hnsw_idx.save_graph(&graph_path) {
-                                        eprintln!(
-                                            "Warning: Failed to save HNSW graph for {}.{}: {}",
-                                            table_name,
-                                            idx.name(),
-                                            e
-                                        );
-                                        graph_error = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if graph_error {
-                        all_succeeded = false;
-                        break;
-                    }
-                }
-
-                // Track this temp file for later rename
-                pending_snapshots.push((temp_path, final_path, table_name.clone()));
-            }
-        }
-
-        // Phase 2: If all snapshots succeeded, rename all temp files atomically
-        // Track successfully renamed files for rollback on failure
-        let mut renamed_successfully: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-
-        if all_succeeded {
-            // Collect unique directories that need syncing
-            let mut dirs_to_sync: FxHashSet<std::path::PathBuf> = FxHashSet::default();
-
-            for (temp_path, final_path, table_name) in &pending_snapshots {
-                #[cfg(any(test, feature = "test-failpoints"))]
-                if crate::test_failpoints::SNAPSHOT_RENAME_FAIL
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    all_succeeded = false;
-                    break;
-                }
-
-                if let Err(e) = std::fs::rename(temp_path, final_path) {
-                    eprintln!(
-                        "Warning: Failed to rename snapshot for {}: {}",
-                        table_name, e
-                    );
-                    // CRITICAL: Rollback all previously successful renames to maintain consistency
-                    // Without this, partial renames cause different tables to have snapshots
-                    // from different points in time, leading to data loss on recovery.
-                    for (orig_temp, renamed_final) in renamed_successfully.iter().rev() {
-                        if let Err(rollback_err) = std::fs::rename(renamed_final, orig_temp) {
-                            eprintln!(
-                                "Critical: Failed to rollback snapshot rename {:?} -> {:?}: {}",
-                                renamed_final, orig_temp, rollback_err
-                            );
-                        }
-                    }
-                    all_succeeded = false;
-                    break;
-                }
-                // Track successful rename for potential rollback
-                renamed_successfully.push((temp_path.clone(), final_path.clone()));
-                // Track the directory for syncing
-                if let Some(parent) = final_path.parent() {
-                    dirs_to_sync.insert(parent.to_path_buf());
-                }
-            }
-
-            // Sync directories to ensure renames are durable
-            // This is important on some file systems (e.g., ext4) where
-            // rename durability requires directory sync
-            if all_succeeded {
-                for dir in &dirs_to_sync {
-                    if let Ok(dir_file) = std::fs::File::open(dir) {
-                        let _ = dir_file.sync_all();
-                    }
-                }
-            }
-        }
-
-        // Phase 3: Cleanup - if anything failed, remove all temp files
-        if !all_succeeded {
-            for (temp_path, _, _) in &pending_snapshots {
-                let _ = std::fs::remove_file(temp_path);
-            }
-            eprintln!("Warning: Snapshot creation failed, all temp files cleaned up");
-            return Ok(());
-        }
-
-        // CRITICAL: Order of operations for crash safety:
-        //
-        // 1. Re-record non-snapshot DDL (indexes, views) to WAL
-        // 2. Write metadata (atomic via temp file + rename) — commits snapshot_lsn
-        // 3. Truncate WAL (safe because metadata + DDL are now durable)
-        // 4. Cleanup old snapshots LAST
-        //
-        // Steps 1→2 ordering is critical: metadata sets the snapshot_lsn from which
-        // recovery replays WAL. DDL entries before that LSN are invisible to replay.
-        // By writing DDL entries FIRST, they land at the WAL head (after snapshot_lsn),
-        // so they survive even if a crash occurs between steps 1 and 2 (metadata not
-        // yet written → recovery uses old snapshot_lsn → replays everything including
-        // the new DDL entries as harmless duplicates).
-        //
-        // Note: Each snapshot file also embeds source_lsn in its header (v3 format),
-        // providing a fallback if metadata file is corrupted. load_snapshots() uses
-        // min(metadata_lsn, min_header_lsn) to handle this case safely.
-
-        // Phase 4: Re-record non-snapshot DDL to WAL.
-        // Snapshots store schema + rows but NOT index metadata or views.
-        // Recovery replays WAL from snapshot_lsn onwards, so any CreateIndex/
-        // CreateView entries before that LSN are effectively invisible.
-        // Re-recording places fresh entries after snapshot_lsn.
-        let mut index_entries: Vec<(String, Vec<u8>)> = Vec::new();
-        for (table_name, _schema) in schemas.iter() {
-            if let Some(store) = stores.get(table_name) {
-                let _ = store.for_each_index(|index| {
-                    // Skip PK indexes — they are auto-created from schema
-                    if index.index_type() == crate::core::IndexType::PrimaryKey {
-                        return Ok(());
-                    }
-                    let index_meta = super::persistence::IndexMetadata {
-                        name: index.name().to_string(),
-                        table_name: table_name.clone(),
-                        column_names: index.column_names().to_vec(),
-                        column_ids: index.column_ids().to_vec(),
-                        data_types: index.data_types().to_vec(),
-                        is_unique: index.is_unique(),
-                        index_type: index.index_type(),
-                        hnsw_m: index.hnsw_m(),
-                        hnsw_ef_construction: index.hnsw_ef_construction(),
-                        hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
-                        hnsw_distance_metric: index.hnsw_distance_metric(),
-                    };
-                    index_entries.push((table_name.clone(), index_meta.serialize()));
-                    Ok(())
-                });
-            }
-        }
-
-        // Collect view definitions
-        let view_entries: Vec<(String, Vec<u8>)> = {
-            let views = self.views.read().unwrap();
-            views
-                .iter()
-                .map(|(name, view_def)| (name.clone(), view_def.serialize()))
-                .collect()
-        };
-
-        // Drop read locks before writing to WAL (record_ddl acquires no schema locks)
-        drop(stores);
-
-        for (table_name, data) in &index_entries {
-            if let Err(e) = self.record_ddl(table_name, WALOperationType::CreateIndex, data) {
-                eprintln!(
-                    "Warning: Failed to re-record index for {}: {}. Aborting snapshot.",
-                    table_name, e
-                );
-                return Ok(());
-            }
-        }
-
-        for (view_name, data) in &view_entries {
-            if let Err(e) = self.record_ddl(view_name, WALOperationType::CreateView, data) {
-                eprintln!(
-                    "Warning: Failed to re-record view {}: {}. Aborting snapshot.",
-                    view_name, e
-                );
-                return Ok(());
-            }
-        }
-
-        // Phase 5: Write snapshot metadata AFTER DDL re-recording.
-        // This commits the new snapshot_lsn. Until this point, recovery uses the
-        // old snapshot_lsn and replays the full WAL (including original DDL).
-        let meta_path = snapshot_dir.join("snapshot_meta.bin");
-        if let Err(e) = write_snapshot_metadata(&meta_path, snapshot_lsn) {
-            eprintln!("Warning: Failed to write snapshot metadata: {}", e);
-            return Ok(()); // Don't truncate WAL or cleanup if metadata write failed
-        }
-
-        // Phase 6: Safe WAL truncation — only truncate to second-to-last verified
-        // snapshot that will SURVIVE Phase 7 cleanup. DDL was already re-recorded
-        // above, so the new entries are safe from truncation (they're at the WAL head).
-        //
-        // Minimum 2 retained snapshots: truncation requires a second-to-last snapshot
-        // as a fallback if the latest is corrupted. Without this floor, keep_snapshots=1
-        // would prevent truncation entirely, causing unbounded WAL growth from
-        // DDL re-recording on every snapshot cycle.
-        let effective_keep = if pm.keep_count() > 0 {
-            pm.keep_count().max(2)
-        } else {
-            0 // 0 means "keep all"
-        };
-        if snapshot_lsn > 0 {
-            let active_tables: FxHashSet<&str> = schemas.keys().map(|k| k.as_str()).collect();
-            if let Some(safe_lsn) =
-                find_safe_truncation_lsn(&snapshot_dir, effective_keep, &active_tables)
-            {
-                if let Err(e) = pm.truncate_wal(safe_lsn) {
-                    eprintln!("Warning: Failed to truncate WAL after snapshot: {}", e);
-                }
-            }
-        }
-
-        // Phase 7: Cleanup old snapshots LAST (only after metadata is durable).
-        // Uses the same effective_keep as Phase 6 to ensure at least 2 snapshots
-        // survive, matching the truncation safety requirement.
-        if effective_keep > 0 {
-            for (_, _, table_name) in &pending_snapshots {
-                if let Some(schema) = schemas.get(table_name) {
-                    let disk_store =
-                        super::snapshot::DiskVersionStore::new(&snapshot_dir, table_name, schema);
-                    if let Ok(disk_store) = disk_store {
-                        if let Err(e) = disk_store.cleanup_old_snapshots(effective_keep) {
-                            eprintln!(
-                                "Warning: Failed to cleanup old snapshots for {}: {}",
-                                table_name, e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Phase 8: Remove orphaned snapshot directories from dropped tables.
-        if let Ok(entries) = std::fs::read_dir(&snapshot_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                        if !schemas.contains_key(dir_name) {
-                            let _ = std::fs::remove_dir_all(&path);
-                        }
-                    }
-                }
-            }
-        }
-
+    fn force_checkpoint_cycle(&self) -> Result<()> {
+        MVCCEngine::checkpoint_cycle_inner(self, true)?;
+        self.compact_after_checkpoint_forced();
         Ok(())
+    }
+
+    fn create_snapshot(&self) -> Result<()> {
+        MVCCEngine::create_backup_snapshot(self)
+    }
+
+    fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
+        MVCCEngine::restore_from_snapshot(self, timestamp)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3420,10 +5886,35 @@ impl Engine for MVCCEngine {
     }
 
     fn record_truncate_table(&self, table_name: &str) -> Result<()> {
-        if self.should_skip_wal() {
-            return Ok(());
+        let table_lower = table_name.to_lowercase();
+
+        // WAL FIRST: record the truncate before deleting segment files.
+        // If crash happens after WAL but before file deletion, WAL replay
+        // will re-execute the truncate. Orphan files are harmless.
+        if !self.should_skip_wal() {
+            self.record_ddl(table_name, WALOperationType::TruncateTable, &[])?;
         }
-        self.record_ddl(table_name, WALOperationType::TruncateTable, &[])
+
+        // Clear in-memory segment state
+        {
+            let mgrs = self.segment_managers.read().unwrap();
+            if let Some(mgr) = mgrs.get(&table_lower) {
+                mgr.clear();
+            }
+        }
+
+        // Delete volume files from disk (standalone volumes + legacy tombstones)
+        if let Some(ref pm) = *self.persistence {
+            if pm.is_enabled() {
+                let vol_dir = pm.path().join("volumes");
+                let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_lower);
+                let snapshot_dir = pm.path().join("snapshots");
+                let ts_path = snapshot_dir.join(&table_lower).join("tombstones.dat");
+                let _ = std::fs::remove_file(ts_path);
+            }
+        }
+
+        Ok(())
     }
 
     fn fetch_rows_by_ids(&self, table_name: &str, row_ids: &[i64]) -> Result<crate::core::RowVec> {
@@ -3432,12 +5923,26 @@ impl Engine for MVCCEngine {
         }
 
         let store = self.get_version_store(table_name)?;
-
-        // Use a high txn_id to see the latest committed version
-        // INVALID_TRANSACTION_ID + 1 will see all committed transactions
         let read_txn_id = INVALID_TRANSACTION_ID + 1;
+        let mut result = store.get_visible_versions_batch(row_ids, read_txn_id);
 
-        Ok(store.get_visible_versions_batch(row_ids, read_txn_id))
+        // Fall back to cold segments for rows not found in hot
+        if result.len() < row_ids.len() {
+            let mgr = self.get_or_create_segment_manager(table_name);
+            if mgr.has_segments() {
+                let schema = store.schema().clone();
+                let found_ids: rustc_hash::FxHashSet<i64> =
+                    result.iter().map(|(id, _)| *id).collect();
+                for &rid in row_ids {
+                    if !found_ids.contains(&rid) {
+                        if let Some(row) = mgr.get_cold_row_normalized(rid, &schema) {
+                            result.push((rid, row));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     fn get_row_fetcher(
@@ -3448,16 +5953,25 @@ impl Engine for MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
 
-        // Get the version store reference once
         let store = self.get_version_store(table_name)?;
-
-        // Use a high txn_id to see the latest committed version
+        let mgr = self.get_or_create_segment_manager(table_name);
+        let schema = store.schema().clone();
         let read_txn_id = INVALID_TRANSACTION_ID + 1;
 
-        // Return a closure that captures the store and can be called repeatedly
-        // without the overhead of looking up the version store each time
         Ok(Box::new(move |row_ids: &[i64]| {
-            store.get_visible_versions_batch(row_ids, read_txn_id)
+            let mut result = store.get_visible_versions_batch(row_ids, read_txn_id);
+            if result.len() < row_ids.len() && mgr.has_segments() {
+                let found_ids: rustc_hash::FxHashSet<i64> =
+                    result.iter().map(|(id, _)| *id).collect();
+                for &rid in row_ids {
+                    if !found_ids.contains(&rid) {
+                        if let Some(row) = mgr.get_cold_row_normalized(rid, &schema) {
+                            result.push((rid, row));
+                        }
+                    }
+                }
+            }
+            result
         }))
     }
 
@@ -3471,15 +5985,20 @@ impl Engine for MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
 
-        // Get the version store reference once
         let store = self.get_version_store(table_name)?;
-
-        // Use a high txn_id to see the latest committed version
+        let mgr = self.get_or_create_segment_manager(table_name);
         let read_txn_id = INVALID_TRANSACTION_ID + 1;
 
-        // Return a closure that counts visible rows without cloning their data
         Ok(Box::new(move |row_ids: &[i64]| {
-            store.count_visible_versions_batch(row_ids, read_txn_id)
+            let mut count = store.count_visible_versions_batch(row_ids, read_txn_id);
+            if count < row_ids.len() && mgr.has_segments() {
+                for &rid in row_ids {
+                    if !store.has_committed_row(rid) && mgr.row_exists(rid) {
+                        count += 1;
+                    }
+                }
+            }
+            count
         }))
     }
 }
@@ -3529,8 +6048,22 @@ impl MVCCEngine {
         total_cleaned
     }
 
+    /// No-op: in the new tombstone design, cold deletes are not tracked
+    /// per-transaction. Kept for API compatibility.
+    pub fn cleanup_abandoned_cold_deletes(&self) {
+        // Intentionally empty.
+    }
+
     /// Manual VACUUM: cleanup deleted rows, old versions, and stale transactions.
     ///
+    /// Get the oldest snapshot timestamp that was loaded during startup.
+    /// Used by CLI restore to pick the correct DDL file after Database::open()
+    /// has determined which snapshots were actually loadable.
+    pub fn oldest_loaded_snapshot_timestamp(&self) -> Option<String> {
+        let ts = self.snapshot_timestamps.read().unwrap();
+        ts.values().min().cloned()
+    }
+
     /// When `table_name` is `Some`, only that table is vacuumed.
     /// Returns `(deleted_rows_cleaned, old_versions_cleaned, transactions_cleaned)`.
     pub fn vacuum(
@@ -3562,6 +6095,8 @@ impl MVCCEngine {
                 versions_cleaned += store.cleanup_old_previous_versions_with_retention(retention);
             }
         }
+
+        drop(stores);
 
         Ok((rows_cleaned, versions_cleaned, txn_cleaned))
     }
@@ -3651,6 +6186,11 @@ struct EngineOperations {
     persistence: Arc<Option<PersistenceManager>>,
     /// Shared reference to loading_from_disk flag
     loading_from_disk: Arc<AtomicBool>,
+    /// Shared reference to segment managers
+    segment_managers:
+        Arc<RwLock<FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>>>,
+    /// Seal fence for WAL truncation safety
+    seal_fence: Arc<parking_lot::RwLock<()>>,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
@@ -3664,6 +6204,8 @@ impl EngineOperations {
             txn_version_stores: Arc::clone(&engine.txn_version_stores),
             persistence: Arc::clone(&engine.persistence),
             loading_from_disk: Arc::clone(&engine.loading_from_disk),
+            segment_managers: Arc::clone(&engine.segment_managers),
+            seal_fence: Arc::clone(&engine.seal_fence),
         }
     }
 
@@ -3757,7 +6299,10 @@ impl TransactionEngineOperations for EngineOperations {
                         Arc::clone(&version_store),
                         txn_id,
                     )));
-                    txn_tables.push((table_name_lower.into_owned().into(), Arc::clone(&new_store)));
+                    txn_tables.push((
+                        table_name_lower.clone().into_owned().into(),
+                        Arc::clone(&new_store),
+                    ));
                     new_store
                 }
             }
@@ -3765,6 +6310,32 @@ impl TransactionEngineOperations for EngineOperations {
 
         // Create MVCC table with shared transaction version store
         let table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
+
+        // If segments exist for this table, wrap in SegmentedTable.
+        // For snapshot isolation transactions, pass the begin_seq so tombstone
+        // filtering respects the snapshot's point-in-time view of cold data.
+        let mgrs = self.segment_managers.read().unwrap();
+        if let Some(mgr) = mgrs.get(&*table_name_lower) {
+            if mgr.has_segments() {
+                let mgr = Arc::clone(mgr);
+                drop(mgrs);
+                if self.registry.get_isolation_level(txn_id)
+                    == crate::IsolationLevel::SnapshotIsolation
+                {
+                    let begin_seq = self.registry.get_transaction_begin_sequence(txn_id) as u64;
+                    return Ok(Box::new(
+                        crate::storage::volume::table::SegmentedTable::with_snapshot_seq(
+                            Box::new(table),
+                            mgr,
+                            begin_seq,
+                        ),
+                    ));
+                }
+                return Ok(Box::new(
+                    crate::storage::volume::table::SegmentedTable::new(Box::new(table), mgr),
+                ));
+            }
+        }
 
         Ok(Box::new(table))
     }
@@ -3824,6 +6395,32 @@ impl TransactionEngineOperations for EngineOperations {
             }
         }
 
+        // Record DDL to WAL so the drop survives crash recovery
+        if !self.should_skip_wal() {
+            if let Some(ref pm) = *self.persistence() {
+                if pm.is_enabled() {
+                    let _ = pm.record_ddl_operation(name, WALOperationType::DropTable, &[]);
+                }
+            }
+        }
+
+        // Clear in-memory segment state (prevents phantom rows on re-create)
+        {
+            let mut mgrs = self.segment_managers.write().unwrap();
+            if let Some(mgr) = mgrs.get(&table_name_lower) {
+                mgr.clear();
+            }
+            mgrs.remove(&table_name_lower);
+        }
+
+        // Delete volume files from disk
+        if let Some(ref pm) = *self.persistence() {
+            if pm.is_enabled() {
+                let vol_dir = pm.path().join("volumes");
+                let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_name_lower);
+            }
+        }
+
         Ok(())
     }
 
@@ -3857,14 +6454,77 @@ impl TransactionEngineOperations for EngineOperations {
         {
             let mut stores = self.version_stores().write().unwrap();
             if let Some(store) = stores.remove(&old_name_lower) {
-                // Also update the version store's internal schema
                 {
                     let mut vs_schema_guard = store.schema_mut();
                     let schema = CompactArc::make_mut(&mut *vs_schema_guard);
                     schema.table_name = new_name.to_string();
                     schema.table_name_lower = new_name_lower.clone();
                 }
-                stores.insert(new_name_lower, store);
+                stores.insert(new_name_lower.clone(), store);
+            }
+        }
+
+        // Move segment manager to new name and update its manifest table_name
+        // (persist() uses manifest.table_name for the on-disk directory)
+        {
+            let mut mgrs = self.segment_managers.write().unwrap();
+            if let Some(mgr) = mgrs.remove(&old_name_lower) {
+                mgr.manifest_mut().table_name =
+                    crate::common::SmartString::from(new_name_lower.as_str());
+                mgrs.insert(new_name_lower.clone(), mgr);
+            }
+        }
+        // Rename on-disk volume directory and tombstones
+        if let Some(ref pm) = *self.persistence {
+            if pm.is_enabled() {
+                let vol_dir = pm.path().join("volumes");
+                let old_dir = vol_dir.join(&old_name_lower);
+                let new_dir = vol_dir.join(&new_name_lower);
+                if old_dir.exists() {
+                    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                        // Revert ALL in-memory renames on disk failure
+                        {
+                            let mut schemas = self.schemas().write().unwrap();
+                            if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
+                                let schema = CompactArc::make_mut(&mut schema_arc);
+                                schema.table_name = old_name.to_string();
+                                schema.table_name_lower = old_name_lower.clone();
+                                schemas.insert(old_name_lower.clone(), schema_arc);
+                            }
+                        }
+                        {
+                            let mut stores = self.version_stores().write().unwrap();
+                            if let Some(store) = stores.remove(&new_name_lower) {
+                                {
+                                    let mut vs_schema_guard = store.schema_mut();
+                                    let schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                                    schema.table_name = old_name.to_string();
+                                    schema.table_name_lower = old_name_lower.clone();
+                                }
+                                stores.insert(old_name_lower.clone(), store);
+                            }
+                        }
+                        {
+                            let mut mgrs = self.segment_managers.write().unwrap();
+                            if let Some(mgr) = mgrs.remove(&new_name_lower) {
+                                mgr.manifest_mut().table_name =
+                                    crate::common::SmartString::from(old_name_lower.as_str());
+                                mgrs.insert(old_name_lower.clone(), mgr);
+                            }
+                        }
+                        return Err(Error::Internal {
+                            message: format!("Failed to rename volume directory: {}", e),
+                        });
+                    }
+                }
+                let snap_dir = pm.path().join("snapshots");
+                let old_ts = snap_dir.join(&old_name_lower).join("tombstones.dat");
+                let new_ts_dir = snap_dir.join(&new_name_lower);
+                let new_ts = new_ts_dir.join("tombstones.dat");
+                if old_ts.exists() {
+                    let _ = std::fs::create_dir_all(&new_ts_dir);
+                    let _ = std::fs::rename(&old_ts, &new_ts);
+                }
             }
         }
 
@@ -3952,22 +6612,21 @@ impl TransactionEngineOperations for EngineOperations {
     fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn Table>>> {
         let mut tables = Vec::new();
 
-        // O(1) lookup for this transaction's tables
+        // O(1) lookup for this transaction's tables (hot changes)
         let cache = self.txn_version_stores().read().unwrap();
 
         if let Some(txn_tables) = cache.get(txn_id) {
             for (table_name, txn_store) in txn_tables.iter() {
-                // Check if this store has pending changes
-                let store = txn_store.read().unwrap();
-                if store.has_local_changes() {
-                    drop(store);
+                let has_hot = {
+                    let store = txn_store.read().unwrap();
+                    store.has_local_changes()
+                };
 
-                    // Get the version store for this table
+                if has_hot {
                     let stores = self.version_stores().read().unwrap();
                     if let Some(version_store) = stores.get(table_name.as_str()).cloned() {
                         drop(stores);
 
-                        // Create a table instance with shared transaction store
                         let table = MVCCTable::new_with_shared_store(
                             txn_id,
                             Arc::clone(&version_store),
@@ -3984,12 +6643,38 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn has_pending_dml_changes(&self, txn_id: i64) -> bool {
-        // O(1) lookup by txn_id
+        // Check hot-side DML changes
         let cache = self.txn_version_stores().read().unwrap();
-        if let Some(txn_tables) = cache.get(txn_id) {
-            for (_table_name, txn_store) in txn_tables.iter() {
-                let store = txn_store.read().unwrap();
-                if store.has_local_changes() {
+        let txn_tables = match cache.get(txn_id) {
+            Some(tables) if !tables.is_empty() => tables,
+            _ => {
+                // No txn_version_store entry means this txn never accessed any table
+                // for DML, so no pending tombstones can exist either.
+                return false;
+            }
+        };
+
+        // Phase 1: Check hot mutations. Return immediately if any found.
+        // Do NOT collect table names here — avoids SmartString clones
+        // on the common early-return path.
+        for (_, txn_store) in txn_tables.iter() {
+            if txn_store.read().unwrap().has_local_changes() {
+                return true;
+            }
+        }
+
+        // Phase 2: No hot changes found. Now collect table names for cold check.
+        let touched_tables: smallvec::SmallVec<[crate::common::SmartString; 4]> =
+            txn_tables.iter().map(|(name, _)| name.clone()).collect();
+        drop(cache);
+
+        // Check cold-side pending tombstones only for tables this txn touched.
+        // Cold DELETE/UPDATE on non-int-pk tables may create tombstones without
+        // hot mutations, but they always go through get_table_for_transaction first.
+        let mgrs = self.segment_managers.read().unwrap();
+        for table_name in &touched_tables {
+            if let Some(mgr) = mgrs.get(table_name.as_str()) {
+                if mgr.has_pending_tombstones(txn_id) {
                     return true;
                 }
             }
@@ -3998,81 +6683,239 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>) {
-        // O(1) lookup by txn_id using nested HashMap
-        let cache = self.txn_version_stores().read().unwrap();
+        // Get the commit_seq for this transaction. start_commit() was called before us,
+        // so the commit_seq is in the registry. Used for versioned tombstones: snapshot
+        // isolation transactions only see tombstones with commit_seq <= their begin_seq.
+        let commit_seq = self.registry.get_committing_sequence(txn_id) as u64;
+
+        // Collect table data under the read lock, then drop the lock before WAL I/O.
+        // This prevents blocking concurrent get_table_for_transaction (which needs
+        // a write lock on txn_version_stores) during potentially slow WAL writes.
+        let tables_to_commit: Vec<(
+            crate::common::SmartString,
+            Arc<RwLock<TransactionVersionStore>>,
+            Arc<VersionStore>,
+        )>;
+        {
+            let cache = self.txn_version_stores().read().unwrap();
+            tables_to_commit = if let Some(txn_tables) = cache.get(txn_id) {
+                let stores = self.version_stores().read().unwrap();
+                txn_tables
+                    .iter()
+                    .filter(|(_, txn_store)| {
+                        let store = txn_store.read().unwrap();
+                        store.has_local_changes()
+                    })
+                    .filter_map(|(table_name, txn_store)| {
+                        stores
+                            .get(table_name.as_str())
+                            .cloned()
+                            .map(|vs| (table_name.clone(), Arc::clone(txn_store), vs))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // cache (read lock) and stores (read lock) dropped here
+        }
 
         let mut commit_error: Option<crate::core::Error> = None;
         let mut any_committed = false;
+        let mut tombstones_wal_recorded: rustc_hash::FxHashSet<String> =
+            rustc_hash::FxHashSet::default();
 
-        if let Some(txn_tables) = cache.get(txn_id) {
-            // Check if WAL recording is needed (persistence enabled and not in recovery)
-            let should_record_wal = !self.should_skip_wal()
+        // Check if WAL recording is needed (persistence enabled and not in recovery)
+        let should_record_wal = !self.should_skip_wal()
+            && self
+                .persistence()
+                .as_ref()
+                .is_some_and(|pm| pm.is_enabled());
+
+        // Collect Arc clones of segment managers, then drop the read lock
+        // before WAL I/O to avoid blocking seal/compaction writes.
+        let commit_mgrs: ahash::AHashMap<
+            String,
+            Arc<crate::storage::volume::manifest::SegmentManager>,
+        > = {
+            let mgrs = self.segment_managers.read().unwrap();
+            mgrs.iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
+        };
+
+        // WAL I/O and table commits happen here with NO lock on txn_version_stores
+        for (table_name, txn_store, version_store) in &tables_to_commit {
+            // Record cold tombstone DELETEs to WAL FIRST.
+            // These must come before hot INSERTs so that on replay,
+            // the tombstone marks the cold row as superseded BEFORE
+            // the new hot version is encountered.
+            if should_record_wal {
+                if let Some(mgr) = commit_mgrs.get(table_name.as_str()) {
+                    let pending = mgr.get_pending_tombstones(txn_id);
+                    if !pending.is_empty() {
+                        if let Some(ref pm) = *self.persistence() {
+                            for &row_id in &pending {
+                                let version = crate::storage::mvcc::version_store::RowVersion {
+                                    txn_id,
+                                    deleted_at_txn_id: txn_id,
+                                    data: crate::core::Row::new(),
+                                    create_time: 0,
+                                };
+                                if let Err(e) = pm.record_dml_operation(
+                                    txn_id,
+                                    table_name,
+                                    row_id,
+                                    crate::storage::mvcc::wal_manager::WALOperationType::Delete,
+                                    &version,
+                                ) {
+                                    commit_error = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if commit_error.is_some() {
+                    break;
+                }
+            }
+
+            // Create table and commit through it (updates indexes)
+            let mut table = MVCCTable::new_with_shared_store(
+                txn_id,
+                Arc::clone(version_store),
+                Arc::clone(txn_store),
+            );
+
+            // Record hot pending versions to WAL (after tombstone DELETEs)
+            if should_record_wal {
+                if let Err(e) = self.record_table_to_wal(txn_id, &table) {
+                    commit_error = Some(e);
+                    break;
+                }
+            }
+
+            if let Err(e) = table.commit() {
+                commit_error = Some(e);
+                break;
+            }
+
+            // Mark tombstones as WAL-recorded ONLY after table.commit() succeeds.
+            // Before this fix, the mark was set before commit, so a failed commit
+            // would still apply tombstones in the tail loop — hiding cold rows
+            // without the update version to replace them.
+            if should_record_wal {
+                tombstones_wal_recorded.insert(table_name.to_string());
+            }
+
+            any_committed = true;
+        }
+
+        // Always cleanup txn_version_stores to prevent memory leak,
+        // even if commit failed partway through
+        let mut cache = self.txn_version_stores().write().unwrap();
+        cache.remove(txn_id);
+        drop(cache);
+
+        drop(tables_to_commit);
+
+        // Commit or rollback pending tombstones on all segment managers.
+        // For tables with hot changes, tombstone WAL entries were already
+        // recorded in the per-table loop above. For cold-only changes
+        // (no hot), record tombstones here.
+        //
+        // On partial failure: tables whose hot changes were already committed
+        // (tracked in tombstones_wal_recorded) must have their tombstones
+        // committed too, not rolled back. Rolling back tombstones on an
+        // already-committed table would leave stale cold rows visible.
+        {
+            let should_record_wal = commit_error.is_none()
+                && !self.should_skip_wal()
                 && self
                     .persistence()
                     .as_ref()
                     .is_some_and(|pm| pm.is_enabled());
 
-            for (table_name, txn_store) in txn_tables.iter() {
-                // Check if there are local changes before committing
-                let has_changes = {
-                    let store = txn_store.read().unwrap();
-                    store.has_local_changes()
-                };
-
-                if has_changes {
-                    // Get the version store for this table
-                    let stores = self.version_stores().read().unwrap();
-                    if let Some(version_store) = stores.get(table_name.as_str()).cloned() {
-                        drop(stores);
-
-                        // Create table and commit through it (updates indexes)
-                        let mut table = MVCCTable::new_with_shared_store(
-                            txn_id,
-                            Arc::clone(&version_store),
-                            Arc::clone(txn_store),
-                        );
-
-                        // Record to WAL BEFORE commit (while pending versions still exist)
-                        if should_record_wal {
-                            if let Err(e) = self.record_table_to_wal(txn_id, &table) {
-                                commit_error = Some(e);
-                                break;
+            // Reuse the commit_mgrs read lock acquired before the commit loop
+            for (table_name, mgr) in commit_mgrs.iter() {
+                if commit_error.is_none() {
+                    // Record cold-only tombstones to WAL (tables not already handled above)
+                    if should_record_wal && !tombstones_wal_recorded.contains(table_name.as_str()) {
+                        let pending = mgr.get_pending_tombstones(txn_id);
+                        if !pending.is_empty() {
+                            if let Some(ref pm) = *self.persistence() {
+                                for &row_id in &pending {
+                                    let version = crate::storage::mvcc::version_store::RowVersion {
+                                        txn_id,
+                                        deleted_at_txn_id: txn_id,
+                                        data: crate::core::Row::new(),
+                                        create_time: 0,
+                                    };
+                                    if let Err(e) = pm.record_dml_operation(
+                                        txn_id,
+                                        table_name,
+                                        row_id,
+                                        crate::storage::mvcc::wal_manager::WALOperationType::Delete,
+                                        &version,
+                                    ) {
+                                        commit_error = Some(e);
+                                        break;
+                                    }
+                                }
                             }
                         }
-
-                        if let Err(e) = table.commit() {
-                            commit_error = Some(e);
-                            break;
-                        }
-
-                        any_committed = true;
                     }
+                    if commit_error.is_some() {
+                        mgr.rollback_pending_tombstones(txn_id);
+                    } else {
+                        mgr.commit_pending_tombstones(txn_id, commit_seq);
+                    }
+                } else if tombstones_wal_recorded.contains(table_name.as_str()) {
+                    // This table's hot changes were already committed and its
+                    // tombstones were WAL-recorded. Commit (not rollback) its
+                    // tombstones to keep cold state consistent with hot.
+                    mgr.commit_pending_tombstones(txn_id, commit_seq);
+                } else {
+                    mgr.rollback_pending_tombstones(txn_id);
                 }
             }
         }
-
-        // Always cleanup txn_version_stores to prevent memory leak,
-        // even if commit failed partway through
-        drop(cache);
-        let mut cache = self.txn_version_stores().write().unwrap();
-        cache.remove(txn_id);
-        drop(cache);
 
         (any_committed, commit_error)
     }
 
     fn rollback_all_tables(&self, txn_id: i64) {
-        // O(1) cleanup - remove entire transaction entry from txn_version_stores
-        // This prevents memory leaks when transactions are rolled back
+        // Collect touched table names BEFORE removing the cache entry,
+        // so we only rollback tombstones on tables this txn actually used
+        // instead of iterating every segment manager (O(tables) → O(touched)).
         let mut cache = self.txn_version_stores().write().unwrap();
+        let touched: smallvec::SmallVec<[crate::common::SmartString; 4]> = cache
+            .get(txn_id)
+            .map(|tables| tables.iter().map(|(name, _)| name.clone()).collect())
+            .unwrap_or_default();
         cache.remove(txn_id);
+        drop(cache);
+
+        // Rollback pending tombstones only on tables this transaction touched
+        if !touched.is_empty() {
+            let mgrs = self.segment_managers.read().unwrap();
+            for name in &touched {
+                if let Some(mgr) = mgrs.get(name.as_str()) {
+                    mgr.rollback_pending_tombstones(txn_id);
+                }
+            }
+        }
+    }
+
+    fn acquire_seal_fence(&self) -> Option<SealFenceGuard> {
+        Some(SealFenceGuard::new(Arc::clone(&self.seal_fence)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{DataType, Row, SchemaBuilder, Value};
+    use crate::core::{DataType, IndexType, Row, SchemaBuilder, Value};
 
     #[test]
     fn test_engine_creation() {
@@ -4317,6 +7160,253 @@ mod tests {
         assert!(engine.create_snapshot().is_ok());
 
         engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_restart_merges_snapshot_and_newer_standalone_volume_without_duplicates() {
+        fn count_rows(engine: &MVCCEngine, table_name: &str) -> i64 {
+            let tx = engine.begin_transaction().unwrap();
+            let table = tx.get_table(table_name).unwrap();
+            let mut scanner = table.scan(&[0], None).unwrap();
+            let mut count = 0i64;
+            while scanner.next() {
+                count += 1;
+            }
+            count
+        }
+
+        fn pseudo_random_payload(seed: i64, chunks: usize) -> String {
+            let mut state = seed as u64 ^ 0x9E37_79B9_7F4A_7C15;
+            let mut payload = String::with_capacity(chunks * 16);
+            for _ in 0..chunks {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                payload.push_str(&format!("{:016x}", state));
+            }
+            payload
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("volume_restart_dedupe");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let config = Config::with_path(&db_path_str);
+        let engine = MVCCEngine::new(config);
+        engine.open_engine().unwrap();
+
+        let schema = SchemaBuilder::new("items")
+            .column("id", DataType::Integer, false, true)
+            .column("note", DataType::Text, false, false)
+            .build();
+        engine.create_table(schema).unwrap();
+
+        {
+            let mut tx = engine.begin_transaction().unwrap();
+            let mut table = tx.get_table("items").unwrap();
+            for i in 0..100_000i64 {
+                table
+                    .insert(Row::from_values(vec![
+                        Value::Integer(i),
+                        Value::text(pseudo_random_payload(i, 16)),
+                    ]))
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        // Checkpoint cycle: seals hot rows into frozen volumes and persists manifests.
+        engine.checkpoint_cycle().unwrap();
+        let vol_dir = db_path.join("volumes");
+        assert!(
+            !crate::storage::volume::io::list_volumes(&vol_dir, "items").is_empty(),
+            "expected sealed standalone volume after checkpoint cycle"
+        );
+
+        // Verify manifest was persisted with checkpoint_lsn
+        let manifest_path = vol_dir.join("items").join("manifest.bin");
+        assert!(
+            manifest_path.exists(),
+            "expected manifest.bin after checkpoint cycle"
+        );
+
+        engine.close_engine().unwrap();
+
+        let reopen_config = Config::with_path(&db_path_str);
+        let reopened = MVCCEngine::new(reopen_config);
+        reopened.open_engine().unwrap();
+        assert_eq!(count_rows(&reopened, "items"), 100_000);
+        reopened.close_engine().unwrap();
+    }
+
+    #[test]
+    fn test_btree_index_on_volume_backed_table_covers_hot_rows_only() {
+        // In the new architecture, hot indexes only cover hot rows.
+        // Cold data is accessed via segment zone maps, binary search, and dictionary filters.
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+
+        let schema = SchemaBuilder::new("items")
+            .column("id", DataType::Integer, false, true)
+            .column("age", DataType::Integer, false, false)
+            .build();
+        engine.create_table(schema.clone()).unwrap();
+
+        let mut builder = crate::storage::volume::writer::VolumeBuilder::new(&schema);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(1), Value::Integer(30)]),
+        );
+        builder.add_row(
+            2,
+            &Row::from_values(vec![Value::Integer(2), Value::Integer(45)]),
+        );
+        engine.register_volume("items", Arc::new(builder.finish()));
+
+        let tx = engine.begin_transaction().unwrap();
+        let table = tx.get_table("items").unwrap();
+        table.create_btree_index("age", false, None).unwrap();
+
+        // Hot index should be empty (no hot rows)
+        let index = table
+            .get_index_on_column("age")
+            .expect("btree index should exist");
+        let row_ids = index.get_row_ids_equal(&[Value::Integer(30)]);
+        assert!(
+            row_ids.is_empty(),
+            "hot index should not contain volume rows"
+        );
+
+        // But full table scan should still find volume rows
+        let rows = table.collect_all_rows(None).unwrap();
+        assert_eq!(rows.len(), 2, "scan should merge volume + hot rows");
+
+        engine.close_engine().unwrap();
+    }
+
+    #[test]
+    fn test_unique_index_rejects_duplicate_cold_data() {
+        // CREATE UNIQUE INDEX must validate cold volume data for duplicates.
+        // If cold data already has duplicate values, the unique index must be rejected.
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+
+        let schema = SchemaBuilder::new("items")
+            .column("id", DataType::Integer, false, true)
+            .column("dup", DataType::Text, false, false)
+            .build();
+        engine.create_table(schema.clone()).unwrap();
+
+        let mut builder = crate::storage::volume::writer::VolumeBuilder::new(&schema);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(1), Value::text("dup")]),
+        );
+        builder.add_row(
+            2,
+            &Row::from_values(vec![Value::Integer(2), Value::text("dup")]),
+        );
+        engine.register_volume("items", Arc::new(builder.finish()));
+
+        let tx = engine.begin_transaction().unwrap();
+        let table = tx.get_table("items").unwrap();
+        let result = table.create_index("idx_dup_unique", &["dup"], true);
+        assert!(
+            result.is_err(),
+            "unique index creation should fail when cold data has duplicates"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unique constraint"));
+
+        engine.close_engine().unwrap();
+    }
+
+    #[test]
+    fn test_unique_index_succeeds_on_distinct_cold_data() {
+        // CREATE UNIQUE INDEX should succeed when cold data has no duplicates.
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+
+        let schema = SchemaBuilder::new("items")
+            .column("id", DataType::Integer, false, true)
+            .column("name", DataType::Text, false, false)
+            .build();
+        engine.create_table(schema.clone()).unwrap();
+
+        let mut builder = crate::storage::volume::writer::VolumeBuilder::new(&schema);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(1), Value::text("alice")]),
+        );
+        builder.add_row(
+            2,
+            &Row::from_values(vec![Value::Integer(2), Value::text("bob")]),
+        );
+        engine.register_volume("items", Arc::new(builder.finish()));
+
+        let tx = engine.begin_transaction().unwrap();
+        let table = tx.get_table("items").unwrap();
+        let result = table.create_index("idx_name_unique", &["name"], true);
+        assert!(
+            result.is_ok(),
+            "unique index creation should succeed when cold data is distinct"
+        );
+
+        engine.close_engine().unwrap();
+    }
+
+    #[test]
+    fn test_hnsw_index_on_volume_backed_table_populates_cold() {
+        // HNSW indexes must include cold data because vector similarity search
+        // cannot fall back to zone maps like B-tree/Hash indexes can.
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+
+        let schema = SchemaBuilder::new("items")
+            .column("id", DataType::Integer, false, true)
+            .column("embedding", DataType::Vector, false, false)
+            .set_last_vector_dimensions(2)
+            .build();
+        engine.create_table(schema.clone()).unwrap();
+
+        let mut builder = crate::storage::volume::writer::VolumeBuilder::new(&schema);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(1), Value::vector(vec![1.0, 0.0])]),
+        );
+        engine.register_volume("items", Arc::new(builder.finish()));
+
+        let tx = engine.begin_transaction().unwrap();
+        let table = tx.get_table("items").unwrap();
+        table
+            .create_index_with_type(
+                "idx_embedding",
+                &["embedding"],
+                false,
+                Some(IndexType::Hnsw),
+            )
+            .unwrap();
+
+        // HNSW index should include cold data after creation
+        let index = table
+            .get_index_on_column("embedding")
+            .expect("hnsw index should exist");
+        let results = index
+            .search_nearest(&Value::vector(vec![1.0, 0.0]), 1, 32)
+            .unwrap_or_default();
+        assert_eq!(
+            results.len(),
+            1,
+            "HNSW index should include cold volume rows"
+        );
+
+        // Full table scan also returns volume data
+        let rows = table.collect_all_rows(None).unwrap();
+        assert_eq!(rows.len(), 1, "scan should find volume rows");
+
+        engine.close_engine().unwrap();
     }
 
     #[test]
