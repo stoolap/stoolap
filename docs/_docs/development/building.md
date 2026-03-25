@@ -188,7 +188,7 @@ cargo run --features cli -- --help
 
 # As a library (default in your Cargo.toml)
 # [dependencies]
-# stoolap = "0.3"
+# stoolap = "0.4"
 ```
 
 ## CI Profiles

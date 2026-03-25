@@ -602,6 +602,14 @@ impl ColumnBloomFilter {
         self.add_raw(5, &nanos.to_le_bytes());
     }
 
+    /// Add the no-op Extension hash (tag 0, no payload). All Extension
+    /// values hash identically in bloom filters. This avoids constructing
+    /// a Value::Extension(CompactArc) per cell during volume freeze.
+    #[inline]
+    pub fn add_extension_noop(&mut self) {
+        self.add_raw(0, &[]);
+    }
+
     fn insert_hash(&mut self, h: u64) {
         let h1 = h as usize;
         let h2 = (h >> 32) as usize;
@@ -739,6 +747,13 @@ impl ColumnBloomFilter {
                 mix(&mut h, &nanos.to_le_bytes());
             }
             _ => {
+                // Extension (JSON, Vector) and Null all hash to tag 0.
+                // Extension values cannot be meaningfully distinguished by
+                // bloom filters yet — all hash identically. This is
+                // intentional: changing the tag would break pruning on
+                // volumes persisted with the old hash. A future format
+                // version can introduce per-value Extension hashing with
+                // a bloom filter rebuild on load.
                 mix(&mut h, &[0]);
             }
         }

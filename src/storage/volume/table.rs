@@ -1435,39 +1435,26 @@ impl Table for SegmentedTable {
 
         let target = limit + offset;
 
-        // Phase 0: Collect hot rows (already in row_id order from BTree).
-        let hot_rows = self.hot.collect_rows_with_limit(where_expr, target, 0)?;
-        if hot_rows.len() >= target {
-            return Ok(hot_rows.into_iter().skip(offset).take(limit).collect());
-        }
-
         let volumes = self.segment_mgr.get_volumes_newest_first();
         if volumes.is_empty() {
-            return Ok(hot_rows.into_iter().skip(offset).take(limit).collect());
+            return self.hot.collect_rows_with_limit(where_expr, limit, offset);
         }
 
-        // Phase 1: Build authority map (row_id → vol_index in newest-first order).
-        // Only row_ids are touched — no row materialization, no Value construction.
-        // Hot row_ids derived from actual hot scan results (not a separate B-tree
-        // read) to avoid race with concurrent remove_sealed_rows.
+        // Phase 1: Build authority map (row_id → volume index).
+        // Iterates cold row_ids newest-first so newer volumes win dedup.
+        // Uses has_row_id() B-tree point lookup for hot check instead
+        // of collecting all hot row_ids. Cost: O(cold_ids) integer ops.
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut hot_rids: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
-        for &(id, _) in &hot_rows {
-            hot_rids.insert(id);
-        }
         let mut pending_tomb: FxHashSet<i64> = FxHashSet::default();
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut pending_tomb);
 
-        // Map: row_id → index in the newest-first volumes vec.
-        // First insertion wins (newest source is authoritative).
         let total_cold_rows: usize = volumes.iter().map(|(_, v)| v.row_count).sum();
         let mut authority: FxHashMap<i64, usize> =
             FxHashMap::with_capacity_and_hasher(total_cold_rows.min(500_000), Default::default());
         for (nf_idx, (_, vol)) in volumes.iter().enumerate() {
             for &rid in &vol.row_ids {
-                if hot_rids.contains(&rid)
+                if self.hot.has_row_id(rid)
                     || self.is_row_tombstoned(&tombstones_arc, rid)
                     || pending_tomb.contains(&rid)
                 {
@@ -1477,19 +1464,17 @@ impl Table for SegmentedTable {
             }
         }
 
-        // Phase 2: Iterate oldest-first, materialize only rows this volume owns.
-        let remaining = target - hot_rows.len();
-        let mut cold_rows = RowVec::with_capacity(remaining.min(1024));
+        // Phase 2: Iterate oldest-first, materialize only authoritative
+        // rows, stop as soon as we have `target` matches.
+        let mut cold_rows = RowVec::with_capacity(target.min(1024));
         let current_schema = self.hot.schema();
 
-        // Zone-map + bloom filter setup for pruning
         let comparisons = where_expr
             .map(|e| e.collect_comparisons())
             .unwrap_or_default();
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
 
         'done: for (nf_idx, (_, vol)) in volumes.iter().enumerate().rev() {
-            // Zone-map pruning: skip entire volume if no rows can match
             if !comparisons.is_empty() {
                 let (skip, _, _) = Self::prune_volume(vol, &comparisons, &bloom_hashes);
                 if skip {
@@ -1515,14 +1500,20 @@ impl Table for SegmentedTable {
                     }
                 }
                 cold_rows.push((rid, row));
-                if cold_rows.len() >= remaining {
+                if cold_rows.len() >= target {
                     break 'done;
                 }
             }
         }
 
-        // Combine: cold (oldest-first) then hot
-        cold_rows.extend(hot_rows);
+        // Phase 3: If cold didn't fill the target, materialize hot rows
+        // for the remainder only.
+        if cold_rows.len() < target {
+            let remaining = target - cold_rows.len();
+            let hot_rows = self.hot.collect_rows_with_limit(where_expr, remaining, 0)?;
+            cold_rows.extend(hot_rows);
+        }
+
         Ok(cold_rows.into_iter().skip(offset).take(limit).collect())
     }
 
@@ -1540,8 +1531,11 @@ impl Table for SegmentedTable {
 
         let target = limit + offset;
 
-        // Collect hot rows first (typically small after checkpoint)
-        let hot_rows = self.hot.collect_all_rows(where_expr)?;
+        // Unordered: hot rows first with early termination.
+        // Only scan up to `target` hot rows — avoids O(hot_rows) for small LIMITs.
+        let hot_rows = self
+            .hot
+            .collect_rows_with_limit_unordered(where_expr, target, 0)?;
         if hot_rows.len() >= target {
             return Ok(hot_rows.into_iter().skip(offset).take(limit).collect());
         }

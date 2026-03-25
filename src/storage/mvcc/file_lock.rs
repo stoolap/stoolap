@@ -21,6 +21,7 @@
 //!
 
 use std::fs::{self, File, OpenOptions};
+#[cfg(not(target_os = "wasi"))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -70,6 +71,7 @@ impl FileLock {
 
         // Open the lock file WITHOUT truncating — truncating before acquiring
         // the lock would destroy another process's PID if it currently holds the lock.
+        #[allow(unused_mut)]
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)

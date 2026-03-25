@@ -56,7 +56,7 @@ Stoolap is designed around practical embedded database needs:
 
 ```toml
 [dependencies]
-stoolap = "0.3"
+stoolap = "0.4"
 ```
 
 Build from source:
@@ -70,7 +70,7 @@ cargo build --release
 ### Rust API
 
 ```rust
-use stoolap::api::Database;
+use stoolap::Database;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::open_in_memory()?;
@@ -208,7 +208,7 @@ For built-in semantic text embeddings, enable the `semantic` feature:
 
 ```toml
 [dependencies]
-stoolap = { version = "0.3", features = ["semantic"] }
+stoolap = { version = "0.4", features = ["semantic"] }
 ```
 
 ```sql

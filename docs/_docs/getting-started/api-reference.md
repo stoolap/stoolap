@@ -11,7 +11,7 @@ Complete reference for the Stoolap Rust API (`stoolap` crate).
 
 ```toml
 [dependencies]
-stoolap = "0.3"
+stoolap = "0.4"
 ```
 
 ## Database

@@ -16,16 +16,17 @@ v0.4.0 replaces the snapshot-based persistence engine with an immutable volume-b
 | Aspect | v0.3.7 (Snapshots) | v0.4.0 (Volumes) |
 |--------|-------------------|-------------------|
 | Storage model | All rows in hot buffer, periodic snapshot to `.bin` | Hot/cold split: mutable hot buffer + immutable cold `.vol` files |
-| Persistence format | Monolithic row-serialized `.bin` per table | Columnar `.vol` files with zone maps, bloom filters, dictionary encoding |
+| Persistence format | Monolithic row-serialized `.bin` per table | Columnar `.vol` files with zone maps, bloom filters, dictionary encoding, LZ4 compression |
 | Persistence location | `snapshots/<table>/` | `volumes/<table>/` |
 | Metadata | `snapshot_meta.bin` | `manifest.bin` per table (versioned, V4 format) |
 | Startup speed | Proportional to data size (deserialize all rows into memory) | Near-instant (cold data stays on disk, only WAL replay for recent writes) |
 | Memory usage | All data in memory at all times | Only hot buffer in memory, cold data read on demand |
-| Query on persisted data | Must be in memory first | Zone map pruning, bloom filters, column projection directly from disk |
+| Query on persisted data | Must be in memory first | Zone map pruning, bloom filters, row-group skipping, column projection directly from disk |
 | Snapshot isolation | Hot buffer only | Full support including cold rows via versioned tombstones |
-| Concurrent writes to persisted rows | N/A (all rows in memory) | Row-level claim (try_claim_row) prevents lost updates |
-| Compaction | Not applicable | Automatic merge when volume count exceeds threshold |
+| Concurrent writes to persisted rows | N/A (all rows in memory) | Per-table seal fence + row-level claim prevents lost updates |
+| Compaction | Not applicable | Adaptive 4-phase merge (convergence, opportunistic, incremental dedup, epoch staleness) |
 | DELETE performance | Row removed from memory, snapshot rewrites all | Tombstone (no rewrite until compaction) |
+| Compression | WAL-only (optional) | LZ4 for both WAL and cold volumes (independent `wal_compression` and `volume_compression` flags) |
 
 ## What Happens Automatically
 
@@ -76,22 +77,26 @@ The migration is I/O bound. SSD storage significantly reduces migration time.
 | v0.3.7 Parameter | v0.4.0 Parameter | Notes |
 |------------------|------------------|-------|
 | `snapshot_interval` | `checkpoint_interval` | Backward compatible: old name still accepted in DSN |
-| `snapshot_compression` | `compression` | Backward compatible: old name still accepted in DSN |
+| `snapshot_compression` | `compression` | Backward compatible: old name still accepted. Now sets both `wal_compression` and `volume_compression` |
 | `keep_snapshots` | `keep_snapshots` | Unchanged. Now controls backup snapshot retention |
 
 ### New Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `sync_mode` | `normal` | `none` (no fsync, data durable at checkpoint), `normal` (fsync every 1 second), `full` (fsync every write) |
 | `checkpoint_interval` | 60 | Seconds between checkpoint cycles (seal + compact + WAL truncate) |
 | `compact_threshold` | 4 | Number of cold volumes before compaction merges them |
 | `checkpoint_on_close` | on | Seal all hot rows on clean shutdown for fast startup |
+| `wal_compression` | on | LZ4 compression for WAL entries |
+| `volume_compression` | on | LZ4 compression for cold volume files |
+| `compression` | on | Shorthand: sets both `wal_compression` and `volume_compression` |
 
 ### Removed Parameters
 
 | v0.3.7 Parameter | Reason |
 |------------------|--------|
-| `snapshot_compression` | Volumes use their own compression (dictionary encoding, zone maps). WAL compression controlled by `wal_compression` |
+| `snapshot_compression` | Replaced by `compression` (sets both WAL and volume). Use `wal_compression` or `volume_compression` for independent control |
 
 ### DSN Example
 
@@ -102,10 +107,20 @@ file:///data/mydb?sync=normal&snapshot_interval=300&keep_snapshots=5
 
 v0.4.0:
 ```
-file:///data/mydb?sync=normal&checkpoint_interval=60&compact_threshold=4
+file:///data/mydb?sync_mode=normal&checkpoint_interval=60&compact_threshold=4
 ```
 
 The old DSN still works (backward compatible), but the new parameter names are recommended.
+
+### Sync Mode Behavior
+
+The `sync_mode` parameter controls durability guarantees:
+
+| Mode | Behavior | Use case |
+|------|----------|----------|
+| `none` | No fsync calls. Data is durable only after checkpoint writes volumes to disk. | Maximum throughput, acceptable data loss window |
+| `normal` | Fsync every 1 second (batched). DDL operations fsync immediately. | Balanced (comparable to SQLite WAL + synchronous=NORMAL) |
+| `full` | Fsync on every write operation. | Maximum durability, lower throughput |
 
 ### CLI Flag Changes
 
@@ -172,13 +187,13 @@ mydb/
   volumes/
     users/
       manifest.bin
-      vol-00001.vol
+      vol-00001.vol          (columnar, LZ4 compressed)
     orders/
       manifest.bin
       vol-00001.vol
-  snapshots/           (only if PRAGMA SNAPSHOT used, optional)
+  snapshots/                 (only if PRAGMA SNAPSHOT used, optional)
     snapshot_meta.bin
-    ddl.bin              (index + view definitions, CRC32 protected)
+    ddl.bin                  (index + view definitions, CRC32 protected)
     users/
       snapshot-20240315-100000.000.bin
 ```
@@ -186,7 +201,9 @@ mydb/
 Key differences:
 - `volumes/` replaces `snapshots/` as primary storage
 - Each table has a `manifest.bin` tracking its volumes and tombstones
-- `.vol` files are columnar (not row-serialized `.bin`)
+- `.vol` files are columnar (not row-serialized `.bin`), with per-column zone maps, bloom filters, and dictionary encoding
+- `.vol` files use LZ4 compression by default (STVZ magic header when compressed, STVL when uncompressed)
+- Row-group zone maps (64K-row groups) enable sub-volume pruning
 - `snapshots/` only appears if you explicitly run `PRAGMA SNAPSHOT` for backups
 
 ## Behavioral Changes
@@ -195,9 +212,10 @@ Key differences:
 
 v0.3.7 had a snapshot cycle that periodically serialized the entire hot buffer into `.bin` files. v0.4.0 replaces this with a checkpoint cycle:
 
-1. **Seal**: Move hot buffer rows into a new immutable `.vol` file
-2. **Compact**: If volume count exceeds `compact_threshold`, merge volumes (newest-first dedup)
+1. **Seal**: Move hot buffer rows into a new immutable `.vol` file (per-table seal fence ensures DML consistency)
+2. **Persist manifests**: Write `manifest.bin` atomically (fsync tmp, rename, fsync directory)
 3. **WAL Truncate**: Remove WAL entries before the checkpoint LSN
+4. **Compact** (background thread): If volume count exceeds `compact_threshold`, merge volumes using adaptive 4-phase strategy
 
 The checkpoint cycle runs automatically every `checkpoint_interval` seconds (default: 60) and on clean shutdown.
 
@@ -209,6 +227,25 @@ Not every checkpoint creates a new volume. Rows are only sealed when:
 - On close: ALL remaining hot rows are sealed (regardless of count)
 
 This prevents creating many tiny volume files.
+
+### Seal Fence (DML Safety)
+
+v0.4.0 uses a per-table `RwLock` (seal fence) to coordinate between DML operations and the seal process:
+- **DML** (INSERT, UPDATE, DELETE) acquires a shared read lock
+- **Seal** acquires an exclusive write lock
+
+This ensures no DML can see a partially-sealed state. Additionally, at commit time, a generation counter detects whether a seal happened during the transaction's lifetime. If so, pending rows are revalidated against cold segments to catch constraint violations that the original INSERT-time check may have missed.
+
+### Adaptive Compaction
+
+v0.4.0 uses a 4-phase compaction strategy instead of fixed-count merging:
+
+1. **Convergence**: Merge enough volumes to reach `compact_threshold` in one cycle
+2. **Opportunistic**: Keep including volumes as long as each is no larger than the running average
+3. **Incremental dedup**: If selected rows exceed 25% of the largest volume, include it too (deduplicates overlapping rows)
+4. **Epoch staleness**: Force-include all volumes if any hasn't been rewritten for `compact_threshold * 2` compaction epochs
+
+This eliminates the problem of large base volumes accumulating stale tombstones or outdated format versions.
 
 ### Snapshot Isolation on Cold Data
 
@@ -229,8 +266,8 @@ Each tombstone stores a `commit_seq`. A snapshot transaction at `begin_seq=N` on
 v0.3.7 had no cold storage, so all writes targeted the hot buffer which already had MVCC conflict detection. v0.4.0 introduces cold rows that live in volumes. When two transactions concurrently modify the same cold row, `try_claim_row()` uses the hot buffer's `uncommitted_writes` map to prevent lost updates:
 
 ```
-Txn A: UPDATE WHERE id=5 (cold row) → claims row 5
-Txn B: UPDATE WHERE id=5 (cold row) → conflict error (row already claimed)
+Txn A: UPDATE WHERE id=5 (cold row) -> claims row 5
+Txn B: UPDATE WHERE id=5 (cold row) -> conflict error (row already claimed)
 ```
 
 Only one transaction can modify a given cold row at a time. The loser receives a write conflict error and must retry.
@@ -242,6 +279,7 @@ v0.3.7 snapshot creation serialized the entire hot buffer under a lock, which co
 - `COUNT(*)` uses O(1) formula during seal overlap (no scanning needed)
 - Aggregation pushdowns (`SUM`, `MIN`, `MAX`) use pre-computed cold volume statistics
 - Cold data scanning is lazy via `MergingScanner` (streams rows from volumes without loading all into memory)
+- Column pruning: only columns referenced by filters and projections are materialized from cold storage
 
 ### Aggregation Pushdown
 

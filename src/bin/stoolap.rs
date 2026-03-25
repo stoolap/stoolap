@@ -49,24 +49,28 @@ const VERSION: &str = concat!(
 This CLI provides an interactive interface to execute SQL queries and manage your database.\n\n\
 PERSISTENCE DSN PARAMETERS:\n\
   file:///path/to/db?param=value&param2=value2\n\n\
-  sync=none|normal|full       WAL sync mode (default: normal)\n\
+  sync_mode=none|normal|full   Fsync mode (default: normal)\n\
+    none: no fsync, durable at checkpoint only\n\
+    normal: fsync every 1 second, DDL fsyncs immediately\n\
+    full: fsync on every write\n\
   checkpoint_interval=SECS    Checkpoint interval in seconds (default: 60)\n\
-  compact_threshold=COUNT     Number of segments before compaction (default: 4)\n\
+  compact_threshold=COUNT     Number of volumes before compaction (default: 4)\n\
+  compression=on|off          WAL + volume LZ4 compression (default: on)\n\
+  wal_compression=on|off      WAL compression only (default: on)\n\
+  volume_compression=on|off   Volume LZ4 compression only (default: on)\n\
+  keep_snapshots=COUNT        Backup snapshots per table (default: 3)\n\
+  checkpoint_on_close=on|off  Checkpoint on shutdown (default: on)\n\
   wal_max_size=BYTES          Max WAL file size before rotation (default: 67108864)\n\
   wal_buffer_size=BYTES       WAL buffer size (default: 65536)\n\
   wal_flush_trigger=BYTES     Buffer size to trigger flush (default: 32768)\n\
   commit_batch_size=COUNT     Commits to batch before sync (default: 100)\n\
-  sync_interval_ms=MS         Min time between syncs (default: 10)\n\
-  keep_snapshots=COUNT        Backup snapshots per table (default: 3)\n\
-  checkpoint_on_close=on|off  Checkpoint on shutdown (default: on)\n\
-  compression=on|off          Enable/disable compression (default: on)\n\
-  wal_compression=on|off      WAL compression only (default: on)\n\
+  sync_interval_ms=MS         Min time between syncs in normal mode (default: 1000)\n\
   compression_threshold=BYTES Min size to compress (default: 64)\n\n\
 EXAMPLES:\n\
   stoolap -d memory://                                    In-memory database\n\
   stoolap -d file:///tmp/mydb                             Persistent database\n\
-  stoolap -d file:///tmp/mydb?sync=full                   Maximum durability\n\
-  stoolap -d file:///tmp/mydb?sync=none&compression=off   Maximum performance\n\
+  stoolap -d file:///tmp/mydb?sync_mode=full               Maximum durability\n\
+  stoolap -d file:///tmp/mydb?sync_mode=none&compression=off  Max performance\n\
   stoolap -d file:///tmp/mydb --profile durable           Use durable preset\n\
   stoolap -d file:///tmp/mydb --sync full --compression off\n\n\
 BACKUP & RESTORE:\n\
@@ -101,9 +105,9 @@ struct Args {
     file: Option<String>,
 
     /// WAL sync mode for durability (none, normal, full)
-    /// - none: Fastest but least durable - doesn't force syncs
-    /// - normal: Syncs on transaction commits (default)
-    /// - full: Forces syncs on every WAL write - slowest but most durable
+    /// - none: No fsync, data durable at checkpoint only
+    /// - normal: Fsync every 1 second, DDL fsyncs immediately (default)
+    /// - full: Fsync on every write
     #[arg(short = 's', long = "sync", value_name = "MODE")]
     sync_mode: Option<String>,
 
@@ -118,7 +122,7 @@ struct Args {
     #[arg(long = "checkpoint-interval", value_name = "SECONDS")]
     checkpoint_interval: Option<u32>,
 
-    /// Number of segments before compaction (default: 4)
+    /// Number of cold volumes before compaction (default: 4)
     #[arg(long = "compact-threshold", value_name = "COUNT")]
     compact_threshold: Option<u32>,
 
@@ -126,7 +130,7 @@ struct Args {
     #[arg(long = "wal-max-size", value_name = "MB")]
     wal_max_size: Option<u32>,
 
-    /// Enable or disable WAL compression (default: on)
+    /// Enable or disable LZ4 compression for WAL and volumes (default: on)
     #[arg(long = "compression", value_name = "on|off")]
     compression: Option<String>,
 
@@ -804,9 +808,52 @@ fn main() {
         None
     };
 
+    // Handle --reset-volumes BEFORE --restore: delete volumes/ (and wal/)
+    // so that Database::open() in the restore path doesn't choke on
+    // corrupted on-disk state. This makes `--reset-volumes --restore`
+    // work as documented.
+    if args.reset_volumes {
+        if let Some(ref dir) = db_dir {
+            let vol_dir = dir.join("volumes");
+            if vol_dir.exists() {
+                match std::fs::remove_dir_all(&vol_dir) {
+                    Ok(()) => {
+                        if !args.quiet {
+                            eprintln!("Removed volumes/ directory for recovery");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error removing volumes/ directory: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let wal_dir = dir.join("wal");
+            if wal_dir.exists() {
+                match std::fs::remove_dir_all(&wal_dir) {
+                    Ok(()) => {
+                        if !args.quiet {
+                            eprintln!("Removed wal/ directory for recovery");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error removing wal/ directory: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            // Also remove the stale lock file so open() doesn't fail
+            let lock_file = dir.join("db.lock");
+            if lock_file.exists() {
+                let _ = std::fs::remove_file(&lock_file);
+            }
+        } else if !args.quiet {
+            eprintln!("Warning: --reset-volumes only applies to file:// databases");
+        }
+    }
+
     // Handle --restore: filesystem-level recovery from backup snapshots.
-    // Removes corrupted volumes/ and wal/, then opens normally which
-    // triggers the legacy snapshot migration path.
+    // If --reset-volumes was used above, volumes/ and wal/ are already gone.
     if args.restore.is_some() {
         let dir = match &db_dir {
             Some(d) => d,
@@ -1054,24 +1101,7 @@ fn main() {
         return;
     }
 
-    // Handle --reset-volumes: delete volumes/ directory before opening.
-    // This forces the engine to fall back to snapshot-based recovery.
-    if args.reset_volumes {
-        if let Some(ref dir) = db_dir {
-            let vol_dir = dir.join("volumes");
-            if vol_dir.exists() {
-                match std::fs::remove_dir_all(&vol_dir) {
-                    Ok(()) => eprintln!("Removed volumes/ directory for recovery"),
-                    Err(e) => {
-                        eprintln!("Error removing volumes/ directory: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-        } else if !args.quiet {
-            eprintln!("Warning: --reset-volumes only applies to file:// databases");
-        }
-    }
+    // --reset-volumes already handled above (before --restore).
 
     // Open the database
     let db = match Database::open(&db_path) {

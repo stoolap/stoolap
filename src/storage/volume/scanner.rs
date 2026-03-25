@@ -113,6 +113,10 @@ pub struct VolumeScanner {
     /// Pre-computed row group skip decisions. group_idx → can skip entirely.
     /// None = no row groups (small volume or no filter). Computed in set_filter().
     row_group_skips: Option<Vec<bool>>,
+    /// Cached end of the current row group (exclusive index). Avoids per-row
+    /// integer division in the slow-path scan loop. Recomputed only on group
+    /// boundary crossings. 0 means "not yet initialized".
+    next_group_boundary: usize,
 }
 
 impl VolumeScanner {
@@ -156,6 +160,7 @@ impl VolumeScanner {
             typed_predicates: Vec::new(),
             needed_cols: None,
             row_group_skips: None,
+            next_group_boundary: 0,
         }
     }
 
@@ -194,6 +199,7 @@ impl VolumeScanner {
             typed_predicates: Vec::new(),
             needed_cols: None,
             row_group_skips: None,
+            next_group_boundary: 0,
         }
     }
 
@@ -252,6 +258,7 @@ impl VolumeScanner {
             typed_predicates: Vec::new(),
             needed_cols: None,
             row_group_skips: None,
+            next_group_boundary: 0,
         }
     }
 
@@ -480,6 +487,95 @@ impl VolumeScanner {
             self.column_mapping = Some(mapping);
         }
     }
+
+    // =========================================================================
+    // Shared helpers for both fast path (matching_indices) and slow path
+    // (linear scan). Extracted to eliminate code duplication — a single source
+    // of truth for skip checks and row materialization.
+    // =========================================================================
+
+    /// Check tombstones and pending deletes for a row index. Returns true if
+    /// the row should be skipped.
+    #[inline(always)]
+    fn should_skip_row(&self, idx: usize) -> bool {
+        let rid = self.volume.row_ids[idx];
+        if let Some(ref ts) = self.committed_tombstones {
+            if let Some(&commit_seq) = ts.get(&rid) {
+                if self.snapshot_seq.is_none_or(|ss| commit_seq <= ss) {
+                    return true;
+                }
+            }
+        }
+        if let Some(ref pending) = self.pending_cold_deletes {
+            if pending.contains(&rid) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check dictionary pre-filters for a row index. Returns true if the row
+    /// does NOT match (should be skipped). Only called when dict_filters is
+    /// non-empty.
+    #[inline(always)]
+    fn dict_filters_reject(&self, idx: usize) -> bool {
+        for &(col_idx, expected_id) in &self.dict_filters {
+            if self.volume.columns[col_idx].is_null(idx)
+                || self.volume.columns[col_idx].get_dict_id(idx) != expected_id
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Materialize a row at `idx`, evaluate the filter (if any), and write
+    /// the result into `self.current_row`. Returns false if the filter
+    /// rejects the row.
+    #[inline(always)]
+    fn materialize_row(&mut self, idx: usize) -> bool {
+        if let Some(ref filter) = self.filter {
+            let full_row = match (&self.needed_cols, &self.column_mapping) {
+                (Some(mask), Some(mapping)) => {
+                    self.volume.get_row_mapped_needed(idx, mapping, mask)
+                }
+                (Some(mask), None) => self.volume.get_row_needed(idx, mask),
+                (None, Some(mapping)) => self.volume.get_row_mapped(idx, mapping),
+                (None, None) => self.volume.get_row(idx),
+            };
+            if !filter.evaluate_fast(&full_row) {
+                return false;
+            }
+            if self.is_full_projection {
+                self.current_row = full_row;
+            } else {
+                self.current_row = Row::from_values(
+                    self.project_cols
+                        .iter()
+                        .map(|&col| {
+                            full_row
+                                .get(col)
+                                .cloned()
+                                .unwrap_or(Value::Null(crate::core::DataType::Null))
+                        })
+                        .collect(),
+                );
+            }
+        } else if let Some(ref mapping) = self.column_mapping {
+            if self.is_full_projection {
+                self.current_row = self.volume.get_row_mapped(idx, mapping);
+            } else {
+                self.current_row =
+                    self.volume
+                        .get_row_mapped_projected(idx, mapping, &self.project_cols);
+            }
+        } else if self.is_full_projection {
+            self.current_row = self.volume.get_row(idx);
+        } else {
+            self.current_row = self.volume.get_row_projected(idx, &self.project_cols);
+        }
+        true
+    }
 }
 
 impl Scanner for VolumeScanner {
@@ -489,192 +585,74 @@ impl Scanner for VolumeScanner {
             return false;
         }
 
-        // Fast path: use pre-computed matching indices
-        if let Some(ref indices) = self.matching_indices {
-            while self.match_idx < indices.len() {
-                let idx = indices[self.match_idx];
-                self.match_idx += 1;
-
-                // Check skip sets: committed tombstones (shared Arc, no clone)
-                // then dynamic skip set (hot row_ids + pending + per-volume dedup)
-                let rid = self.volume.row_ids[idx];
-                if let Some(ref ts) = self.committed_tombstones {
-                    if let Some(&commit_seq) = ts.get(&rid) {
-                        // Snapshot filtering: only skip if this tombstone is
-                        // visible to our snapshot (commit_seq <= snapshot_seq).
-                        // For auto-commit (snapshot_seq=None), all tombstones are visible.
-                        if self.snapshot_seq.is_none_or(|ss| commit_seq <= ss) {
-                            continue;
-                        }
+        // Fast path: use pre-computed matching indices (from dictionary filters).
+        // Copy indices length to avoid holding an immutable borrow on self
+        // across the mutable materialize_row call.
+        if self.matching_indices.is_some() {
+            loop {
+                let idx = match self.matching_indices.as_ref() {
+                    Some(indices) if self.match_idx < indices.len() => {
+                        let i = indices[self.match_idx];
+                        self.match_idx += 1;
+                        i
                     }
-                }
-                if let Some(ref pending) = self.pending_cold_deletes {
-                    if pending.contains(&rid) {
-                        continue;
+                    _ => {
+                        self.has_current = false;
+                        return false;
                     }
-                }
+                };
 
-                // Typed pre-filter: skip without full Value reconstruction
+                if self.should_skip_row(idx) {
+                    continue;
+                }
                 if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx) {
                     continue;
                 }
-
-                // Materialize the row. Four paths, fastest first:
-                // 1. No filter, no mapping, partial projection → projected read
-                // 2. No filter, no mapping, full projection → full read
-                // 3. Has filter → full row for filter, then project
-                // 4. Has mapping (schema evolved) → mapped read
-                if let Some(ref filter) = self.filter {
-                    // Build the row for filter evaluation. When needed_cols
-                    // is set, only materialize filter + output columns.
-                    let full_row = match (&self.needed_cols, &self.column_mapping) {
-                        (Some(mask), Some(mapping)) => {
-                            self.volume.get_row_mapped_needed(idx, mapping, mask)
-                        }
-                        (Some(mask), None) => self.volume.get_row_needed(idx, mask),
-                        (None, Some(mapping)) => self.volume.get_row_mapped(idx, mapping),
-                        (None, None) => self.volume.get_row(idx),
-                    };
-                    if !filter.evaluate_fast(&full_row) {
-                        continue;
-                    }
-                    if self.is_full_projection {
-                        self.current_row = full_row;
-                    } else {
-                        self.current_row = Row::from_values(
-                            self.project_cols
-                                .iter()
-                                .map(|&col| {
-                                    full_row
-                                        .get(col)
-                                        .cloned()
-                                        .unwrap_or(Value::Null(crate::core::DataType::Null))
-                                })
-                                .collect(),
-                        );
-                    }
-                } else if let Some(ref mapping) = self.column_mapping {
-                    // Schema evolved, no filter → use mapped projection.
-                    if self.is_full_projection {
-                        self.current_row = self.volume.get_row_mapped(idx, mapping);
-                    } else {
-                        self.current_row =
-                            self.volume
-                                .get_row_mapped_projected(idx, mapping, &self.project_cols);
-                    }
-                } else if self.is_full_projection {
-                    self.current_row = self.volume.get_row(idx);
-                } else {
-                    self.current_row = self.volume.get_row_projected(idx, &self.project_cols);
+                if !self.materialize_row(idx) {
+                    continue;
                 }
 
                 self.current_rid = self.volume.row_ids[idx];
                 self.has_current = true;
                 return true;
             }
-            self.has_current = false;
-            return false;
         }
 
-        // Slow path: linear scan
+        // Slow path: linear scan with row-group skipping
         while self.current_idx < self.end_idx {
-            // Row-group skip: jump over entire 64K-row groups whose zone maps
-            // prove no rows can match. O(1) integer division per boundary check.
+            // Row-group skip: jump over entire groups whose zone maps prove
+            // no rows can match. Uses a cached boundary to avoid per-row
+            // integer division — only recomputed on group transitions.
             if let Some(ref skips) = self.row_group_skips {
-                let group_idx = self.current_idx / super::column::ROW_GROUP_SIZE;
-                if group_idx < skips.len() && skips[group_idx] {
-                    let next_start = (group_idx + 1) * super::column::ROW_GROUP_SIZE;
-                    self.current_idx = next_start.min(self.end_idx);
-                    continue;
-                }
-            }
-
-            // Check skip sets: committed tombstones (shared Arc, no clone)
-            // then dynamic skip set (hot row_ids + pending + per-volume dedup)
-            {
-                let rid = self.volume.row_ids[self.current_idx];
-                if let Some(ref ts) = self.committed_tombstones {
-                    if let Some(&commit_seq) = ts.get(&rid) {
-                        if self.snapshot_seq.is_none_or(|ss| commit_seq <= ss) {
-                            self.current_idx += 1;
-                            continue;
-                        }
-                    }
-                }
-                if let Some(ref pending) = self.pending_cold_deletes {
-                    if pending.contains(&rid) {
-                        self.current_idx += 1;
+                if self.current_idx >= self.next_group_boundary {
+                    let group_idx = self.current_idx / super::column::ROW_GROUP_SIZE;
+                    self.next_group_boundary =
+                        ((group_idx + 1) * super::column::ROW_GROUP_SIZE).min(self.end_idx);
+                    if group_idx < skips.len() && skips[group_idx] {
+                        self.current_idx = self.next_group_boundary;
                         continue;
                     }
                 }
             }
 
-            let idx = self.current_idx;
-
-            // Fast dictionary pre-filter: skip without full Value reconstruction
-            if !self.dict_filters.is_empty() {
-                let mut matches = true;
-                for &(col_idx, expected_id) in &self.dict_filters {
-                    if self.volume.columns[col_idx].is_null(idx)
-                        || self.volume.columns[col_idx].get_dict_id(idx) != expected_id
-                    {
-                        matches = false;
-                        break;
-                    }
-                }
-                if !matches {
-                    self.current_idx += 1;
-                    continue;
-                }
-            }
-
-            // Typed pre-filter: skip without full Value reconstruction
-            if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx) {
+            if self.should_skip_row(self.current_idx) {
                 self.current_idx += 1;
                 continue;
             }
 
-            // Materialize the row. Same paths as matching_indices above.
-            if let Some(ref filter) = self.filter {
-                let full_row = match (&self.needed_cols, &self.column_mapping) {
-                    (Some(mask), Some(mapping)) => {
-                        self.volume.get_row_mapped_needed(idx, mapping, mask)
-                    }
-                    (Some(mask), None) => self.volume.get_row_needed(idx, mask),
-                    (None, Some(mapping)) => self.volume.get_row_mapped(idx, mapping),
-                    (None, None) => self.volume.get_row(idx),
-                };
-                if !filter.evaluate_fast(&full_row) {
-                    self.current_idx += 1;
-                    continue;
-                }
-                if self.is_full_projection {
-                    self.current_row = full_row;
-                } else {
-                    self.current_row = Row::from_values(
-                        self.project_cols
-                            .iter()
-                            .map(|&col| {
-                                full_row
-                                    .get(col)
-                                    .cloned()
-                                    .unwrap_or(Value::Null(crate::core::DataType::Null))
-                            })
-                            .collect(),
-                    );
-                }
-            } else if let Some(ref mapping) = self.column_mapping {
-                if self.is_full_projection {
-                    self.current_row = self.volume.get_row_mapped(idx, mapping);
-                } else {
-                    self.current_row =
-                        self.volume
-                            .get_row_mapped_projected(idx, mapping, &self.project_cols);
-                }
-            } else if self.is_full_projection {
-                self.current_row = self.volume.get_row(idx);
-            } else {
-                self.current_row = self.volume.get_row_projected(idx, &self.project_cols);
+            let idx = self.current_idx;
+
+            if !self.dict_filters.is_empty() && self.dict_filters_reject(idx) {
+                self.current_idx += 1;
+                continue;
+            }
+            if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx) {
+                self.current_idx += 1;
+                continue;
+            }
+            if !self.materialize_row(idx) {
+                self.current_idx += 1;
+                continue;
             }
 
             self.current_rid = self.volume.row_ids[idx];

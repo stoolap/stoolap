@@ -114,6 +114,8 @@ pub fn write_volume_to_disk_opts(
     })?;
 
     // Fsync the parent directory to ensure the rename is durable.
+    // Windows does not support opening directories for fsync.
+    #[cfg(not(windows))]
     if let Ok(d) = std::fs::File::open(&table_dir) {
         d.sync_all().map_err(|e| {
             crate::core::Error::internal(format!("failed to fsync volume directory: {}", e))
@@ -445,10 +447,16 @@ impl VolumeCatalog {
         })?;
 
         // Fsync directory to ensure the rename is durable.
-        let d = std::fs::File::open(dir)
-            .map_err(|e| std::io::Error::other(format!("failed to open dir for fsync: {}", e)))?;
-        d.sync_all()
-            .map_err(|e| std::io::Error::other(format!("failed to fsync dir: {}", e)))?;
+        // Windows does not support opening directories for fsync;
+        // NTFS metadata is flushed with the file's sync_all().
+        #[cfg(not(windows))]
+        {
+            let d = std::fs::File::open(dir).map_err(|e| {
+                std::io::Error::other(format!("failed to open dir for fsync: {}", e))
+            })?;
+            d.sync_all()
+                .map_err(|e| std::io::Error::other(format!("failed to fsync dir: {}", e)))?;
+        }
 
         Ok(())
     }

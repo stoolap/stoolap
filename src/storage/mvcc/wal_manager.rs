@@ -900,8 +900,8 @@ impl CheckpointMetadata {
         buf.extend_from_slice(&crc.to_le_bytes());
 
         // Write atomically using temp file + rename (unique name to avoid races)
-        let unique_suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let temp_path = path.with_extension(format!("meta.{}.tmp", unique_suffix));
@@ -922,7 +922,9 @@ impl CheckpointMetadata {
         fs::rename(&temp_path, path)
             .map_err(|e| Error::internal(format!("failed to rename checkpoint: {}", e)))?;
 
-        // Sync directory to ensure rename is durable
+        // Sync directory to ensure rename is durable.
+        // Windows does not support opening directories for fsync.
+        #[cfg(not(windows))]
         if let Some(parent) = path.parent() {
             if let Ok(dir_file) = File::open(parent) {
                 let _ = dir_file.sync_all();
@@ -1382,8 +1384,8 @@ impl WALManager {
                 .map_err(|e| Error::internal(format!("failed to sync WAL: {}", e)))?;
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
         self.last_sync_time.store(now, Ordering::Relaxed);
@@ -2462,10 +2464,12 @@ impl WALManager {
 
         *wal_file_guard = Some(new_file);
 
-        // Step 5: Sync directory to ensure renames are durable
+        // Step 5: Sync directory to ensure renames are durable.
         // This is critical on filesystems like ext4 where rename durability
         // requires directory sync. Without this, a crash after rename but
         // before natural sync could result in the old filename persisting.
+        // Windows does not support opening directories for fsync.
+        #[cfg(not(windows))]
         if let Ok(dir_file) = File::open(&self.path) {
             let _ = dir_file.sync_all();
         }

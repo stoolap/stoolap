@@ -345,7 +345,10 @@ impl TableManifest {
         std::fs::rename(&tmp_path, path).map_err(|e| {
             crate::core::Error::internal(format!("failed to rename manifest: {}", e))
         })?;
-        // Fsync parent directory to ensure the rename is durable
+        // Fsync parent directory to ensure the rename is durable.
+        // Windows does not support opening directories for fsync;
+        // NTFS metadata is flushed with the file's sync_all().
+        #[cfg(not(windows))]
         if let Some(parent) = path.parent() {
             let d = std::fs::File::open(parent)
                 .map_err(|e| io::Error::other(format!("failed to open dir for fsync: {}", e)))?;

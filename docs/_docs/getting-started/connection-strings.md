@@ -80,10 +80,12 @@ file:///path/to/data?sync_mode=normal&checkpoint_interval=60
 | `compression` | on/off | on | Enable LZ4 compression for both WAL and volumes |
 | `compression_threshold` | Integer (bytes) | 64 | Minimum size for WAL compression |
 | `checkpoint_on_close` | on/off | on | Seal all hot rows to volumes on clean shutdown |
+| `commit_batch_size` | Integer | 100 | Commits to batch before sync |
+| `sync_interval_ms` | Integer (ms) | 1000 | Minimum time between syncs in normal mode |
 
 Legacy parameter names are accepted for backward compatibility:
 - `snapshot_interval` maps to `checkpoint_interval`
-- `snapshot_compression` maps to `wal_compression`
+- `snapshot_compression` maps to `compression` (sets both WAL and volume)
 
 ### Cleanup Options
 
@@ -106,9 +108,9 @@ file:///data/mydb?cleanup=off
 
 | Mode | Value | Description |
 |------|-------|-------------|
-| none | 0 | No sync (fastest, risk of data loss) |
-| normal | 1 | Sync on flush (balanced) |
-| full | 2 | Sync every write (maximum durability) |
+| none | 0 | No fsync. Data is durable only after checkpoint writes volumes to disk. |
+| normal | 1 | Fsync every 1 second (configurable via `sync_interval_ms`). DDL fsyncs immediately. Comparable to SQLite WAL + synchronous=NORMAL. |
+| full | 2 | Fsync on every write operation. Maximum durability. |
 
 ## Usage Examples
 

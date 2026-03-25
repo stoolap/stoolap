@@ -114,7 +114,7 @@ impl Default for PersistenceConfig {
             wal_buffer_size: 64 * 1024,     // 64KB
             wal_max_size: 64 * 1024 * 1024, // 64MB
             commit_batch_size: 100,         // Batch 100 commits
-            sync_interval_ms: 10,           // 10ms minimum interval
+            sync_interval_ms: 1000,         // 1 second between syncs
             wal_compression: true,          // Enable WAL compression
             volume_compression: true,       // Enable volume LZ4 compression
             compression_threshold: 64,      // Compress entries >= 64 bytes
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(config.wal_buffer_size, 64 * 1024);
         assert_eq!(config.wal_max_size, 64 * 1024 * 1024);
         assert_eq!(config.commit_batch_size, 100);
-        assert_eq!(config.sync_interval_ms, 10);
+        assert_eq!(config.sync_interval_ms, 1000);
         assert!(config.wal_compression);
         assert_eq!(config.compression_threshold, 64);
         assert_eq!(config.keep_snapshots, 3);

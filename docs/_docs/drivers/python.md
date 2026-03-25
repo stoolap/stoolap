@@ -89,7 +89,7 @@ db = Database.open('file:///absolute/path/to/db')
 
 ## Persistence
 
-File-based databases persist data to disk using WAL (Write-Ahead Logging) and periodic snapshots. Data survives process restarts.
+File-based databases persist data to disk using WAL (Write-Ahead Logging) and immutable cold volumes. A background checkpoint cycle seals hot rows into columnar volume files, compacts them, and truncates the WAL. Data survives process restarts.
 
 ```python
 db = Database.open('./mydata')

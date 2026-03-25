@@ -441,9 +441,11 @@ impl VolumeBuilder {
                             }
                         }
                         super::column::ColumnData::Bytes { .. } => {
-                            // Fall back to Value for complex types
-                            let value = col.get_value(i);
-                            bf.add(&value);
+                            // Extension types (JSON, Vector) all hash to tag 0
+                            // in hash_value (no payload). Insert the same no-op
+                            // hash directly — avoids constructing
+                            // Value::Extension(CompactArc) per cell.
+                            bf.add_extension_noop();
                         }
                     }
                 }

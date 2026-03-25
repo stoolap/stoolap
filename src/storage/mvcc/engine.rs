@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use std::path::Path;
-use std::time::Instant;
+
+use crate::common::time_compat::Instant;
 
 /// Returns lowercase version of string, avoiding allocation if already lowercase.
 /// This is a hot-path optimization - most table names are already lowercase.
@@ -286,7 +287,9 @@ fn write_snapshot_metadata(path: &std::path::Path, lsn: u64) -> Result<()> {
     std::fs::rename(&temp_path, path)
         .map_err(|e| Error::internal(format!("failed to rename snapshot metadata: {}", e)))?;
 
-    // Sync directory to ensure rename is durable
+    // Sync directory to ensure rename is durable.
+    // Windows does not support opening directories for fsync.
+    #[cfg(not(windows))]
     if let Some(parent) = path.parent() {
         if let Ok(dir_file) = std::fs::File::open(parent) {
             let _ = dir_file.sync_all();
@@ -457,11 +460,13 @@ pub struct MVCCEngine {
     /// (exclusive, brief ~100ms) to create a quiet moment where all_hot_empty can
     /// be true. This enables WAL truncation under continuous writes.
     seal_fence: Arc<parking_lot::RwLock<()>>,
-    /// Last compaction timestamp. Compaction is skipped if less than
-    /// `compact_threshold * checkpoint_interval` has passed since the last one.
-    /// This prevents compaction from running every checkpoint cycle when multiple
-    /// tables stagger their volume accumulation.
-    last_compaction_time: Mutex<Instant>,
+    /// Last compaction timestamp as `Instant` epoch nanos (from
+    /// `Instant::now().elapsed()` baseline). Compaction is skipped if less than
+    /// `compact_threshold * checkpoint_interval` has passed. AtomicU64 avoids
+    /// mutex contention on the background thread's `should_compact()` check.
+    last_compaction_nanos: AtomicU64,
+    /// Baseline `Instant` for computing elapsed time from `last_compaction_nanos`.
+    compaction_baseline: Instant,
     /// True while a background compaction thread is running.
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
@@ -533,8 +538,9 @@ impl MVCCEngine {
             force_seal_all: AtomicBool::new(false),
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
-            // Initialize to epoch so the first compaction is not delayed
-            last_compaction_time: Mutex::new(Instant::now() - std::time::Duration::from_secs(3600)),
+            // Initialize to 0 so the first compaction is not delayed by cooldown
+            last_compaction_nanos: AtomicU64::new(0),
+            compaction_baseline: Instant::now(),
             compaction_running: Arc::new(AtomicBool::new(false)),
             compaction_epoch: AtomicU64::new(0),
         }
@@ -1239,8 +1245,13 @@ impl MVCCEngine {
             );
             return None;
         }
-        // Ensure data is durable before rename, preventing zero-length files after crash
-        if let Err(e) = std::fs::File::open(&tmp_path).and_then(|f| f.sync_all()) {
+        // Ensure data is durable before rename, preventing zero-length files after crash.
+        // Open with write access — Windows requires it for sync_all().
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp_path)
+            .and_then(|f| f.sync_all())
+        {
             eprintln!(
                 "Warning: Failed to sync standalone volume for {}: {}",
                 table_name, e
@@ -1261,7 +1272,10 @@ impl MVCCEngine {
         // with the same segment_id as the standalone copy.
         // Fsync the marker to prevent re-promotion (and duplicate volumes) after crash.
         if std::fs::write(&marker_path, volume_id.to_string()).is_ok() {
-            let _ = std::fs::File::open(&marker_path).and_then(|f| f.sync_all());
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&marker_path)
+                .and_then(|f| f.sync_all());
         }
         Some(volume_id)
     }
@@ -3748,12 +3762,12 @@ impl MVCCEngine {
         // set and registry are fully consistent: every tombstone corresponds
         // to a visible commit, and the cutoff includes all of them.
         {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 if self.registry.safe_snapshot_cutoff() == self.registry.current_commit_sequence() {
                     break;
                 }
-                if std::time::Instant::now() >= deadline {
+                if Instant::now() >= deadline {
                     return Err(crate::core::Error::internal(
                         "PRAGMA SNAPSHOT timed out waiting for in-flight commits to complete",
                     ));
@@ -3987,6 +4001,7 @@ impl MVCCEngine {
                 }
             }
 
+            #[cfg(not(windows))]
             if all_succeeded {
                 for dir in &dirs_to_sync {
                     if let Ok(dir_file) = std::fs::File::open(dir) {
@@ -4070,9 +4085,11 @@ impl MVCCEngine {
             let ddl_path = snapshot_dir.join(format!("ddl-{}.bin", timestamp));
             let ddl_tmp = snapshot_dir.join(format!("ddl-{}.bin.tmp", timestamp));
             let ddl_result = (|| -> std::io::Result<()> {
-                std::fs::write(&ddl_tmp, &ddl_buf)?;
-                std::fs::File::open(&ddl_tmp)?.sync_all()?;
+                let f = std::fs::File::create(&ddl_tmp)?;
+                std::io::Write::write_all(&mut &f, &ddl_buf)?;
+                f.sync_all()?;
                 std::fs::rename(&ddl_tmp, &ddl_path)?;
+                #[cfg(not(windows))]
                 if let Ok(dir) = std::fs::File::open(&snapshot_dir) {
                     let _ = dir.sync_all();
                 }
@@ -4102,8 +4119,9 @@ impl MVCCEngine {
                     .join(",")
             );
             let manifest_result = (|| -> std::io::Result<()> {
-                std::fs::write(&manifest_tmp, manifest_json.as_bytes())?;
-                std::fs::File::open(&manifest_tmp)?.sync_all()?;
+                let f = std::fs::File::create(&manifest_tmp)?;
+                std::io::Write::write_all(&mut &f, manifest_json.as_bytes())?;
+                f.sync_all()?;
                 std::fs::rename(&manifest_tmp, &manifest_path)?;
                 Ok(())
             })();
@@ -4864,6 +4882,7 @@ impl MVCCEngine {
 
     /// Check whether compaction should run (cooldown + backlog check).
     /// Returns true if compaction should proceed.
+    #[cfg(not(target_arch = "wasm32"))]
     fn should_compact(&self) -> bool {
         let (compact_threshold, checkpoint_interval) = {
             let config = self.config.read();
@@ -4886,10 +4905,10 @@ impl MVCCEngine {
         if max_segments > compact_threshold {
             return true; // backlog exists — compact immediately
         }
-        let last = self.last_compaction_time.lock().unwrap();
-        let cooldown =
-            std::time::Duration::from_secs(compact_threshold as u64 * checkpoint_interval);
-        last.elapsed() >= cooldown
+        let last_nanos = self.last_compaction_nanos.load(Ordering::Relaxed);
+        let now_nanos = self.compaction_baseline.elapsed().as_nanos() as u64;
+        let cooldown_nanos = compact_threshold as u64 * checkpoint_interval * 1_000_000_000;
+        now_nanos.saturating_sub(last_nanos) >= cooldown_nanos
     }
 
     /// Run compaction synchronously under the compaction_running flag.
@@ -4901,12 +4920,16 @@ impl MVCCEngine {
             eprintln!("Warning: compact_volumes failed: {}", e);
             return;
         }
-        *self.last_compaction_time.lock().unwrap() = Instant::now();
+        self.last_compaction_nanos.store(
+            self.compaction_baseline.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// Spawn compaction on a background thread. If compaction is already
     /// running, this is a no-op (the next checkpoint cycle will retry).
     /// Called from the background cleanup thread which owns Arc<Self>.
+    #[cfg(not(target_arch = "wasm32"))]
     fn spawn_compaction(self: &Arc<Self>) {
         if !self.should_compact() {
             return;

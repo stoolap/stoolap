@@ -182,12 +182,12 @@ Volume files include a trailing CRC32 checksum for corruption detection. Bloom f
 
 `PRAGMA CHECKPOINT` (and the periodic background cycle) executes:
 
-1. **Seal**: Move hot buffer rows to cold volumes
-2. **Check**: If all hot buffers are empty, advance WAL checkpoint
+1. **Seal**: Move hot buffer rows into new immutable `.vol` files (per-table seal fence ensures DML consistency)
+2. **Fence**: Brief exclusive check that all hot buffers are empty, advance WAL checkpoint LSN
 3. **Re-record DDL**: Write DDL entries after checkpoint LSN so they survive WAL truncation
-4. **Persist**: Write manifests (volume list, tombstones, checkpoint LSN) to disk
-5. **Compact**: Merge the smallest volumes when count exceeds `compact_threshold`
-6. **WAL truncate**: Remove WAL entries before checkpoint LSN (only when all hot data is sealed and all manifests are persisted)
+4. **Persist manifests**: Write `manifest.bin` per table (volume list, tombstones, checkpoint LSN) atomically via fsync-before-rename
+5. **WAL truncate**: Remove WAL entries before checkpoint LSN (only when all manifests are persisted)
+6. **Compact** (background thread): Merge cold volumes when count exceeds `compact_threshold` using adaptive 4-phase strategy
 
 ### Constraints and DML
 
