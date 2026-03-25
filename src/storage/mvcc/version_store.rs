@@ -4630,6 +4630,38 @@ impl VersionStore {
         self.indexes.read()
     }
 
+    /// Get column indices and names for all non-PK unique indexes.
+    /// Used by commit-time cold revalidation.
+    pub fn get_unique_non_pk_index_columns(&self) -> Vec<(Vec<usize>, Vec<String>)> {
+        let schema = self.schema();
+        let pk_col = schema
+            .pk_column_index()
+            .map(|i| &schema.columns[i].name_lower);
+        let indexes = self.indexes.read();
+        let mut result = Vec::new();
+        for idx in indexes.values() {
+            if !idx.is_unique() {
+                continue;
+            }
+            let names = idx.column_names();
+            if names.len() == 1 {
+                if let Some(pk) = pk_col {
+                    if names[0].eq_ignore_ascii_case(pk) {
+                        continue;
+                    }
+                }
+            }
+            let col_indices: Vec<usize> = names
+                .iter()
+                .filter_map(|name| schema.columns.iter().position(|c| c.name_lower == *name))
+                .collect();
+            if col_indices.len() == names.len() {
+                result.push((col_indices, names.to_vec()));
+            }
+        }
+        result
+    }
+
     // =========================================================================
     // Zone Map Operations (Statistics for Segment Pruning)
     // =========================================================================
@@ -5356,21 +5388,10 @@ impl VersionStore {
     }
 
     /// Remove stale hot index entries for sealed rows (phase 2 of seal).
-    /// Called AFTER clear_seal_overlap so that the cold check sees the
-    /// newly registered volume before we remove the hot index safety net.
+    /// Called while the table's seal fence is still held so INSERT cannot race
+    /// between cold constraint checks and hot-index cleanup.
     pub fn remove_sealed_index_entries(&self, cleanup: SealedIndexCleanup) {
         if cleanup.removed_ids.is_empty() {
-            return;
-        }
-
-        let indexes = self.indexes.read();
-        let hot_only_indexes: Vec<_> = indexes
-            .values()
-            .enumerate()
-            .filter(|(_, idx)| idx.index_type() != crate::core::IndexType::Hnsw)
-            .collect();
-
-        if hot_only_indexes.is_empty() {
             return;
         }
 
@@ -5378,24 +5399,49 @@ impl VersionStore {
             return;
         };
 
-        for &row_id in &cleanup.removed_ids {
-            if let Some(entry) = snap.get(row_id) {
-                let row = &entry.version.data;
-                for (_, index) in &hot_only_indexes {
-                    let col_ids = index.column_ids();
-                    let values: Vec<crate::core::Value> = col_ids
-                        .iter()
-                        .map(|&col_id| {
-                            row.get(col_id as usize)
-                                .cloned()
-                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
-                        })
-                        .collect();
-                    let _ = index.remove(&values, row_id, row_id);
-                }
-            }
-        }
+        let indexes = self.indexes.read();
+        let hot_only_indexes: Vec<_> = indexes
+            .values()
+            .filter(|idx| idx.index_type() != crate::core::IndexType::Hnsw)
+            .cloned()
+            .collect();
         drop(indexes);
+
+        if hot_only_indexes.is_empty() {
+            return;
+        }
+
+        for index in &hot_only_indexes {
+            let col_ids = index.column_ids();
+            let mut owned_entries: Vec<(i64, Vec<crate::core::Value>)> =
+                Vec::with_capacity(cleanup.removed_ids.len());
+
+            for &row_id in &cleanup.removed_ids {
+                let Some(entry) = snap.get(row_id) else {
+                    continue;
+                };
+                let row = &entry.version.data;
+                let values: Vec<crate::core::Value> = col_ids
+                    .iter()
+                    .map(|&col_id| {
+                        row.get(col_id as usize)
+                            .cloned()
+                            .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
+                    })
+                    .collect();
+                owned_entries.push((row_id, values));
+            }
+
+            if owned_entries.is_empty() {
+                continue;
+            }
+
+            let borrowed_entries: Vec<(i64, &[crate::core::Value])> = owned_entries
+                .iter()
+                .map(|(row_id, values)| (*row_id, values.as_slice()))
+                .collect();
+            let _ = index.remove_batch_slice(&borrowed_entries);
+        }
     }
 
     /// Cleanup deleted rows that are older than the retention period.
@@ -6240,6 +6286,11 @@ impl TransactionVersionStore {
     /// Read-only access to local versions for rollback cleanup.
     pub fn local_versions_ref(&self) -> Option<&I64Map<VersionList>> {
         self.local_versions.as_ref()
+    }
+
+    /// Read-only access to write set for commit-time cold revalidation.
+    pub fn write_set_ref(&self) -> Option<&I64Map<WriteSetEntry>> {
+        self.write_set.as_ref()
     }
 
     /// Ensures local_versions map is allocated, returning a mutable reference.

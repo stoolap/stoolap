@@ -5568,85 +5568,70 @@ impl MVCCEngine {
                 compress,
             ) {
                 Ok((volume, _path, volume_id)) => {
-                    // Register the cold segment BEFORE removing rows from hot.
-                    // Rows are visible in BOTH hot and cold briefly. Skip-set
-                    // dedup (newest-first wins) handles this at scan time.
-                    // Registration MUST happen before tombstone clearing so
-                    // unique enforcement can see the new values immediately.
                     let mgr = self.get_or_create_segment_manager(&table_name);
-                    mgr.set_seal_overlap(total_rows);
-                    self.register_volume_with_id(&table_name, Arc::clone(&volume), volume_id);
 
-                    // Phase 1: Remove sealed rows from hot version store in batches.
-                    // Index entries are KEPT to prevent unique constraint violations
-                    // during the seal window (stale index entries still trigger
-                    // UniqueConstraint errors, which is correct — the value exists in cold).
-                    let mut index_cleanups = Vec::new();
-                    let mut all_skipped: Vec<i64> = Vec::new();
-                    let all_row_ids: Vec<i64> = all_rows.iter().map(|(id, _)| *id).collect();
-                    for batch in all_row_ids.chunks(REMOVE_BATCH_SIZE) {
-                        let (removed, cleanup, skipped) =
-                            store.remove_sealed_rows(batch, &extraction_snapshot);
-                        store.subtract_committed_row_count(removed);
-                        index_cleanups.push(cleanup);
-                        all_skipped.extend(skipped);
-                    }
-
-                    // Tombstone skipped row_ids. These rows were modified by a
-                    // concurrent commit after extraction — the sealed volume has
-                    // stale data for them. Tombstones ensure:
-                    // 1. Scans skip the stale cold copy (hot version wins via skip set,
-                    //    but tombstone is the authoritative marker for deduped_row_count)
-                    // 2. WAL recovery applies the update (sees tombstone → not a sealed
-                    //    INSERT → applies the WAL entry to hot)
-                    // 3. row_count() is correct (tombstoned cold rows are excluded)
-                    if !all_skipped.is_empty() {
-                        // Use the current commit sequence as the tombstone's
-                        // commit_seq. This makes each seal's tombstones
-                        // distinguishable from previous seals, so concurrent
-                        // compaction (which snapshots tombstones at start)
-                        // won't accidentally clear a tombstone re-added by
-                        // a later seal.
-                        let seal_seq = self.registry.get_current_sequence() as u64;
-                        mgr.add_tombstones(&all_skipped, seal_seq);
-                    }
-
-                    // Sync auto-increment so new inserts don't collide
-                    // with row_ids in the newly sealed segment.
-                    if let Some(&(max_id, _)) = all_rows.last() {
-                        let current = store.get_auto_increment_counter();
-                        if max_id > current {
-                            store.set_auto_increment_counter(max_id);
-                        }
-                    }
-
-                    mgr.clear_seal_overlap();
-
-                    // Remove stale hot index entries. These existed as a safety net
-                    // during the seal window but are now safe to clean since
-                    // seal_overlap is cleared and new cold checks get fresh snapshots.
-                    for cleanup in index_cleanups {
-                        store.remove_sealed_index_entries(cleanup);
-                    }
-
-                    // Clear tombstones for row_ids that are now in the new
-                    // volume, EXCEPT for skipped row_ids. Skipped rows have
-                    // a stale copy in the volume and a live version in hot —
-                    // their tombstone must survive for recovery and row_count.
+                    // Seal critical section under exclusive fence: register cold
+                    // segment + remove hot rows + remove hot index entries.
+                    // DML operations hold the shared fence, so they cannot race
+                    // between cold constraint checks and hot publication.
                     {
-                        let skip_set: FxHashSet<i64> = all_skipped.iter().copied().collect();
-                        let ts = mgr.tombstone_set_arc();
-                        if !ts.is_empty() {
-                            let sealed_ids: FxHashSet<i64> = volume
-                                .row_ids
-                                .iter()
-                                .copied()
-                                .filter(|rid| ts.contains_key(rid) && !skip_set.contains(rid))
-                                .collect();
-                            if !sealed_ids.is_empty() {
-                                mgr.remove_tombstones_for_rows(&sealed_ids);
+                        let _seal_guard = mgr.acquire_seal_write();
+
+                        mgr.set_seal_overlap(total_rows);
+                        self.register_volume_with_id(&table_name, Arc::clone(&volume), volume_id);
+
+                        let mut index_cleanups = Vec::new();
+                        let mut all_skipped_inner: Vec<i64> = Vec::new();
+                        let all_row_ids: Vec<i64> = all_rows.iter().map(|(id, _)| *id).collect();
+                        for batch in all_row_ids.chunks(REMOVE_BATCH_SIZE) {
+                            let (removed, cleanup, skipped) =
+                                store.remove_sealed_rows(batch, &extraction_snapshot);
+                            store.subtract_committed_row_count(removed);
+                            index_cleanups.push(cleanup);
+                            all_skipped_inner.extend(skipped);
+                        }
+
+                        if !all_skipped_inner.is_empty() {
+                            let seal_seq = self.registry.get_current_sequence() as u64;
+                            mgr.add_tombstones(&all_skipped_inner, seal_seq);
+                        }
+
+                        if let Some(&(max_id, _)) = all_rows.last() {
+                            let current = store.get_auto_increment_counter();
+                            if max_id > current {
+                                store.set_auto_increment_counter(max_id);
                             }
                         }
+
+                        mgr.clear_seal_overlap();
+
+                        for cleanup in index_cleanups {
+                            store.remove_sealed_index_entries(cleanup);
+                        }
+
+                        // Clear tombstones for sealed row_ids INSIDE the fence.
+                        // Previously-updated rows have tombstones hiding the old
+                        // cold copy. The new volume has the updated version.
+                        // Clearing outside the fence would leave a window where
+                        // the row is invisible (hot removed, cold tombstoned).
+                        {
+                            let skip_set: FxHashSet<i64> =
+                                all_skipped_inner.iter().copied().collect();
+                            let ts = mgr.tombstone_set_arc();
+                            if !ts.is_empty() {
+                                let sealed_ids: FxHashSet<i64> = volume
+                                    .row_ids
+                                    .iter()
+                                    .copied()
+                                    .filter(|rid| ts.contains_key(rid) && !skip_set.contains(rid))
+                                    .collect();
+                                if !sealed_ids.is_empty() {
+                                    mgr.remove_tombstones_for_rows(&sealed_ids);
+                                }
+                            }
+                        }
+
+                        // _seal_guard dropped here — DML unblocked
                     }
                 }
                 Err(e) => {
@@ -6402,6 +6387,201 @@ impl EngineOperations {
         self.loading_from_disk.load(Ordering::Acquire)
     }
 
+    /// Validate pending INSERT/UPDATE rows against cold segments at commit time.
+    /// Called when seal_generation changed since the transaction's INSERT,
+    /// meaning a seal may have moved conflicting rows from hot to cold.
+    /// The seal read fence is held by the caller.
+    fn validate_pending_against_cold(
+        &self,
+        txn_id: i64,
+        txn_store: &Arc<RwLock<TransactionVersionStore>>,
+        version_store: &Arc<VersionStore>,
+        mgr: &Arc<crate::storage::volume::manifest::SegmentManager>,
+    ) -> Result<()> {
+        let store = txn_store.read().unwrap();
+        let Some(local) = store.local_versions_ref() else {
+            return Ok(());
+        };
+
+        let schema_arc = version_store.schema();
+        let schema = &*schema_arc;
+        let pk_idx = schema.pk_column_index();
+
+        // Collect unique index column info + precompute defaults once
+        let unique_indexes: Vec<(Vec<usize>, Vec<String>, Vec<crate::core::Value>)> = version_store
+            .get_unique_non_pk_index_columns()
+            .into_iter()
+            .map(|(col_indices, col_names)| {
+                let defaults: Vec<crate::core::Value> = col_indices
+                    .iter()
+                    .map(|&ci| {
+                        schema.columns[ci]
+                            .default_value
+                            .clone()
+                            .unwrap_or(crate::core::Value::null(schema.columns[ci].data_type))
+                    })
+                    .collect();
+                (col_indices, col_names, defaults)
+            })
+            .collect();
+
+        for (row_id, versions) in local.iter() {
+            let Some(version) = versions.last() else {
+                continue;
+            };
+            if version.is_deleted() {
+                continue;
+            }
+            let row = &version.data;
+
+            // Classify INSERT vs UPDATE:
+            // - Hot UPDATE: write_set has read_version: Some(old_row)
+            // - Cold UPDATE: pending tombstone exists for this row_id
+            //   (added during cold-row claim in update/update_by_row_ids)
+            // - Fresh INSERT: neither of the above
+            // Note: put() creates write_set entries for all rows (including
+            // INSERTs with read_version: None), so write_set presence alone
+            // cannot distinguish INSERT from cold-row claim.
+            let has_read_version = store
+                .write_set_ref()
+                .and_then(|ws| ws.get(row_id))
+                .and_then(|entry| entry.read_version.as_ref())
+                .is_some();
+            let is_cold_claim = mgr.is_pending_tombstone(txn_id, row_id);
+            let is_insert = !has_read_version && !is_cold_claim;
+
+            if is_insert {
+                // PK check against cold
+                if let Some(pk_col) = pk_idx {
+                    if let Some(pk_val) = row.get(pk_col) {
+                        if !pk_val.is_null() {
+                            if let Some(cold_rid) =
+                                mgr.check_value_exists_in_segments(pk_col, pk_val)
+                            {
+                                if !mgr.is_pending_tombstone(txn_id, cold_rid) {
+                                    return Err(crate::core::Error::PrimaryKeyConstraint {
+                                        row_id: cold_rid,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // UNIQUE constraint checks against cold
+                for (col_indices, col_names, defaults) in &unique_indexes {
+                    let coerced: Vec<crate::core::Value> = col_indices
+                        .iter()
+                        .filter_map(|&idx| {
+                            let val = row.get(idx)?;
+                            Some(val.coerce_to_type(schema.columns[idx].data_type))
+                        })
+                        .collect();
+                    if coerced.len() != col_indices.len() || coerced.iter().any(|v| v.is_null()) {
+                        continue;
+                    }
+                    let values: Vec<&crate::core::Value> = coerced.iter().collect();
+                    if let Some(cold_rid) = mgr.find_row_id_by_values(
+                        col_indices,
+                        &values,
+                        defaults,
+                        schema.columns.len(),
+                    ) {
+                        if !mgr.is_pending_tombstone(txn_id, cold_rid) {
+                            return Err(crate::core::Error::UniqueConstraint {
+                                index: col_names.join("_"),
+                                column: col_names.join(", "),
+                                value: values
+                                    .iter()
+                                    .map(|v| v.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                row_id: cold_rid,
+                            });
+                        }
+                    }
+                }
+            } else {
+                // UPDATE: check PK if it changed
+                if let Some(pk_col) = pk_idx {
+                    let new_pk = row.get(pk_col);
+                    let old_pk = store
+                        .write_set_ref()
+                        .and_then(|ws| ws.get(row_id))
+                        .and_then(|entry| entry.read_version.as_ref())
+                        .and_then(|rv| rv.data.get(pk_col));
+                    if new_pk != old_pk {
+                        if let Some(pk_val) = new_pk {
+                            if !pk_val.is_null() {
+                                if let Some(cold_rid) =
+                                    mgr.check_value_exists_in_segments(pk_col, pk_val)
+                                {
+                                    if cold_rid != row_id
+                                        && !mgr.is_pending_tombstone(txn_id, cold_rid)
+                                    {
+                                        return Err(crate::core::Error::PrimaryKeyConstraint {
+                                            row_id: cold_rid,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // UPDATE: check unique constraints excluding the row being updated.
+                // Skip when the indexed columns haven't changed.
+                let old_row = store
+                    .write_set_ref()
+                    .and_then(|ws| ws.get(row_id))
+                    .and_then(|entry| entry.read_version.as_ref())
+                    .map(|rv| &rv.data);
+
+                for (col_indices, col_names, defaults) in &unique_indexes {
+                    // Skip if none of the indexed columns changed
+                    if let Some(old_r) = old_row {
+                        let any_changed = col_indices
+                            .iter()
+                            .any(|&idx| row.get(idx) != old_r.get(idx));
+                        if !any_changed {
+                            continue;
+                        }
+                    }
+
+                    let coerced: Vec<crate::core::Value> = col_indices
+                        .iter()
+                        .filter_map(|&idx| {
+                            let val = row.get(idx)?;
+                            Some(val.coerce_to_type(schema.columns[idx].data_type))
+                        })
+                        .collect();
+                    if coerced.len() != col_indices.len() || coerced.iter().any(|v| v.is_null()) {
+                        continue;
+                    }
+                    let values: Vec<&crate::core::Value> = coerced.iter().collect();
+                    if let Some(cold_rid) = mgr.find_row_id_by_values(
+                        col_indices,
+                        &values,
+                        defaults,
+                        schema.columns.len(),
+                    ) {
+                        if cold_rid != row_id && !mgr.is_pending_tombstone(txn_id, cold_rid) {
+                            return Err(crate::core::Error::UniqueConstraint {
+                                index: col_names.join("_"),
+                                column: col_names.join(", "),
+                                value: values
+                                    .iter()
+                                    .map(|v| v.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                row_id: cold_rid,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Record pending versions for a table to WAL (helper for commit_all_tables)
     fn record_table_to_wal(&self, txn_id: i64, table: &MVCCTable) -> Result<()> {
         if let Some(ref pm) = self.persistence() {
@@ -6968,10 +7148,50 @@ impl TransactionEngineOperations for EngineOperations {
                 }
             }
 
+            // Commit-time seal coordination:
+            // 1. Always take fence for tables with segments (prevents concurrent
+            //    seal from removing index entries during commit validation).
+            // 2. If seal_generation changed since our INSERT, revalidate pending
+            //    rows against cold (catches rows sealed before this commit).
+            // Fall back to live lookup if the manager was created after our snapshot
+            // (first seal on a previously hot-only table).
+            let mgr_for_commit = commit_mgrs.get(table_name.as_str()).cloned().or_else(|| {
+                self.segment_managers
+                    .read()
+                    .unwrap()
+                    .get(table_name.as_str())
+                    .cloned()
+            });
+            // Always take fence if manager exists — even before first seal
+            // completes, the manager may exist without has_segments() being
+            // true yet (created before register_volume publishes the flag).
+            let _seal_guard = mgr_for_commit.as_ref().map(|mgr| mgr.acquire_seal_read());
+
+            // Cold revalidation: only when a seal happened since our INSERT.
+            if let Some(mgr) = mgr_for_commit.as_ref() {
+                let recorded = mgr.get_txn_seal_generation(txn_id);
+                let needs_recheck = match recorded {
+                    Some(gen) => gen != mgr.seal_generation(),
+                    // No recorded generation but segments exist: txn started
+                    // before first seal or used hot-only path. Must recheck.
+                    None => mgr.has_segments(),
+                };
+                if needs_recheck {
+                    if let Err(e) =
+                        self.validate_pending_against_cold(txn_id, txn_store, version_store, mgr)
+                    {
+                        commit_error = Some(e);
+                        break;
+                    }
+                }
+            }
+
             if let Err(e) = table.commit() {
                 commit_error = Some(e);
                 break;
             }
+
+            // txn_seal_gens cleanup handled in the tail loop below
 
             // Mark tombstones as WAL-recorded ONLY after table.commit() succeeds.
             // Before this fix, the mark was set before commit, so a failed commit
@@ -7044,13 +7264,11 @@ impl TransactionEngineOperations for EngineOperations {
                         mgr.commit_pending_tombstones(txn_id, commit_seq);
                     }
                 } else if tombstones_wal_recorded.contains(table_name.as_str()) {
-                    // This table's hot changes were already committed and its
-                    // tombstones were WAL-recorded. Commit (not rollback) its
-                    // tombstones to keep cold state consistent with hot.
                     mgr.commit_pending_tombstones(txn_id, commit_seq);
                 } else {
                     mgr.rollback_pending_tombstones(txn_id);
                 }
+                mgr.clear_txn_seal_generation(txn_id);
             }
         }
 
@@ -7069,12 +7287,14 @@ impl TransactionEngineOperations for EngineOperations {
         cache.remove(txn_id);
         drop(cache);
 
-        // Rollback pending tombstones only on tables this transaction touched
+        // Rollback pending tombstones and clean up seal generation records
+        // only on tables this transaction touched.
         if !touched.is_empty() {
             let mgrs = self.segment_managers.read().unwrap();
             for name in &touched {
                 if let Some(mgr) = mgrs.get(name.as_str()) {
                     mgr.rollback_pending_tombstones(txn_id);
+                    mgr.clear_txn_seal_generation(txn_id);
                 }
             }
         }

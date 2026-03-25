@@ -408,6 +408,17 @@ pub struct SegmentManager {
     /// Cached deduplicated row count. Invalidated (set to u64::MAX) on
     /// segment or tombstone changes. Recomputed lazily on next read.
     cached_deduped_count: std::sync::atomic::AtomicU64,
+    /// Per-table fence that serializes seal with cold-check + hot insert.
+    /// INSERTs take a shared guard while checking cold constraints and
+    /// publishing into hot; seal takes the exclusive guard while moving rows.
+    seal_fence: RwLock<()>,
+    /// Monotonic counter incremented on every register_segment. Used at
+    /// commit time to detect whether a seal happened since statement time.
+    /// If unchanged, the commit-time cold recheck is skipped (fast path).
+    seal_generation: std::sync::atomic::AtomicU64,
+    /// Per-txn seal generation at INSERT time. Small map — only active
+    /// transactions with pending inserts on this table.
+    txn_seal_gens: parking_lot::Mutex<rustc_hash::FxHashMap<i64, u64>>,
     /// Number of rows currently being sealed (exist in both hot and cold).
     /// Set to N before register_segment, cleared after remove_sealed_rows.
     /// Subtracted from row_count() to prevent double-counting during the seal window.
@@ -426,6 +437,9 @@ impl SegmentManager {
             tombstones: RwLock::new(Arc::new(FxHashMap::default())),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
+            seal_fence: RwLock::new(()),
+            seal_generation: std::sync::atomic::AtomicU64::new(0),
+            txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -443,6 +457,9 @@ impl SegmentManager {
             tombstones: RwLock::new(Arc::new(tombstone_map)),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
+            seal_fence: RwLock::new(()),
+            seal_generation: std::sync::atomic::AtomicU64::new(0),
+            txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -830,6 +847,8 @@ impl SegmentManager {
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.seal_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Load a volume into the segments map for an existing manifest entry.
@@ -1235,6 +1254,56 @@ impl SegmentManager {
         self.cached_deduped_count
             .store(count as u64, std::sync::atomic::Ordering::Relaxed);
         count
+    }
+
+    /// Acquire a shared guard while performing a cold check + hot insert.
+    /// Seal takes the exclusive guard so it cannot move rows between the
+    /// cold visibility check and hot publication.
+    #[inline]
+    pub fn acquire_seal_read(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.seal_fence.read()
+    }
+
+    /// Acquire the exclusive guard for the seal critical section.
+    #[inline]
+    pub fn acquire_seal_write(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.seal_fence.write()
+    }
+
+    /// Current seal generation. Incremented on every register_segment.
+    #[inline]
+    pub fn seal_generation(&self) -> u64 {
+        self.seal_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record the current seal generation for a transaction. Called under
+    /// the seal read fence during INSERT so the value is consistent.
+    /// Stores the minimum (earliest) generation seen by this txn, so that
+    /// a later INSERT within the same txn cannot hide an earlier seal.
+    #[inline]
+    pub fn record_txn_seal_generation(&self, txn_id: i64) {
+        let gen = self.seal_generation();
+        let mut map = self.txn_seal_gens.lock();
+        map.entry(txn_id)
+            .and_modify(|existing| {
+                if gen < *existing {
+                    *existing = gen;
+                }
+            })
+            .or_insert(gen);
+    }
+
+    /// Get the seal generation recorded for a transaction.
+    #[inline]
+    pub fn get_txn_seal_generation(&self, txn_id: i64) -> Option<u64> {
+        self.txn_seal_gens.lock().get(&txn_id).copied()
+    }
+
+    /// Remove the seal generation record for a transaction (on commit/rollback).
+    #[inline]
+    pub fn clear_txn_seal_generation(&self, txn_id: i64) {
+        self.txn_seal_gens.lock().remove(&txn_id);
     }
 
     /// Scan all row_ids, deduplicate (newest-first wins), and exclude tombstones.

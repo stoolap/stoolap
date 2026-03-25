@@ -878,29 +878,41 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn insert(&mut self, row: Row) -> Result<Row> {
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         if self.segment_mgr.has_segments() {
             self.check_segment_constraints(&row)?;
         }
-        // Hot unique constraints are checked atomically inside
-        // MVCCTable::insert via add_to_unique_indexes() → index.add()
-        // which does check+insert under the index WRITE lock.
-        self.hot.insert(row)
+        let result = self.hot.insert(row)?;
+        if self.segment_mgr.has_segments() {
+            self.segment_mgr.record_txn_seal_generation(self.txn_id());
+        }
+        Ok(result)
     }
 
     fn insert_discard(&mut self, row: Row) -> Result<()> {
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         if self.segment_mgr.has_segments() {
             self.check_segment_constraints(&row)?;
         }
-        self.hot.insert_discard(row)
+        self.hot.insert_discard(row)?;
+        if self.segment_mgr.has_segments() {
+            self.segment_mgr.record_txn_seal_generation(self.txn_id());
+        }
+        Ok(())
     }
 
     fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()> {
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         if self.segment_mgr.has_segments() {
             for row in &rows {
                 self.check_segment_constraints(row)?;
             }
         }
-        self.hot.insert_batch(rows)
+        self.hot.insert_batch(rows)?;
+        if self.segment_mgr.has_segments() {
+            self.segment_mgr.record_txn_seal_generation(self.txn_id());
+        }
+        Ok(())
     }
 
     fn update(
@@ -908,14 +920,7 @@ impl Table for SegmentedTable {
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
-        // Hot-row updates delegate to the hot table directly.
-        // Cold unique checks for the hot path are NOT done here because:
-        // 1. ON CONFLICT DO UPDATE calls this path to update the conflicting row.
-        //    The new values often match the existing cold key (that's the point).
-        //    Checking cold would raise a false UniqueConstraint violation.
-        // 2. Cold-segment iteration below (for cold-row updates) uses
-        //    check_cold_unique_for_update with exclude_row_id, which is correct.
-        // 3. Commit-time index validation catches remaining edge cases.
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let mut count = self.hot.update(where_expr, setter)?;
 
         // Update matching segment rows.
@@ -999,6 +1004,9 @@ impl Table for SegmentedTable {
                 dynamic_skip.insert(rid);
             }
         }
+        if count > 0 {
+            self.segment_mgr.record_txn_seal_generation(self.txn_id());
+        }
         Ok(count)
     }
 
@@ -1007,6 +1015,7 @@ impl Table for SegmentedTable {
         row_ids: &[i64],
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let mut count = 0i32;
         let mut hot_ids = Vec::new();
         let schema = self.hot.schema().clone();
@@ -1081,10 +1090,14 @@ impl Table for SegmentedTable {
             // to avoid false violations during ON CONFLICT DO UPDATE.
             count += self.hot.update_by_row_ids(&hot_ids, setter)?;
         }
+        if count > 0 {
+            self.segment_mgr.record_txn_seal_generation(self.txn_id());
+        }
         Ok(count)
     }
 
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let mut count = 0i32;
         let mut hot_ids = Vec::new();
         let has_int_pk = self
@@ -1150,6 +1163,7 @@ impl Table for SegmentedTable {
     }
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let mut count = self.hot.delete(where_expr)?;
         let has_int_pk = self
             .hot
@@ -1209,6 +1223,7 @@ impl Table for SegmentedTable {
     }
 
     fn truncate(&mut self) -> Result<i32> {
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let seg_rows = self.segment_mgr.total_row_count() as i32;
         // Clear pending tombstones for this txn (segments are being dropped)
         self.segment_mgr.rollback_pending_tombstones(self.txn_id());
@@ -2289,14 +2304,17 @@ impl Table for SegmentedTable {
         // commit_seq=0 means "always visible to all snapshots". This is safe because
         // the main commit path goes through engine.commit_all_tables() which passes
         // the real commit_seq. This fallback is for direct Table::commit() calls.
-        self.segment_mgr.commit_pending_tombstones(self.txn_id(), 0);
+        let txn_id = self.txn_id();
+        self.segment_mgr.commit_pending_tombstones(txn_id, 0);
+        self.segment_mgr.clear_txn_seal_generation(txn_id);
         Ok(())
     }
 
     fn rollback(&mut self) {
         self.hot.rollback();
-        // Discard pending tombstones — cold rows remain visible.
-        self.segment_mgr.rollback_pending_tombstones(self.txn_id());
+        let txn_id = self.txn_id();
+        self.segment_mgr.rollback_pending_tombstones(txn_id);
+        self.segment_mgr.clear_txn_seal_generation(txn_id);
     }
 
     fn rollback_to_timestamp(&self, timestamp: i64) {
