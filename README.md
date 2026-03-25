@@ -233,7 +233,7 @@ file://./mydb?sync_mode=normal&compression=on&checkpoint_interval=60
 
 | DSN Parameter | Default | Description |
 |---------------|---------|-------------|
-| `sync_mode` | `normal` | WAL sync: `none`, `normal`, `full` |
+| `sync_mode` | `normal` | `none` (no fsync, data durable at checkpoint), `normal` (fsync every 1s), `full` (fsync every write) |
 | `compression` | `on` | LZ4 for both WAL and volumes |
 | `wal_compression` | `on` | LZ4 for WAL entries only |
 | `volume_compression` | `on` | LZ4 for cold volume files only |

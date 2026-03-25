@@ -68,18 +68,17 @@ file:///path/to/data?sync_mode=normal&checkpoint_interval=60
 
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
-| `sync` / `sync_mode` | none, normal, full (or 0, 1, 2) | normal | WAL synchronization mode |
+| `sync` / `sync_mode` | none, normal, full (or 0, 1, 2) | normal | WAL synchronization mode. none=no fsync (data durable at checkpoint), normal=fsync every 1s, full=fsync every write |
 | `checkpoint_interval` | Integer (seconds) | 60 | Time between automatic checkpoint cycles |
 | `compact_threshold` | Integer | 4 | Volume count before compaction triggers |
 | `keep_snapshots` | Integer | 3 | Backup snapshots to retain per table |
 | `wal_flush_trigger` | Integer (bytes) | 32768 | Size in bytes before WAL flush |
 | `wal_buffer_size` | Integer (bytes) | 65536 | WAL write buffer size |
 | `wal_max_size` | Integer (bytes) | 67108864 | Maximum WAL file size (64MB) |
-| `commit_batch_size` | Integer | 100 | Operations batched per commit flush |
-| `sync_interval_ms` | Integer (ms) | 10 | Background sync interval |
-| `wal_compression` | on/off | on | Enable WAL compression |
-| `compression` | on/off | on | Enable WAL compression |
-| `compression_threshold` | Integer (bytes) | 64 | Minimum size for compression |
+| `wal_compression` | on/off | on | Enable LZ4 compression for WAL entries |
+| `volume_compression` | on/off | on | Enable LZ4 compression for cold volume files |
+| `compression` | on/off | on | Enable LZ4 compression for both WAL and volumes |
+| `compression_threshold` | Integer (bytes) | 64 | Minimum size for WAL compression |
 | `checkpoint_on_close` | on/off | on | Seal all hot rows to volumes on clean shutdown |
 
 Legacy parameter names are accepted for backward compatibility:

@@ -74,6 +74,9 @@ pub(crate) struct DatabaseInner {
     /// Whether this DatabaseInner owns the engine (created it via open()).
     /// Cloned DatabaseInners share the engine but don't own it.
     owns_engine: bool,
+    /// Temp directory for test-filedb feature. Deleted on drop.
+    #[cfg(feature = "test-filedb")]
+    _temp_dir: Option<tempfile::TempDir>,
 }
 
 /// Type alias for Statement to use (avoids exposing DatabaseInner directly)
@@ -180,7 +183,9 @@ impl Clone for Database {
             engine,
             executor: Mutex::new(executor),
             dsn: self.inner.dsn.clone(),
-            owns_engine: false, // Cloned handles don't own the engine
+            owns_engine: false,
+            #[cfg(feature = "test-filedb")]
+            _temp_dir: None, // Clones don't own the temp dir
         });
 
         Database { inner }
@@ -254,15 +259,35 @@ impl Database {
         // Parse the DSN
         let (scheme, path) = Self::parse_dsn(dsn)?;
 
+        // test-filedb: track temp dir so it lives as long as the engine
+        #[cfg(feature = "test-filedb")]
+        let mut _temp_dir_holder: Option<tempfile::TempDir> = None;
+
         // Create the engine based on scheme
         let engine = match scheme.as_str() {
             MEMORY_SCHEME => {
-                let engine = MVCCEngine::in_memory();
-                engine.open_engine()?;
-                let engine = Arc::new(engine);
-                // Start background cleanup (uses config from engine)
-                engine.start_cleanup();
-                engine
+                #[cfg(feature = "test-filedb")]
+                {
+                    let tmp = tempfile::tempdir().map_err(|e| {
+                        Error::internal(format!("failed to create temp dir: {}", e))
+                    })?;
+                    let file_dsn = format!("file://{}", tmp.path().display());
+                    let (_clean_path, config) = Self::parse_file_config(&file_dsn[7..])?;
+                    let engine = MVCCEngine::new(config);
+                    engine.open_engine()?;
+                    let engine = Arc::new(engine);
+                    engine.start_cleanup();
+                    _temp_dir_holder = Some(tmp);
+                    engine
+                }
+                #[cfg(not(feature = "test-filedb"))]
+                {
+                    let engine = MVCCEngine::in_memory();
+                    engine.open_engine()?;
+                    let engine = Arc::new(engine);
+                    engine.start_cleanup();
+                    engine
+                }
             }
             FILE_SCHEME => {
                 // Parse optional query parameters
@@ -290,7 +315,9 @@ impl Database {
             engine,
             executor: Mutex::new(executor),
             dsn: dsn.to_string(),
-            owns_engine: true, // This DatabaseInner owns the engine
+            owns_engine: true,
+            #[cfg(feature = "test-filedb")]
+            _temp_dir: _temp_dir_holder,
         });
 
         // Store in registry
@@ -305,23 +332,43 @@ impl Database {
     /// Each call creates a unique instance (unlike `open("memory://")` which
     /// would share the same instance).
     pub fn open_in_memory() -> Result<Self> {
-        // Create engine directly without registry (each in_memory call is unique)
-        let engine = MVCCEngine::in_memory();
+        Self::create_in_memory_engine()
+    }
+
+    #[cfg(feature = "test-filedb")]
+    fn create_in_memory_engine() -> Result<Self> {
+        let tmp = tempfile::tempdir()
+            .map_err(|e| Error::internal(format!("failed to create temp dir: {}", e)))?;
+        let file_dsn = format!("file://{}", tmp.path().display());
+        let (_clean_path, config) = Self::parse_file_config(&file_dsn[7..])?;
+        let engine = MVCCEngine::new(config);
         engine.open_engine()?;
         let engine = Arc::new(engine);
-        // Start background cleanup (uses config from engine)
         engine.start_cleanup();
-
-        // Create executor (uses shared default function registry)
         let executor = Executor::new(Arc::clone(&engine));
-
         let inner = Arc::new(DatabaseInner {
             engine,
             executor: Mutex::new(executor),
             dsn: "memory://".to_string(),
-            owns_engine: true, // This DatabaseInner owns the engine
+            owns_engine: true,
+            _temp_dir: Some(tmp),
         });
+        Ok(Database { inner })
+    }
 
+    #[cfg(not(feature = "test-filedb"))]
+    fn create_in_memory_engine() -> Result<Self> {
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine()?;
+        let engine = Arc::new(engine);
+        engine.start_cleanup();
+        let executor = Executor::new(Arc::clone(&engine));
+        let inner = Arc::new(DatabaseInner {
+            engine,
+            executor: Mutex::new(executor),
+            dsn: "memory://".to_string(),
+            owns_engine: true,
+        });
         Ok(Database { inner })
     }
 

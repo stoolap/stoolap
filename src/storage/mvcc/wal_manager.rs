@@ -1382,6 +1382,12 @@ impl WALManager {
                 .map_err(|e| Error::internal(format!("failed to sync WAL: {}", e)))?;
         }
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        self.last_sync_time.store(now, Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -1541,23 +1547,21 @@ impl WALManager {
         match self.sync_mode {
             SyncMode::None => false,
             SyncMode::Normal => {
-                // CRITICAL: Always sync on DDL operations
+                // Always sync on DDL operations (schema changes must be durable)
                 if op.is_ddl() {
                     return true;
                 }
-                // CRITICAL: Always sync on transaction end (commit/rollback)
-                // This ensures durability - a committed transaction is guaranteed
-                // to survive crashes. Without this, commit markers could be lost
-                // in the OS buffer cache, causing committed data to appear as
-                // "in-doubt" (aborted) after recovery.
-                //
-                // Note: This removes the previous batching optimization for commits.
-                // If users need higher write throughput at the cost of durability,
-                // they can use SyncMode::None explicitly.
-                if op.is_transaction_end() {
-                    return true;
-                }
-                false
+                // Time-based sync: fsync at most once per second.
+                // Committed data survives in the OS buffer cache for most crashes
+                // (power failure is the exception). Checkpoint (every 60s) moves
+                // data to fsynced volume files for full durability.
+                // Max data loss on power failure: ~1 second of commits.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0);
+                let last = self.last_sync_time.load(Ordering::Relaxed);
+                now - last >= 1_000_000_000 // 1 second
             }
             SyncMode::Full => true,
         }

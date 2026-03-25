@@ -27,6 +27,13 @@ const ITERATIONS_HEAVY: usize = 50; // Full scans, JOINs
 const WARMUP: usize = 10;
 
 fn main() {
+    let filedb = std::env::args().any(|a| a == "--filedb");
+    let _temp_dir = if filedb {
+        Some(tempfile::tempdir().unwrap())
+    } else {
+        None
+    };
+
     println!("Starting DuckDB benchmark...");
     println!(
         "Configuration: {} rows, {} iterations per test\n",
@@ -34,7 +41,11 @@ fn main() {
     );
 
     let mut rng = rand::rng();
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = if let Some(ref tmp) = _temp_dir {
+        Connection::open(tmp.path().join("bench.duckdb")).unwrap()
+    } else {
+        Connection::open_in_memory().unwrap()
+    };
 
     // Create schema (same as Stoolap)
     conn.execute(
@@ -80,11 +91,12 @@ fn main() {
         }
     }
 
+    let mode = if filedb { "file-db" } else { "in-memory" };
     println!("Benchmarking DuckDB...\n");
     println!("============================================================");
     println!(
-        "DUCKDB BENCHMARK ({} rows, {} iterations, in-memory)",
-        ROW_COUNT, ITERATIONS
+        "DUCKDB BENCHMARK ({} rows, {} iterations, {})",
+        ROW_COUNT, ITERATIONS, mode
     );
     println!("============================================================\n");
     println!(

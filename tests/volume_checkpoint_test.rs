@@ -662,7 +662,7 @@ fn test_snapshot_transaction_blocks_compaction() {
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", ())
         .unwrap();
 
-    for batch in 0..2 {
+    for batch in 0..3 {
         db.execute("BEGIN", ()).unwrap();
         let start = batch * 10 + 1;
         let end = start + 9;
@@ -677,7 +677,7 @@ fn test_snapshot_transaction_blocks_compaction() {
         db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     }
 
-    assert_eq!(list_volume_files(&db_path, "t").len(), 2);
+    assert_eq!(list_volume_files(&db_path, "t").len(), 3);
 
     db.execute("PRAGMA compact_threshold = 2", ()).unwrap();
 
@@ -685,12 +685,12 @@ fn test_snapshot_transaction_blocks_compaction() {
         .begin_with_isolation(IsolationLevel::SnapshotIsolation)
         .unwrap();
     let snapshot_count: i64 = snapshot_tx.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
-    assert_eq!(snapshot_count, 20);
+    assert_eq!(snapshot_count, 30);
 
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     assert_eq!(
         list_volume_files(&db_path, "t").len(),
-        2,
+        3,
         "compaction should be skipped while a snapshot transaction is active"
     );
 

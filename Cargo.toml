@@ -65,6 +65,9 @@ sha2 = "0.10"
 # Compression
 lz4_flex = "0.12"
 
+# Test support
+tempfile = { version = "3.9", optional = true }
+
 # Utilities
 bytes = "1.5"
 smallvec = "1.11"
@@ -135,6 +138,7 @@ semantic = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf
 ann-benchmark = ["dep:ureq", "dep:flate2"]
 test-failpoints = []
 stress-tests = []
+test-filedb = ["dep:tempfile"]  # Routes memory:// databases to temp file-backed databases for testing volume storage
 
 [[example]]
 name = "benchmark_sqlite"

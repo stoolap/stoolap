@@ -83,11 +83,11 @@ PRAGMA sync_mode = 1;
 PRAGMA wal_flush_trigger = 32768;
 ```
 
-| Sync Mode | Value | Behavior |
-|-----------|-------|----------|
-| None | 0 | No sync (fastest, but data may be lost on crash) |
-| Normal | 1 | Sync on commit (balanced performance and durability) |
-| Full | 2 | Sync every operation (slowest, maximum durability) |
+| Sync Mode | Value | Behavior | Max Data Loss |
+|-----------|-------|----------|---------------|
+| None | 0 | No fsync. WAL is written to the OS buffer cache only. Data becomes durable at the next checkpoint cycle (every 60s by default) when it is sealed into fsynced volume files. | ~60s (checkpoint interval) |
+| Normal | 1 | Fsync WAL at most once per second and on DDL operations. Similar to SQLite WAL mode with `synchronous=NORMAL`. | ~1s |
+| Full | 2 | Fsync on every WAL write. Maximum durability at the cost of write throughput. | 0 |
 
 ### WAL Files
 
@@ -385,11 +385,11 @@ PRAGMA checkpoint;
 
 Choose sync_mode based on your requirements:
 
-| Use Case | Recommended sync_mode |
-|----------|----------------------|
-| Development/Testing | 0 (None) |
-| General Use | 1 (Normal) |
-| Financial/Critical Data | 2 (Full) |
+| Use Case | Recommended sync_mode | Write Throughput |
+|----------|----------------------|-----------------|
+| Development/Testing | 0 (None) | Highest. No fsync overhead. Data durable at checkpoint. |
+| General Use (recommended) | 1 (Normal) | High. Fsync at most once per second. ~1s durability gap. |
+| Financial/Critical Data | 2 (Full) | Lower. Fsync per WAL write. Zero data loss on crash. |
 
 ### Checkpoint Frequency
 

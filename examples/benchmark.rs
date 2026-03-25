@@ -34,6 +34,13 @@ fn main() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
+    let filedb = std::env::args().any(|a| a == "--filedb");
+    let _temp_dir = if filedb {
+        Some(tempfile::tempdir().unwrap())
+    } else {
+        None
+    };
+
     println!("Starting Stoolap-Rust benchmark...");
     println!(
         "Configuration: {} rows, {} iterations per test\n",
@@ -41,7 +48,11 @@ fn main() {
     );
 
     let mut rng = rand::rng();
-    let db = Database::open("memory://").unwrap();
+    let db = if let Some(ref tmp) = _temp_dir {
+        Database::open(&format!("file://{}?sync_mode=normal", tmp.path().display())).unwrap()
+    } else {
+        Database::open("memory://").unwrap()
+    };
 
     // Create schema
     db.execute(
@@ -87,11 +98,12 @@ fn main() {
             .unwrap();
     }
 
+    let mode = if filedb { "file-db" } else { "in-memory" };
     println!("Benchmarking Stoolap-Rust...\n");
     println!("============================================================");
     println!(
-        "STOOLAP-RUST BENCHMARK ({} rows, {} iterations, in-memory)",
-        ROW_COUNT, ITERATIONS
+        "STOOLAP-RUST BENCHMARK ({} rows, {} iterations, {})",
+        ROW_COUNT, ITERATIONS, mode
     );
     println!("============================================================\n");
     println!(
