@@ -49,8 +49,8 @@ use super::writer::FrozenVolume;
 
 // Magic bytes: "STVL" (SToolap VoLume)
 const MAGIC: [u8; 4] = *b"STVL";
-const FORMAT_VERSION: u32 = 2;
-const FORMAT_VERSION_V1: u32 = 1;
+const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION_V2: u32 = 2;
 
 // Column type tags for the directory
 const COL_INT64: u8 = 1;
@@ -220,6 +220,19 @@ pub fn serialize_volume(vol: &FrozenVolume) -> io::Result<Vec<u8>> {
         buf.push(*dt as u8);
     }
 
+    // Row groups (v3+): per-group zone maps for sub-volume pruning
+    buf.write_all(&(vol.row_groups.len() as u32).to_le_bytes())?;
+    for rg in &vol.row_groups {
+        buf.write_all(&rg.start_idx.to_le_bytes())?;
+        buf.write_all(&rg.end_idx.to_le_bytes())?;
+        for zm in &rg.zone_maps {
+            write_value(&mut buf, &zm.min)?;
+            write_value(&mut buf, &zm.max)?;
+            buf.write_all(&zm.null_count.to_le_bytes())?;
+            buf.write_all(&zm.row_count.to_le_bytes())?;
+        }
+    }
+
     // Trailing CRC32 over the entire payload (detects bitflips and partial writes)
     let crc = crc32fast::hash(&buf);
     buf.write_all(&crc.to_le_bytes())?;
@@ -269,13 +282,13 @@ pub fn deserialize_volume(data: &[u8]) -> io::Result<FrozenVolume> {
 
     pos += 4;
     let version = read_u32(data, &mut pos)?;
-    if version != FORMAT_VERSION && version != FORMAT_VERSION_V1 {
+    if version != FORMAT_VERSION && version != FORMAT_VERSION_V2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported volume version {}", version),
         ));
     }
-    let has_bloom_section = version >= FORMAT_VERSION;
+    let has_bloom_section = version >= FORMAT_VERSION_V2;
     let row_count = read_u64(data, &mut pos)? as usize;
     let col_count = read_u32(data, &mut pos)? as usize;
     pos += 12; // reserved
@@ -511,7 +524,41 @@ pub fn deserialize_volume(data: &[u8]) -> io::Result<FrozenVolume> {
         pos += 1;
     }
 
-    // Resolve bloom filters: use deserialized (v2) or rebuild from column data (v1)
+    // Row groups (v3+): per-group zone maps for sub-volume pruning.
+    // Read from file if present, otherwise compute from column data at load
+    // time (same pattern as bloom filters for v1→v2). v2 files get row groups
+    // computed once at startup without needing a format rewrite on disk.
+    let row_groups_raw: Option<Vec<super::column::RowGroupMeta>> = if version >= FORMAT_VERSION {
+        let num_groups = read_u32(data, &mut pos)? as usize;
+        let mut groups = Vec::with_capacity(num_groups);
+        for _ in 0..num_groups {
+            let start_idx = read_u32(data, &mut pos)?;
+            let end_idx = read_u32(data, &mut pos)?;
+            let mut group_zone_maps = Vec::with_capacity(col_count);
+            for _ in 0..col_count {
+                let min = read_value(data, &mut pos)?;
+                let max = read_value(data, &mut pos)?;
+                let nc = read_u32(data, &mut pos)?;
+                let rc = read_u32(data, &mut pos)?;
+                group_zone_maps.push(ZoneMap {
+                    min,
+                    max,
+                    null_count: nc,
+                    row_count: rc,
+                });
+            }
+            groups.push(super::column::RowGroupMeta {
+                start_idx,
+                end_idx,
+                zone_maps: group_zone_maps,
+            });
+        }
+        Some(groups)
+    } else {
+        None
+    };
+
+    // Resolve bloom filters: use deserialized (v2+) or rebuild from column data
     let bloom_filters: Vec<super::column::ColumnBloomFilter> =
         bloom_filters_raw.unwrap_or_else(|| {
             columns
@@ -535,6 +582,31 @@ pub fn deserialize_volume(data: &[u8]) -> io::Result<FrozenVolume> {
         .map(|(i, name)| (crate::common::SmartString::from(name.to_lowercase()), i))
         .collect();
 
+    // Resolve row groups: use deserialized (v3+) or compute from column data.
+    // Must happen before `columns` is moved into the struct.
+    let row_groups = match row_groups_raw {
+        Some(groups) => groups,
+        None if row_count > super::column::ROW_GROUP_SIZE => {
+            let mut groups = Vec::new();
+            let mut start = 0;
+            while start < row_count {
+                let end = (start + super::column::ROW_GROUP_SIZE).min(row_count);
+                let gzm: Vec<ZoneMap> = columns
+                    .iter()
+                    .map(|c| c.zone_map_for_range(start, end))
+                    .collect();
+                groups.push(super::column::RowGroupMeta {
+                    start_idx: start as u32,
+                    end_idx: end as u32,
+                    zone_maps: gzm,
+                });
+                start = end;
+            }
+            groups
+        }
+        None => Vec::new(),
+    };
+
     Ok(FrozenVolume {
         columns,
         zone_maps,
@@ -551,6 +623,7 @@ pub fn deserialize_volume(data: &[u8]) -> io::Result<FrozenVolume> {
         sorted_columns: col_sorted,
         column_name_map,
         unique_indices: parking_lot::RwLock::new(rustc_hash::FxHashMap::default()),
+        row_groups,
     })
 }
 

@@ -110,6 +110,9 @@ pub struct VolumeScanner {
     /// of all columns. Built in set_filter() from filter's referenced
     /// columns ∪ project_cols. None = materialize all (fallback).
     needed_cols: Option<Vec<bool>>,
+    /// Pre-computed row group skip decisions. group_idx → can skip entirely.
+    /// None = no row groups (small volume or no filter). Computed in set_filter().
+    row_group_skips: Option<Vec<bool>>,
 }
 
 impl VolumeScanner {
@@ -152,6 +155,7 @@ impl VolumeScanner {
             snapshot_seq: None,
             typed_predicates: Vec::new(),
             needed_cols: None,
+            row_group_skips: None,
         }
     }
 
@@ -189,6 +193,7 @@ impl VolumeScanner {
             snapshot_seq: None,
             typed_predicates: Vec::new(),
             needed_cols: None,
+            row_group_skips: None,
         }
     }
 
@@ -226,6 +231,7 @@ impl VolumeScanner {
                 sorted_columns: Vec::new(),
                 column_name_map: ahash::AHashMap::new(),
                 unique_indices: parking_lot::RwLock::new(rustc_hash::FxHashMap::default()),
+                row_groups: Vec::new(),
             }),
             project_cols: Vec::new(),
             is_full_projection: true,
@@ -245,6 +251,7 @@ impl VolumeScanner {
             snapshot_seq: None,
             typed_predicates: Vec::new(),
             needed_cols: None,
+            row_group_skips: None,
         }
     }
 
@@ -369,6 +376,44 @@ impl VolumeScanner {
                 }
             }
             self.needed_cols = Some(mask);
+        }
+
+        // Pre-compute row group skip decisions from per-group zone maps.
+        // For each group, if ANY comparison's zone map says "no match",
+        // the entire group can be skipped.
+        if !self.volume.row_groups.is_empty() && !comparisons.is_empty() {
+            let skips: Vec<bool> = self
+                .volume
+                .row_groups
+                .iter()
+                .map(|rg| {
+                    for &(col_name, op, value) in &comparisons {
+                        let col_idx = match self.volume.column_index(col_name) {
+                            Some(idx) if idx < rg.zone_maps.len() => idx,
+                            _ => continue,
+                        };
+                        let zm = &rg.zone_maps[col_idx];
+                        let dominated = match op {
+                            crate::core::Operator::Eq => !zm.may_contain_eq(value),
+                            crate::core::Operator::Gt | crate::core::Operator::Gte => {
+                                !zm.may_contain_gte(value)
+                            }
+                            crate::core::Operator::Lt | crate::core::Operator::Lte => {
+                                !zm.may_contain_lte(value)
+                            }
+                            _ => false,
+                        };
+                        if dominated {
+                            return true; // skip this group
+                        }
+                    }
+                    false
+                })
+                .collect();
+            // Only store if at least one group can be skipped
+            if skips.iter().any(|&s| s) {
+                self.row_group_skips = Some(skips);
+            }
         }
 
         self.filter = Some(filter);
@@ -533,6 +578,17 @@ impl Scanner for VolumeScanner {
 
         // Slow path: linear scan
         while self.current_idx < self.end_idx {
+            // Row-group skip: jump over entire 64K-row groups whose zone maps
+            // prove no rows can match. O(1) integer division per boundary check.
+            if let Some(ref skips) = self.row_group_skips {
+                let group_idx = self.current_idx / super::column::ROW_GROUP_SIZE;
+                if group_idx < skips.len() && skips[group_idx] {
+                    let next_start = (group_idx + 1) * super::column::ROW_GROUP_SIZE;
+                    self.current_idx = next_start.min(self.end_idx);
+                    continue;
+                }
+            }
+
             // Check skip sets: committed tombstones (shared Arc, no clone)
             // then dynamic skip set (hot row_ids + pending + per-volume dedup)
             {

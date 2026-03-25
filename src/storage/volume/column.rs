@@ -93,7 +93,233 @@ pub struct ZoneMap {
     pub row_count: u32,
 }
 
+/// Default number of rows per row group for sub-volume zone map pruning.
+pub const ROW_GROUP_SIZE: usize = 65536; // 64K rows
+
+/// Zone map metadata for a single row group within a volume.
+/// Each row group covers a contiguous index range [start_idx, end_idx).
+/// Column data stays contiguous in memory; row groups are a logical overlay.
+#[derive(Debug, Clone)]
+pub struct RowGroupMeta {
+    /// Start index (inclusive) within the volume's column arrays.
+    pub start_idx: u32,
+    /// End index (exclusive).
+    pub end_idx: u32,
+    /// Per-column zone maps for this row group. Length = number of columns.
+    pub zone_maps: Vec<ZoneMap>,
+}
+
 impl ColumnData {
+    /// Compute a zone map (min/max) for a range [start, end) of this column.
+    /// Uses typed comparisons directly on the underlying arrays to avoid
+    /// constructing Value objects for every row.
+    pub fn zone_map_for_range(&self, start: usize, end: usize) -> ZoneMap {
+        let mut null_count = 0u32;
+        let row_count = (end - start) as u32;
+        match self {
+            ColumnData::Int64 { values, nulls } => {
+                let mut min_val = i64::MAX;
+                let mut max_val = i64::MIN;
+                let mut has_value = false;
+                for i in start..end {
+                    if nulls[i] {
+                        null_count += 1;
+                    } else {
+                        let v = values[i];
+                        if !has_value || v < min_val {
+                            min_val = v;
+                        }
+                        if !has_value || v > max_val {
+                            max_val = v;
+                        }
+                        has_value = true;
+                    }
+                }
+                if has_value {
+                    ZoneMap {
+                        min: Value::Integer(min_val),
+                        max: Value::Integer(max_val),
+                        null_count,
+                        row_count,
+                    }
+                } else {
+                    ZoneMap {
+                        min: Value::Null(DataType::Integer),
+                        max: Value::Null(DataType::Integer),
+                        null_count,
+                        row_count,
+                    }
+                }
+            }
+            ColumnData::Float64 { values, nulls } => {
+                let mut min_val = f64::INFINITY;
+                let mut max_val = f64::NEG_INFINITY;
+                let mut has_value = false;
+                for i in start..end {
+                    if nulls[i] {
+                        null_count += 1;
+                    } else {
+                        let v = values[i];
+                        // Skip NaN: NaN comparisons are always false, so a NaN
+                        // in min/max would make the zone map reject valid rows.
+                        if v.is_nan() {
+                            continue;
+                        }
+                        if !has_value || v < min_val {
+                            min_val = v;
+                        }
+                        if !has_value || v > max_val {
+                            max_val = v;
+                        }
+                        has_value = true;
+                    }
+                }
+                if has_value {
+                    ZoneMap {
+                        min: Value::Float(min_val),
+                        max: Value::Float(max_val),
+                        null_count,
+                        row_count,
+                    }
+                } else {
+                    ZoneMap {
+                        min: Value::Null(DataType::Float),
+                        max: Value::Null(DataType::Float),
+                        null_count,
+                        row_count,
+                    }
+                }
+            }
+            ColumnData::TimestampNanos { values, nulls } => {
+                let mut min_val = i64::MAX;
+                let mut max_val = i64::MIN;
+                let mut has_value = false;
+                for i in start..end {
+                    if nulls[i] {
+                        null_count += 1;
+                    } else {
+                        let v = values[i];
+                        if !has_value || v < min_val {
+                            min_val = v;
+                        }
+                        if !has_value || v > max_val {
+                            max_val = v;
+                        }
+                        has_value = true;
+                    }
+                }
+                if has_value {
+                    let to_ts = |nanos: i64| -> Value {
+                        let secs = nanos.div_euclid(1_000_000_000);
+                        let sub = nanos.rem_euclid(1_000_000_000) as u32;
+                        match chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, sub) {
+                            chrono::LocalResult::Single(dt) => Value::Timestamp(dt),
+                            _ => Value::Null(DataType::Timestamp),
+                        }
+                    };
+                    ZoneMap {
+                        min: to_ts(min_val),
+                        max: to_ts(max_val),
+                        null_count,
+                        row_count,
+                    }
+                } else {
+                    ZoneMap {
+                        min: Value::Null(DataType::Timestamp),
+                        max: Value::Null(DataType::Timestamp),
+                        null_count,
+                        row_count,
+                    }
+                }
+            }
+            ColumnData::Boolean { values, nulls } => {
+                let mut has_true = false;
+                let mut has_false = false;
+                for i in start..end {
+                    if nulls[i] {
+                        null_count += 1;
+                    } else if values[i] {
+                        has_true = true;
+                    } else {
+                        has_false = true;
+                    }
+                }
+                let (min, max) = if has_false && has_true {
+                    (Value::Boolean(false), Value::Boolean(true))
+                } else if has_false {
+                    (Value::Boolean(false), Value::Boolean(false))
+                } else if has_true {
+                    (Value::Boolean(true), Value::Boolean(true))
+                } else {
+                    (
+                        Value::Null(DataType::Boolean),
+                        Value::Null(DataType::Boolean),
+                    )
+                };
+                ZoneMap {
+                    min,
+                    max,
+                    null_count,
+                    row_count,
+                }
+            }
+            ColumnData::Dictionary {
+                ids,
+                dictionary,
+                nulls,
+            } => {
+                let mut min_str: Option<&str> = None;
+                let mut max_str: Option<&str> = None;
+                for i in start..end {
+                    if nulls[i] {
+                        null_count += 1;
+                    } else {
+                        let s = dictionary[ids[i] as usize].as_str();
+                        min_str = Some(match min_str {
+                            Some(cur) if cur <= s => cur,
+                            _ => s,
+                        });
+                        max_str = Some(match max_str {
+                            Some(cur) if cur >= s => cur,
+                            _ => s,
+                        });
+                    }
+                }
+                if let (Some(mn), Some(mx)) = (min_str, max_str) {
+                    ZoneMap {
+                        min: Value::text(mn),
+                        max: Value::text(mx),
+                        null_count,
+                        row_count,
+                    }
+                } else {
+                    ZoneMap {
+                        min: Value::Null(DataType::Text),
+                        max: Value::Null(DataType::Text),
+                        null_count,
+                        row_count,
+                    }
+                }
+            }
+            ColumnData::Bytes {
+                nulls, ext_type, ..
+            } => {
+                // Extension types: no meaningful min/max ordering
+                for is_null in &nulls[start..end] {
+                    if *is_null {
+                        null_count += 1;
+                    }
+                }
+                ZoneMap {
+                    min: Value::Null(*ext_type),
+                    max: Value::Null(*ext_type),
+                    null_count,
+                    row_count,
+                }
+            }
+        }
+    }
+
     /// Get the number of rows in this column.
     #[inline]
     pub fn len(&self) -> usize {

@@ -55,6 +55,9 @@ pub struct SegmentMeta {
     pub max_row_id: i64,
     /// WAL LSN at which this segment was created (for recovery).
     pub creation_lsn: u64,
+    /// Compaction epoch when this segment was last written/merged.
+    /// Used to force-include stale volumes after max_age cycles.
+    pub compaction_epoch: u64,
 }
 
 /// The manifest for a single table: tracks all live segments and tombstones.
@@ -266,6 +269,7 @@ impl TableManifest {
                 min_row_id,
                 max_row_id,
                 creation_lsn,
+                compaction_epoch: 0,
             });
         }
 
@@ -763,6 +767,12 @@ impl SegmentManager {
     /// Get the number of segments.
     pub fn segment_count(&self) -> usize {
         self.manifest.read().segments.len()
+    }
+
+    /// Get the oldest compaction_epoch across all segments.
+    pub fn oldest_segment_epoch(&self) -> Option<u64> {
+        let manifest = self.manifest.read();
+        manifest.segments.iter().map(|s| s.compaction_epoch).min()
     }
 
     /// Check if a segment with the given ID is already registered (loaded in memory).
@@ -1556,6 +1566,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 1000,
             creation_lsn: 100,
+            compaction_epoch: 0,
         });
         m.add_segment(SegmentMeta {
             segment_id: 2,
@@ -1564,6 +1575,7 @@ mod tests {
             min_row_id: 1001,
             max_row_id: 1500,
             creation_lsn: 200,
+            compaction_epoch: 0,
         });
         assert_eq!(m.segments.len(), 2);
 
@@ -1582,6 +1594,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 100,
             creation_lsn: 0,
+            compaction_epoch: 0,
         });
         m.add_segment(SegmentMeta {
             segment_id: 2,
@@ -1590,6 +1603,7 @@ mod tests {
             min_row_id: 101,
             max_row_id: 200,
             creation_lsn: 0,
+            compaction_epoch: 0,
         });
 
         assert_eq!(m.find_segment_for_row_id(50).unwrap().1.segment_id, 1);
@@ -1610,6 +1624,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 10000,
             creation_lsn: 10,
+            compaction_epoch: 0,
         });
         m.add_segment(SegmentMeta {
             segment_id: 3,
@@ -1618,6 +1633,7 @@ mod tests {
             min_row_id: 10001,
             max_row_id: 15000,
             creation_lsn: 30,
+            compaction_epoch: 0,
         });
 
         let data = m.serialize().unwrap();
@@ -1651,6 +1667,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 100,
             creation_lsn: 0,
+            compaction_epoch: 0,
         });
 
         m.write_to_disk(&path).unwrap();
@@ -1683,6 +1700,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 10,
             creation_lsn: 0,
+            compaction_epoch: 0,
         };
         mgr.register_segment(1, volume, meta);
 
@@ -1717,6 +1735,7 @@ mod tests {
                 min_row_id: 1,
                 max_row_id: 10,
                 creation_lsn: 0,
+                compaction_epoch: 0,
             },
         );
 
@@ -1762,6 +1781,7 @@ mod tests {
                     min_row_id: seg_id as i64,
                     max_row_id: seg_id as i64,
                     creation_lsn: 0,
+                    compaction_epoch: 0,
                 },
             );
         }
@@ -1785,6 +1805,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 10,
             creation_lsn: 0,
+            compaction_epoch: 0,
         });
         mgr.add_tombstones(&[5], 1);
 

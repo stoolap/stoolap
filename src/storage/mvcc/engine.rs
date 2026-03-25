@@ -466,6 +466,11 @@ pub struct MVCCEngine {
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
     compaction_running: Arc<AtomicBool>,
+    /// Global compaction epoch. Incremented each compaction cycle.
+    /// Each SegmentMeta records the epoch at which it was created/merged.
+    /// Volumes older than compact_threshold epochs are force-included
+    /// in the next merge to prevent unbounded staleness.
+    compaction_epoch: AtomicU64,
 }
 
 /// RAII guard that clears an AtomicBool on drop. Used to release the
@@ -531,6 +536,7 @@ impl MVCCEngine {
             // Initialize to epoch so the first compaction is not delayed
             last_compaction_time: Mutex::new(Instant::now() - std::time::Duration::from_secs(3600)),
             compaction_running: Arc::new(AtomicBool::new(false)),
+            compaction_epoch: AtomicU64::new(0),
         }
     }
 
@@ -2917,6 +2923,7 @@ impl MVCCEngine {
                 min_row_id: min_id,
                 max_row_id: max_id,
                 creation_lsn: 0,
+                compaction_epoch: self.compaction_epoch.load(Ordering::Relaxed),
             },
         );
     }
@@ -5034,10 +5041,25 @@ impl MVCCEngine {
             return Ok(());
         }
 
+        let current_epoch = self.compaction_epoch.fetch_add(1, Ordering::Relaxed);
+        let max_age = compact_threshold as u64 * 2;
+
         let tables_to_compact: Vec<String> = {
             let mgrs = self.segment_managers.read().unwrap();
             mgrs.iter()
-                .filter(|(_, mgr)| mgr.segment_count() >= compact_threshold)
+                .filter(|(_, mgr)| {
+                    if mgr.segment_count() > compact_threshold {
+                        return true;
+                    }
+                    // Force-compact tables with stale volumes even if under threshold.
+                    // Prevents large base volumes from accumulating unbounded staleness.
+                    if mgr.segment_count() >= 2 {
+                        if let Some(oldest_epoch) = mgr.oldest_segment_epoch() {
+                            return current_epoch.saturating_sub(oldest_epoch) >= max_age;
+                        }
+                    }
+                    false
+                })
                 .map(|(name, _)| name.clone())
                 .collect()
         };
@@ -5128,6 +5150,22 @@ impl MVCCEngine {
                         for &(_, rows) in &by_size[merge_count..] {
                             row_total += rows;
                         }
+                        merge_count = seg_count;
+                    }
+                }
+
+                // Phase 4: staleness — if any volume hasn't been rewritten
+                // for max_age compaction epochs, force-include all volumes.
+                // Prevents large base volumes from accumulating unbounded
+                // staleness (stale tombstones, old format, no compression).
+                if merge_count < seg_count {
+                    let oldest = manifest
+                        .segments
+                        .iter()
+                        .map(|s| s.compaction_epoch)
+                        .min()
+                        .unwrap_or(0);
+                    if (current_epoch + 1).saturating_sub(oldest) >= max_age {
                         merge_count = seg_count;
                     }
                 }
@@ -5287,6 +5325,7 @@ impl MVCCEngine {
                                 min_row_id: min_id,
                                 max_row_id: max_id,
                                 creation_lsn: 0,
+                                compaction_epoch: current_epoch + 1,
                             },
                             &old_ids,
                         );

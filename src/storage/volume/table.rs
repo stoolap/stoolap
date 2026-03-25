@@ -2967,6 +2967,7 @@ mod tests {
                 min_row_id: min_id,
                 max_row_id: max_id,
                 creation_lsn: 0,
+                compaction_epoch: 0,
             },
         );
         mgr

@@ -62,6 +62,9 @@ pub struct FrozenVolume {
     pub unique_indices: parking_lot::RwLock<
         rustc_hash::FxHashMap<Vec<usize>, rustc_hash::FxHashMap<u64, Vec<u32>>>,
     >,
+    /// Row group metadata for sub-volume zone map pruning.
+    /// Empty for volumes with <= ROW_GROUP_SIZE rows (single implicit group).
+    pub row_groups: Vec<super::column::RowGroupMeta>,
 }
 
 /// Builder that accumulates rows and produces a FrozenVolume.
@@ -465,6 +468,29 @@ impl VolumeBuilder {
             .map(|(i, name)| (SmartString::from(name.to_lowercase()), i))
             .collect();
 
+        // Build row-group zone maps for sub-volume pruning.
+        // Only worth it for volumes larger than one group.
+        let row_groups = if self.row_count > super::column::ROW_GROUP_SIZE {
+            let mut groups = Vec::new();
+            let mut start = 0;
+            while start < self.row_count {
+                let end = (start + super::column::ROW_GROUP_SIZE).min(self.row_count);
+                let group_zone_maps: Vec<super::column::ZoneMap> = columns
+                    .iter()
+                    .map(|col| col.zone_map_for_range(start, end))
+                    .collect();
+                groups.push(super::column::RowGroupMeta {
+                    start_idx: start as u32,
+                    end_idx: end as u32,
+                    zone_maps: group_zone_maps,
+                });
+                start = end;
+            }
+            groups
+        } else {
+            Vec::new()
+        };
+
         FrozenVolume {
             columns,
             zone_maps: self.zone_maps,
@@ -477,6 +503,7 @@ impl VolumeBuilder {
             sorted_columns,
             column_name_map,
             unique_indices: parking_lot::RwLock::new(rustc_hash::FxHashMap::default()),
+            row_groups,
         }
     }
 }
