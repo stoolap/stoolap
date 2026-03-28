@@ -46,6 +46,23 @@ pub struct ColdSegment {
     /// Schema version when this volume was created. Used with dropped_columns
     /// to correctly mask stale data only from volumes older than a column drop.
     pub schema_version: u64,
+    /// Per-row visibility bitmap: bit i is set when row i is the authoritative
+    /// (newest) version across all overlapping volumes. None when this is the
+    /// only segment (all rows visible) or when there is no overlap.
+    /// Arc so ColdSegment::clone() is O(1) — scanners share the same bitmap.
+    pub visible: Option<Arc<Vec<u64>>>,
+}
+
+impl ColdSegment {
+    /// Check whether row at position `idx` in this volume is the authoritative
+    /// (newest) copy across all overlapping volumes.
+    #[inline]
+    pub fn is_visible(&self, idx: usize) -> bool {
+        match &self.visible {
+            None => true,
+            Some(bits) => (bits[idx >> 6] >> (idx & 63)) & 1 == 1,
+        }
+    }
 }
 
 /// Atomic snapshot of cold segment state for batch constraint checking.
@@ -511,6 +528,64 @@ impl TableManifest {
     }
 }
 
+/// Recompute the visibility bitmaps for all segments in `segments`.
+///
+/// `seg_order` lists segment IDs in ascending (oldest-first) order.
+/// Segments are processed newest-first: the first time a row_id is seen it is
+/// marked visible; subsequent occurrences (in older volumes) are masked out.
+/// When there is at most one segment every row is authoritative, so all
+/// `visible` fields are set to `None` (fast path for the common case).
+fn compute_visibility_bitmaps(
+    seg_order: &[u64],
+    segments: &mut rustc_hash::FxHashMap<u64, ColdSegment>,
+    reusable_seen: &mut rustc_hash::FxHashSet<i64>,
+) {
+    if segments.len() <= 1 {
+        for cs in segments.values_mut() {
+            cs.visible = None;
+        }
+        return;
+    }
+    // Reuse the caller's seen set — clear and resize, but keep the allocation.
+    reusable_seen.clear();
+    let total: usize = segments.values().map(|cs| cs.volume.row_count).sum();
+    if reusable_seen.capacity() < total {
+        reusable_seen.reserve(total * 8 / 7 + 16 - reusable_seen.capacity());
+    }
+    // Process newest-first (seg_order is ascending, so iterate reversed)
+    for &seg_id in seg_order.iter().rev() {
+        if let Some(cs) = segments.get_mut(&seg_id) {
+            let rc = cs.volume.row_count;
+            if rc == 0 {
+                cs.visible = None;
+                continue;
+            }
+            let num_words = rc.div_ceil(64);
+            let mut bits = vec![!0u64; num_words];
+            // Clear trailing bits beyond row_count
+            let trailing = rc % 64;
+            if trailing != 0 {
+                bits[num_words - 1] &= (1u64 << trailing) - 1;
+            }
+            let mut has_overlap = false;
+            for i in 0..rc {
+                if !reusable_seen.insert(cs.volume.row_ids[i]) {
+                    bits[i >> 6] &= !(1u64 << (i & 63));
+                    has_overlap = true;
+                }
+            }
+            // No overlap with newer volumes: None = all visible (zero memory, no per-row check)
+            cs.visible = if has_overlap {
+                Some(Arc::new(bits))
+            } else {
+                None
+            };
+        }
+    }
+    // Clear but keep allocation for reuse on next seal/compact.
+    reusable_seen.clear();
+}
+
 /// Per-table segment manager.
 ///
 /// Owns the manifest, loaded segments, and tombstone set for one table.
@@ -559,6 +634,11 @@ pub struct SegmentManager {
     /// INSERTs take a shared guard while checking cold constraints and
     /// publishing into hot; seal takes the exclusive guard while moving rows.
     seal_fence: RwLock<()>,
+    /// Reusable scratch set for compute_visibility_bitmaps. Kept alive across
+    /// calls to avoid re-allocating 200 MB on every seal/compact. Protected by
+    /// Mutex since visibility computation is always single-threaded (under
+    /// segments write lock).
+    visibility_seen: parking_lot::Mutex<rustc_hash::FxHashSet<i64>>,
     /// Monotonic counter incremented on every register_segment. Used at
     /// commit time to detect whether a seal happened since statement time.
     /// If unchanged, the commit-time cold recheck is skipped (fast path).
@@ -585,6 +665,7 @@ impl SegmentManager {
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_fence: RwLock::new(()),
+            visibility_seen: parking_lot::Mutex::new(rustc_hash::FxHashSet::default()),
             seal_generation: std::sync::atomic::AtomicU64::new(0),
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
@@ -605,6 +686,7 @@ impl SegmentManager {
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_fence: RwLock::new(()),
+            visibility_seen: parking_lot::Mutex::new(rustc_hash::FxHashSet::default()),
             seal_generation: std::sync::atomic::AtomicU64::new(0),
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1052,6 +1134,10 @@ impl SegmentManager {
         meta: SegmentMeta,
         schema: Option<&crate::core::Schema>,
     ) {
+        // Both manifest and segments must be updated atomically under write locks.
+        // The bitmap computation runs inside the critical section — this is safe
+        // because the segments write lock only blocks other writers (readers clone
+        // the Arc), and concurrent writers are already serialized by seal_fence.
         {
             let seg_schema_version = meta.schema_version;
             let mut manifest = self.manifest.write();
@@ -1070,7 +1156,6 @@ impl SegmentManager {
                     &renames,
                 )
             } else {
-                // Identity mapping (newly sealed volume matches current schema)
                 super::writer::ColumnMapping {
                     sources: (0..volume.columns.len())
                         .map(super::writer::ColSource::Volume)
@@ -1082,10 +1167,13 @@ impl SegmentManager {
                 volume,
                 mapping,
                 schema_version: seg_schema_version,
+                visible: None,
             };
+            let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
             new_map.insert(segment_id, cold);
+            compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
             *segments = Arc::new(new_map);
         }
         self.cached_deduped_count
@@ -1126,6 +1214,7 @@ impl SegmentManager {
                 },
                 volume,
                 schema_version,
+                visible: None,
             };
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
@@ -1567,19 +1656,10 @@ impl SegmentManager {
         self.txn_seal_gens.lock().remove(&txn_id);
     }
 
-    /// Scan all row_ids, deduplicate (newest-first wins), and exclude tombstones.
+    /// Count visible rows using pre-computed visibility bitmaps.
+    /// Falls back to hash-based dedup only when bitmaps are not available.
     fn compute_deduped_row_count(&self) -> usize {
-        let (seg_ids, segments) = {
-            let manifest = self.manifest.read();
-            let seg_ids: Vec<u64> = manifest
-                .segments
-                .iter()
-                .rev()
-                .map(|m| m.segment_id)
-                .collect();
-            let segments = Arc::clone(&*self.segments.read());
-            (seg_ids, segments)
-        };
+        let segments = Arc::clone(&*self.segments.read());
         if segments.is_empty() {
             return 0;
         }
@@ -1588,23 +1668,25 @@ impl SegmentManager {
             let total: usize = segments.values().map(|cs| cs.volume.row_count).sum();
             return total.saturating_sub(tombstones.len());
         }
-        let mut seen = FxHashSet::default();
 
-        let mut count = 0usize;
-        for seg_id in &seg_ids {
-            let Some(cold) = segments.get(seg_id) else {
-                continue;
-            };
-            for &rid in &cold.volume.row_ids {
-                if tombstones.contains_key(&rid) {
-                    continue;
-                }
-                if seen.insert(rid) {
+        // Fast path: use visibility bitmaps (O(1) per row, zero allocation).
+        // visible=None means all rows visible (no overlap), is_visible() handles both.
+        {
+            let mut count = 0usize;
+            for cs in segments.values() {
+                let vol = &cs.volume;
+                for i in 0..vol.row_count {
+                    if !cs.is_visible(i) {
+                        continue;
+                    }
+                    if !tombstones.is_empty() && tombstones.contains_key(&vol.row_ids[i]) {
+                        continue;
+                    }
                     count += 1;
                 }
             }
+            count
         }
-        count
     }
 
     /// Get the cached column mapping for a volume. Computes on first call,
@@ -1776,13 +1858,18 @@ impl SegmentManager {
     }
 
     fn remove_segments_inner(&self, segment_ids: &[u64], _invalidate_cache: bool) {
-        self.manifest.write().remove_segments(segment_ids);
+        let seg_ids: Vec<u64> = {
+            let mut manifest = self.manifest.write();
+            manifest.remove_segments(segment_ids);
+            manifest.segments.iter().map(|m| m.segment_id).collect()
+        };
         {
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
             for &id in segment_ids {
                 new_map.remove(&id);
             }
+            compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
             *segments = Arc::new(new_map);
         }
         self.cached_deduped_count
@@ -1800,13 +1887,10 @@ impl SegmentManager {
         new_meta: SegmentMeta,
         old_segment_ids: &[u64],
     ) {
+        // Atomic: manifest + segments updated under both write locks.
+        // Bitmap computation runs inside — safe because writers are serialized.
         {
             let mut manifest = self.manifest.write();
-            // Find insertion point: the compacted volume replaces the oldest
-            // merged segments, so it must go at the position of the first old
-            // segment. If placed at the end (like add_segment does), the
-            // newest-first scan would treat it as newer than unmerged volumes,
-            // returning stale data instead of the latest version.
             let insert_pos = manifest
                 .segments
                 .iter()
@@ -1816,12 +1900,10 @@ impl SegmentManager {
             if new_segment_id >= manifest.next_segment_id {
                 manifest.next_segment_id = new_segment_id + 1;
             }
-            // Insert at the position of the old segments, not at the end.
             let insert_pos = insert_pos.min(manifest.segments.len());
             let seg_schema_version = new_meta.schema_version;
             manifest.segments.insert(insert_pos, new_meta);
 
-            // Swap segments map under the same logical operation
             let cold = ColdSegment {
                 mapping: super::writer::ColumnMapping {
                     sources: (0..new_volume.columns.len())
@@ -1831,18 +1913,20 @@ impl SegmentManager {
                 },
                 volume: new_volume,
                 schema_version: seg_schema_version,
+                visible: None,
             };
+            let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
             for &id in old_segment_ids {
                 new_map.remove(&id);
             }
             new_map.insert(new_segment_id, cold);
+            compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
             *segments = Arc::new(new_map);
         }
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-        // has_segments_flag remains true (we just added a segment)
     }
 
     /// Atomically remove old segments without adding a replacement.
@@ -1851,13 +1935,14 @@ impl SegmentManager {
         {
             let mut manifest = self.manifest.write();
             manifest.remove_segments(old_segment_ids);
-
+            let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
             for &id in old_segment_ids {
                 new_map.remove(&id);
             }
             let has_any = !new_map.is_empty();
+            compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
             *segments = Arc::new(new_map);
             self.has_segments_flag
                 .store(has_any, std::sync::atomic::Ordering::Relaxed);
@@ -1884,6 +1969,19 @@ impl SegmentManager {
     /// Get the volume directory path.
     pub fn volume_dir(&self) -> Option<&Path> {
         self.volume_dir.as_deref()
+    }
+
+    /// Recompute visibility bitmaps for all segments.
+    /// Called after a batch of `load_volume_for_existing_segment` calls (recovery)
+    /// so that the bitmaps reflect the final set of loaded volumes.
+    pub fn recompute_visibility(&self) {
+        let manifest = self.manifest.read();
+        let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+        drop(manifest);
+        let mut segments = self.segments.write();
+        let mut new_map = (**segments).clone();
+        compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
+        *segments = Arc::new(new_map);
     }
 }
 

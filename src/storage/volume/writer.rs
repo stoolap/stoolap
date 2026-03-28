@@ -28,7 +28,10 @@ use crate::common::SmartString;
 use crate::core::{DataType, Row, Schema, Value};
 
 use super::column::{ColumnData, ZoneMap, ROW_GROUP_SIZE};
-use super::format::{deserialize_column_block, serialize_column_block, COL_BYTES, COL_DICTIONARY};
+use super::format::{
+    deserialize_column_block, deserialize_column_block_into, serialize_column_block, COL_BYTES,
+    COL_DICTIONARY,
+};
 use super::stats::VolumeAggregateStats;
 
 // =============================================================================
@@ -250,7 +253,8 @@ impl CompressedBlockStore {
                     )
                 });
             }
-            let raw = lz4_flex::decompress(&col_blocks[0], decomp_len).unwrap_or_else(|e| {
+            let mut raw = vec![0u8; decomp_len];
+            lz4_flex::decompress_into(&col_blocks[0], &mut raw).unwrap_or_else(|e| {
                 panic!(
                     "corrupt V4 block: col={}, {} bytes: {}",
                     col_idx,
@@ -267,22 +271,37 @@ impl CompressedBlockStore {
                 });
         }
 
-        // Multiple groups — decompress each, then concatenate
+        // Multiple groups — decompress each block directly into pre-allocated
+        // output buffers, avoiding one intermediate ColumnData per group.
+        // Reusable LZ4 scratch buffer — allocated once, reused across all groups.
+        let max_decomp = self.decompressed_lens[col_idx]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let mut lz4_buf = Vec::with_capacity(max_decomp);
         let num_groups = col_blocks.len();
         match type_tag {
             super::format::COL_INT64 => {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for (gi, block) in col_blocks.iter().enumerate() {
-                    let col = self
-                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
-                        .unwrap_or_else(|e| {
-                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
-                        });
-                    if let ColumnData::Int64 { values, nulls } = col {
-                        all_values.extend(values);
-                        all_nulls.extend(nulls);
-                    }
+                    self.decompress_block_into(
+                        col_idx,
+                        gi,
+                        block,
+                        type_tag,
+                        num_groups,
+                        &mut lz4_buf,
+                        &mut all_nulls,
+                        Some(&mut all_values),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
                 }
                 ColumnData::Int64 {
                     values: all_values,
@@ -293,15 +312,22 @@ impl CompressedBlockStore {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for (gi, block) in col_blocks.iter().enumerate() {
-                    let col = self
-                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
-                        .unwrap_or_else(|e| {
-                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
-                        });
-                    if let ColumnData::Float64 { values, nulls } = col {
-                        all_values.extend(values);
-                        all_nulls.extend(nulls);
-                    }
+                    self.decompress_block_into(
+                        col_idx,
+                        gi,
+                        block,
+                        type_tag,
+                        num_groups,
+                        &mut lz4_buf,
+                        &mut all_nulls,
+                        None,
+                        Some(&mut all_values),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
                 }
                 ColumnData::Float64 {
                     values: all_values,
@@ -312,15 +338,22 @@ impl CompressedBlockStore {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for (gi, block) in col_blocks.iter().enumerate() {
-                    let col = self
-                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
-                        .unwrap_or_else(|e| {
-                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
-                        });
-                    if let ColumnData::TimestampNanos { values, nulls } = col {
-                        all_values.extend(values);
-                        all_nulls.extend(nulls);
-                    }
+                    self.decompress_block_into(
+                        col_idx,
+                        gi,
+                        block,
+                        type_tag,
+                        num_groups,
+                        &mut lz4_buf,
+                        &mut all_nulls,
+                        Some(&mut all_values),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
                 }
                 ColumnData::TimestampNanos {
                     values: all_values,
@@ -331,15 +364,22 @@ impl CompressedBlockStore {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for (gi, block) in col_blocks.iter().enumerate() {
-                    let col = self
-                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
-                        .unwrap_or_else(|e| {
-                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
-                        });
-                    if let ColumnData::Boolean { values, nulls } = col {
-                        all_values.extend(values);
-                        all_nulls.extend(nulls);
-                    }
+                    self.decompress_block_into(
+                        col_idx,
+                        gi,
+                        block,
+                        type_tag,
+                        num_groups,
+                        &mut lz4_buf,
+                        &mut all_nulls,
+                        None,
+                        None,
+                        None,
+                        Some(&mut all_values),
+                        None,
+                        None,
+                    )
+                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
                 }
                 ColumnData::Boolean {
                     values: all_values,
@@ -350,15 +390,22 @@ impl CompressedBlockStore {
                 let mut all_ids = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for (gi, block) in col_blocks.iter().enumerate() {
-                    let col = self
-                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
-                        .unwrap_or_else(|e| {
-                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
-                        });
-                    if let ColumnData::Dictionary { ids, nulls, .. } = col {
-                        all_ids.extend(ids);
-                        all_nulls.extend(nulls);
-                    }
+                    self.decompress_block_into(
+                        col_idx,
+                        gi,
+                        block,
+                        type_tag,
+                        num_groups,
+                        &mut lz4_buf,
+                        &mut all_nulls,
+                        None,
+                        None,
+                        Some(&mut all_ids),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
                 }
                 ColumnData::Dictionary {
                     ids: all_ids,
@@ -371,25 +418,22 @@ impl CompressedBlockStore {
                 let mut all_offsets = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for (gi, block) in col_blocks.iter().enumerate() {
-                    let col = self
-                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
-                        .unwrap_or_else(|e| {
-                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
-                        });
-                    if let ColumnData::Bytes {
-                        data,
-                        offsets,
-                        nulls,
-                        ..
-                    } = col
-                    {
-                        let base = all_data.len() as u64;
-                        all_data.extend(data);
-                        for (off, len) in offsets {
-                            all_offsets.push((off + base, len));
-                        }
-                        all_nulls.extend(nulls);
-                    }
+                    self.decompress_block_into(
+                        col_idx,
+                        gi,
+                        block,
+                        type_tag,
+                        num_groups,
+                        &mut lz4_buf,
+                        &mut all_nulls,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&mut all_data),
+                        Some(&mut all_offsets),
+                    )
+                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
                 }
                 ColumnData::Bytes {
                     data: all_data,
@@ -440,6 +484,70 @@ impl CompressedBlockStore {
             })?
         };
         deserialize_column_block(&raw_bytes, type_tag, group_rows, dict, ext_type)
+    }
+
+    /// Decompress and deserialize a single block, appending directly into
+    /// the caller's output buffers. No intermediate `ColumnData` is created.
+    /// `lz4_buf` is a reusable scratch buffer for LZ4 decompression — resized
+    /// as needed but never freed between groups, eliminating per-group allocs.
+    #[allow(clippy::too_many_arguments)]
+    fn decompress_block_into(
+        &self,
+        col_idx: usize,
+        gi: usize,
+        block: &[u8],
+        type_tag: u8,
+        num_groups: usize,
+        lz4_buf: &mut Vec<u8>,
+        nulls_out: &mut Vec<bool>,
+        i64_out: Option<&mut Vec<i64>>,
+        f64_out: Option<&mut Vec<f64>>,
+        u32_out: Option<&mut Vec<u32>>,
+        bool_out: Option<&mut Vec<bool>>,
+        bytes_data_out: Option<&mut Vec<u8>>,
+        bytes_offsets_out: Option<&mut Vec<(u64, u64)>>,
+    ) -> std::io::Result<()> {
+        let decomp_len = self.decompressed_lens[col_idx][gi];
+        let group_rows = self.group_row_count(gi, num_groups);
+        if block.len() == decomp_len {
+            return deserialize_column_block_into(
+                block,
+                type_tag,
+                group_rows,
+                nulls_out,
+                i64_out,
+                f64_out,
+                u32_out,
+                bool_out,
+                bytes_data_out,
+                bytes_offsets_out,
+            );
+        }
+        // Reuse caller's LZ4 scratch buffer (grows once, reused across groups).
+        if lz4_buf.len() < decomp_len {
+            lz4_buf.resize(decomp_len, 0);
+        }
+        lz4_flex::decompress_into(block, &mut lz4_buf[..decomp_len]).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt V4 block: col={}, group={}/{}: {}",
+                    col_idx, gi, num_groups, e
+                ),
+            )
+        })?;
+        deserialize_column_block_into(
+            &lz4_buf[..decomp_len],
+            type_tag,
+            group_rows,
+            nulls_out,
+            i64_out,
+            f64_out,
+            u32_out,
+            bool_out,
+            bytes_data_out,
+            bytes_offsets_out,
+        )
     }
 
     /// Decompress a single row group for one column. Returns the ColumnData
@@ -864,15 +972,13 @@ pub struct FrozenVolume {
     /// Precomputed lowercase column name → index map for O(1) lookup.
     /// Built once at construction; replaces O(C) linear scan in column_index().
     pub column_name_map: AHashMap<SmartString, usize>,
-    /// Per-volume unique hash index: lazily built, never invalidated (volume is immutable).
+    /// Per-volume unique index: lazily built, never invalidated (volume is immutable).
     /// Key: sorted column indices for a UNIQUE constraint.
-    /// Value: hash(column values) → row indices within this volume.
-    /// Multiple indices per hash when the volume has duplicate values (pre-existing
-    /// dupes that haven't been cleaned yet). Typically 1 entry per hash.
+    /// Value: sorted Vec of (hash, row_idx) pairs — binary search for lookup.
+    /// Uses 12 bytes per entry vs ~80 bytes for FxHashMap<u64, Vec<u32>>, and
+    /// zero tiny heap allocations (single contiguous allocation).
     #[allow(clippy::type_complexity)]
-    pub unique_indices: parking_lot::RwLock<
-        rustc_hash::FxHashMap<Vec<usize>, rustc_hash::FxHashMap<u64, Vec<u32>>>,
-    >,
+    pub unique_indices: parking_lot::RwLock<rustc_hash::FxHashMap<Vec<usize>, Vec<(u64, u32)>>>,
     /// Row group metadata for sub-volume zone map pruning.
     /// Empty for volumes with <= ROW_GROUP_SIZE rows (single implicit group).
     pub row_groups: Vec<super::column::RowGroupMeta>,
@@ -1555,26 +1661,27 @@ impl FrozenVolume {
         // Fast path: check if index is already built
         {
             let indices = self.unique_indices.read();
-            if let Some(idx_map) = indices.get(col_indices) {
-                if let Some(row_indices) = idx_map.get(&hash) {
-                    for &row_idx in row_indices {
-                        // Verify actual values match (handle hash collision)
-                        let matches = col_indices.iter().zip(values.iter()).all(|(&ci, &val)| {
-                            let vol_val = self.columns[ci].get_value(row_idx as usize);
-                            !vol_val.is_null() && vol_val == *val
-                        });
-                        if matches && f(row_idx) {
-                            return;
-                        }
+            if let Some(sorted_idx) = indices.get(col_indices) {
+                // Binary search for the hash, then scan all entries with same hash
+                let pos = sorted_idx.partition_point(|&(h, _)| h < hash);
+                for &(h, row_idx) in &sorted_idx[pos..] {
+                    if h != hash {
+                        break;
+                    }
+                    let matches = col_indices.iter().zip(values.iter()).all(|(&ci, &val)| {
+                        let vol_val = self.columns[ci].get_value(row_idx as usize);
+                        !vol_val.is_null() && vol_val == *val
+                    });
+                    if matches && f(row_idx) {
+                        return;
                     }
                 }
                 return;
             }
         }
 
-        // Build index for this column set (first use)
-        let mut idx_map: rustc_hash::FxHashMap<u64, Vec<u32>> =
-            rustc_hash::FxHashMap::with_capacity_and_hasher(self.row_count, Default::default());
+        // Build sorted index for this column set (first use)
+        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(self.row_count);
         for row_idx in 0..self.row_count {
             let mut row_hasher = ahash::AHasher::default();
             let mut has_null = false;
@@ -1588,30 +1695,32 @@ impl FrozenVolume {
             if has_null {
                 continue;
             }
-            let row_hash = row_hasher.finish();
-            idx_map.entry(row_hash).or_default().push(row_idx as u32);
+            entries.push((row_hasher.finish(), row_idx as u32));
         }
+        entries.sort_unstable_by_key(|&(h, _)| h);
 
         // Look up before storing
-        if let Some(row_indices) = idx_map.get(&hash) {
-            for &row_idx in row_indices {
-                let matches = col_indices.iter().zip(values.iter()).all(|(&ci, &val)| {
-                    let vol_val = self.columns[ci].get_value(row_idx as usize);
-                    !vol_val.is_null() && vol_val == *val
-                });
-                if matches && f(row_idx) {
-                    break;
-                }
+        let pos = entries.partition_point(|&(h, _)| h < hash);
+        for &(h, row_idx) in &entries[pos..] {
+            if h != hash {
+                break;
+            }
+            let matches = col_indices.iter().zip(values.iter()).all(|(&ci, &val)| {
+                let vol_val = self.columns[ci].get_value(row_idx as usize);
+                !vol_val.is_null() && vol_val == *val
+            });
+            if matches && f(row_idx) {
+                break;
             }
         }
 
         // Store the built index
         self.unique_indices
             .write()
-            .insert(col_indices.to_vec(), idx_map);
+            .insert(col_indices.to_vec(), entries);
     }
 
-    /// Pre-build the unique hash index for a set of column indices.
+    /// Pre-build the unique sorted index for a set of column indices.
     /// Called during seal/compaction so the first INSERT after seal doesn't
     /// pay a ~60ms stall scanning all rows to build the index.
     pub fn prebuild_unique_index(&self, col_indices: &[usize]) {
@@ -1619,12 +1728,10 @@ impl FrozenVolume {
         if col_indices.iter().any(|&idx| idx >= self.columns.len()) {
             return;
         }
-        // Skip if already built
         if self.unique_indices.read().contains_key(col_indices) {
             return;
         }
-        let mut idx_map: rustc_hash::FxHashMap<u64, Vec<u32>> =
-            rustc_hash::FxHashMap::with_capacity_and_hasher(self.row_count, Default::default());
+        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(self.row_count);
         for row_idx in 0..self.row_count {
             let mut row_hasher = ahash::AHasher::default();
             let mut has_null = false;
@@ -1638,14 +1745,12 @@ impl FrozenVolume {
             if has_null {
                 continue;
             }
-            idx_map
-                .entry(row_hasher.finish())
-                .or_default()
-                .push(row_idx as u32);
+            entries.push((row_hasher.finish(), row_idx as u32));
         }
+        entries.sort_unstable_by_key(|&(h, _)| h);
         self.unique_indices
             .write()
-            .insert(col_indices.to_vec(), idx_map);
+            .insert(col_indices.to_vec(), entries);
     }
 
     /// Find the column index by name. O(1) via precomputed hashmap.

@@ -1137,6 +1137,292 @@ pub(crate) fn serialize_column_block(col: &ColumnData, start: usize, end: usize)
     buf
 }
 
+// =============================================================================
+// Append-into helpers: extend existing Vecs instead of allocating new ones.
+// Used by CompressedBlockStore::decompress_column for multi-group columns to
+// avoid 1000s of intermediate ColumnData allocations.
+// =============================================================================
+
+/// Append `count` null flags from `data[*pos..]` into `out`.
+#[inline]
+pub(crate) fn read_nulls_into(
+    data: &[u8],
+    pos: &mut usize,
+    count: usize,
+    out: &mut Vec<bool>,
+) -> io::Result<()> {
+    let end = *pos + count;
+    if end > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated volume: null bitmap extends past end of data",
+        ));
+    }
+    out.reserve(count);
+    for i in 0..count {
+        out.push(data[*pos + i] != 0);
+    }
+    *pos = end;
+    Ok(())
+}
+
+/// Append `count` i64 values from `data[*pos..]` into `out` (bulk, LE).
+#[inline]
+pub(crate) fn read_i64_bulk_into(
+    data: &[u8],
+    pos: &mut usize,
+    count: usize,
+    out: &mut Vec<i64>,
+) -> io::Result<()> {
+    let byte_len = count * 8;
+    let end = *pos + byte_len;
+    if end > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated volume: i64 column data",
+        ));
+    }
+    #[cfg(target_endian = "little")]
+    {
+        let old_len = out.len();
+        out.resize(old_len + count, 0i64);
+        // SAFETY: slice is valid for byte_len bytes; layout of [i64] matches [u8; N*8] on LE.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data[*pos..end].as_ptr(),
+                out[old_len..].as_mut_ptr() as *mut u8,
+                byte_len,
+            );
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        out.reserve(count);
+        for i in 0..count {
+            let off = *pos + i * 8;
+            let bytes: [u8; 8] = data[off..off + 8].try_into().unwrap();
+            out.push(i64::from_le_bytes(bytes));
+        }
+    }
+    *pos = end;
+    Ok(())
+}
+
+/// Append `count` f64 values from `data[*pos..]` into `out` (bulk, LE).
+#[inline]
+pub(crate) fn read_f64_bulk_into(
+    data: &[u8],
+    pos: &mut usize,
+    count: usize,
+    out: &mut Vec<f64>,
+) -> io::Result<()> {
+    let byte_len = count * 8;
+    let end = *pos + byte_len;
+    if end > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated volume: f64 column data",
+        ));
+    }
+    #[cfg(target_endian = "little")]
+    {
+        let old_len = out.len();
+        out.resize(old_len + count, 0f64);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data[*pos..end].as_ptr(),
+                out[old_len..].as_mut_ptr() as *mut u8,
+                byte_len,
+            );
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        out.reserve(count);
+        for i in 0..count {
+            let off = *pos + i * 8;
+            let bytes: [u8; 8] = data[off..off + 8].try_into().unwrap();
+            out.push(f64::from_le_bytes(bytes));
+        }
+    }
+    *pos = end;
+    Ok(())
+}
+
+/// Append `count` u32 values from `data[*pos..]` into `out` (bulk, LE).
+#[inline]
+pub(crate) fn read_u32_bulk_into(
+    data: &[u8],
+    pos: &mut usize,
+    count: usize,
+    out: &mut Vec<u32>,
+) -> io::Result<()> {
+    let byte_len = count * 4;
+    let end = *pos + byte_len;
+    if end > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated volume: u32 column data",
+        ));
+    }
+    #[cfg(target_endian = "little")]
+    {
+        let old_len = out.len();
+        out.resize(old_len + count, 0u32);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data[*pos..end].as_ptr(),
+                out[old_len..].as_mut_ptr() as *mut u8,
+                byte_len,
+            );
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        out.reserve(count);
+        for i in 0..count {
+            let off = *pos + i * 4;
+            let bytes: [u8; 4] = data[off..off + 4].try_into().unwrap();
+            out.push(u32::from_le_bytes(bytes));
+        }
+    }
+    *pos = end;
+    Ok(())
+}
+
+/// Append `count` bool values from `data[*pos..]` into `out`.
+#[inline]
+pub(crate) fn read_bool_bulk_into(
+    data: &[u8],
+    pos: &mut usize,
+    count: usize,
+    out: &mut Vec<bool>,
+) -> io::Result<()> {
+    let end = *pos + count;
+    if end > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated volume: boolean column data",
+        ));
+    }
+    out.reserve(count);
+    for i in 0..count {
+        out.push(data[*pos + i] != 0);
+    }
+    *pos = end;
+    Ok(())
+}
+
+/// Deserialize a single column block, appending directly into the caller's
+/// output buffers. This avoids creating an intermediate `ColumnData` per group.
+///
+/// - `values_out`: receives the column's typed values (i64/f64/u32/bool).
+///   For COL_BYTES the bytes blob is returned separately; pass `()` as
+///   the generic: the function writes data/offsets into the dedicated parameters.
+/// - `nulls_out`: receives the null flags.
+///
+/// For COL_BYTES, `bytes_data_out` and `bytes_offsets_out` are used instead of
+/// `values_out`. The offset base for the current group must be passed as
+/// `bytes_base_offset` so block-local offsets are converted to global offsets.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deserialize_column_block_into(
+    data: &[u8],
+    col_type_tag: u8,
+    row_count: usize,
+    nulls_out: &mut Vec<bool>,
+    // Typed value outputs — only the one matching col_type_tag is used:
+    i64_out: Option<&mut Vec<i64>>,
+    f64_out: Option<&mut Vec<f64>>,
+    u32_out: Option<&mut Vec<u32>>,
+    bool_out: Option<&mut Vec<bool>>,
+    // COL_BYTES specific:
+    bytes_data_out: Option<&mut Vec<u8>>,
+    bytes_offsets_out: Option<&mut Vec<(u64, u64)>>,
+) -> io::Result<()> {
+    let mut pos = 0;
+    match col_type_tag {
+        COL_INT64 | COL_TIMESTAMP => {
+            read_nulls_into(data, &mut pos, row_count, nulls_out)?;
+            read_i64_bulk_into(
+                data,
+                &mut pos,
+                row_count,
+                i64_out.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing i64_out buffer")
+                })?,
+            )?;
+        }
+        COL_FLOAT64 => {
+            read_nulls_into(data, &mut pos, row_count, nulls_out)?;
+            read_f64_bulk_into(
+                data,
+                &mut pos,
+                row_count,
+                f64_out.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing f64_out buffer")
+                })?,
+            )?;
+        }
+        COL_BOOLEAN => {
+            read_nulls_into(data, &mut pos, row_count, nulls_out)?;
+            read_bool_bulk_into(
+                data,
+                &mut pos,
+                row_count,
+                bool_out.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing bool_out buffer")
+                })?,
+            )?;
+        }
+        COL_DICTIONARY => {
+            read_nulls_into(data, &mut pos, row_count, nulls_out)?;
+            read_u32_bulk_into(
+                data,
+                &mut pos,
+                row_count,
+                u32_out.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing u32_out buffer")
+                })?,
+            )?;
+        }
+        COL_BYTES => {
+            read_nulls_into(data, &mut pos, row_count, nulls_out)?;
+            let offset_count = read_u64(data, &mut pos)? as usize;
+            let bytes_data = bytes_data_out.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing bytes_data_out buffer")
+            })?;
+            let bytes_offsets = bytes_offsets_out.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing bytes_offsets_out buffer",
+                )
+            })?;
+            let base = bytes_data.len() as u64;
+            bytes_offsets.reserve(offset_count);
+            for _ in 0..offset_count {
+                let off = read_u64(data, &mut pos)?;
+                let len = read_u64(data, &mut pos)?;
+                bytes_offsets.push((off + base, len));
+            }
+            let data_len = read_u64(data, &mut pos)? as usize;
+            if pos + data_len > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated column block: bytes data",
+                ));
+            }
+            bytes_data.extend_from_slice(&data[pos..pos + data_len]);
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown column type tag {}", col_type_tag),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Deserialize a single column block from raw bytes.
 /// For Dictionary columns, pass the dictionary; for Bytes columns, pass ext_type.
 pub(crate) fn deserialize_column_block(

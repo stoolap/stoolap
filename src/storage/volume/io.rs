@@ -250,9 +250,19 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     let mut meta_compressed = vec![0u8; meta_len];
     crc_read!(&mut meta_compressed);
 
-    let meta_raw = lz4_flex::decompress_size_prepended(&meta_compressed)
-        .map_err(|e| inv(&format!("metadata LZ4: {}", e)))?;
-    drop(meta_compressed);
+    // Parse prepended uncompressed size (4 bytes LE), then decompress_into
+    // to avoid lz4_flex::decompress_size_prepended allocating a fresh Vec.
+    let meta_raw = if meta_compressed.len() >= 4 {
+        let uncomp_size = u32::from_le_bytes(meta_compressed[..4].try_into().unwrap()) as usize;
+        let mut buf = vec![0u8; uncomp_size];
+        lz4_flex::decompress_into(&meta_compressed[4..], &mut buf)
+            .map_err(|e| inv(&format!("metadata LZ4: {}", e)))?;
+        drop(meta_compressed);
+        buf
+    } else {
+        drop(meta_compressed);
+        return Err(inv("metadata too short for LZ4 size prefix"));
+    };
     let meta = deserialize_volume_metadata(&meta_raw)
         .map_err(|e| crate::core::Error::internal(format!("V4 metadata: {}", e)))?;
     drop(meta_raw);

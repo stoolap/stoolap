@@ -163,13 +163,13 @@ impl SegmentedTable {
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let ts = self.segment_mgr.tombstone_set_arc();
         let mut seen_values: ahash::AHashMap<Vec<Value>, i64> = ahash::AHashMap::new();
-        let mut seen_rows = rustc_hash::FxHashSet::default();
 
         // Build skip set: hot row_ids + pending tombstones for this transaction.
         // Inside an explicit transaction, uncommitted UPDATEs create pending
         // local versions that shadow cold rows. has_row_id only sees committed
         // rows, so we also need pending tombstones to skip rows being modified.
-        let mut hot_skip: FxHashSet<i64> = FxHashSet::default();
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
@@ -177,8 +177,11 @@ impl SegmentedTable {
         for (_, cs) in volumes.iter() {
             let vol = &cs.volume;
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let rid = vol.row_ids[i];
-                if self.is_row_tombstoned(&ts, rid) || !seen_rows.insert(rid) {
+                if self.is_row_tombstoned(&ts, rid) {
                     continue;
                 }
                 // Skip rows shadowed by hot buffer or pending transaction changes
@@ -240,12 +243,14 @@ impl SegmentedTable {
         }
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let ts = self.segment_mgr.tombstone_set_arc();
-        let mut seen = rustc_hash::FxHashSet::default();
         for (_, cs) in volumes.iter() {
             let vol = &cs.volume;
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let rid = vol.row_ids[i];
-                if self.is_row_tombstoned(&ts, rid) || !seen.insert(rid) {
+                if self.is_row_tombstoned(&ts, rid) {
                     continue;
                 }
                 let values: Vec<Value> = col_indices
@@ -570,18 +575,18 @@ impl SegmentedTable {
     /// Create lazy segment scanners for a read query, applying zone map pruning
     /// and binary search on sorted columns for range predicates.
     ///
-    /// Uses per-volume skip sets: the caller-provided `dynamic_skip` (hot row_ids
-    /// and pending tombstones) forms the initial skip set, then each volume's
-    /// row_ids are added for older volumes. Committed tombstones are shared
-    /// via Arc (no clone per volume).
+    /// Uses the per-row visibility bitmap on each ColdSegment for inter-volume
+    /// dedup. The caller-provided `hot_skip` (hot row_ids and pending tombstones)
+    /// is passed to every scanner unchanged — no per-volume accumulation needed.
+    /// Committed tombstones are shared via Arc (no clone per volume).
     ///
-    /// The `dynamic_skip` MUST be derived from actual hot scan results (not a
+    /// The `hot_skip` MUST be derived from actual hot scan results (not a
     /// separate B-tree read) to prevent the seal race.
     fn create_segment_scanners_filtered(
         &self,
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
-        mut dynamic_skip: FxHashSet<i64>,
+        hot_skip: FxHashSet<i64>,
     ) -> Vec<Box<dyn Scanner>> {
         let comparisons = where_expr
             .map(|e| e.collect_comparisons())
@@ -596,71 +601,18 @@ impl SegmentedTable {
         // Committed tombstones are kept as a shared Arc (no clone).
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
 
-        // For single-volume tables (most common after compaction), no per-volume
-        // dedup needed. Just use the skip sets directly.
-        if volumes.len() == 1 {
-            let dynamic = Arc::new(dynamic_skip);
-            let mut scanners_reverse: Vec<Box<dyn Scanner>> = Vec::with_capacity(1);
-            let (seg_id, cs) = &volumes[0];
-            let vol = &cs.volume;
+        // hot_skip is shared across all scanners via Arc — no clone per volume.
+        let hot_skip_arc = Arc::new(hot_skip);
 
-            // Zone map + binary search pruning (inlined below for single-vol fast path)
-            let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-            let (should_skip, start, end) = Self::prune_volume(vol, &comparisons, &bloom_hashes);
-            if !should_skip && start < end {
-                let mut scanner = if start > 0 || end < vol.row_count {
-                    VolumeScanner::with_range(
-                        Arc::clone(vol),
-                        column_indices.to_vec(),
-                        start,
-                        end,
-                        None,
-                    )
-                } else {
-                    VolumeScanner::new(Arc::clone(vol), column_indices.to_vec(), None)
-                };
-                scanner.set_skip_sets(Arc::clone(&tombstones_arc), dynamic);
-                scanner.snapshot_seq = self.snapshot_seq;
-                let current_schema = self.hot.schema();
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
-                scanner.set_column_mapping(mapping);
-                if let Some(expr) = where_expr {
-                    let filter = expr.with_aliases(&Default::default());
-                    let mut prepared = filter;
-                    prepared.prepare_for_schema(current_schema);
-                    scanner.set_filter(prepared);
-                }
-                scanners_reverse.push(Box::new(scanner) as Box<dyn Scanner>);
-            }
-            return scanners_reverse;
-        }
-
-        // Multi-volume path: build cumulative dynamic skip set per volume.
-        // Committed tombstones are shared via Arc (no clone per volume).
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
         let mut scanners_reverse: Vec<Box<dyn Scanner>> = Vec::with_capacity(volumes.len());
-        let num_volumes = volumes.len();
-        for (vol_idx, (seg_id, cs)) in volumes.iter().enumerate() {
+
+        for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
             let (should_skip, start, end) = Self::prune_volume(vol, &comparisons, &bloom_hashes);
             if should_skip {
-                for &rid in &vol.row_ids {
-                    dynamic_skip.insert(rid);
-                }
                 continue;
             }
-
-            // Scanner captures the skip set — clone needed for multi-volume.
-            // Last volume can move instead of cloning.
-            let dynamic_for_this_volume = if vol_idx + 1 < num_volumes {
-                let snap = Arc::new(dynamic_skip.clone());
-                for &rid in &vol.row_ids {
-                    dynamic_skip.insert(rid);
-                }
-                snap
-            } else {
-                Arc::new(std::mem::take(&mut dynamic_skip))
-            };
 
             let mut scanner = if start > 0 || end < vol.row_count {
                 VolumeScanner::with_range(
@@ -673,7 +625,10 @@ impl SegmentedTable {
             } else {
                 VolumeScanner::new(Arc::clone(vol), column_indices.to_vec(), None)
             };
-            scanner.set_skip_sets(Arc::clone(&tombstones_arc), dynamic_for_this_volume);
+            // Each scanner gets the same small hot_skip Arc (no clone of hot IDs).
+            // Inter-volume dedup is handled by the per-volume visibility bitmap.
+            scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
+            scanner.set_visibility_bitmap(cs.visible.clone());
             scanner.snapshot_seq = self.snapshot_seq;
             let current_schema = self.hot.schema();
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
@@ -696,16 +651,16 @@ impl SegmentedTable {
     /// Collect rows from segments into a RowVec, with zone map pruning
     /// and binary search on sorted columns.
     ///
-    /// Uses per-volume skip sets: hot row_ids + tombstones form the initial
-    /// skip set, then each volume's row_ids are added for older volumes.
-    /// Scan cold volumes with an externally-provided skip set.
+    /// Uses the per-row visibility bitmap on each ColdSegment for inter-volume
+    /// dedup. The caller-provided `hot_skip` (hot row_ids and pending tombstones)
+    /// filters rows that are shadowed by the hot buffer.
     ///
-    /// The skip set MUST be derived from actual hot scan results (not a separate
+    /// The `hot_skip` MUST be derived from actual hot scan results (not a separate
     /// B-tree read) to avoid races with concurrent `remove_sealed_rows`.
     fn collect_cold_rows(
         &self,
         where_expr: Option<&dyn Expression>,
-        mut dynamic_skip: FxHashSet<i64>,
+        hot_skip: FxHashSet<i64>,
     ) -> Result<RowVec> {
         let comparisons = where_expr
             .map(|e| e.collect_comparisons())
@@ -718,16 +673,13 @@ impl SegmentedTable {
         let total: usize = volumes.iter().map(|(_, cs)| cs.volume.row_count).sum();
         let mut rows = RowVec::with_capacity(total.min(64_000));
 
-        // Process newest-first, accumulating dynamic skip sets
+        // Process newest-first; visibility bitmap handles inter-volume dedup.
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
         let mut per_volume_rows: Vec<RowVec> = Vec::with_capacity(volumes.len());
         for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
             let (should_skip, start, end) = Self::prune_volume(vol, &comparisons, &bloom_hashes);
             if should_skip {
-                for &rid in &vol.row_ids {
-                    dynamic_skip.insert(rid);
-                }
                 continue;
             }
 
@@ -759,9 +711,6 @@ impl SegmentedTable {
             }
 
             if start >= end {
-                for &rid in &vol.row_ids {
-                    dynamic_skip.insert(rid);
-                }
                 continue;
             }
 
@@ -770,9 +719,11 @@ impl SegmentedTable {
 
             let mut vol_rows = RowVec::new();
             for i in start..end {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let row_id = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, row_id) || dynamic_skip.contains(&row_id)
-                {
+                if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
                     continue;
                 }
 
@@ -802,10 +753,6 @@ impl SegmentedTable {
                     }
                 }
                 vol_rows.push((row_id, row));
-            }
-            // Add this volume's row_ids so older volumes skip them
-            for &rid in &vol.row_ids {
-                dynamic_skip.insert(rid);
             }
             per_volume_rows.push(vol_rows);
         }
@@ -990,10 +937,11 @@ impl Table for SegmentedTable {
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
 
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut dynamic_skip: FxHashSet<i64> = FxHashSet::default();
-        self.hot.collect_hot_row_ids_into(&mut dynamic_skip);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut dynamic_skip);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
         let schema_clone = self.hot.schema().clone();
 
         for (seg_id, cs) in volumes.iter() {
@@ -1001,9 +949,11 @@ impl Table for SegmentedTable {
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema_clone);
 
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let row_id = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, row_id) || dynamic_skip.contains(&row_id)
-                {
+                if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
                     continue;
                 }
                 let row = if mapping.is_identity {
@@ -1056,9 +1006,6 @@ impl Table for SegmentedTable {
                         .add_pending_tombstone(self.txn_id(), row_id);
                     count += 1;
                 }
-            }
-            for &rid in &vol.row_ids {
-                dynamic_skip.insert(rid);
             }
         }
         if count > 0 {
@@ -1193,27 +1140,29 @@ impl Table for SegmentedTable {
             return hot_ids;
         }
 
-        // Build dynamic skip set from hot row_ids + pending tombstones.
+        // Build hot_skip from hot row_ids + pending tombstones.
         // Committed tombstones are kept as a shared Arc (no clone).
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut dynamic_skip: FxHashSet<i64> = FxHashSet::default();
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
         for id in &hot_ids {
-            dynamic_skip.insert(*id);
+            hot_skip.insert(*id);
         }
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut dynamic_skip);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
         let mut ids = Vec::new();
         for (_, cs) in volumes.iter() {
             let vol = &cs.volume;
-            for &id in &vol.row_ids {
-                if !self.is_row_tombstoned(&tombstones_arc, id) && !dynamic_skip.contains(&id) {
+            for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
+                let id = vol.row_ids[i];
+                if !self.is_row_tombstoned(&tombstones_arc, id) && !hot_skip.contains(&id) {
                     ids.push(id);
                 }
-            }
-            for &rid in &vol.row_ids {
-                dynamic_skip.insert(rid);
             }
         }
         ids.extend(hot_ids);
@@ -1230,34 +1179,114 @@ impl Table for SegmentedTable {
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
 
-        // Build dynamic skip set from hot row_ids + pending tombstones.
+        // Build hot_skip from hot row_ids + pending tombstones.
         // Committed tombstones are kept as a shared Arc (no clone).
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut dynamic_skip: FxHashSet<i64> = FxHashSet::default();
-        self.hot.collect_hot_row_ids_into(&mut dynamic_skip);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut dynamic_skip);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
         let schema_clone = self.hot.schema().clone();
 
+        // Pre-compute a column-level bitmask from the WHERE expression so that
+        // we only decompress/allocate the columns the filter actually references.
+        // When `where_expr` is None every row matches, so we skip materialisation
+        // entirely.  When `collect_column_indices` returns false (expression type
+        // is unknown) we fall back to a full-row materialisation.
+        let needed_cols: Option<Vec<bool>> = where_expr.and_then(|expr| {
+            let mut cols = Vec::new();
+            if expr.collect_column_indices(&mut cols) {
+                // Size the mask to the schema width; individual volumes may be
+                // wider/narrower after schema evolution — the per-volume mask is
+                // clamped inside get_row_needed / get_row_mapped_needed.
+                let mask_len = schema_clone.columns.len();
+                let mut mask = vec![false; mask_len];
+                for &ci in &cols {
+                    if ci < mask_len {
+                        mask[ci] = true;
+                    }
+                }
+                Some(mask)
+            } else {
+                None // unknown expression — materialise all columns
+            }
+        });
+
         let mut deleted_cold_ids: Vec<i64> = Vec::new();
+        // Reusable row for WHERE evaluation — avoids Vec/Arc allocation per row.
+        // The CompactVec capacity is set once, then clear+push reuses the buffer.
+        let mut reusable_row = Row::with_capacity(schema_clone.columns.len());
         for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema_clone);
 
             for i in 0..vol.row_count {
-                let row_id = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, row_id) || dynamic_skip.contains(&row_id)
-                {
+                if !cs.is_visible(i) {
                     continue;
                 }
-                let row = if mapping.is_identity {
-                    vol.get_row(i)
-                } else {
-                    vol.get_row_mapped(i, &mapping)
-                };
+                let row_id = vol.row_ids[i];
+                if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
+                    continue;
+                }
                 if let Some(expr) = where_expr {
-                    if !expr.evaluate_fast(&row) {
+                    // Fill reusable row with only the needed columns.
+                    // Zero heap allocation after first iteration (buffer reuse).
+                    reusable_row.clear();
+                    match (&needed_cols, mapping.is_identity) {
+                        (Some(mask), true) => {
+                            for ci in 0..vol.columns.len() {
+                                if ci < mask.len() && mask[ci] {
+                                    reusable_row.push(vol.columns[ci].get_value(i));
+                                } else {
+                                    reusable_row.push(Value::Null(vol.columns.data_type(ci)));
+                                }
+                            }
+                        }
+                        (Some(mask), false) => {
+                            for (ci, src) in mapping.sources.iter().enumerate() {
+                                if ci < mask.len() && mask[ci] {
+                                    match src {
+                                        super::writer::ColSource::Volume(vi) => {
+                                            reusable_row.push(vol.columns[*vi].get_value(i));
+                                        }
+                                        super::writer::ColSource::Default(val) => {
+                                            reusable_row.push(val.clone());
+                                        }
+                                    }
+                                } else {
+                                    match src {
+                                        super::writer::ColSource::Volume(vi) => {
+                                            reusable_row
+                                                .push(Value::Null(vol.columns.data_type(*vi)));
+                                        }
+                                        super::writer::ColSource::Default(val) => {
+                                            reusable_row.push(Value::Null(val.data_type()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        (None, true) => {
+                            for ci in 0..vol.columns.len() {
+                                reusable_row.push(vol.columns[ci].get_value(i));
+                            }
+                        }
+                        (None, false) => {
+                            for src in &mapping.sources {
+                                match src {
+                                    super::writer::ColSource::Volume(vi) => {
+                                        reusable_row.push(vol.columns[*vi].get_value(i));
+                                    }
+                                    super::writer::ColSource::Default(val) => {
+                                        reusable_row.push(val.clone());
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    if !expr.evaluate_fast(&reusable_row) {
                         continue;
                     }
                 }
@@ -1268,9 +1297,6 @@ impl Table for SegmentedTable {
                 }
                 deleted_cold_ids.push(row_id);
                 count += 1;
-            }
-            for &rid in &vol.row_ids {
-                dynamic_skip.insert(rid);
             }
         }
         // Track tombstones for commit
@@ -1503,13 +1529,16 @@ impl Table for SegmentedTable {
         // Uses has_row_id() B-tree point lookup for hot check instead
         // of collecting all hot row_ids. Cost: O(cold_ids) integer ops.
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut pending_tomb: FxHashSet<i64> = FxHashSet::default();
+        let mut pending_tomb: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(1_000, Default::default());
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut pending_tomb);
 
         let total_cold_rows: usize = volumes.iter().map(|(_, cs)| cs.volume.row_count).sum();
-        let mut authority: FxHashMap<i64, usize> =
-            FxHashMap::with_capacity_and_hasher(total_cold_rows.min(500_000), Default::default());
+        let mut authority: FxHashMap<i64, usize> = FxHashMap::with_capacity_and_hasher(
+            total_cold_rows.min(500_000) * 8 / 7 + 16,
+            Default::default(),
+        );
         for (nf_idx, (_seg_id, cs)) in volumes.iter().enumerate() {
             for &rid in &cs.volume.row_ids {
                 if self.hot.has_row_id(rid)
@@ -1599,21 +1628,22 @@ impl Table for SegmentedTable {
             return Ok(hot_rows.into_iter().skip(offset).take(limit).collect());
         }
 
-        // Need cold rows. Build skip set and scan with early termination.
+        // Need cold rows. Build hot_skip and scan with early termination.
         let mut result = hot_rows;
         let remaining = target - result.len();
 
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut dynamic_skip: FxHashSet<i64> = FxHashSet::default();
-        self.hot.collect_hot_row_ids_into(&mut dynamic_skip);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut dynamic_skip);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let current_schema = self.hot.schema();
         let mut collected = 0usize;
 
-        // Zone-map + bloom filter setup for pruning (was missing in unordered path)
+        // Zone-map + bloom filter setup for pruning.
         let comparisons = where_expr
             .map(|e| e.collect_comparisons())
             .unwrap_or_default();
@@ -1622,7 +1652,6 @@ impl Table for SegmentedTable {
         'outer: for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
             // Zone-map pruning: skip entire volume if no rows can match.
-            // Still need to add row_ids to dynamic_skip for older volumes.
             let pruned = if !comparisons.is_empty() {
                 let (skip, _, _) = Self::prune_volume(vol, &comparisons, &bloom_hashes);
                 skip
@@ -1631,18 +1660,17 @@ impl Table for SegmentedTable {
             };
 
             if pruned {
-                for &rid in &vol.row_ids {
-                    dynamic_skip.insert(rid);
-                }
                 continue;
             }
 
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
 
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let row_id = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, row_id) || dynamic_skip.contains(&row_id)
-                {
+                if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
                     continue;
                 }
                 let row = if mapping.is_identity {
@@ -1660,9 +1688,6 @@ impl Table for SegmentedTable {
                 if collected >= remaining {
                     break 'outer;
                 }
-            }
-            for &rid in &vol.row_ids {
-                dynamic_skip.insert(rid);
             }
         }
 
@@ -1830,10 +1855,11 @@ impl Table for SegmentedTable {
         // Tombstones exist: scan columnar data with dedup (avoids full Row materialization)
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut seen: FxHashSet<i64> = FxHashSet::default();
-        self.hot.collect_hot_row_ids_into(&mut seen);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut seen);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
         let mut total_sum = hot_sum;
         let mut total_count = hot_count;
@@ -1842,8 +1868,11 @@ impl Table for SegmentedTable {
             let vol = &cs.volume;
             let vol_has_col = col_idx < vol.columns.len();
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let rid = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, rid) || !seen.insert(rid) {
+                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
                 if vol_has_col {
@@ -1926,18 +1955,22 @@ impl Table for SegmentedTable {
         // Tombstones exist: scan columnar data with dedup
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut seen: FxHashSet<i64> = FxHashSet::default();
-        self.hot.collect_hot_row_ids_into(&mut seen);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut seen);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
         let mut overall_min = hot_min;
         for (_, cs) in volumes.iter() {
             let vol = &cs.volume;
             let vol_has_col = col_idx < vol.columns.len();
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let rid = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, rid) || !seen.insert(rid) {
+                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
                 let val = if vol_has_col {
@@ -2019,18 +2052,22 @@ impl Table for SegmentedTable {
         // Tombstones exist: scan columnar data with dedup
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut seen: FxHashSet<i64> = FxHashSet::default();
-        self.hot.collect_hot_row_ids_into(&mut seen);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut seen);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
         let mut overall_max = hot_max;
         for (_, cs) in volumes.iter() {
             let vol = &cs.volume;
             let vol_has_col = col_idx < vol.columns.len();
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let rid = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, rid) || !seen.insert(rid) {
+                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
                 let val = if vol_has_col {
@@ -2087,10 +2124,11 @@ impl Table for SegmentedTable {
         // Build skip set: hot row_ids + tombstones + pending tombstones
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut seen_row_ids: FxHashSet<i64> = FxHashSet::default();
-        self.hot.collect_hot_row_ids_into(&mut seen_row_ids);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut seen_row_ids);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
         // Scan cold volumes columnar-only (no Row materialization)
         let default_val = self.column_default(col_idx);
@@ -2099,8 +2137,11 @@ impl Table for SegmentedTable {
             let vol = &cs.volume;
             let vol_has_col = col_idx < vol.columns.len();
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let rid = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, rid) || !seen_row_ids.insert(rid) {
+                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
                 if vol_has_col {
@@ -2141,10 +2182,11 @@ impl Table for SegmentedTable {
 
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut seen_row_ids: FxHashSet<i64> = FxHashSet::default();
-        self.hot.collect_hot_row_ids_into(&mut seen_row_ids);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut seen_row_ids);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
         let default_val = self.column_default(col_idx);
         let has_non_null_default = !default_val.is_null();
@@ -2152,8 +2194,11 @@ impl Table for SegmentedTable {
             let vol = &cs.volume;
             let vol_has_col = col_idx < vol.columns.len();
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let rid = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, rid) || !seen_row_ids.insert(rid) {
+                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
                 if vol_has_col {
@@ -2192,13 +2237,14 @@ impl Table for SegmentedTable {
             }
         }
 
-        // Build skip set: hot row_ids + tombstones + pending tombstones
+        // Build hot_skip: hot row_ids + tombstones + pending tombstones
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut seen_row_ids: FxHashSet<i64> = FxHashSet::default();
-        self.hot.collect_hot_row_ids_into(&mut seen_row_ids);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut seen_row_ids);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
         let current_schema = self.hot.schema();
 
         let default_val = self.column_default(col_idx);
@@ -2213,8 +2259,11 @@ impl Table for SegmentedTable {
             };
 
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let rid = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, rid) || !seen_row_ids.insert(rid) {
+                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
                 let val = if let Some(pc) = phys_col {
@@ -2266,13 +2315,14 @@ impl Table for SegmentedTable {
             .get_rows_for_partition_value(column_name, partition_value)
             .unwrap_or_default();
 
-        // Build skip set: hot row_ids + tombstones + pending tombstones
+        // Build hot_skip: hot row_ids + tombstones + pending tombstones
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut seen_row_ids: FxHashSet<i64> = FxHashSet::default();
-        self.hot.collect_hot_row_ids_into(&mut seen_row_ids);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut seen_row_ids);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
         let current_schema = self.hot.schema();
 
         let default_val = self.column_default(col_idx);
@@ -2291,8 +2341,11 @@ impl Table for SegmentedTable {
             }
 
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let rid = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, rid) || !seen_row_ids.insert(rid) {
+                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
                 let matches = if let Some(pc) = phys_col {
@@ -2708,7 +2761,8 @@ impl Table for SegmentedTable {
 
         let schema = self.hot.schema().clone();
         let pk_idx = schema.columns.iter().position(|c| c.primary_key);
-        let mut hot_pks: FxHashSet<i64> = FxHashSet::default();
+        let mut hot_pks: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
         let mut all_rows = RowVec::new();
 
         while hot_result.next() {
@@ -2726,22 +2780,25 @@ impl Table for SegmentedTable {
         // Cold segments store raw data without version chains, so they're valid
         // only for "CURRENT" temporal queries. Historical queries return early above.
         if is_current_query {
-            // Build dynamic skip set from hot row_ids + pending tombstones.
+            // Build hot_skip from hot row_ids + pending tombstones.
             // Committed tombstones are kept as a shared Arc (no clone).
             let volumes = self.segment_mgr.get_volumes_newest_first();
             let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-            let mut dynamic_skip: FxHashSet<i64> = FxHashSet::default();
-            self.hot.collect_hot_row_ids_into(&mut dynamic_skip);
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
             self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut dynamic_skip);
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
             for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
                 for i in 0..vol.row_count {
+                    if !cs.is_visible(i) {
+                        continue;
+                    }
                     let row_id = vol.row_ids[i];
-                    if self.is_row_tombstoned(&tombstones_arc, row_id)
-                        || dynamic_skip.contains(&row_id)
+                    if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id)
                     {
                         continue;
                     }
@@ -2771,9 +2828,6 @@ impl Table for SegmentedTable {
                         }
                     }
                     all_rows.push((row_id, row));
-                }
-                for &rid in &vol.row_ids {
-                    dynamic_skip.insert(rid);
                 }
             }
         }
@@ -2964,13 +3018,14 @@ impl Table for SegmentedTable {
             update_accums(&mut entry.1, aggregates, row);
         }
 
-        // Process cold volumes with dedup
+        // Process cold volumes with visibility bitmap dedup
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut seen: FxHashSet<i64> = FxHashSet::default();
-        self.hot.collect_hot_row_ids_into(&mut seen);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut seen);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
         let current_schema = self.hot.schema();
 
         for (seg_id, cs) in volumes.iter() {
@@ -2978,8 +3033,11 @@ impl Table for SegmentedTable {
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
 
             for i in 0..vol.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
                 let rid = vol.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, rid) || !seen.insert(rid) {
+                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
                 let row = if mapping.is_identity {

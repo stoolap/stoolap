@@ -139,6 +139,17 @@ fn try_extract_literal(expr: &Expression) -> Option<Value> {
     }
 }
 
+/// Pre-compiled upsert expressions built once per INSERT statement and reused for every
+/// conflicting row. Without this, `apply_on_duplicate_update` recompiles expressions and
+/// re-parses CHECK constraint SQL on every conflict, causing O(n) allocation churn.
+struct CompiledUpsert {
+    /// (column_index, column_type, vector_dimensions, compiled_program)
+    compiled_updates: Vec<(usize, DataType, u16, super::expression::SharedProgram)>,
+    /// (column_index, column_name, check_expression_text, compiled_check_program)
+    /// The program is executed with a single-column row containing the new value.
+    compiled_checks: Vec<(usize, String, String, super::expression::SharedProgram)>,
+}
+
 impl Executor {
     /// Select row_ids for DML operations using the full SELECT executor.
     /// This reuses all SELECT optimizations (indexes, semi-joins, parallel execution, etc.)
@@ -435,6 +446,18 @@ impl Executor {
                 None
             };
 
+            // Pre-compile upsert expressions once for all conflicting rows in this batch.
+            // Without this, compile_upsert work repeats for every conflict (O(n) cost).
+            let compiled_upsert = if stmt.on_duplicate {
+                if let Some(ref s) = select_schema {
+                    Some(Self::compile_upsert(s, stmt)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             // For explicit transactions, materialize the SELECT BEFORE any inserts
             // to ensure statement atomicity: a late runtime error (e.g., invalid REGEXP)
             // won't leave partial inserts pending for commit. Auto-commit transactions
@@ -570,6 +593,7 @@ impl Executor {
                                 None,
                                 row_values,
                                 stmt,
+                                compiled_upsert.as_ref(),
                                 ctx,
                                 has_returning,
                             ) {
@@ -618,6 +642,7 @@ impl Executor {
                                         Some(column),
                                         row_values,
                                         stmt,
+                                        compiled_upsert.as_ref(),
                                         ctx,
                                         has_returning,
                                     ) {
@@ -716,6 +741,14 @@ impl Executor {
         if stmt.do_nothing || stmt.on_duplicate {
             // ON DUPLICATE KEY UPDATE requires schema (CompactArc ref-count bump, not deep clone)
             let schema = self.engine.get_table_schema(table_name)?;
+
+            // Pre-compile upsert expressions once for all conflicting rows in this batch.
+            // Without this, compile_upsert work repeats for every conflict (O(n) cost).
+            let compiled_upsert = if stmt.on_duplicate {
+                Some(Self::compile_upsert(&schema, stmt)?)
+            } else {
+                None
+            };
 
             for value_row in &stmt.values {
                 if value_row.len() != column_indices.len() {
@@ -839,6 +872,7 @@ impl Executor {
                                 None,
                                 &row_values,
                                 stmt,
+                                compiled_upsert.as_ref(),
                                 ctx,
                                 has_returning,
                             ) {
@@ -888,6 +922,7 @@ impl Executor {
                                         Some(column),
                                         &row_values,
                                         stmt,
+                                        compiled_upsert.as_ref(),
                                         ctx,
                                         has_returning,
                                     ) {
@@ -2566,6 +2601,92 @@ impl Executor {
         )))
     }
 
+    /// Build a `CompiledUpsert` from `schema` and `stmt` once per INSERT statement.
+    /// This avoids re-compiling update expressions and re-parsing CHECK constraint SQL
+    /// for every conflicting row in an upsert batch.
+    fn compile_upsert(
+        schema: &crate::core::Schema,
+        stmt: &InsertStatement,
+    ) -> Result<CompiledUpsert> {
+        use super::expression::{compile_expression, CompileContext, ExprCompiler, SharedProgram};
+        use crate::functions::registry::global_registry;
+        use crate::parser::parse_sql;
+
+        let col_map = schema.column_index_map();
+
+        // Resolve each update column to its schema index, type, and AST expression.
+        let update_specs: Vec<(usize, DataType, u16, &Expression)> = stmt
+            .update_columns
+            .iter()
+            .zip(stmt.update_expressions.iter())
+            .filter_map(|(col, expr)| {
+                col_map.get(col.value_lower.as_str()).map(|&idx| {
+                    (
+                        idx,
+                        schema.columns[idx].data_type,
+                        schema.columns[idx].vector_dimensions,
+                        expr,
+                    )
+                })
+            })
+            .collect();
+
+        let column_names: Vec<String> = schema.column_names_owned().to_vec();
+
+        // Build EXCLUDED column name list for the second row source.
+        let excluded_columns: Vec<String> = column_names
+            .iter()
+            .map(|c| format!("excluded.{}", c))
+            .collect();
+
+        // Compile each update expression with EXCLUDED as the second row source.
+        let mut compiled_updates: Vec<(usize, DataType, u16, SharedProgram)> =
+            Vec::with_capacity(update_specs.len());
+        for (idx, col_type, vec_dims, expr) in &update_specs {
+            let compile_ctx = CompileContext::new(&column_names, global_registry())
+                .with_second_row(&excluded_columns);
+            let compiler = ExprCompiler::new(&compile_ctx);
+            match compiler.compile(expr) {
+                Ok(program) => {
+                    compiled_updates.push((*idx, *col_type, *vec_dims, CompactArc::new(program)));
+                }
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "failed to compile ON CONFLICT update expression: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        // Compile CHECK constraints for columns being updated.
+        // Store as SharedProgram (not ExpressionEval) so the struct can be shared
+        // immutably — the VM used to execute the program lives in the setter closure.
+        let compiled_checks: Vec<(usize, String, String, SharedProgram)> = update_specs
+            .iter()
+            .filter_map(|(idx, _, _, _)| {
+                let col = &schema.columns[*idx];
+                col.check_expr.as_ref().and_then(|check_expr| {
+                    let sql = format!("SELECT {}", check_expr);
+                    let stmts = parse_sql(&sql).ok()?;
+                    if let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() {
+                        let expr = select.columns.first()?;
+                        let columns = vec![col.name.to_string()];
+                        let program = compile_expression(expr, &columns).ok()?;
+                        Some((*idx, col.name.to_string(), check_expr.to_string(), program))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        Ok(CompiledUpsert {
+            compiled_updates,
+            compiled_checks,
+        })
+    }
+
     /// Apply ON DUPLICATE KEY UPDATE to an existing row.
     /// `insert_values` contains the attempted insert row — accessible via `EXCLUDED.column`
     /// in update expressions (PostgreSQL-style).
@@ -2581,6 +2702,7 @@ impl Executor {
         conflict_column: Option<&str>,
         insert_values: &[Value],
         stmt: &InsertStatement,
+        compiled: Option<&CompiledUpsert>,
         ctx: &ExecutionContext,
         capture_row: bool,
     ) -> Result<Option<Row>> {
@@ -2628,80 +2750,19 @@ impl Executor {
             None
         };
 
-        // OPTIMIZATION: Pre-compute column indices and types to avoid per-row linear search
-        // Use cached column_index_map for O(1) lookups
-        let col_map = schema.column_index_map();
-        let update_specs: Vec<(usize, crate::core::DataType, u16, &Expression)> = stmt
-            .update_columns
-            .iter()
-            .zip(stmt.update_expressions.iter())
-            .filter_map(|(col, expr)| {
-                col_map.get(col.value_lower.as_str()).map(|&idx| {
-                    (
-                        idx,
-                        schema.columns[idx].data_type,
-                        schema.columns[idx].vector_dimensions,
-                        expr,
-                    )
-                })
-            })
-            .collect();
+        use super::expression::{ExecuteContext, ExprVM};
 
-        let column_names: Vec<String> = schema.column_names_owned().to_vec();
-
-        // Build EXCLUDED columns for the second row source (insert values)
-        // This allows EXCLUDED.column to reference the attempted insert values
-        let excluded_columns: Vec<String> = column_names
-            .iter()
-            .map(|c| format!("excluded.{}", c))
-            .collect();
-
-        // Pre-compile update expressions with EXCLUDED as a second row source
-        use super::expression::{
-            CompileContext, ExecuteContext, ExprCompiler, ExprVM, SharedProgram,
-        };
-        use crate::functions::registry::global_registry;
-
-        let mut compiled_updates: Vec<(usize, crate::core::DataType, u16, SharedProgram)> =
-            Vec::with_capacity(update_specs.len());
-        for (idx, col_type, vec_dims, expr) in &update_specs {
-            let ctx = CompileContext::new(&column_names, global_registry())
-                .with_second_row(&excluded_columns);
-            let compiler = ExprCompiler::new(&ctx);
-            match compiler.compile(expr) {
-                Ok(program) => {
-                    compiled_updates.push((*idx, *col_type, *vec_dims, CompactArc::new(program)));
-                }
-                Err(e) => {
-                    return Err(Error::internal(format!(
-                        "failed to compile ON CONFLICT update expression: {}",
-                        e
-                    )));
-                }
+        // Use pre-compiled programs when provided (normal fast path).
+        // Fall back to inline compilation only when called without a CompiledUpsert
+        // (backward-compatibility / single-row callers).
+        let inline_compiled: Option<CompiledUpsert>;
+        let effective = match compiled {
+            Some(c) => c,
+            None => {
+                inline_compiled = Some(Self::compile_upsert(schema, stmt)?);
+                inline_compiled.as_ref().unwrap()
             }
-        }
-
-        // Pre-compile CHECK constraints for columns being updated (once, not per-row)
-        use super::expression::ExpressionEval;
-        use crate::parser::parse_sql;
-        let mut compiled_checks: Vec<(usize, String, String, ExpressionEval)> = update_specs
-            .iter()
-            .filter_map(|(idx, _, _, _)| {
-                let col = &schema.columns[*idx];
-                col.check_expr.as_ref().and_then(|check_expr| {
-                    let sql = format!("SELECT {}", check_expr);
-                    let stmts = parse_sql(&sql).ok()?;
-                    if let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() {
-                        let expr = select.columns.first()?;
-                        let columns = vec![col.name.to_string()];
-                        let eval = ExpressionEval::compile(expr, &columns).ok()?;
-                        Some((*idx, col.name.to_string(), check_expr.to_string(), eval))
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
+        };
 
         // Build the EXCLUDED row from insert_values
         let excluded_row = Row::from_values(insert_values.to_vec());
@@ -2729,8 +2790,8 @@ impl Executor {
                     exec_ctx = exec_ctx.with_named_params(named_params);
                 }
 
-                let mut updates = Vec::with_capacity(compiled_updates.len());
-                for (idx, col_type, vec_dims, program) in &compiled_updates {
+                let mut updates = Vec::with_capacity(effective.compiled_updates.len());
+                for (idx, col_type, vec_dims, program) in &effective.compiled_updates {
                     if let Ok(v) = vm.execute_cow(program, &exec_ctx) {
                         let coerced = v.into_coerce_to_type(*col_type);
                         // Validate vector dimensions
@@ -2757,11 +2818,12 @@ impl Executor {
             // Apply updates and validate CHECK constraints on each new value
             let changed = !updates_to_apply.is_empty();
             for (idx, new_value) in updates_to_apply {
-                // Validate CHECK constraint using pre-compiled evaluator
-                for (check_idx, col_name, check_expr, eval) in &mut compiled_checks {
+                // Validate CHECK constraint using pre-compiled program via existing VM
+                for (check_idx, col_name, check_expr, program) in &effective.compiled_checks {
                     if *check_idx == idx && !new_value.is_null() {
                         let check_row = Row::from_values(vec![new_value.clone()]);
-                        if let Ok(result) = eval.eval(&check_row) {
+                        let check_ctx = ExecuteContext::new(&check_row);
+                        if let Ok(result) = vm.execute_cow(program, &check_ctx) {
                             let is_truthy = match &result {
                                 Value::Boolean(b) => *b,
                                 Value::Null(_) => true, // NULL passes CHECK (SQL standard)

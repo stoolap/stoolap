@@ -3134,6 +3134,8 @@ impl MVCCEngine {
                 }
                 // Volumes without parseable IDs are orphans — skip.
             }
+            // Recompute visibility bitmaps after all volumes for this table are loaded.
+            mgr.recompute_visibility();
         }
     }
 
@@ -3216,6 +3218,8 @@ impl MVCCEngine {
                 };
                 mgr.load_volume_for_existing_segment(stable_id, volume);
             }
+            // Recompute visibility bitmaps after all volumes for this table are loaded.
+            mgr.recompute_visibility();
         }
     }
 

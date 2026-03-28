@@ -117,6 +117,11 @@ pub struct VolumeScanner {
     matching_indices: Option<Vec<usize>>,
     /// Current position in matching_indices.
     match_idx: usize,
+    /// Pre-computed inter-volume visibility bitmap.
+    /// Bit i is set (1) if row at index i is visible (not overridden by a newer volume).
+    /// Stored as packed u64 words: word w covers rows [w*64 .. w*64+63].
+    /// When None, all rows are assumed visible (no inter-volume dedup needed).
+    visibility_bitmap: Option<Arc<Vec<u64>>>,
     /// Per-transaction pending cold deletes (deferred, not yet in shared DV).
     /// The owning transaction sees these as deleted; other transactions don't.
     pending_cold_deletes: Option<Arc<rustc_hash::FxHashSet<i64>>>,
@@ -183,6 +188,7 @@ impl VolumeScanner {
             dict_filters: Vec::new(),
             matching_indices: None,
             match_idx: 0,
+            visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
             snapshot_seq: None,
@@ -233,6 +239,7 @@ impl VolumeScanner {
             dict_filters: Vec::new(),
             matching_indices: None,
             match_idx: 0,
+            visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
             snapshot_seq: None,
@@ -273,6 +280,14 @@ impl VolumeScanner {
         self.pending_cold_deletes = Some(dynamic);
     }
 
+    /// Set a pre-computed inter-volume visibility bitmap.
+    /// Bit i is 1 if the row at position i in this volume is visible (not overridden by
+    /// a newer volume). Bit i being 0 means a newer volume has a row with the same row_id,
+    /// so this row should be skipped without materialization.
+    pub fn set_visibility_bitmap(&mut self, bitmap: Option<Arc<Vec<u64>>>) {
+        self.visibility_bitmap = bitmap;
+    }
+
     /// Create an empty scanner (for zone-map-pruned volumes that match nothing).
     pub fn empty() -> Self {
         Self {
@@ -303,6 +318,7 @@ impl VolumeScanner {
             dict_filters: Vec::new(),
             matching_indices: None,
             match_idx: 0,
+            visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
             snapshot_seq: None,
@@ -670,6 +686,14 @@ impl VolumeScanner {
     /// the row should be skipped.
     #[inline(always)]
     fn should_skip_row(&self, idx: usize) -> bool {
+        // Check pre-computed inter-volume visibility bitmap first (O(1) bit check).
+        // A clear bit means a newer volume owns this row_id — skip without materialization.
+        if let Some(ref bm) = self.visibility_bitmap {
+            let word_idx = idx >> 6;
+            if word_idx < bm.len() && (bm[word_idx] >> (idx & 63)) & 1 == 0 {
+                return true;
+            }
+        }
         let rid = self.volume.row_ids[idx];
         if let Some(ref ts) = self.committed_tombstones {
             if let Some(&commit_seq) = ts.get(&rid) {
