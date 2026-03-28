@@ -3243,13 +3243,14 @@ impl Executor {
             let mut rows = RowVec::with_capacity(64);
             let mut row_count = 0u64;
             while scanner.next() {
-                // Check for cancellation every 100 rows
                 row_count += 1;
                 if row_count.is_multiple_of(100) {
                     ctx.check_cancelled()?;
                 }
-                // Use row_count as synthetic row ID for scanner-based paths
                 rows.push((row_count as i64, scanner.take_row()));
+            }
+            if let Some(e) = scanner.err() {
+                return Err(crate::core::Error::internal(format!("scan error: {}", e)));
             }
             (rows, None, None)
         } else {

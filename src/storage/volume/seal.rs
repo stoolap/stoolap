@@ -72,6 +72,8 @@ pub fn seal_and_persist(
 }
 
 /// Seal rows into a frozen volume with optional LZ4 compression.
+/// When V4 (compress=true), the returned volume keeps eager columns pre-loaded
+/// in OnceLock slots with a compressed backing store for per-group scanner access.
 pub fn seal_and_persist_opts(
     schema: &Schema,
     rows: &[(i64, Row)],
@@ -81,7 +83,11 @@ pub fn seal_and_persist_opts(
 ) -> Result<(Arc<FrozenVolume>, std::path::PathBuf, u64)> {
     let volume = seal_rows(schema, rows);
     let volume_id = io::next_volume_id();
-    let path = io::write_volume_to_disk_opts(volume_dir, table_name, volume_id, &volume, compress)?;
+    let (path, _store) =
+        io::write_volume_to_disk_opts(volume_dir, table_name, volume_id, &volume, compress)?;
+    // V4 writes compressed blocks to disk but we drop the CompressedBlockStore.
+    // Eager columns from seal_rows are already in RAM via OnceLock — no need to
+    // keep ~30MB of compressed data alongside them.
     Ok((Arc::new(volume), path, volume_id))
 }
 

@@ -19,21 +19,832 @@
 //! pre-computed aggregate stats. This is done by a background thread during
 //! the seal operation.
 
+use std::sync::Arc;
+use std::sync::OnceLock;
+
 use ahash::AHashMap;
 
 use crate::common::SmartString;
 use crate::core::{DataType, Row, Schema, Value};
 
-use super::column::{ColumnData, ZoneMap};
+use super::column::{ColumnData, ZoneMap, ROW_GROUP_SIZE};
+use super::format::{deserialize_column_block, serialize_column_block, COL_BYTES, COL_DICTIONARY};
 use super::stats::VolumeAggregateStats;
+
+// =============================================================================
+// CompressedBlockStore: per-column per-row-group LZ4 blocks in RAM
+// =============================================================================
+
+/// Holds LZ4-compressed column data in RAM. Each column is split into row-group-
+/// sized blocks (64K rows). Decompression from RAM runs at ~4 GB/s, negligible
+/// compared to disk I/O. This is the backing store for LazyColumns.
+pub struct CompressedBlockStore {
+    /// blocks[col_idx][group_idx] = LZ4-compressed bytes (no size prefix)
+    blocks: Vec<Vec<Vec<u8>>>,
+    /// decompressed_lens[col_idx][group_idx] = exact decompressed size
+    decompressed_lens: Vec<Vec<usize>>,
+    /// Column type tags (COL_INT64, COL_FLOAT64, etc.) for deserialization
+    col_type_tags: Vec<u8>,
+    /// Column data types
+    #[allow(dead_code)]
+    col_data_types: Vec<DataType>,
+    /// Ext type per column (only meaningful for COL_BYTES columns)
+    col_ext_types: Vec<u8>,
+    /// Per dictionary column: pre-built Arc, shared across all group decompressions.
+    /// Created once at construction — group decompression clones the Arc (~5ns)
+    /// instead of cloning all dictionary strings per group.
+    col_dicts: Vec<(usize, Arc<[SmartString]>)>,
+    /// Row group size (ROW_GROUP_SIZE = 65536)
+    group_size: usize,
+    /// Total row count across all groups
+    row_count: usize,
+}
+
+impl CompressedBlockStore {
+    /// Compress existing columns into per-group LZ4 blocks.
+    /// Used when sealing (VolumeBuilder::finish() → eager columns → V4 write)
+    /// and when converting legacy STVZ volumes.
+    pub fn compress_columns(
+        columns: &LazyColumns,
+        col_data_types: &[DataType],
+        row_count: usize,
+    ) -> Self {
+        let group_size = ROW_GROUP_SIZE;
+        let col_count = columns.len();
+        let num_groups = if row_count == 0 {
+            0
+        } else {
+            row_count.div_ceil(group_size)
+        };
+
+        // Phase 1: Sequential — extract per-column metadata (type tags, dict, ext types).
+        // Must be sequential because shared_dict accumulates across columns.
+        let mut shared_dict: Vec<SmartString> = Vec::new();
+        let mut dict_ranges = Vec::new();
+        let mut col_type_tags = Vec::with_capacity(col_count);
+        let mut col_ext_types = Vec::with_capacity(col_count);
+
+        for col_idx in 0..col_count {
+            let col = &columns[col_idx];
+            let type_tag = match col {
+                ColumnData::Int64 { .. } => super::format::COL_INT64,
+                ColumnData::Float64 { .. } => super::format::COL_FLOAT64,
+                ColumnData::TimestampNanos { .. } => super::format::COL_TIMESTAMP,
+                ColumnData::Boolean { .. } => super::format::COL_BOOLEAN,
+                ColumnData::Dictionary { .. } => COL_DICTIONARY,
+                ColumnData::Bytes { .. } => COL_BYTES,
+            };
+            col_type_tags.push(type_tag);
+            col_ext_types.push(match col {
+                ColumnData::Bytes { ext_type, .. } => *ext_type as u8,
+                _ => 0,
+            });
+            if let ColumnData::Dictionary { dictionary, .. } = col {
+                let start = shared_dict.len();
+                shared_dict.extend(dictionary.iter().cloned());
+                dict_ranges.push((col_idx, start, shared_dict.len()));
+            }
+        }
+
+        // Phase 2: Compress all column blocks (parallelizable per column).
+        #[cfg(feature = "parallel")]
+        let (all_blocks, all_decomp_lens) = {
+            use rayon::prelude::*;
+            let results: Vec<(Vec<Vec<u8>>, Vec<usize>)> = (0..col_count)
+                .into_par_iter()
+                .map(|col_idx| {
+                    let col = &columns[col_idx];
+                    let mut col_blocks = Vec::with_capacity(num_groups);
+                    let mut col_decomp_lens = Vec::with_capacity(num_groups);
+                    let mut start = 0;
+                    while start < row_count {
+                        let end = (start + group_size).min(row_count);
+                        let raw = serialize_column_block(col, start, end);
+                        let compressed = lz4_flex::compress(&raw);
+                        col_decomp_lens.push(raw.len());
+                        if compressed.len() < raw.len() {
+                            col_blocks.push(compressed);
+                        } else {
+                            col_blocks.push(raw);
+                        }
+                        start = end;
+                    }
+                    (col_blocks, col_decomp_lens)
+                })
+                .collect();
+            let mut all_blocks = Vec::with_capacity(col_count);
+            let mut all_decomp_lens = Vec::with_capacity(col_count);
+            for (blocks, lens) in results {
+                all_blocks.push(blocks);
+                all_decomp_lens.push(lens);
+            }
+            (all_blocks, all_decomp_lens)
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let (all_blocks, all_decomp_lens) = {
+            let mut all_blocks = Vec::with_capacity(col_count);
+            let mut all_decomp_lens = Vec::with_capacity(col_count);
+            for col_idx in 0..col_count {
+                let col = &columns[col_idx];
+                let mut col_blocks = Vec::with_capacity(num_groups);
+                let mut col_decomp_lens = Vec::with_capacity(num_groups);
+                let mut start = 0;
+                while start < row_count {
+                    let end = (start + group_size).min(row_count);
+                    let raw = serialize_column_block(col, start, end);
+                    let compressed = lz4_flex::compress(&raw);
+                    col_decomp_lens.push(raw.len());
+                    if compressed.len() < raw.len() {
+                        col_blocks.push(compressed);
+                    } else {
+                        col_blocks.push(raw);
+                    }
+                    start = end;
+                }
+                all_blocks.push(col_blocks);
+                all_decomp_lens.push(col_decomp_lens);
+            }
+            (all_blocks, all_decomp_lens)
+        };
+
+        let col_dicts: Vec<(usize, Arc<[SmartString]>)> = dict_ranges
+            .iter()
+            .map(|(ci, start, end)| (*ci, Arc::from(&shared_dict[*start..*end])))
+            .collect();
+        Self {
+            blocks: all_blocks,
+            decompressed_lens: all_decomp_lens,
+            col_type_tags,
+            col_data_types: col_data_types.to_vec(),
+            col_ext_types,
+            col_dicts,
+            group_size,
+            row_count,
+        }
+    }
+
+    /// Build a CompressedBlockStore from pre-compressed blocks (V4 file read).
+    /// No decompression happens — blocks are stored as-is from the file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_raw_blocks(
+        blocks: Vec<Vec<Vec<u8>>>,
+        decompressed_lens: Vec<Vec<usize>>,
+        col_type_tags: Vec<u8>,
+        col_data_types: Vec<DataType>,
+        col_ext_types: Vec<u8>,
+        shared_dict: Vec<SmartString>,
+        dict_ranges: Vec<(usize, usize, usize)>,
+        group_size: usize,
+        row_count: usize,
+    ) -> Self {
+        let col_dicts: Vec<(usize, Arc<[SmartString]>)> = dict_ranges
+            .iter()
+            .map(|(ci, start, end)| (*ci, Arc::from(&shared_dict[*start..*end])))
+            .collect();
+        // shared_dict and dict_ranges are consumed — only col_dicts kept
+        Self {
+            blocks,
+            decompressed_lens,
+            col_type_tags,
+            col_data_types,
+            col_ext_types,
+            col_dicts,
+            group_size,
+            row_count,
+        }
+    }
+
+    /// Decompress a single column from RAM. Concatenates all row-group blocks.
+    /// Runs at ~4 GB/s (LZ4 from RAM), typically <1ms per column.
+    pub fn decompress_column(&self, col_idx: usize) -> ColumnData {
+        let col_blocks = &self.blocks[col_idx];
+        let type_tag = self.col_type_tags[col_idx];
+        let ext_type = DataType::from_u8(self.col_ext_types[col_idx]).unwrap_or(DataType::Null);
+
+        // Find pre-built dictionary Arc for this column (Arc clone = ~5ns)
+        let dict: Option<Arc<[SmartString]>> = if type_tag == COL_DICTIONARY {
+            self.col_dicts
+                .iter()
+                .find(|(ci, _)| *ci == col_idx)
+                .map(|(_, arc)| Arc::clone(arc))
+        } else {
+            None
+        };
+
+        if col_blocks.len() == 1 {
+            let decomp_len = self.decompressed_lens[col_idx][0];
+            let group_rows = self.row_count.min(self.group_size);
+            if col_blocks[0].len() == decomp_len {
+                return deserialize_column_block(
+                    &col_blocks[0],
+                    type_tag,
+                    group_rows,
+                    dict,
+                    ext_type,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "corrupt V4 block: col={}, raw, {} rows: {}",
+                        col_idx, group_rows, e
+                    )
+                });
+            }
+            let raw = lz4_flex::decompress(&col_blocks[0], decomp_len).unwrap_or_else(|e| {
+                panic!(
+                    "corrupt V4 block: col={}, {} bytes: {}",
+                    col_idx,
+                    col_blocks[0].len(),
+                    e
+                )
+            });
+            return deserialize_column_block(&raw, type_tag, group_rows, dict, ext_type)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "corrupt V4 block: col={}, {} rows: {}",
+                        col_idx, group_rows, e
+                    )
+                });
+        }
+
+        // Multiple groups — decompress each, then concatenate
+        let num_groups = col_blocks.len();
+        match type_tag {
+            super::format::COL_INT64 => {
+                let mut all_values = Vec::with_capacity(self.row_count);
+                let mut all_nulls = Vec::with_capacity(self.row_count);
+                for (gi, block) in col_blocks.iter().enumerate() {
+                    let col = self
+                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
+                        .unwrap_or_else(|e| {
+                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
+                        });
+                    if let ColumnData::Int64 { values, nulls } = col {
+                        all_values.extend(values);
+                        all_nulls.extend(nulls);
+                    }
+                }
+                ColumnData::Int64 {
+                    values: all_values,
+                    nulls: all_nulls,
+                }
+            }
+            super::format::COL_FLOAT64 => {
+                let mut all_values = Vec::with_capacity(self.row_count);
+                let mut all_nulls = Vec::with_capacity(self.row_count);
+                for (gi, block) in col_blocks.iter().enumerate() {
+                    let col = self
+                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
+                        .unwrap_or_else(|e| {
+                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
+                        });
+                    if let ColumnData::Float64 { values, nulls } = col {
+                        all_values.extend(values);
+                        all_nulls.extend(nulls);
+                    }
+                }
+                ColumnData::Float64 {
+                    values: all_values,
+                    nulls: all_nulls,
+                }
+            }
+            super::format::COL_TIMESTAMP => {
+                let mut all_values = Vec::with_capacity(self.row_count);
+                let mut all_nulls = Vec::with_capacity(self.row_count);
+                for (gi, block) in col_blocks.iter().enumerate() {
+                    let col = self
+                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
+                        .unwrap_or_else(|e| {
+                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
+                        });
+                    if let ColumnData::TimestampNanos { values, nulls } = col {
+                        all_values.extend(values);
+                        all_nulls.extend(nulls);
+                    }
+                }
+                ColumnData::TimestampNanos {
+                    values: all_values,
+                    nulls: all_nulls,
+                }
+            }
+            super::format::COL_BOOLEAN => {
+                let mut all_values = Vec::with_capacity(self.row_count);
+                let mut all_nulls = Vec::with_capacity(self.row_count);
+                for (gi, block) in col_blocks.iter().enumerate() {
+                    let col = self
+                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
+                        .unwrap_or_else(|e| {
+                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
+                        });
+                    if let ColumnData::Boolean { values, nulls } = col {
+                        all_values.extend(values);
+                        all_nulls.extend(nulls);
+                    }
+                }
+                ColumnData::Boolean {
+                    values: all_values,
+                    nulls: all_nulls,
+                }
+            }
+            COL_DICTIONARY => {
+                let mut all_ids = Vec::with_capacity(self.row_count);
+                let mut all_nulls = Vec::with_capacity(self.row_count);
+                for (gi, block) in col_blocks.iter().enumerate() {
+                    let col = self
+                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
+                        .unwrap_or_else(|e| {
+                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
+                        });
+                    if let ColumnData::Dictionary { ids, nulls, .. } = col {
+                        all_ids.extend(ids);
+                        all_nulls.extend(nulls);
+                    }
+                }
+                ColumnData::Dictionary {
+                    ids: all_ids,
+                    dictionary: dict.unwrap_or_else(|| Arc::from(Vec::<SmartString>::new())),
+                    nulls: all_nulls,
+                }
+            }
+            COL_BYTES => {
+                let mut all_data = Vec::new();
+                let mut all_offsets = Vec::with_capacity(self.row_count);
+                let mut all_nulls = Vec::with_capacity(self.row_count);
+                for (gi, block) in col_blocks.iter().enumerate() {
+                    let col = self
+                        .decompress_block(col_idx, gi, block, type_tag, num_groups, None, ext_type)
+                        .unwrap_or_else(|e| {
+                            panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}")
+                        });
+                    if let ColumnData::Bytes {
+                        data,
+                        offsets,
+                        nulls,
+                        ..
+                    } = col
+                    {
+                        let base = all_data.len() as u64;
+                        all_data.extend(data);
+                        for (off, len) in offsets {
+                            all_offsets.push((off + base, len));
+                        }
+                        all_nulls.extend(nulls);
+                    }
+                }
+                ColumnData::Bytes {
+                    data: all_data,
+                    offsets: all_offsets,
+                    ext_type,
+                    nulls: all_nulls,
+                }
+            }
+            _ => self
+                .decompress_block(
+                    col_idx,
+                    0,
+                    &col_blocks[0],
+                    type_tag,
+                    num_groups,
+                    dict,
+                    ext_type,
+                )
+                .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}: {e}")),
+        }
+    }
+
+    /// Decompress and deserialize a single block with context in error messages.
+    #[allow(clippy::too_many_arguments)]
+    fn decompress_block(
+        &self,
+        col_idx: usize,
+        gi: usize,
+        block: &[u8],
+        type_tag: u8,
+        num_groups: usize,
+        dict: Option<Arc<[SmartString]>>,
+        ext_type: DataType,
+    ) -> std::io::Result<ColumnData> {
+        let decomp_len = self.decompressed_lens[col_idx][gi];
+        let group_rows = self.group_row_count(gi, num_groups);
+        let raw_bytes = if block.len() == decomp_len {
+            return deserialize_column_block(block, type_tag, group_rows, dict, ext_type);
+        } else {
+            lz4_flex::decompress(block, decomp_len).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "corrupt V4 block: col={}, group={}/{}: {}",
+                        col_idx, gi, num_groups, e
+                    ),
+                )
+            })?
+        };
+        deserialize_column_block(&raw_bytes, type_tag, group_rows, dict, ext_type)
+    }
+
+    /// Decompress a single row group for one column. Returns the ColumnData
+    /// covering only that group's rows (0..group_row_count).
+    pub fn decompress_single_group(
+        &self,
+        col_idx: usize,
+        group_idx: usize,
+    ) -> std::io::Result<ColumnData> {
+        let num_groups = self.blocks[col_idx].len();
+        let type_tag = self.col_type_tags[col_idx];
+        let ext_type = DataType::from_u8(self.col_ext_types[col_idx]).unwrap_or(DataType::Null);
+        let dict: Option<Arc<[SmartString]>> = if type_tag == COL_DICTIONARY {
+            self.col_dicts
+                .iter()
+                .find(|(ci, _)| *ci == col_idx)
+                .map(|(_, arc)| Arc::clone(arc))
+        } else {
+            None
+        };
+        self.decompress_block(
+            col_idx,
+            group_idx,
+            &self.blocks[col_idx][group_idx],
+            type_tag,
+            num_groups,
+            dict,
+            ext_type,
+        )
+    }
+
+    /// Look up a string in a Dictionary column's shared dictionary.
+    /// Returns the dict_id without decompressing any column blocks.
+    pub fn dict_lookup(&self, col_idx: usize, value: &str) -> Option<u32> {
+        if self.col_type_tags[col_idx] != COL_DICTIONARY {
+            return None;
+        }
+        let dict = self.col_dicts.iter().find(|(ci, _)| *ci == col_idx)?;
+        for (i, s) in dict.1.iter().enumerate() {
+            if s.as_str() == value {
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
+    /// Binary search on a sorted column using row-group zone maps.
+    /// Decompresses only the group(s) containing the target value.
+    /// Returns global row index (same as ColumnData::binary_search_ge/gt).
+    pub fn binary_search_ge(
+        &self,
+        col_idx: usize,
+        target: i64,
+        row_groups: &[super::column::RowGroupMeta],
+    ) -> usize {
+        self.binary_search_impl(col_idx, target, row_groups, false)
+    }
+
+    pub fn binary_search_gt(
+        &self,
+        col_idx: usize,
+        target: i64,
+        row_groups: &[super::column::RowGroupMeta],
+    ) -> usize {
+        self.binary_search_impl(col_idx, target, row_groups, true)
+    }
+
+    fn binary_search_impl(
+        &self,
+        col_idx: usize,
+        target: i64,
+        row_groups: &[super::column::RowGroupMeta],
+        strict: bool,
+    ) -> usize {
+        let num_groups = self.blocks[col_idx].len();
+
+        // Use zone maps to find the group containing the target.
+        // When duplicates span group boundaries, continue to the next group
+        // if the search result lands at the group end.
+        if !row_groups.is_empty() {
+            for (gi, rg) in row_groups.iter().enumerate() {
+                if gi >= num_groups || col_idx >= rg.zone_maps.len() {
+                    continue;
+                }
+                let zm = &rg.zone_maps[col_idx];
+                let max_i64 = match &zm.max {
+                    crate::core::Value::Integer(v) => *v,
+                    crate::core::Value::Timestamp(ts) => {
+                        ts.timestamp_nanos_opt().unwrap_or(i64::MAX)
+                    }
+                    _ => continue,
+                };
+                if target > max_i64 {
+                    continue;
+                }
+                let col = match self.decompress_single_group(col_idx, gi) {
+                    Ok(c) => c,
+                    Err(_) => return 0, // corrupt block: scan from start (conservative)
+                };
+                let group_rows = (rg.end_idx - rg.start_idx) as usize;
+                let local = if strict {
+                    col.binary_search_gt(target)
+                } else {
+                    col.binary_search_ge(target)
+                };
+                if local < group_rows {
+                    return rg.start_idx as usize + local;
+                }
+            }
+            return self.row_count;
+        }
+
+        if num_groups == 1 {
+            let col = match self.decompress_single_group(col_idx, 0) {
+                Ok(c) => c,
+                Err(_) => return 0,
+            };
+            return if strict {
+                col.binary_search_gt(target)
+            } else {
+                col.binary_search_ge(target)
+            };
+        }
+
+        // Fallback: full column (shouldn't happen for V4 with zone maps)
+        self.row_count
+    }
+
+    /// Number of groups for a given column.
+    pub fn num_groups(&self, col_idx: usize) -> usize {
+        self.blocks[col_idx].len()
+    }
+
+    /// Number of rows in a specific group.
+    fn group_row_count(&self, group_idx: usize, num_groups: usize) -> usize {
+        if group_idx == num_groups - 1 {
+            self.row_count - group_idx * self.group_size
+        } else {
+            self.group_size
+        }
+    }
+
+    /// Number of columns.
+    pub fn col_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Total compressed bytes in RAM.
+    pub fn memory_size(&self) -> usize {
+        let mut size = 0;
+        for col_blocks in &self.blocks {
+            for block in col_blocks {
+                size += block.len();
+            }
+        }
+        // Add dictionary memory (col_dicts Arcs)
+        for (_, dict) in &self.col_dicts {
+            for s in dict.iter() {
+                size += s.len() + 24; // SmartString overhead
+            }
+        }
+        size
+    }
+
+    /// Access raw compressed blocks (for V4 write without re-compression).
+    pub fn raw_blocks(&self) -> &[Vec<Vec<u8>>] {
+        &self.blocks
+    }
+
+    /// Column type tags.
+    pub fn col_type_tags(&self) -> &[u8] {
+        &self.col_type_tags
+    }
+
+    /// Column ext types.
+    pub fn col_ext_types(&self) -> &[u8] {
+        &self.col_ext_types
+    }
+
+    /// Group size.
+    pub fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    /// Decompressed sizes per block.
+    pub fn decompressed_lens(&self) -> &[Vec<usize>] {
+        &self.decompressed_lens
+    }
+}
+
+// =============================================================================
+// LazyColumns: per-column OnceLock with transparent Index<usize> access
+// =============================================================================
+
+/// Column storage that decompresses from CompressedBlockStore on first access.
+/// After OnceLock init, subsequent access is a pointer dereference (free).
+pub struct LazyColumns {
+    /// Per-column OnceLock slots. Empty until first access.
+    slots: Vec<OnceLock<ColumnData>>,
+    /// Compressed backing store. None for eagerly-loaded columns.
+    compressed_store: Option<CompressedBlockStore>,
+    /// Column data types (available without decompressing).
+    col_data_types: Vec<DataType>,
+    /// True when all OnceLock slots are initialized. Starts true for eager,
+    /// false for deferred. Flipped to true when the last OnceLock is populated
+    /// (via Index<usize>), so subsequent scans skip per-group decompression.
+    is_eager: std::sync::atomic::AtomicBool,
+    /// Number of initialized OnceLock slots. When it reaches slots.len(),
+    /// is_eager is flipped to true. Only used for deferred columns.
+    loaded_count: std::sync::atomic::AtomicUsize,
+}
+
+impl LazyColumns {
+    /// Create from pre-loaded columns (VolumeBuilder::finish(), legacy STVL/STVZ).
+    /// All OnceLock slots are pre-initialized. No compressed store.
+    pub fn eager(columns: Vec<ColumnData>, col_data_types: Vec<DataType>) -> Self {
+        let len = columns.len();
+        let slots: Vec<OnceLock<ColumnData>> = columns
+            .into_iter()
+            .map(|col| {
+                let cell = OnceLock::new();
+                let _ = cell.set(col);
+                cell
+            })
+            .collect();
+        Self {
+            slots,
+            compressed_store: None,
+            col_data_types,
+            is_eager: std::sync::atomic::AtomicBool::new(true),
+            loaded_count: std::sync::atomic::AtomicUsize::new(len),
+        }
+    }
+
+    /// Create with empty slots backed by a CompressedBlockStore.
+    /// Columns are decompressed from RAM on first access (~4 GB/s).
+    pub fn deferred(store: CompressedBlockStore, col_data_types: Vec<DataType>) -> Self {
+        let col_count = store.col_count();
+        let slots = (0..col_count).map(|_| OnceLock::new()).collect();
+        Self {
+            slots,
+            compressed_store: Some(store),
+            col_data_types,
+            is_eager: std::sync::atomic::AtomicBool::new(false),
+            loaded_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Create empty LazyColumns (for Scanner::empty()).
+    pub fn empty() -> Self {
+        Self {
+            slots: Vec::new(),
+            compressed_store: None,
+            col_data_types: Vec::new(),
+            is_eager: std::sync::atomic::AtomicBool::new(true),
+            loaded_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Number of columns.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether there are no columns.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Get the DataType for a column without decompressing it.
+    #[inline]
+    pub fn data_type(&self, idx: usize) -> DataType {
+        self.col_data_types[idx]
+    }
+
+    /// Iterator over all columns (triggers decompression of unloaded columns).
+    pub fn iter(&self) -> LazyColumnsIter<'_> {
+        LazyColumnsIter {
+            columns: self,
+            idx: 0,
+        }
+    }
+
+    /// Estimate in-memory size: compressed store + loaded columns.
+    pub fn memory_size(&self) -> usize {
+        let mut size = 0;
+        // Compressed store
+        if let Some(ref store) = self.compressed_store {
+            size += store.memory_size();
+        }
+        // Loaded (decompressed) columns
+        for slot in &self.slots {
+            if let Some(col) = slot.get() {
+                size += col.memory_size();
+            }
+        }
+        size
+    }
+
+    /// Whether this LazyColumns has a compressed backing store.
+    pub fn has_compressed_store(&self) -> bool {
+        self.compressed_store.is_some()
+    }
+
+    /// Whether the scanner should use per-group decompression from the
+    /// CompressedBlockStore. Returns false when all columns are already
+    /// loaded in OnceLock slots (eager after seal/compaction),
+    /// because direct OnceLock access is faster than re-decompressing groups.
+    #[inline]
+    pub fn should_use_group_cache(&self) -> bool {
+        !self.is_eager.load(std::sync::atomic::Ordering::Relaxed) && self.compressed_store.is_some()
+    }
+
+    /// Access the compressed store (for V4 write).
+    pub fn compressed_store(&self) -> Option<&CompressedBlockStore> {
+        self.compressed_store.as_ref()
+    }
+
+    /// Take ownership of all loaded columns, consuming the LazyColumns.
+    /// Used by compress_and_release to avoid cloning.
+    pub fn take_columns(self) -> Vec<ColumnData> {
+        let mut result = Vec::with_capacity(self.slots.len());
+        for slot in self.slots {
+            if let Some(col) = slot.into_inner() {
+                result.push(col);
+            }
+        }
+        result
+    }
+}
+
+impl std::ops::Index<usize> for LazyColumns {
+    type Output = ColumnData;
+
+    #[inline]
+    fn index(&self, idx: usize) -> &ColumnData {
+        // Fast path: already initialized
+        if let Some(col) = self.slots[idx].get() {
+            return col;
+        }
+        // Slow path: decompress and track
+        let col = self.slots[idx].get_or_init(|| {
+            self.compressed_store
+                .as_ref()
+                .map(|store| store.decompress_column(idx))
+                .expect("column not loaded and no compressed store available")
+        });
+        // Track loaded columns. When all are loaded, flip is_eager so
+        // scanners stop using per-group decompression.
+        let prev = self
+            .loaded_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if prev + 1 >= self.slots.len() {
+            self.is_eager
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        col
+    }
+}
+
+/// Iterator over LazyColumns that triggers decompression on access.
+pub struct LazyColumnsIter<'a> {
+    columns: &'a LazyColumns,
+    idx: usize,
+}
+
+impl<'a> Iterator for LazyColumnsIter<'a> {
+    type Item = &'a ColumnData;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx < self.columns.len() {
+            let col = &self.columns[self.idx];
+            self.idx += 1;
+            Some(col)
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.columns.len() - self.idx;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for LazyColumnsIter<'_> {}
+
+impl<'a> IntoIterator for &'a LazyColumns {
+    type Item = &'a ColumnData;
+    type IntoIter = LazyColumnsIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
 
 /// A frozen volume ready for queries.
 ///
 /// This is the in-memory representation. Serialization to/from disk
 /// will be added in a separate module.
 pub struct FrozenVolume {
-    /// Column data stored as typed arrays
-    pub columns: Vec<ColumnData>,
+    /// Column data stored as typed arrays with lazy decompression
+    pub columns: LazyColumns,
     /// Zone maps per column
     pub zone_maps: Vec<ZoneMap>,
     /// Bloom filters per column (for fast equality membership testing)
@@ -389,7 +1200,7 @@ impl VolumeBuilder {
                 },
                 StorageKind::Dictionary(idx) => ColumnData::Dictionary {
                     ids: std::mem::take(&mut self.dict_cols[idx]),
-                    dictionary: std::mem::take(&mut self.dict_tables[idx]),
+                    dictionary: Arc::from(std::mem::take(&mut self.dict_tables[idx])),
                     nulls,
                 },
                 StorageKind::Bytes(idx, ext_type) => {
@@ -467,7 +1278,17 @@ impl VolumeBuilder {
         let column_name_map: AHashMap<SmartString, usize> = column_names
             .iter()
             .enumerate()
-            .map(|(i, name)| (SmartString::from(name.to_lowercase()), i))
+            .flat_map(|(i, name)| {
+                let lower = SmartString::from(name.to_lowercase());
+                let original = SmartString::from(name.as_str());
+                if lower == original {
+                    // Already lowercase — one entry
+                    vec![(lower, i)]
+                } else {
+                    // Store both original and lowercase for zero-alloc lookup
+                    vec![(original, i), (lower, i)]
+                }
+            })
             .collect();
 
         // Build row-group zone maps for sub-volume pruning.
@@ -494,7 +1315,7 @@ impl VolumeBuilder {
         };
 
         FrozenVolume {
-            columns,
+            columns: LazyColumns::eager(columns, column_types.clone()),
             zone_maps: self.zone_maps,
             bloom_filters,
             stats: self.stats,
@@ -533,25 +1354,59 @@ pub struct ColumnMapping {
     pub is_identity: bool,
 }
 
-/// Compute the column mapping from current schema to a frozen volume.
-/// O(schema_cols * volume_cols) but runs once per volume per scan.
-pub fn compute_column_mapping(schema: &Schema, volume: &FrozenVolume) -> ColumnMapping {
+/// Compute column mapping from current schema to a frozen volume.
+/// Handles renames (via column_renames fallback) and drops.
+/// `volume_schema_version` is the schema epoch when the volume was created.
+/// For dropped columns, only volumes created before or at the drop are masked.
+/// Callers should use SegmentManager::get_volume_mapping() which caches the result.
+pub fn compute_column_mapping_with_drops(
+    schema: &Schema,
+    volume: &FrozenVolume,
+    dropped_columns: &[(crate::common::SmartString, u64)],
+    volume_schema_version: u64,
+    column_renames: &[(crate::common::SmartString, crate::common::SmartString)],
+) -> ColumnMapping {
     let mut sources = Vec::with_capacity(schema.columns.len());
     let mut is_identity = schema.columns.len() == volume.columns.len();
+    // Track which volume column indices are already claimed. Prevents two
+    // schema columns from binding to the same physical column (e.g., after
+    // RENAME a→b then ADD COLUMN a, both "b" via rename and "a" via direct
+    // match would hit the same old physical column without this guard).
+    let mut used_vol_indices = smallvec::SmallVec::<[usize; 16]>::new();
 
     for (pos, col) in schema.columns.iter().enumerate() {
-        if let Some(vol_idx) = volume.column_index(&col.name_lower) {
-            if is_identity && vol_idx != pos {
+        // Try rename fallback FIRST (higher priority: a renamed column's
+        // old physical slot belongs to the renamed column, not a new column
+        // that happens to reuse the old name).
+        let vol_idx = column_renames
+            .iter()
+            .find(|(_, new)| new.as_str() == col.name_lower)
+            .and_then(|(old, _)| volume.column_index(old.as_str()))
+            .or_else(|| volume.column_index(&col.name_lower));
+
+        if let Some(vol_idx) = vol_idx {
+            let type_matches = vol_idx < volume.column_types.len()
+                && volume.column_types[vol_idx] == col.data_type;
+            let was_dropped = dropped_columns.iter().any(|(d, drop_ver)| {
+                d.as_str() == col.name_lower && volume_schema_version <= *drop_ver
+            });
+            let already_used = used_vol_indices.contains(&vol_idx);
+            if type_matches && !was_dropped && !already_used {
+                if is_identity && vol_idx != pos {
+                    is_identity = false;
+                }
+                used_vol_indices.push(vol_idx);
+                sources.push(ColSource::Volume(vol_idx));
+            } else {
                 is_identity = false;
+                if let Some(ref default_val) = col.default_value {
+                    sources.push(ColSource::Default(default_val.clone()));
+                } else {
+                    sources.push(ColSource::Default(Value::Null(col.data_type)));
+                }
             }
-            sources.push(ColSource::Volume(vol_idx));
-        } else if pos < volume.columns.len()
-            && pos < volume.column_types.len()
-            && volume.column_types[pos] == col.data_type
-        {
-            // Positional fallback: same position + same type = likely a rename
-            sources.push(ColSource::Volume(pos));
         } else {
+            // Column not in volume (added after seal, or dropped+re-added)
             is_identity = false;
             if let Some(ref default_val) = col.default_value {
                 sources.push(ColSource::Default(default_val.clone()));
@@ -603,17 +1458,15 @@ impl FrozenVolume {
     /// Get a row materializing only columns marked true in the mask.
     /// Other columns get typed Null (stack-only, zero allocation).
     /// The row has full schema width so filter column indices work.
+    /// Uses LazyColumns::data_type() for unneeded columns to avoid decompression.
     #[inline]
     pub fn get_row_needed(&self, idx: usize, needed: &[bool]) -> Row {
-        let values: Vec<Value> = self
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(ci, col)| {
+        let values: Vec<Value> = (0..self.columns.len())
+            .map(|ci| {
                 if ci < needed.len() && needed[ci] {
-                    col.get_value(idx)
+                    self.columns[ci].get_value(idx)
                 } else {
-                    Value::Null(col.data_type())
+                    Value::Null(self.columns.data_type(ci))
                 }
             })
             .collect();
@@ -622,6 +1475,7 @@ impl FrozenVolume {
 
     /// Get a row using a mapping, materializing only needed columns.
     /// Combines schema evolution (mapping) with column pruning (mask).
+    /// Uses LazyColumns::data_type() for unneeded columns to avoid decompression.
     #[inline]
     pub fn get_row_mapped_needed(
         &self,
@@ -641,9 +1495,7 @@ impl FrozenVolume {
                     }
                 } else {
                     match src {
-                        ColSource::Volume(vol_idx) => {
-                            Value::Null(self.columns[*vol_idx].data_type())
-                        }
+                        ColSource::Volume(vol_idx) => Value::Null(self.columns.data_type(*vol_idx)),
                         ColSource::Default(val) => Value::Null(val.data_type()),
                     }
                 }
@@ -759,75 +1611,70 @@ impl FrozenVolume {
             .insert(col_indices.to_vec(), idx_map);
     }
 
+    /// Pre-build the unique hash index for a set of column indices.
+    /// Called during seal/compaction so the first INSERT after seal doesn't
+    /// pay a ~60ms stall scanning all rows to build the index.
+    pub fn prebuild_unique_index(&self, col_indices: &[usize]) {
+        use std::hash::{Hash, Hasher};
+        if col_indices.iter().any(|&idx| idx >= self.columns.len()) {
+            return;
+        }
+        // Skip if already built
+        if self.unique_indices.read().contains_key(col_indices) {
+            return;
+        }
+        let mut idx_map: rustc_hash::FxHashMap<u64, Vec<u32>> =
+            rustc_hash::FxHashMap::with_capacity_and_hasher(self.row_count, Default::default());
+        for row_idx in 0..self.row_count {
+            let mut row_hasher = ahash::AHasher::default();
+            let mut has_null = false;
+            for &ci in col_indices {
+                if self.columns[ci].is_null(row_idx) {
+                    has_null = true;
+                    break;
+                }
+                self.columns[ci].get_value(row_idx).hash(&mut row_hasher);
+            }
+            if has_null {
+                continue;
+            }
+            idx_map
+                .entry(row_hasher.finish())
+                .or_default()
+                .push(row_idx as u32);
+        }
+        self.unique_indices
+            .write()
+            .insert(col_indices.to_vec(), idx_map);
+    }
+
     /// Find the column index by name. O(1) via precomputed hashmap.
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        // Fast path: use the precomputed map (handles lowercase input directly)
         if let Some(&idx) = self.column_name_map.get(name) {
             return Some(idx);
         }
-        // Fallback for mixed-case input: lowercase then lookup
         let lower = name.to_lowercase();
         self.column_name_map.get(lower.as_str()).copied()
     }
 
-    /// Get a row normalized to a (possibly different) schema.
-    ///
-    /// Handles schema evolution:
-    /// - Matching columns (by name): returned as-is
-    /// - Renamed columns: matched by position + type when name lookup fails
-    /// - New columns (not in volume): filled with DEFAULT or NULL
-    /// - Dropped columns (not in current schema): skipped
-    pub fn get_row_normalized(&self, idx: usize, current_schema: &Schema) -> Row {
-        let mut values = Vec::with_capacity(current_schema.columns.len());
-        for (pos, col) in current_schema.columns.iter().enumerate() {
-            // First try name-based matching
-            if let Some(vol_idx) = self.column_index(&col.name_lower) {
-                values.push(self.columns[vol_idx].get_value(idx));
-            } else if pos < self.columns.len()
-                && pos < self.column_types.len()
-                && self.column_types[pos] == col.data_type
-            {
-                // Positional fallback: same position + same type = likely a rename
-                values.push(self.columns[pos].get_value(idx));
-            } else {
-                // Column added after this volume was created
-                if let Some(ref default_val) = col.default_value {
-                    values.push(default_val.clone());
-                } else {
-                    values.push(Value::Null(col.data_type));
-                }
-            }
+    /// Merge a column rename directly into column_name_map.
+    /// Must be called BEFORE wrapping in Arc (takes &mut self).
+    /// After this, column_index() finds both old and new names via the map.
+    pub fn merge_column_rename(&mut self, new_name: &str, old_name: &str) {
+        let old_lower = SmartString::from(old_name.to_lowercase());
+        let new_lower = SmartString::from(new_name.to_lowercase());
+        if let Some(&idx) = self.column_name_map.get(&old_lower) {
+            self.column_name_map.insert(new_lower, idx);
+        } else if let Some(&idx) = self.column_name_map.get(&new_lower) {
+            // Already has the new name (chained rename handled)
+            let _ = idx;
         }
-        Row::from_values(values)
     }
 
     /// Estimate the in-memory size of this volume in bytes.
+    /// Only counts loaded (decompressed) columns + compressed store.
     pub fn memory_size(&self) -> usize {
-        let mut size = 0;
-        for col in &self.columns {
-            size += match col {
-                ColumnData::Int64 { values, nulls } => values.len() * 8 + nulls.len(),
-                ColumnData::Float64 { values, nulls } => values.len() * 8 + nulls.len(),
-                ColumnData::TimestampNanos { values, nulls } => values.len() * 8 + nulls.len(),
-                ColumnData::Boolean { values, nulls } => values.len() + nulls.len(),
-                ColumnData::Dictionary {
-                    ids,
-                    dictionary,
-                    nulls,
-                } => {
-                    ids.len() * 4
-                        + dictionary.iter().map(|s| s.len() + 24).sum::<usize>()
-                        + nulls.len()
-                }
-                ColumnData::Bytes {
-                    data,
-                    offsets,
-                    nulls,
-                    ..
-                } => data.len() + offsets.len() * 16 + nulls.len(),
-            };
-        }
-        size + self.row_ids.len() * 8
+        self.columns.memory_size() + self.row_ids.len() * 8
     }
 }
 

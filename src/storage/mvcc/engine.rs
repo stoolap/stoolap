@@ -636,6 +636,19 @@ impl MVCCEngine {
                 // read via normalize_row_to_schema would get NULL instead of the column default.
                 self.populate_schema_defaults();
 
+                // Recompute cold volume column mappings now that schemas have
+                // default_value populated. Volumes loaded from disk had identity
+                // mappings; after ALTER TABLE ADD COLUMN, the schema differs.
+                {
+                    let schemas = self.schemas.read().unwrap();
+                    let mgrs = self.segment_managers.read().unwrap();
+                    for (table_name, schema) in schemas.iter() {
+                        if let Some(mgr) = mgrs.get(table_name.as_str()) {
+                            mgr.invalidate_mappings(schema);
+                        }
+                    }
+                }
+
                 // Sync auto-increment counters from segment data so the next
                 // generated row_id doesn't collide with cold rows.
                 self.sync_auto_increment_from_segments();
@@ -1391,7 +1404,8 @@ impl MVCCEngine {
 
                 const HNSW_FLUSH_THRESHOLD: usize = 8192;
 
-                for (_, vol) in volumes.iter() {
+                for (_, cs) in volumes.iter() {
+                    let vol = &cs.volume;
                     for i in 0..vol.row_count {
                         let row_id = vol.row_ids[i];
                         if tombstones.contains_key(&row_id) || !seen.insert(row_id) {
@@ -2927,6 +2941,8 @@ impl MVCCEngine {
         let min_id = volume.row_ids.first().copied().unwrap_or(0);
         let max_id = volume.row_ids.last().copied().unwrap_or(0);
         let row_count = volume.row_count;
+        // None = identity mapping (volume was just built from current schema).
+        // Load paths that may have schema mismatch pass Some(schema).
         mgr.register_segment(
             seg_id,
             volume,
@@ -2938,7 +2954,9 @@ impl MVCCEngine {
                 max_row_id: max_id,
                 creation_lsn: 0,
                 compaction_epoch: self.compaction_epoch.load(Ordering::Relaxed),
+                schema_version: self.schema_epoch.load(Ordering::Acquire),
             },
+            None,
         );
     }
 
@@ -3062,10 +3080,28 @@ impl MVCCEngine {
             let mut standalone: Vec<(u64, Arc<crate::storage::volume::writer::FrozenVolume>)> =
                 Vec::new();
 
+            // Get column renames from manifest (if any) to merge into volumes.
+            let mgr_for_renames = self.get_or_create_segment_manager(&table_name);
+            let renames: Vec<(String, String)> = {
+                let manifest = mgr_for_renames.manifest();
+                manifest
+                    .column_renames
+                    .iter()
+                    .map(|(old, new)| (old.to_string(), new.to_string()))
+                    .collect()
+            };
+
             for path in paths {
                 let volume_id = parse_volume_id(&path);
                 let volume = match crate::storage::volume::io::read_volume_from_disk(&path) {
-                    Ok(volume) => Arc::new(volume),
+                    Ok(mut volume) => {
+                        // Merge renames into column_name_map BEFORE Arc wrapping.
+                        // No RwLock needed — volume is still exclusively owned.
+                        for (old_name, new_name) in &renames {
+                            volume.merge_column_rename(new_name, old_name);
+                        }
+                        Arc::new(volume)
+                    }
                     Err(e) => {
                         eprintln!(
                             "Warning: Failed to read volume {:?}: {}. Skipping file.",
@@ -3155,8 +3191,21 @@ impl MVCCEngine {
                 }
 
                 // Segment is in manifest but not yet loaded — read from disk.
+                let renames: Vec<(String, String)> = {
+                    let manifest = mgr.manifest();
+                    manifest
+                        .column_renames
+                        .iter()
+                        .map(|(old, new)| (old.to_string(), new.to_string()))
+                        .collect()
+                };
                 let volume = match crate::storage::volume::io::read_volume_from_disk(&path) {
-                    Ok(volume) => Arc::new(volume),
+                    Ok(mut volume) => {
+                        for (old_name, new_name) in &renames {
+                            volume.merge_column_rename(new_name, old_name);
+                        }
+                        Arc::new(volume)
+                    }
                     Err(e) => {
                         eprintln!(
                             "Warning: Failed to read volume {:?}: {}. Skipping file.",
@@ -3267,6 +3316,11 @@ impl MVCCEngine {
         // Increment schema epoch for cache invalidation
         self.schema_epoch.fetch_add(1, Ordering::Release);
 
+        // Record the drop in the segment manifest so cold volume mappings
+        // mask stale data. Same as the live DDL path in ddl.rs. Without this,
+        // crash recovery (WAL replay) loses dropped_columns metadata.
+        self.propagate_column_drop(table_name, column_name);
+
         Ok(())
     }
 
@@ -3311,7 +3365,18 @@ impl MVCCEngine {
             };
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
-                schemas.insert(table_name_lower, schema);
+                schemas.insert(table_name_lower.clone(), schema);
+            }
+        }
+
+        // Propagate rename to cold volumes (persists in manifest) and recompute mappings
+        {
+            let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
+            if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
+                mgr.record_column_rename(old_name, new_name);
+                if let Some(ref s) = schema {
+                    mgr.invalidate_mappings(s);
+                }
             }
         }
 
@@ -3319,6 +3384,32 @@ impl MVCCEngine {
         self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
+    }
+
+    /// Record a column drop so old cold volumes don't leak stale data.
+    pub fn propagate_column_drop(&self, table_name: &str, col_name: &str) {
+        let table_name_lower = table_name.to_lowercase();
+        let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
+        let current_epoch = self.schema_epoch.load(Ordering::Acquire);
+        if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
+            mgr.record_column_drop(col_name, current_epoch);
+            if let Some(ref s) = schema {
+                mgr.invalidate_mappings(s);
+            }
+        }
+    }
+
+    /// Record a column rename and propagate alias to all cold volumes.
+    /// Persists in the manifest so aliases survive restart.
+    pub fn propagate_column_alias(&self, table_name: &str, new_name: &str, old_name: &str) {
+        let table_name_lower = table_name.to_lowercase();
+        let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
+        if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
+            mgr.record_column_rename(old_name, new_name);
+            if let Some(ref s) = schema {
+                mgr.invalidate_mappings(s);
+            }
+        }
     }
 
     /// Modifies a column's type and nullable property in a table
@@ -3894,9 +3985,9 @@ impl MVCCEngine {
 
                 let schema_cols = schema.columns.len();
 
-                for (_seg_id, vol) in volumes.iter() {
-                    let mapping =
-                        crate::storage::volume::writer::compute_column_mapping(schema, vol);
+                for (seg_id, cs) in volumes.iter() {
+                    let vol = &cs.volume;
+                    let mapping = mgr.get_volume_mapping(*seg_id, schema);
 
                     for i in 0..vol.row_count {
                         let row_id = vol.row_ids[i];
@@ -4792,7 +4883,7 @@ impl MVCCEngine {
         // this cycle and let the next cycle's bulk seal drain them.
         let checkpoint_lsn = match self
             .seal_fence
-            .try_write_for(std::time::Duration::from_secs(5))
+            .try_write_for(std::time::Duration::from_secs(15))
         {
             Some(_fence) => {
                 // Fence acquired — no new commits can start. In-flight commits
@@ -4820,8 +4911,6 @@ impl MVCCEngine {
                 // _fence dropped here — commits resume
             }
             None => {
-                // Couldn't acquire fence within 5s (long-running commit).
-                // Skip WAL truncation this cycle, try again next time.
                 eprintln!("Warning: seal_fence timeout, skipping WAL truncation");
                 0
             }
@@ -5210,7 +5299,7 @@ impl MVCCEngine {
                         .filter_map(|&i| {
                             let seg = &manifest.segments[i];
                             segs.get(&seg.segment_id)
-                                .map(|v| (seg.segment_id, Arc::clone(v)))
+                                .map(|cs| (seg.segment_id, Arc::clone(&cs.volume)))
                         })
                         .collect();
                 // Every manifest entry must have a loaded volume. If any are
@@ -5297,9 +5386,7 @@ impl MVCCEngine {
             // Precompute column mapping per volume (once each, not per row).
             let vol_mappings: Vec<crate::storage::volume::writer::ColumnMapping> = volumes
                 .iter()
-                .map(|(_, vol)| {
-                    crate::storage::volume::writer::compute_column_mapping(&schema, vol)
-                })
+                .map(|(seg_id, _vol)| mgr.get_volume_mapping(*seg_id, &schema))
                 .collect();
             for &(row_id, vol_idx, row_idx) in &live_refs {
                 let vol = &volumes[vol_idx].1;
@@ -5328,11 +5415,20 @@ impl MVCCEngine {
                 &compacted,
                 compress,
             ) {
-                Ok(_path) => {
-                    // Atomic swap: replace old segments with compacted volume
-                    // under a single lock hold. This prevents the window where
-                    // both old and new segments are visible, which caused queries
-                    // to scan duplicated data during compaction.
+                Ok((_path, _store)) => {
+                    // V4 writes compressed blocks to disk but we drop the
+                    // CompressedBlockStore. Eager columns from VolumeBuilder::finish()
+                    // are already in RAM — no need for ~30MB compressed copy.
+
+                    // Pre-build unique hash indices before registration.
+                    {
+                        let stores = self.version_stores.read().unwrap();
+                        if let Some(store) = stores.get(table_name) {
+                            for (col_indices, _) in store.get_unique_non_pk_index_columns() {
+                                compacted.prebuild_unique_index(&col_indices);
+                            }
+                        }
+                    }
                     {
                         use crate::storage::volume::manifest::SegmentMeta;
                         let min_id = live_refs.first().map(|(id, _, _)| *id).unwrap_or(0);
@@ -5349,6 +5445,7 @@ impl MVCCEngine {
                                 max_row_id: max_id,
                                 creation_lsn: 0,
                                 compaction_epoch: current_epoch + 1,
+                                schema_version: self.schema_epoch.load(Ordering::Acquire),
                             },
                             &old_ids,
                         );
@@ -5591,6 +5688,17 @@ impl MVCCEngine {
                 compress,
             ) {
                 Ok((volume, _path, volume_id)) => {
+                    // Pre-build unique hash indices BEFORE registration so the
+                    // first INSERT after seal doesn't pay a ~60ms stall scanning
+                    // all rows. Safe: volume is not yet visible to other threads.
+                    {
+                        let stores = self.version_stores.read().unwrap();
+                        if let Some(store) = stores.get(&table_name) {
+                            for (col_indices, _) in store.get_unique_non_pk_index_columns() {
+                                volume.prebuild_unique_index(&col_indices);
+                            }
+                        }
+                    }
                     let mgr = self.get_or_create_segment_manager(&table_name);
 
                     // Seal critical section under exclusive fence: register cold
@@ -5954,6 +6062,20 @@ impl Engine for MVCCEngine {
             data.extend_from_slice(expr.as_bytes());
         } else {
             data.extend_from_slice(&0u16.to_le_bytes());
+        }
+
+        // If this column was previously dropped, clear it from dropped_columns.
+        // Recompute cold mappings with the post-add schema.
+        // dropped_columns stays permanent — old volumes have stale data under
+        // the dropped name, new volumes get the re-added column at a new position.
+        {
+            let schema = self.schemas.read().unwrap().get(table_name).cloned();
+            let mgrs = self.segment_managers.read().unwrap();
+            if let Some(mgr) = mgrs.get(table_name) {
+                if let Some(ref s) = schema {
+                    mgr.invalidate_mappings(s);
+                }
+            }
         }
 
         self.record_ddl(table_name, WALOperationType::AlterTable, &data)
@@ -6430,7 +6552,7 @@ impl EngineOperations {
         let schema = &*schema_arc;
         let pk_idx = schema.pk_column_index();
 
-        // Collect unique index column info + precompute defaults once
+        // Collect unique index column info + precompute defaults once.
         let unique_indexes: Vec<(Vec<usize>, Vec<String>, Vec<crate::core::Value>)> = version_store
             .get_unique_non_pk_index_columns()
             .into_iter()
@@ -6503,12 +6625,9 @@ impl EngineOperations {
                         continue;
                     }
                     let values: Vec<&crate::core::Value> = coerced.iter().collect();
-                    if let Some(cold_rid) = mgr.find_row_id_by_values(
-                        col_indices,
-                        &values,
-                        defaults,
-                        schema.columns.len(),
-                    ) {
+                    if let Some(cold_rid) =
+                        mgr.find_row_id_by_values(col_indices, &values, defaults)
+                    {
                         if !mgr.is_pending_tombstone(txn_id, cold_rid) {
                             return Err(crate::core::Error::UniqueConstraint {
                                 index: col_names.join("_"),
@@ -6580,12 +6699,9 @@ impl EngineOperations {
                         continue;
                     }
                     let values: Vec<&crate::core::Value> = coerced.iter().collect();
-                    if let Some(cold_rid) = mgr.find_row_id_by_values(
-                        col_indices,
-                        &values,
-                        defaults,
-                        schema.columns.len(),
-                    ) {
+                    if let Some(cold_rid) =
+                        mgr.find_row_id_by_values(col_indices, &values, defaults)
+                    {
                         if cold_rid != row_id && !mgr.is_pending_tombstone(txn_id, cold_rid) {
                             return Err(crate::core::Error::UniqueConstraint {
                                 index: col_names.join("_"),

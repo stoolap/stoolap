@@ -36,9 +36,30 @@ use crate::core::{Result, Value};
 
 use super::writer::FrozenVolume;
 
+/// A cold segment: immutable volume + pre-computed column mapping.
+/// The mapping is computed once at registration (seal/compaction/load) and
+/// recomputed on ALTER TABLE. No per-scan computation, no lock contention.
+#[derive(Clone)]
+pub struct ColdSegment {
+    pub volume: Arc<FrozenVolume>,
+    pub mapping: super::writer::ColumnMapping,
+    /// Schema version when this volume was created. Used with dropped_columns
+    /// to correctly mask stale data only from volumes older than a column drop.
+    pub schema_version: u64,
+}
+
+/// Atomic snapshot of cold segment state for batch constraint checking.
+/// Captures manifest seg_ids + segments Arc + tombstones Arc once,
+/// eliminating 3 lock reads per row in batch INSERT/upsert.
+pub struct ColdSnapshot {
+    pub seg_ids: smallvec::SmallVec<[u64; 4]>,
+    pub segs: Arc<FxHashMap<u64, ColdSegment>>,
+    pub ts: Arc<FxHashMap<i64, u64>>,
+}
+
 // Manifest file magic: "STMF" (SToolap ManiFest)
 const MANIFEST_MAGIC: [u8; 4] = *b"STMF";
-const MANIFEST_VERSION: u32 = 4;
+const MANIFEST_VERSION: u32 = 6;
 
 /// Metadata for a single immutable segment (frozen volume).
 #[derive(Debug, Clone)]
@@ -58,6 +79,9 @@ pub struct SegmentMeta {
     /// Compaction epoch when this segment was last written/merged.
     /// Used to force-include stale volumes after max_age cycles.
     pub compaction_epoch: u64,
+    /// Schema version when this segment was created. Used with dropped_columns
+    /// to correctly mask stale data only from volumes older than a column drop.
+    pub schema_version: u64,
 }
 
 /// The manifest for a single table: tracks all live segments and tombstones.
@@ -80,6 +104,15 @@ pub struct TableManifest {
     /// begin_seq=N only sees tombstones with commit_seq <= N.
     /// Cleared after compaction processes them.
     pub tombstones: Vec<(i64, u64)>,
+    /// Column rename history: (old_name, new_name) pairs.
+    /// Applied as aliases to cold volumes on load so pre-rename data
+    /// is visible through the new schema column name.
+    pub column_renames: Vec<(SmartString, SmartString)>,
+    /// Columns that have been dropped (and possibly re-added with same name).
+    /// Each entry is (column_name, schema_version_at_drop). Old volumes sealed
+    /// before the drop (schema_version <= drop_version) have stale data masked.
+    /// Cleared during compaction (new volumes don't have stale data).
+    pub dropped_columns: Vec<(SmartString, u64)>,
 }
 
 impl TableManifest {
@@ -91,6 +124,8 @@ impl TableManifest {
             next_segment_id: 1,
             checkpoint_lsn: 0,
             tombstones: Vec::new(),
+            column_renames: Vec::new(),
+            dropped_columns: Vec::new(),
         }
     }
 
@@ -148,6 +183,8 @@ impl TableManifest {
             buf.write_all(&seg.min_row_id.to_le_bytes())?;
             buf.write_all(&seg.max_row_id.to_le_bytes())?;
             buf.write_all(&seg.creation_lsn.to_le_bytes())?;
+            buf.write_all(&seg.compaction_epoch.to_le_bytes())?;
+            buf.write_all(&seg.schema_version.to_le_bytes())?;
 
             // File path as UTF-8 string
             let path_str = seg.file_path.to_string_lossy();
@@ -161,6 +198,26 @@ impl TableManifest {
         for &(row_id, commit_seq) in &self.tombstones {
             buf.write_all(&row_id.to_le_bytes())?;
             buf.write_all(&commit_seq.to_le_bytes())?;
+        }
+
+        // Column renames (V5+): (old_name, new_name) pairs
+        buf.write_all(&(self.column_renames.len() as u32).to_le_bytes())?;
+        for (old_name, new_name) in &self.column_renames {
+            let ob = old_name.as_bytes();
+            buf.write_all(&(ob.len() as u16).to_le_bytes())?;
+            buf.write_all(ob)?;
+            let nb = new_name.as_bytes();
+            buf.write_all(&(nb.len() as u16).to_le_bytes())?;
+            buf.write_all(nb)?;
+        }
+
+        // Dropped columns (V6+: name + schema_version; V5: name only)
+        buf.write_all(&(self.dropped_columns.len() as u32).to_le_bytes())?;
+        for (name, version) in &self.dropped_columns {
+            let nb = name.as_bytes();
+            buf.write_all(&(nb.len() as u16).to_le_bytes())?;
+            buf.write_all(nb)?;
+            buf.write_all(&version.to_le_bytes())?;
         }
 
         // Trailing CRC32 over the entire payload (V3+)
@@ -239,7 +296,15 @@ impl TableManifest {
         let seg_count = read_u32(data, &mut pos)? as usize;
         let mut segments = Vec::with_capacity(seg_count);
         for _ in 0..seg_count {
-            if pos + 40 > data.len() {
+            // V6: 56 bytes (adds schema_version), V5: 48, V1-V4: 40
+            let min_seg_bytes = if version >= 6 {
+                56
+            } else if version >= 5 {
+                48
+            } else {
+                40
+            };
+            if pos + min_seg_bytes > data.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "manifest truncated at segment",
@@ -250,6 +315,16 @@ impl TableManifest {
             let min_row_id = read_i64(data, &mut pos)?;
             let max_row_id = read_i64(data, &mut pos)?;
             let creation_lsn = read_u64(data, &mut pos)?;
+            let compaction_epoch = if version >= 5 {
+                read_u64(data, &mut pos)?
+            } else {
+                0
+            };
+            let schema_version = if version >= 6 {
+                read_u64(data, &mut pos)?
+            } else {
+                0
+            };
 
             let path_len = read_u32(data, &mut pos)? as usize;
             if pos + path_len > data.len() {
@@ -269,7 +344,8 @@ impl TableManifest {
                 min_row_id,
                 max_row_id,
                 creation_lsn,
-                compaction_epoch: 0,
+                compaction_epoch,
+                schema_version,
             });
         }
 
@@ -307,12 +383,79 @@ impl TableManifest {
             }
         }
 
+        // Column renames (V5+)
+        let mut column_renames = Vec::new();
+        if version >= 5 && pos + 4 <= tombstone_data_end {
+            let rename_count = read_u32(data, &mut pos)? as usize;
+            column_renames.reserve(rename_count);
+            for _ in 0..rename_count {
+                if pos + 2 > tombstone_data_end {
+                    break;
+                }
+                let old_len = u16::from_le_bytes(data[pos..pos + 2].try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "truncated rename old_name len")
+                })?) as usize;
+                pos += 2;
+                if pos + old_len > tombstone_data_end {
+                    break;
+                }
+                let old_name = std::str::from_utf8(&data[pos..pos + old_len])
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                pos += old_len;
+                if pos + 2 > tombstone_data_end {
+                    break;
+                }
+                let new_len = u16::from_le_bytes(data[pos..pos + 2].try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "truncated rename new_name len")
+                })?) as usize;
+                pos += 2;
+                if pos + new_len > tombstone_data_end {
+                    break;
+                }
+                let new_name = std::str::from_utf8(&data[pos..pos + new_len])
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                pos += new_len;
+                column_renames.push((SmartString::from(old_name), SmartString::from(new_name)));
+            }
+        }
+
+        // Dropped columns (V6+: name + schema_version; V5: name only → version=0)
+        let mut dropped_columns = Vec::new();
+        if version >= 5 && pos + 4 <= tombstone_data_end {
+            let count = read_u32(data, &mut pos)? as usize;
+            for _ in 0..count {
+                if pos + 2 > tombstone_data_end {
+                    break;
+                }
+                let nlen = u16::from_le_bytes(data[pos..pos + 2].try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "truncated dropped col name")
+                })?) as usize;
+                pos += 2;
+                if pos + nlen > tombstone_data_end {
+                    break;
+                }
+                let name = std::str::from_utf8(&data[pos..pos + nlen])
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                pos += nlen;
+                let drop_version = if version >= 6 {
+                    read_u64(data, &mut pos)?
+                } else {
+                    // V5 didn't store drop version; use 0 so all old volumes are masked
+                    // (conservative: masks everything, same as old behavior)
+                    u64::MAX
+                };
+                dropped_columns.push((SmartString::from(name), drop_version));
+            }
+        }
+
         Ok(Self {
             table_name: SmartString::from(table_name),
             segments,
             next_segment_id,
             checkpoint_lsn,
             tombstones,
+            column_renames,
+            dropped_columns,
         })
     }
 
@@ -382,11 +525,12 @@ pub struct SegmentManager {
     table_name: SmartString,
     /// The manifest (source of truth for segment state).
     manifest: RwLock<TableManifest>,
-    /// Loaded segments, keyed by segment_id.
+    /// Loaded segments with pre-computed column mappings, keyed by segment_id.
     /// CoW via Arc: readers clone the Arc (O(1) atomic increment, ~5ns),
     /// writers clone the inner map, modify, and swap the Arc.
-    /// This eliminates write-lock starvation on register_segment.
-    segments: RwLock<Arc<FxHashMap<u64, Arc<FrozenVolume>>>>,
+    /// The ColumnMapping is computed once at registration and recomputed on ALTER TABLE.
+    /// This eliminates per-scan compute_column_mapping overhead and lock contention.
+    segments: RwLock<Arc<FxHashMap<u64, ColdSegment>>>,
     /// Base directory for volume files (None for memory-only databases).
     volume_dir: Option<PathBuf>,
     /// Fast atomic flag: true if any segments are loaded.
@@ -475,7 +619,7 @@ impl SegmentManager {
     /// Get all loaded segments (for scanning).
     pub fn get_segments(&self) -> Vec<Arc<FrozenVolume>> {
         let segs = Arc::clone(&*self.segments.read());
-        segs.values().cloned().collect()
+        segs.values().map(|cs| Arc::clone(&cs.volume)).collect()
     }
 
     /// Get segments in order (by segment_id, oldest first).
@@ -490,7 +634,7 @@ impl SegmentManager {
         };
         seg_ids
             .iter()
-            .filter_map(|id| segments.get(id).cloned())
+            .filter_map(|id| segments.get(id).map(|cs| Arc::clone(&cs.volume)))
             .collect()
     }
 
@@ -498,7 +642,7 @@ impl SegmentManager {
     /// Used for building per-volume skip sets in SegmentedTable.scan().
     /// Segments are always appended in ascending order, so reverse gives
     /// newest-first in O(n) instead of O(n log n) sort.
-    pub fn get_volumes_newest_first(&self) -> Arc<Vec<(u64, Arc<FrozenVolume>)>> {
+    pub fn get_volumes_newest_first(&self) -> Arc<Vec<(u64, ColdSegment)>> {
         // Hold manifest lock while cloning segments Arc to prevent
         // compaction's replace_segments_atomic from swapping the map
         // between the two reads (TOCTOU → missing rows in scan).
@@ -508,9 +652,9 @@ impl SegmentManager {
             let segs = Arc::clone(&*self.segments.read());
             (seg_ids, segs)
         };
-        let mut result: Vec<(u64, Arc<FrozenVolume>)> = seg_ids
+        let mut result: Vec<(u64, ColdSegment)> = seg_ids
             .iter()
-            .filter_map(|&id| segs.get(&id).map(|v| (id, Arc::clone(v))))
+            .filter_map(|&id| segs.get(&id).map(|cs| (id, cs.clone())))
             .collect();
         result.reverse();
         Arc::new(result)
@@ -522,44 +666,71 @@ impl SegmentManager {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Check if a value exists in any segment's column (for PK/UNIQUE constraint checks).
-    ///
-    /// Uses zone maps + binary search on sorted integer columns. No cloning.
-    /// Returns the row_id if found and not tombstoned, None otherwise.
-    /// Check if a value exists in cold segments for a given column.
-    /// Used for PK constraint checking (Integer/Timestamp columns only).
-    ///
-    /// Iterates newest-first with row_id dedup so that when the same row_id
-    /// exists in multiple overlapping volumes, only the newest version is checked.
+    /// Capture an atomic snapshot of segment state for batch constraint checking.
+    /// Acquires manifest + segments + tombstones locks once. All per-row checks
+    /// within the batch reuse this snapshot with zero lock overhead.
+    pub fn cold_snapshot(&self) -> ColdSnapshot {
+        let manifest = self.manifest.read();
+        let seg_ids: smallvec::SmallVec<[u64; 4]> = manifest
+            .segments
+            .iter()
+            .rev()
+            .map(|m| m.segment_id)
+            .collect();
+        let segs = Arc::clone(&*self.segments.read());
+        let ts = Arc::clone(&*self.tombstones.read());
+        drop(manifest);
+        ColdSnapshot { seg_ids, segs, ts }
+    }
+
+    /// Check if a value exists using a pre-captured snapshot (no lock acquisition).
+    pub fn check_value_exists_with_snapshot(
+        &self,
+        snapshot: &ColdSnapshot,
+        col_idx: usize,
+        value: &crate::core::Value,
+    ) -> Option<i64> {
+        self.check_value_exists_impl(
+            &snapshot.seg_ids,
+            &snapshot.segs,
+            &snapshot.ts,
+            col_idx,
+            value,
+        )
+    }
+
+    /// Check if a value exists in cold segments (acquires locks per call).
+    /// For batch operations, prefer cold_snapshot() + check_value_exists_with_snapshot().
     pub fn check_value_exists_in_segments(
         &self,
         col_idx: usize,
         value: &crate::core::Value,
     ) -> Option<i64> {
-        // Atomic snapshot: read seg_ids and segments map under the manifest
-        // lock so compaction's replace_segments_atomic (which holds manifest
-        // write → segments write) cannot swap them between the two reads.
-        let (seg_ids, segs, ts) = {
-            let manifest = self.manifest.read();
-            let seg_ids: Vec<u64> = manifest
-                .segments
-                .iter()
-                .rev()
-                .map(|m| m.segment_id)
-                .collect();
-            let segs = Arc::clone(&*self.segments.read());
-            let ts = Arc::clone(&*self.tombstones.read());
-            (seg_ids, segs, ts)
-        };
+        let snapshot = self.cold_snapshot();
+        self.check_value_exists_impl(
+            &snapshot.seg_ids,
+            &snapshot.segs,
+            &snapshot.ts,
+            col_idx,
+            value,
+        )
+    }
 
-        // Collect row_ids we've already seen across volumes (newest-first dedup).
-        // For PK checks this is typically small because PK values are unique per volume.
+    fn check_value_exists_impl(
+        &self,
+        seg_ids: &[u64],
+        segs: &FxHashMap<u64, ColdSegment>,
+        ts: &FxHashMap<i64, u64>,
+        col_idx: usize,
+        value: &crate::core::Value,
+    ) -> Option<i64> {
         let mut seen = FxHashSet::default();
 
-        for &seg_id in &seg_ids {
-            let Some(vol) = segs.get(&seg_id) else {
+        for &seg_id in seg_ids {
+            let Some(cold) = segs.get(&seg_id) else {
                 continue;
             };
+            let vol = &cold.volume;
             if col_idx >= vol.columns.len() || col_idx >= vol.zone_maps.len() {
                 continue;
             }
@@ -577,6 +748,10 @@ impl SegmentManager {
             };
             if let Some(target) = target {
                 if vol.is_sorted(col_idx) {
+                    // Always use OnceLock path: decompresses the full column
+                    // once (~50ms) then caches it. compressed_store.binary_search_ge
+                    // decompresses a fresh group per call (~0.3ms each), which is
+                    // 100x slower for bulk validation (25K calls = 8+ seconds).
                     let start = vol.columns[col_idx].binary_search_ge(target);
                     let mut i = start;
                     while i < vol.row_count && vol.columns[col_idx].get_i64(i) == target {
@@ -635,39 +810,59 @@ impl SegmentManager {
     ///
     /// No global cache. Each volume's hash index is built once on first use
     /// and lives on the immutable FrozenVolume. Zero invalidation cost.
+    /// Find row by values using a pre-captured snapshot (no lock acquisition).
+    pub fn find_row_id_by_values_with_snapshot(
+        &self,
+        snapshot: &ColdSnapshot,
+        col_indices: &[usize],
+        values: &[&Value],
+        column_defaults: &[Value],
+    ) -> Option<i64> {
+        self.find_row_id_by_values_impl(
+            &snapshot.seg_ids,
+            &snapshot.segs,
+            &snapshot.ts,
+            col_indices,
+            values,
+            column_defaults,
+        )
+    }
+
     pub fn find_row_id_by_values(
         &self,
         col_indices: &[usize],
         values: &[&Value],
         column_defaults: &[Value],
-        schema_col_count: usize,
+    ) -> Option<i64> {
+        let snapshot = self.cold_snapshot();
+        self.find_row_id_by_values_impl(
+            &snapshot.seg_ids,
+            &snapshot.segs,
+            &snapshot.ts,
+            col_indices,
+            values,
+            column_defaults,
+        )
+    }
+
+    fn find_row_id_by_values_impl(
+        &self,
+        seg_ids: &[u64],
+        segs: &FxHashMap<u64, ColdSegment>,
+        ts: &FxHashMap<i64, u64>,
+        col_indices: &[usize],
+        values: &[&Value],
+        column_defaults: &[Value],
     ) -> Option<i64> {
         if col_indices.is_empty() || col_indices.len() != values.len() {
             return None;
         }
 
-        // Atomic snapshot: read seg_ids and segments map under the manifest
-        // lock so compaction's replace_segments_atomic cannot swap them
-        // between the two reads (TOCTOU race → false unique-miss → dupes).
-        let (seg_ids, segs, ts) = {
-            let manifest = self.manifest.read();
-            let seg_ids: Vec<u64> = manifest
-                .segments
-                .iter()
-                .rev()
-                .map(|m| m.segment_id)
-                .collect();
-            let segs = Arc::clone(&*self.segments.read());
-            let ts = Arc::clone(&*self.tombstones.read());
-            (seg_ids, segs, ts)
-        };
-
         if seg_ids.is_empty() {
             return None;
         }
 
-        // Pre-compute bloom hashes once (reused across all volumes).
-        let bloom_hashes: Vec<u64> = values
+        let bloom_hashes: smallvec::SmallVec<[u64; 4]> = values
             .iter()
             .map(|v| super::column::ColumnBloomFilter::hash_value_static(v))
             .collect();
@@ -675,26 +870,53 @@ impl SegmentManager {
         // Track seen row_ids for newest-first dedup across overlapping volumes.
         let mut seen = FxHashSet::default();
 
-        for &seg_id in &seg_ids {
-            let Some(vol) = segs.get(&seg_id) else {
+        for &seg_id in seg_ids {
+            let Some(cold) = segs.get(&seg_id) else {
                 continue;
             };
-            // For schema-evolved volumes missing columns: check if the search
-            // value matches the column default. If not → no row can match → skip.
-            // If yes → check only the columns that exist in this volume.
-            let vol_cols = vol.columns.len().min(schema_col_count);
-            if col_indices
-                .iter()
-                .enumerate()
-                .any(|(i, &idx)| idx >= vol_cols && *values[i] != column_defaults[i])
-            {
+            let vol = &cold.volume;
+            // Derive remap from ColdSegment.mapping (already cached per volume).
+            // Maps schema column indices to volume column indices.
+            // Missing columns (ColSource::Default) are usize::MAX.
+            let mut vol_col_indices: smallvec::SmallVec<[usize; 4]> =
+                smallvec::SmallVec::with_capacity(col_indices.len());
+            let mut has_missing = false;
+            let mut skip_vol = false;
+            for (i, &ci) in col_indices.iter().enumerate() {
+                if ci < cold.mapping.sources.len() {
+                    match &cold.mapping.sources[ci] {
+                        super::writer::ColSource::Volume(vi) => {
+                            vol_col_indices.push(*vi);
+                        }
+                        super::writer::ColSource::Default(_) => {
+                            has_missing = true;
+                            // Column missing from volume. If searched value
+                            // doesn't match default, no row can match.
+                            if *values[i] != column_defaults[i] {
+                                skip_vol = true;
+                                break;
+                            }
+                            vol_col_indices.push(usize::MAX);
+                        }
+                    }
+                } else {
+                    // Schema column index out of range for this mapping
+                    has_missing = true;
+                    if *values[i] != column_defaults[i] {
+                        skip_vol = true;
+                        break;
+                    }
+                    vol_col_indices.push(usize::MAX);
+                }
+            }
+            if skip_vol {
                 continue;
             }
 
-            // Tier 1: Zone map pruning — skip volume if value outside [min, max]
+            // Tier 1: Zone map pruning
             let mut zone_skip = false;
-            for (&ci, &val) in col_indices.iter().zip(values.iter()) {
-                if ci < vol.zone_maps.len() && !vol.zone_maps[ci].may_contain_eq(val) {
+            for (i, &vi) in vol_col_indices.iter().enumerate() {
+                if vi < vol.zone_maps.len() && !vol.zone_maps[vi].may_contain_eq(values[i]) {
                     zone_skip = true;
                     break;
                 }
@@ -703,11 +925,11 @@ impl SegmentManager {
                 continue;
             }
 
-            // Tier 2: Bloom filter pruning — skip if any column says "definitely not"
+            // Tier 2: Bloom filter pruning
             let mut bloom_skip = false;
-            for (i, &ci) in col_indices.iter().enumerate() {
-                if ci < vol.bloom_filters.len()
-                    && !vol.bloom_filters[ci].might_contain_hash(bloom_hashes[i])
+            for (i, &vi) in vol_col_indices.iter().enumerate() {
+                if vi < vol.bloom_filters.len()
+                    && !vol.bloom_filters[vi].might_contain_hash(bloom_hashes[i])
                 {
                     bloom_skip = true;
                     break;
@@ -717,12 +939,11 @@ impl SegmentManager {
                 continue;
             }
 
-            // Tier 3: Per-volume hash index — O(1) lookup, supports duplicate rows
+            // Tier 3: Per-volume hash index
             let mut vol_result: Option<i64> = None;
-            let vol_missing_cols = col_indices.iter().any(|&idx| idx >= vol_cols);
-            if !vol_missing_cols {
-                // All columns present: standard hash index lookup
-                vol.unique_lookup_all(col_indices, values, |row_idx| {
+            if !has_missing {
+                // Common path: no schema evolution, pass values directly (zero alloc)
+                vol.unique_lookup_all(&vol_col_indices, values, |row_idx| {
                     let rid = vol.row_ids[row_idx as usize];
                     if ts.contains_key(&rid) {
                         false
@@ -736,11 +957,11 @@ impl SegmentManager {
             } else {
                 // Schema-evolved volume: some columns missing (default matches).
                 // Check only the columns that exist in the volume.
-                let present_cols: Vec<(usize, usize)> = col_indices
+                let present_cols: Vec<(usize, usize)> = vol_col_indices
                     .iter()
                     .enumerate()
-                    .filter(|(_, &ci)| ci < vol_cols)
-                    .map(|(i, &ci)| (i, ci))
+                    .filter(|(_, &vi)| vi != usize::MAX)
+                    .map(|(i, &vi)| (i, vi))
                     .collect();
                 for i in 0..vol.row_count {
                     let rid = vol.row_ids[i];
@@ -814,18 +1035,14 @@ impl SegmentManager {
     /// When `invalidate_cache` is false (compaction), the unique lookup cache is
     /// preserved. Compaction doesn't change row_ids or values, just which volume
     /// they live in. The cache's `row_exists()` filter handles stale entries.
-    pub fn register_segment(&self, segment_id: u64, volume: Arc<FrozenVolume>, meta: SegmentMeta) {
-        self.register_segment_inner(segment_id, volume, meta, true);
-    }
-
-    /// Register without invalidating the unique lookup cache (for compaction).
-    pub fn register_compacted_segment(
+    pub fn register_segment(
         &self,
         segment_id: u64,
         volume: Arc<FrozenVolume>,
         meta: SegmentMeta,
+        schema: Option<&crate::core::Schema>,
     ) {
-        self.register_segment_inner(segment_id, volume, meta, false);
+        self.register_segment_inner(segment_id, volume, meta, schema);
     }
 
     fn register_segment_inner(
@@ -833,17 +1050,42 @@ impl SegmentManager {
         segment_id: u64,
         volume: Arc<FrozenVolume>,
         meta: SegmentMeta,
-        _invalidate_cache: bool,
+        schema: Option<&crate::core::Schema>,
     ) {
         {
+            let seg_schema_version = meta.schema_version;
             let mut manifest = self.manifest.write();
             if segment_id >= manifest.next_segment_id {
                 manifest.next_segment_id = segment_id + 1;
             }
             manifest.add_segment(meta);
+            let mapping = if let Some(s) = schema {
+                let drops = manifest.dropped_columns.clone();
+                let renames = manifest.column_renames.clone();
+                super::writer::compute_column_mapping_with_drops(
+                    s,
+                    &volume,
+                    &drops,
+                    seg_schema_version,
+                    &renames,
+                )
+            } else {
+                // Identity mapping (newly sealed volume matches current schema)
+                super::writer::ColumnMapping {
+                    sources: (0..volume.columns.len())
+                        .map(super::writer::ColSource::Volume)
+                        .collect(),
+                    is_identity: true,
+                }
+            };
+            let cold = ColdSegment {
+                volume,
+                mapping,
+                schema_version: seg_schema_version,
+            };
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
-            new_map.insert(segment_id, volume);
+            new_map.insert(segment_id, cold);
             *segments = Arc::new(new_map);
         }
         self.cached_deduped_count
@@ -865,13 +1107,29 @@ impl SegmentManager {
         volume: Arc<FrozenVolume>,
     ) -> bool {
         let manifest = self.manifest.read();
-        let exists_in_manifest = manifest.segments.iter().any(|s| s.segment_id == segment_id);
+        let seg_schema_version = manifest
+            .segments
+            .iter()
+            .find(|s| s.segment_id == segment_id)
+            .map(|s| s.schema_version);
+        // Column renames are already merged into column_name_map before Arc
+        // wrapping in load_standalone_volumes.
         drop(manifest);
 
-        if exists_in_manifest {
+        if let Some(schema_version) = seg_schema_version {
+            let cold = ColdSegment {
+                mapping: super::writer::ColumnMapping {
+                    sources: (0..volume.columns.len())
+                        .map(super::writer::ColSource::Volume)
+                        .collect(),
+                    is_identity: true,
+                },
+                volume,
+                schema_version,
+            };
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
-            new_map.insert(segment_id, volume);
+            new_map.insert(segment_id, cold);
             *segments = Arc::new(new_map);
             self.has_segments_flag
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1122,8 +1380,8 @@ impl SegmentManager {
             if row_id < *min_id || row_id > *max_id {
                 continue;
             }
-            if let Some(vol) = segments.get(seg_id) {
-                if vol.row_ids.binary_search(&row_id).is_ok() {
+            if let Some(cold) = segments.get(seg_id) {
+                if cold.volume.row_ids.binary_search(&row_id).is_ok() {
                     return true;
                 }
             }
@@ -1155,9 +1413,9 @@ impl SegmentManager {
             if row_id < *min_id || row_id > *max_id {
                 continue;
             }
-            if let Some(vol) = segments.get(seg_id) {
-                if let Ok(idx) = vol.row_ids.binary_search(&row_id) {
-                    return Some(vol.get_row(idx));
+            if let Some(cold) = segments.get(seg_id) {
+                if let Ok(idx) = cold.volume.row_ids.binary_search(&row_id) {
+                    return Some(cold.volume.get_row(idx));
                 }
             }
         }
@@ -1194,13 +1452,13 @@ impl SegmentManager {
             if row_id < *min_id || row_id > *max_id {
                 continue;
             }
-            if let Some(vol) = segments.get(seg_id) {
-                if let Ok(idx) = vol.row_ids.binary_search(&row_id) {
-                    let mapping = super::writer::compute_column_mapping(schema, vol);
+            if let Some(cold) = segments.get(seg_id) {
+                if let Ok(idx) = cold.volume.row_ids.binary_search(&row_id) {
+                    let mapping = self.get_volume_mapping(*seg_id, schema);
                     if mapping.is_identity {
-                        return Some(vol.get_row(idx));
+                        return Some(cold.volume.get_row(idx));
                     }
-                    return Some(vol.get_row_mapped(idx, &mapping));
+                    return Some(cold.volume.get_row_mapped(idx, &mapping));
                 }
             }
         }
@@ -1225,8 +1483,8 @@ impl SegmentManager {
             if row_id < *min_id || row_id > *max_id {
                 continue;
             }
-            if let Some(vol) = segments.get(seg_id) {
-                if vol.row_ids.binary_search(&row_id).is_ok() {
+            if let Some(cold) = segments.get(seg_id) {
+                if cold.volume.row_ids.binary_search(&row_id).is_ok() {
                     return true;
                 }
             }
@@ -1327,17 +1585,17 @@ impl SegmentManager {
         }
         let tombstones = Arc::clone(&*self.tombstones.read());
         if segments.len() == 1 {
-            let total: usize = segments.values().map(|v| v.row_count).sum();
+            let total: usize = segments.values().map(|cs| cs.volume.row_count).sum();
             return total.saturating_sub(tombstones.len());
         }
         let mut seen = FxHashSet::default();
 
         let mut count = 0usize;
         for seg_id in &seg_ids {
-            let Some(vol) = segments.get(seg_id) else {
+            let Some(cold) = segments.get(seg_id) else {
                 continue;
             };
-            for &rid in &vol.row_ids {
+            for &rid in &cold.volume.row_ids {
                 if tombstones.contains_key(&rid) {
                     continue;
                 }
@@ -1349,8 +1607,84 @@ impl SegmentManager {
         count
     }
 
-    /// Set the seal overlap count (rows that exist in both hot and cold during seal).
-    /// Called BEFORE register_segment with the number of rows being sealed.
+    /// Get the cached column mapping for a volume. Computes on first call,
+    /// returns cached on subsequent calls. Handles dropped columns + renames
+    /// automatically. Call invalidate_mappings() on ALTER TABLE.
+    pub fn get_volume_mapping(
+        &self,
+        seg_id: u64,
+        _schema: &crate::core::Schema,
+    ) -> super::writer::ColumnMapping {
+        let segs = self.segments.read();
+        if let Some(cold) = segs.get(&seg_id) {
+            cold.mapping.clone()
+        } else {
+            super::writer::ColumnMapping {
+                sources: Vec::new(),
+                is_identity: true,
+            }
+        }
+    }
+
+    /// Recompute all column mappings for loaded volumes.
+    /// Called on ALTER TABLE (rename/drop/add column).
+    pub fn invalidate_mappings(&self, schema: &crate::core::Schema) {
+        let manifest = self.manifest.read();
+        let drops = manifest.dropped_columns.clone();
+        let renames = manifest.column_renames.clone();
+        drop(manifest);
+        let mut segs = self.segments.write();
+        let mut new_map = (**segs).clone();
+        for cold in new_map.values_mut() {
+            cold.mapping = super::writer::compute_column_mapping_with_drops(
+                schema,
+                &cold.volume,
+                &drops,
+                cold.schema_version,
+                &renames,
+            );
+        }
+        *segs = Arc::new(new_map);
+    }
+
+    /// Record a column drop so old volumes don't leak stale data.
+    /// `schema_version` is the current schema epoch at drop time. Only volumes
+    /// with schema_version <= this value will have the column masked.
+    pub fn record_column_drop(&self, col_name: &str, schema_version: u64) {
+        let lower = SmartString::from(col_name.to_lowercase());
+        let mut manifest = self.manifest.write();
+        // Remove any existing entry for this column name before adding the new one.
+        // This handles DROP + ADD + DROP sequences correctly.
+        manifest
+            .dropped_columns
+            .retain(|(name, _)| name.as_str() != lower.as_str());
+        manifest.dropped_columns.push((lower, schema_version));
+    }
+
+    /// Note: record_column_readd was removed. dropped_columns is permanent
+    /// until compaction rewrites all old volumes. After ADD COLUMN re-adds a
+    /// dropped name, compute_column_mapping_with_drops handles it correctly:
+    /// old volumes have the column at an old position (blocked by drop mask),
+    /// new volumes don't have it at all (mapped to Default).
+    ///
+    /// Clear dropped column tracking (called after compaction replaces all old volumes).
+    pub fn clear_dropped_columns(&self) {
+        self.manifest.write().dropped_columns.clear();
+    }
+
+    /// Check if a column name was dropped (for compute_column_mapping).
+    pub fn is_column_dropped(&self, col_name: &str) -> bool {
+        self.manifest
+            .read()
+            .dropped_columns
+            .iter()
+            .any(|(name, _)| name.as_str() == col_name)
+    }
+
+    pub fn get_dropped_columns(&self) -> Vec<(SmartString, u64)> {
+        self.manifest.read().dropped_columns.clone()
+    }
+
     pub fn set_seal_overlap(&self, count: usize) {
         self.seal_overlap_count
             .store(count, std::sync::atomic::Ordering::Release);
@@ -1389,6 +1723,16 @@ impl SegmentManager {
         self.manifest.read().write_to_disk(&manifest_path)?;
 
         Ok(())
+    }
+
+    /// Record a column rename. The caller must call invalidate_mappings()
+    /// afterwards to recompute column mappings with the new rename.
+    pub fn record_column_rename(&self, old_name: &str, new_name: &str) {
+        // Persist in manifest for restart
+        self.manifest
+            .write()
+            .column_renames
+            .push((SmartString::from(old_name), SmartString::from(new_name)));
     }
 
     /// Load manifest from disk.
@@ -1474,15 +1818,26 @@ impl SegmentManager {
             }
             // Insert at the position of the old segments, not at the end.
             let insert_pos = insert_pos.min(manifest.segments.len());
+            let seg_schema_version = new_meta.schema_version;
             manifest.segments.insert(insert_pos, new_meta);
 
             // Swap segments map under the same logical operation
+            let cold = ColdSegment {
+                mapping: super::writer::ColumnMapping {
+                    sources: (0..new_volume.columns.len())
+                        .map(super::writer::ColSource::Volume)
+                        .collect(),
+                    is_identity: true,
+                },
+                volume: new_volume,
+                schema_version: seg_schema_version,
+            };
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
             for &id in old_segment_ids {
                 new_map.remove(&id);
             }
-            new_map.insert(new_segment_id, new_volume);
+            new_map.insert(new_segment_id, cold);
             *segments = Arc::new(new_map);
         }
         self.cached_deduped_count
@@ -1517,7 +1872,7 @@ impl SegmentManager {
     }
 
     /// CoW snapshot of the loaded segments map.
-    pub fn segments_snapshot(&self) -> Arc<FxHashMap<u64, Arc<FrozenVolume>>> {
+    pub fn segments_snapshot(&self) -> Arc<FxHashMap<u64, ColdSegment>> {
         Arc::clone(&*self.segments.read())
     }
 
@@ -1639,6 +1994,7 @@ mod tests {
             max_row_id: 1000,
             creation_lsn: 100,
             compaction_epoch: 0,
+            schema_version: 0,
         });
         m.add_segment(SegmentMeta {
             segment_id: 2,
@@ -1648,6 +2004,7 @@ mod tests {
             max_row_id: 1500,
             creation_lsn: 200,
             compaction_epoch: 0,
+            schema_version: 0,
         });
         assert_eq!(m.segments.len(), 2);
 
@@ -1667,6 +2024,7 @@ mod tests {
             max_row_id: 100,
             creation_lsn: 0,
             compaction_epoch: 0,
+            schema_version: 0,
         });
         m.add_segment(SegmentMeta {
             segment_id: 2,
@@ -1676,6 +2034,7 @@ mod tests {
             max_row_id: 200,
             creation_lsn: 0,
             compaction_epoch: 0,
+            schema_version: 0,
         });
 
         assert_eq!(m.find_segment_for_row_id(50).unwrap().1.segment_id, 1);
@@ -1697,6 +2056,7 @@ mod tests {
             max_row_id: 10000,
             creation_lsn: 10,
             compaction_epoch: 0,
+            schema_version: 3,
         });
         m.add_segment(SegmentMeta {
             segment_id: 3,
@@ -1706,6 +2066,7 @@ mod tests {
             max_row_id: 15000,
             creation_lsn: 30,
             compaction_epoch: 0,
+            schema_version: 5,
         });
 
         let data = m.serialize().unwrap();
@@ -1722,6 +2083,8 @@ mod tests {
         assert_eq!(loaded.segments[0].file_path, PathBuf::from("seg_0001.vol"));
         assert_eq!(loaded.segments[1].segment_id, 3);
         assert_eq!(loaded.segments[1].creation_lsn, 30);
+        assert_eq!(loaded.segments[0].schema_version, 3);
+        assert_eq!(loaded.segments[1].schema_version, 5);
         assert_eq!(loaded.tombstones, vec![(10, 0), (20, 0), (30, 0)]);
     }
 
@@ -1740,6 +2103,7 @@ mod tests {
             max_row_id: 100,
             creation_lsn: 0,
             compaction_epoch: 0,
+            schema_version: 0,
         });
 
         m.write_to_disk(&path).unwrap();
@@ -1773,8 +2137,9 @@ mod tests {
             max_row_id: 10,
             creation_lsn: 0,
             compaction_epoch: 0,
+            schema_version: 0,
         };
-        mgr.register_segment(1, volume, meta);
+        mgr.register_segment(1, volume, meta, None);
 
         assert_eq!(mgr.segment_count(), 1);
         assert_eq!(mgr.total_row_count(), 10);
@@ -1808,7 +2173,9 @@ mod tests {
                 max_row_id: 10,
                 creation_lsn: 0,
                 compaction_epoch: 0,
+                schema_version: 0,
             },
+            None,
         );
 
         // Tombstone row_id=5 (commit_seq=1)
@@ -1854,7 +2221,9 @@ mod tests {
                     max_row_id: seg_id as i64,
                     creation_lsn: 0,
                     compaction_epoch: 0,
+                    schema_version: 0,
                 },
+                None,
             );
         }
 
@@ -1878,6 +2247,7 @@ mod tests {
             max_row_id: 10,
             creation_lsn: 0,
             compaction_epoch: 0,
+            schema_version: 0,
         });
         mgr.add_tombstones(&[5], 1);
 

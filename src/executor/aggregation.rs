@@ -5525,6 +5525,9 @@ impl Executor {
             }
         }
 
+        if let Some(e) = scanner.err() {
+            return Err(crate::core::Error::internal(format!("scan error: {}", e)));
+        }
         scanner.close()?;
 
         // Build intermediate result columns (raw aggregate values)

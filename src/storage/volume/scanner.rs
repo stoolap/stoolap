@@ -52,6 +52,31 @@ struct ColumnPredicate {
     target: TypedTarget,
 }
 
+/// Cache holding decompressed columns for a single row group.
+/// Avoids decompressing the entire column when only a few groups are needed.
+struct GroupColumnCache {
+    #[allow(dead_code)]
+    group_idx: usize,
+    /// Decompressed columns for this group (only needed columns populated)
+    columns: Vec<Option<super::column::ColumnData>>,
+    /// Global row index where this group starts
+    group_start: usize,
+}
+
+impl GroupColumnCache {
+    /// Get column data and local row index for a global row index.
+    #[inline(always)]
+    fn col_and_local(
+        &self,
+        col_idx: usize,
+        global_idx: usize,
+    ) -> Option<(&super::column::ColumnData, usize)> {
+        self.columns[col_idx]
+            .as_ref()
+            .map(|col| (col, global_idx - self.group_start))
+    }
+}
+
 /// Scanner over a frozen volume that implements the `Scanner` trait.
 ///
 /// Reconstructs rows lazily from column-major data, projecting only
@@ -113,6 +138,10 @@ pub struct VolumeScanner {
     /// Pre-computed row group skip decisions. group_idx → can skip entirely.
     /// None = no row groups (small volume or no filter). Computed in set_filter().
     row_group_skips: Option<Vec<bool>>,
+    /// Per-group column cache: decompresses only needed columns for the current
+    /// group instead of the entire column. Active when the volume has a compressed
+    /// store (V4 format). Dramatically reduces decompression work for selective scans.
+    group_cache: Option<GroupColumnCache>,
     /// Cached end of the current row group (exclusive index). Avoids per-row
     /// integer division in the slow-path scan loop. Recomputed only on group
     /// boundary crossings. 0 means "not yet initialized".
@@ -139,7 +168,7 @@ impl VolumeScanner {
             project_cols
         };
         let is_full_projection = Self::compute_is_full_projection(&project, volume.columns.len());
-        Self {
+        let mut s = Self {
             end_idx: volume.row_count,
             volume,
             project_cols: project,
@@ -160,8 +189,19 @@ impl VolumeScanner {
             typed_predicates: Vec::new(),
             needed_cols: None,
             row_group_skips: None,
+            group_cache: None,
             next_group_boundary: 0,
+        };
+        if !s.is_full_projection && s.volume.columns.should_use_group_cache() {
+            let mut mask = vec![false; s.volume.columns.len()];
+            for &ci in &s.project_cols {
+                if ci < mask.len() {
+                    mask[ci] = true;
+                }
+            }
+            s.needed_cols = Some(mask);
         }
+        s
     }
 
     /// Create a scanner with a start/end range (for binary-search narrowing).
@@ -178,7 +218,7 @@ impl VolumeScanner {
             project_cols
         };
         let is_full_projection = Self::compute_is_full_projection(&project, volume.columns.len());
-        Self {
+        let mut s = Self {
             volume,
             project_cols: project,
             is_full_projection,
@@ -199,8 +239,19 @@ impl VolumeScanner {
             typed_predicates: Vec::new(),
             needed_cols: None,
             row_group_skips: None,
+            group_cache: None,
             next_group_boundary: 0,
+        };
+        if !s.is_full_projection && s.volume.columns.should_use_group_cache() {
+            let mut mask = vec![false; s.volume.columns.len()];
+            for &ci in &s.project_cols {
+                if ci < mask.len() {
+                    mask[ci] = true;
+                }
+            }
+            s.needed_cols = Some(mask);
         }
+        s
     }
 
     /// Set per-transaction pending cold deletes. The owning transaction
@@ -226,7 +277,7 @@ impl VolumeScanner {
     pub fn empty() -> Self {
         Self {
             volume: Arc::new(FrozenVolume {
-                columns: Vec::new(),
+                columns: super::writer::LazyColumns::empty(),
                 zone_maps: Vec::new(),
                 bloom_filters: Vec::new(),
                 stats: super::stats::VolumeAggregateStats::new(0),
@@ -258,6 +309,7 @@ impl VolumeScanner {
             typed_predicates: Vec::new(),
             needed_cols: None,
             row_group_skips: None,
+            group_cache: None,
             next_group_boundary: 0,
         }
     }
@@ -265,18 +317,32 @@ impl VolumeScanner {
     /// Set a predicate filter on this scanner.
     /// Automatically extracts dictionary-based fast filters for text equality predicates.
     pub fn set_filter(&mut self, filter: Box<dyn crate::storage::expression::Expression>) {
-        // Extract dictionary filters for fast pre-filtering
+        // Extract dictionary filters for fast pre-filtering.
+        // Uses CompressedBlockStore's shared dict when available (no column decompression).
         let comparisons = filter.collect_comparisons();
+        // Only use CompressedBlockStore for dict lookup / group scan when
+        // columns are NOT already loaded (deferred volumes from disk).
+        // After seal/compaction, eager() pre-loads all OnceLock
+        // slots — direct column access is faster than re-decompressing.
+        let store = if self.volume.columns.should_use_group_cache() {
+            self.volume.columns.compressed_store()
+        } else {
+            None
+        };
         for &(col_name, op, value) in &comparisons {
             if op != crate::core::Operator::Eq {
                 continue;
             }
             if let Value::Text(s) = value {
                 if let Some(col_idx) = self.volume.column_index(col_name) {
-                    if let Some(dict_id) = self.volume.columns[col_idx].dict_lookup(s.as_str()) {
-                        self.dict_filters.push((col_idx, dict_id));
+                    let dict_id = if let Some(st) = store {
+                        st.dict_lookup(col_idx, s.as_str())
                     } else {
-                        // Value not in dictionary = zero matches, set empty range
+                        self.volume.columns[col_idx].dict_lookup(s.as_str())
+                    };
+                    if let Some(id) = dict_id {
+                        self.dict_filters.push((col_idx, id));
+                    } else {
                         self.current_idx = self.end_idx;
                         self.filter = Some(filter);
                         return;
@@ -284,30 +350,83 @@ impl VolumeScanner {
                 }
             }
         }
-        // If we have dictionary filters, pre-compute matching row indices.
-        // This turns the scanner from O(N) iteration into O(matches) iteration.
+        // Pre-compute matching row indices from dictionary filters.
+        // Skip pre-computation when match rate is too high (>10%) to avoid
+        // large Vec allocation — use streaming dict filter in the slow path instead.
         if !self.dict_filters.is_empty() {
-            let mut matches = Vec::new();
-            for i in self.current_idx..self.end_idx {
-                let mut row_matches = true;
-                for &(col_idx, expected_id) in &self.dict_filters {
-                    if self.volume.columns[col_idx].is_null(i)
-                        || self.volume.columns[col_idx].get_dict_id(i) != expected_id
-                    {
-                        row_matches = false;
+            let scan_range = self.end_idx - self.current_idx;
+            let selectivity_cap = scan_range / 10; // 10% threshold
+            let matches = if let Some(st) = store {
+                let mut m = Vec::new();
+                let first_col = self.dict_filters[0].0;
+                let num_grp = st.num_groups(first_col);
+                let mut exceeded = false;
+                for gi in 0..num_grp {
+                    let gs = gi * super::column::ROW_GROUP_SIZE;
+                    let ge = ((gi + 1) * super::column::ROW_GROUP_SIZE).min(self.end_idx);
+                    if gs >= self.end_idx || ge <= self.current_idx {
+                        continue;
+                    }
+                    let mut group_cols = Vec::with_capacity(self.dict_filters.len());
+                    let mut corrupt = false;
+                    for &(ci, _) in &self.dict_filters {
+                        match st.decompress_single_group(ci, gi) {
+                            Ok(col) => group_cols.push(col),
+                            Err(_) => {
+                                corrupt = true;
+                                break;
+                            }
+                        }
+                    }
+                    if corrupt {
+                        self.current_idx = self.end_idx;
+                        self.error =
+                            Some(Error::internal("corrupt V4 block during dictionary filter"));
+                        self.filter = Some(filter);
+                        return;
+                    }
+                    for i in gs.max(self.current_idx)..ge {
+                        let local = i - gs;
+                        let ok = self.dict_filters.iter().zip(group_cols.iter()).all(
+                            |(&(_, eid), col)| !col.is_null(local) && col.get_dict_id(local) == eid,
+                        );
+                        if ok {
+                            m.push(i);
+                        }
+                    }
+                    if m.len() > selectivity_cap {
+                        exceeded = true;
                         break;
                     }
                 }
-                if row_matches {
-                    matches.push(i);
+                if exceeded {
+                    None
+                } else {
+                    Some(m)
                 }
-            }
-            self.matching_indices = Some(matches);
+            } else {
+                let mut m = Vec::new();
+                for i in self.current_idx..self.end_idx {
+                    let ok = self.dict_filters.iter().all(|&(ci, eid)| {
+                        !self.volume.columns[ci].is_null(i)
+                            && self.volume.columns[ci].get_dict_id(i) == eid
+                    });
+                    if ok {
+                        m.push(i);
+                    }
+                    if m.len() > selectivity_cap {
+                        break;
+                    }
+                }
+                if m.len() > selectivity_cap {
+                    None
+                } else {
+                    Some(m)
+                }
+            };
+            self.matching_indices = matches;
         }
-        // Extract typed pre-filter predicates for non-text columns.
-        // These are evaluated directly on raw column data (get_i64, get_f64, get_bool)
-        // without constructing Value objects. Only AND-connected simple comparisons
-        // are extracted (collect_comparisons handles this).
+        // Extract typed pre-filter predicates using data_type() (no column decompression).
         for &(col_name, op, value) in &comparisons {
             if !matches!(
                 op,
@@ -324,26 +443,19 @@ impl VolumeScanner {
                 Some(idx) => idx,
                 None => continue,
             };
-            // Extract typed target matching the column's storage type.
-            // Text equality is already handled by dict_filters above.
-            let target = match (value, &self.volume.columns[col_idx]) {
-                (Value::Integer(v), super::column::ColumnData::Int64 { .. }) => {
-                    TypedTarget::Int64(*v)
-                }
-                (Value::Float(v), super::column::ColumnData::Float64 { .. }) => {
-                    TypedTarget::Float64(*v)
-                }
-                (Value::Boolean(v), super::column::ColumnData::Boolean { .. }) => {
-                    TypedTarget::Bool(*v)
-                }
-                (Value::Timestamp(dt), super::column::ColumnData::TimestampNanos { .. }) => {
+            let col_dt = self.volume.columns.data_type(col_idx);
+            let target = match (value, col_dt) {
+                (Value::Integer(v), crate::core::DataType::Integer) => TypedTarget::Int64(*v),
+                (Value::Float(v), crate::core::DataType::Float) => TypedTarget::Float64(*v),
+                (Value::Boolean(v), crate::core::DataType::Boolean) => TypedTarget::Bool(*v),
+                (Value::Timestamp(dt), crate::core::DataType::Timestamp) => {
                     TypedTarget::Int64(dt.timestamp_nanos_opt().unwrap_or_else(|| {
                         dt.timestamp()
                             .saturating_mul(1_000_000_000)
                             .saturating_add(dt.timestamp_subsec_nanos() as i64)
                     }))
                 }
-                (Value::Integer(v), super::column::ColumnData::Float64 { .. }) => {
+                (Value::Integer(v), crate::core::DataType::Float) => {
                     TypedTarget::Float64(*v as f64)
                 }
                 _ => continue,
@@ -432,15 +544,15 @@ impl VolumeScanner {
     #[inline]
     fn evaluate_typed_predicates(&self, idx: usize) -> bool {
         for pred in &self.typed_predicates {
-            let col = &self.volume.columns[pred.col_idx];
-            if col.is_null(idx) {
+            let (col, local) = self.col_and_idx(pred.col_idx, idx);
+            if col.is_null(local) {
                 // NULL: conservatively pass through (might match under SQL NULL semantics).
                 // The full filter will handle it correctly.
                 continue;
             }
             let matches = match &pred.target {
                 TypedTarget::Int64(target) => {
-                    let val = col.get_i64(idx);
+                    let val = col.get_i64(local);
                     match pred.op {
                         crate::core::Operator::Eq => val == *target,
                         crate::core::Operator::Ne => val != *target,
@@ -452,7 +564,7 @@ impl VolumeScanner {
                     }
                 }
                 TypedTarget::Float64(target) => {
-                    let val = col.get_f64(idx);
+                    let val = col.get_f64(local);
                     match pred.op {
                         crate::core::Operator::Eq => val == *target,
                         crate::core::Operator::Ne => val != *target,
@@ -464,7 +576,7 @@ impl VolumeScanner {
                     }
                 }
                 TypedTarget::Bool(target) => {
-                    let val = col.get_bool(idx);
+                    let val = col.get_bool(local);
                     match pred.op {
                         crate::core::Operator::Eq => val == *target,
                         crate::core::Operator::Ne => val != *target,
@@ -486,6 +598,66 @@ impl VolumeScanner {
         if !mapping.is_identity {
             self.column_mapping = Some(mapping);
         }
+    }
+
+    /// Get (column_data, local_index) for a global row index.
+    /// Uses group cache when available, falls back to full volume columns.
+    #[inline(always)]
+    fn col_and_idx(
+        &self,
+        col_idx: usize,
+        global_idx: usize,
+    ) -> (&super::column::ColumnData, usize) {
+        if let Some(ref cache) = self.group_cache {
+            if let Some(pair) = cache.col_and_local(col_idx, global_idx) {
+                return pair;
+            }
+        }
+        (&self.volume.columns[col_idx], global_idx)
+    }
+
+    /// Load group cache for a new row group. Decompresses only the columns
+    /// needed for filtering + projection from the compressed store.
+    fn load_group_cache(&mut self, group_idx: usize) {
+        let store = match self.volume.columns.compressed_store() {
+            Some(s) => s,
+            None => return,
+        };
+        let col_count = self.volume.columns.len();
+        let group_start = group_idx * super::column::ROW_GROUP_SIZE;
+
+        let mut columns: Vec<Option<super::column::ColumnData>> = vec![None; col_count];
+        if let Some(ref needed) = self.needed_cols {
+            for (ci, &need) in needed.iter().enumerate() {
+                if need && ci < col_count && group_idx < store.num_groups(ci) {
+                    match store.decompress_single_group(ci, group_idx) {
+                        Ok(col) => columns[ci] = Some(col),
+                        Err(e) => {
+                            self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));
+                            return;
+                        }
+                    }
+                }
+            }
+        } else {
+            for (ci, slot) in columns.iter_mut().enumerate() {
+                if group_idx < store.num_groups(ci) {
+                    match store.decompress_single_group(ci, group_idx) {
+                        Ok(col) => *slot = Some(col),
+                        Err(e) => {
+                            self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.group_cache = Some(GroupColumnCache {
+            group_idx,
+            columns,
+            group_start,
+        });
     }
 
     // =========================================================================
@@ -520,9 +692,8 @@ impl VolumeScanner {
     #[inline(always)]
     fn dict_filters_reject(&self, idx: usize) -> bool {
         for &(col_idx, expected_id) in &self.dict_filters {
-            if self.volume.columns[col_idx].is_null(idx)
-                || self.volume.columns[col_idx].get_dict_id(idx) != expected_id
-            {
+            let (col, local) = self.col_and_idx(col_idx, idx);
+            if col.is_null(local) || col.get_dict_id(local) != expected_id {
                 return true;
             }
         }
@@ -534,6 +705,12 @@ impl VolumeScanner {
     /// rejects the row.
     #[inline(always)]
     fn materialize_row(&mut self, idx: usize) -> bool {
+        // Per-group cache path: only when no schema mapping is needed.
+        // Schema-evolved volumes require column_mapping which remaps positions.
+        if self.group_cache.is_some() && self.column_mapping.is_none() {
+            return self.materialize_row_from_cache(idx);
+        }
+
         if let Some(ref filter) = self.filter {
             let full_row = match (&self.needed_cols, &self.column_mapping) {
                 (Some(mask), Some(mapping)) => {
@@ -576,6 +753,59 @@ impl VolumeScanner {
         }
         true
     }
+
+    /// Build a row from the per-group column cache (avoids full-column decompression).
+    fn materialize_row_from_cache(&mut self, idx: usize) -> bool {
+        let col_count = self.volume.columns.len();
+
+        // Build full-width row from cache
+        let full_row = if let Some(ref needed) = self.needed_cols {
+            let values: Vec<Value> = (0..col_count)
+                .map(|ci| {
+                    if ci < needed.len() && needed[ci] {
+                        let (col, local) = self.col_and_idx(ci, idx);
+                        col.get_value(local)
+                    } else {
+                        Value::Null(self.volume.columns.data_type(ci))
+                    }
+                })
+                .collect();
+            Row::from_values(values)
+        } else {
+            let values: Vec<Value> = (0..col_count)
+                .map(|ci| {
+                    let (col, local) = self.col_and_idx(ci, idx);
+                    col.get_value(local)
+                })
+                .collect();
+            Row::from_values(values)
+        };
+
+        // Apply filter if present
+        if let Some(ref filter) = self.filter {
+            if !filter.evaluate_fast(&full_row) {
+                return false;
+            }
+        }
+
+        // Project
+        if self.is_full_projection {
+            self.current_row = full_row;
+        } else {
+            self.current_row = Row::from_values(
+                self.project_cols
+                    .iter()
+                    .map(|&col| {
+                        full_row
+                            .get(col)
+                            .cloned()
+                            .unwrap_or(Value::Null(crate::core::DataType::Null))
+                    })
+                    .collect(),
+            );
+        }
+        true
+    }
 }
 
 impl Scanner for VolumeScanner {
@@ -586,8 +816,7 @@ impl Scanner for VolumeScanner {
         }
 
         // Fast path: use pre-computed matching indices (from dictionary filters).
-        // Copy indices length to avoid holding an immutable borrow on self
-        // across the mutable materialize_row call.
+        let use_group_cache_fast = self.volume.columns.should_use_group_cache();
         if self.matching_indices.is_some() {
             loop {
                 let idx = match self.matching_indices.as_ref() {
@@ -605,6 +834,20 @@ impl Scanner for VolumeScanner {
                 if self.should_skip_row(idx) {
                     continue;
                 }
+
+                // Load group cache on group transition (matching_indices are sorted)
+                if use_group_cache_fast {
+                    let gi = idx / super::column::ROW_GROUP_SIZE;
+                    let need_load = self.group_cache.as_ref().is_none_or(|c| c.group_idx != gi);
+                    if need_load {
+                        self.load_group_cache(gi);
+                        if self.error.is_some() {
+                            self.has_current = false;
+                            return false;
+                        }
+                    }
+                }
+
                 if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx) {
                     continue;
                 }
@@ -618,19 +861,29 @@ impl Scanner for VolumeScanner {
             }
         }
 
-        // Slow path: linear scan with row-group skipping
+        // Slow path: linear scan with row-group skipping + per-group decompression
+        let use_group_cache = self.volume.columns.should_use_group_cache();
         while self.current_idx < self.end_idx {
-            // Row-group skip: jump over entire groups whose zone maps prove
-            // no rows can match. Uses a cached boundary to avoid per-row
-            // integer division — only recomputed on group transitions.
-            if let Some(ref skips) = self.row_group_skips {
-                if self.current_idx >= self.next_group_boundary {
-                    let group_idx = self.current_idx / super::column::ROW_GROUP_SIZE;
-                    self.next_group_boundary =
-                        ((group_idx + 1) * super::column::ROW_GROUP_SIZE).min(self.end_idx);
+            // Row-group boundary: skip pruned groups + load group cache
+            if self.current_idx >= self.next_group_boundary {
+                let group_idx = self.current_idx / super::column::ROW_GROUP_SIZE;
+                self.next_group_boundary =
+                    ((group_idx + 1) * super::column::ROW_GROUP_SIZE).min(self.end_idx);
+
+                // Zone map skip
+                if let Some(ref skips) = self.row_group_skips {
                     if group_idx < skips.len() && skips[group_idx] {
                         self.current_idx = self.next_group_boundary;
                         continue;
+                    }
+                }
+
+                // Load per-group cache (V4 only)
+                if use_group_cache {
+                    self.load_group_cache(group_idx);
+                    if self.error.is_some() {
+                        self.has_current = false;
+                        return false;
                     }
                 }
             }

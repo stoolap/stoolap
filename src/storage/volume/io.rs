@@ -23,8 +23,12 @@ use std::sync::Arc;
 
 use crate::core::Result;
 
-use super::format::{deserialize_volume, serialize_volume};
-use super::writer::FrozenVolume;
+use super::column::ROW_GROUP_SIZE;
+use super::format::{
+    deserialize_volume, deserialize_volume_metadata, serialize_volume, serialize_volume_metadata,
+    COL_DICTIONARY,
+};
+use super::writer::{CompressedBlockStore, FrozenVolume, LazyColumns};
 
 /// Volume file extension
 const VOLUME_EXT: &str = "vol";
@@ -34,6 +38,12 @@ const VOLUME_EXT: &str = "vol";
 /// means decompress first, STVL means read directly. This keeps compression
 /// fully transparent to the format module.
 const COMPRESSED_MAGIC: [u8; 4] = *b"STVZ";
+
+/// Magic bytes for V4 per-column per-group compressed format.
+const V4_MAGIC: [u8; 4] = *b"STV4";
+
+/// V4 format version. Bump when the metadata or block layout changes.
+const V4_VERSION: u32 = 1;
 
 /// Volume catalog filename
 const CATALOG_FILE: &str = "volumes.catalog";
@@ -48,21 +58,25 @@ pub fn write_volume_to_disk(
     volume_id: u64,
     volume: &FrozenVolume,
 ) -> Result<PathBuf> {
-    write_volume_to_disk_opts(dir, table_name, volume_id, volume, true)
+    let (path, _store) = write_volume_to_disk_opts(dir, table_name, volume_id, volume, true)?;
+    Ok(path)
 }
 
 /// Write a frozen volume to disk atomically, with optional LZ4 compression.
 ///
-/// When `compress` is true, the serialized bytes are LZ4-compressed and
-/// prefixed with the STVZ magic. When false (or compression doesn't shrink
-/// the data), the raw STVL format is written.
+/// When `compress` is true, writes V4 format (per-column per-group LZ4 blocks).
+/// V4 enables lazy column loading on read — only metadata is decompressed at
+/// startup, columns are decompressed from RAM on demand.
+/// When false, writes legacy STVL format.
+/// Returns (path, Option<CompressedBlockStore>). When V4, the store is returned
+/// so callers can register a lazy volume without re-reading from disk.
 pub fn write_volume_to_disk_opts(
     dir: &Path,
     table_name: &str,
     volume_id: u64,
     volume: &FrozenVolume,
     compress: bool,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Option<CompressedBlockStore>)> {
     let table_dir = dir.join(table_name);
     std::fs::create_dir_all(&table_dir)
         .map_err(|e| crate::core::Error::internal(format!("failed to create volume dir: {}", e)))?;
@@ -71,31 +85,16 @@ pub fn write_volume_to_disk_opts(
     let final_path = table_dir.join(&filename);
     let tmp_path = table_dir.join(format!("{}.tmp", filename));
 
-    let raw = serialize_volume(volume)
-        .map_err(|e| crate::core::Error::internal(format!("failed to serialize volume: {}", e)))?;
-
-    // LZ4 compress when enabled and it actually shrinks the data.
-    // Wrap with STVZ magic so the reader can detect compressed vs uncompressed.
-    // Drop raw before building output to avoid holding both in memory.
-    let data = if compress {
-        let raw_len = raw.len();
-        let compressed = lz4_flex::compress_prepend_size(&raw);
-        if COMPRESSED_MAGIC.len() + compressed.len() < raw_len {
-            drop(raw);
-            let mut out = Vec::with_capacity(COMPRESSED_MAGIC.len() + compressed.len());
-            out.extend_from_slice(&COMPRESSED_MAGIC);
-            out.extend_from_slice(&compressed);
-            out
-        } else {
-            raw
-        }
+    let (data, store) = if compress {
+        let (bytes, s) = serialize_v4(volume)
+            .map_err(|e| crate::core::Error::internal(format!("V4 serialize failed: {}", e)))?;
+        (bytes, Some(s))
     } else {
-        raw
+        let bytes = serialize_volume(volume)
+            .map_err(|e| crate::core::Error::internal(format!("serialize failed: {}", e)))?;
+        (bytes, None)
     };
 
-    // Write to tmp file, fsync BEFORE rename for crash safety.
-    // Without fsync-before-rename, a power failure after rename could leave
-    // the file with zeros (metadata journaled, data not yet flushed).
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
@@ -108,13 +107,12 @@ pub fn write_volume_to_disk_opts(
             crate::core::Error::internal(format!("failed to fsync volume tmp file: {}", e))
         })?;
     }
+    drop(data);
 
     std::fs::rename(&tmp_path, &final_path).map_err(|e| {
         crate::core::Error::internal(format!("failed to rename volume file: {}", e))
     })?;
 
-    // Fsync the parent directory to ensure the rename is durable.
-    // Windows does not support opening directories for fsync.
     #[cfg(not(windows))]
     if let Ok(d) = std::fs::File::open(&table_dir) {
         d.sync_all().map_err(|e| {
@@ -122,29 +120,281 @@ pub fn write_volume_to_disk_opts(
         })?;
     }
 
-    Ok(final_path)
+    Ok((final_path, store))
+}
+
+/// Serialize a FrozenVolume to V4 format.
+///
+/// Layout:
+/// ```text
+/// [STV4 (4)] [version (4)] [col_count (4)] [num_groups (4)] [meta_compressed_len (4)]
+/// [LZ4(metadata)]
+/// [block_index: (compressed_len: u64, decompressed_len: u64) * col_count * num_groups]
+/// [LZ4 blocks: col_0_grp_0, col_0_grp_1, ..., col_N_grp_G]
+/// [CRC32 (4)]
+/// ```
+/// Returns (file_bytes, CompressedBlockStore). The store can be used to register
+/// a lazy volume without re-reading from disk — avoids keeping eager columns in RAM.
+fn serialize_v4(vol: &FrozenVolume) -> std::io::Result<(Vec<u8>, CompressedBlockStore)> {
+    use std::io::Write;
+
+    let col_count = vol.columns.len();
+    let group_size = ROW_GROUP_SIZE;
+    let num_groups = if vol.row_count == 0 {
+        0
+    } else {
+        vol.row_count.div_ceil(group_size)
+    };
+
+    // 1. Serialize + compress metadata
+    let meta_raw = serialize_volume_metadata(vol)?;
+    let meta_compressed = lz4_flex::compress_prepend_size(&meta_raw);
+    drop(meta_raw);
+
+    // 2. Build CompressedBlockStore (compresses all column blocks)
+    let store =
+        CompressedBlockStore::compress_columns(&vol.columns, &vol.column_types, vol.row_count);
+
+    // 3. Compute total size for pre-allocation
+    let all_blocks = store.raw_blocks();
+    let all_decomp_lens = store.decompressed_lens();
+    let block_lens_size = col_count * num_groups * 16;
+    let total_block_bytes: usize = all_blocks
+        .iter()
+        .flat_map(|c| c.iter())
+        .map(|b| b.len())
+        .sum();
+    let total_size = 20 + meta_compressed.len() + block_lens_size + total_block_bytes + 4;
+    let mut buf = Vec::with_capacity(total_size);
+
+    // 4. Fixed header (20 bytes)
+    buf.write_all(&V4_MAGIC)?;
+    buf.write_all(&V4_VERSION.to_le_bytes())?;
+    buf.write_all(&(col_count as u32).to_le_bytes())?;
+    buf.write_all(&(num_groups as u32).to_le_bytes())?;
+    buf.write_all(&(meta_compressed.len() as u32).to_le_bytes())?;
+
+    // 5. Compressed metadata
+    buf.write_all(&meta_compressed)?;
+    drop(meta_compressed);
+
+    // 6. Block index: (compressed_len: u64, decompressed_len: u64) pairs
+    for (col_blocks, col_decomp) in all_blocks.iter().zip(all_decomp_lens.iter()) {
+        for (block, &decomp_len) in col_blocks.iter().zip(col_decomp.iter()) {
+            buf.write_all(&(block.len() as u64).to_le_bytes())?;
+            buf.write_all(&(decomp_len as u64).to_le_bytes())?;
+        }
+    }
+
+    // 7. Block data
+    for col_blocks in all_blocks {
+        for block in col_blocks {
+            buf.write_all(block)?;
+        }
+    }
+
+    // 8. Trailing CRC32
+    let crc = crc32fast::hash(&buf);
+    buf.write_all(&crc.to_le_bytes())?;
+
+    Ok((buf, store))
+}
+
+/// Read a V4 volume via streaming I/O. Never holds the full file in memory.
+/// CRC32 is computed incrementally as sections are read.
+/// Peak memory = compressed_metadata + parsed_metadata + compressed_blocks.
+fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
+    use std::io::Read;
+
+    let inv = |msg: &str| crate::core::Error::internal(format!("V4: {}", msg));
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| crate::core::Error::internal(format!("V4 open {:?}: {}", path, e)))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| crate::core::Error::internal(format!("V4 stat {:?}: {}", path, e)))?
+        .len() as usize;
+    if file_len < 24 {
+        return Err(inv("file too small"));
+    }
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = crc32fast::Hasher::new();
+
+    // Helper: read exact bytes and feed to CRC
+    macro_rules! crc_read {
+        ($buf:expr) => {{
+            reader
+                .read_exact($buf)
+                .map_err(|e| crate::core::Error::internal(format!("V4 read: {}", e)))?;
+            hasher.update($buf);
+        }};
+    }
+
+    // 1. Fixed header (20 bytes)
+    let mut header = [0u8; 20];
+    crc_read!(&mut header);
+
+    if header[0..4] != V4_MAGIC {
+        return Err(inv("bad magic"));
+    }
+    let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if version != V4_VERSION {
+        return Err(inv(&format!("unsupported version {}", version)));
+    }
+    let col_count = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+    let num_groups = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    let meta_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+
+    // 2. Compressed metadata (read into temp buffer, decompress, drop)
+    let mut meta_compressed = vec![0u8; meta_len];
+    crc_read!(&mut meta_compressed);
+
+    let meta_raw = lz4_flex::decompress_size_prepended(&meta_compressed)
+        .map_err(|e| inv(&format!("metadata LZ4: {}", e)))?;
+    drop(meta_compressed);
+    let meta = deserialize_volume_metadata(&meta_raw)
+        .map_err(|e| crate::core::Error::internal(format!("V4 metadata: {}", e)))?;
+    drop(meta_raw);
+
+    if meta.col_type_tags.len() != col_count {
+        return Err(inv(&format!(
+            "col_count mismatch: header={}, metadata={}",
+            col_count,
+            meta.col_type_tags.len()
+        )));
+    }
+
+    // 3. Block index: (compressed_len: u64, decompressed_len: u64) pairs
+    let total_blocks = col_count * num_groups;
+    let mut index_buf = vec![0u8; total_blocks * 16];
+    crc_read!(&mut index_buf);
+
+    let mut compressed_lens = Vec::with_capacity(total_blocks);
+    let mut decompressed_lens_flat = Vec::with_capacity(total_blocks);
+    for i in 0..total_blocks {
+        let off = i * 16;
+        compressed_lens
+            .push(u64::from_le_bytes(index_buf[off..off + 8].try_into().unwrap()) as usize);
+        decompressed_lens_flat
+            .push(u64::from_le_bytes(index_buf[off + 8..off + 16].try_into().unwrap()) as usize);
+    }
+    drop(index_buf);
+
+    // 4. Read blocks one at a time (no full file buffer)
+    let mut all_blocks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(col_count);
+    let mut all_decomp_lens: Vec<Vec<usize>> = Vec::with_capacity(col_count);
+    let mut block_idx = 0;
+    for _ in 0..col_count {
+        let mut col_blocks = Vec::with_capacity(num_groups);
+        let mut col_decomp = Vec::with_capacity(num_groups);
+        for _ in 0..num_groups {
+            let len = compressed_lens[block_idx];
+            let mut block = vec![0u8; len];
+            crc_read!(&mut block);
+            col_blocks.push(block);
+            col_decomp.push(decompressed_lens_flat[block_idx]);
+            block_idx += 1;
+        }
+        all_blocks.push(col_blocks);
+        all_decomp_lens.push(col_decomp);
+    }
+
+    // 5. Verify CRC32 (computed incrementally over everything we read)
+    let mut crc_buf = [0u8; 4];
+    reader
+        .read_exact(&mut crc_buf)
+        .map_err(|e| crate::core::Error::internal(format!("V4 CRC read: {}", e)))?;
+    let stored_crc = u32::from_le_bytes(crc_buf);
+    if hasher.finalize() != stored_crc {
+        return Err(inv("CRC mismatch"));
+    }
+
+    // 6. Build dict_ranges (O(C) accumulation)
+    let mut dict_ranges = Vec::new();
+    let mut dict_start = 0usize;
+    for (i, &tag) in meta.col_type_tags.iter().enumerate() {
+        if tag == COL_DICTIONARY {
+            let count = meta.col_dict_counts[i] as usize;
+            dict_ranges.push((i, dict_start, dict_start + count));
+            dict_start += count;
+        }
+    }
+
+    let col_data_types = meta.column_types.clone();
+
+    let store = CompressedBlockStore::from_raw_blocks(
+        all_blocks,
+        all_decomp_lens,
+        meta.col_type_tags.clone(),
+        col_data_types.clone(),
+        meta.col_ext_types.clone(),
+        meta.shared_dict,
+        dict_ranges,
+        ROW_GROUP_SIZE,
+        meta.row_count,
+    );
+
+    // Eagerly decompress all columns from CompressedBlockStore into RAM.
+    // V3 (STVZ) loads all columns at startup; V4 must match for equal
+    // performance on INSERT/upsert/aggregate paths. The CompressedBlockStore
+    // is consumed — no duplicate memory.
+    let eager_columns: Vec<super::column::ColumnData> = (0..store.col_count())
+        .map(|ci| store.decompress_column(ci))
+        .collect();
+
+    Ok(FrozenVolume {
+        columns: LazyColumns::eager(eager_columns, col_data_types),
+        zone_maps: meta.zone_maps,
+        bloom_filters: meta.bloom_filters,
+        stats: meta.stats,
+        row_count: meta.row_count,
+        column_names: meta.column_names,
+        column_types: meta.column_types,
+        row_ids: meta.row_ids,
+        sorted_columns: meta.col_sorted,
+        column_name_map: meta.column_name_map,
+        unique_indices: parking_lot::RwLock::new(rustc_hash::FxHashMap::default()),
+        row_groups: meta.row_groups,
+    })
 }
 
 /// Read a frozen volume from disk.
 ///
-/// Detects LZ4-compressed files (STVZ magic) and decompresses transparently.
-/// Uncompressed files (STVL magic) are read directly.
+/// Detects format by peeking at magic bytes:
+/// - STV4: streaming read with incremental CRC (no full file buffer)
+/// - STVZ/STVL: legacy full read (converted to V4 on compaction)
 pub fn read_volume_from_disk(path: &Path) -> Result<FrozenVolume> {
-    let data = std::fs::read(path).map_err(|e| {
-        crate::core::Error::internal(format!("failed to read volume file {:?}: {}", path, e))
-    })?;
+    use std::io::Read;
 
-    if data.len() >= 4 && data[..4] == COMPRESSED_MAGIC {
-        let raw = lz4_flex::decompress_size_prepended(&data[4..]).map_err(|e| {
-            crate::core::Error::internal(format!("failed to decompress volume {:?}: {}", path, e))
+    let mut magic = [0u8; 4];
+    {
+        let mut f = std::fs::File::open(path).map_err(|e| {
+            crate::core::Error::internal(format!("failed to open volume {:?}: {}", path, e))
         })?;
-        deserialize_volume(&raw).map_err(|e| {
-            crate::core::Error::internal(format!("failed to deserialize volume {:?}: {}", path, e))
-        })
+        f.read_exact(&mut magic).map_err(|e| {
+            crate::core::Error::internal(format!("failed to read magic {:?}: {}", path, e))
+        })?;
+    }
+
+    if magic == V4_MAGIC {
+        read_volume_v4(path)
     } else {
-        deserialize_volume(&data).map_err(|e| {
-            crate::core::Error::internal(format!("failed to deserialize volume {:?}: {}", path, e))
-        })
+        let data = std::fs::read(path).map_err(|e| {
+            crate::core::Error::internal(format!("failed to read volume {:?}: {}", path, e))
+        })?;
+        if data.len() >= 4 && data[..4] == COMPRESSED_MAGIC {
+            let raw = lz4_flex::decompress_size_prepended(&data[4..]).map_err(|e| {
+                crate::core::Error::internal(format!("failed to decompress {:?}: {}", path, e))
+            })?;
+            deserialize_volume(&raw).map_err(|e| {
+                crate::core::Error::internal(format!("failed to deserialize {:?}: {}", path, e))
+            })
+        } else {
+            deserialize_volume(&data).map_err(|e| {
+                crate::core::Error::internal(format!("failed to deserialize {:?}: {}", path, e))
+            })
+        }
     }
 }
 
@@ -630,5 +880,206 @@ mod tests {
         assert_eq!(list_volumes(dir.path(), "t").len(), 1);
         delete_all_volumes(dir.path(), "t").unwrap();
         assert_eq!(list_volumes(dir.path(), "t").len(), 0);
+    }
+
+    #[test]
+    fn test_v4_roundtrip_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .column("name", DataType::Text, false, false)
+            .column("price", DataType::Float, false, false)
+            .build();
+
+        let mut builder = VolumeBuilder::with_capacity(&schema, 3);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![
+                Value::Integer(1),
+                Value::text("apple"),
+                Value::Float(1.50),
+            ]),
+        );
+        builder.add_row(
+            2,
+            &Row::from_values(vec![
+                Value::Integer(2),
+                Value::text("banana"),
+                Value::Float(0.75),
+            ]),
+        );
+        builder.add_row(
+            3,
+            &Row::from_values(vec![
+                Value::Integer(3),
+                Value::text("apple"),
+                Value::Float(3.00),
+            ]),
+        );
+        let vol = builder.finish();
+
+        // write_volume_to_disk with compress=true produces V4
+        let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
+        // Verify STV4 magic
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..4], b"STV4");
+
+        // Read back and verify eager loading
+        let loaded = read_volume_from_disk(&path).unwrap();
+        assert_eq!(loaded.row_count, 3);
+
+        // Access columns triggers decompression from RAM
+        assert_eq!(loaded.columns[0].get_i64(0), 1);
+        assert_eq!(loaded.columns[0].get_i64(2), 3);
+        assert_eq!(loaded.columns[1].get_str(0), "apple");
+        assert_eq!(loaded.columns[1].get_str(1), "banana");
+        assert_eq!(loaded.columns[2].get_f64(1), 0.75);
+
+        // Zone maps survived
+        assert_eq!(loaded.zone_maps[0].min, Value::Integer(1));
+        assert_eq!(loaded.zone_maps[0].max, Value::Integer(3));
+
+        // Stats survived
+        assert_eq!(loaded.stats.count_star(), 3);
+        assert_eq!(loaded.stats.sum(2), 5.25);
+
+        // Sorted flags survived
+        assert!(loaded.sorted_columns[0]);
+
+        // Row IDs survived
+        assert_eq!(loaded.row_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_v4_roundtrip_with_nulls() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .column("value", DataType::Float, true, false)
+            .build();
+
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(1), Value::Float(10.0)]),
+        );
+        builder.add_row(
+            2,
+            &Row::from_values(vec![Value::Integer(2), Value::Null(DataType::Float)]),
+        );
+        builder.add_row(
+            3,
+            &Row::from_values(vec![Value::Integer(3), Value::Float(30.0)]),
+        );
+        let vol = builder.finish();
+
+        let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
+        let loaded = read_volume_from_disk(&path).unwrap();
+
+        assert_eq!(loaded.row_count, 3);
+        assert!(!loaded.columns[1].is_null(0));
+        assert!(loaded.columns[1].is_null(1));
+        assert!(!loaded.columns[1].is_null(2));
+        assert_eq!(loaded.columns[1].get_f64(0), 10.0);
+        assert_eq!(loaded.columns[1].get_f64(2), 30.0);
+    }
+
+    #[test]
+    fn test_v4_roundtrip_multiple_row_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .column("label", DataType::Text, false, false)
+            .build();
+
+        // Create > ROW_GROUP_SIZE rows to exercise multi-group path
+        let n = 70_000; // > 65536 (ROW_GROUP_SIZE)
+        let mut builder = VolumeBuilder::with_capacity(&schema, n);
+        for i in 0..n {
+            builder.add_row(
+                i as i64,
+                &Row::from_values(vec![
+                    Value::Integer(i as i64),
+                    Value::text(if i % 2 == 0 { "even" } else { "odd" }),
+                ]),
+            );
+        }
+        let vol = builder.finish();
+
+        let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
+        let loaded = read_volume_from_disk(&path).unwrap();
+
+        assert_eq!(loaded.row_count, n);
+
+        // Check first, middle, and last rows
+        assert_eq!(loaded.columns[0].get_i64(0), 0);
+        assert_eq!(loaded.columns[0].get_i64(n / 2), (n / 2) as i64);
+        assert_eq!(loaded.columns[0].get_i64(n - 1), (n - 1) as i64);
+        assert_eq!(loaded.columns[1].get_str(0), "even");
+        assert_eq!(loaded.columns[1].get_str(1), "odd");
+        assert_eq!(loaded.columns[1].get_str(n - 1), "odd");
+
+        // Row groups present
+        assert!(!loaded.row_groups.is_empty());
+    }
+
+    #[test]
+    fn test_v4_roundtrip_timestamp_boolean() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = SchemaBuilder::new("test")
+            .column("time", DataType::Timestamp, false, false)
+            .column("flag", DataType::Boolean, false, false)
+            .build();
+
+        let ts = chrono::Utc::now();
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Timestamp(ts), Value::Boolean(true)]),
+        );
+        builder.add_row(
+            2,
+            &Row::from_values(vec![
+                Value::Timestamp(ts + chrono::Duration::minutes(1)),
+                Value::Boolean(false),
+            ]),
+        );
+        let vol = builder.finish();
+
+        let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
+        let loaded = read_volume_from_disk(&path).unwrap();
+
+        assert_eq!(loaded.row_count, 2);
+        // Timestamp nanosecond precision
+        if let Value::Timestamp(loaded_ts) = loaded.columns[0].get_value(0) {
+            assert_eq!(loaded_ts.timestamp_nanos_opt(), ts.timestamp_nanos_opt());
+        } else {
+            panic!("expected Timestamp");
+        }
+        assert!(loaded.columns[1].get_bool(0));
+        assert!(!loaded.columns[1].get_bool(1));
+    }
+
+    #[test]
+    fn test_v4_get_row_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .column("name", DataType::Text, false, false)
+            .build();
+
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(42), Value::text("test")]),
+        );
+        let vol = builder.finish();
+
+        let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
+        let loaded = read_volume_from_disk(&path).unwrap();
+
+        let row = loaded.get_row(0);
+        assert_eq!(row.get(0), Some(&Value::Integer(42)));
+        assert_eq!(row.get(1), Some(&Value::text("test")));
     }
 }

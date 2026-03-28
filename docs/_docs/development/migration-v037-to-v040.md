@@ -19,9 +19,9 @@ v0.4.0 replaces the snapshot-based persistence engine with an immutable volume-b
 | Persistence format | Monolithic row-serialized `.bin` per table | Columnar `.vol` files with zone maps, bloom filters, dictionary encoding, LZ4 compression |
 | Persistence location | `snapshots/<table>/` | `volumes/<table>/` |
 | Metadata | `snapshot_meta.bin` | `manifest.bin` per table (versioned, V4 format) |
-| Startup speed | Proportional to data size (deserialize all rows into memory) | Near-instant (cold data stays on disk, only WAL replay for recent writes) |
-| Memory usage | All data in memory at all times | Only hot buffer in memory, cold data read on demand |
-| Query on persisted data | Must be in memory first | Zone map pruning, bloom filters, row-group skipping, column projection directly from disk |
+| Startup speed | Proportional to data size (deserialize all rows into memory) | Loads compressed blocks + metadata into RAM, WAL replay for recent writes |
+| Memory usage | All data in memory at all times | Compressed blocks in RAM, columns decompressed from RAM on first access |
+| Query on persisted data | Must be in memory first | Zone map pruning, bloom filters, row-group skipping, lazy column decompression from RAM |
 | Snapshot isolation | Hot buffer only | Full support including cold rows via versioned tombstones |
 | Concurrent writes to persisted rows | N/A (all rows in memory) | Per-table seal fence + row-level claim prevents lost updates |
 | Compaction | Not applicable | Adaptive 4-phase merge (convergence, opportunistic, incremental dedup, epoch staleness) |
@@ -202,7 +202,7 @@ Key differences:
 - `volumes/` replaces `snapshots/` as primary storage
 - Each table has a `manifest.bin` tracking its volumes and tombstones
 - `.vol` files are columnar (not row-serialized `.bin`), with per-column zone maps, bloom filters, and dictionary encoding
-- `.vol` files use LZ4 compression by default (STVZ magic header when compressed, STVL when uncompressed)
+- `.vol` files use V4 format (STV4 magic) with per-column per-row-group LZ4 blocks. Legacy STVZ/STVL formats are read but converted to V4 on compaction
 - Row-group zone maps (64K-row groups) enable sub-volume pruning
 - `snapshots/` only appears if you explicitly run `PRAGMA SNAPSHOT` for backups
 
@@ -278,8 +278,8 @@ v0.3.7 snapshot creation serialized the entire hot buffer under a lock, which co
 
 - `COUNT(*)` uses O(1) formula during seal overlap (no scanning needed)
 - Aggregation pushdowns (`SUM`, `MIN`, `MAX`) use pre-computed cold volume statistics
-- Cold data scanning is lazy via `MergingScanner` (streams rows from volumes without loading all into memory)
-- Column pruning: only columns referenced by filters and projections are materialized from cold storage
+- Cold data scanning is lazy via `MergingScanner` (streams rows from volumes, columns decompressed from RAM on first access)
+- Column pruning: only columns referenced by filters and projections are decompressed from compressed in-memory blocks
 
 ### Aggregation Pushdown
 

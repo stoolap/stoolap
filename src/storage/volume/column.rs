@@ -22,6 +22,8 @@
 //! referencing a deduplicated string table, reducing storage for repeated
 //! values (e.g., exchange names, symbols) from N bytes to 4 bytes.
 
+use std::sync::Arc;
+
 use crate::common::SmartString;
 use crate::core::{DataType, Value};
 
@@ -30,6 +32,7 @@ use crate::core::{DataType, Value};
 /// Each variant stores a flat array of the native type plus a null bitmap.
 /// The null bitmap uses one byte per row (not bit-packed) for simplicity
 /// and fast random access. For 1M rows this is 1MB overhead.
+#[derive(Clone)]
 pub enum ColumnData {
     /// 64-bit signed integers with null bitmap.
     /// Used for INTEGER columns and auto-increment IDs.
@@ -54,8 +57,8 @@ pub enum ColumnData {
     Dictionary {
         /// Per-row dictionary IDs
         ids: Vec<u32>,
-        /// Deduplicated string table
-        dictionary: Vec<SmartString>,
+        /// Deduplicated string table (Arc for cheap cloning across row groups)
+        dictionary: Arc<[SmartString]>,
         /// Null bitmap
         nulls: Vec<bool>,
     },
@@ -110,6 +113,29 @@ pub struct RowGroupMeta {
 }
 
 impl ColumnData {
+    /// Estimate in-memory size of this column in bytes.
+    pub fn memory_size(&self) -> usize {
+        match self {
+            ColumnData::Int64 { values, nulls } => values.len() * 8 + nulls.len(),
+            ColumnData::Float64 { values, nulls } => values.len() * 8 + nulls.len(),
+            ColumnData::TimestampNanos { values, nulls } => values.len() * 8 + nulls.len(),
+            ColumnData::Boolean { values, nulls } => values.len() + nulls.len(),
+            ColumnData::Dictionary {
+                ids,
+                dictionary,
+                nulls,
+            } => {
+                ids.len() * 4 + dictionary.iter().map(|s| s.len() + 24).sum::<usize>() + nulls.len()
+            }
+            ColumnData::Bytes {
+                data,
+                offsets,
+                nulls,
+                ..
+            } => data.len() + offsets.len() * 16 + nulls.len(),
+        }
+    }
+
     /// Compute a zone map (min/max) for a range [start, end) of this column.
     /// Uses typed comparisons directly on the underlying arrays to avoid
     /// constructing Value objects for every row.
@@ -849,7 +875,10 @@ mod tests {
     fn test_dictionary_column() {
         let col = ColumnData::Dictionary {
             ids: vec![0, 1, 0, 1, 0],
-            dictionary: vec![SmartString::from("binance"), SmartString::from("coinbase")],
+            dictionary: Arc::from(vec![
+                SmartString::from("binance"),
+                SmartString::from("coinbase"),
+            ]),
             nulls: vec![false, false, false, false, false],
         };
         assert_eq!(col.get_str(0), "binance");

@@ -39,6 +39,7 @@
 //! ```
 
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use crate::common::SmartString;
 use crate::core::{DataType, Value};
@@ -53,15 +54,15 @@ const FORMAT_VERSION: u32 = 3;
 const FORMAT_VERSION_V2: u32 = 2;
 
 // Column type tags for the directory
-const COL_INT64: u8 = 1;
-const COL_FLOAT64: u8 = 2;
-const COL_TIMESTAMP: u8 = 3;
-const COL_BOOLEAN: u8 = 4;
-const COL_DICTIONARY: u8 = 5;
-const COL_BYTES: u8 = 6;
+pub(crate) const COL_INT64: u8 = 1;
+pub(crate) const COL_FLOAT64: u8 = 2;
+pub(crate) const COL_TIMESTAMP: u8 = 3;
+pub(crate) const COL_BOOLEAN: u8 = 4;
+pub(crate) const COL_DICTIONARY: u8 = 5;
+pub(crate) const COL_BYTES: u8 = 6;
 
 // Column flags
-const FLAG_SORTED: u8 = 0x01;
+pub(crate) const FLAG_SORTED: u8 = 0x01;
 
 /// Write a FrozenVolume to a byte buffer.
 ///
@@ -354,7 +355,7 @@ pub fn deserialize_volume(data: &[u8]) -> io::Result<FrozenVolume> {
                 // Dictionary will be filled after reading the shared dict
                 columns.push(ColumnData::Dictionary {
                     ids,
-                    dictionary: Vec::new(), // placeholder
+                    dictionary: Arc::from(Vec::<SmartString>::new()), // placeholder
                     nulls,
                 });
             }
@@ -422,7 +423,7 @@ pub fn deserialize_volume(data: &[u8]) -> io::Result<FrozenVolume> {
                     .map(|(_, &off)| off as usize)
                     .min()
                     .unwrap_or(shared_dict.len());
-                *dictionary = shared_dict[start..end].to_vec();
+                *dictionary = Arc::from(&shared_dict[start..end]);
             }
         }
     }
@@ -579,7 +580,15 @@ pub fn deserialize_volume(data: &[u8]) -> io::Result<FrozenVolume> {
     let column_name_map: ahash::AHashMap<crate::common::SmartString, usize> = column_names
         .iter()
         .enumerate()
-        .map(|(i, name)| (crate::common::SmartString::from(name.to_lowercase()), i))
+        .flat_map(|(i, name)| {
+            let lower = crate::common::SmartString::from(name.to_lowercase());
+            let original = crate::common::SmartString::from(name.as_str());
+            if lower == original {
+                vec![(lower, i)]
+            } else {
+                vec![(original, i), (lower, i)]
+            }
+        })
         .collect();
 
     // Resolve row groups: use deserialized (v3+) or compute from column data.
@@ -608,7 +617,7 @@ pub fn deserialize_volume(data: &[u8]) -> io::Result<FrozenVolume> {
     };
 
     Ok(FrozenVolume {
-        columns,
+        columns: super::writer::LazyColumns::eager(columns, column_types.clone()),
         zone_maps,
         bloom_filters,
         stats: VolumeAggregateStats {
@@ -1041,6 +1050,507 @@ fn read_value(data: &[u8], pos: &mut usize) -> io::Result<Value> {
             format!("unknown value tag {}", tag),
         )),
     }
+}
+
+// =============================================================================
+// V4 format: per-row-group per-column block serialization
+// =============================================================================
+
+/// Map DataType to column type tag for serialization.
+#[allow(dead_code)]
+pub(crate) fn data_type_to_col_tag(dt: DataType) -> u8 {
+    match dt {
+        DataType::Integer => COL_INT64,
+        DataType::Float => COL_FLOAT64,
+        DataType::Timestamp => COL_TIMESTAMP,
+        DataType::Boolean => COL_BOOLEAN,
+        DataType::Text => COL_DICTIONARY,
+        _ => COL_BYTES, // JSON, Vector, etc.
+    }
+}
+
+/// Serialize a single column's row range [start, end) to raw bytes.
+/// For Dictionary columns, only nulls+ids are written (dictionary stored separately).
+pub(crate) fn serialize_column_block(col: &ColumnData, start: usize, end: usize) -> Vec<u8> {
+    let count = end - start;
+    let estimated = match col {
+        ColumnData::Int64 { .. } | ColumnData::TimestampNanos { .. } => count * 9,
+        ColumnData::Float64 { .. } => count * 9,
+        ColumnData::Boolean { .. } => count * 2,
+        ColumnData::Dictionary { .. } => count * 5,
+        ColumnData::Bytes { .. } => count * 17,
+    };
+    let mut buf = Vec::with_capacity(estimated);
+    match col {
+        ColumnData::Int64 { values, nulls } => {
+            write_nulls(&mut buf, &nulls[start..end]).unwrap();
+            write_i64_bulk(&mut buf, &values[start..end]);
+        }
+        ColumnData::Float64 { values, nulls } => {
+            write_nulls(&mut buf, &nulls[start..end]).unwrap();
+            write_f64_bulk(&mut buf, &values[start..end]);
+        }
+        ColumnData::TimestampNanos { values, nulls } => {
+            write_nulls(&mut buf, &nulls[start..end]).unwrap();
+            write_i64_bulk(&mut buf, &values[start..end]);
+        }
+        ColumnData::Boolean { values, nulls } => {
+            write_nulls(&mut buf, &nulls[start..end]).unwrap();
+            write_bool_bulk(&mut buf, &values[start..end]);
+        }
+        ColumnData::Dictionary { ids, nulls, .. } => {
+            // Dictionary stored separately — only write nulls + ids
+            write_nulls(&mut buf, &nulls[start..end]).unwrap();
+            write_u32_bulk(&mut buf, &ids[start..end]);
+        }
+        ColumnData::Bytes {
+            data,
+            offsets,
+            nulls,
+            ..
+        } => {
+            write_nulls(&mut buf, &nulls[start..end]).unwrap();
+            let range_offsets = &offsets[start..end];
+            let count = end - start;
+            // Repack data blob with zero-based offsets for this block
+            let mut new_data = Vec::new();
+            let mut new_offsets = Vec::with_capacity(count);
+            for &(off, len) in range_offsets {
+                let new_off = new_data.len() as u64;
+                if len > 0 && (off as usize) < data.len() {
+                    let end_pos = ((off + len) as usize).min(data.len());
+                    new_data.extend_from_slice(&data[off as usize..end_pos]);
+                }
+                new_offsets.push((new_off, len));
+            }
+            buf.write_all(&(new_offsets.len() as u64).to_le_bytes())
+                .unwrap();
+            for (off, len) in &new_offsets {
+                buf.write_all(&off.to_le_bytes()).unwrap();
+                buf.write_all(&len.to_le_bytes()).unwrap();
+            }
+            buf.write_all(&(new_data.len() as u64).to_le_bytes())
+                .unwrap();
+            buf.write_all(&new_data).unwrap();
+        }
+    }
+    buf
+}
+
+/// Deserialize a single column block from raw bytes.
+/// For Dictionary columns, pass the dictionary; for Bytes columns, pass ext_type.
+pub(crate) fn deserialize_column_block(
+    data: &[u8],
+    col_type_tag: u8,
+    row_count: usize,
+    dictionary: Option<Arc<[SmartString]>>,
+    ext_type: DataType,
+) -> io::Result<ColumnData> {
+    let mut pos = 0;
+    match col_type_tag {
+        COL_INT64 => {
+            let nulls = read_nulls(data, &mut pos, row_count)?;
+            let values = read_i64_bulk(data, &mut pos, row_count)?;
+            Ok(ColumnData::Int64 { values, nulls })
+        }
+        COL_FLOAT64 => {
+            let nulls = read_nulls(data, &mut pos, row_count)?;
+            let values = read_f64_bulk(data, &mut pos, row_count)?;
+            Ok(ColumnData::Float64 { values, nulls })
+        }
+        COL_TIMESTAMP => {
+            let nulls = read_nulls(data, &mut pos, row_count)?;
+            let values = read_i64_bulk(data, &mut pos, row_count)?;
+            Ok(ColumnData::TimestampNanos { values, nulls })
+        }
+        COL_BOOLEAN => {
+            let nulls = read_nulls(data, &mut pos, row_count)?;
+            let values = read_bool_bulk(data, &mut pos, row_count)?;
+            Ok(ColumnData::Boolean { values, nulls })
+        }
+        COL_DICTIONARY => {
+            let nulls = read_nulls(data, &mut pos, row_count)?;
+            let ids = read_u32_bulk(data, &mut pos, row_count)?;
+            Ok(ColumnData::Dictionary {
+                ids,
+                dictionary: dictionary.unwrap_or_else(|| Arc::from(Vec::<SmartString>::new())),
+                nulls,
+            })
+        }
+        COL_BYTES => {
+            let nulls = read_nulls(data, &mut pos, row_count)?;
+            let offset_count = read_u64(data, &mut pos)? as usize;
+            let mut offsets = Vec::with_capacity(offset_count);
+            for _ in 0..offset_count {
+                let off = read_u64(data, &mut pos)?;
+                let len = read_u64(data, &mut pos)?;
+                offsets.push((off, len));
+            }
+            let data_len = read_u64(data, &mut pos)? as usize;
+            if pos + data_len > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated column block: bytes data",
+                ));
+            }
+            let blob = data[pos..pos + data_len].to_vec();
+            Ok(ColumnData::Bytes {
+                data: blob,
+                offsets,
+                ext_type,
+                nulls,
+            })
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown column type tag {}", col_type_tag),
+        )),
+    }
+}
+
+/// Metadata parsed from a V4 volume file (everything except column data).
+pub(crate) struct VolumeMetadata {
+    pub row_count: usize,
+    #[allow(dead_code)]
+    pub col_count: usize,
+    pub col_type_tags: Vec<u8>,
+    pub col_ext_types: Vec<u8>,
+    pub col_sorted: Vec<bool>,
+    pub col_dict_counts: Vec<u32>,
+    pub shared_dict: Vec<SmartString>,
+    pub row_ids: Vec<i64>,
+    pub zone_maps: Vec<ZoneMap>,
+    pub bloom_filters: Vec<super::column::ColumnBloomFilter>,
+    pub stats: VolumeAggregateStats,
+    pub column_names: Vec<String>,
+    pub column_types: Vec<DataType>,
+    pub row_groups: Vec<super::column::RowGroupMeta>,
+    pub column_name_map: ahash::AHashMap<SmartString, usize>,
+}
+
+/// Serialize volume metadata (everything except column data) for V4 format.
+/// The caller LZ4-compresses the result before writing to disk.
+pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8>> {
+    let col_count = vol.columns.len();
+    let estimated = 12 + col_count * 6 + vol.row_ids.len() * 8 + col_count * 40;
+    let mut buf = Vec::with_capacity(estimated);
+
+    // Row count + col count
+    buf.write_all(&(vol.row_count as u64).to_le_bytes())?;
+    buf.write_all(&(col_count as u32).to_le_bytes())?;
+
+    // Build shared dict from Dictionary columns
+    let mut shared_dict: Vec<SmartString> = Vec::new();
+    let mut dict_counts: Vec<u32> = Vec::new();
+    for i in 0..col_count {
+        if let ColumnData::Dictionary { dictionary, .. } = &vol.columns[i] {
+            dict_counts.push(dictionary.len() as u32);
+            shared_dict.extend(dictionary.iter().cloned());
+        }
+    }
+
+    // Column directory: type(1) + flags(1) + extra(4) per column
+    let mut dict_col_idx = 0usize;
+    for i in 0..col_count {
+        let col = &vol.columns[i];
+        let type_tag = match col {
+            ColumnData::Int64 { .. } => COL_INT64,
+            ColumnData::Float64 { .. } => COL_FLOAT64,
+            ColumnData::TimestampNanos { .. } => COL_TIMESTAMP,
+            ColumnData::Boolean { .. } => COL_BOOLEAN,
+            ColumnData::Dictionary { .. } => COL_DICTIONARY,
+            ColumnData::Bytes { .. } => COL_BYTES,
+        };
+        let sorted_flag = if vol.sorted_columns[i] {
+            FLAG_SORTED
+        } else {
+            0
+        };
+        buf.push(type_tag);
+        buf.push(sorted_flag);
+        if type_tag == COL_DICTIONARY {
+            buf.write_all(&dict_counts[dict_col_idx].to_le_bytes())?;
+            dict_col_idx += 1;
+        } else if type_tag == COL_BYTES {
+            let ext = match col {
+                ColumnData::Bytes { ext_type, .. } => *ext_type as u32,
+                _ => 0,
+            };
+            buf.write_all(&ext.to_le_bytes())?;
+        } else {
+            buf.write_all(&[0u8; 4])?;
+        }
+    }
+
+    // Shared dictionary
+    buf.write_all(&(shared_dict.len() as u32).to_le_bytes())?;
+    for s in &shared_dict {
+        let bytes = s.as_bytes();
+        buf.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        buf.write_all(bytes)?;
+    }
+
+    // Row IDs (bulk — single memcpy on LE)
+    write_i64_bulk(&mut buf, &vol.row_ids);
+
+    // Zone maps
+    for zm in &vol.zone_maps {
+        write_value(&mut buf, &zm.min)?;
+        write_value(&mut buf, &zm.max)?;
+        buf.write_all(&zm.null_count.to_le_bytes())?;
+        buf.write_all(&zm.row_count.to_le_bytes())?;
+    }
+
+    // Bloom filters
+    buf.write_all(&(vol.bloom_filters.len() as u32).to_le_bytes())?;
+    for bf in &vol.bloom_filters {
+        buf.write_all(&(bf.num_bits() as u64).to_le_bytes())?;
+        let data_bytes = bf.bits_as_bytes();
+        buf.write_all(&(data_bytes.len() as u32).to_le_bytes())?;
+        buf.write_all(&data_bytes)?;
+    }
+
+    // Stats
+    buf.write_all(&vol.stats.total_rows.to_le_bytes())?;
+    buf.write_all(&vol.stats.live_rows.to_le_bytes())?;
+    buf.write_all(&(vol.stats.columns.len() as u32).to_le_bytes())?;
+    for cs in &vol.stats.columns {
+        buf.write_all(&cs.sum_int.to_le_bytes())?;
+        buf.write_all(&cs.sum_float.to_le_bytes())?;
+        buf.write_all(&cs.numeric_count.to_le_bytes())?;
+        buf.write_all(&cs.non_null_count.to_le_bytes())?;
+        write_value(&mut buf, &cs.min)?;
+        write_value(&mut buf, &cs.max)?;
+    }
+
+    // Column names
+    for name in &vol.column_names {
+        let bytes = name.as_bytes();
+        buf.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        buf.write_all(bytes)?;
+    }
+
+    // Column types
+    for dt in &vol.column_types {
+        buf.push(*dt as u8);
+    }
+
+    // Row groups
+    buf.write_all(&(vol.row_groups.len() as u32).to_le_bytes())?;
+    for rg in &vol.row_groups {
+        buf.write_all(&rg.start_idx.to_le_bytes())?;
+        buf.write_all(&rg.end_idx.to_le_bytes())?;
+        for zm in &rg.zone_maps {
+            write_value(&mut buf, &zm.min)?;
+            write_value(&mut buf, &zm.max)?;
+            buf.write_all(&zm.null_count.to_le_bytes())?;
+            buf.write_all(&zm.row_count.to_le_bytes())?;
+        }
+    }
+
+    Ok(buf)
+}
+
+/// Deserialize volume metadata from V4 format bytes.
+pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetadata> {
+    let mut pos = 0;
+
+    let row_count = read_u64(data, &mut pos)? as usize;
+    let col_count = read_u32(data, &mut pos)? as usize;
+
+    // Column directory
+    let mut col_type_tags = Vec::with_capacity(col_count);
+    let mut col_ext_types = Vec::with_capacity(col_count);
+    let mut col_sorted = Vec::with_capacity(col_count);
+    let mut col_dict_counts = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        if pos + 2 > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated V4 column directory",
+            ));
+        }
+        let type_tag = data[pos];
+        pos += 1;
+        let flags = data[pos];
+        pos += 1;
+        let extra = read_u32(data, &mut pos)?;
+        col_type_tags.push(type_tag);
+        col_ext_types.push(if type_tag == COL_BYTES {
+            extra as u8
+        } else {
+            0
+        });
+        col_sorted.push(flags & FLAG_SORTED != 0);
+        col_dict_counts.push(if type_tag == COL_DICTIONARY { extra } else { 0 });
+    }
+
+    // Shared dictionary
+    let dict_len = read_u32(data, &mut pos)? as usize;
+    let mut shared_dict = Vec::with_capacity(dict_len);
+    for _ in 0..dict_len {
+        let slen = read_u32(data, &mut pos)? as usize;
+        if pos + slen > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated V4 metadata: dictionary string",
+            ));
+        }
+        let s = std::str::from_utf8(&data[pos..pos + slen])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        shared_dict.push(SmartString::from(s));
+        pos += slen;
+    }
+
+    // Row IDs (bulk read — single memcpy on LE platforms)
+    let row_ids = read_i64_bulk(data, &mut pos, row_count)?;
+
+    // Zone maps
+    let mut zone_maps = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        let min = read_value(data, &mut pos)?;
+        let max = read_value(data, &mut pos)?;
+        let null_count = read_u32(data, &mut pos)?;
+        let row_count_zm = read_u32(data, &mut pos)?;
+        zone_maps.push(ZoneMap {
+            min,
+            max,
+            null_count,
+            row_count: row_count_zm,
+        });
+    }
+
+    // Bloom filters
+    let num_blooms = read_u32(data, &mut pos)? as usize;
+    let mut bloom_filters = Vec::with_capacity(num_blooms);
+    for _ in 0..num_blooms {
+        let num_bits = read_u64(data, &mut pos)? as usize;
+        let data_len = read_u32(data, &mut pos)? as usize;
+        if pos + data_len > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated V4 metadata: bloom filter",
+            ));
+        }
+        let bits_bytes = &data[pos..pos + data_len];
+        pos += data_len;
+        bloom_filters.push(super::column::ColumnBloomFilter::from_parts(
+            num_bits, bits_bytes,
+        ));
+    }
+
+    // Stats
+    let total_rows = read_u64(data, &mut pos)?;
+    let live_rows = read_u64(data, &mut pos)?;
+    let stats_col_count = read_u32(data, &mut pos)? as usize;
+    let mut stat_columns = Vec::with_capacity(stats_col_count);
+    for _ in 0..stats_col_count {
+        let sum_int = read_i128(data, &mut pos)?;
+        let sum_float = read_f64(data, &mut pos)?;
+        let numeric_count = read_u64(data, &mut pos)?;
+        let non_null_count = read_u64(data, &mut pos)?;
+        let min = read_value(data, &mut pos)?;
+        let max = read_value(data, &mut pos)?;
+        stat_columns.push(ColumnAggregateStats {
+            sum_int,
+            sum_float,
+            numeric_count,
+            min,
+            max,
+            non_null_count,
+        });
+    }
+
+    // Column names
+    let mut column_names = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        let slen = read_u32(data, &mut pos)? as usize;
+        if pos + slen > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated V4 metadata: column name",
+            ));
+        }
+        let s = std::str::from_utf8(&data[pos..pos + slen])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        column_names.push(s.to_string());
+        pos += slen;
+    }
+
+    // Column types
+    let mut column_types = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        if pos >= data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated V4 metadata: column type",
+            ));
+        }
+        column_types.push(DataType::from_u8(data[pos]).unwrap_or(DataType::Null));
+        pos += 1;
+    }
+
+    // Row groups
+    let num_groups = read_u32(data, &mut pos)? as usize;
+    let mut row_groups = Vec::with_capacity(num_groups);
+    for _ in 0..num_groups {
+        let start_idx = read_u32(data, &mut pos)?;
+        let end_idx = read_u32(data, &mut pos)?;
+        let mut group_zone_maps = Vec::with_capacity(col_count);
+        for _ in 0..col_count {
+            let min = read_value(data, &mut pos)?;
+            let max = read_value(data, &mut pos)?;
+            let nc = read_u32(data, &mut pos)?;
+            let rc = read_u32(data, &mut pos)?;
+            group_zone_maps.push(ZoneMap {
+                min,
+                max,
+                null_count: nc,
+                row_count: rc,
+            });
+        }
+        row_groups.push(super::column::RowGroupMeta {
+            start_idx,
+            end_idx,
+            zone_maps: group_zone_maps,
+        });
+    }
+
+    let column_name_map = column_names
+        .iter()
+        .enumerate()
+        .flat_map(|(i, name)| {
+            let lower = SmartString::from(name.to_lowercase());
+            let original = SmartString::from(name.as_str());
+            if lower == original {
+                vec![(lower, i)]
+            } else {
+                vec![(original, i), (lower, i)]
+            }
+        })
+        .collect();
+
+    Ok(VolumeMetadata {
+        row_count,
+        col_count,
+        col_type_tags,
+        col_ext_types,
+        col_sorted,
+        col_dict_counts,
+        shared_dict,
+        row_ids,
+        zone_maps,
+        bloom_filters,
+        stats: VolumeAggregateStats {
+            total_rows,
+            live_rows,
+            columns: stat_columns,
+        },
+        column_names,
+        column_types,
+        row_groups,
+        column_name_map,
+    })
 }
 
 #[cfg(test)]
