@@ -27,20 +27,14 @@ use crate::core::Result;
 use super::column::ColumnData;
 use super::column::ROW_GROUP_SIZE;
 use super::format::{
-    deserialize_column_block, deserialize_column_block_into, deserialize_volume,
-    deserialize_volume_metadata, serialize_volume, serialize_volume_metadata, COL_BOOLEAN,
-    COL_BYTES, COL_DICTIONARY, COL_FLOAT64, COL_INT64, COL_TIMESTAMP,
+    deserialize_column_block, deserialize_column_block_into, deserialize_volume_metadata,
+    serialize_volume_metadata, COL_BOOLEAN, COL_BYTES, COL_DICTIONARY, COL_FLOAT64, COL_INT64,
+    COL_TIMESTAMP,
 };
 use super::writer::{CompressedBlockStore, FrozenVolume, LazyColumns};
 
 /// Volume file extension
 const VOLUME_EXT: &str = "vol";
-
-/// Magic bytes for LZ4-compressed volumes. Uncompressed volumes start with
-/// b"STVL" (the format magic). On read we check the first 4 bytes: STVZ
-/// means decompress first, STVL means read directly. This keeps compression
-/// fully transparent to the format module.
-const COMPRESSED_MAGIC: [u8; 4] = *b"STVZ";
 
 /// Magic bytes for V4 per-column per-group compressed format.
 const V4_MAGIC: [u8; 4] = *b"STV4";
@@ -51,10 +45,7 @@ const V4_VERSION: u32 = 1;
 /// Volume catalog filename
 const CATALOG_FILE: &str = "volumes.catalog";
 
-/// Write a frozen volume to disk atomically.
-///
-/// Writes to a .tmp file first, then renames to the final name.
-/// This prevents partial files from crashes during writes.
+/// Write a frozen volume to disk atomically (V4 format, LZ4 compressed).
 pub fn write_volume_to_disk(
     dir: &Path,
     table_name: &str,
@@ -67,19 +58,18 @@ pub fn write_volume_to_disk(
 
 /// Write a frozen volume to disk atomically, with optional LZ4 compression.
 ///
-/// When `compress` is true, writes V4 format (per-column per-group LZ4 blocks).
-/// V4 enables lazy column loading on read — only metadata is decompressed at
-/// startup, columns are decompressed from RAM on demand.
-/// When false, writes legacy STVL format.
-/// Returns (path, Option<CompressedBlockStore>). When V4, the store is returned
-/// so callers can register a lazy volume without re-reading from disk.
+/// Always writes V4 format (per-column per-group blocks with CRC32).
+/// When `compress` is true, blocks are LZ4-compressed (blocks that don't
+/// compress well are stored raw automatically). When false, all blocks
+/// are stored raw (same V4 layout, no LZ4 overhead).
+/// Returns (path, CompressedBlockStore).
 pub fn write_volume_to_disk_opts(
     dir: &Path,
     table_name: &str,
     volume_id: u64,
     volume: &FrozenVolume,
     compress: bool,
-) -> Result<(PathBuf, Option<CompressedBlockStore>)> {
+) -> Result<(PathBuf, CompressedBlockStore)> {
     let table_dir = dir.join(table_name);
     std::fs::create_dir_all(&table_dir)
         .map_err(|e| crate::core::Error::internal(format!("failed to create volume dir: {}", e)))?;
@@ -88,15 +78,8 @@ pub fn write_volume_to_disk_opts(
     let final_path = table_dir.join(&filename);
     let tmp_path = table_dir.join(format!("{}.tmp", filename));
 
-    let (data, store) = if compress {
-        let (bytes, s) = serialize_v4(volume)
-            .map_err(|e| crate::core::Error::internal(format!("V4 serialize failed: {}", e)))?;
-        (bytes, Some(s))
-    } else {
-        let bytes = serialize_volume(volume)
-            .map_err(|e| crate::core::Error::internal(format!("serialize failed: {}", e)))?;
-        (bytes, None)
-    };
+    let (data, store) = serialize_v4_opts(volume, compress)
+        .map_err(|e| crate::core::Error::internal(format!("V4 serialize failed: {}", e)))?;
 
     {
         use std::io::Write;
@@ -136,9 +119,17 @@ pub fn write_volume_to_disk_opts(
 /// [LZ4 blocks: col_0_grp_0, col_0_grp_1, ..., col_N_grp_G]
 /// [CRC32 (4)]
 /// ```
+/// Serialize a volume to V4 format bytes with LZ4 compression.
+pub fn serialize_v4_public(vol: &FrozenVolume) -> std::io::Result<(Vec<u8>, CompressedBlockStore)> {
+    serialize_v4_opts(vol, true)
+}
+
 /// Returns (file_bytes, CompressedBlockStore). The store can be used to register
-/// a lazy volume without re-reading from disk — avoids keeping eager columns in RAM.
-fn serialize_v4(vol: &FrozenVolume) -> std::io::Result<(Vec<u8>, CompressedBlockStore)> {
+/// a lazy volume without re-reading from disk.
+fn serialize_v4_opts(
+    vol: &FrozenVolume,
+    compress: bool,
+) -> std::io::Result<(Vec<u8>, CompressedBlockStore)> {
     use std::io::Write;
 
     let col_count = vol.columns.len();
@@ -154,9 +145,13 @@ fn serialize_v4(vol: &FrozenVolume) -> std::io::Result<(Vec<u8>, CompressedBlock
     let meta_compressed = lz4_flex::compress_prepend_size(&meta_raw);
     drop(meta_raw);
 
-    // 2. Build CompressedBlockStore (compresses all column blocks)
-    let store =
-        CompressedBlockStore::compress_columns(&vol.columns, &vol.column_types, vol.row_count);
+    // 2. Build CompressedBlockStore (compresses all column blocks when enabled)
+    let store = CompressedBlockStore::compress_columns_opts(
+        &vol.columns,
+        &vol.column_types,
+        vol.row_count,
+        compress,
+    );
 
     // 3. Compute total size for pre-allocation
     let all_blocks = store.raw_blocks();
@@ -601,11 +596,7 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     })
 }
 
-/// Read a frozen volume from disk.
-///
-/// Detects format by peeking at magic bytes:
-/// - STV4: streaming read with incremental CRC (no full file buffer)
-/// - STVZ/STVL: legacy full read (converted to V4 on compaction)
+/// Read a frozen volume from disk. Only V4 (STV4) format is supported.
 pub fn read_volume_from_disk(path: &Path) -> Result<FrozenVolume> {
     use std::io::Read;
 
@@ -622,21 +613,10 @@ pub fn read_volume_from_disk(path: &Path) -> Result<FrozenVolume> {
     if magic == V4_MAGIC {
         read_volume_v4(path)
     } else {
-        let data = std::fs::read(path).map_err(|e| {
-            crate::core::Error::internal(format!("failed to read volume {:?}: {}", path, e))
-        })?;
-        if data.len() >= 4 && data[..4] == COMPRESSED_MAGIC {
-            let raw = lz4_flex::decompress_size_prepended(&data[4..]).map_err(|e| {
-                crate::core::Error::internal(format!("failed to decompress {:?}: {}", path, e))
-            })?;
-            deserialize_volume(&raw).map_err(|e| {
-                crate::core::Error::internal(format!("failed to deserialize {:?}: {}", path, e))
-            })
-        } else {
-            deserialize_volume(&data).map_err(|e| {
-                crate::core::Error::internal(format!("failed to deserialize {:?}: {}", path, e))
-            })
-        }
+        Err(crate::core::Error::internal(format!(
+            "unsupported volume format {:?}: expected STV4 magic, got {:?}",
+            path, magic
+        )))
     }
 }
 

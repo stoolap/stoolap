@@ -1100,11 +1100,11 @@ impl Database {
         Ok(())
     }
 
-    /// Create a point-in-time snapshot of the database
+    /// Create a backup snapshot of the database
     ///
-    /// This creates snapshot files for each table that can be used to speed up
-    /// database recovery. Instead of replaying the entire WAL, recovery can
-    /// load the snapshot and only replay WAL entries after the snapshot.
+    /// This creates snapshot files (.bin) for each table along with
+    /// index/view definitions (ddl-{timestamp}.bin) for disaster recovery.
+    /// Normal persistence uses the checkpoint cycle (seal to volumes + WAL).
     ///
     /// Note: This is a no-op for in-memory databases.
     pub fn create_snapshot(&self) -> Result<()> {
@@ -1119,7 +1119,8 @@ impl Database {
     /// restores from that specific snapshot.
     ///
     /// This is a destructive operation that replaces all current data
-    /// with the snapshot data. User-created indexes and views are lost.
+    /// with the snapshot data. Indexes and views are restored from
+    /// ddl-{timestamp}.bin or preserved from current in-memory state.
     pub fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
         use crate::storage::Engine;
         let result = self.inner.engine.restore_snapshot(timestamp)?;

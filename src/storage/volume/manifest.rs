@@ -93,8 +93,8 @@ pub struct SegmentMeta {
     pub max_row_id: i64,
     /// WAL LSN at which this segment was created (for recovery).
     pub creation_lsn: u64,
-    /// Compaction epoch when this segment was last written/merged.
-    /// Used to force-include stale volumes after max_age cycles.
+    /// Dead field, always 0. Kept for V6 manifest binary layout compatibility.
+    /// Remove this field when bumping to V7.
     pub compaction_epoch: u64,
     /// Schema version when this segment was created. Used with dropped_columns
     /// to correctly mask stale data only from volumes older than a column drop.
@@ -177,7 +177,7 @@ impl TableManifest {
         None
     }
 
-    /// Serialize the manifest to bytes (V2 format with tombstones).
+    /// Serialize the manifest to bytes (V6 format).
     pub fn serialize(&self) -> io::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(256);
 
@@ -210,14 +210,14 @@ impl TableManifest {
             buf.write_all(path_bytes)?;
         }
 
-        // Tombstones (V4: row_id + commit_seq pairs; V2-V3: row_id only)
+        // Tombstones: (row_id, commit_seq) pairs
         buf.write_all(&(self.tombstones.len() as u64).to_le_bytes())?;
         for &(row_id, commit_seq) in &self.tombstones {
             buf.write_all(&row_id.to_le_bytes())?;
             buf.write_all(&commit_seq.to_le_bytes())?;
         }
 
-        // Column renames (V5+): (old_name, new_name) pairs
+        // Column renames: (old_name, new_name) pairs
         buf.write_all(&(self.column_renames.len() as u32).to_le_bytes())?;
         for (old_name, new_name) in &self.column_renames {
             let ob = old_name.as_bytes();
@@ -228,7 +228,7 @@ impl TableManifest {
             buf.write_all(nb)?;
         }
 
-        // Dropped columns (V6+: name + schema_version; V5: name only)
+        // Dropped columns: (name, schema_version) pairs
         buf.write_all(&(self.dropped_columns.len() as u32).to_le_bytes())?;
         for (name, version) in &self.dropped_columns {
             let nb = name.as_bytes();
@@ -237,16 +237,16 @@ impl TableManifest {
             buf.write_all(&version.to_le_bytes())?;
         }
 
-        // Trailing CRC32 over the entire payload (V3+)
+        // Trailing CRC32 over the entire payload
         let crc = crc32fast::hash(&buf);
         buf.write_all(&crc.to_le_bytes())?;
 
         Ok(buf)
     }
 
-    /// Deserialize a manifest from bytes.
+    /// Deserialize a manifest from bytes. Only V6 format is supported.
     pub fn deserialize(data: &[u8]) -> io::Result<Self> {
-        if data.len() < 24 {
+        if data.len() < 28 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "manifest too small",
@@ -261,37 +261,32 @@ impl TableManifest {
         let mut pos = 4;
 
         let version = read_u32(data, &mut pos)?;
-        if version > MANIFEST_VERSION {
+        if version != MANIFEST_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported manifest version {}", version),
+                format!(
+                    "unsupported manifest version {} (expected {})",
+                    version, MANIFEST_VERSION
+                ),
             ));
         }
 
-        // V3+: verify trailing CRC32 before parsing the rest.
-        if version >= 3 {
-            if data.len() < 28 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "manifest too small for CRC",
-                ));
-            }
-            let payload = &data[..data.len() - 4];
-            let stored_crc = u32::from_le_bytes(
-                data[data.len() - 4..]
-                    .try_into()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad CRC bytes"))?,
-            );
-            let computed_crc = crc32fast::hash(payload);
-            if stored_crc != computed_crc {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "manifest CRC mismatch: stored={:#010x}, computed={:#010x}",
-                        stored_crc, computed_crc
-                    ),
-                ));
-            }
+        // Verify trailing CRC32 before parsing the rest.
+        let payload = &data[..data.len() - 4];
+        let stored_crc = u32::from_le_bytes(
+            data[data.len() - 4..]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad CRC bytes"))?,
+        );
+        let computed_crc = crc32fast::hash(payload);
+        if stored_crc != computed_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "manifest CRC mismatch: stored={:#010x}, computed={:#010x}",
+                    stored_crc, computed_crc
+                ),
+            ));
         }
 
         let next_segment_id = read_u64(data, &mut pos)?;
@@ -309,19 +304,11 @@ impl TableManifest {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         pos += name_len;
 
-        // Segments
+        // Segments: V6 fixed fields are 56 bytes per segment (before variable-length path)
         let seg_count = read_u32(data, &mut pos)? as usize;
         let mut segments = Vec::with_capacity(seg_count);
         for _ in 0..seg_count {
-            // V6: 56 bytes (adds schema_version), V5: 48, V1-V4: 40
-            let min_seg_bytes = if version >= 6 {
-                56
-            } else if version >= 5 {
-                48
-            } else {
-                40
-            };
-            if pos + min_seg_bytes > data.len() {
+            if pos + 56 > data.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "manifest truncated at segment",
@@ -332,16 +319,8 @@ impl TableManifest {
             let min_row_id = read_i64(data, &mut pos)?;
             let max_row_id = read_i64(data, &mut pos)?;
             let creation_lsn = read_u64(data, &mut pos)?;
-            let compaction_epoch = if version >= 5 {
-                read_u64(data, &mut pos)?
-            } else {
-                0
-            };
-            let schema_version = if version >= 6 {
-                read_u64(data, &mut pos)?
-            } else {
-                0
-            };
+            let compaction_epoch = read_u64(data, &mut pos)?;
+            let schema_version = read_u64(data, &mut pos)?;
 
             let path_len = read_u32(data, &mut pos)? as usize;
             if pos + path_len > data.len() {
@@ -366,67 +345,51 @@ impl TableManifest {
             });
         }
 
-        // Tombstones (V2+, optional for V1 backward compat)
-        // V4: (row_id, commit_seq) pairs. V2-V3: row_id only (commit_seq=0).
-        // For V3+, the last 4 bytes are CRC, so stop before them.
-        let tombstone_data_end = if version >= 3 {
-            data.len() - 4
-        } else {
-            data.len()
-        };
+        // Last 4 bytes are CRC, so stop before them.
+        let data_end = data.len() - 4;
+
+        // Tombstones: (row_id: i64, commit_seq: u64) pairs
         let mut tombstones = Vec::new();
-        if version >= 2 && pos + 8 <= tombstone_data_end {
+        if pos + 8 <= data_end {
             let tombstone_count = read_u64(data, &mut pos)? as usize;
             tombstones.reserve(tombstone_count);
-            if version >= 4 {
-                // V4: each tombstone is (row_id: i64, commit_seq: u64) = 16 bytes
-                for _ in 0..tombstone_count {
-                    if pos + 16 > tombstone_data_end {
-                        break;
-                    }
-                    let row_id = read_i64(data, &mut pos)?;
-                    let commit_seq = read_u64(data, &mut pos)?;
-                    tombstones.push((row_id, commit_seq));
+            for _ in 0..tombstone_count {
+                if pos + 16 > data_end {
+                    break;
                 }
-            } else {
-                // V2-V3: each tombstone is just row_id, assign commit_seq=0
-                // (always visible to all snapshots — pre-restart tombstones)
-                for _ in 0..tombstone_count {
-                    if pos + 8 > tombstone_data_end {
-                        break;
-                    }
-                    tombstones.push((read_i64(data, &mut pos)?, 0));
-                }
+                let row_id = read_i64(data, &mut pos)?;
+                let commit_seq = read_u64(data, &mut pos)?;
+                tombstones.push((row_id, commit_seq));
             }
         }
 
-        // Column renames (V5+)
+        // Column renames: (old_name, new_name) pairs
         let mut column_renames = Vec::new();
-        if version >= 5 && pos + 4 <= tombstone_data_end {
+        if pos + 4 <= data_end {
             let rename_count = read_u32(data, &mut pos)? as usize;
             column_renames.reserve(rename_count);
             for _ in 0..rename_count {
-                if pos + 2 > tombstone_data_end {
+                if pos + 2 > data_end {
                     break;
                 }
                 let old_len = u16::from_le_bytes(data[pos..pos + 2].try_into().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "truncated rename old_name len")
                 })?) as usize;
                 pos += 2;
-                if pos + old_len > tombstone_data_end {
+                if pos + old_len > data_end {
                     break;
                 }
                 let old_name = std::str::from_utf8(&data[pos..pos + old_len])
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 pos += old_len;
-                if pos + 2 > tombstone_data_end {
+                if pos + 2 > data_end {
                     break;
                 }
                 let new_len = u16::from_le_bytes(data[pos..pos + 2].try_into().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "truncated rename new_name len")
                 })?) as usize;
                 pos += 2;
-                if pos + new_len > tombstone_data_end {
+                if pos + new_len > data_end {
                     break;
                 }
                 let new_name = std::str::from_utf8(&data[pos..pos + new_len])
@@ -436,31 +399,25 @@ impl TableManifest {
             }
         }
 
-        // Dropped columns (V6+: name + schema_version; V5: name only → version=0)
+        // Dropped columns: (name, schema_version) pairs
         let mut dropped_columns = Vec::new();
-        if version >= 5 && pos + 4 <= tombstone_data_end {
+        if pos + 4 <= data_end {
             let count = read_u32(data, &mut pos)? as usize;
             for _ in 0..count {
-                if pos + 2 > tombstone_data_end {
+                if pos + 2 > data_end {
                     break;
                 }
                 let nlen = u16::from_le_bytes(data[pos..pos + 2].try_into().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "truncated dropped col name")
                 })?) as usize;
                 pos += 2;
-                if pos + nlen > tombstone_data_end {
+                if pos + nlen > data_end {
                     break;
                 }
                 let name = std::str::from_utf8(&data[pos..pos + nlen])
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 pos += nlen;
-                let drop_version = if version >= 6 {
-                    read_u64(data, &mut pos)?
-                } else {
-                    // V5 didn't store drop version; use 0 so all old volumes are masked
-                    // (conservative: masks everything, same as old behavior)
-                    u64::MAX
-                };
+                let drop_version = read_u64(data, &mut pos)?;
                 dropped_columns.push((SmartString::from(name), drop_version));
             }
         }
@@ -1090,12 +1047,6 @@ impl SegmentManager {
     /// Get the number of segments.
     pub fn segment_count(&self) -> usize {
         self.manifest.read().segments.len()
-    }
-
-    /// Get the oldest compaction_epoch across all segments.
-    pub fn oldest_segment_epoch(&self) -> Option<u64> {
-        let manifest = self.manifest.read();
-        manifest.segments.iter().map(|s| s.compaction_epoch).min()
     }
 
     /// Get the maximum row_count across all segments.

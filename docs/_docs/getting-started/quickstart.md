@@ -269,14 +269,17 @@ stoolap -d "file:///path/to/data" --snapshot
 If your database is corrupted or you need to roll back, restore from a backup snapshot:
 
 ```bash
-# Restore from latest backup (works even with corrupted volumes)
+# Restore from a specific backup by timestamp (recommended)
+stoolap -d "file:///path/to/data" --restore "20260315-100000.000"
+
+# Restore from latest backup snapshot
 stoolap -d "file:///path/to/data" --restore
 
-# Restore from a specific backup by timestamp
-stoolap -d "file:///path/to/data" --restore "20260315-100000.000"
+# Recovery from corrupted volumes/manifests (cleans up first)
+stoolap -d "file:///path/to/data" --reset-volumes --restore
 ```
 
-The `--restore` command works at the filesystem level. It removes corrupted volumes and WAL files, then rebuilds from the backup snapshot. No running database is required.
+The `--restore` command requires the database to open successfully. If volumes or manifests are corrupted, use `--reset-volumes --restore` which removes bad on-disk state before restoring.
 
 ### Configuration
 

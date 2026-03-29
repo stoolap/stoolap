@@ -49,8 +49,8 @@ pub trait Engine: Send + Sync {
 
     /// Closes the storage engine
     ///
-    /// This flushes pending writes, creates a final snapshot if needed,
-    /// and releases all resources.
+    /// This flushes pending writes, seals all hot rows into cold volumes
+    /// (when checkpoint_on_close is enabled), and releases all resources.
     fn close(&mut self) -> Result<()>;
 
     /// Begins a new transaction

@@ -37,10 +37,9 @@ Stoolap currently supports the following PRAGMA commands:
 |--------|-------------|---------|
 | `checkpoint_interval` | Seconds between automatic checkpoints | 60 |
 | `sync_mode` | WAL sync mode (0=None, 1=Normal, 2=Full) | 1 |
-| `compact_threshold` | Volume count before compaction triggers | 4 |
+| `compact_threshold` | Sub-target volumes per table before merging | 4 |
 | `keep_snapshots` | Backup snapshots to retain per table | 3 |
 | `wal_flush_trigger` | Buffer size in bytes before WAL flush | 32768 |
-| `checkpoint_on_close` | Seal all hot rows on clean shutdown | on |
 | `target_volume_rows` | Target rows per cold volume (compaction split boundary) | 1048576 |
 | `snapshot` | Create a full backup snapshot | - |
 | `restore` | Restore database from a backup snapshot | - |
@@ -75,7 +74,7 @@ Supported values:
 
 #### compact_threshold
 
-Controls how many cold volumes accumulate per table before compaction triggers. Compaction merges the smallest volumes first, bounded per cycle. Default: 4.
+Controls how many sub-target volumes (smaller than `target_volume_rows`) accumulate per table before compaction merges them. At-target volumes are not counted and are never rewritten unless they have tombstoned rows. Default: 4.
 
 ```sql
 PRAGMA compact_threshold = 4;
@@ -102,20 +101,20 @@ PRAGMA keep_snapshots = 5;
 PRAGMA keep_snapshots;              -- read current value
 ```
 
-#### checkpoint_on_close
+#### target_volume_rows
 
-Controls whether all hot rows are sealed to cold volumes on clean shutdown. When enabled (default), the engine runs a force checkpoint during `close()`, ensuring fast startup because no WAL replay is needed. Set to `off` only for crash simulation in tests.
+Controls the target number of rows per cold volume. Compaction splits output into volumes of approximately this size (rounded down to the nearest row-group boundary of 64K rows). Values below 65,536 are rejected. Default: 1,048,576 (1M rows, 16 row groups).
 
 ```sql
-PRAGMA checkpoint_on_close = on;
-PRAGMA checkpoint_on_close;         -- read current value
+PRAGMA target_volume_rows = 1048576;
+PRAGMA target_volume_rows;          -- read current value
 ```
 
 ### Manual Snapshot and Checkpoint Control
 
 #### snapshot
 
-Creates a full backup snapshot of all tables. Snapshot files (.bin) are stored in the `snapshots/` directory alongside a `ddl.bin` file containing index and view definitions. The `keep_snapshots` setting limits how many snapshot files are retained per table.
+Creates a full backup snapshot of all tables. Snapshot files (.bin) are stored in the `snapshots/` directory with per-timestamp `ddl-{timestamp}.bin` and `manifest-{timestamp}.json` files. The `keep_snapshots` setting limits how many snapshot files are retained per table.
 
 ```sql
 -- Create a full backup snapshot
@@ -142,8 +141,8 @@ The checkpoint cycle performs these steps in order:
 
 1. **Seal**: Move eligible hot buffer rows to immutable cold volumes (.vol files)
 2. **Persist**: Write manifests (volume list, tombstones, checkpoint LSN) to disk
-3. **Compact**: Merge the smallest volumes when count exceeds `compact_threshold`
-4. **WAL truncate**: Remove WAL entries before checkpoint LSN (only when all hot data is sealed)
+3. **WAL truncate**: Remove WAL entries before checkpoint LSN (only when all hot data is sealed)
+4. **Compact**: Merge sub-target, oversized, and tombstoned volumes into target-sized outputs
 
 The background thread runs this cycle automatically every `checkpoint_interval` seconds. On clean shutdown, a force checkpoint seals ALL remaining hot rows regardless of threshold.
 
@@ -158,25 +157,31 @@ Note: This PRAGMA cannot run inside an explicit transaction.
 
 Restores the database state from backup snapshots created by `PRAGMA snapshot`. This is a destructive operation that replaces all current data with the snapshot data.
 
+Without a timestamp, restore uses the latest `manifest-*.json` to filter which tables are eligible (preventing dropped tables from being resurrected), then picks the newest snapshot file per eligible table. If no manifest exists (older snapshots), all table directories are included. Index and view definitions are loaded from the `ddl-{timestamp}.bin` matching the oldest selected snapshot; if that file is missing, current in-memory definitions are preserved as a fallback.
+
+With a timestamp, restore selects the exact snapshot file per table matching that timestamp and loads the corresponding `ddl-{timestamp}.bin` for index/view definitions. If the DDL file is missing, the restore fails with an error.
+
 ```sql
+-- Restore from a specific snapshot by timestamp (recommended)
+PRAGMA restore = '20260315-120000.000';
+
 -- Restore from the latest backup snapshot
 PRAGMA restore;
-
--- Restore from a specific snapshot by timestamp
-PRAGMA restore = '20260315-120000.000';
 ```
 
 The restore operation:
 
 1. **Validates** all snapshot files before making any changes
-2. **Reads** `ddl.bin` for index and view definitions (if available, falls back to saving current in-memory definitions)
+2. **Reads** `ddl-{timestamp}.bin` for index and view definitions
 3. **Truncates** WAL to prevent post-snapshot entries from overwriting restored data
 4. **Clears** all current data (hot buffer, cold volumes, in-memory state)
 5. **Loads** snapshot data for each table
-6. **Recreates** indexes and views from `ddl.bin` or fallback
+6. **Recreates** indexes and views from DDL metadata
 7. **Syncs** auto-increment counters with restored data
 8. **Re-records** DDL to WAL for crash safety
 9. **Checkpoints** the restored data into volumes for immediate durability
+
+If the database cannot open due to corrupted volumes or manifests, use the CLI with `--reset-volumes --restore` to clean up bad on-disk state before restoring.
 
 This command is useful for:
 - Rolling back to a known good state after accidental data corruption
@@ -187,15 +192,14 @@ The timestamp format matches the snapshot filename: `YYYYMMDD-HHMMSS.fff` (e.g. 
 
 Important notes:
 - This PRAGMA cannot run inside an explicit transaction
-- Indexes and views are automatically preserved via `ddl.bin` saved by `PRAGMA SNAPSHOT`
-- If no `ddl.bin` exists (snapshots from older versions), indexes and views are saved from the current in-memory state before the destructive step
+- Indexes and views are automatically preserved via `ddl-{timestamp}.bin` saved by `PRAGMA SNAPSHOT`
 - Tables created after the snapshot will not exist after restore
 - Backup snapshots in `snapshots/` are preserved (not deleted) for future restores
 
-For recovery from corrupted databases where `Database::open()` fails, use the CLI `--restore` flag instead, which works at the filesystem level:
+For recovery from corrupted databases where `Database::open()` fails, use the CLI with `--reset-volumes` to clean up bad on-disk state before restoring:
 
 ```bash
-stoolap -d "file:///path/to/db" --restore
+stoolap -d "file:///path/to/db" --reset-volumes --restore
 ```
 
 #### dedup_segments
@@ -226,4 +230,4 @@ file:///path/to/db?checkpoint_interval=60&compact_threshold=4&keep_snapshots=3&s
 
 Legacy parameter names are accepted for backward compatibility:
 - `snapshot_interval` maps to `checkpoint_interval`
-- `snapshot_compression` maps to `wal_compression`
+- `snapshot_compression` maps to `compression` (sets both `wal_compression` and `volume_compression`)

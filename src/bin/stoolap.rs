@@ -54,7 +54,7 @@ PERSISTENCE DSN PARAMETERS:\n\
     normal: fsync every 1 second, DDL fsyncs immediately\n\
     full: fsync on every write\n\
   checkpoint_interval=SECS    Checkpoint interval in seconds (default: 60)\n\
-  compact_threshold=COUNT     Number of volumes before compaction (default: 4)\n\
+  compact_threshold=COUNT     Sub-target volumes per table before merging (default: 4)\n\
   compression=on|off          WAL + volume LZ4 compression (default: on)\n\
   wal_compression=on|off      WAL compression only (default: on)\n\
   volume_compression=on|off   Volume LZ4 compression only (default: on)\n\
@@ -123,7 +123,7 @@ struct Args {
     #[arg(long = "checkpoint-interval", value_name = "SECONDS")]
     checkpoint_interval: Option<u32>,
 
-    /// Number of cold volumes before compaction (default: 4)
+    /// Sub-target volumes per table before merging (default: 4)
     #[arg(long = "compact-threshold", value_name = "COUNT")]
     compact_threshold: Option<u32>,
 

@@ -65,12 +65,23 @@ pub struct CompressedBlockStore {
 
 impl CompressedBlockStore {
     /// Compress existing columns into per-group LZ4 blocks.
-    /// Used when sealing (VolumeBuilder::finish() → eager columns → V4 write)
-    /// and when converting legacy STVZ volumes.
+    /// Used when sealing (VolumeBuilder::finish() → eager columns → V4 write).
     pub fn compress_columns(
         columns: &LazyColumns,
         col_data_types: &[DataType],
         row_count: usize,
+    ) -> Self {
+        Self::compress_columns_opts(columns, col_data_types, row_count, true)
+    }
+
+    /// Build per-group blocks from columns. When `compress` is true, blocks are
+    /// LZ4-compressed (blocks that don't shrink are stored raw). When false,
+    /// all blocks are stored raw (same V4 layout, no LZ4 overhead).
+    pub fn compress_columns_opts(
+        columns: &LazyColumns,
+        col_data_types: &[DataType],
+        row_count: usize,
+        compress: bool,
     ) -> Self {
         let group_size = ROW_GROUP_SIZE;
         let col_count = columns.len();
@@ -109,31 +120,36 @@ impl CompressedBlockStore {
             }
         }
 
-        // Phase 2: Compress all column blocks (parallelizable per column).
+        // Phase 2: Serialize column blocks (optionally LZ4-compressed).
+        let compress_blocks = |col: &ColumnData| -> (Vec<Vec<u8>>, Vec<usize>) {
+            let mut col_blocks = Vec::with_capacity(num_groups);
+            let mut col_decomp_lens = Vec::with_capacity(num_groups);
+            let mut start = 0;
+            while start < row_count {
+                let end = (start + group_size).min(row_count);
+                let raw = serialize_column_block(col, start, end);
+                col_decomp_lens.push(raw.len());
+                if compress {
+                    let compressed = lz4_flex::compress(&raw);
+                    if compressed.len() < raw.len() {
+                        col_blocks.push(compressed);
+                    } else {
+                        col_blocks.push(raw);
+                    }
+                } else {
+                    col_blocks.push(raw);
+                }
+                start = end;
+            }
+            (col_blocks, col_decomp_lens)
+        };
+
         #[cfg(feature = "parallel")]
         let (all_blocks, all_decomp_lens) = {
             use rayon::prelude::*;
             let results: Vec<(Vec<Vec<u8>>, Vec<usize>)> = (0..col_count)
                 .into_par_iter()
-                .map(|col_idx| {
-                    let col = &columns[col_idx];
-                    let mut col_blocks = Vec::with_capacity(num_groups);
-                    let mut col_decomp_lens = Vec::with_capacity(num_groups);
-                    let mut start = 0;
-                    while start < row_count {
-                        let end = (start + group_size).min(row_count);
-                        let raw = serialize_column_block(col, start, end);
-                        let compressed = lz4_flex::compress(&raw);
-                        col_decomp_lens.push(raw.len());
-                        if compressed.len() < raw.len() {
-                            col_blocks.push(compressed);
-                        } else {
-                            col_blocks.push(raw);
-                        }
-                        start = end;
-                    }
-                    (col_blocks, col_decomp_lens)
-                })
+                .map(|col_idx| compress_blocks(&columns[col_idx]))
                 .collect();
             let mut all_blocks = Vec::with_capacity(col_count);
             let mut all_decomp_lens = Vec::with_capacity(col_count);
@@ -149,24 +165,9 @@ impl CompressedBlockStore {
             let mut all_blocks = Vec::with_capacity(col_count);
             let mut all_decomp_lens = Vec::with_capacity(col_count);
             for col_idx in 0..col_count {
-                let col = &columns[col_idx];
-                let mut col_blocks = Vec::with_capacity(num_groups);
-                let mut col_decomp_lens = Vec::with_capacity(num_groups);
-                let mut start = 0;
-                while start < row_count {
-                    let end = (start + group_size).min(row_count);
-                    let raw = serialize_column_block(col, start, end);
-                    let compressed = lz4_flex::compress(&raw);
-                    col_decomp_lens.push(raw.len());
-                    if compressed.len() < raw.len() {
-                        col_blocks.push(compressed);
-                    } else {
-                        col_blocks.push(raw);
-                    }
-                    start = end;
-                }
-                all_blocks.push(col_blocks);
-                all_decomp_lens.push(col_decomp_lens);
+                let (blocks, lens) = compress_blocks(&columns[col_idx]);
+                all_blocks.push(blocks);
+                all_decomp_lens.push(lens);
             }
             (all_blocks, all_decomp_lens)
         };
@@ -761,7 +762,7 @@ pub struct LazyColumns {
 }
 
 impl LazyColumns {
-    /// Create from pre-loaded columns (VolumeBuilder::finish(), legacy STVL/STVZ).
+    /// Create from pre-loaded columns (VolumeBuilder::finish(), V4 eager load).
     /// All OnceLock slots are pre-initialized. No compressed store.
     pub fn eager(columns: Vec<ColumnData>, col_data_types: Vec<DataType>) -> Self {
         let len = columns.len();

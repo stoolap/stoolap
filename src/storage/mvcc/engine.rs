@@ -460,22 +460,10 @@ pub struct MVCCEngine {
     /// (exclusive, brief ~100ms) to create a quiet moment where all_hot_empty can
     /// be true. This enables WAL truncation under continuous writes.
     seal_fence: Arc<parking_lot::RwLock<()>>,
-    /// Last compaction timestamp as `Instant` epoch nanos (from
-    /// `Instant::now().elapsed()` baseline). Compaction is skipped if less than
-    /// `compact_threshold * checkpoint_interval` has passed. AtomicU64 avoids
-    /// mutex contention on the background thread's `should_compact()` check.
-    last_compaction_nanos: AtomicU64,
-    /// Baseline `Instant` for computing elapsed time from `last_compaction_nanos`.
-    compaction_baseline: Instant,
     /// True while a background compaction thread is running.
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
     compaction_running: Arc<AtomicBool>,
-    /// Global compaction epoch. Incremented each compaction cycle.
-    /// Each SegmentMeta records the epoch at which it was created/merged.
-    /// Volumes older than compact_threshold epochs are force-included
-    /// in the next merge to prevent unbounded staleness.
-    compaction_epoch: AtomicU64,
 }
 
 /// RAII guard that clears an AtomicBool on drop. Used to release the
@@ -538,11 +526,7 @@ impl MVCCEngine {
             force_seal_all: AtomicBool::new(false),
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
-            // Initialize to 0 so the first compaction is not delayed by cooldown
-            last_compaction_nanos: AtomicU64::new(0),
-            compaction_baseline: Instant::now(),
             compaction_running: Arc::new(AtomicBool::new(false)),
-            compaction_epoch: AtomicU64::new(0),
         }
     }
 
@@ -1145,8 +1129,8 @@ impl MVCCEngine {
         // Write volume file to disk for next startup (atomic write)
         if vol_row_count > 0 {
             if let Err(e) = (|| -> Result<()> {
-                let data =
-                    crate::storage::volume::format::serialize_volume(&volume).map_err(|e| {
+                let (data, _store) = crate::storage::volume::io::serialize_v4_public(&volume)
+                    .map_err(|e| {
                         crate::core::Error::internal(format!("failed to serialize volume: {}", e))
                     })?;
                 let tmp_path = vol_path.with_extension("vol.tmp");
@@ -2953,7 +2937,7 @@ impl MVCCEngine {
                 min_row_id: min_id,
                 max_row_id: max_id,
                 creation_lsn: 0,
-                compaction_epoch: self.compaction_epoch.load(Ordering::Relaxed),
+                compaction_epoch: 0,
                 schema_version: self.schema_epoch.load(Ordering::Acquire),
             },
             None,
@@ -4478,11 +4462,70 @@ impl MVCCEngine {
             }
         };
 
+        // When no timestamp is given, find the latest manifest-*.json to get the
+        // coherent table list from that snapshot batch. This prevents resurrecting
+        // tables that were dropped between snapshots.
+        let effective_tables: Option<Vec<String>> = if timestamp.is_none() {
+            let mut manifests: Vec<std::path::PathBuf> = std::fs::read_dir(&snapshot_dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("json")
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("manifest-"))
+                    {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            manifests.sort();
+            if let Some(latest) = manifests.last() {
+                if let Ok(data) = std::fs::read_to_string(latest) {
+                    // manifest-*.json is {"timestamp":"...","tables":["t1","t2"]}
+                    let parsed: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
+                    let tables: Vec<String> = parsed
+                        .get("tables")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !tables.is_empty() {
+                        Some(tables)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         for entry in table_dirs.flatten() {
             if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 continue;
             }
             let table_name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip tables not in the manifest (prevents resurrecting dropped tables)
+            if let Some(ref tables) = effective_tables {
+                if !tables.iter().any(|t| t.eq_ignore_ascii_case(&table_name)) {
+                    continue;
+                }
+            }
+
             let paths = Self::find_snapshots_newest_first(&entry.path());
 
             if let Some(ts) = timestamp {
@@ -4517,23 +4560,12 @@ impl MVCCEngine {
             // Also validate companion .vol if it exists (will be used by load_table_snapshot_as_volume)
             let vol_path = path.with_extension("vol");
             if vol_path.exists() {
-                match std::fs::read(&vol_path) {
-                    Ok(data) => {
-                        if let Err(e) = crate::storage::volume::format::deserialize_volume(&data) {
-                            self.registry.start_accepting_transactions();
-                            return Err(Error::internal(format!(
-                                "Snapshot volume validation failed for table {}: {}",
-                                table_name, e
-                            )));
-                        }
-                    }
-                    Err(e) => {
-                        self.registry.start_accepting_transactions();
-                        return Err(Error::internal(format!(
-                            "Cannot read snapshot volume for table {}: {}",
-                            table_name, e
-                        )));
-                    }
+                if let Err(e) = crate::storage::volume::io::read_volume_from_disk(&vol_path) {
+                    self.registry.start_accepting_transactions();
+                    return Err(Error::internal(format!(
+                        "Snapshot volume validation failed for table {}: {}",
+                        table_name, e
+                    )));
                 }
             }
         }
@@ -4973,37 +5005,6 @@ impl MVCCEngine {
         Ok(())
     }
 
-    /// Check whether compaction should run (cooldown + backlog check).
-    /// Returns true if compaction should proceed.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn should_compact(&self) -> bool {
-        let (compact_threshold, checkpoint_interval) = {
-            let config = self.config.read();
-            let ct = config
-                .as_ref()
-                .map(|c| c.persistence.compact_threshold as usize)
-                .unwrap_or(4)
-                .max(2);
-            let ci = config
-                .as_ref()
-                .map(|c| c.persistence.checkpoint_interval as u64)
-                .unwrap_or(60)
-                .max(10);
-            (ct, ci)
-        }; // config lock dropped
-        let max_segments = {
-            let mgrs = self.segment_managers.read().unwrap();
-            mgrs.values().map(|m| m.segment_count()).max().unwrap_or(0)
-        };
-        if max_segments > compact_threshold {
-            return true; // backlog exists — compact immediately
-        }
-        let last_nanos = self.last_compaction_nanos.load(Ordering::Relaxed);
-        let now_nanos = self.compaction_baseline.elapsed().as_nanos() as u64;
-        let cooldown_nanos = compact_threshold as u64 * checkpoint_interval * 1_000_000_000;
-        now_nanos.saturating_sub(last_nanos) >= cooldown_nanos
-    }
-
     /// Run compaction synchronously under the compaction_running flag.
     /// The flag prevents concurrent compaction from background and forced
     /// callers. Clears the flag on exit (including panics via drop guard).
@@ -5011,12 +5012,7 @@ impl MVCCEngine {
         let _guard = AtomicBoolGuard(&self.compaction_running);
         if let Err(e) = self.compact_volumes() {
             eprintln!("Warning: compact_volumes failed: {}", e);
-            return;
         }
-        self.last_compaction_nanos.store(
-            self.compaction_baseline.elapsed().as_nanos() as u64,
-            Ordering::Relaxed,
-        );
     }
 
     /// Spawn compaction on a background thread. If compaction is already
@@ -5024,9 +5020,6 @@ impl MVCCEngine {
     /// Called from the background cleanup thread which owns Arc<Self>.
     #[cfg(not(target_arch = "wasm32"))]
     fn spawn_compaction(self: &Arc<Self>) {
-        if !self.should_compact() {
-            return;
-        }
         // Try to claim the compaction slot. If already running, skip.
         if self
             .compaction_running
@@ -5161,8 +5154,6 @@ impl MVCCEngine {
         if !self.registry.get_snapshot_transaction_ids().is_empty() {
             return Ok(());
         }
-
-        let current_epoch = self.compaction_epoch.fetch_add(1, Ordering::Relaxed);
 
         let tables_to_compact: Vec<String> = {
             let mgrs = self.segment_managers.read().unwrap();
@@ -5428,7 +5419,7 @@ impl MVCCEngine {
                                 min_row_id: min_id,
                                 max_row_id: max_id,
                                 creation_lsn: 0,
-                                compaction_epoch: current_epoch + 1,
+                                compaction_epoch: 0,
                                 schema_version: self.schema_epoch.load(Ordering::Acquire),
                             },
                         ));

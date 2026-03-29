@@ -70,7 +70,7 @@ file:///path/to/data?sync_mode=normal&checkpoint_interval=60
 |--------|--------|---------|-------------|
 | `sync` / `sync_mode` | none, normal, full (or 0, 1, 2) | normal | WAL synchronization mode. none=no fsync (data durable at checkpoint), normal=fsync every 1s, full=fsync every write |
 | `checkpoint_interval` | Integer (seconds) | 60 | Time between automatic checkpoint cycles |
-| `compact_threshold` | Integer | 4 | Volume count before compaction triggers |
+| `compact_threshold` | Integer (min 2) | 4 | Sub-target volumes per table before merging |
 | `keep_snapshots` | Integer | 3 | Backup snapshots to retain per table |
 | `wal_flush_trigger` | Integer (bytes) | 32768 | Size in bytes before WAL flush |
 | `wal_buffer_size` | Integer (bytes) | 65536 | WAL write buffer size |
@@ -176,17 +176,17 @@ stoolap --db "file:///data/mydb" -f script.sql
 # Create a backup snapshot
 stoolap --db "file:///data/mydb" --snapshot
 
-# Restore from latest backup (filesystem-level, works with corrupted data)
-stoolap --db "file:///data/mydb" --restore
-
-# Restore from a specific backup by timestamp
+# Restore from a specific backup by timestamp (recommended)
 stoolap --db "file:///data/mydb" --restore "20260315-100000.000"
 
-# Recovery from corrupted volumes (removes volumes/ before restore)
+# Restore from latest backup
+stoolap --db "file:///data/mydb" --restore
+
+# Recovery from corrupted volumes/manifests (cleans up first)
 stoolap --db "file:///data/mydb" --reset-volumes --restore
 ```
 
-The `--restore` command works at the filesystem level without opening the database engine. It removes corrupted `volumes/` and `wal/` directories, then opens the database which rebuilds from the backup snapshot files in `snapshots/`.
+The `--restore` command opens the database and replaces current data with snapshot data. If volumes or manifests are corrupted, use `--reset-volumes --restore` which removes bad on-disk state before opening.
 
 ## PRAGMA Configuration
 
@@ -230,4 +230,4 @@ See the [PRAGMA Commands]({% link _docs/sql-commands/pragma-commands.md %}) docu
 3. **Critical data**: Set `sync_mode=full` for maximum durability
 4. **High throughput**: Use `sync_mode=normal` with the default checkpoint cycle
 5. **Backup**: Use `PRAGMA SNAPSHOT` or `--snapshot` for backups, `keep_snapshots` to control retention
-6. **Recovery**: Use `--restore` from CLI to recover from corrupted state
+6. **Recovery**: Use `--reset-volumes --restore` from CLI to recover from corrupted state

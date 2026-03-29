@@ -238,7 +238,8 @@ file://./mydb?sync_mode=normal&compression=on&checkpoint_interval=60
 | `wal_compression` | `on` | LZ4 for WAL entries only |
 | `volume_compression` | `on` | LZ4 for cold volume files only |
 | `checkpoint_interval` | `60` | Seconds between checkpoint cycles |
-| `compact_threshold` | `4` | Volume count that triggers compaction |
+| `compact_threshold` | `4` | Sub-target volumes per table before merging |
+| `target_volume_rows` | `1048576` | Target rows per cold volume |
 
 ## Performance
 

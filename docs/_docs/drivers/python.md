@@ -141,16 +141,19 @@ Controls the durability vs. performance trade-off:
 |-----------|---------|-------------|
 | `sync` | `normal` | Sync mode: `none`, `normal`, or `full` |
 | `checkpoint_interval` | `60` | Seconds between automatic checkpoint cycles |
-| `compact_threshold` | `4` | Volume count before compaction triggers |
+| `compact_threshold` | `4` | Sub-target volumes per table before merging |
 | `keep_snapshots` | `3` | Backup snapshots to retain per table |
 | `wal_flush_trigger` | `32768` | WAL flush trigger size in bytes (32 KB) |
 | `wal_buffer_size` | `65536` | WAL buffer size in bytes (64 KB) |
 | `wal_max_size` | `67108864` | Max WAL file size before rotation (64 MB) |
 | `commit_batch_size` | `100` | Commits to batch before syncing (normal mode) |
-| `sync_interval_ms` | `10` | Minimum ms between syncs (normal mode) |
+| `sync_interval_ms` | `1000` | Minimum ms between syncs (normal mode) |
 | `wal_compression` | `on` | LZ4 compression for WAL entries |
-| `compression` | -- | Alias for `wal_compression` |
+| `volume_compression` | `on` | LZ4 compression for cold volume files |
+| `compression` | -- | Alias that sets both `wal_compression` and `volume_compression` |
 | `compression_threshold` | `64` | Minimum bytes before compressing an entry |
+| `checkpoint_on_close` | `on` | Seal all hot rows to volumes on clean shutdown |
+| `target_volume_rows` | `1048576` | Target rows per cold volume (min 65536) |
 
 ## Raw Query Format
 

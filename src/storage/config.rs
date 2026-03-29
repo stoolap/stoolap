@@ -20,7 +20,7 @@
 pub enum SyncMode {
     /// Fastest but least durable - doesn't force syncs
     None = 0,
-    /// Syncs on transaction commits - good balance of performance and durability
+    /// Fsync at most once per sync_interval_ms (default 1s) and on DDL operations
     #[default]
     Normal = 1,
     /// Forces syncs on every WAL write - slowest but most durable
@@ -58,7 +58,7 @@ pub struct PersistenceConfig {
     /// Default: 60 (1 minute)
     pub checkpoint_interval: u32,
 
-    /// Number of cold segments that triggers compaction
+    /// Number of sub-target volumes per table before compaction merges them
     /// Default: 4
     pub compact_threshold: u32,
 
@@ -79,7 +79,7 @@ pub struct PersistenceConfig {
     pub commit_batch_size: u32,
 
     /// Minimum time between syncs in milliseconds in SyncNormal mode
-    /// Default: 10
+    /// Default: 1000
     pub sync_interval_ms: u32,
 
     /// Enable LZ4 compression for WAL entries

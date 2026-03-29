@@ -164,7 +164,7 @@ When persistence is enabled:
 The background thread periodically seals hot rows into cold volumes:
 1. Hot buffer rows are written to immutable columnar `.vol` files
 2. Manifests (volume list, tombstones, checkpoint LSN) are persisted
-3. Compaction merges the smallest volumes when count exceeds threshold
+3. Compaction merges sub-target, oversized, and tombstoned volumes into target-sized outputs
 4. WAL is truncated when all hot data is sealed
 
 ### Recovery Process
@@ -239,7 +239,7 @@ Most databases pick one format. PostgreSQL is row-oriented everywhere. DuckDB is
 
 **Row-level skip-set dedup without coordination.** Most LSM engines use sequence numbers or tombstone markers that require merge iterators with multi-way comparison. Stoolap uses a single rule: "for any row_id, the newest source wins." At scan time, a FxHashSet skip set is built from hot row_ids and passed to cold scanners. No bloom filter probes across levels, no merge cursors, no coordination between layers.
 
-**No levels or compaction tiers.** LSM databases (RocksDB, LevelDB) use multi-level compaction (L0, L1, L2 and so on) with size ratios between levels. Stoolap compacts all volumes for a table into one when the count exceeds a threshold (default 4). This is closer to universal compaction but even simpler. It works because the engine targets embedded, single-node workloads with bounded data sizes.
+**No levels or compaction tiers.** LSM databases (RocksDB, LevelDB) use multi-level compaction (L0, L1, L2 and so on) with size ratios between levels. Stoolap uses bounded volume compaction: sub-target, oversized, and tombstoned volumes are merged into target-sized outputs (`target_volume_rows`, default 1M rows). Clean at-target volumes are frozen and never rewritten. This minimizes disk I/O while keeping volumes balanced.
 
 **Versioned tombstones for snapshot isolation.** Cold tombstones carry a commit_seq that is checked against the reading transaction's begin_seq. Most systems either use merge-on-read where deletes are separate files (Iceberg) or copy-on-write where deletes rewrite data files (Delta Lake). Stoolap inlines tombstone visibility into the scan path, avoiding both file rewrites and separate delete file management.
 

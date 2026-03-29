@@ -137,7 +137,7 @@ No separate deduplication step is needed.
 When a cold row is deleted or updated, a versioned tombstone is recorded as a `(row_id, commit_seq)` pair:
 
 - **Per-transaction pending**: Tracked on the segment manager, applied at commit with the transaction's commit sequence
-- **Committed tombstones**: Stored in the manifest (V4 format), persisted atomically
+- **Committed tombstones**: Stored in the manifest (V6 format), persisted atomically
 - **Snapshot isolation**: A snapshot transaction at `begin_seq=N` only sees tombstones with `commit_seq <= N`. Newer tombstones are invisible, so the original cold row remains visible to the older snapshot. Auto-commit transactions see all tombstones.
 - **Cleared after compaction**: Rows are physically removed from the merged volume
 - **Cleared after seal**: When sealed row_ids overlap with existing tombstones, those tombstones are removed (the new volume is authoritative)
@@ -155,7 +155,7 @@ Three categories trigger compaction:
 The compaction process:
 1. Select volumes by category (sub-target + oversized + dirty). Leave clean at-target volumes untouched.
 2. Iterate selected volumes newest-first, collecting live rows (dedup by row_id, newest wins)
-3. Split output into row-group aligned volumes of `target_volume_rows` each
+3. Split output into row-group aligned volumes (rounded down to nearest multiple of 64K rows from `target_volume_rows`)
 4. Write each output volume to disk
 5. Atomically register all new volumes and remove old ones (no visibility gap)
 6. Clear tombstones for row_ids in the merged volumes
@@ -194,7 +194,7 @@ Volume files include a trailing CRC32 checksum for corruption detection. Bloom f
 3. **Re-record DDL**: Write DDL entries after checkpoint LSN so they survive WAL truncation
 4. **Persist manifests**: Write `manifest.bin` per table (volume list, tombstones, checkpoint LSN) atomically via fsync-before-rename
 5. **WAL truncate**: Remove WAL entries before checkpoint LSN (only when all manifests are persisted)
-6. **Compact** (background thread): Merge cold volumes when count exceeds `compact_threshold` using adaptive 4-phase strategy
+6. **Compact**: Merge sub-target, oversized, and tombstoned volumes into target-sized outputs. Runs inline for explicit `PRAGMA CHECKPOINT`, offloaded to a background thread for the periodic automatic cycle.
 
 ### Constraints and DML
 
@@ -236,9 +236,9 @@ Snapshots capture:
 1. All table schemas
 2. All committed data (both hot buffer and cold volume rows)
 3. Point-in-time consistency via commit sequence cutoff
-4. Index and view definitions in `ddl.bin` (BTree, Hash, Bitmap, HNSW indexes and all views)
+4. Index and view definitions in per-timestamp `ddl-{timestamp}.bin` files (BTree, Hash, Bitmap, HNSW indexes and all views)
 
-The `ddl.bin` file is critical for restore: snapshot `.bin` files contain only row data and schema, not index or view definitions. Without `ddl.bin`, indexes and views must be recreated manually after restore.
+The DDL file is critical for timestamped restore: snapshot `.bin` files contain only row data and schema, not index or view definitions. Timestamped restore requires the matching `ddl-{timestamp}.bin` and fails if it is missing. Non-timestamped restore uses current in-memory definitions as a fallback.
 
 ### Snapshot Configuration
 
@@ -249,23 +249,23 @@ PRAGMA keep_snapshots = 3;
 -- Manually create a backup snapshot
 PRAGMA SNAPSHOT;
 
--- Restore from latest backup (engine-level, indexes and views preserved)
+-- Restore from latest backup snapshot
 PRAGMA RESTORE;
 
 -- Restore from a specific backup
 PRAGMA RESTORE = '20260315-100000.000';
 ```
 
-Backup and restore are also available from the CLI for recovery scenarios when the database cannot open:
+Backup and restore are also available from the CLI:
 
 ```bash
 # Create backup
 stoolap -d "file:///path/to/db" --snapshot
 
-# Restore (filesystem-level, works with corrupted volumes)
+# Restore (requires database to open successfully)
 stoolap -d "file:///path/to/db" --restore
 
-# Force snapshot recovery when volumes are corrupted
+# Restore when volumes/manifests are corrupted (cleans up first)
 stoolap -d "file:///path/to/db" --reset-volumes --restore
 ```
 
@@ -276,10 +276,10 @@ Snapshots are stored as binary files, organized per table:
 /path/to/database/
   snapshots/
     snapshot_meta.bin               # Global snapshot metadata
-    ddl.bin                        # Index and view definitions (CRC32 protected)
+    ddl-20240101-120000.000.bin    # Index/view definitions for this timestamp
+    manifest-20240101-120000.000.json  # Table list for this snapshot batch
     table_name/
       snapshot-20240101-120000.000.bin
-      snapshot-20240101-130000.000.bin
     other_table/
       snapshot-20240101-120000.000.bin
 ```
@@ -355,7 +355,7 @@ file:///path/to/database?sync_mode=2&checkpoint_interval=60&compact_threshold=4&
 |-----------|-------------|---------|
 | sync_mode | WAL sync mode (0, 1, 2) | 1 |
 | checkpoint_interval | Seconds between checkpoints | 60 |
-| compact_threshold | Volume count before compaction | 4 |
+| compact_threshold | Sub-target volumes per table before merging | 4 |
 | keep_snapshots | Backup snapshots to retain per table | 3 |
 | checkpoint_on_close | Seal all hot rows on clean shutdown | on |
 | target_volume_rows | Target rows per cold volume (min 65536) | 1048576 |
@@ -436,6 +436,8 @@ A persistent database creates this directory structure:
       manifest.bin                     # Segment metadata (volumes, tombstones, checkpoint LSN)
   snapshots/                           # Created by PRAGMA SNAPSHOT (backup)
     snapshot_meta.bin                   # Global snapshot metadata
+    ddl-TIMESTAMP.bin                  # Index/view definitions per snapshot batch
+    manifest-TIMESTAMP.json            # Table list per snapshot batch
     table_name/
       snapshot-TIMESTAMP.bin           # Per-table backup snapshot files
 ```

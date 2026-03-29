@@ -900,10 +900,12 @@ PRAGMA name;
 |--------|-------------|---------|
 | sync_mode | WAL sync mode (0=None, 1=Normal, 2=Full) | 1 |
 | checkpoint_interval | Seconds between automatic checkpoint cycles | 60 |
-| compact_threshold | Volume count before compaction triggers | 4 |
+| compact_threshold | Sub-target volumes per table before merging | 4 |
 | keep_snapshots | Backup snapshots to retain per table | 3 |
 | wal_flush_trigger | Buffer size in bytes before WAL flush | 32768 |
+| target_volume_rows | Target rows per cold volume (compaction split boundary) | 1048576 |
 | snapshot | Create a full backup snapshot | - |
+| restore | Restore database from a backup snapshot | - |
 | checkpoint | Run checkpoint cycle (seal + compact + WAL truncate) | - |
 | vacuum | Manual cleanup of deleted rows and index compaction | - |
 

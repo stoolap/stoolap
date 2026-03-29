@@ -18,13 +18,13 @@ v0.4.0 replaces the snapshot-based persistence engine with an immutable volume-b
 | Storage model | All rows in hot buffer, periodic snapshot to `.bin` | Hot/cold split: mutable hot buffer + immutable cold `.vol` files |
 | Persistence format | Monolithic row-serialized `.bin` per table | Columnar `.vol` files with zone maps, bloom filters, dictionary encoding, LZ4 compression |
 | Persistence location | `snapshots/<table>/` | `volumes/<table>/` |
-| Metadata | `snapshot_meta.bin` | `manifest.bin` per table (versioned, V4 format) |
+| Metadata | `snapshot_meta.bin` | `manifest.bin` per table (versioned, V6 format) |
 | Startup speed | Proportional to data size (deserialize all rows into memory) | Loads compressed blocks + metadata into RAM, WAL replay for recent writes |
 | Memory usage | All data in memory at all times | Compressed blocks in RAM, columns decompressed from RAM on first access |
 | Query on persisted data | Must be in memory first | Zone map pruning, bloom filters, row-group skipping, lazy column decompression from RAM |
 | Snapshot isolation | Hot buffer only | Full support including cold rows via versioned tombstones |
 | Concurrent writes to persisted rows | N/A (all rows in memory) | Per-table seal fence + row-level claim prevents lost updates |
-| Compaction | Not applicable | Adaptive 4-phase merge (convergence, opportunistic, incremental dedup, epoch staleness) |
+| Compaction | Not applicable | Bounded volume compaction: merges sub-target, oversized, and tombstoned volumes into target-sized outputs |
 | DELETE performance | Row removed from memory, snapshot rewrites all | Tombstone (no rewrite until compaction) |
 | Compression | WAL-only (optional) | LZ4 for both WAL and cold volumes (independent `wal_compression` and `volume_compression` flags) |
 
@@ -86,7 +86,8 @@ The migration is I/O bound. SSD storage significantly reduces migration time.
 |-----------|---------|-------------|
 | `sync_mode` | `normal` | `none` (no fsync, data durable at checkpoint), `normal` (fsync every 1 second), `full` (fsync every write) |
 | `checkpoint_interval` | 60 | Seconds between checkpoint cycles (seal + compact + WAL truncate) |
-| `compact_threshold` | 4 | Number of cold volumes before compaction merges them |
+| `compact_threshold` | 4 | Sub-target volumes per table before merging |
+| `target_volume_rows` | 1048576 | Target rows per cold volume. Controls compaction split boundary. |
 | `checkpoint_on_close` | on | Seal all hot rows on clean shutdown for fast startup |
 | `wal_compression` | on | LZ4 compression for WAL entries |
 | `volume_compression` | on | LZ4 compression for cold volume files |
@@ -131,7 +132,7 @@ The `sync_mode` parameter controls durability guarantees:
 | N/A | `--compact-threshold` (new) |
 | N/A | `--no-checkpoint-on-close` (new) |
 | N/A | `--snapshot` (new, create backup and exit) |
-| N/A | `--restore [TIMESTAMP]` (new, filesystem-level restore) |
+| N/A | `--restore [TIMESTAMP]` (new, requires database to open; use with `--reset-volumes` for corruption) |
 | N/A | `--reset-volumes` (new, delete volumes/ for recovery) |
 
 ### PRAGMA Changes
@@ -143,9 +144,9 @@ The `sync_mode` parameter controls durability guarantees:
 | N/A | `PRAGMA CHECKPOINT` | Runs checkpoint cycle: seal + compact + WAL truncate |
 | N/A | `PRAGMA RESTORE` | Restore from a backup snapshot (latest or by timestamp) |
 | N/A | `PRAGMA compact_threshold` | Set/read compaction threshold |
-| N/A | `PRAGMA checkpoint_on_close` | Set/read close behavior |
+| N/A | `PRAGMA target_volume_rows` | Set/read target rows per volume |
 
-**Important**: `PRAGMA SNAPSHOT` changed meaning. In v0.3.7 it was the primary persistence mechanism. In v0.4.0 it creates optional backup files for disaster recovery. It saves table data as `.bin` files and index/view definitions as `ddl.bin` (with CRC32 integrity check). Primary persistence is handled automatically by the checkpoint cycle. Use `PRAGMA RESTORE` to recover from a backup snapshot if needed.
+**Important**: `PRAGMA SNAPSHOT` changed meaning. In v0.3.7 it was the primary persistence mechanism. In v0.4.0 it creates optional backup files for disaster recovery. It saves table data as `.bin` files and index/view definitions as per-timestamp `ddl-{timestamp}.bin` (with CRC32 integrity check). Primary persistence is handled automatically by the checkpoint cycle. Use `PRAGMA RESTORE = '{timestamp}'` for consistent point-in-time restore.
 
 ```sql
 -- Create a backup snapshot
@@ -193,7 +194,8 @@ mydb/
       vol-00001.vol
   snapshots/                 (only if PRAGMA SNAPSHOT used, optional)
     snapshot_meta.bin
-    ddl.bin                  (index + view definitions, CRC32 protected)
+    ddl-20240315-100000.000.bin        (index + view definitions, per-timestamp)
+    manifest-20240315-100000.000.json  (table list for this snapshot batch)
     users/
       snapshot-20240315-100000.000.bin
 ```
@@ -202,7 +204,7 @@ Key differences:
 - `volumes/` replaces `snapshots/` as primary storage
 - Each table has a `manifest.bin` tracking its volumes and tombstones
 - `.vol` files are columnar (not row-serialized `.bin`), with per-column zone maps, bloom filters, and dictionary encoding
-- `.vol` files use V4 format (STV4 magic) with per-column per-row-group LZ4 blocks. Legacy STVZ/STVL formats are read but converted to V4 on compaction
+- `.vol` files use V4 format (STV4 magic) with per-column per-row-group LZ4 blocks
 - Row-group zone maps (64K-row groups) enable sub-volume pruning
 - `snapshots/` only appears if you explicitly run `PRAGMA SNAPSHOT` for backups
 
@@ -215,7 +217,7 @@ v0.3.7 had a snapshot cycle that periodically serialized the entire hot buffer i
 1. **Seal**: Move hot buffer rows into a new immutable `.vol` file (per-table seal fence ensures DML consistency)
 2. **Persist manifests**: Write `manifest.bin` atomically (fsync tmp, rename, fsync directory)
 3. **WAL Truncate**: Remove WAL entries before the checkpoint LSN
-4. **Compact** (background thread): If volume count exceeds `compact_threshold`, merge volumes using adaptive 4-phase strategy
+4. **Compact** (background thread): Merge sub-target, oversized, and tombstoned volumes into target-sized outputs
 
 The checkpoint cycle runs automatically every `checkpoint_interval` seconds (default: 60) and on clean shutdown.
 
@@ -236,16 +238,16 @@ v0.4.0 uses a per-table `RwLock` (seal fence) to coordinate between DML operatio
 
 This ensures no DML can see a partially-sealed state. Additionally, at commit time, a generation counter detects whether a seal happened during the transaction's lifetime. If so, pending rows are revalidated against cold segments to catch constraint violations that the original INSERT-time check may have missed.
 
-### Adaptive Compaction
+### Bounded Volume Compaction
 
-v0.4.0 uses a 4-phase compaction strategy instead of fixed-count merging:
+v0.4.0 uses content-driven compaction with a target volume size (`target_volume_rows`, default 1M rows):
 
-1. **Convergence**: Merge enough volumes to reach `compact_threshold` in one cycle
-2. **Opportunistic**: Keep including volumes as long as each is no larger than the running average
-3. **Incremental dedup**: If selected rows exceed 25% of the largest volume, include it too (deduplicates overlapping rows)
-4. **Epoch staleness**: Force-include all volumes if any hasn't been rewritten for `compact_threshold * 2` compaction epochs
+- **Sub-target** volumes (smaller than target): merged together when count exceeds `compact_threshold`
+- **Oversized** volumes (larger than 150% of target): split into target-sized volumes
+- **Dirty** volumes (at-target but have tombstoned rows): rewritten to physically remove dead rows
+- **Clean at-target** volumes: frozen, never rewritten
 
-This eliminates the problem of large base volumes accumulating stale tombstones or outdated format versions.
+Output is split at row-group aligned boundaries (multiples of 64K rows). This keeps volumes balanced and minimizes disk I/O.
 
 ### Snapshot Isolation on Cold Data
 
@@ -332,14 +334,14 @@ There is no automatic downgrade path from v0.4.0 to v0.3.7. Always backup before
 If your v0.4.0 database becomes corrupted (e.g., disk failure, interrupted checkpoint), use the CLI restore:
 
 ```bash
-# Restore from backup snapshot (removes corrupted volumes and WAL)
+# Restore from backup snapshot (requires database to open)
 stoolap -d "file:///path/to/db" --restore
 
-# Or reset volumes first, then open normally
-stoolap -d "file:///path/to/db" --reset-volumes
+# Recovery from corrupted volumes/manifests (cleans up first)
+stoolap -d "file:///path/to/db" --reset-volumes --restore
 ```
 
-The `--restore` flag works at the filesystem level without opening the database engine. It removes `volumes/`, `wal/`, and `db.lock`, then opens the database which rebuilds from the backup snapshot files.
+The `--restore` flag opens the database engine and replaces current data with snapshot data. If volumes or manifests are corrupted and the database cannot open, use `--reset-volumes --restore` which removes `volumes/` and `wal/` first.
 
 To ensure you always have backup snapshots available:
 
