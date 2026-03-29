@@ -96,6 +96,21 @@ pub trait Expression: Send + Sync + Debug {
         None
     }
 
+    /// Collect all column indices this expression accesses during evaluation.
+    /// Used for column pruning: only materialize columns the filter needs.
+    /// Returns false if column indices could not be fully determined (caller
+    /// should fall back to materializing all columns).
+    fn collect_column_indices(&self, out: &mut Vec<usize>) -> bool {
+        // Default: try AND/OR children first, then single-column fallback.
+        if let Some(children) = self.get_and_operands() {
+            return children.iter().all(|c| c.collect_column_indices(out));
+        }
+        if let Some(children) = self.get_or_operands() {
+            return children.iter().all(|c| c.collect_column_indices(out));
+        }
+        false // unknown expression type — caller materializes all
+    }
+
     /// Check if this expression can potentially use an index
     fn can_use_index(&self) -> bool {
         false

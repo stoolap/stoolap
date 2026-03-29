@@ -971,8 +971,12 @@ impl Executor {
                 if let Some(ref col_name) = stmt.column_name {
                     table.drop_column(&col_name.value)?;
 
-                    // Refresh engine's schema cache from version store
+                    // Refresh schema cache FIRST so invalidate_mappings sees the post-drop schema
                     self.engine.refresh_schema_cache(table_name)?;
+
+                    // Record column drop in manifest and recompute cold volume mappings
+                    self.engine
+                        .propagate_column_drop(table_name, &col_name.value);
 
                     // Record ALTER TABLE DROP COLUMN to WAL for persistence
                     self.engine
@@ -986,6 +990,13 @@ impl Executor {
             AlterTableOperation::RenameColumn => match (&stmt.column_name, &stmt.new_column_name) {
                 (Some(old_name), Some(new_name)) => {
                     table.rename_column(&old_name.value, &new_name.value)?;
+
+                    // Propagate rename alias to cold volumes
+                    self.engine.propagate_column_alias(
+                        table_name,
+                        &new_name.value,
+                        &old_name.value,
+                    );
 
                     // Refresh engine's schema cache from version store
                     self.engine.refresh_schema_cache(table_name)?;

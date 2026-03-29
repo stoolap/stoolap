@@ -49,25 +49,36 @@ const VERSION: &str = concat!(
 This CLI provides an interactive interface to execute SQL queries and manage your database.\n\n\
 PERSISTENCE DSN PARAMETERS:\n\
   file:///path/to/db?param=value&param2=value2\n\n\
-  sync=none|normal|full       WAL sync mode (default: normal)\n\
-  snapshot_interval=SECS      Snapshot interval in seconds (default: 300)\n\
-  keep_snapshots=COUNT        Number of snapshots to keep (default: 5)\n\
+  sync_mode=none|normal|full   Fsync mode (default: normal)\n\
+    none: no fsync, durable at checkpoint only\n\
+    normal: fsync every 1 second, DDL fsyncs immediately\n\
+    full: fsync on every write\n\
+  checkpoint_interval=SECS    Checkpoint interval in seconds (default: 60)\n\
+  compact_threshold=COUNT     Sub-target volumes per table before merging (default: 4)\n\
+  compression=on|off          WAL + volume LZ4 compression (default: on)\n\
+  wal_compression=on|off      WAL compression only (default: on)\n\
+  volume_compression=on|off   Volume LZ4 compression only (default: on)\n\
+  keep_snapshots=COUNT        Backup snapshots per table (default: 3)\n\
+  checkpoint_on_close=on|off  Checkpoint on shutdown (default: on)\n\
   wal_max_size=BYTES          Max WAL file size before rotation (default: 67108864)\n\
   wal_buffer_size=BYTES       WAL buffer size (default: 65536)\n\
   wal_flush_trigger=BYTES     Buffer size to trigger flush (default: 32768)\n\
   commit_batch_size=COUNT     Commits to batch before sync (default: 100)\n\
-  sync_interval_ms=MS         Min time between syncs (default: 10)\n\
-  compression=on|off          Enable/disable all compression (default: on)\n\
-  wal_compression=on|off      WAL compression only (default: on)\n\
-  snapshot_compression=on|off Snapshot compression only (default: on)\n\
-  compression_threshold=BYTES Min size to compress (default: 64)\n\n\
+  sync_interval_ms=MS         Min time between syncs in normal mode (default: 1000)\n\
+  compression_threshold=BYTES Min size to compress (default: 64)\n\
+  target_volume_rows=ROWS     Target rows per cold volume (default: 1048576)\n\n\
 EXAMPLES:\n\
   stoolap -d memory://                                    In-memory database\n\
   stoolap -d file:///tmp/mydb                             Persistent database\n\
-  stoolap -d file:///tmp/mydb?sync=full                   Maximum durability\n\
-  stoolap -d file:///tmp/mydb?sync=none&compression=off   Maximum performance\n\
+  stoolap -d file:///tmp/mydb?sync_mode=full               Maximum durability\n\
+  stoolap -d file:///tmp/mydb?sync_mode=none&compression=off  Max performance\n\
   stoolap -d file:///tmp/mydb --profile durable           Use durable preset\n\
-  stoolap -d file:///tmp/mydb --sync full --compression off"
+  stoolap -d file:///tmp/mydb --sync full --compression off\n\n\
+BACKUP & RESTORE:\n\
+  stoolap -d file:///tmp/mydb --snapshot                  Create backup snapshot\n\
+  stoolap -d file:///tmp/mydb --restore                   Restore from latest snapshot\n\
+  stoolap -d file:///tmp/mydb --restore 20260315-100000   Restore specific snapshot\n\
+  stoolap -d file:///tmp/mydb --reset-volumes --restore   Recovery from corrupted volumes"
 )]
 struct Args {
     /// Database path (file://<path> or memory://)
@@ -95,9 +106,9 @@ struct Args {
     file: Option<String>,
 
     /// WAL sync mode for durability (none, normal, full)
-    /// - none: Fastest but least durable - doesn't force syncs
-    /// - normal: Syncs on transaction commits (default)
-    /// - full: Forces syncs on every WAL write - slowest but most durable
+    /// - none: No fsync, data durable at checkpoint only
+    /// - normal: Fsync every 1 second, DDL fsyncs immediately (default)
+    /// - full: Fsync on every write
     #[arg(short = 's', long = "sync", value_name = "MODE")]
     sync_mode: Option<String>,
 
@@ -108,21 +119,44 @@ struct Args {
     #[arg(short = 'p', long = "profile", value_name = "PROFILE")]
     persistence_profile: Option<String>,
 
-    /// Snapshot interval in seconds (default: 300)
-    #[arg(long = "snapshot-interval", value_name = "SECONDS")]
-    snapshot_interval: Option<u32>,
+    /// Checkpoint interval in seconds (default: 60)
+    #[arg(long = "checkpoint-interval", value_name = "SECONDS")]
+    checkpoint_interval: Option<u32>,
 
-    /// Number of snapshots to keep (default: 5)
-    #[arg(long = "keep-snapshots", value_name = "COUNT")]
-    keep_snapshots: Option<u32>,
+    /// Sub-target volumes per table before merging (default: 4)
+    #[arg(long = "compact-threshold", value_name = "COUNT")]
+    compact_threshold: Option<u32>,
 
     /// Maximum WAL file size in MB before rotation (default: 64)
     #[arg(long = "wal-max-size", value_name = "MB")]
     wal_max_size: Option<u32>,
 
-    /// Enable or disable compression for WAL and snapshots (default: on)
+    /// Enable or disable LZ4 compression for WAL and volumes (default: on)
     #[arg(long = "compression", value_name = "on|off")]
     compression: Option<String>,
+
+    /// Number of backup snapshots to keep per table (default: 3)
+    #[arg(long = "keep-snapshots", value_name = "COUNT")]
+    keep_snapshots: Option<u32>,
+
+    /// Disable checkpoint on close (for crash simulation in tests)
+    #[arg(long = "no-checkpoint-on-close")]
+    no_checkpoint_on_close: bool,
+
+    /// Restore database from backup snapshot and exit.
+    /// Deletes corrupted volumes/ if needed, loads snapshot data, recreates indexes.
+    /// Optionally specify a timestamp: --restore "20260315-100000.000"
+    #[arg(long = "restore", value_name = "TIMESTAMP", num_args = 0..=1, default_missing_value = "")]
+    restore: Option<String>,
+
+    /// Create a backup snapshot and exit.
+    #[arg(long = "snapshot")]
+    snapshot: bool,
+
+    /// Force remove volumes/ directory before opening (for recovery from corrupted volumes).
+    /// Use with --restore to force snapshot-based recovery.
+    #[arg(long = "reset-volumes")]
+    reset_volumes: bool,
 
     /// Query timeout in milliseconds (0 for no timeout, default: 0)
     /// Long-running queries will be cancelled after this time.
@@ -577,6 +611,7 @@ impl Cli {
         println!("    DELETE ...             Delete data from a table");
         println!("    CREATE TABLE ...       Create a new table");
         println!("    CREATE INDEX ...       Create an index on a column");
+        println!("    ALTER TABLE ...        Modify table schema");
         println!("    SHOW TABLES            List all tables");
         println!("    SHOW CREATE TABLE ...  Show CREATE TABLE statement for a table");
         println!("    SHOW INDEXES FROM ...  Show indexes for a table");
@@ -585,6 +620,15 @@ impl Cli {
         println!("    BEGIN                  Start a new transaction");
         println!("    COMMIT                 Commit the current transaction");
         println!("    ROLLBACK               Rollback the current transaction");
+        println!();
+        println!("  \x1b[1;33mPRAGMA Commands:\x1b[0m");
+        println!("    PRAGMA CHECKPOINT      Seal hot data to volumes, compact, truncate WAL");
+        println!("    PRAGMA SNAPSHOT        Create backup snapshot (.bin files)");
+        println!("    PRAGMA RESTORE         Restore from latest backup snapshot");
+        println!(
+            "    PRAGMA key=value       Set configuration (sync_mode, checkpoint_interval, ...)"
+        );
+        println!("    PRAGMA key             Show current configuration value");
         println!();
         println!("  \x1b[1;33mSpecial Commands:\x1b[0m");
         println!("    exit, quit, \\q         Exit the CLI");
@@ -652,14 +696,14 @@ fn build_dsn(args: &Args) -> String {
         }
     }
 
-    // Snapshot interval
-    if let Some(interval) = args.snapshot_interval {
-        params.push(format!("snapshot_interval={}", interval));
+    // Checkpoint interval
+    if let Some(interval) = args.checkpoint_interval {
+        params.push(format!("checkpoint_interval={}", interval));
     }
 
-    // Keep snapshots
-    if let Some(count) = args.keep_snapshots {
-        params.push(format!("keep_snapshots={}", count));
+    // Compact threshold
+    if let Some(count) = args.compact_threshold {
+        params.push(format!("compact_threshold={}", count));
     }
 
     // WAL max size (convert MB to bytes)
@@ -679,6 +723,16 @@ fn build_dsn(args: &Args) -> String {
                 );
             }
         }
+    }
+
+    // Keep snapshots
+    if let Some(count) = args.keep_snapshots {
+        params.push(format!("keep_snapshots={}", count));
+    }
+
+    // Checkpoint on close
+    if args.no_checkpoint_on_close {
+        params.push("checkpoint_on_close=off".to_string());
     }
 
     // Append params to DSN
@@ -713,8 +767,12 @@ fn print_persistence_info(args: &Args) {
 
     println!("Persistence: WAL sync mode = {}", sync_desc);
 
-    if let Some(interval) = args.snapshot_interval {
-        println!("Persistence: Snapshot interval = {}s", interval);
+    if let Some(interval) = args.checkpoint_interval {
+        println!("Persistence: Checkpoint interval = {}s", interval);
+    }
+
+    if let Some(count) = args.compact_threshold {
+        println!("Persistence: Compact threshold = {}", count);
     }
 
     if let Some(count) = args.keep_snapshots {
@@ -728,6 +786,10 @@ fn print_persistence_info(args: &Args) {
     if let Some(ref comp) = args.compression {
         println!("Persistence: Compression = {}", comp);
     }
+
+    if args.no_checkpoint_on_close {
+        println!("Persistence: Checkpoint on close = off");
+    }
 }
 
 fn main() {
@@ -735,6 +797,312 @@ fn main() {
 
     // Build the DSN with optional query parameters
     let db_path = build_dsn(&args);
+
+    // ── Filesystem-level operations (before Database::open) ────────
+    // These work directly on disk so they can recover from broken state.
+
+    let db_dir = if let Some(path) = db_path.strip_prefix("file://") {
+        Some(std::path::PathBuf::from(
+            path.split('?').next().unwrap_or(path),
+        ))
+    } else {
+        None
+    };
+
+    // Handle --reset-volumes BEFORE --restore: delete volumes/ (and wal/)
+    // so that Database::open() in the restore path doesn't choke on
+    // corrupted on-disk state. This makes `--reset-volumes --restore`
+    // work as documented.
+    if args.reset_volumes {
+        if let Some(ref dir) = db_dir {
+            let vol_dir = dir.join("volumes");
+            if vol_dir.exists() {
+                match std::fs::remove_dir_all(&vol_dir) {
+                    Ok(()) => {
+                        if !args.quiet {
+                            eprintln!("Removed volumes/ directory for recovery");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error removing volumes/ directory: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let wal_dir = dir.join("wal");
+            if wal_dir.exists() {
+                match std::fs::remove_dir_all(&wal_dir) {
+                    Ok(()) => {
+                        if !args.quiet {
+                            eprintln!("Removed wal/ directory for recovery");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error removing wal/ directory: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            // Also remove the stale lock file so open() doesn't fail
+            let lock_file = dir.join("db.lock");
+            if lock_file.exists() {
+                let _ = std::fs::remove_file(&lock_file);
+            }
+        } else if !args.quiet {
+            eprintln!("Warning: --reset-volumes only applies to file:// databases");
+        }
+    }
+
+    // Handle --restore: filesystem-level recovery from backup snapshots.
+    // If --reset-volumes was used above, volumes/ and wal/ are already gone.
+    if args.restore.is_some() {
+        let dir = match &db_dir {
+            Some(d) => d,
+            None => {
+                eprintln!("Error: --restore requires a file:// database");
+                std::process::exit(1);
+            }
+        };
+
+        let snapshot_dir = dir.join("snapshots");
+        if !snapshot_dir.exists() {
+            eprintln!("Error: No snapshots/ directory found in {:?}", dir);
+            eprintln!(
+                "Create a backup first with: stoolap -d {} --snapshot",
+                db_path
+            );
+            std::process::exit(1);
+        }
+
+        // Find snapshot files to validate
+        let mut table_count = 0u32;
+        if let Ok(entries) = std::fs::read_dir(&snapshot_dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    let table_name = entry.file_name().to_string_lossy().to_string();
+                    let has_bin = std::fs::read_dir(entry.path())
+                        .ok()
+                        .map(|e| {
+                            e.flatten().any(|f| {
+                                f.path()
+                                    .extension()
+                                    .map(|ext| ext == "bin")
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false);
+                    if has_bin {
+                        table_count += 1;
+                        if !args.quiet {
+                            eprintln!("[restore] Found snapshot for table '{}'", table_name);
+                        }
+                    }
+                }
+            }
+        }
+
+        if table_count == 0 {
+            eprintln!("Error: No snapshot .bin files found in {:?}", snapshot_dir);
+            std::process::exit(1);
+        }
+
+        // Timestamp restore: open the database normally and use the engine's
+        // restore_snapshot() API, which loads the specific timestamp without
+        // deleting other backup files. Other snapshots are preserved.
+        if let Some(ref ts) = args.restore {
+            if !ts.is_empty() {
+                if !args.quiet {
+                    eprintln!("[restore] Restoring to timestamp: {}", ts);
+                }
+
+                let db = match Database::open(&db_path) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        eprintln!("Error opening database: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                match db.restore_snapshot(Some(ts)) {
+                    Ok(msg) => {
+                        println!("{}", msg);
+                    }
+                    Err(e) => {
+                        eprintln!("Error restoring snapshot: {}", e);
+                        db.close().unwrap_or(());
+                        std::process::exit(1);
+                    }
+                }
+
+                db.close().unwrap_or(());
+                return;
+            }
+        }
+
+        // Crash recovery (no timestamp): find the newest complete manifest
+        // and use the timestamped restore path for a coherent snapshot set.
+        let snap_dir = dir.join("snapshots");
+
+        // Scan manifests newest-first, pick the latest whose table snapshots all exist.
+        let restore_ts = {
+            let mut manifests: Vec<String> = std::fs::read_dir(&snap_dir)
+                .ok()
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            name.strip_prefix("manifest-")
+                                .and_then(|s| s.strip_suffix(".json"))
+                                .map(|ts| ts.to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            manifests.sort();
+            manifests.reverse(); // newest first
+
+            let mut chosen: Option<String> = None;
+            for ts in &manifests {
+                // Read manifest to get table list
+                let manifest_path = snap_dir.join(format!("manifest-{}.json", ts));
+                let Ok(content) = std::fs::read_to_string(&manifest_path) else {
+                    continue;
+                };
+                let table_names: Vec<String> = if let Some(start) = content.find("\"tables\":[") {
+                    let after = &content[start + 10..];
+                    if let Some(end) = after.find(']') {
+                        after[..end]
+                            .split(',')
+                            .filter_map(|s| {
+                                let trimmed = s.trim().trim_matches('"');
+                                if trimmed.is_empty() {
+                                    None
+                                } else {
+                                    Some(trimmed.to_string())
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                if table_names.is_empty() {
+                    continue;
+                }
+
+                // Verify all table snapshots exist for this timestamp
+                let all_exist = table_names.iter().all(|table| {
+                    let snapshot_file = snap_dir.join(table).join(format!("snapshot-{}.bin", ts));
+                    snapshot_file.exists()
+                });
+
+                if all_exist {
+                    if !args.quiet {
+                        eprintln!(
+                            "[restore] Found complete manifest for timestamp {} ({} tables)",
+                            ts,
+                            table_names.len()
+                        );
+                    }
+                    chosen = Some(ts.clone());
+                    break;
+                } else if !args.quiet {
+                    eprintln!(
+                        "[restore] Manifest {} has missing table snapshots, trying older...",
+                        ts
+                    );
+                }
+            }
+            chosen
+        };
+
+        if let Some(ts) = restore_ts {
+            // Use the timestamped restore path for a coherent snapshot set.
+            // This reuses the engine's restore_from_snapshot which handles
+            // data + DDL matching correctly.
+            if !args.quiet {
+                eprintln!("[restore] Restoring from timestamp {}...", ts);
+            }
+
+            let db = match Database::open(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("Error opening database: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            match db.restore_snapshot(Some(&ts)) {
+                Ok(msg) => println!("{}", msg),
+                Err(e) => {
+                    eprintln!("Error restoring snapshot: {}", e);
+                    db.close().unwrap_or(());
+                    std::process::exit(1);
+                }
+            }
+            db.close().unwrap_or(());
+        } else {
+            // No manifest found — legacy fallback: open DB and let load_snapshots
+            // pick the newest per table. Warn about potential DDL mismatch.
+            if !args.quiet {
+                eprintln!("[restore] No snapshot manifest found, using legacy restore path.");
+                eprintln!("[restore] Warning: DDL (indexes, views) may not match restored data.");
+            }
+
+            // Remove volumes/ and wal/ for clean startup
+            let vol_dir = dir.join("volumes");
+            if vol_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&vol_dir) {
+                    eprintln!("Error removing volumes/: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            let wal_dir = dir.join("wal");
+            if wal_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&wal_dir) {
+                    eprintln!("Error removing wal/: {}", e);
+                    std::process::exit(1);
+                }
+            }
+
+            let db = match Database::open(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("Error opening database after restore: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            // Verify data loaded
+            match db.query("SHOW TABLES", ()) {
+                Ok(rows) => {
+                    let tables: Vec<String> = rows
+                        .filter_map(|r| r.ok())
+                        .filter_map(|r| r.get::<String>(0).ok())
+                        .collect();
+                    println!(
+                        "Restore complete (legacy). {} tables recovered: {}",
+                        tables.len(),
+                        tables.join(", ")
+                    );
+                }
+                Err(_) => {
+                    println!(
+                        "Restore complete (legacy). {} tables recovered.",
+                        table_count
+                    );
+                }
+            }
+            db.close().unwrap_or(());
+        }
+        return;
+    }
+
+    // --reset-volumes already handled above (before --restore).
 
     // Open the database
     let db = match Database::open(&db_path) {
@@ -751,6 +1119,25 @@ fn main() {
         if db_path.starts_with("file://") {
             print_persistence_info(&args);
         }
+    }
+
+    // Handle --snapshot: open DB, create backup, close, exit
+    if args.snapshot {
+        match db.query("PRAGMA SNAPSHOT", ()) {
+            Ok(mut rows) => {
+                if let Some(Ok(row)) = rows.next() {
+                    if let Ok(msg) = row.get::<String>(0) {
+                        println!("{}", msg);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error creating snapshot: {}", e);
+                std::process::exit(1);
+            }
+        }
+        db.close().unwrap_or(());
+        return;
     }
 
     // Handle execute flag - run single query and exit
@@ -1399,7 +1786,7 @@ fn format_value(value: &Value) -> String {
         Value::Float(f) => format_float(*f),
         Value::Text(s) => s.to_string(),
         Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
-        Value::Timestamp(ts) => ts.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        Value::Timestamp(ts) => format_timestamp(ts),
         Value::Extension(data) if data.first() == Some(&(stoolap::DataType::Json as u8)) => {
             std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
         }
@@ -1407,6 +1794,24 @@ fn format_value(value: &Value) -> String {
             stoolap::core::value::format_vector_bytes(&data[1..])
         }
         Value::Extension(_) => "<extension>".to_string(),
+    }
+}
+
+/// Format a timestamp preserving sub-second precision.
+/// Omits fractional part when zero, trims trailing zeros otherwise.
+fn format_timestamp(ts: &chrono::DateTime<chrono::Utc>) -> String {
+    let nanos = ts.timestamp_subsec_nanos();
+    if nanos == 0 {
+        return ts.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    }
+    // Format with 9-digit nanoseconds, then trim trailing zeros
+    let s = ts.format("%Y-%m-%dT%H:%M:%S.%9fZ").to_string();
+    // Find the 'Z' and trim zeros before it
+    if let Some(z_pos) = s.rfind('Z') {
+        let trimmed = s[..z_pos].trim_end_matches('0');
+        format!("{}Z", trimmed)
+    } else {
+        s
     }
 }
 
@@ -1465,7 +1870,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Float(f) => serde_json::json!(f),
         Value::Text(s) => serde_json::json!(s.as_str()),
         Value::Boolean(b) => serde_json::json!(b),
-        Value::Timestamp(ts) => serde_json::json!(ts.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        Value::Timestamp(ts) => serde_json::json!(format_timestamp(ts)),
         Value::Extension(data) if data.first() == Some(&(stoolap::DataType::Json as u8)) => {
             serde_json::json!(std::str::from_utf8(&data[1..]).unwrap_or(""))
         }

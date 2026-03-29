@@ -74,6 +74,9 @@ pub(crate) struct DatabaseInner {
     /// Whether this DatabaseInner owns the engine (created it via open()).
     /// Cloned DatabaseInners share the engine but don't own it.
     owns_engine: bool,
+    /// Temp directory for test-filedb feature. Deleted on drop.
+    #[cfg(feature = "test-filedb")]
+    _temp_dir: Option<tempfile::TempDir>,
 }
 
 /// Type alias for Statement to use (avoids exposing DatabaseInner directly)
@@ -180,7 +183,9 @@ impl Clone for Database {
             engine,
             executor: Mutex::new(executor),
             dsn: self.inner.dsn.clone(),
-            owns_engine: false, // Cloned handles don't own the engine
+            owns_engine: false,
+            #[cfg(feature = "test-filedb")]
+            _temp_dir: None, // Clones don't own the temp dir
         });
 
         Database { inner }
@@ -254,15 +259,35 @@ impl Database {
         // Parse the DSN
         let (scheme, path) = Self::parse_dsn(dsn)?;
 
+        // test-filedb: track temp dir so it lives as long as the engine
+        #[cfg(feature = "test-filedb")]
+        let mut _temp_dir_holder: Option<tempfile::TempDir> = None;
+
         // Create the engine based on scheme
         let engine = match scheme.as_str() {
             MEMORY_SCHEME => {
-                let engine = MVCCEngine::in_memory();
-                engine.open_engine()?;
-                let engine = Arc::new(engine);
-                // Start background cleanup (uses config from engine)
-                engine.start_cleanup();
-                engine
+                #[cfg(feature = "test-filedb")]
+                {
+                    let tmp = tempfile::tempdir().map_err(|e| {
+                        Error::internal(format!("failed to create temp dir: {}", e))
+                    })?;
+                    let file_dsn = format!("file://{}", tmp.path().display());
+                    let (_clean_path, config) = Self::parse_file_config(&file_dsn[7..])?;
+                    let engine = MVCCEngine::new(config);
+                    engine.open_engine()?;
+                    let engine = Arc::new(engine);
+                    engine.start_cleanup();
+                    _temp_dir_holder = Some(tmp);
+                    engine
+                }
+                #[cfg(not(feature = "test-filedb"))]
+                {
+                    let engine = MVCCEngine::in_memory();
+                    engine.open_engine()?;
+                    let engine = Arc::new(engine);
+                    engine.start_cleanup();
+                    engine
+                }
             }
             FILE_SCHEME => {
                 // Parse optional query parameters
@@ -290,7 +315,9 @@ impl Database {
             engine,
             executor: Mutex::new(executor),
             dsn: dsn.to_string(),
-            owns_engine: true, // This DatabaseInner owns the engine
+            owns_engine: true,
+            #[cfg(feature = "test-filedb")]
+            _temp_dir: _temp_dir_holder,
         });
 
         // Store in registry
@@ -305,23 +332,43 @@ impl Database {
     /// Each call creates a unique instance (unlike `open("memory://")` which
     /// would share the same instance).
     pub fn open_in_memory() -> Result<Self> {
-        // Create engine directly without registry (each in_memory call is unique)
-        let engine = MVCCEngine::in_memory();
+        Self::create_in_memory_engine()
+    }
+
+    #[cfg(feature = "test-filedb")]
+    fn create_in_memory_engine() -> Result<Self> {
+        let tmp = tempfile::tempdir()
+            .map_err(|e| Error::internal(format!("failed to create temp dir: {}", e)))?;
+        let file_dsn = format!("file://{}", tmp.path().display());
+        let (_clean_path, config) = Self::parse_file_config(&file_dsn[7..])?;
+        let engine = MVCCEngine::new(config);
         engine.open_engine()?;
         let engine = Arc::new(engine);
-        // Start background cleanup (uses config from engine)
         engine.start_cleanup();
-
-        // Create executor (uses shared default function registry)
         let executor = Executor::new(Arc::clone(&engine));
-
         let inner = Arc::new(DatabaseInner {
             engine,
             executor: Mutex::new(executor),
             dsn: "memory://".to_string(),
-            owns_engine: true, // This DatabaseInner owns the engine
+            owns_engine: true,
+            _temp_dir: Some(tmp),
         });
+        Ok(Database { inner })
+    }
 
+    #[cfg(not(feature = "test-filedb"))]
+    fn create_in_memory_engine() -> Result<Self> {
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine()?;
+        let engine = Arc::new(engine);
+        engine.start_cleanup();
+        let executor = Executor::new(Arc::clone(&engine));
+        let inner = Arc::new(DatabaseInner {
+            engine,
+            executor: Mutex::new(executor),
+            dsn: "memory://".to_string(),
+            owns_engine: true,
+        });
         Ok(Database { inner })
     }
 
@@ -388,13 +435,20 @@ impl Database {
                             _ => SyncMode::Normal,
                         };
                     }
-                    // Snapshot interval in seconds: snapshot_interval=300
-                    "snapshot_interval" => {
+                    // Checkpoint interval in seconds: checkpoint_interval=60
+                    // Also accepts snapshot_interval for backward compatibility
+                    "checkpoint_interval" | "snapshot_interval" => {
                         if let Ok(secs) = value.parse::<u32>() {
-                            config.persistence.snapshot_interval = secs;
+                            config.persistence.checkpoint_interval = secs;
                         }
                     }
-                    // Number of snapshots to keep: keep_snapshots=5
+                    // Compaction threshold: compact_threshold=4
+                    "compact_threshold" => {
+                        if let Ok(count) = value.parse::<u32>() {
+                            config.persistence.compact_threshold = count;
+                        }
+                    }
+                    // Number of backup snapshots to keep: keep_snapshots=3
                     "keep_snapshots" => {
                         if let Ok(count) = value.parse::<u32>() {
                             config.persistence.keep_snapshots = count;
@@ -435,23 +489,36 @@ impl Database {
                         config.persistence.wal_compression =
                             matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
                     }
-                    // Snapshot compression: snapshot_compression=on|off
-                    "snapshot_compression" => {
-                        config.persistence.snapshot_compression =
+                    // Volume LZ4 compression: volume_compression=on|off
+                    "volume_compression" => {
+                        config.persistence.volume_compression =
                             matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
                     }
-                    // Both compressions: compression=on|off
-                    "compression" => {
+                    // All compressions (WAL + volume): compression=on|off
+                    // Also accepts snapshot_compression for backward compatibility
+                    "compression" | "snapshot_compression" => {
                         let enabled =
                             matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
                         config.persistence.wal_compression = enabled;
-                        config.persistence.snapshot_compression = enabled;
+                        config.persistence.volume_compression = enabled;
                     }
                     // Compression threshold in bytes: compression_threshold=64
                     "compression_threshold" => {
                         if let Ok(bytes) = value.parse::<usize>() {
                             config.persistence.compression_threshold = bytes;
                         }
+                    }
+                    // Target rows per volume: target_volume_rows=1048576
+                    "target_volume_rows" => {
+                        if let Ok(rows) = value.parse::<usize>() {
+                            config.persistence.target_volume_rows = rows.max(65_536);
+                        }
+                    }
+                    // Checkpoint on close: checkpoint_on_close=off
+                    // Set to off to simulate crashes in tests (WAL not truncated)
+                    "checkpoint_on_close" => {
+                        config.persistence.checkpoint_on_close =
+                            matches!(value.to_lowercase().as_str(), "on" | "true" | "1" | "yes");
                     }
                     // Cleanup interval in seconds: cleanup_interval=60
                     "cleanup_interval" => {
@@ -1033,16 +1100,41 @@ impl Database {
         Ok(())
     }
 
-    /// Create a point-in-time snapshot of the database
+    /// Create a backup snapshot of the database
     ///
-    /// This creates snapshot files for each table that can be used to speed up
-    /// database recovery. Instead of replaying the entire WAL, recovery can
-    /// load the snapshot and only replay WAL entries after the snapshot.
+    /// This creates snapshot files (.bin) for each table along with
+    /// index/view definitions (ddl-{timestamp}.bin) for disaster recovery.
+    /// Normal persistence uses the checkpoint cycle (seal to volumes + WAL).
     ///
     /// Note: This is a no-op for in-memory databases.
     pub fn create_snapshot(&self) -> Result<()> {
         use crate::storage::Engine;
         self.inner.engine.create_snapshot()
+    }
+
+    /// Restore the database from a backup snapshot.
+    ///
+    /// If no timestamp is provided, restores from the latest snapshot.
+    /// If a timestamp is provided (format: "YYYYMMDD-HHMMSS.fff"),
+    /// restores from that specific snapshot.
+    ///
+    /// This is a destructive operation that replaces all current data
+    /// with the snapshot data. Indexes and views are restored from
+    /// ddl-{timestamp}.bin or preserved from current in-memory state.
+    pub fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
+        use crate::storage::Engine;
+        let result = self.inner.engine.restore_snapshot(timestamp)?;
+        // Clear all query caches since all data has changed.
+        let executor = self
+            .inner
+            .executor
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        executor.clear_semantic_cache();
+        crate::executor::context::clear_scalar_subquery_cache();
+        crate::executor::context::clear_in_subquery_cache();
+        crate::executor::context::clear_semi_join_cache();
+        Ok(result)
     }
 
     /// Get the internal executor (for Statement use)
@@ -1085,6 +1177,12 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
         executor.clear_semantic_cache();
         Ok(())
+    }
+
+    /// Get the oldest snapshot timestamp loaded during startup.
+    /// Returns None if no snapshots were loaded.
+    pub fn oldest_loaded_snapshot_timestamp(&self) -> Option<String> {
+        self.inner.engine.oldest_loaded_snapshot_timestamp()
     }
 }
 

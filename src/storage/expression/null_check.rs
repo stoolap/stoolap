@@ -125,6 +125,15 @@ impl Expression for NullCheckExpr {
         self.col_index = find_column_index(schema, &self.column);
     }
 
+    fn collect_column_indices(&self, out: &mut Vec<usize>) -> bool {
+        if let Some(idx) = self.col_index {
+            out.push(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     fn is_prepared(&self) -> bool {
         self.col_index.is_some()
     }

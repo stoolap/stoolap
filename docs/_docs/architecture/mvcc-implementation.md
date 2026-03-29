@@ -26,7 +26,7 @@ Stoolap implements a **true multi-version MVCC** design:
 - **Full Version Chains**: Unlimited version history per row linked via `prev` pointers
 - **In-Memory Chains**: Version chains built from WAL replay during recovery
 - **Immutable Versions**: New versions always created, never modified in place
-- **Efficient Persistence**: Only latest version persisted to disk snapshots
+- **Efficient Persistence**: Latest version persisted to frozen volumes via checkpoint cycle
 - **Automatic Cleanup**: Old versions garbage collected when no longer needed
 
 ## Core Components

@@ -108,7 +108,7 @@ db.execute_batch(`
 Returns the Stoolap version string.
 
 ```javascript
-console.log(db.version()); // "0.3.7"
+console.log(db.version()); // "0.4.0"
 ```
 
 #### `free()`
@@ -187,7 +187,7 @@ The WASM build includes the full SQL engine:
 
 - All SQL features: joins, subqueries, CTEs (including recursive), window functions, aggregations (ROLLUP, CUBE, GROUPING SETS), DISTINCT ON, set operations
 - All data types: INTEGER, FLOAT, TEXT, BOOLEAN, TIMESTAMP, JSON, VECTOR
-- All 127+ built-in functions (string, math, date/time, JSON, hash, vector, aggregate, window)
+- All 131+ built-in functions (string, math, date/time, JSON, hash, vector, aggregate, window)
 - MVCC transactions with snapshot isolation
 - Cost-based query optimizer with EXPLAIN/EXPLAIN ANALYZE
 - All index types: B-tree, Hash, Bitmap, multi-column, HNSW
@@ -199,9 +199,9 @@ The WASM build includes the full SQL engine:
 | Feature | Status | Notes |
 |---------|--------|-------|
 | File persistence | Not available | In-memory only; data is lost on page reload |
-| Background threads | Not available | No parallel query execution; no automatic cleanup |
-| Cleanup | Manual only | Use `VACUUM` or `PRAGMA vacuum` for maintenance |
-| WAL / Snapshots | Not available | No crash recovery needed (in-memory) |
+| Background threads | Not available | No parallel query execution; no automatic checkpoint/cleanup |
+| Cleanup | Manual only | Use `VACUUM` for maintenance |
+| Checkpoint / WAL | Not available | No persistence needed (in-memory) |
 
 Since the background cleanup thread is unavailable in WASM, run `VACUUM` periodically in long-running sessions to reclaim memory from deleted rows:
 

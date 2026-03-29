@@ -26,10 +26,14 @@ Stoolap's storage engine is designed with the following principles:
 Tables in Stoolap are composed of:
 
 - **Metadata** - Schema information, column definitions, and indexes
-- **Row Data** - The primary data storage, organized by row
+- **Hot Buffer** - In-memory row storage for recent writes (row-major, MVCC-managed)
+- **Cold Segments (Frozen Volumes)** - Column-major storage for sealed historical data. Stores timestamps at nanosecond precision. Includes zone maps, bloom filters, dictionary encoding, and CRC32 integrity checks
+- **Tombstones** - Manifest-tracked markers for deleted cold rows, with per-transaction deferred application for isolation
 - **Version Store** - Tracks row versions for MVCC
-- **Indexes** - B-tree, Hash, Bitmap, HNSW, and multi-column indexes
+- **Indexes** - B-tree, Hash, Bitmap, HNSW, and multi-column indexes (hot data only, cold uses zone maps and bloom filters)
 - **Transaction Manager** - Manages transaction state and visibility
+
+In memory mode, all data lives in the hot buffer. In persistence mode, tables automatically seal hot rows into cold segments when they accumulate enough data (100K rows for first seal, 10K incremental). The query engine merges hot and cold sources transparently. See [Persistence]({{ '/docs/architecture/persistence/' | relative_url }}) for details.
 
 ### Data Types
 
@@ -70,8 +74,8 @@ When persistence is enabled, data is stored on disk with:
 
 - **Binary serialization** - Compact binary format for storage
 - **WAL files** - Write-ahead log for durability
-- **Snapshot files** - Point-in-time table snapshots
-- **Metadata files** - Schema and index information
+- **Volume files** - Immutable columnar cold segments with manifests
+- **Snapshot files** - Optional backup files (via PRAGMA SNAPSHOT)
 
 ## MVCC Implementation
 
@@ -155,18 +159,20 @@ When persistence is enabled:
 3. WAL is flushed to disk for durability
 4. This ensures recovery in case of crashes
 
-### Snapshots
+### Checkpoint Cycle
 
-1. Periodically, consistent snapshots of tables are created
-2. Snapshots contain the latest version of each row
-3. Snapshots accelerate recovery compared to replaying the entire WAL
+The background thread periodically seals hot rows into cold volumes:
+1. Hot buffer rows are written to immutable columnar `.vol` files
+2. Manifests (volume list, tombstones, checkpoint LSN) are persisted
+3. Compaction merges sub-target, oversized, and tombstoned volumes into target-sized outputs
+4. WAL is truncated when all hot data is sealed
 
 ### Recovery Process
 
 After a crash, recovery proceeds as follows:
 
-1. The latest valid snapshot is loaded for each table
-2. WAL entries after the snapshot are replayed
+1. Manifests and cold volumes are loaded from `volumes/`
+2. WAL entries after the checkpoint LSN are replayed (idempotent for sealed rows)
 3. Index definitions are restored and indexes rebuilt
 4. Incomplete transactions are rolled back
 
@@ -187,13 +193,59 @@ src/storage/
 │   ├── bitmap.rs       # Bitmap index
 │   ├── multi_column.rs # Multi-column index
 │   └── hnsw.rs         # HNSW vector index
+├── volume/             # Immutable volume storage
+│   ├── manifest.rs     # Segment manager, tombstones, manifest I/O
+│   ├── table.rs        # Volume-backed table operations
+│   ├── writer.rs       # Volume builder (hot to columnar)
+│   ├── scanner.rs      # Volume scanner with skip sets
+│   ├── column.rs       # Columnar data, bloom filters, dict encoding
+│   ├── format.rs       # Binary format reader
+│   └── io.rs           # Atomic volume file I/O
 └── mvcc/               # MVCC implementation
-    ├── engine.rs       # MVCC storage engine
+    ├── engine.rs       # MVCC storage engine (checkpoint, seal, compact)
     ├── table.rs        # Table with row storage
     ├── transaction.rs  # Transaction management
     ├── version_store.rs # Version tracking
-    └── persistence.rs  # WAL and snapshots
+    ├── persistence.rs  # WAL and persistence manager
+    └── snapshot.rs     # Backup snapshot reader/writer
 ```
+
+## Architecture Comparison
+
+Stoolap's storage engine combines ideas from several database architectures into a design tailored for an embedded, single-node MVCC database.
+
+### Delta-Main Architecture
+
+The core design follows the **delta-main** pattern used by systems like SAP HANA and SingleStore (MemSQL):
+
+- **Delta store (hot buffer):** Row-oriented, MVCC-managed B-tree for writes. Supports full transaction isolation with version chains, visibility checks, and lock-free reads.
+- **Main store (cold volumes):** Columnar, immutable `.vol` files optimized for analytical reads. Zone maps, bloom filters, dictionary encoding, and CRC32 checksums.
+
+Most databases pick one format. PostgreSQL is row-oriented everywhere. DuckDB is columnar everywhere. Stoolap uses **row-oriented for writes** and **columnar for reads**, which gives good performance on both OLTP and analytical workloads without the complexity of a distributed system.
+
+### Similarities to Existing Systems
+
+| Concept | Stoolap | Similar To |
+|---|---|---|
+| Hot buffer to immutable cold files | Hot buffer seal to `.vol` files | LSM-tree memtable to SST (RocksDB) |
+| Columnar volumes with zone maps, bloom filters | FrozenVolume format | Apache Parquet, Delta Lake data files |
+| Manifest tracking segments and tombstones | manifest.bin per table | Delta Lake transaction log, Iceberg manifest lists |
+| Newest-source-wins dedup via skip sets | Hot shadows cold by row_id | Iceberg position delete files, merge-on-read |
+| Compaction merging multiple volumes | compact_volumes() | LSM compaction (universal style) |
+| WAL with checkpoint-based truncation | WAL truncation after seal | SQLite WAL, PostgreSQL checkpoint |
+| Delta store plus columnar main store | Hot MVCC plus cold volumes | SAP HANA, Apache Kudu, SingleStore |
+
+### Key Differences
+
+**Row-level skip-set dedup without coordination.** Most LSM engines use sequence numbers or tombstone markers that require merge iterators with multi-way comparison. Stoolap uses a single rule: "for any row_id, the newest source wins." At scan time, a FxHashSet skip set is built from hot row_ids and passed to cold scanners. No bloom filter probes across levels, no merge cursors, no coordination between layers.
+
+**No levels or compaction tiers.** LSM databases (RocksDB, LevelDB) use multi-level compaction (L0, L1, L2 and so on) with size ratios between levels. Stoolap uses bounded volume compaction: sub-target, oversized, and tombstoned volumes are merged into target-sized outputs (`target_volume_rows`, default 1M rows). Clean at-target volumes are frozen and never rewritten. This minimizes disk I/O while keeping volumes balanced.
+
+**Versioned tombstones for snapshot isolation.** Cold tombstones carry a commit_seq that is checked against the reading transaction's begin_seq. Most systems either use merge-on-read where deletes are separate files (Iceberg) or copy-on-write where deletes rewrite data files (Delta Lake). Stoolap inlines tombstone visibility into the scan path, avoiding both file rewrites and separate delete file management.
+
+**Seal-overlap window with atomic counter.** During seal, rows briefly exist in both hot and cold. A `seal_overlap` atomic counter tracks how many rows are in transition, avoiding systematic double-counting in `row_count()` and `fast_row_count()` without expensive dedup. The implementation still allows small transient drift during the brief seal window. Most systems use heavier coordination mechanisms like barriers or epoch-based reclamation.
+
+**Hot-only secondary indexes.** B-tree, Hash, and Bitmap indexes cover only hot buffer rows. Cold data is accessed through volume metadata: zone maps for range pruning, bloom filters for point lookups, dictionary pre-filters for equality checks. This avoids the cost of maintaining indexes across millions of immutable cold rows. The one exception is HNSW vector indexes, which must include cold data because vector similarity search has no equivalent to zone map pruning.
 
 ## Performance Characteristics
 

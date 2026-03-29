@@ -17,8 +17,8 @@ High-performance PHP driver for Stoolap. Built as a native PHP extension (C) for
 Download a package matching your PHP version and platform from [GitHub Releases](https://github.com/stoolap/stoolap-php/releases). Each archive contains both the PHP extension and the stoolap library.
 
 ```bash
-tar xzf stoolap-v0.3.7-php8.4-linux-x86_64.tar.gz
-cd stoolap-v0.3.7-php8.4-linux-x86_64
+tar xzf stoolap-v0.4.0-php8.4-linux-x86_64.tar.gz
+cd stoolap-v0.4.0-php8.4-linux-x86_64
 
 # Install the shared library
 sudo cp libstoolap.so /usr/local/lib/
@@ -139,7 +139,7 @@ $db = Database::open('file:///absolute/path/to/db');
 
 ## Persistence
 
-File-based databases persist data to disk using WAL (Write-Ahead Logging) and periodic snapshots. Data survives process restarts.
+File-based databases persist data to disk using WAL (Write-Ahead Logging) and immutable cold volumes. A background checkpoint cycle seals hot rows into columnar volume files, compacts them, and truncates the WAL. Data survives process restarts.
 
 ```php
 $db = Database::open('./mydata');

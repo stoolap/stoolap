@@ -11,7 +11,7 @@ Complete reference for the Stoolap Rust API (`stoolap` crate).
 
 ```toml
 [dependencies]
-stoolap = "0.3"
+stoolap = "0.4"
 ```
 
 ## Database
@@ -33,7 +33,7 @@ let db = Database::open("memory://")?;
 let db = Database::open("file:///path/to/database")?;
 
 // File-based with configuration
-let db = Database::open("file:///path/to/db?sync=full&snapshot_interval=60")?;
+let db = Database::open("file:///path/to/db?sync=full&checkpoint_interval=60")?;
 ```
 
 `open_in_memory()` creates a unique, isolated instance each time. `open("memory://")` returns the same shared engine for the same DSN.
@@ -43,17 +43,20 @@ let db = Database::open("file:///path/to/db?sync=full&snapshot_interval=60")?;
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `sync` / `sync_mode` | `normal` | Sync mode: `none`, `normal`, `full` (or `0`, `1`, `2`) |
-| `snapshot_interval` | `300` | Seconds between automatic snapshots |
-| `keep_snapshots` | `5` | Number of snapshot files to retain |
+| `checkpoint_interval` | `60` | Seconds between automatic checkpoint cycles |
+| `compact_threshold` | `4` | Sub-target volumes per table before merging |
+| `keep_snapshots` | `3` | Backup snapshots to retain per table |
 | `wal_flush_trigger` | `32768` | WAL flush trigger size in bytes |
 | `wal_buffer_size` | `65536` | WAL buffer size in bytes |
 | `wal_max_size` | `67108864` | Max WAL file size before rotation (64 MB) |
 | `commit_batch_size` | `100` | Commits to batch before syncing (normal mode) |
-| `sync_interval_ms` | `10` | Minimum ms between syncs (normal mode) |
+| `sync_interval_ms` | `1000` | Minimum ms between syncs (normal mode) |
 | `wal_compression` | `on` | LZ4 compression for WAL entries |
-| `snapshot_compression` | `on` | LZ4 compression for snapshots |
-| `compression` | -- | Set both `wal_compression` and `snapshot_compression` |
+| `compression` | -- | Alias that sets both `wal_compression` and `volume_compression` |
 | `compression_threshold` | `64` | Minimum bytes before compressing an entry |
+| `volume_compression` | `on` | LZ4 compression for cold volume files |
+| `checkpoint_on_close` | `on` | Seal all hot rows to volumes on clean shutdown |
+| `target_volume_rows` | `1048576` | Target rows per cold volume. Controls compaction split boundary. |
 
 ### execute()
 

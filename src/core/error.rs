@@ -105,6 +105,8 @@ pub enum Error {
         index: String,
         column: String,
         value: String,
+        /// Row ID of the conflicting row (-1 if unknown)
+        row_id: i64,
     },
 
     /// CHECK constraint violation
@@ -340,6 +342,7 @@ impl Error {
             index: index.into(),
             column: column.into(),
             value: value.into(),
+            row_id: -1,
         }
     }
 
@@ -421,6 +424,14 @@ impl Error {
                 | Error::PrimaryKeyConstraint { .. }
                 | Error::UniqueConstraint { .. }
                 | Error::ForeignKeyViolation { .. }
+        )
+    }
+
+    /// PK or UNIQUE violation only (excludes NOT NULL / FK).
+    pub fn is_pk_or_unique_violation(&self) -> bool {
+        matches!(
+            self,
+            Error::PrimaryKeyConstraint { .. } | Error::UniqueConstraint { .. }
         )
     }
 

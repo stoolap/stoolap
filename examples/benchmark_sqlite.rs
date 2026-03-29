@@ -27,6 +27,13 @@ const ITERATIONS_HEAVY: usize = 50; // Full scans, JOINs
 const WARMUP: usize = 10;
 
 fn main() {
+    let filedb = std::env::args().any(|a| a == "--filedb");
+    let _temp_dir = if filedb {
+        Some(tempfile::tempdir().unwrap())
+    } else {
+        None
+    };
+
     println!("Starting SQLite benchmark...");
     println!(
         "Configuration: {} rows, {} iterations per test\n",
@@ -34,7 +41,14 @@ fn main() {
     );
 
     let mut rng = rand::rng();
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = if let Some(ref tmp) = _temp_dir {
+        let c = Connection::open(tmp.path().join("bench.db")).unwrap();
+        c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        c
+    } else {
+        Connection::open_in_memory().unwrap()
+    };
 
     // Create schema (same as Stoolap)
     conn.execute(
@@ -81,11 +95,12 @@ fn main() {
         }
     }
 
+    let mode = if filedb { "file-db" } else { "in-memory" };
     println!("Benchmarking SQLite...\n");
     println!("============================================================");
     println!(
-        "SQLITE BENCHMARK ({} rows, {} iterations, in-memory)",
-        ROW_COUNT, ITERATIONS
+        "SQLITE BENCHMARK ({} rows, {} iterations, {})",
+        ROW_COUNT, ITERATIONS, mode
     );
     println!("============================================================\n");
     println!(

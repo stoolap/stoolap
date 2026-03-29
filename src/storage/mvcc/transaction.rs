@@ -142,6 +142,54 @@ pub trait TransactionEngineOperations: Send + Sync {
     fn defer_table_cleanup(&self, _tables: Vec<Box<dyn Table>>) {
         // Default: just drop synchronously (tables dropped when _tables goes out of scope)
     }
+
+    /// Acquire the seal fence shared lock. Commits hold this to signal they
+    /// are in-flight. The checkpoint micro-seal acquires the exclusive lock,
+    /// waiting for all in-flight commits to complete before draining hot rows.
+    /// Returns None for in-memory engines (no persistence, no seal fence needed).
+    fn acquire_seal_fence(&self) -> Option<SealFenceGuard> {
+        None
+    }
+}
+
+/// RAII guard that holds a seal fence read lock. When dropped, the read lock
+/// is released. The checkpoint micro-seal acquires the write lock, which
+/// blocks until all SealFenceGuards are dropped.
+pub struct SealFenceGuard {
+    /// Keep the Arc alive so the lock outlives the guard.
+    _lock: Arc<parking_lot::RwLock<()>>,
+    /// Raw pointer to avoid lifetime issues with RwLockReadGuard.
+    /// SAFETY: The Arc above keeps the RwLock alive.
+    _raw: *const (),
+}
+
+// SAFETY: SealFenceGuard only holds an Arc (Send+Sync) and a raw read-lock
+// that is released on drop. The guard is created and dropped on the same
+// thread (the commit thread). The raw pointer is not dereferenced.
+unsafe impl Send for SealFenceGuard {}
+unsafe impl Sync for SealFenceGuard {}
+
+impl SealFenceGuard {
+    pub fn new(lock: Arc<parking_lot::RwLock<()>>) -> Self {
+        // Acquire the read lock via the raw API so we can control the lifetime.
+        // parking_lot::RawRwLock::lock_shared is balanced by unlock_shared in Drop.
+        use parking_lot::lock_api::RawRwLock;
+        // SAFETY: lock_shared() is always safe to call. We balance it with
+        // unlock_shared() in Drop. The Arc keeps the RwLock alive.
+        unsafe { lock.raw().lock_shared() };
+        Self {
+            _raw: std::ptr::null(),
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for SealFenceGuard {
+    fn drop(&mut self) {
+        use parking_lot::lock_api::RawRwLock;
+        // SAFETY: We acquired lock_shared() in new(), this is the balancing release.
+        unsafe { self._lock.raw().unlock_shared() };
+    }
 }
 
 impl MvccTransaction {
@@ -383,6 +431,15 @@ impl Transaction for MvccTransaction {
 
         // Two-phase commit protocol
         if !is_read_only {
+            // Acquire seal fence shared lock. This signals to the checkpoint
+            // micro-seal that a commit is in-flight. The micro-seal waits for
+            // all in-flight commits to finish before draining hot rows.
+            // Held until complete_commit (end of this block).
+            let _seal_guard = self
+                .engine_operations
+                .as_ref()
+                .and_then(|ops| ops.acquire_seal_fence());
+
             // Phase 1: Start commit - mark transaction as "committing"
             self.registry.start_commit(self.id);
 
@@ -401,8 +458,11 @@ impl Transaction for MvccTransaction {
                         self.cleanup();
                         return Err(e);
                     } else {
-                        // Nothing committed yet - safe to abort cleanly
+                        // Nothing committed yet - safe to abort cleanly.
+                        // Release uncommitted_writes claims and remove from
+                        // txn_version_stores to prevent permanent row blocking.
                         self.registry.abort_transaction(self.id);
+                        ops.rollback_all_tables(self.id);
                         self.state = TransactionState::RolledBack;
                         self.cleanup();
                         return Err(e);

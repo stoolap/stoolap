@@ -1261,43 +1261,27 @@ impl MVCCTable {
         self.cached_schema.pk_column_index()
     }
 
-    /// Check unique index constraints for a row being inserted
-    /// OPTIMIZATION: Uses cached_schema and iterates indexes directly without collecting names
+    /// Check unique index constraints for a row being inserted.
     fn check_unique_constraints(&self, row: &Row, _row_id: i64) -> Result<()> {
-        // OPTIMIZATION: Use cached_schema instead of cloning
         let schema = &self.cached_schema;
-
-        // OPTIMIZATION: Iterate indexes directly without collecting names
-        // Use iter_unique_indexes to only iterate unique indexes
         self.version_store
             .for_each_unique_index(|index_name, index| {
-                // Get ALL columns this index is on
                 let column_ids = index.column_ids();
                 if column_ids.is_empty() {
                     return Ok(());
                 }
-
-                // Collect values for ALL columns in the index
                 let values: Vec<Value> = column_ids
                     .iter()
                     .filter_map(|&col_id| row.get(col_id as usize).cloned())
                     .collect();
-
-                // If we didn't get all values, skip this check
                 if values.len() != column_ids.len() {
                     return Ok(());
                 }
-
-                // NULL values are allowed in unique indexes (multiple NULLs are distinct)
-                // For multi-column unique indexes, if ANY column is NULL, it's allowed
                 if values.iter().any(|v| v.is_null()) {
                     return Ok(());
                 }
-
-                // Check if this value combination already exists in the index
                 let entries = index.find(&values)?;
-                if !entries.is_empty() {
-                    // Value already exists - constraint violation
+                if let Some(entry) = entries.first() {
                     let col_names: Vec<&str> = column_ids
                         .iter()
                         .map(|&col_id| {
@@ -1308,11 +1292,12 @@ impl MVCCTable {
                                 .unwrap_or("unknown")
                         })
                         .collect();
-                    return Err(Error::unique_constraint(
-                        index_name,
-                        col_names.join(", "),
-                        format!("{:?}", values),
-                    ));
+                    return Err(Error::UniqueConstraint {
+                        index: index_name.to_string(),
+                        column: col_names.join(", "),
+                        value: format!("{:?}", values),
+                        row_id: entry.row_id,
+                    });
                 }
                 Ok(())
             })
@@ -1375,7 +1360,7 @@ impl MVCCTable {
             }
         }
 
-        // Check unique index constraints
+        // Check unique index constraints (READ lock).
         self.check_unique_constraints(row, row_id)?;
 
         Ok(row_id)
@@ -1849,12 +1834,11 @@ impl Table for MVCCTable {
         let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
 
-        // Optimize: Reserve space in buffer if empty
-        if rows.is_empty() {
-            rows.reserve(row_ids.len());
-        }
-
-        let mut global_row_ids = Vec::with_capacity(row_ids.len());
+        // Don't pre-allocate based on row_ids.len() — for volume-backed tables,
+        // indexes may contain row_ids that exist in frozen volumes but not in
+        // the version store. Most lookups will be misses, so pre-allocating
+        // for all of them wastes memory.
+        let mut global_row_ids = Vec::with_capacity(row_ids.len().min(4096));
 
         // Step 1: Check local versions first (uncommitted changes in this transaction)
         for &row_id in row_ids {
@@ -1946,22 +1930,14 @@ impl Table for MVCCTable {
 
     fn insert(&mut self, mut row: Row) -> Result<Row> {
         let row_id = self.prepare_insert(&mut row)?;
-
-        // Clone the row for returning (with AUTO_INCREMENT value applied)
         let inserted_row = row.clone();
-
-        // Add to transaction's local version store
         self.txn_versions.write().unwrap().put(row_id, row, false)?;
-
         Ok(inserted_row)
     }
 
     fn insert_discard(&mut self, mut row: Row) -> Result<()> {
         let row_id = self.prepare_insert(&mut row)?;
-
-        // Add to transaction's local version store - NO CLONE!
         self.txn_versions.write().unwrap().put(row_id, row, false)?;
-
         Ok(())
     }
 
@@ -2411,27 +2387,49 @@ impl Table for MVCCTable {
         // Step 2: Batch fetch remaining from version store
         let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
             Vec::with_capacity(remaining_row_ids.len());
+        // Track which remaining row_ids have hot versions (cold-only rows won't)
+        let mut found_ids = rustc_hash::FxHashSet::default();
         if !remaining_row_ids.is_empty() {
             let batch_rows = self
                 .version_store
                 .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
             for (row_id, row, version) in batch_rows {
+                found_ids.insert(row_id);
                 let row = self.normalize_row_to_schema(row, schema);
                 rows_with_originals.push((row_id, row, version));
             }
         }
 
-        // Step 3: Batch delete all rows
-        let delete_count = (local_deletes.len() + rows_with_originals.len()) as i32;
-        if !local_deletes.is_empty() || !rows_with_originals.is_empty() {
+        // Cold-only row_ids: not in local versions and not in the hot version store.
+        // Create phantom delete markers so the WAL records the deletion, enabling
+        // tombstone recovery on restart.
+        let cold_only_ids: Vec<i64> = remaining_row_ids
+            .iter()
+            .filter(|id| !found_ids.contains(id))
+            .copied()
+            .collect();
+
+        // Step 3: Claim cold-only rows before acquiring txn_versions lock.
+        // Prevents concurrent DELETE + UPDATE from both committing (lost update).
+        // The claim is tracked in write_set via track_external_claim.
+        for row_id in &cold_only_ids {
+            self.try_claim_row(*row_id)?;
+        }
+
+        // Step 4: Batch delete all rows
+        let delete_count =
+            (local_deletes.len() + rows_with_originals.len() + cold_only_ids.len()) as i32;
+        if !local_deletes.is_empty() || !rows_with_originals.is_empty() || !cold_only_ids.is_empty()
+        {
             let mut txn_versions = self.txn_versions.write().unwrap();
-            // Delete local rows
             for (row_id, row) in local_deletes {
                 txn_versions.put(row_id, row, true)?;
             }
-            // Delete rows from version store with originals
             for (row_id, row, orig) in rows_with_originals {
                 txn_versions.put_with_original(row_id, row, orig, true)?;
+            }
+            for row_id in cold_only_ids {
+                txn_versions.put(row_id, Row::new(), true)?;
             }
         }
 
@@ -2440,6 +2438,29 @@ impl Table for MVCCTable {
 
     fn get_active_row_ids(&self) -> Vec<i64> {
         self.version_store.get_all_row_ids()
+    }
+
+    fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
+        self.version_store.collect_row_ids_into(dest);
+    }
+
+    fn has_row_id(&self, row_id: i64) -> bool {
+        self.version_store.has_committed_row(row_id)
+    }
+
+    fn try_claim_row(&self, row_id: i64) -> Result<()> {
+        self.version_store
+            .try_claim_row(row_id, self.txn_id)
+            .map_err(|e| Error::internal(e.to_string()))?;
+        // Track this claim in TransactionVersionStore's write_set so that
+        // commit/rollback releases it. Without this, claims made directly
+        // on VersionStore (for cold row UPDATE/DELETE) are never released
+        // because TransactionVersionStore::commit() only drains write_set.
+        self.txn_versions
+            .write()
+            .unwrap()
+            .track_external_claim(row_id);
+        Ok(())
     }
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
@@ -3289,6 +3310,66 @@ impl Table for MVCCTable {
 
     fn get_index(&self, name: &str) -> Option<std::sync::Arc<dyn Index>> {
         self.version_store.get_index(name)
+    }
+
+    fn get_unique_indexes(&self) -> Vec<(String, Vec<String>)> {
+        self.version_store
+            .get_all_indexes()
+            .into_iter()
+            .filter(|idx| idx.is_unique())
+            .map(|idx| (idx.name().to_string(), idx.column_names().to_vec()))
+            .collect()
+    }
+
+    fn for_each_unique_non_pk_index(
+        &self,
+        f: &mut dyn FnMut(&str, &[String]) -> Result<()>,
+    ) -> Result<()> {
+        let pk_col = self
+            .cached_schema
+            .pk_column_index()
+            .map(|i| &self.cached_schema.columns[i].name_lower);
+        let indexes = self.version_store.indexes_read();
+        for idx in indexes.values() {
+            if !idx.is_unique() {
+                continue;
+            }
+            let names = idx.column_names();
+            // Skip single-column indexes that match the PK column
+            if names.len() == 1 {
+                if let Some(pk) = pk_col {
+                    if names[0].eq_ignore_ascii_case(pk) {
+                        continue;
+                    }
+                }
+            }
+            f(idx.name(), names)?;
+        }
+        Ok(())
+    }
+
+    fn has_unique_non_pk_indexes(&self) -> bool {
+        let pk_col = self
+            .cached_schema
+            .pk_column_index()
+            .map(|i| &self.cached_schema.columns[i].name_lower);
+        let indexes = self.version_store.indexes_read();
+        indexes.values().any(|idx| {
+            if !idx.is_unique() {
+                return false;
+            }
+            let names = idx.column_names();
+            if names.len() == 1 {
+                if let Some(pk) = pk_col {
+                    return !names[0].eq_ignore_ascii_case(pk);
+                }
+            }
+            true
+        })
+    }
+
+    fn acquire_upsert_lock(&self) -> Option<Box<dyn std::any::Any>> {
+        Some(Box::new(self.version_store.acquire_upsert_lock()))
     }
 
     fn get_multi_column_index(

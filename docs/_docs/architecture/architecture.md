@@ -69,12 +69,13 @@ Stoolap's architecture consists of the following major components:
 
 - **Persistence Layer** - Optional disk storage
   - Write-ahead logging (WAL)
-  - Snapshot management
-  - Crash recovery
+  - Immutable cold volumes (column-major storage with manifests and tombstones)
+  - Backup snapshots (PRAGMA SNAPSHOT for disaster recovery)
+  - Crash recovery (manifest + WAL replay)
 
 ### Function System
 
-- **Function Registry** - Central registry for 127+ SQL functions
+- **Function Registry** - Central registry for 131+ SQL functions
   - Scalar functions (scalar/) - String, math, date, JSON, vector functions
   - Aggregate functions (aggregate/)
   - Window functions (window/)
@@ -140,7 +141,7 @@ In persistent mode, Stoolap uses disk storage with memory caching:
 
 - Data is stored on disk with WAL for durability
 - Write-ahead logging ensures crash recovery
-- Periodic snapshots for faster recovery
+- Immutable cold volumes for fast startup on large tables
 - Use with `Database::open("file:///path/to/db")`
 
 ## Concurrency Model
@@ -165,7 +166,7 @@ src/
 │   ├── query.rs   # Main query executor
 │   ├── planner.rs # Query planner with cost estimation
 │   └── ...
-├── functions/     # 127+ built-in functions
+├── functions/     # 131+ built-in functions
 │   ├── scalar/    # String, math, date, JSON, vector functions
 │   ├── aggregate/ # COUNT, SUM, AVG, etc.
 │   └── window/    # ROW_NUMBER, RANK, LAG, etc.

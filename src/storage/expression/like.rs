@@ -314,6 +314,15 @@ impl Expression for LikeExpr {
         self.prepared = true;
     }
 
+    fn collect_column_indices(&self, out: &mut Vec<usize>) -> bool {
+        if let Some(idx) = self.col_index {
+            out.push(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     fn is_prepared(&self) -> bool {
         self.prepared
     }

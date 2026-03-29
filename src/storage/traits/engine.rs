@@ -49,8 +49,8 @@ pub trait Engine: Send + Sync {
 
     /// Closes the storage engine
     ///
-    /// This flushes pending writes, creates a final snapshot if needed,
-    /// and releases all resources.
+    /// This flushes pending writes, seals all hot rows into cold volumes
+    /// (when checkpoint_on_close is enabled), and releases all resources.
     fn close(&mut self) -> Result<()>;
 
     /// Begins a new transaction
@@ -115,10 +115,35 @@ pub trait Engine: Send + Sync {
     /// Note: Some configuration changes may require a restart to take effect.
     fn update_config(&mut self, config: Config) -> Result<()>;
 
-    /// Manually triggers snapshot creation for all tables
-    ///
-    /// This is useful for creating a consistent backup point.
+    /// Creates a full backup snapshot of all tables to .bin files.
+    /// Backup files are stored in the snapshots/ directory.
+    /// The keep_snapshots config limits how many backup files are retained per table.
     fn create_snapshot(&self) -> Result<()>;
+
+    /// Restores the database state from backup snapshots.
+    /// If timestamp is None, restores from the latest snapshot per table.
+    /// If timestamp is Some, restores from the snapshot with that specific timestamp.
+    /// This is a destructive operation that replaces all current data.
+    fn restore_snapshot(&self, _timestamp: Option<&str>) -> Result<String> {
+        Err(crate::core::Error::internal(
+            "restore_snapshot not supported by this engine",
+        ))
+    }
+
+    /// Runs the checkpoint cycle: seal hot buffers to volumes, persist manifests,
+    /// compact volumes, and truncate WAL. Used by the background checkpoint thread.
+    /// Respects seal thresholds (only seals when hot buffer exceeds size limits).
+    fn checkpoint_cycle(&self) -> Result<()>;
+
+    /// Runs the checkpoint cycle with force seal: seals ALL hot rows into volumes
+    /// regardless of threshold, then persists manifests, compacts, and truncates WAL.
+    /// Used by PRAGMA CHECKPOINT and close_engine where all data must be durable.
+    fn force_checkpoint_cycle(&self) -> Result<()>;
+
+    /// Deduplicate overlapping segments. Returns count of ghost duplicates fixed.
+    fn dedup_segments(&self) -> usize {
+        0
+    }
 
     /// Record an index creation operation to WAL for persistence
     ///

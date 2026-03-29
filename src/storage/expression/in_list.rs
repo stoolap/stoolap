@@ -395,6 +395,15 @@ impl Expression for InListExpr {
         self.build_hash_sets();
     }
 
+    fn collect_column_indices(&self, out: &mut Vec<usize>) -> bool {
+        if let Some(idx) = self.col_index {
+            out.push(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     fn is_prepared(&self) -> bool {
         self.col_index.is_some()
     }
