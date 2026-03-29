@@ -91,6 +91,50 @@ pub fn seal_and_persist_opts(
     Ok((Arc::new(volume), path, volume_id))
 }
 
+/// Seal rows into multiple target-sized volumes.
+/// Split is row-group aligned (multiples of 64K rows) so every volume
+/// has complete row groups. Optimal for LZ4 compression and zone maps.
+/// The last chunk may be smaller (partial row groups at the tail).
+///
+/// Returns a Vec of (volume, path, volume_id) tuples.
+pub fn seal_and_persist_multi(
+    schema: &Schema,
+    rows: &[(i64, Row)],
+    volume_dir: &std::path::Path,
+    table_name: &str,
+    compress: bool,
+    target_rows: usize,
+) -> Result<Vec<(Arc<FrozenVolume>, std::path::PathBuf, u64)>> {
+    // Row-group aligned chunk size
+    let row_group_size = 65_536usize;
+    let chunk_size = (target_rows / row_group_size).max(1) * row_group_size;
+
+    if rows.len() <= chunk_size || target_rows == 0 {
+        let (vol, path, id) =
+            seal_and_persist_opts(schema, rows, volume_dir, table_name, compress)?;
+        return Ok(vec![(vol, path, id)]);
+    }
+
+    let mut results = Vec::new();
+    for chunk in rows.chunks(chunk_size) {
+        let volume = seal_rows(schema, chunk);
+        let volume_id = io::next_volume_id();
+        match io::write_volume_to_disk_opts(volume_dir, table_name, volume_id, &volume, compress) {
+            Ok((path, _store)) => {
+                results.push((Arc::new(volume), path, volume_id));
+            }
+            Err(e) => {
+                // Clean up already-written files before propagating the error.
+                for (_, path, _) in &results {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

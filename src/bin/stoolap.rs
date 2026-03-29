@@ -65,7 +65,8 @@ PERSISTENCE DSN PARAMETERS:\n\
   wal_flush_trigger=BYTES     Buffer size to trigger flush (default: 32768)\n\
   commit_batch_size=COUNT     Commits to batch before sync (default: 100)\n\
   sync_interval_ms=MS         Min time between syncs in normal mode (default: 1000)\n\
-  compression_threshold=BYTES Min size to compress (default: 64)\n\n\
+  compression_threshold=BYTES Min size to compress (default: 64)\n\
+  target_volume_rows=ROWS     Target rows per cold volume (default: 1048576)\n\n\
 EXAMPLES:\n\
   stoolap -d memory://                                    In-memory database\n\
   stoolap -d file:///tmp/mydb                             Persistent database\n\

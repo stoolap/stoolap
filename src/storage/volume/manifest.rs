@@ -1098,6 +1098,27 @@ impl SegmentManager {
         manifest.segments.iter().map(|s| s.compaction_epoch).min()
     }
 
+    /// Get the maximum row_count across all segments.
+    pub fn max_segment_row_count(&self) -> usize {
+        let manifest = self.manifest.read();
+        manifest
+            .segments
+            .iter()
+            .map(|s| s.row_count)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Count segments below the target row count (sub-target volumes that need merging).
+    pub fn sub_target_segment_count(&self, target_rows: usize) -> usize {
+        let manifest = self.manifest.read();
+        manifest
+            .segments
+            .iter()
+            .filter(|s| s.row_count < target_rows)
+            .count()
+    }
+
     /// Check if a segment with the given ID is already registered (loaded in memory).
     pub fn has_segment(&self, segment_id: u64) -> bool {
         self.segments.read().contains_key(&segment_id)
@@ -1925,6 +1946,69 @@ impl SegmentManager {
             compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
             *segments = Arc::new(new_map);
         }
+        self.cached_deduped_count
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Atomically replace old segments with multiple new ones.
+    /// Used by compaction-with-split when the merged output exceeds target_volume_rows.
+    pub fn replace_segments_atomic_multi(
+        &self,
+        new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
+        old_segment_ids: &[u64],
+    ) {
+        if new_volumes.is_empty() {
+            self.replace_segments_atomic_remove_only(old_segment_ids);
+            return;
+        }
+        if new_volumes.len() == 1 {
+            let (id, vol, meta) = new_volumes.into_iter().next().unwrap();
+            self.replace_segments_atomic(id, vol, meta, old_segment_ids);
+            return;
+        }
+        {
+            let mut manifest = self.manifest.write();
+            let insert_pos = manifest
+                .segments
+                .iter()
+                .position(|s| old_segment_ids.contains(&s.segment_id))
+                .unwrap_or(manifest.segments.len());
+            manifest.remove_segments(old_segment_ids);
+
+            let mut segments = self.segments.write();
+            let mut new_map = (**segments).clone();
+            for &id in old_segment_ids {
+                new_map.remove(&id);
+            }
+
+            let insert_pos = insert_pos.min(manifest.segments.len());
+            for (i, (seg_id, vol, meta)) in new_volumes.into_iter().enumerate() {
+                if seg_id >= manifest.next_segment_id {
+                    manifest.next_segment_id = seg_id + 1;
+                }
+                let seg_schema_version = meta.schema_version;
+                manifest.segments.insert(insert_pos + i, meta);
+
+                let cold = ColdSegment {
+                    mapping: super::writer::ColumnMapping {
+                        sources: (0..vol.columns.len())
+                            .map(super::writer::ColSource::Volume)
+                            .collect(),
+                        is_identity: true,
+                    },
+                    volume: vol,
+                    schema_version: seg_schema_version,
+                    visible: None,
+                };
+                new_map.insert(seg_id, cold);
+            }
+
+            let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+            compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
+            *segments = Arc::new(new_map);
+        }
+        self.has_segments_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     }

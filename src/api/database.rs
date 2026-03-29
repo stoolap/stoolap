@@ -508,6 +508,12 @@ impl Database {
                             config.persistence.compression_threshold = bytes;
                         }
                     }
+                    // Target rows per volume: target_volume_rows=1048576
+                    "target_volume_rows" => {
+                        if let Ok(rows) = value.parse::<usize>() {
+                            config.persistence.target_volume_rows = rows.max(65_536);
+                        }
+                    }
                     // Checkpoint on close: checkpoint_on_close=off
                     // Set to off to simulate crashes in tests (WAL not truncated)
                     "checkpoint_on_close" => {

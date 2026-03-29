@@ -41,6 +41,7 @@ Stoolap currently supports the following PRAGMA commands:
 | `keep_snapshots` | Backup snapshots to retain per table | 3 |
 | `wal_flush_trigger` | Buffer size in bytes before WAL flush | 32768 |
 | `checkpoint_on_close` | Seal all hot rows on clean shutdown | on |
+| `target_volume_rows` | Target rows per cold volume (compaction split boundary) | 1048576 |
 | `snapshot` | Create a full backup snapshot | - |
 | `restore` | Restore database from a backup snapshot | - |
 | `checkpoint` | Run checkpoint cycle (seal + compact + WAL truncate) | - |

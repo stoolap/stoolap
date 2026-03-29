@@ -21,12 +21,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::common::SmartString;
 use crate::core::Result;
 
+use super::column::ColumnData;
 use super::column::ROW_GROUP_SIZE;
 use super::format::{
-    deserialize_volume, deserialize_volume_metadata, serialize_volume, serialize_volume_metadata,
-    COL_DICTIONARY,
+    deserialize_column_block, deserialize_column_block_into, deserialize_volume,
+    deserialize_volume_metadata, serialize_volume, serialize_volume_metadata, COL_BOOLEAN,
+    COL_BYTES, COL_DICTIONARY, COL_FLOAT64, COL_INT64, COL_TIMESTAMP,
 };
 use super::writer::{CompressedBlockStore, FrozenVolume, LazyColumns};
 
@@ -202,7 +205,8 @@ fn serialize_v4(vol: &FrozenVolume) -> std::io::Result<(Vec<u8>, CompressedBlock
 
 /// Read a V4 volume via streaming I/O. Never holds the full file in memory.
 /// CRC32 is computed incrementally as sections are read.
-/// Peak memory = compressed_metadata + parsed_metadata + compressed_blocks.
+/// Blocks are read one at a time into a reusable buffer and decompressed
+/// directly into final column vectors. No intermediate compressed storage.
 fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     use std::io::Read;
 
@@ -291,26 +295,287 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     }
     drop(index_buf);
 
-    // 4. Read blocks one at a time (no full file buffer)
-    let mut all_blocks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(col_count);
-    let mut all_decomp_lens: Vec<Vec<usize>> = Vec::with_capacity(col_count);
-    let mut block_idx = 0;
-    for _ in 0..col_count {
-        let mut col_blocks = Vec::with_capacity(num_groups);
-        let mut col_decomp = Vec::with_capacity(num_groups);
-        for _ in 0..num_groups {
-            let len = compressed_lens[block_idx];
-            let mut block = vec![0u8; len];
-            crc_read!(&mut block);
-            col_blocks.push(block);
-            col_decomp.push(decompressed_lens_flat[block_idx]);
-            block_idx += 1;
+    // 4. Build per-column dictionaries (needed before streaming decompression)
+    let mut col_dicts: Vec<Option<Arc<[SmartString]>>> = vec![None; col_count];
+    {
+        let mut dict_start = 0usize;
+        for (i, &tag) in meta.col_type_tags.iter().enumerate() {
+            if tag == COL_DICTIONARY {
+                let count = meta.col_dict_counts[i] as usize;
+                let end = dict_start + count;
+                col_dicts[i] = Some(Arc::from(&meta.shared_dict[dict_start..end]));
+                dict_start = end;
+            }
         }
-        all_blocks.push(col_blocks);
-        all_decomp_lens.push(col_decomp);
     }
 
-    // 5. Verify CRC32 (computed incrementally over everything we read)
+    let col_data_types = meta.column_types.clone();
+    let row_count = meta.row_count;
+    let group_size = ROW_GROUP_SIZE;
+
+    // 5. Stream-decompress: read each block into a reusable buffer, decompress
+    //    directly into pre-allocated column vectors. No CompressedBlockStore,
+    //    no intermediate Vec<Vec<Vec<u8>>> — saves ~1.3 GB allocation throughput.
+    let mut read_buf: Vec<u8> = Vec::new(); // reusable disk-read buffer
+    let mut lz4_buf: Vec<u8> = Vec::new(); // reusable LZ4 scratch buffer
+    let mut block_idx = 0;
+
+    let mut eager_columns: Vec<ColumnData> = Vec::with_capacity(col_count);
+
+    #[allow(clippy::needless_range_loop)]
+    for col_idx in 0..col_count {
+        let type_tag = meta.col_type_tags[col_idx];
+        let ext_type = crate::core::DataType::from_u8(meta.col_ext_types[col_idx])
+            .unwrap_or(crate::core::DataType::Null);
+
+        if num_groups == 0 {
+            // Empty volume — push empty column data
+            let col = match type_tag {
+                COL_INT64 => ColumnData::Int64 {
+                    values: Vec::new(),
+                    nulls: Vec::new(),
+                },
+                COL_FLOAT64 => ColumnData::Float64 {
+                    values: Vec::new(),
+                    nulls: Vec::new(),
+                },
+                COL_TIMESTAMP => ColumnData::TimestampNanos {
+                    values: Vec::new(),
+                    nulls: Vec::new(),
+                },
+                COL_BOOLEAN => ColumnData::Boolean {
+                    values: Vec::new(),
+                    nulls: Vec::new(),
+                },
+                COL_DICTIONARY => ColumnData::Dictionary {
+                    ids: Vec::new(),
+                    dictionary: col_dicts[col_idx]
+                        .take()
+                        .unwrap_or_else(|| Arc::from(Vec::<SmartString>::new())),
+                    nulls: Vec::new(),
+                },
+                COL_BYTES => ColumnData::Bytes {
+                    data: Vec::new(),
+                    offsets: Vec::new(),
+                    ext_type,
+                    nulls: Vec::new(),
+                },
+                _ => return Err(inv(&format!("unknown col type tag {}", type_tag))),
+            };
+            eager_columns.push(col);
+        } else if num_groups == 1 {
+            // Single group: read block, decompress, deserialize via existing path
+            let comp_len = compressed_lens[block_idx];
+            let decomp_len = decompressed_lens_flat[block_idx];
+            read_buf.clear();
+            read_buf.resize(comp_len, 0);
+            crc_read!(&mut read_buf);
+            block_idx += 1;
+
+            let group_rows = row_count.min(group_size);
+            let dict = col_dicts[col_idx].as_ref().map(Arc::clone);
+
+            let col = if read_buf.len() == decomp_len {
+                // Stored uncompressed
+                deserialize_column_block(&read_buf, type_tag, group_rows, dict, ext_type)
+                    .map_err(|e| inv(&format!("col={}: {}", col_idx, e)))?
+            } else {
+                if lz4_buf.len() < decomp_len {
+                    lz4_buf.resize(decomp_len, 0);
+                }
+                lz4_flex::decompress_into(&read_buf, &mut lz4_buf[..decomp_len])
+                    .map_err(|e| inv(&format!("col={} LZ4: {}", col_idx, e)))?;
+                deserialize_column_block(
+                    &lz4_buf[..decomp_len],
+                    type_tag,
+                    group_rows,
+                    dict,
+                    ext_type,
+                )
+                .map_err(|e| inv(&format!("col={}: {}", col_idx, e)))?
+            };
+            eager_columns.push(col);
+        } else {
+            // Multi-group: stream blocks directly into pre-allocated vectors.
+            // Helper closure: compute row count for a group index.
+            let group_row_count = |gi: usize| -> usize {
+                if gi == num_groups - 1 {
+                    row_count - gi * group_size
+                } else {
+                    group_size
+                }
+            };
+
+            // Read + decompress each group block inline into typed output vecs.
+            macro_rules! stream_decompress_into {
+                ($nulls:expr, $i64_out:expr, $f64_out:expr, $u32_out:expr,
+                 $bool_out:expr, $bytes_data:expr, $bytes_offsets:expr) => {
+                    for gi in 0..num_groups {
+                        let comp_len = compressed_lens[block_idx];
+                        let decomp_len = decompressed_lens_flat[block_idx];
+                        read_buf.clear();
+                        read_buf.resize(comp_len, 0);
+                        crc_read!(&mut read_buf);
+                        block_idx += 1;
+
+                        let grp_rows = group_row_count(gi);
+                        if read_buf.len() == decomp_len {
+                            // Stored uncompressed — deserialize directly
+                            deserialize_column_block_into(
+                                &read_buf,
+                                type_tag,
+                                grp_rows,
+                                $nulls,
+                                $i64_out,
+                                $f64_out,
+                                $u32_out,
+                                $bool_out,
+                                $bytes_data,
+                                $bytes_offsets,
+                            )
+                            .map_err(|e| inv(&format!("col={} g={}: {}", col_idx, gi, e)))?;
+                        } else {
+                            if lz4_buf.len() < decomp_len {
+                                lz4_buf.resize(decomp_len, 0);
+                            }
+                            lz4_flex::decompress_into(&read_buf, &mut lz4_buf[..decomp_len])
+                                .map_err(|e| {
+                                    inv(&format!("col={} g={} LZ4: {}", col_idx, gi, e))
+                                })?;
+                            deserialize_column_block_into(
+                                &lz4_buf[..decomp_len],
+                                type_tag,
+                                grp_rows,
+                                $nulls,
+                                $i64_out,
+                                $f64_out,
+                                $u32_out,
+                                $bool_out,
+                                $bytes_data,
+                                $bytes_offsets,
+                            )
+                            .map_err(|e| inv(&format!("col={} g={}: {}", col_idx, gi, e)))?;
+                        }
+                    }
+                };
+            }
+
+            let col = match type_tag {
+                COL_INT64 => {
+                    let mut vals = Vec::with_capacity(row_count);
+                    let mut nulls = Vec::with_capacity(row_count);
+                    stream_decompress_into!(
+                        &mut nulls,
+                        Some(&mut vals),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None
+                    );
+                    ColumnData::Int64 {
+                        values: vals,
+                        nulls,
+                    }
+                }
+                COL_FLOAT64 => {
+                    let mut vals = Vec::with_capacity(row_count);
+                    let mut nulls = Vec::with_capacity(row_count);
+                    stream_decompress_into!(
+                        &mut nulls,
+                        None,
+                        Some(&mut vals),
+                        None,
+                        None,
+                        None,
+                        None
+                    );
+                    ColumnData::Float64 {
+                        values: vals,
+                        nulls,
+                    }
+                }
+                COL_TIMESTAMP => {
+                    let mut vals = Vec::with_capacity(row_count);
+                    let mut nulls = Vec::with_capacity(row_count);
+                    stream_decompress_into!(
+                        &mut nulls,
+                        Some(&mut vals),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None
+                    );
+                    ColumnData::TimestampNanos {
+                        values: vals,
+                        nulls,
+                    }
+                }
+                COL_BOOLEAN => {
+                    let mut vals = Vec::with_capacity(row_count);
+                    let mut nulls = Vec::with_capacity(row_count);
+                    stream_decompress_into!(
+                        &mut nulls,
+                        None,
+                        None,
+                        None,
+                        Some(&mut vals),
+                        None,
+                        None
+                    );
+                    ColumnData::Boolean {
+                        values: vals,
+                        nulls,
+                    }
+                }
+                COL_DICTIONARY => {
+                    let mut ids = Vec::with_capacity(row_count);
+                    let mut nulls = Vec::with_capacity(row_count);
+                    stream_decompress_into!(
+                        &mut nulls,
+                        None,
+                        None,
+                        Some(&mut ids),
+                        None,
+                        None,
+                        None
+                    );
+                    ColumnData::Dictionary {
+                        ids,
+                        dictionary: col_dicts[col_idx]
+                            .take()
+                            .unwrap_or_else(|| Arc::from(Vec::<SmartString>::new())),
+                        nulls,
+                    }
+                }
+                COL_BYTES => {
+                    let mut data = Vec::new();
+                    let mut offsets = Vec::with_capacity(row_count);
+                    let mut nulls = Vec::with_capacity(row_count);
+                    stream_decompress_into!(
+                        &mut nulls,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&mut data),
+                        Some(&mut offsets)
+                    );
+                    ColumnData::Bytes {
+                        data,
+                        offsets,
+                        ext_type,
+                        nulls,
+                    }
+                }
+                _ => return Err(inv(&format!("unknown col type tag {}", type_tag))),
+            };
+            eager_columns.push(col);
+        }
+    }
+
+    // 6. Verify CRC32 (computed incrementally over everything we read)
     let mut crc_buf = [0u8; 4];
     reader
         .read_exact(&mut crc_buf)
@@ -319,39 +584,6 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     if hasher.finalize() != stored_crc {
         return Err(inv("CRC mismatch"));
     }
-
-    // 6. Build dict_ranges (O(C) accumulation)
-    let mut dict_ranges = Vec::new();
-    let mut dict_start = 0usize;
-    for (i, &tag) in meta.col_type_tags.iter().enumerate() {
-        if tag == COL_DICTIONARY {
-            let count = meta.col_dict_counts[i] as usize;
-            dict_ranges.push((i, dict_start, dict_start + count));
-            dict_start += count;
-        }
-    }
-
-    let col_data_types = meta.column_types.clone();
-
-    let store = CompressedBlockStore::from_raw_blocks(
-        all_blocks,
-        all_decomp_lens,
-        meta.col_type_tags.clone(),
-        col_data_types.clone(),
-        meta.col_ext_types.clone(),
-        meta.shared_dict,
-        dict_ranges,
-        ROW_GROUP_SIZE,
-        meta.row_count,
-    );
-
-    // Eagerly decompress all columns from CompressedBlockStore into RAM.
-    // V3 (STVZ) loads all columns at startup; V4 must match for equal
-    // performance on INSERT/upsert/aggregate paths. The CompressedBlockStore
-    // is consumed — no duplicate memory.
-    let eager_columns: Vec<super::column::ColumnData> = (0..store.col_count())
-        .map(|ci| store.decompress_column(ci))
-        .collect();
 
     Ok(FrozenVolume {
         columns: LazyColumns::eager(eager_columns, col_data_types),

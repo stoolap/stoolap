@@ -5141,12 +5141,17 @@ impl MVCCEngine {
             _ => return Ok(()),
         };
 
-        let compact_threshold = self
+        let (compact_threshold, target_volume_rows) = self
             .config
             .read()
-            .map(|c| c.persistence.compact_threshold as usize)
-            .unwrap_or(4)
-            .max(2);
+            .map(|c| {
+                (
+                    c.persistence.compact_threshold as usize,
+                    c.persistence.target_volume_rows,
+                )
+            })
+            .unwrap_or((4, 1_048_576));
+        let compact_threshold = compact_threshold.max(2);
 
         // Skip compaction entirely when snapshot transactions are active.
         // Compaction physically removes rows from old volumes. A snapshot
@@ -5158,21 +5163,32 @@ impl MVCCEngine {
         }
 
         let current_epoch = self.compaction_epoch.fetch_add(1, Ordering::Relaxed);
-        let max_age = compact_threshold as u64 * 2;
 
         let tables_to_compact: Vec<String> = {
             let mgrs = self.segment_managers.read().unwrap();
             mgrs.iter()
                 .filter(|(_, mgr)| {
-                    if mgr.segment_count() > compact_threshold {
+                    // Only count sub-target volumes toward threshold.
+                    let sub_target = mgr.sub_target_segment_count(target_volume_rows);
+                    if sub_target > compact_threshold {
                         return true;
                     }
-                    // Force-compact tables with stale volumes even if under threshold.
-                    // Prevents large base volumes from accumulating unbounded staleness.
-                    if mgr.segment_count() >= 2 {
-                        if let Some(oldest_epoch) = mgr.oldest_segment_epoch() {
-                            return current_epoch.saturating_sub(oldest_epoch) >= max_age;
-                        }
+                    // Sub-target volumes exist AND tombstones exist: the sub-target
+                    // volumes likely contain new versions of tombstoned rows.
+                    // Compact to merge new versions back into at-target volumes.
+                    if sub_target >= 2 && !mgr.is_tombstone_set_empty() {
+                        return true;
+                    }
+                    // Tombstones exist even without sub-target volumes (pure DELETE).
+                    // At-target volumes with tombstoned rows need cleanup.
+                    if sub_target == 0 && !mgr.is_tombstone_set_empty() && mgr.segment_count() >= 1
+                    {
+                        return true;
+                    }
+                    // Split oversized volumes that exceed 150% of target.
+                    let oversized_threshold = target_volume_rows * 3 / 2;
+                    if mgr.max_segment_row_count() > oversized_threshold {
+                        return true;
                     }
                     false
                 })
@@ -5195,102 +5211,59 @@ impl MVCCEngine {
 
             let mgr = self.get_or_create_segment_manager(table_name);
 
-            // Size-sorted compaction: sort segments by row_count, merge the
-            // smallest cluster. This naturally groups similar-sized volumes
-            // without artificial tier boundaries:
-            // - Bounded I/O (small volumes merged first, large ones left alone)
-            // - No arbitrary tier boundaries (adapts to any workload)
-            // - Logarithmic convergence (merged result is larger, eventually merges too)
+            // Targeted compaction: only rewrite volumes that need work.
+            // At-target volumes are left untouched to minimize disk I/O.
+            //
+            // Categories:
+            // - Sub-target (< target_volume_rows): small volumes to merge together
+            // - Oversized (> target * 3/2): large volumes to split
+            // - At-target: properly sized, never rewrite
             let (old_ids, volumes, tombstones) = {
                 let manifest = mgr.manifest();
                 let segs = mgr.segments_snapshot();
+                let ts = mgr.tombstone_set_arc();
 
-                // Adaptive compaction with three phases:
-                //
-                // 1. Space amplification: if physical rows > 2x logical,
-                //    merge ALL volumes to eliminate duplicates.
-                // 2. Convergence: merge at least (excess + 1) volumes so
-                //    the count drops to threshold in one cycle.
-                // 3. Opportunistic: keep including volumes as long as each
-                //    is no larger than the running average (sweeps up
-                //    similarly-sized small volumes cheaply).
-                let mut by_size: Vec<(usize, usize)> = manifest
-                    .segments
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, seg)| (idx, seg.row_count))
-                    .collect();
-                by_size.sort_by_key(|&(_, rows)| rows);
+                let oversized_threshold = target_volume_rows * 3 / 2;
 
-                let seg_count = by_size.len();
-                let excess = seg_count.saturating_sub(compact_threshold);
-
-                // Convergence floor: merge enough volumes so the count
-                // drops to threshold in one cycle. Merging N into 1
-                // removes N-1 from the count, so min_merge = excess + 1.
-                let min_merge = (excess + 1).max(2).min(seg_count);
-
-                // Phase 1: include min_merge volumes (mandatory).
-                let mut merge_count = min_merge.min(by_size.len());
-                let mut row_total: usize = by_size[..merge_count].iter().map(|(_, r)| *r).sum();
-
-                // Phase 2: opportunistic — keep including volumes as long
-                // as each one is no larger than the running average. This
-                // sweeps up similarly-sized small volumes cheaply but
-                // stops at the first volume that's significantly bigger.
-                while merge_count < by_size.len() {
-                    let avg = row_total / merge_count.max(1);
-                    let next_rows = by_size[merge_count].1;
-                    if next_rows > avg {
-                        break;
-                    }
-                    row_total += next_rows;
-                    merge_count += 1;
-                }
-
-                // Phase 3: incremental dedup — if the selected volumes
-                // collectively hold enough rows relative to the largest
-                // volume (which is the "base" from a previous compaction),
-                // include it too. This deduplicates overlapping rows
-                // incrementally instead of waiting for a full-table rewrite.
-                //
-                // Triggers when selected rows > largest / 4 (25%). This
-                // means the base is only rewritten when enough new data
-                // has accumulated to justify the I/O. Fully adaptive:
-                // low write rate → rarely triggers, high rate → triggers
-                // proportionally.
-                if merge_count < seg_count {
-                    let largest_rows = by_size[seg_count - 1].1;
-                    if largest_rows > 0 && row_total > largest_rows / 4 {
-                        // Include all remaining volumes (including the largest).
-                        for &(_, rows) in &by_size[merge_count..] {
-                            row_total += rows;
+                let mut merge_indices: Vec<usize> = Vec::new();
+                for (idx, seg) in manifest.segments.iter().enumerate() {
+                    if seg.row_count < target_volume_rows {
+                        // Sub-target: merge together to reach target size
+                        merge_indices.push(idx);
+                    } else if seg.row_count > oversized_threshold {
+                        // Oversized: needs splitting
+                        merge_indices.push(idx);
+                    } else if !ts.is_empty() {
+                        // At-target: include only if it has tombstoned rows.
+                        // Tombstones mean rows in this volume were updated/deleted
+                        // and newer versions live in sub-target volumes.
+                        if let Some(cs) = segs.get(&seg.segment_id) {
+                            let tombstone_count = cs
+                                .volume
+                                .row_ids
+                                .iter()
+                                .filter(|rid| ts.contains_key(rid))
+                                .count();
+                            if tombstone_count > 0 {
+                                merge_indices.push(idx);
+                            }
                         }
-                        merge_count = seg_count;
                     }
+                    // At-target with no tombstones: frozen, don't touch
                 }
 
-                // Phase 4: staleness — if any volume hasn't been rewritten
-                // for max_age compaction epochs, force-include all volumes.
-                // Prevents large base volumes from accumulating unbounded
-                // staleness (stale tombstones, old format, no compression).
-                if merge_count < seg_count {
-                    let oldest = manifest
-                        .segments
-                        .iter()
-                        .map(|s| s.compaction_epoch)
-                        .min()
-                        .unwrap_or(0);
-                    if (current_epoch + 1).saturating_sub(oldest) >= max_age {
-                        merge_count = seg_count;
-                    }
-                }
-
-                let merge_indices: Vec<usize> =
-                    by_size[..merge_count].iter().map(|&(idx, _)| idx).collect();
-
-                if merge_indices.len() < 2 {
+                if merge_indices.is_empty() {
                     continue;
+                }
+                // Single sub-target volume (too small, not dirty): wait for
+                // more to accumulate before merging.
+                // A single at-target/oversized volume with tombstones should
+                // NOT be skipped — it needs rewriting to remove dead rows.
+                if merge_indices.len() == 1 {
+                    let seg = &manifest.segments[merge_indices[0]];
+                    if seg.row_count < target_volume_rows {
+                        continue; // small volume, wait for more
+                    }
                 }
 
                 let old_ids: Vec<u64> = merge_indices
@@ -5381,134 +5354,147 @@ impl MVCCEngine {
                 continue;
             }
 
-            // Build compacted volume by streaming from volume references.
+            // Build compacted volumes, splitting at target_volume_rows boundary.
             // Only one Row is materialized at a time, avoiding O(N) memory.
-            let mut builder = crate::storage::volume::writer::VolumeBuilder::with_capacity(
-                &schema,
-                live_refs.len(),
-            );
-            // Precompute column mapping per volume (once each, not per row).
-            let vol_mappings: Vec<crate::storage::volume::writer::ColumnMapping> = volumes
-                .iter()
-                .map(|(seg_id, _vol)| mgr.get_volume_mapping(*seg_id, &schema))
-                .collect();
-            for &(row_id, vol_idx, row_idx) in &live_refs {
-                let vol = &volumes[vol_idx].1;
-                let mapping = &vol_mappings[vol_idx];
-                let row = if mapping.is_identity {
-                    vol.get_row(row_idx)
-                } else {
-                    vol.get_row_mapped(row_idx, mapping)
-                };
-                builder.add_row(row_id, &row);
-            }
-            let compacted = builder.finish();
-
-            // Write to disk with a stable volume_id for filename and registration.
             let vol_dir = pm.path().join("volumes");
-            let compact_vol_id = crate::storage::volume::io::next_volume_id();
             let compress = self
                 .config
                 .read()
                 .map(|c| c.persistence.volume_compression)
                 .unwrap_or(true);
-            match crate::storage::volume::io::write_volume_to_disk_opts(
-                &vol_dir,
-                table_name,
-                compact_vol_id,
-                &compacted,
-                compress,
-            ) {
-                Ok((_path, _store)) => {
-                    // V4 writes compressed blocks to disk but we drop the
-                    // CompressedBlockStore. Eager columns from VolumeBuilder::finish()
-                    // are already in RAM — no need for ~30MB compressed copy.
 
-                    // Pre-build unique hash indices before registration.
-                    {
-                        let stores = self.version_stores.read().unwrap();
-                        if let Some(store) = stores.get(table_name) {
-                            for (col_indices, _) in store.get_unique_non_pk_index_columns() {
-                                compacted.prebuild_unique_index(&col_indices);
+            // Precompute column mapping per volume (once each, not per row).
+            let vol_mappings: Vec<crate::storage::volume::writer::ColumnMapping> = volumes
+                .iter()
+                .map(|(seg_id, _vol)| mgr.get_volume_mapping(*seg_id, &schema))
+                .collect();
+
+            // Split live_refs into target-sized chunks and build one volume per chunk.
+            // Row-group aligned split: round to 64K boundary so every volume
+            // has complete row groups. Optimal for LZ4 compression and zone maps.
+            let row_group_size = 65_536usize;
+            let chunk_size = (target_volume_rows / row_group_size).max(1) * row_group_size;
+            let mut new_volumes: Vec<(
+                u64,
+                Arc<crate::storage::volume::writer::FrozenVolume>,
+                crate::storage::volume::manifest::SegmentMeta,
+            )> = Vec::new();
+            let mut write_failed = false;
+
+            for chunk in live_refs.chunks(chunk_size) {
+                let mut builder = crate::storage::volume::writer::VolumeBuilder::with_capacity(
+                    &schema,
+                    chunk.len(),
+                );
+                for &(row_id, vol_idx, row_idx) in chunk {
+                    let vol = &volumes[vol_idx].1;
+                    let mapping = &vol_mappings[vol_idx];
+                    let row = if mapping.is_identity {
+                        vol.get_row(row_idx)
+                    } else {
+                        vol.get_row_mapped(row_idx, mapping)
+                    };
+                    builder.add_row(row_id, &row);
+                }
+                let compacted = builder.finish();
+
+                let compact_vol_id = crate::storage::volume::io::next_volume_id();
+                match crate::storage::volume::io::write_volume_to_disk_opts(
+                    &vol_dir,
+                    table_name,
+                    compact_vol_id,
+                    &compacted,
+                    compress,
+                ) {
+                    Ok((_path, _store)) => {
+                        // Pre-build unique hash indices before registration.
+                        {
+                            let stores = self.version_stores.read().unwrap();
+                            if let Some(store) = stores.get(table_name) {
+                                for (col_indices, _) in store.get_unique_non_pk_index_columns() {
+                                    compacted.prebuild_unique_index(&col_indices);
+                                }
                             }
                         }
-                    }
-                    {
-                        use crate::storage::volume::manifest::SegmentMeta;
-                        let min_id = live_refs.first().map(|(id, _, _)| *id).unwrap_or(0);
-                        let max_id = live_refs.last().map(|(id, _, _)| *id).unwrap_or(0);
-                        let row_count = live_refs.len();
-                        mgr.replace_segments_atomic(
+                        let min_id = chunk.first().map(|(id, _, _)| *id).unwrap_or(0);
+                        let max_id = chunk.last().map(|(id, _, _)| *id).unwrap_or(0);
+                        new_volumes.push((
                             compact_vol_id,
                             Arc::new(compacted),
-                            SegmentMeta {
+                            crate::storage::volume::manifest::SegmentMeta {
                                 segment_id: compact_vol_id,
                                 file_path: std::path::PathBuf::new(),
-                                row_count,
+                                row_count: chunk.len(),
                                 min_row_id: min_id,
                                 max_row_id: max_id,
                                 creation_lsn: 0,
                                 compaction_epoch: current_epoch + 1,
                                 schema_version: self.schema_epoch.load(Ordering::Acquire),
                             },
-                            &old_ids,
-                        );
+                        ));
                     }
-                    // Clear only tombstones that existed at snapshot time for
-                    // row_ids in the merged volumes. Tombstones added after the
-                    // snapshot (by concurrent seal) are preserved — they are
-                    // needed for WAL replay correctness.
-                    {
-                        let merged_row_ids: FxHashSet<i64> = volumes
-                            .iter()
-                            .flat_map(|(_, vol)| vol.row_ids.iter().copied())
-                            .collect();
-                        mgr.remove_tombstones_matching_snapshot(&tombstones, &merged_row_ids);
-                    }
-
-                    // CRITICAL: Persist manifest BEFORE deleting old files.
-                    // Without this, a crash between file deletion and manifest
-                    // persist leaves the manifest referencing deleted files,
-                    // causing data loss on restart (24M → 9M rows).
-                    if let Err(e) = mgr.persist_manifest_only() {
+                    Err(e) => {
                         eprintln!(
-                            "Warning: Failed to persist manifest after compaction for {}: {}",
+                            "Warning: Failed to write compacted volume for {}: {}",
                             table_name, e
                         );
-                        // Don't delete old files if manifest persist failed.
-                        // The old manifest still references them, so they're
-                        // needed for recovery.
-                        continue;
+                        write_failed = true;
+                        break;
                     }
+                }
+            }
 
-                    // Now safe to delete old volume files + stale .dv files.
-                    // Manifest is durable on disk with the new segment list.
-                    let vol_table_dir = vol_dir.join(table_name);
-                    let old_filenames: FxHashSet<String> = old_ids
-                        .iter()
-                        .map(|id| format!("vol_{:016x}.vol", id))
-                        .collect();
-                    if let Ok(entries) = std::fs::read_dir(&vol_table_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            let ext = path.extension().and_then(|e| e.to_str());
-                            if ext == Some("dv") {
+            if write_failed || new_volumes.is_empty() {
+                // Clean up any volumes we did write before failure
+                let vol_table_dir = vol_dir.join(table_name);
+                for (vid, _, _) in &new_volumes {
+                    let fname = format!("vol_{:016x}.vol", vid);
+                    let _ = std::fs::remove_file(vol_table_dir.join(fname));
+                }
+                continue;
+            }
+
+            // Atomically register all new volumes and remove old segments.
+            mgr.replace_segments_atomic_multi(new_volumes, &old_ids);
+
+            // Clear only tombstones that existed at snapshot time for
+            // row_ids in the merged volumes.
+            {
+                let merged_row_ids: FxHashSet<i64> = volumes
+                    .iter()
+                    .flat_map(|(_, vol)| vol.row_ids.iter().copied())
+                    .collect();
+                mgr.remove_tombstones_matching_snapshot(&tombstones, &merged_row_ids);
+            }
+
+            // CRITICAL: Persist manifest BEFORE deleting old files.
+            if let Err(e) = mgr.persist_manifest_only() {
+                eprintln!(
+                    "Warning: Failed to persist manifest after compaction for {}: {}",
+                    table_name, e
+                );
+                continue;
+            }
+
+            // Now safe to delete old volume files + stale .dv files.
+            let vol_table_dir = vol_dir.join(table_name);
+            let old_filenames: FxHashSet<String> = old_ids
+                .iter()
+                .map(|id| format!("vol_{:016x}.vol", id))
+                .collect();
+            if let Ok(entries) = std::fs::read_dir(&vol_table_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let ext = path.extension().and_then(|e| e.to_str());
+                    if ext == Some("dv") {
+                        let _ = std::fs::remove_file(&path);
+                    } else if ext == Some("vol") {
+                        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                            if old_filenames.contains(fname) {
                                 let _ = std::fs::remove_file(&path);
-                            } else if ext == Some("vol") {
-                                if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                                    if old_filenames.contains(fname) {
-                                        let _ = std::fs::remove_file(&path);
-                                    }
-                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to write compacted volume for {}: {}",
-                        table_name, e
-                    );
                 }
             }
         }
@@ -5531,9 +5517,17 @@ impl MVCCEngine {
     /// - New scans see the delete and skip the row (read from volume instead)
     ///
     /// Threshold: 100K rows (first seal) or 10K rows (subsequent seals).
+    /// Output is split into target_volume_rows-sized volumes.
     fn seal_hot_buffers(&self) -> Result<()> {
         const SEAL_ROW_THRESHOLD: usize = 100_000;
         const SEAL_INCREMENTAL_THRESHOLD: usize = 10_000;
+        let seal_row_threshold = SEAL_ROW_THRESHOLD;
+        let seal_incremental_threshold = SEAL_INCREMENTAL_THRESHOLD;
+        let target_volume_rows = self
+            .config
+            .read()
+            .map(|c| c.persistence.target_volume_rows)
+            .unwrap_or(1_048_576);
 
         let pm = match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => pm,
@@ -5593,9 +5587,9 @@ impl MVCCEngine {
                         .map(|m| m.has_segments())
                         .unwrap_or(false);
                     let threshold = if has_seg {
-                        SEAL_INCREMENTAL_THRESHOLD
+                        seal_incremental_threshold
                     } else {
-                        SEAL_ROW_THRESHOLD
+                        seal_row_threshold
                     };
                     if row_count >= threshold {
                         Some((table_name, store, has_seg))
@@ -5640,9 +5634,9 @@ impl MVCCEngine {
             // On close (force_seal_all), seal ALL rows regardless of threshold.
             if !self.force_seal_all.load(Ordering::Acquire) {
                 let threshold = if has_segments {
-                    SEAL_INCREMENTAL_THRESHOLD
+                    seal_incremental_threshold
                 } else {
-                    SEAL_ROW_THRESHOLD
+                    seal_row_threshold
                 };
                 if all_rows.len() < threshold {
                     continue;
@@ -5676,44 +5670,53 @@ impl MVCCEngine {
 
             let vol_dir = pm.path().join("volumes");
 
-            // Build ONE volume from ALL rows for this table.
-            // Previous design created one .vol per 50K batch, causing compaction
-            // to explode (17 batches = 17 volumes to merge = 25s compaction).
+            // Build volumes from rows, splitting at target_volume_rows boundary.
             let compress = self
                 .config
                 .read()
                 .map(|c| c.persistence.volume_compression)
                 .unwrap_or(true);
-            match crate::storage::volume::seal::seal_and_persist_opts(
+            match crate::storage::volume::seal::seal_and_persist_multi(
                 &schema,
                 &all_rows,
                 &vol_dir,
                 &table_name,
                 compress,
+                target_volume_rows,
             ) {
-                Ok((volume, _path, volume_id)) => {
+                Ok(sealed_volumes) => {
                     // Pre-build unique hash indices BEFORE registration so the
                     // first INSERT after seal doesn't pay a ~60ms stall scanning
-                    // all rows. Safe: volume is not yet visible to other threads.
+                    // all rows. Safe: volumes are not yet visible to other threads.
                     {
                         let stores = self.version_stores.read().unwrap();
                         if let Some(store) = stores.get(&table_name) {
                             for (col_indices, _) in store.get_unique_non_pk_index_columns() {
-                                volume.prebuild_unique_index(&col_indices);
+                                for (vol, _, _) in &sealed_volumes {
+                                    vol.prebuild_unique_index(&col_indices);
+                                }
                             }
                         }
                     }
                     let mgr = self.get_or_create_segment_manager(&table_name);
 
                     // Seal critical section under exclusive fence: register cold
-                    // segment + remove hot rows + remove hot index entries.
+                    // segments + remove hot rows + remove hot index entries.
                     // DML operations hold the shared fence, so they cannot race
                     // between cold constraint checks and hot publication.
                     {
                         let _seal_guard = mgr.acquire_seal_write();
 
                         mgr.set_seal_overlap(total_rows);
-                        self.register_volume_with_id(&table_name, Arc::clone(&volume), volume_id);
+
+                        // Register all sealed volumes
+                        for (volume, _path, volume_id) in &sealed_volumes {
+                            self.register_volume_with_id(
+                                &table_name,
+                                Arc::clone(volume),
+                                *volume_id,
+                            );
+                        }
 
                         let mut index_cleanups = Vec::new();
                         let mut all_skipped_inner: Vec<i64> = Vec::new();
@@ -5745,21 +5748,19 @@ impl MVCCEngine {
                         }
 
                         // Clear tombstones for sealed row_ids INSIDE the fence.
-                        // Previously-updated rows have tombstones hiding the old
-                        // cold copy. The new volume has the updated version.
-                        // Clearing outside the fence would leave a window where
-                        // the row is invisible (hot removed, cold tombstoned).
                         {
                             let skip_set: FxHashSet<i64> =
                                 all_skipped_inner.iter().copied().collect();
                             let ts = mgr.tombstone_set_arc();
                             if !ts.is_empty() {
-                                let sealed_ids: FxHashSet<i64> = volume
-                                    .row_ids
-                                    .iter()
-                                    .copied()
-                                    .filter(|rid| ts.contains_key(rid) && !skip_set.contains(rid))
-                                    .collect();
+                                let mut sealed_ids: FxHashSet<i64> = FxHashSet::default();
+                                for (vol, _, _) in &sealed_volumes {
+                                    for &rid in &vol.row_ids {
+                                        if ts.contains_key(&rid) && !skip_set.contains(&rid) {
+                                            sealed_ids.insert(rid);
+                                        }
+                                    }
+                                }
                                 if !sealed_ids.is_empty() {
                                     mgr.remove_tombstones_for_rows(&sealed_ids);
                                 }

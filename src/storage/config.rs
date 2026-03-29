@@ -101,6 +101,13 @@ pub struct PersistenceConfig {
     /// Whether to run a final checkpoint (seal all hot rows to volumes) on close.
     /// Default: true. Set to false when simulating crashes in tests.
     pub checkpoint_on_close: bool,
+
+    /// Target number of rows per cold volume. Seal and compaction split their
+    /// output into volumes of approximately this size. Smaller values reduce
+    /// compaction write amplification; larger values improve compression and
+    /// reduce per-volume metadata overhead.
+    /// Default: 1,048,576 (1M rows = ~16 row groups of 64K each)
+    pub target_volume_rows: usize,
 }
 
 impl Default for PersistenceConfig {
@@ -120,6 +127,7 @@ impl Default for PersistenceConfig {
             compression_threshold: 64,      // Compress entries >= 64 bytes
             keep_snapshots: 3,              // Keep 3 backup snapshots per table
             checkpoint_on_close: true,      // Seal all data on clean shutdown
+            target_volume_rows: 1_048_576,  // 1M rows per volume (~16 row groups)
         }
     }
 }
@@ -147,6 +155,7 @@ impl PersistenceConfig {
             compression_threshold: 64,
             keep_snapshots: 3,
             checkpoint_on_close: true,
+            target_volume_rows: 1_048_576,
         }
     }
 
@@ -167,6 +176,7 @@ impl PersistenceConfig {
             compression_threshold: 64,
             keep_snapshots: 3,
             checkpoint_on_close: true,
+            target_volume_rows: 2_097_152, // 2M rows for fast mode
         }
     }
 
@@ -216,6 +226,12 @@ impl PersistenceConfig {
     /// Builder method to set keep count for backup snapshots
     pub fn with_keep_snapshots(mut self, count: u32) -> Self {
         self.keep_snapshots = count;
+        self
+    }
+
+    /// Builder method to set target rows per volume (minimum: 65,536 = one row group)
+    pub fn with_target_volume_rows(mut self, rows: usize) -> Self {
+        self.target_volume_rows = rows.max(65_536);
         self
     }
 }

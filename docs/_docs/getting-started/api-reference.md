@@ -54,6 +54,9 @@ let db = Database::open("file:///path/to/db?sync=full&checkpoint_interval=60")?;
 | `wal_compression` | `on` | LZ4 compression for WAL entries |
 | `compression` | -- | Alias for `wal_compression` |
 | `compression_threshold` | `64` | Minimum bytes before compressing an entry |
+| `volume_compression` | `on` | LZ4 compression for cold volume files |
+| `checkpoint_on_close` | `on` | Seal all hot rows to volumes on clean shutdown |
+| `target_volume_rows` | `1048576` | Target rows per cold volume. Controls compaction split boundary. |
 
 ### execute()
 

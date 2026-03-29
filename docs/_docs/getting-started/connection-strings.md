@@ -82,6 +82,7 @@ file:///path/to/data?sync_mode=normal&checkpoint_interval=60
 | `checkpoint_on_close` | on/off | on | Seal all hot rows to volumes on clean shutdown |
 | `commit_batch_size` | Integer | 100 | Commits to batch before sync |
 | `sync_interval_ms` | Integer (ms) | 1000 | Minimum time between syncs in normal mode |
+| `target_volume_rows` | Integer | 1048576 | Target rows per cold volume (min: 65536). Controls compaction split boundary. |
 
 Legacy parameter names are accepted for backward compatibility:
 - `snapshot_interval` maps to `checkpoint_interval`

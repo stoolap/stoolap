@@ -144,15 +144,22 @@ When a cold row is deleted or updated, a versioned tombstone is recorded as a `(
 
 ### Compaction
 
-When a table accumulates more than `compact_threshold` cold volumes, compaction runs:
+Compaction keeps volumes at a bounded target size (`target_volume_rows`, default 1M rows).
+Only volumes that need work are rewritten. At-target volumes with no tombstones are frozen and never touched.
 
-1. Sort volumes by row count, select the smallest cluster (bounded I/O per cycle)
-2. Iterate selected volumes newest-first, collecting live rows
-3. Tombstones filter pure-DELETE rows (no newer version exists)
-4. The `seen` set handles UPDATE dedup (newest version wins by row_id)
-5. Write a single clean merged volume
-6. Atomically swap old segments for the new one (no visibility gap for queries)
-7. Clear tombstones only for row_ids in the merged volumes
+Three categories trigger compaction:
+- **Sub-target**: Volumes smaller than `target_volume_rows` (from recent seals). Merged together when count exceeds `compact_threshold`.
+- **Oversized**: Volumes larger than 150% of target (legacy or bulk-loaded). Split into target-sized volumes.
+- **Dirty**: At-target volumes with tombstoned rows (DELETEd or UPDATEd). Rewritten to physically remove dead rows and merge in newer versions.
+
+The compaction process:
+1. Select volumes by category (sub-target + oversized + dirty). Leave clean at-target volumes untouched.
+2. Iterate selected volumes newest-first, collecting live rows (dedup by row_id, newest wins)
+3. Split output into row-group aligned volumes of `target_volume_rows` each
+4. Write each output volume to disk
+5. Atomically register all new volumes and remove old ones (no visibility gap)
+6. Clear tombstones for row_ids in the merged volumes
+7. Persist manifest before deleting old volume files (crash safety)
 8. Skipped entirely when snapshot isolation transactions are active
 
 ### What Volumes Optimize
@@ -351,6 +358,7 @@ file:///path/to/database?sync_mode=2&checkpoint_interval=60&compact_threshold=4&
 | compact_threshold | Volume count before compaction | 4 |
 | keep_snapshots | Backup snapshots to retain per table | 3 |
 | checkpoint_on_close | Seal all hot rows on clean shutdown | on |
+| target_volume_rows | Target rows per cold volume (min 65536) | 1048576 |
 
 Legacy parameter names are accepted for backward compatibility:
 - `snapshot_interval` maps to `checkpoint_interval`
