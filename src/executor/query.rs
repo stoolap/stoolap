@@ -3334,7 +3334,10 @@ impl Executor {
                             (
                                 all_rows,
                                 None,
-                                Some(WindowPreGroupedState { partition_map }),
+                                Some(WindowPreGroupedState {
+                                    partition_map,
+                                    partition_column: col_lower.clone(),
+                                }),
                             )
                         } else {
                             (table.collect_all_rows(None)?, None, None)

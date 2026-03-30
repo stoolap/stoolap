@@ -464,6 +464,9 @@ pub struct MVCCEngine {
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
     compaction_running: Arc<AtomicBool>,
+    /// Global epoch counter for volume eviction. Incremented each checkpoint
+    /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
+    eviction_epoch: AtomicU64,
 }
 
 /// RAII guard that clears an AtomicBool on drop. Used to release the
@@ -527,6 +530,7 @@ impl MVCCEngine {
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             compaction_running: Arc::new(AtomicBool::new(false)),
+            eviction_epoch: AtomicU64::new(0),
         }
     }
 
@@ -819,6 +823,11 @@ impl MVCCEngine {
                             // a separate thread instead of running synchronously.
                             match engine.checkpoint_cycle_inner(false) {
                                 Ok(()) => {
+                                    // Eviction runs inside spawn_compaction, AFTER
+                                    // compaction finishes. Running them in the same
+                                    // cycle but concurrently causes thrashing:
+                                    // eviction frees volumes that compaction
+                                    // immediately reloads via segments_snapshot.
                                     engine.spawn_compaction();
                                 }
                                 Err(e) => {
@@ -1058,7 +1067,7 @@ impl MVCCEngine {
         // Try loading a pre-built volume file first (instant startup)
         if vol_path.exists() {
             let volume = crate::storage::volume::io::read_volume_from_disk(&vol_path)?;
-            let vol_row_count = volume.row_count;
+            let vol_row_count = volume.meta.row_count;
 
             // We still need the schema from the snapshot header
             let reader = super::snapshot::SnapshotReader::open(snapshot_path)?;
@@ -1123,36 +1132,45 @@ impl MVCCEngine {
             }
             true
         })?;
-        let volume = builder.finish();
-        let vol_row_count = volume.row_count;
+        let mut volume = builder.finish();
+        let vol_row_count = volume.meta.row_count;
 
-        // Write volume file to disk for next startup (atomic write)
+        // Write volume file to disk and retain CompressedBlockStore for
+        // warm-tier eviction (single compress, no double work).
         if vol_row_count > 0 {
-            if let Err(e) = (|| -> Result<()> {
-                let (data, _store) = crate::storage::volume::io::serialize_v4_public(&volume)
-                    .map_err(|e| {
-                        crate::core::Error::internal(format!("failed to serialize volume: {}", e))
-                    })?;
-                let tmp_path = vol_path.with_extension("vol.tmp");
-                std::fs::write(&tmp_path, &data).map_err(|e| {
-                    crate::core::Error::internal(format!("failed to write volume: {}", e))
-                })?;
-                // Ensure data is durable before rename, preventing zero-length files after crash
-                std::fs::File::open(&tmp_path)
-                    .and_then(|f| f.sync_all())
-                    .map_err(|e| {
-                        crate::core::Error::internal(format!("failed to sync volume: {}", e))
-                    })?;
-                std::fs::rename(&tmp_path, &vol_path).map_err(|e| {
-                    crate::core::Error::internal(format!("failed to rename volume: {}", e))
-                })?;
-                Ok(())
-            })() {
-                eprintln!(
-                    "Warning: Failed to save volume file for {}: {}",
-                    table_name_lower, e
-                );
-                // Non-fatal: volume stays in RAM, next startup will re-convert
+            match crate::storage::volume::io::serialize_v4_public(&volume) {
+                Ok((data, store)) => {
+                    volume.columns.attach_compressed_store(store);
+                    if let Err(e) = (|| -> Result<()> {
+                        let tmp_path = vol_path.with_extension("vol.tmp");
+                        std::fs::write(&tmp_path, &data).map_err(|e| {
+                            crate::core::Error::internal(format!("failed to write volume: {}", e))
+                        })?;
+                        std::fs::File::open(&tmp_path)
+                            .and_then(|f| f.sync_all())
+                            .map_err(|e| {
+                                crate::core::Error::internal(format!(
+                                    "failed to sync volume: {}",
+                                    e
+                                ))
+                            })?;
+                        std::fs::rename(&tmp_path, &vol_path).map_err(|e| {
+                            crate::core::Error::internal(format!("failed to rename volume: {}", e))
+                        })?;
+                        Ok(())
+                    })() {
+                        eprintln!(
+                            "Warning: Failed to save volume file for {}: {}",
+                            table_name_lower, e
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to serialize volume for {}: {}",
+                        table_name_lower, e
+                    );
+                }
             }
         }
 
@@ -1390,8 +1408,8 @@ impl MVCCEngine {
 
                 for (_, cs) in volumes.iter() {
                     let vol = &cs.volume;
-                    for i in 0..vol.row_count {
-                        let row_id = vol.row_ids[i];
+                    for i in 0..vol.meta.row_count {
+                        let row_id = vol.meta.row_ids[i];
                         if tombstones.contains_key(&row_id) || !seen.insert(row_id) {
                             continue;
                         }
@@ -2922,9 +2940,9 @@ impl MVCCEngine {
     ) {
         use crate::storage::volume::manifest::SegmentMeta;
         let mgr = self.get_or_create_segment_manager(table_name);
-        let min_id = volume.row_ids.first().copied().unwrap_or(0);
-        let max_id = volume.row_ids.last().copied().unwrap_or(0);
-        let row_count = volume.row_count;
+        let min_id = volume.meta.row_ids.first().copied().unwrap_or(0);
+        let max_id = volume.meta.row_ids.last().copied().unwrap_or(0);
+        let row_count = volume.meta.row_count;
         // None = identity mapping (volume was just built from current schema).
         // Load paths that may have schema mismatch pass Some(schema).
         mgr.register_segment(
@@ -3223,12 +3241,12 @@ impl MVCCEngine {
             }
             mgrs.iter()
                 .filter_map(|(table_name, mgr)| {
-                    let segments = mgr.get_segments_ordered();
+                    let segments = mgr.get_segments_ordered_meta();
                     let mut max_vol_row_id: i64 = 0;
                     for vol in &segments {
                         // Row IDs are sorted (from B-tree iteration during seal).
                         // Use last() for O(1) instead of iterating all row_ids.
-                        if let Some(&last_id) = vol.row_ids.last() {
+                        if let Some(&last_id) = vol.meta.row_ids.last() {
                             if last_id > max_vol_row_id {
                                 max_vol_row_id = last_id;
                             }
@@ -3977,8 +3995,8 @@ impl MVCCEngine {
                     let vol = &cs.volume;
                     let mapping = mgr.get_volume_mapping(*seg_id, schema);
 
-                    for i in 0..vol.row_count {
-                        let row_id = vol.row_ids[i];
+                    for i in 0..vol.meta.row_count {
+                        let row_id = vol.meta.row_ids[i];
 
                         // Skip tombstoned rows not already in hot snapshot.
                         // For int-PK tables, pre-cutoff deletes are in `seen`.
@@ -5015,22 +5033,38 @@ impl MVCCEngine {
         }
     }
 
+    /// Evict idle volume data to save memory. Volumes not accessed since the
+    /// last epoch transition: hot → warm (drop decompressed) → cold (drop compressed).
+    fn evict_idle_volumes(&self) {
+        let epoch = self.eviction_epoch.fetch_add(1, Ordering::Relaxed);
+        // Publish to global so scanners stamp volumes with the correct epoch.
+        // Use fetch_max so multiple engines only move the global forward.
+        crate::storage::volume::writer::GLOBAL_EVICTION_EPOCH.fetch_max(epoch, Ordering::Relaxed);
+        let mgrs = self.segment_managers.read().unwrap();
+        for mgr in mgrs.values() {
+            mgr.evict_idle_volumes(epoch);
+        }
+    }
+
     /// Spawn compaction on a background thread. If compaction is already
     /// running, this is a no-op (the next checkpoint cycle will retry).
     /// Called from the background cleanup thread which owns Arc<Self>.
     #[cfg(not(target_arch = "wasm32"))]
     fn spawn_compaction(self: &Arc<Self>) {
-        // Try to claim the compaction slot. If already running, skip.
+        // Try to claim the compaction slot. If already running, skip
+        // compaction but still run eviction on this thread.
         if self
             .compaction_running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            self.evict_idle_volumes();
             return;
         }
         let engine = Arc::clone(self);
         std::thread::spawn(move || {
             engine.run_compaction_guarded();
+            engine.evict_idle_volumes();
         });
     }
 
@@ -5210,8 +5244,11 @@ impl MVCCEngine {
             // - Oversized (> target * 3/2): large volumes to split
             // - At-target: properly sized, never rewrite
             let (old_ids, volumes, tombstones) = {
+                // Use segments_raw for planning — only metadata (row_ids,
+                // row_count) is needed. Avoids reloading ALL cold volumes
+                // for tables where only sub-target volumes need compaction.
+                let segs = mgr.segments_raw();
                 let manifest = mgr.manifest();
-                let segs = mgr.segments_snapshot();
                 let ts = mgr.tombstone_set_arc();
 
                 let oversized_threshold = target_volume_rows * 3 / 2;
@@ -5231,6 +5268,7 @@ impl MVCCEngine {
                         if let Some(cs) = segs.get(&seg.segment_id) {
                             let tombstone_count = cs
                                 .volume
+                                .meta
                                 .row_ids
                                 .iter()
                                 .filter(|rid| ts.contains_key(rid))
@@ -5257,6 +5295,8 @@ impl MVCCEngine {
                     }
                 }
 
+                // Load only the merge-candidate volumes (not the entire table).
+                // Cold volumes are loaded on demand via ensure_volume.
                 let old_ids: Vec<u64> = merge_indices
                     .iter()
                     .map(|&i| manifest.segments[i].segment_id)
@@ -5266,19 +5306,23 @@ impl MVCCEngine {
                         .iter()
                         .filter_map(|&i| {
                             let seg = &manifest.segments[i];
-                            segs.get(&seg.segment_id)
-                                .map(|cs| (seg.segment_id, Arc::clone(&cs.volume)))
+                            let vol = segs.get(&seg.segment_id)?;
+                            if vol.volume.is_cold() {
+                                // Load only this merge candidate from disk.
+                                let loaded = mgr.ensure_volume(seg.segment_id)?;
+                                Some((seg.segment_id, loaded))
+                            } else {
+                                Some((seg.segment_id, Arc::clone(&vol.volume)))
+                            }
                         })
                         .collect();
-                // Every manifest entry must have a loaded volume. If any are
-                // missing (startup load failure), skip this table to avoid
-                // dropping unloaded segments from the manifest permanently.
+                drop(segs);
+
+                // Every manifest entry must have a loaded volume.
                 if vols.len() != old_ids.len() {
                     continue;
                 }
                 // Sort by segment_id descending (newest first) for correct dedup.
-                // The merge_indices were sorted by size, not age — reversing
-                // would give largest-first, not newest-first.
                 vols.sort_by(|a, b| b.0.cmp(&a.0));
                 let ts = mgr.tombstone_set_arc();
                 (old_ids, Arc::new(vols), ts)
@@ -5292,8 +5336,8 @@ impl MVCCEngine {
             let mut live_refs: Vec<(i64, usize, usize)> = Vec::new(); // (row_id, vol_idx, row_idx)
 
             for (vol_idx, (_seg_id, vol)) in volumes.iter().enumerate() {
-                for i in 0..vol.row_count {
-                    let row_id = vol.row_ids[i];
+                for i in 0..vol.meta.row_count {
+                    let row_id = vol.meta.row_ids[i];
                     if tombstones.contains_key(&row_id) && !seen.contains(&row_id) {
                         continue;
                     }
@@ -5310,7 +5354,7 @@ impl MVCCEngine {
                 // volumes and their tombstones, but keep unmerged volumes intact.
                 let merged_row_ids: FxHashSet<i64> = volumes
                     .iter()
-                    .flat_map(|(_, vol)| vol.row_ids.iter().copied())
+                    .flat_map(|(_, vol)| vol.meta.row_ids.iter().copied())
                     .collect();
                 mgr.replace_segments_atomic_remove_only(&old_ids);
                 // Only clear tombstones that existed at snapshot time.
@@ -5387,7 +5431,7 @@ impl MVCCEngine {
                     };
                     builder.add_row(row_id, &row);
                 }
-                let compacted = builder.finish();
+                let mut compacted = builder.finish();
 
                 let compact_vol_id = crate::storage::volume::io::next_volume_id();
                 match crate::storage::volume::io::write_volume_to_disk_opts(
@@ -5397,7 +5441,9 @@ impl MVCCEngine {
                     &compacted,
                     compress,
                 ) {
-                    Ok((_path, _store)) => {
+                    Ok((_path, store)) => {
+                        // Retain compressed store for hot→warm eviction.
+                        compacted.columns.attach_compressed_store(store);
                         // Pre-build unique hash indices before registration.
                         {
                             let stores = self.version_stores.read().unwrap();
@@ -5453,7 +5499,7 @@ impl MVCCEngine {
             {
                 let merged_row_ids: FxHashSet<i64> = volumes
                     .iter()
-                    .flat_map(|(_, vol)| vol.row_ids.iter().copied())
+                    .flat_map(|(_, vol)| vol.meta.row_ids.iter().copied())
                     .collect();
                 mgr.remove_tombstones_matching_snapshot(&tombstones, &merged_row_ids);
             }
@@ -5746,7 +5792,7 @@ impl MVCCEngine {
                             if !ts.is_empty() {
                                 let mut sealed_ids: FxHashSet<i64> = FxHashSet::default();
                                 for (vol, _, _) in &sealed_volumes {
-                                    for &rid in &vol.row_ids {
+                                    for &rid in &vol.meta.row_ids {
                                         if ts.contains_key(&rid) && !skip_set.contains(&rid) {
                                             sealed_ids.insert(rid);
                                         }

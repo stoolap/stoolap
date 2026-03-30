@@ -24,6 +24,12 @@ use std::sync::OnceLock;
 
 use ahash::AHashMap;
 
+/// Global eviction epoch. Updated by MVCCEngine::evict_idle_volumes(),
+/// read by VolumeScanner to stamp last_access_epoch correctly.
+/// Using a global avoids threading the epoch through every scan path.
+pub static GLOBAL_EVICTION_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 use crate::common::SmartString;
 use crate::core::{DataType, Row, Schema, Value};
 
@@ -749,23 +755,20 @@ pub struct LazyColumns {
     /// Per-column OnceLock slots. Empty until first access.
     slots: Vec<OnceLock<ColumnData>>,
     /// Compressed backing store. None for eagerly-loaded columns.
-    compressed_store: Option<CompressedBlockStore>,
+    /// Wrapped in Arc so warm-tier volumes can share the store cheaply.
+    compressed_store: Option<Arc<CompressedBlockStore>>,
     /// Column data types (available without decompressing).
     col_data_types: Vec<DataType>,
     /// True when all OnceLock slots are initialized. Starts true for eager,
-    /// false for deferred. Flipped to true when the last OnceLock is populated
-    /// (via Index<usize>), so subsequent scans skip per-group decompression.
+    /// false for deferred. Flipped to true when all OnceLock slots are
+    /// populated (checked on slow path), so scanners skip per-group decompression.
     is_eager: std::sync::atomic::AtomicBool,
-    /// Number of initialized OnceLock slots. When it reaches slots.len(),
-    /// is_eager is flipped to true. Only used for deferred columns.
-    loaded_count: std::sync::atomic::AtomicUsize,
 }
 
 impl LazyColumns {
     /// Create from pre-loaded columns (VolumeBuilder::finish(), V4 eager load).
     /// All OnceLock slots are pre-initialized. No compressed store.
     pub fn eager(columns: Vec<ColumnData>, col_data_types: Vec<DataType>) -> Self {
-        let len = columns.len();
         let slots: Vec<OnceLock<ColumnData>> = columns
             .into_iter()
             .map(|col| {
@@ -779,7 +782,6 @@ impl LazyColumns {
             compressed_store: None,
             col_data_types,
             is_eager: std::sync::atomic::AtomicBool::new(true),
-            loaded_count: std::sync::atomic::AtomicUsize::new(len),
         }
     }
 
@@ -790,10 +792,38 @@ impl LazyColumns {
         let slots = (0..col_count).map(|_| OnceLock::new()).collect();
         Self {
             slots,
+            compressed_store: Some(Arc::new(store)),
+            col_data_types,
+            is_eager: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Create with empty slots backed by a shared CompressedBlockStore Arc.
+    /// Used by warm-tier volumes to share the store cheaply.
+    pub fn deferred_shared(
+        store: Arc<CompressedBlockStore>,
+        col_data_types: Vec<DataType>,
+    ) -> Self {
+        let col_count = store.col_count();
+        let slots = (0..col_count).map(|_| OnceLock::new()).collect();
+        Self {
+            slots,
             compressed_store: Some(store),
             col_data_types,
             is_eager: std::sync::atomic::AtomicBool::new(false),
-            loaded_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Create columns with only data types (for cold-tier volumes).
+    /// No columns, no compressed store. Column access will panic;
+    /// the volume must be reloaded from disk before scanning.
+    pub fn metadata_only(col_data_types: Vec<DataType>) -> Self {
+        let col_count = col_data_types.len();
+        Self {
+            slots: (0..col_count).map(|_| OnceLock::new()).collect(),
+            compressed_store: None,
+            col_data_types,
+            is_eager: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -804,8 +834,20 @@ impl LazyColumns {
             compressed_store: None,
             col_data_types: Vec::new(),
             is_eager: std::sync::atomic::AtomicBool::new(true),
-            loaded_count: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Attach a compressed backing store to an eager LazyColumns.
+    /// The store enables warm-tier eviction: decompressed columns can be
+    /// dropped and re-decompressed from the in-memory compressed blocks.
+    /// Does not change is_eager (scan path remains OnceLock-based).
+    pub fn attach_compressed_store(&mut self, store: CompressedBlockStore) {
+        self.compressed_store = Some(Arc::new(store));
+    }
+
+    /// Whether all OnceLock slots are initialized (eager mode).
+    pub fn is_eager(&self) -> bool {
+        self.is_eager.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Number of columns.
@@ -866,6 +908,11 @@ impl LazyColumns {
 
     /// Access the compressed store (for V4 write).
     pub fn compressed_store(&self) -> Option<&CompressedBlockStore> {
+        self.compressed_store.as_ref().map(|a| a.as_ref())
+    }
+
+    /// Access the compressed store as a shared Arc (for warm-tier cloning).
+    pub fn compressed_store_arc(&self) -> Option<&Arc<CompressedBlockStore>> {
         self.compressed_store.as_ref()
     }
 
@@ -891,19 +938,27 @@ impl std::ops::Index<usize> for LazyColumns {
         if let Some(col) = self.slots[idx].get() {
             return col;
         }
-        // Slow path: decompress and track
+        // Slow path: decompress on first access via get_or_init (runs closure
+        // exactly once per slot, even under concurrent access).
         let col = self.slots[idx].get_or_init(|| {
             self.compressed_store
                 .as_ref()
                 .map(|store| store.decompress_column(idx))
-                .expect("column not loaded and no compressed store available")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "BUG: column {} accessed on cold volume (no compressed store). \
+                         A caller is missing is_cold() check before column access. \
+                         Run with RUST_BACKTRACE=1 to find the caller.",
+                        idx
+                    )
+                })
         });
-        // Track loaded columns. When all are loaded, flip is_eager so
-        // scanners stop using per-group decompression.
-        let prev = self
-            .loaded_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if prev + 1 >= self.slots.len() {
+        // Check if all slots are now populated. This is O(C) where C = column
+        // count, but only runs on the slow path (first access per column).
+        // Avoids the loaded_count race where concurrent threads double-increment.
+        if !self.is_eager.load(std::sync::atomic::Ordering::Relaxed)
+            && self.slots.iter().all(|s| s.get().is_some())
+        {
             self.is_eager
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -947,13 +1002,10 @@ impl<'a> IntoIterator for &'a LazyColumns {
     }
 }
 
-/// A frozen volume ready for queries.
-///
-/// This is the in-memory representation. Serialization to/from disk
-/// will be added in a separate module.
-pub struct FrozenVolume {
-    /// Column data stored as typed arrays with lazy decompression
-    pub columns: LazyColumns,
+/// Immutable metadata shared across hot/warm/cold volume tiers.
+/// Wrapped in Arc so eviction only swaps LazyColumns, zero allocation.
+#[derive(Clone)]
+pub struct VolumeMeta {
     /// Zone maps per column
     pub zone_maps: Vec<ZoneMap>,
     /// Bloom filters per column (for fast equality membership testing)
@@ -970,19 +1022,33 @@ pub struct FrozenVolume {
     pub row_ids: Vec<i64>,
     /// Whether the time/integer columns are sorted (enables binary search)
     pub sorted_columns: Vec<bool>,
-    /// Precomputed lowercase column name → index map for O(1) lookup.
+    /// Precomputed lowercase column name -> index map for O(1) lookup.
     /// Built once at construction; replaces O(C) linear scan in column_index().
     pub column_name_map: AHashMap<SmartString, usize>,
-    /// Per-volume unique index: lazily built, never invalidated (volume is immutable).
-    /// Key: sorted column indices for a UNIQUE constraint.
-    /// Value: sorted Vec of (hash, row_idx) pairs — binary search for lookup.
-    /// Uses 12 bytes per entry vs ~80 bytes for FxHashMap<u64, Vec<u32>>, and
-    /// zero tiny heap allocations (single contiguous allocation).
-    #[allow(clippy::type_complexity)]
-    pub unique_indices: parking_lot::RwLock<rustc_hash::FxHashMap<Vec<usize>, Vec<(u64, u32)>>>,
     /// Row group metadata for sub-volume zone map pruning.
     /// Empty for volumes with <= ROW_GROUP_SIZE rows (single implicit group).
     pub row_groups: Vec<super::column::RowGroupMeta>,
+}
+
+/// A frozen volume ready for queries.
+///
+/// This is the in-memory representation. Serialization to/from disk
+/// is handled by io.rs (V4 format).
+pub struct FrozenVolume {
+    /// Column data stored as typed arrays with lazy decompression
+    pub columns: LazyColumns,
+    /// Shared metadata (zone maps, bloom filters, stats, row IDs, etc.)
+    pub meta: Arc<VolumeMeta>,
+    /// Per-volume unique index: lazily built, never invalidated (volume is immutable).
+    /// Key: sorted column indices for a UNIQUE constraint.
+    /// Value: sorted Vec of (hash, row_idx) pairs -- binary search for lookup.
+    /// Uses 12 bytes per entry vs ~80 bytes for FxHashMap<u64, Vec<u32>>, and
+    /// zero tiny heap allocations (single contiguous allocation).
+    #[allow(clippy::type_complexity)]
+    pub unique_indices:
+        Arc<parking_lot::RwLock<rustc_hash::FxHashMap<Vec<usize>, Vec<(u64, u32)>>>>,
+    /// Access epoch counter. Bumped per scan for eviction tracking.
+    pub last_access_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// Builder that accumulates rows and produces a FrozenVolume.
@@ -1423,17 +1489,22 @@ impl VolumeBuilder {
 
         FrozenVolume {
             columns: LazyColumns::eager(columns, column_types.clone()),
-            zone_maps: self.zone_maps,
-            bloom_filters,
-            stats: self.stats,
-            row_count: self.row_count,
-            column_names,
-            column_types,
-            row_ids: self.row_ids,
-            sorted_columns,
-            column_name_map,
-            unique_indices: parking_lot::RwLock::new(rustc_hash::FxHashMap::default()),
-            row_groups,
+            meta: Arc::new(VolumeMeta {
+                zone_maps: self.zone_maps,
+                bloom_filters,
+                stats: self.stats,
+                row_count: self.row_count,
+                column_names,
+                column_types,
+                row_ids: self.row_ids,
+                sorted_columns,
+                column_name_map,
+                row_groups,
+            }),
+            unique_indices: Arc::new(parking_lot::RwLock::new(rustc_hash::FxHashMap::default())),
+            last_access_epoch: std::sync::atomic::AtomicU64::new(
+                GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
+            ),
         }
     }
 }
@@ -1492,8 +1563,8 @@ pub fn compute_column_mapping_with_drops(
             .or_else(|| volume.column_index(&col.name_lower));
 
         if let Some(vol_idx) = vol_idx {
-            let type_matches = vol_idx < volume.column_types.len()
-                && volume.column_types[vol_idx] == col.data_type;
+            let type_matches = vol_idx < volume.meta.column_types.len()
+                && volume.meta.column_types[vol_idx] == col.data_type;
             let was_dropped = dropped_columns.iter().any(|(d, drop_ver)| {
                 d.as_str() == col.name_lower && volume_schema_version <= *drop_ver
             });
@@ -1629,7 +1700,7 @@ impl FrozenVolume {
     /// Check if a column is sorted (enables binary search).
     #[inline]
     pub fn is_sorted(&self, col_idx: usize) -> bool {
-        self.sorted_columns[col_idx]
+        self.meta.sorted_columns[col_idx]
     }
 
     /// Look up a composite unique key in this volume's per-volume hash index.
@@ -1682,8 +1753,8 @@ impl FrozenVolume {
         }
 
         // Build sorted index for this column set (first use)
-        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(self.row_count);
-        for row_idx in 0..self.row_count {
+        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(self.meta.row_count);
+        for row_idx in 0..self.meta.row_count {
             let mut row_hasher = ahash::AHasher::default();
             let mut has_null = false;
             for &ci in col_indices {
@@ -1732,8 +1803,8 @@ impl FrozenVolume {
         if self.unique_indices.read().contains_key(col_indices) {
             return;
         }
-        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(self.row_count);
-        for row_idx in 0..self.row_count {
+        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(self.meta.row_count);
+        for row_idx in 0..self.meta.row_count {
             let mut row_hasher = ahash::AHasher::default();
             let mut has_null = false;
             for &ci in col_indices {
@@ -1756,22 +1827,23 @@ impl FrozenVolume {
 
     /// Find the column index by name. O(1) via precomputed hashmap.
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        if let Some(&idx) = self.column_name_map.get(name) {
+        if let Some(&idx) = self.meta.column_name_map.get(name) {
             return Some(idx);
         }
         let lower = name.to_lowercase();
-        self.column_name_map.get(lower.as_str()).copied()
+        self.meta.column_name_map.get(lower.as_str()).copied()
     }
 
     /// Merge a column rename directly into column_name_map.
     /// Must be called BEFORE wrapping in Arc (takes &mut self).
     /// After this, column_index() finds both old and new names via the map.
     pub fn merge_column_rename(&mut self, new_name: &str, old_name: &str) {
+        let meta = Arc::make_mut(&mut self.meta);
         let old_lower = SmartString::from(old_name.to_lowercase());
         let new_lower = SmartString::from(new_name.to_lowercase());
-        if let Some(&idx) = self.column_name_map.get(&old_lower) {
-            self.column_name_map.insert(new_lower, idx);
-        } else if let Some(&idx) = self.column_name_map.get(&new_lower) {
+        if let Some(&idx) = meta.column_name_map.get(&old_lower) {
+            meta.column_name_map.insert(new_lower, idx);
+        } else if let Some(&idx) = meta.column_name_map.get(&new_lower) {
             // Already has the new name (chained rename handled)
             let _ = idx;
         }
@@ -1780,7 +1852,59 @@ impl FrozenVolume {
     /// Estimate the in-memory size of this volume in bytes.
     /// Only counts loaded (decompressed) columns + compressed store.
     pub fn memory_size(&self) -> usize {
-        self.columns.memory_size() + self.row_ids.len() * 8
+        self.columns.memory_size() + self.meta.row_ids.len() * 8
+    }
+
+    /// Mark this volume as recently accessed. Stores u64::MAX as a sentinel
+    /// meaning "accessed since last eviction cycle." The eviction pass resets
+    /// non-evicted volumes to current_epoch, so the idle counter only starts
+    /// after the last access.
+    #[inline]
+    pub fn mark_accessed(&self) {
+        self.last_access_epoch
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this volume is warm (compressed blocks in RAM, no decompressed columns).
+    pub fn is_warm(&self) -> bool {
+        !self.columns.is_eager() && self.columns.has_compressed_store()
+    }
+
+    /// Whether this volume is cold (no column data, no compressed blocks).
+    pub fn is_cold(&self) -> bool {
+        !self.columns.is_eager() && !self.columns.has_compressed_store()
+    }
+
+    /// Create a warm-tier volume: shares metadata via Arc (zero copy),
+    /// shares compressed store via Arc, drops decompressed columns.
+    /// Scanners use per-group decompression from RAM (~1ms per column per group).
+    pub fn to_warm(&self) -> Option<FrozenVolume> {
+        let store = self.columns.compressed_store_arc()?.clone();
+        Some(FrozenVolume {
+            columns: LazyColumns::deferred_shared(store, self.meta.column_types.clone()),
+            meta: Arc::clone(&self.meta),
+            unique_indices: Arc::clone(&self.unique_indices),
+            // Start at current epoch so warm gets MIN_IDLE_CYCLES before cold.
+            last_access_epoch: std::sync::atomic::AtomicU64::new(
+                GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        })
+    }
+
+    /// Create a cold-tier volume: shares metadata via Arc (zero copy),
+    /// drops both decompressed columns AND compressed blocks.
+    /// Must reload from disk to scan.
+    pub fn to_cold(&self) -> FrozenVolume {
+        FrozenVolume {
+            columns: LazyColumns::metadata_only(self.meta.column_types.clone()),
+            meta: Arc::clone(&self.meta),
+            unique_indices: Arc::clone(&self.unique_indices),
+            // Start at current epoch so cold gets MIN_IDLE_CYCLES before
+            // being considered for reload/re-eviction.
+            last_access_epoch: std::sync::atomic::AtomicU64::new(
+                GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
     }
 }
 
@@ -1837,9 +1961,9 @@ mod tests {
 
         let volume = builder.finish();
 
-        assert_eq!(volume.row_count, 3);
+        assert_eq!(volume.meta.row_count, 3);
         assert_eq!(volume.columns.len(), 4);
-        assert_eq!(volume.stats.count_star(), 3);
+        assert_eq!(volume.meta.stats.count_star(), 3);
 
         // Check typed access
         assert_eq!(volume.columns[0].get_i64(0), 1);
@@ -1857,13 +1981,13 @@ mod tests {
         );
 
         // Check zone maps
-        assert_eq!(volume.zone_maps[0].min, Value::Integer(1));
-        assert_eq!(volume.zone_maps[0].max, Value::Integer(3));
-        assert_eq!(volume.zone_maps[3].min, Value::Float(99.0));
-        assert_eq!(volume.zone_maps[3].max, Value::Float(101.5));
+        assert_eq!(volume.meta.zone_maps[0].min, Value::Integer(1));
+        assert_eq!(volume.meta.zone_maps[0].max, Value::Integer(3));
+        assert_eq!(volume.meta.zone_maps[3].min, Value::Float(99.0));
+        assert_eq!(volume.meta.zone_maps[3].max, Value::Float(101.5));
 
         // Check stats
-        assert_eq!(volume.stats.sum(3), 300.5); // 100.0 + 101.5 + 99.0
+        assert_eq!(volume.meta.stats.sum(3), 300.5); // 100.0 + 101.5 + 99.0
 
         // Check sortedness
         assert!(volume.is_sorted(0)); // id is sorted

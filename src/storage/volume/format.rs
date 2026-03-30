@@ -930,11 +930,11 @@ pub(crate) struct VolumeMetadata {
 /// The caller LZ4-compresses the result before writing to disk.
 pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8>> {
     let col_count = vol.columns.len();
-    let estimated = 12 + col_count * 6 + vol.row_ids.len() * 8 + col_count * 40;
+    let estimated = 12 + col_count * 6 + vol.meta.row_ids.len() * 8 + col_count * 40;
     let mut buf = Vec::with_capacity(estimated);
 
     // Row count + col count
-    buf.write_all(&(vol.row_count as u64).to_le_bytes())?;
+    buf.write_all(&(vol.meta.row_count as u64).to_le_bytes())?;
     buf.write_all(&(col_count as u32).to_le_bytes())?;
 
     // Build shared dict from Dictionary columns
@@ -959,7 +959,7 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
             ColumnData::Dictionary { .. } => COL_DICTIONARY,
             ColumnData::Bytes { .. } => COL_BYTES,
         };
-        let sorted_flag = if vol.sorted_columns[i] {
+        let sorted_flag = if vol.meta.sorted_columns[i] {
             FLAG_SORTED
         } else {
             0
@@ -989,10 +989,10 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     }
 
     // Row IDs (bulk — single memcpy on LE)
-    write_i64_bulk(&mut buf, &vol.row_ids);
+    write_i64_bulk(&mut buf, &vol.meta.row_ids);
 
     // Zone maps
-    for zm in &vol.zone_maps {
+    for zm in &vol.meta.zone_maps {
         write_value(&mut buf, &zm.min)?;
         write_value(&mut buf, &zm.max)?;
         buf.write_all(&zm.null_count.to_le_bytes())?;
@@ -1000,8 +1000,8 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     }
 
     // Bloom filters
-    buf.write_all(&(vol.bloom_filters.len() as u32).to_le_bytes())?;
-    for bf in &vol.bloom_filters {
+    buf.write_all(&(vol.meta.bloom_filters.len() as u32).to_le_bytes())?;
+    for bf in &vol.meta.bloom_filters {
         buf.write_all(&(bf.num_bits() as u64).to_le_bytes())?;
         let data_bytes = bf.bits_as_bytes();
         buf.write_all(&(data_bytes.len() as u32).to_le_bytes())?;
@@ -1009,10 +1009,10 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     }
 
     // Stats
-    buf.write_all(&vol.stats.total_rows.to_le_bytes())?;
-    buf.write_all(&vol.stats.live_rows.to_le_bytes())?;
-    buf.write_all(&(vol.stats.columns.len() as u32).to_le_bytes())?;
-    for cs in &vol.stats.columns {
+    buf.write_all(&vol.meta.stats.total_rows.to_le_bytes())?;
+    buf.write_all(&vol.meta.stats.live_rows.to_le_bytes())?;
+    buf.write_all(&(vol.meta.stats.columns.len() as u32).to_le_bytes())?;
+    for cs in &vol.meta.stats.columns {
         buf.write_all(&cs.sum_int.to_le_bytes())?;
         buf.write_all(&cs.sum_float.to_le_bytes())?;
         buf.write_all(&cs.numeric_count.to_le_bytes())?;
@@ -1022,20 +1022,20 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     }
 
     // Column names
-    for name in &vol.column_names {
+    for name in &vol.meta.column_names {
         let bytes = name.as_bytes();
         buf.write_all(&(bytes.len() as u32).to_le_bytes())?;
         buf.write_all(bytes)?;
     }
 
     // Column types
-    for dt in &vol.column_types {
+    for dt in &vol.meta.column_types {
         buf.push(*dt as u8);
     }
 
     // Row groups
-    buf.write_all(&(vol.row_groups.len() as u32).to_le_bytes())?;
-    for rg in &vol.row_groups {
+    buf.write_all(&(vol.meta.row_groups.len() as u32).to_le_bytes())?;
+    for rg in &vol.meta.row_groups {
         buf.write_all(&rg.start_idx.to_le_bytes())?;
         buf.write_all(&rg.end_idx.to_le_bytes())?;
         for zm in &rg.zone_maps {

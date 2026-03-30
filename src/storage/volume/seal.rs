@@ -81,13 +81,13 @@ pub fn seal_and_persist_opts(
     table_name: &str,
     compress: bool,
 ) -> Result<(Arc<FrozenVolume>, std::path::PathBuf, u64)> {
-    let volume = seal_rows(schema, rows);
+    let mut volume = seal_rows(schema, rows);
     let volume_id = io::next_volume_id();
-    let (path, _store) =
+    let (path, store) =
         io::write_volume_to_disk_opts(volume_dir, table_name, volume_id, &volume, compress)?;
-    // V4 writes compressed blocks to disk but we drop the CompressedBlockStore.
-    // Eager columns from seal_rows are already in RAM via OnceLock — no need to
-    // keep ~30MB of compressed data alongside them.
+    // Retain compressed store so eviction can transition hot → warm
+    // (drop decompressed columns, keep compressed blocks in RAM).
+    volume.columns.attach_compressed_store(store);
     Ok((Arc::new(volume), path, volume_id))
 }
 
@@ -117,10 +117,11 @@ pub fn seal_and_persist_multi(
 
     let mut results = Vec::new();
     for chunk in rows.chunks(chunk_size) {
-        let volume = seal_rows(schema, chunk);
+        let mut volume = seal_rows(schema, chunk);
         let volume_id = io::next_volume_id();
         match io::write_volume_to_disk_opts(volume_dir, table_name, volume_id, &volume, compress) {
-            Ok((path, _store)) => {
+            Ok((path, store)) => {
+                volume.columns.attach_compressed_store(store);
                 results.push((Arc::new(volume), path, volume_id));
             }
             Err(e) => {
@@ -163,7 +164,7 @@ mod tests {
         ];
 
         let volume = seal_rows(&schema, &rows);
-        assert_eq!(volume.row_count, 3);
+        assert_eq!(volume.meta.row_count, 3);
         assert_eq!(volume.columns[0].get_i64(0), 1);
         assert_eq!(volume.columns[1].get_str(2), "carol");
         assert!(volume.is_sorted(0)); // id is sorted
@@ -192,13 +193,13 @@ mod tests {
         let (volume, path, _vol_id) =
             seal_and_persist(&schema, &rows, &vol_dir, "test_table").unwrap();
 
-        assert_eq!(volume.row_count, 2);
+        assert_eq!(volume.meta.row_count, 2);
         assert!(path.exists());
 
         // Read it back
         let loaded = io::read_volume_from_disk(&path).unwrap();
-        assert_eq!(loaded.row_count, 2);
+        assert_eq!(loaded.meta.row_count, 2);
         assert_eq!(loaded.columns[0].get_i64(0), 1);
-        assert_eq!(loaded.stats.sum(1), 30.0);
+        assert_eq!(loaded.meta.stats.sum(1), 30.0);
     }
 }

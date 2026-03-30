@@ -505,14 +505,14 @@ fn compute_visibility_bitmaps(
     }
     // Reuse the caller's seen set — clear and resize, but keep the allocation.
     reusable_seen.clear();
-    let total: usize = segments.values().map(|cs| cs.volume.row_count).sum();
+    let total: usize = segments.values().map(|cs| cs.volume.meta.row_count).sum();
     if reusable_seen.capacity() < total {
         reusable_seen.reserve(total * 8 / 7 + 16 - reusable_seen.capacity());
     }
     // Process newest-first (seg_order is ascending, so iterate reversed)
     for &seg_id in seg_order.iter().rev() {
         if let Some(cs) = segments.get_mut(&seg_id) {
-            let rc = cs.volume.row_count;
+            let rc = cs.volume.meta.row_count;
             if rc == 0 {
                 cs.visible = None;
                 continue;
@@ -526,7 +526,7 @@ fn compute_visibility_bitmaps(
             }
             let mut has_overlap = false;
             for i in 0..rc {
-                if !reusable_seen.insert(cs.volume.row_ids[i]) {
+                if !reusable_seen.insert(cs.volume.meta.row_ids[i]) {
                     bits[i >> 6] &= !(1u64 << (i & 63));
                     has_overlap = true;
                 }
@@ -567,6 +567,13 @@ pub struct SegmentManager {
     volume_dir: Option<PathBuf>,
     /// Fast atomic flag: true if any segments are loaded.
     has_segments_flag: std::sync::atomic::AtomicBool,
+    /// Current eviction epoch. Updated by evict_idle_volumes.
+    pub current_eviction_epoch: std::sync::atomic::AtomicU64,
+    /// True when any segment in the map is cold (metadata only, needs reload).
+    has_cold: std::sync::atomic::AtomicBool,
+    /// Serializes reload attempts. Concurrent callers block on this mutex
+    /// instead of spinning, preventing CPU waste during disk I/O.
+    reloading: parking_lot::Mutex<()>,
     /// Committed tombstone map: cold row_id → commit_seq (when the tombstone was created).
     /// Built from manifest tombstones on startup, updated at commit time.
     /// Wrapped in Arc for cheap O(1) reads — most callers only need to check
@@ -618,6 +625,9 @@ impl SegmentManager {
             segments: RwLock::new(Arc::new(FxHashMap::default())),
             volume_dir,
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
+            has_cold: std::sync::atomic::AtomicBool::new(false),
+            current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
+            reloading: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(FxHashMap::default())),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -639,6 +649,9 @@ impl SegmentManager {
             segments: RwLock::new(Arc::new(FxHashMap::default())),
             volume_dir,
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
+            has_cold: std::sync::atomic::AtomicBool::new(false),
+            current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
+            reloading: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(tombstone_map)),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -655,16 +668,33 @@ impl SegmentManager {
         &self.table_name
     }
 
-    /// Get all loaded segments (for scanning).
-    pub fn get_segments(&self) -> Vec<Arc<FrozenVolume>> {
-        let segs = Arc::clone(&*self.segments.read());
-        segs.values().map(|cs| Arc::clone(&cs.volume)).collect()
+    /// Ensure all volumes have column data before column access.
+    /// Reloads cold segments (in map with metadata only, columns missing).
+    fn ensure_columns(&self) {
+        if !self.has_cold.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let _guard = self.reloading.lock();
+        if !self.has_cold.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let cold_ids: Vec<u64> = {
+            let segs = self.segments.read();
+            segs.iter()
+                .filter(|(_, cs)| cs.volume.is_cold())
+                .map(|(&id, _)| id)
+                .collect()
+        };
+        if !cold_ids.is_empty() {
+            self.reload_cold_volumes(cold_ids);
+        }
     }
 
-    /// Get segments in order (by segment_id, oldest first).
-    pub fn get_segments_ordered(&self) -> Vec<Arc<FrozenVolume>> {
-        // Hold manifest lock while cloning segments Arc to prevent
-        // compaction from swapping the map between the two reads.
+    /// Get segments in order, metadata only (no cold volume reload).
+    /// Use when callers only need vol.meta (stats, zone maps, row_ids).
+    /// Does NOT mark volumes as accessed — metadata reads should not
+    /// prevent eviction of column data.
+    pub fn get_segments_ordered_meta(&self) -> Vec<Arc<FrozenVolume>> {
         let (seg_ids, segments) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
@@ -682,9 +712,63 @@ impl SegmentManager {
     /// Segments are always appended in ascending order, so reverse gives
     /// newest-first in O(n) instead of O(n log n) sort.
     pub fn get_volumes_newest_first(&self) -> Arc<Vec<(u64, ColdSegment)>> {
-        // Hold manifest lock while cloning segments Arc to prevent
-        // compaction's replace_segments_atomic from swapping the map
-        // between the two reads (TOCTOU → missing rows in scan).
+        self.ensure_columns();
+        let mut result = self.build_volumes_newest_first();
+        // Race check: eviction may have created cold volumes between
+        // ensure_columns (fast-path has_cold=false) and segments.read().
+        // Retry once — eviction runs once per ~30s checkpoint cycle.
+        if result.iter().any(|(_, cs)| cs.volume.is_cold()) {
+            self.ensure_columns();
+            result = self.build_volumes_newest_first();
+            // If still cold after retry (persistent reload failure),
+            // filter them out to prevent column-access panics.
+            let cold: Vec<(u64, usize)> = result
+                .iter()
+                .filter(|(_, cs)| cs.volume.is_cold())
+                .map(|(id, cs)| (*id, cs.volume.meta.row_count))
+                .collect();
+            if !cold.is_empty() {
+                for &(seg_id, rows) in &cold {
+                    eprintln!(
+                        "Warning: table {} seg={}: cold volume excluded ({} rows, reload failed)",
+                        self.table_name, seg_id, rows
+                    );
+                }
+                result.retain(|(_, cs)| !cs.volume.is_cold());
+            }
+        }
+        // Mark all volumes accessed. Direct-iteration callers (aggregate
+        // pushdown, DML) access column data without zone-map pruning, so
+        // they need protection from eviction. Scanner paths that prune
+        // first use get_volumes_newest_first_lazy() instead.
+        for (_, cs) in &result {
+            cs.volume.mark_accessed();
+        }
+        result.reverse();
+        Arc::new(result)
+    }
+
+    /// Build the raw newest-first volume list from manifest + segments.
+    fn build_volumes_newest_first(&self) -> Vec<(u64, ColdSegment)> {
+        let (seg_ids, segs) = {
+            let manifest = self.manifest.read();
+            let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+            let segs = Arc::clone(&*self.segments.read());
+            (seg_ids, segs)
+        };
+        seg_ids
+            .iter()
+            .filter_map(|&id| segs.get(&id).map(|cs| (id, cs.clone())))
+            .collect()
+    }
+
+    /// Same as get_volumes_newest_first but without ensure_columns.
+    /// Used by scanner paths that prune by zone maps/bloom filters before
+    /// accessing column data. Cold volumes are loaded on demand via
+    /// ensure_volume after pruning, avoiding full cold-set reload.
+    /// Does NOT mark volumes — only volumes that survive pruning get marked
+    /// by the scanner constructor or explicit per-volume mark_accessed.
+    pub fn get_volumes_newest_first_lazy(&self) -> Arc<Vec<(u64, ColdSegment)>> {
         let (seg_ids, segs) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
@@ -709,6 +793,9 @@ impl SegmentManager {
     /// Acquires manifest + segments + tombstones locks once. All per-row checks
     /// within the batch reuse this snapshot with zero lock overhead.
     pub fn cold_snapshot(&self) -> ColdSnapshot {
+        // No ensure_columns — zone-map/bloom pruning uses metadata (available
+        // on cold volumes). Only volumes that pass pruning get loaded on demand
+        // via ensure_volume in check_value_exists_impl/find_row_id_by_values_impl.
         let manifest = self.manifest.read();
         let seg_ids: smallvec::SmallVec<[u64; 4]> = manifest
             .segments
@@ -755,6 +842,49 @@ impl SegmentManager {
         )
     }
 
+    /// Resolve the current value at a logical column for a given row_id.
+    /// Iterates newest-first with per-volume physical mapping. Used by
+    /// overlap verification to check the authoritative version after
+    /// UPDATE changes a PK value + seal (schema-evolution safe).
+    fn get_authoritative_value(&self, row_id: i64, col_idx: usize) -> Option<crate::core::Value> {
+        let (seg_ids, segments) = {
+            let manifest = self.manifest.read();
+            let seg_ids: Vec<u64> = manifest
+                .segments
+                .iter()
+                .rev()
+                .map(|m| m.segment_id)
+                .collect();
+            let segments = Arc::clone(&*self.segments.read());
+            (seg_ids, segments)
+        };
+        for seg_id in &seg_ids {
+            if let Some(cold) = segments.get(seg_id) {
+                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                    let pi = if cold.mapping.is_identity {
+                        col_idx
+                    } else if col_idx < cold.mapping.sources.len() {
+                        match &cold.mapping.sources[col_idx] {
+                            super::writer::ColSource::Volume(vi) => *vi,
+                            super::writer::ColSource::Default(val) => return Some(val.clone()),
+                        }
+                    } else {
+                        return None;
+                    };
+                    if cold.volume.is_cold() {
+                        if let Some(vol) = self.ensure_volume(*seg_id) {
+                            return Some(vol.columns[pi].get_value(idx));
+                        }
+                        return None;
+                    }
+                    cold.volume.mark_accessed();
+                    return Some(cold.volume.columns[pi].get_value(idx));
+                }
+            }
+        }
+        None
+    }
+
     fn check_value_exists_impl(
         &self,
         seg_ids: &[u64],
@@ -770,12 +900,37 @@ impl SegmentManager {
                 continue;
             };
             let vol = &cold.volume;
-            if col_idx >= vol.columns.len() || col_idx >= vol.zone_maps.len() {
+            // Resolve logical col_idx to physical index via per-volume mapping.
+            // After DROP COLUMN, older volumes may store the column at a
+            // different position than the current schema ordinal.
+            let pi = if cold.mapping.is_identity {
+                if col_idx >= vol.columns.len() {
+                    continue;
+                }
+                col_idx
+            } else if col_idx < cold.mapping.sources.len() {
+                match &cold.mapping.sources[col_idx] {
+                    super::writer::ColSource::Volume(vi) => *vi,
+                    super::writer::ColSource::Default(_) => continue,
+                }
+            } else {
+                continue;
+            };
+            if pi >= vol.meta.zone_maps.len() || !vol.meta.zone_maps[pi].may_contain_eq(value) {
                 continue;
             }
-            if !vol.zone_maps[col_idx].may_contain_eq(value) {
-                continue;
-            }
+            // Zone map passed — need column data. Load cold volumes on demand.
+            let loaded: Arc<FrozenVolume>;
+            let vol = if vol.is_cold() {
+                loaded = match self.ensure_volume(seg_id) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                &*loaded
+            } else {
+                vol.mark_accessed();
+                vol
+            };
             let target = match value {
                 crate::core::Value::Integer(int_val) => Some(*int_val),
                 crate::core::Value::Timestamp(ts_val) => Some(
@@ -786,26 +941,19 @@ impl SegmentManager {
                 _ => None,
             };
             if let Some(target) = target {
-                if vol.is_sorted(col_idx) {
-                    // Always use OnceLock path: decompresses the full column
-                    // once (~50ms) then caches it. compressed_store.binary_search_ge
-                    // decompresses a fresh group per call (~0.3ms each), which is
-                    // 100x slower for bulk validation (25K calls = 8+ seconds).
-                    let start = vol.columns[col_idx].binary_search_ge(target);
+                if vol.is_sorted(pi) {
+                    let start = vol.columns[pi].binary_search_ge(target);
                     let mut i = start;
-                    while i < vol.row_count && vol.columns[col_idx].get_i64(i) == target {
-                        let rid = vol.row_ids[i];
+                    while i < vol.meta.row_count && vol.columns[pi].get_i64(i) == target {
+                        let rid = vol.meta.row_ids[i];
                         if seen.insert(rid) && !ts.contains_key(&rid) {
-                            // Verify this is the authoritative version when overlapping
-                            // volumes exist. After UPDATE changes PK + seal, the old PK
-                            // value exists in an older volume without a tombstone.
                             if seg_ids.len() > 1 {
-                                if let Some(current_row) = self.get_cold_row(rid) {
-                                    if let Some(current_val) = current_row.get(col_idx) {
-                                        if current_val != value {
-                                            i += 1;
-                                            continue; // stale PK in older volume
-                                        }
+                                if let Some(current_val) =
+                                    self.get_authoritative_value(rid, col_idx)
+                                {
+                                    if &current_val != value {
+                                        i += 1;
+                                        continue;
                                     }
                                 }
                             }
@@ -814,21 +962,21 @@ impl SegmentManager {
                         i += 1;
                     }
                 } else {
-                    for i in 0..vol.row_count {
-                        let rid = vol.row_ids[i];
+                    for i in 0..vol.meta.row_count {
+                        let rid = vol.meta.row_ids[i];
                         if !seen.insert(rid) {
                             continue;
                         }
-                        if !vol.columns[col_idx].is_null(i)
-                            && vol.columns[col_idx].get_i64(i) == target
+                        if !vol.columns[pi].is_null(i)
+                            && vol.columns[pi].get_i64(i) == target
                             && !ts.contains_key(&rid)
                         {
                             if seg_ids.len() > 1 {
-                                if let Some(current_row) = self.get_cold_row(rid) {
-                                    if let Some(current_val) = current_row.get(col_idx) {
-                                        if current_val != value {
-                                            continue; // stale PK in older volume
-                                        }
+                                if let Some(current_val) =
+                                    self.get_authoritative_value(rid, col_idx)
+                                {
+                                    if &current_val != value {
+                                        continue;
                                     }
                                 }
                             }
@@ -955,7 +1103,9 @@ impl SegmentManager {
             // Tier 1: Zone map pruning
             let mut zone_skip = false;
             for (i, &vi) in vol_col_indices.iter().enumerate() {
-                if vi < vol.zone_maps.len() && !vol.zone_maps[vi].may_contain_eq(values[i]) {
+                if vi < vol.meta.zone_maps.len()
+                    && !vol.meta.zone_maps[vi].may_contain_eq(values[i])
+                {
                     zone_skip = true;
                     break;
                 }
@@ -967,8 +1117,8 @@ impl SegmentManager {
             // Tier 2: Bloom filter pruning
             let mut bloom_skip = false;
             for (i, &vi) in vol_col_indices.iter().enumerate() {
-                if vi < vol.bloom_filters.len()
-                    && !vol.bloom_filters[vi].might_contain_hash(bloom_hashes[i])
+                if vi < vol.meta.bloom_filters.len()
+                    && !vol.meta.bloom_filters[vi].might_contain_hash(bloom_hashes[i])
                 {
                     bloom_skip = true;
                     break;
@@ -978,12 +1128,24 @@ impl SegmentManager {
                 continue;
             }
 
+            // Zone map + bloom passed — need column data. Load cold on demand.
+            let loaded: Arc<FrozenVolume>;
+            let vol = if vol.is_cold() {
+                loaded = match self.ensure_volume(seg_id) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                &*loaded
+            } else {
+                vol.mark_accessed();
+                vol
+            };
             // Tier 3: Per-volume hash index
             let mut vol_result: Option<i64> = None;
             if !has_missing {
                 // Common path: no schema evolution, pass values directly (zero alloc)
                 vol.unique_lookup_all(&vol_col_indices, values, |row_idx| {
-                    let rid = vol.row_ids[row_idx as usize];
+                    let rid = vol.meta.row_ids[row_idx as usize];
                     if ts.contains_key(&rid) {
                         false
                     } else if seen.insert(rid) {
@@ -1002,8 +1164,8 @@ impl SegmentManager {
                     .filter(|(_, &vi)| vi != usize::MAX)
                     .map(|(i, &vi)| (i, vi))
                     .collect();
-                for i in 0..vol.row_count {
-                    let rid = vol.row_ids[i];
+                for i in 0..vol.meta.row_count {
+                    let rid = vol.meta.row_ids[i];
                     if ts.contains_key(&rid) || !seen.insert(rid) {
                         continue;
                     }
@@ -1025,17 +1187,15 @@ impl SegmentManager {
                 // volume). get_cold_row returns the newest version (newest-first).
                 // Use column_defaults for columns missing from schema-evolved volumes.
                 if seg_ids.len() > 1 {
-                    if let Some(current_row) = self.get_cold_row(rid) {
-                        let still_matches = col_indices.iter().enumerate().all(|(i, &ci)| {
-                            let v = current_row
-                                .get(ci)
-                                .cloned()
-                                .unwrap_or_else(|| column_defaults[i].clone());
+                    let still_matches = col_indices.iter().enumerate().all(|(i, &ci)| {
+                        if let Some(v) = self.get_authoritative_value(rid, ci) {
                             !v.is_null() && v == *values[i]
-                        });
-                        if !still_matches {
-                            continue; // stale value in older volume, skip
+                        } else {
+                            column_defaults[i] == *values[i]
                         }
+                    });
+                    if !still_matches {
+                        continue; // stale value in older volume, skip
                     }
                 }
                 return Some(rid);
@@ -1058,6 +1218,140 @@ impl SegmentManager {
             .map(|s| s.row_count)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Evict idle volumes to save memory. Three-tier transitions:
+    ///
+    /// - Hot → Warm (drop decompressed columns, keep compressed blocks in RAM)
+    /// - Warm → Cold (drop compressed blocks, remove from map, track for disk reload)
+    ///
+    /// Volumes must be idle for MIN_IDLE_CYCLES before each transition.
+    /// Metadata is shared via Arc, zero allocation for hot→warm and warm→cold.
+    pub fn evict_idle_volumes(&self, current_epoch: u64) {
+        const MIN_IDLE_CYCLES: u64 = 3;
+
+        // Publish current epoch so scanners can stamp volumes correctly.
+        self.current_eviction_epoch
+            .store(current_epoch, std::sync::atomic::Ordering::Relaxed);
+
+        // Identify targets under read lock. Reset accessed volumes' epochs
+        // so their idle counter starts from this cycle.
+        let mut has_targets = false;
+        let targets: Vec<(u64, bool, bool)> = {
+            let segs = self.segments.read();
+            segs.iter()
+                .filter_map(|(&seg_id, cs)| {
+                    let vol_epoch = cs
+                        .volume
+                        .last_access_epoch
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if vol_epoch == u64::MAX {
+                        cs.volume
+                            .last_access_epoch
+                            .store(current_epoch, std::sync::atomic::Ordering::Relaxed);
+                        return None;
+                    }
+                    let delta = current_epoch.saturating_sub(vol_epoch);
+                    if delta < MIN_IDLE_CYCLES {
+                        return None;
+                    }
+                    let is_hot = cs.volume.columns.is_eager();
+                    let is_warm = cs.volume.is_warm();
+                    if is_hot || is_warm {
+                        has_targets = true;
+                        Some((seg_id, is_hot, is_warm))
+                    } else {
+                        None // already cold
+                    }
+                })
+                .collect()
+        };
+
+        if !has_targets {
+            return;
+        }
+
+        // Hold reloading mutex across the cold-creation writes. This serializes
+        // with ensure_columns/segments_snapshot so callers never see a cold
+        // volume that ensure_columns' has_cold check just missed.
+        let _reload_guard = self.reloading.lock();
+
+        // Apply transitions under write lock. Arc<VolumeMetadata> is shared
+        // (zero-copy), only LazyColumns is replaced.
+        let mut segments = self.segments.write();
+        let mut new_map = (**segments).clone();
+        for &(seg_id, is_hot, is_warm) in &targets {
+            if is_hot {
+                // Hot → Warm: drop decompressed columns, keep compressed in RAM
+                if let Some(cs) = new_map.get_mut(&seg_id) {
+                    if let Some(warm) = cs.volume.to_warm() {
+                        cs.volume = Arc::new(warm);
+                    }
+                }
+            } else if is_warm {
+                // Warm → Cold: drop compressed blocks, keep metadata in map.
+                // Zone maps, stats, row_ids stay available for fast paths.
+                // Only column access triggers disk reload via ensure_loaded.
+                if let Some(cs) = new_map.get_mut(&seg_id) {
+                    let cold = cs.volume.to_cold();
+                    cs.volume = Arc::new(cold);
+                    self.has_cold
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        *segments = Arc::new(new_map);
+    }
+
+    /// Reload cold volumes (metadata-only, in segments map) from disk.
+    /// Replaces them in-place with full deferred volumes.
+    fn reload_cold_volumes(&self, ids: Vec<u64>) {
+        let vol_dir = match &self.volume_dir {
+            Some(d) => d,
+            None => return,
+        };
+        let mut reloaded = Vec::new();
+        let mut failed = Vec::new();
+        for &id in &ids {
+            let filename = format!("vol_{:016x}.vol", id);
+            let full_path = vol_dir.join(self.table_name.as_str()).join(filename);
+            match crate::storage::volume::io::read_volume_from_disk(&full_path) {
+                Ok(volume) => {
+                    reloaded.push((id, Arc::new(volume)));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to reload cold volume {} seg={}: {}",
+                        self.table_name, id, e
+                    );
+                    failed.push(id);
+                }
+            }
+        }
+        if reloaded.is_empty() {
+            // Nothing loaded (all failed or empty list). Leave cold volumes
+            // in place — next access retries. Don't remove from manifest
+            // (transient I/O errors shouldn't cause permanent data loss).
+            return;
+        }
+        let mut segments = self.segments.write();
+        let mut new_map = (**segments).clone();
+        for (id, volume) in reloaded {
+            if let Some(cs) = new_map.get_mut(&id) {
+                if !cs.volume.unique_indices.read().is_empty() {
+                    *volume.unique_indices.write() =
+                        std::mem::take(&mut *cs.volume.unique_indices.write());
+                }
+                volume.mark_accessed();
+                cs.volume = volume;
+            }
+        }
+        let still_cold = new_map.values().any(|cs| cs.volume.is_cold());
+        *segments = Arc::new(new_map);
+        if !still_cold {
+            self.has_cold
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Count segments below the target row count (sub-target volumes that need merging).
@@ -1427,6 +1721,8 @@ impl SegmentManager {
         if ts.contains_key(&row_id) {
             return false;
         }
+        // Metadata-only check (binary search on row_ids). Does not access
+        // column data, so no mark_accessed — should not pin volumes.
         let (seg_ids, segments) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<(u64, i64, i64)> = manifest
@@ -1442,7 +1738,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if cold.volume.row_ids.binary_search(&row_id).is_ok() {
+                if cold.volume.meta.row_ids.binary_search(&row_id).is_ok() {
                     return true;
                 }
             }
@@ -1452,13 +1748,12 @@ impl SegmentManager {
 
     /// Get a cold row by row_id. Returns the Row if found and not tombstoned.
     /// Iterates newest-first so overlapping row_ids return the newest version.
+    /// Uses metadata-only search, reloads only the target cold volume if needed.
     pub fn get_cold_row(&self, row_id: i64) -> Option<crate::core::Row> {
         let ts = Arc::clone(&*self.tombstones.read());
         if ts.contains_key(&row_id) {
             return None;
         }
-        // Hold manifest lock while cloning segments Arc to prevent
-        // compaction from swapping the map between the two reads.
         let (seg_ids, segments) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<(u64, i64, i64)> = manifest
@@ -1475,7 +1770,40 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.row_ids.binary_search(&row_id) {
+                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                    if cold.volume.is_cold() {
+                        if let Some(vol) = self.ensure_volume(*seg_id) {
+                            return Some(vol.get_row(idx));
+                        }
+                        // Segment removed by compaction — retry with fresh state.
+                        return self.get_cold_row_retry(row_id);
+                    }
+                    cold.volume.mark_accessed();
+                    return Some(cold.volume.get_row(idx));
+                }
+            }
+        }
+        None
+    }
+
+    /// Retry get_cold_row with a fresh consistent snapshot after compaction.
+    fn get_cold_row_retry(&self, row_id: i64) -> Option<crate::core::Row> {
+        self.ensure_columns();
+        let (seg_ids, segments) = {
+            let manifest = self.manifest.read();
+            let seg_ids: Vec<u64> = manifest
+                .segments
+                .iter()
+                .rev()
+                .map(|m| m.segment_id)
+                .collect();
+            let segments = Arc::clone(&*self.segments.read());
+            (seg_ids, segments)
+        };
+        for seg_id in &seg_ids {
+            if let Some(cold) = segments.get(seg_id) {
+                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                    cold.volume.mark_accessed();
                     return Some(cold.volume.get_row(idx));
                 }
             }
@@ -1487,6 +1815,7 @@ impl SegmentManager {
     /// After ALTER TABLE ADD COLUMN, cold volumes may have fewer columns.
     /// This variant fills in defaults for missing columns.
     /// Iterates newest-first so overlapping row_ids return the newest version.
+    /// Uses metadata-only search, reloads only the target cold volume if needed.
     pub fn get_cold_row_normalized(
         &self,
         row_id: i64,
@@ -1496,8 +1825,6 @@ impl SegmentManager {
         if ts.contains_key(&row_id) {
             return None;
         }
-        // Hold manifest lock while cloning segments Arc to prevent
-        // compaction from swapping the map between the two reads.
         let (seg_ids, segments) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<(u64, i64, i64)> = manifest
@@ -1514,7 +1841,52 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.row_ids.binary_search(&row_id) {
+                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                    let vol = if cold.volume.is_cold() {
+                        match self.ensure_volume(*seg_id) {
+                            Some(v) => v,
+                            None => {
+                                // Segment removed by compaction — retry with fresh state.
+                                return self.get_cold_row_normalized_retry(row_id, schema);
+                            }
+                        }
+                    } else {
+                        cold.volume.mark_accessed();
+                        Arc::clone(&cold.volume)
+                    };
+                    let mapping = self.get_volume_mapping(*seg_id, schema);
+                    if mapping.is_identity {
+                        return Some(vol.get_row(idx));
+                    }
+                    return Some(vol.get_row_mapped(idx, &mapping));
+                }
+            }
+        }
+        None
+    }
+
+    /// Retry get_cold_row_normalized with a fresh consistent snapshot after compaction.
+    fn get_cold_row_normalized_retry(
+        &self,
+        row_id: i64,
+        schema: &crate::core::Schema,
+    ) -> Option<crate::core::Row> {
+        self.ensure_columns();
+        let (seg_ids, segments) = {
+            let manifest = self.manifest.read();
+            let seg_ids: Vec<u64> = manifest
+                .segments
+                .iter()
+                .rev()
+                .map(|m| m.segment_id)
+                .collect();
+            let segments = Arc::clone(&*self.segments.read());
+            (seg_ids, segments)
+        };
+        for seg_id in &seg_ids {
+            if let Some(cold) = segments.get(seg_id) {
+                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                    cold.volume.mark_accessed();
                     let mapping = self.get_volume_mapping(*seg_id, schema);
                     if mapping.is_identity {
                         return Some(cold.volume.get_row(idx));
@@ -1545,7 +1917,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if cold.volume.row_ids.binary_search(&row_id).is_ok() {
+                if cold.volume.meta.row_ids.binary_search(&row_id).is_ok() {
                     return true;
                 }
             }
@@ -1637,7 +2009,7 @@ impl SegmentManager {
         }
         let tombstones = Arc::clone(&*self.tombstones.read());
         if segments.len() == 1 {
-            let total: usize = segments.values().map(|cs| cs.volume.row_count).sum();
+            let total: usize = segments.values().map(|cs| cs.volume.meta.row_count).sum();
             return total.saturating_sub(tombstones.len());
         }
 
@@ -1647,11 +2019,11 @@ impl SegmentManager {
             let mut count = 0usize;
             for cs in segments.values() {
                 let vol = &cs.volume;
-                for i in 0..vol.row_count {
+                for i in 0..vol.meta.row_count {
                     if !cs.is_visible(i) {
                         continue;
                     }
-                    if !tombstones.is_empty() && tombstones.contains_key(&vol.row_ids[i]) {
+                    if !tombstones.is_empty() && tombstones.contains_key(&vol.meta.row_ids[i]) {
                         continue;
                     }
                     count += 1;
@@ -1817,6 +2189,8 @@ impl SegmentManager {
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         self.has_segments_flag
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.has_cold
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Remove specific segments after compaction.
@@ -1842,6 +2216,12 @@ impl SegmentManager {
                 new_map.remove(&id);
             }
             compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
+            if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
+                && !new_map.values().any(|cs| cs.volume.is_cold())
+            {
+                self.has_cold
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             *segments = Arc::new(new_map);
         }
         self.cached_deduped_count
@@ -1895,6 +2275,12 @@ impl SegmentManager {
             }
             new_map.insert(new_segment_id, cold);
             compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
+            if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
+                && !new_map.values().any(|cs| cs.volume.is_cold())
+            {
+                self.has_cold
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             *segments = Arc::new(new_map);
         }
         self.cached_deduped_count
@@ -1956,6 +2342,12 @@ impl SegmentManager {
 
             let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
             compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
+            if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
+                && !new_map.values().any(|cs| cs.volume.is_cold())
+            {
+                self.has_cold
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             *segments = Arc::new(new_map);
         }
         self.has_segments_flag
@@ -1978,6 +2370,12 @@ impl SegmentManager {
             }
             let has_any = !new_map.is_empty();
             compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
+            if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
+                && !new_map.values().any(|cs| cs.volume.is_cold())
+            {
+                self.has_cold
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             *segments = Arc::new(new_map);
             self.has_segments_flag
                 .store(has_any, std::sync::atomic::Ordering::Relaxed);
@@ -1992,8 +2390,113 @@ impl SegmentManager {
     }
 
     /// CoW snapshot of the loaded segments map.
+    /// Reloads cold volumes first so column data is available.
+    /// Does NOT mark volumes as accessed — callers that need eviction
+    /// protection should mark the specific volumes they use.
     pub fn segments_snapshot(&self) -> Arc<FxHashMap<u64, ColdSegment>> {
+        self.ensure_columns();
+        let segs = Arc::clone(&*self.segments.read());
+        if !segs.values().any(|cs| cs.volume.is_cold()) {
+            return segs;
+        }
+        // Race or persistent failure: retry once then filter.
+        self.ensure_columns();
+        let segs = Arc::clone(&*self.segments.read());
+        if segs.values().any(|cs| cs.volume.is_cold()) {
+            let mut filtered = (*segs).clone();
+            let cold: Vec<(u64, usize)> = filtered
+                .iter()
+                .filter(|(_, cs)| cs.volume.is_cold())
+                .map(|(&id, cs)| (id, cs.volume.meta.row_count))
+                .collect();
+            for &(seg_id, rows) in &cold {
+                eprintln!(
+                    "Warning: table {} seg={}: cold volume excluded from snapshot ({} rows, reload failed)",
+                    self.table_name, seg_id, rows
+                );
+            }
+            filtered.retain(|_, cs| !cs.volume.is_cold());
+            return Arc::new(filtered);
+        }
+        segs
+    }
+
+    /// Raw CoW snapshot without ensure_columns. Callers that only need
+    /// metadata (row_ids, zone maps) use this to avoid reloading cold volumes.
+    pub fn segments_raw(&self) -> Arc<FxHashMap<u64, ColdSegment>> {
         Arc::clone(&*self.segments.read())
+    }
+
+    /// Reload a single cold volume by segment ID. Returns the loaded volume
+    /// if successful. Used by point lookups to avoid reloading all cold volumes.
+    pub fn ensure_volume(&self, seg_id: u64) -> Option<Arc<FrozenVolume>> {
+        // Fast path: already loaded (or another thread just loaded it)
+        {
+            let segs = self.segments.read();
+            if let Some(cs) = segs.get(&seg_id) {
+                if !cs.volume.is_cold() {
+                    cs.volume.mark_accessed();
+                    return Some(Arc::clone(&cs.volume));
+                }
+            } else {
+                // Segment no longer in map (compaction removed it). Caller
+                // should retry with the current manifest.
+                return None;
+            }
+        }
+        // Serialize reloads — prevents concurrent stampede on the same volume.
+        // Second thread re-checks the fast path after acquiring the guard.
+        let _guard = self.reloading.lock();
+        {
+            let segs = self.segments.read();
+            if let Some(cs) = segs.get(&seg_id) {
+                if !cs.volume.is_cold() {
+                    cs.volume.mark_accessed();
+                    return Some(Arc::clone(&cs.volume));
+                }
+            } else {
+                return None;
+            }
+        }
+        let vol_dir = match &self.volume_dir {
+            Some(d) => d,
+            None => return None,
+        };
+        let filename = format!("vol_{:016x}.vol", seg_id);
+        let full_path = vol_dir.join(self.table_name.as_str()).join(filename);
+        let volume = match crate::storage::volume::io::read_volume_from_disk(&full_path) {
+            Ok(v) => Arc::new(v),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to reload cold volume {} seg={}: {}",
+                    self.table_name, seg_id, e
+                );
+                return None;
+            }
+        };
+        volume.mark_accessed();
+        let mut segments = self.segments.write();
+        let mut new_map = (**segments).clone();
+        // Re-check: segment may have been removed by concurrent compaction
+        // while we were reading from disk.
+        if let Some(cs) = new_map.get_mut(&seg_id) {
+            if !cs.volume.unique_indices.read().is_empty() {
+                *volume.unique_indices.write() =
+                    std::mem::take(&mut *cs.volume.unique_indices.write());
+            }
+            cs.volume = Arc::clone(&volume);
+        } else {
+            // Compaction removed this segment while we were reloading.
+            // The row now lives in a newer compacted volume.
+            return None;
+        }
+        let still_cold = new_map.values().any(|cs| cs.volume.is_cold());
+        *segments = Arc::new(new_map);
+        if !still_cold {
+            self.has_cold
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some(volume)
     }
 
     /// Get the manifest for writing (e.g., to allocate segment IDs).
@@ -2388,5 +2891,167 @@ mod tests {
         mgr.clear();
         assert_eq!(mgr.segment_count(), 0);
         assert!(mgr.tombstone_set_arc().is_empty());
+    }
+
+    #[test]
+    fn test_eviction_lifecycle() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+
+        let schema = SchemaBuilder::new("evict_test")
+            .column("id", DataType::Integer, false, true)
+            .column("name", DataType::Text, false, false)
+            .build();
+
+        let mgr = SegmentManager::new("evict_test", None);
+
+        // Register a volume (simulates seal). VolumeBuilder produces hot (eager) volumes.
+        let mut builder = super::super::writer::VolumeBuilder::new(&schema);
+        for i in 1..=100i64 {
+            builder.add_row(
+                i,
+                &Row::from_values(vec![Value::Integer(i), Value::from(format!("name_{}", i))]),
+            );
+        }
+        let mut volume = builder.finish();
+        // Attach compressed store so hot→warm transition works.
+        let (_, store) = crate::storage::volume::io::serialize_v4_public(&volume).unwrap();
+        volume.columns.attach_compressed_store(store);
+        let volume = Arc::new(volume);
+
+        mgr.register_segment(
+            1,
+            volume,
+            SegmentMeta {
+                segment_id: 1,
+                file_path: PathBuf::from("test.vol"),
+                row_count: 100,
+                min_row_id: 1,
+                max_row_id: 100,
+                creation_lsn: 0,
+                compaction_epoch: 0,
+                schema_version: 0,
+            },
+            None,
+        );
+
+        // Verify: volume starts hot (eager + compressed store).
+        {
+            let segs = mgr.segments_raw();
+            let cs = segs.get(&1).unwrap();
+            assert!(cs.volume.columns.is_eager(), "should start hot");
+            assert!(
+                cs.volume.columns.has_compressed_store(),
+                "should have compressed store"
+            );
+            assert!(!cs.volume.is_warm(), "hot is not warm");
+            assert!(!cs.volume.is_cold(), "hot is not cold");
+        }
+
+        // Data is correct while hot.
+        {
+            let vols = mgr.get_volumes_newest_first();
+            let (_, cs) = &vols[0];
+            let row = cs.volume.get_row(0);
+            assert_eq!(row[0], Value::Integer(1));
+        }
+
+        // Helper: mirror engine's evict_idle_volumes behavior.
+        // Engine does: fetch_add → GLOBAL.fetch_max → mgr.evict_idle_volumes.
+        let run_eviction = |mgr: &SegmentManager, epoch: u64| {
+            super::super::writer::GLOBAL_EVICTION_EPOCH
+                .fetch_max(epoch, std::sync::atomic::Ordering::Relaxed);
+            mgr.evict_idle_volumes(epoch);
+        };
+
+        // ── Eviction cycle 0..2: not enough idle cycles, no eviction ──
+        for epoch in 0..3u64 {
+            run_eviction(&mgr, epoch);
+            let segs = mgr.segments_raw();
+            let cs = segs.get(&1).unwrap();
+            assert!(
+                cs.volume.columns.is_eager(),
+                "epoch {}: should still be hot (< MIN_IDLE_CYCLES)",
+                epoch
+            );
+        }
+
+        // ── Eviction cycle 3: idle for 3 cycles → hot → warm ──
+        run_eviction(&mgr, 3);
+        {
+            let segs = mgr.segments_raw();
+            let cs = segs.get(&1).unwrap();
+            assert!(
+                cs.volume.is_warm(),
+                "epoch 3: should be warm after eviction"
+            );
+            assert!(
+                !cs.volume.columns.is_eager(),
+                "epoch 3: warm means not eager"
+            );
+            assert!(
+                cs.volume.columns.has_compressed_store(),
+                "epoch 3: warm still has compressed store"
+            );
+        }
+
+        // Data is correct while warm (decompresses from compressed store).
+        {
+            let vols = mgr.get_volumes_newest_first();
+            let (_, cs) = &vols[0];
+            let row = cs.volume.get_row(49);
+            assert_eq!(row[0], Value::Integer(50));
+        }
+
+        // ── Mark accessed (simulates a query) → should NOT be evicted ──
+        // get_volumes_newest_first marks all volumes.
+        let _ = mgr.get_volumes_newest_first();
+
+        // Eviction cycles 4..6: volume was accessed, should stay warm/hot.
+        for epoch in 4..7u64 {
+            run_eviction(&mgr, epoch);
+            let segs = mgr.segments_raw();
+            let cs = segs.get(&1).unwrap();
+            assert!(
+                !cs.volume.is_cold(),
+                "epoch {}: actively queried volume should NOT go cold",
+                epoch
+            );
+        }
+
+        // ── Stop querying. After idle cycles: should eventually go cold ──
+        // Epoch 7: the volume was marked u64::MAX by get_volumes_newest_first.
+        // Eviction at epoch 4 reset it to 4. At epoch 7: delta = 3 → evict
+        // hot→warm (OnceLock filled by get_row, so is_eager=true). This is the
+        // first demotion. The new warm volume starts at GLOBAL (7).
+        run_eviction(&mgr, 7);
+        // Epochs 8, 9: delta grows from warm volume's start epoch (7)
+        run_eviction(&mgr, 8);
+        run_eviction(&mgr, 9);
+        {
+            let segs = mgr.segments_raw();
+            let cs = segs.get(&1).unwrap();
+            assert!(!cs.volume.is_cold(), "epoch 9: delta=2, still warm");
+        }
+        // Epoch 10: delta=3 → warm → cold
+        run_eviction(&mgr, 10);
+        {
+            let segs = mgr.segments_raw();
+            let cs = segs.get(&1).unwrap();
+            assert!(
+                cs.volume.is_cold(),
+                "epoch 10: should be cold after 3 idle cycles"
+            );
+            assert!(
+                !cs.volume.columns.has_compressed_store(),
+                "cold has no compressed store"
+            );
+        }
+
+        // Metadata still accessible on cold volumes.
+        assert!(mgr.row_exists(50), "metadata (row_ids) should work on cold");
+        assert_eq!(mgr.total_row_count(), 100);
+
+        // Volume is still in the map (not removed).
+        assert_eq!(mgr.segment_count(), 1);
     }
 }

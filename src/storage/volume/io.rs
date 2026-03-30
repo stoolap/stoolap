@@ -21,16 +21,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::common::SmartString;
 use crate::core::Result;
 
-use super::column::ColumnData;
 use super::column::ROW_GROUP_SIZE;
-use super::format::{
-    deserialize_column_block, deserialize_column_block_into, deserialize_volume_metadata,
-    serialize_volume_metadata, COL_BOOLEAN, COL_BYTES, COL_DICTIONARY, COL_FLOAT64, COL_INT64,
-    COL_TIMESTAMP,
-};
+use super::format::{deserialize_volume_metadata, serialize_volume_metadata};
 use super::writer::{CompressedBlockStore, FrozenVolume, LazyColumns};
 
 /// Volume file extension
@@ -134,10 +128,10 @@ fn serialize_v4_opts(
 
     let col_count = vol.columns.len();
     let group_size = ROW_GROUP_SIZE;
-    let num_groups = if vol.row_count == 0 {
+    let num_groups = if vol.meta.row_count == 0 {
         0
     } else {
-        vol.row_count.div_ceil(group_size)
+        vol.meta.row_count.div_ceil(group_size)
     };
 
     // 1. Serialize + compress metadata
@@ -148,8 +142,8 @@ fn serialize_v4_opts(
     // 2. Build CompressedBlockStore (compresses all column blocks when enabled)
     let store = CompressedBlockStore::compress_columns_opts(
         &vol.columns,
-        &vol.column_types,
-        vol.row_count,
+        &vol.meta.column_types,
+        vol.meta.row_count,
         compress,
     );
 
@@ -290,284 +284,32 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     }
     drop(index_buf);
 
-    // 4. Build per-column dictionaries (needed before streaming decompression)
-    let mut col_dicts: Vec<Option<Arc<[SmartString]>>> = vec![None; col_count];
-    {
-        let mut dict_start = 0usize;
-        for (i, &tag) in meta.col_type_tags.iter().enumerate() {
-            if tag == COL_DICTIONARY {
-                let count = meta.col_dict_counts[i] as usize;
-                let end = dict_start + count;
-                col_dicts[i] = Some(Arc::from(&meta.shared_dict[dict_start..end]));
-                dict_start = end;
-            }
-        }
-    }
-
     let col_data_types = meta.column_types.clone();
-    let row_count = meta.row_count;
     let group_size = ROW_GROUP_SIZE;
 
-    // 5. Stream-decompress: read each block into a reusable buffer, decompress
-    //    directly into pre-allocated column vectors. No CompressedBlockStore,
-    //    no intermediate Vec<Vec<Vec<u8>>> — saves ~1.3 GB allocation throughput.
-    let mut read_buf: Vec<u8> = Vec::new(); // reusable disk-read buffer
-    let mut lz4_buf: Vec<u8> = Vec::new(); // reusable LZ4 scratch buffer
-    let mut block_idx = 0;
+    // 5. Read compressed blocks into CompressedBlockStore (deferred mode).
+    //    Blocks stay compressed in RAM. Decompression happens on first scan
+    //    via the group cache path (~4 GB/s from RAM, ~1ms per column per group).
+    //    Each block is read into a buffer then moved into the store.
+    let mut all_blocks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(col_count);
+    let mut all_decomp_lens: Vec<Vec<usize>> = Vec::with_capacity(col_count);
+    let mut read_buf: Vec<u8> = Vec::new();
+    let mut block_idx = 0usize;
 
-    let mut eager_columns: Vec<ColumnData> = Vec::with_capacity(col_count);
-
-    #[allow(clippy::needless_range_loop)]
-    for col_idx in 0..col_count {
-        let type_tag = meta.col_type_tags[col_idx];
-        let ext_type = crate::core::DataType::from_u8(meta.col_ext_types[col_idx])
-            .unwrap_or(crate::core::DataType::Null);
-
-        if num_groups == 0 {
-            // Empty volume — push empty column data
-            let col = match type_tag {
-                COL_INT64 => ColumnData::Int64 {
-                    values: Vec::new(),
-                    nulls: Vec::new(),
-                },
-                COL_FLOAT64 => ColumnData::Float64 {
-                    values: Vec::new(),
-                    nulls: Vec::new(),
-                },
-                COL_TIMESTAMP => ColumnData::TimestampNanos {
-                    values: Vec::new(),
-                    nulls: Vec::new(),
-                },
-                COL_BOOLEAN => ColumnData::Boolean {
-                    values: Vec::new(),
-                    nulls: Vec::new(),
-                },
-                COL_DICTIONARY => ColumnData::Dictionary {
-                    ids: Vec::new(),
-                    dictionary: col_dicts[col_idx]
-                        .take()
-                        .unwrap_or_else(|| Arc::from(Vec::<SmartString>::new())),
-                    nulls: Vec::new(),
-                },
-                COL_BYTES => ColumnData::Bytes {
-                    data: Vec::new(),
-                    offsets: Vec::new(),
-                    ext_type,
-                    nulls: Vec::new(),
-                },
-                _ => return Err(inv(&format!("unknown col type tag {}", type_tag))),
-            };
-            eager_columns.push(col);
-        } else if num_groups == 1 {
-            // Single group: read block, decompress, deserialize via existing path
+    for _col_idx in 0..col_count {
+        let mut col_blocks = Vec::with_capacity(num_groups);
+        let mut col_lens = Vec::with_capacity(num_groups);
+        for _gi in 0..num_groups {
             let comp_len = compressed_lens[block_idx];
             let decomp_len = decompressed_lens_flat[block_idx];
-            read_buf.clear();
             read_buf.resize(comp_len, 0);
             crc_read!(&mut read_buf);
             block_idx += 1;
-
-            let group_rows = row_count.min(group_size);
-            let dict = col_dicts[col_idx].as_ref().map(Arc::clone);
-
-            let col = if read_buf.len() == decomp_len {
-                // Stored uncompressed
-                deserialize_column_block(&read_buf, type_tag, group_rows, dict, ext_type)
-                    .map_err(|e| inv(&format!("col={}: {}", col_idx, e)))?
-            } else {
-                if lz4_buf.len() < decomp_len {
-                    lz4_buf.resize(decomp_len, 0);
-                }
-                lz4_flex::decompress_into(&read_buf, &mut lz4_buf[..decomp_len])
-                    .map_err(|e| inv(&format!("col={} LZ4: {}", col_idx, e)))?;
-                deserialize_column_block(
-                    &lz4_buf[..decomp_len],
-                    type_tag,
-                    group_rows,
-                    dict,
-                    ext_type,
-                )
-                .map_err(|e| inv(&format!("col={}: {}", col_idx, e)))?
-            };
-            eager_columns.push(col);
-        } else {
-            // Multi-group: stream blocks directly into pre-allocated vectors.
-            // Helper closure: compute row count for a group index.
-            let group_row_count = |gi: usize| -> usize {
-                if gi == num_groups - 1 {
-                    row_count - gi * group_size
-                } else {
-                    group_size
-                }
-            };
-
-            // Read + decompress each group block inline into typed output vecs.
-            macro_rules! stream_decompress_into {
-                ($nulls:expr, $i64_out:expr, $f64_out:expr, $u32_out:expr,
-                 $bool_out:expr, $bytes_data:expr, $bytes_offsets:expr) => {
-                    for gi in 0..num_groups {
-                        let comp_len = compressed_lens[block_idx];
-                        let decomp_len = decompressed_lens_flat[block_idx];
-                        read_buf.clear();
-                        read_buf.resize(comp_len, 0);
-                        crc_read!(&mut read_buf);
-                        block_idx += 1;
-
-                        let grp_rows = group_row_count(gi);
-                        if read_buf.len() == decomp_len {
-                            // Stored uncompressed — deserialize directly
-                            deserialize_column_block_into(
-                                &read_buf,
-                                type_tag,
-                                grp_rows,
-                                $nulls,
-                                $i64_out,
-                                $f64_out,
-                                $u32_out,
-                                $bool_out,
-                                $bytes_data,
-                                $bytes_offsets,
-                            )
-                            .map_err(|e| inv(&format!("col={} g={}: {}", col_idx, gi, e)))?;
-                        } else {
-                            if lz4_buf.len() < decomp_len {
-                                lz4_buf.resize(decomp_len, 0);
-                            }
-                            lz4_flex::decompress_into(&read_buf, &mut lz4_buf[..decomp_len])
-                                .map_err(|e| {
-                                    inv(&format!("col={} g={} LZ4: {}", col_idx, gi, e))
-                                })?;
-                            deserialize_column_block_into(
-                                &lz4_buf[..decomp_len],
-                                type_tag,
-                                grp_rows,
-                                $nulls,
-                                $i64_out,
-                                $f64_out,
-                                $u32_out,
-                                $bool_out,
-                                $bytes_data,
-                                $bytes_offsets,
-                            )
-                            .map_err(|e| inv(&format!("col={} g={}: {}", col_idx, gi, e)))?;
-                        }
-                    }
-                };
-            }
-
-            let col = match type_tag {
-                COL_INT64 => {
-                    let mut vals = Vec::with_capacity(row_count);
-                    let mut nulls = Vec::with_capacity(row_count);
-                    stream_decompress_into!(
-                        &mut nulls,
-                        Some(&mut vals),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None
-                    );
-                    ColumnData::Int64 {
-                        values: vals,
-                        nulls,
-                    }
-                }
-                COL_FLOAT64 => {
-                    let mut vals = Vec::with_capacity(row_count);
-                    let mut nulls = Vec::with_capacity(row_count);
-                    stream_decompress_into!(
-                        &mut nulls,
-                        None,
-                        Some(&mut vals),
-                        None,
-                        None,
-                        None,
-                        None
-                    );
-                    ColumnData::Float64 {
-                        values: vals,
-                        nulls,
-                    }
-                }
-                COL_TIMESTAMP => {
-                    let mut vals = Vec::with_capacity(row_count);
-                    let mut nulls = Vec::with_capacity(row_count);
-                    stream_decompress_into!(
-                        &mut nulls,
-                        Some(&mut vals),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None
-                    );
-                    ColumnData::TimestampNanos {
-                        values: vals,
-                        nulls,
-                    }
-                }
-                COL_BOOLEAN => {
-                    let mut vals = Vec::with_capacity(row_count);
-                    let mut nulls = Vec::with_capacity(row_count);
-                    stream_decompress_into!(
-                        &mut nulls,
-                        None,
-                        None,
-                        None,
-                        Some(&mut vals),
-                        None,
-                        None
-                    );
-                    ColumnData::Boolean {
-                        values: vals,
-                        nulls,
-                    }
-                }
-                COL_DICTIONARY => {
-                    let mut ids = Vec::with_capacity(row_count);
-                    let mut nulls = Vec::with_capacity(row_count);
-                    stream_decompress_into!(
-                        &mut nulls,
-                        None,
-                        None,
-                        Some(&mut ids),
-                        None,
-                        None,
-                        None
-                    );
-                    ColumnData::Dictionary {
-                        ids,
-                        dictionary: col_dicts[col_idx]
-                            .take()
-                            .unwrap_or_else(|| Arc::from(Vec::<SmartString>::new())),
-                        nulls,
-                    }
-                }
-                COL_BYTES => {
-                    let mut data = Vec::new();
-                    let mut offsets = Vec::with_capacity(row_count);
-                    let mut nulls = Vec::with_capacity(row_count);
-                    stream_decompress_into!(
-                        &mut nulls,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(&mut data),
-                        Some(&mut offsets)
-                    );
-                    ColumnData::Bytes {
-                        data,
-                        offsets,
-                        ext_type,
-                        nulls,
-                    }
-                }
-                _ => return Err(inv(&format!("unknown col type tag {}", type_tag))),
-            };
-            eager_columns.push(col);
+            col_blocks.push(std::mem::take(&mut read_buf));
+            col_lens.push(decomp_len);
         }
+        all_blocks.push(col_blocks);
+        all_decomp_lens.push(col_lens);
     }
 
     // 6. Verify CRC32 (computed incrementally over everything we read)
@@ -580,19 +322,55 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
         return Err(inv("CRC mismatch"));
     }
 
+    // 7. Build CompressedBlockStore + deferred LazyColumns.
+    //    Columns start cold (compressed in RAM). First scan decompresses
+    //    per-group on demand. After all columns are accessed, is_eager flips
+    //    to true (automatic hot promotion).
+    let dict_ranges: Vec<(usize, usize, usize)> = {
+        let mut ranges = Vec::new();
+        let mut offset = 0usize;
+        for (i, &count) in meta.col_dict_counts.iter().enumerate() {
+            let count = count as usize;
+            if count > 0 {
+                ranges.push((i, offset, offset + count));
+                offset += count;
+            }
+        }
+        ranges
+    };
+    let store = CompressedBlockStore::from_raw_blocks(
+        all_blocks,
+        all_decomp_lens,
+        meta.col_type_tags.clone(),
+        meta.column_types.clone(),
+        meta.col_ext_types.clone(),
+        meta.shared_dict,
+        dict_ranges,
+        group_size,
+        meta.row_count,
+    );
+    let columns = LazyColumns::deferred(store, col_data_types);
+
     Ok(FrozenVolume {
-        columns: LazyColumns::eager(eager_columns, col_data_types),
-        zone_maps: meta.zone_maps,
-        bloom_filters: meta.bloom_filters,
-        stats: meta.stats,
-        row_count: meta.row_count,
-        column_names: meta.column_names,
-        column_types: meta.column_types,
-        row_ids: meta.row_ids,
-        sorted_columns: meta.col_sorted,
-        column_name_map: meta.column_name_map,
-        unique_indices: parking_lot::RwLock::new(rustc_hash::FxHashMap::default()),
-        row_groups: meta.row_groups,
+        columns,
+        meta: Arc::new(super::writer::VolumeMeta {
+            zone_maps: meta.zone_maps,
+            bloom_filters: meta.bloom_filters,
+            stats: meta.stats,
+            row_count: meta.row_count,
+            column_names: meta.column_names,
+            column_types: meta.column_types,
+            row_ids: meta.row_ids,
+            sorted_columns: meta.col_sorted,
+            column_name_map: meta.column_name_map,
+            row_groups: meta.row_groups,
+        }),
+        unique_indices: std::sync::Arc::new(parking_lot::RwLock::new(
+            rustc_hash::FxHashMap::default(),
+        )),
+        last_access_epoch: std::sync::atomic::AtomicU64::new(
+            super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
+        ),
     })
 }
 
@@ -983,7 +761,7 @@ mod tests {
         assert!(path.exists());
 
         let loaded = read_volume_from_disk(&path).unwrap();
-        assert_eq!(loaded.row_count, 2);
+        assert_eq!(loaded.meta.row_count, 2);
         assert_eq!(loaded.columns[0].get_i64(0), 1);
         assert_eq!(loaded.columns[1].get_str(1), "world");
     }
@@ -1022,7 +800,7 @@ mod tests {
 
         let volumes = load_all_volumes(dir.path(), "t").unwrap();
         assert_eq!(volumes.len(), 3);
-        assert_eq!(volumes[0].row_count, 1);
+        assert_eq!(volumes[0].meta.row_count, 1);
     }
 
     #[test]
@@ -1148,7 +926,7 @@ mod tests {
 
         // Read back and verify eager loading
         let loaded = read_volume_from_disk(&path).unwrap();
-        assert_eq!(loaded.row_count, 3);
+        assert_eq!(loaded.meta.row_count, 3);
 
         // Access columns triggers decompression from RAM
         assert_eq!(loaded.columns[0].get_i64(0), 1);
@@ -1158,18 +936,18 @@ mod tests {
         assert_eq!(loaded.columns[2].get_f64(1), 0.75);
 
         // Zone maps survived
-        assert_eq!(loaded.zone_maps[0].min, Value::Integer(1));
-        assert_eq!(loaded.zone_maps[0].max, Value::Integer(3));
+        assert_eq!(loaded.meta.zone_maps[0].min, Value::Integer(1));
+        assert_eq!(loaded.meta.zone_maps[0].max, Value::Integer(3));
 
         // Stats survived
-        assert_eq!(loaded.stats.count_star(), 3);
-        assert_eq!(loaded.stats.sum(2), 5.25);
+        assert_eq!(loaded.meta.stats.count_star(), 3);
+        assert_eq!(loaded.meta.stats.sum(2), 5.25);
 
         // Sorted flags survived
-        assert!(loaded.sorted_columns[0]);
+        assert!(loaded.meta.sorted_columns[0]);
 
         // Row IDs survived
-        assert_eq!(loaded.row_ids, vec![1, 2, 3]);
+        assert_eq!(loaded.meta.row_ids, vec![1, 2, 3]);
     }
 
     #[test]
@@ -1198,7 +976,7 @@ mod tests {
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let loaded = read_volume_from_disk(&path).unwrap();
 
-        assert_eq!(loaded.row_count, 3);
+        assert_eq!(loaded.meta.row_count, 3);
         assert!(!loaded.columns[1].is_null(0));
         assert!(loaded.columns[1].is_null(1));
         assert!(!loaded.columns[1].is_null(2));
@@ -1231,7 +1009,7 @@ mod tests {
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let loaded = read_volume_from_disk(&path).unwrap();
 
-        assert_eq!(loaded.row_count, n);
+        assert_eq!(loaded.meta.row_count, n);
 
         // Check first, middle, and last rows
         assert_eq!(loaded.columns[0].get_i64(0), 0);
@@ -1242,7 +1020,7 @@ mod tests {
         assert_eq!(loaded.columns[1].get_str(n - 1), "odd");
 
         // Row groups present
-        assert!(!loaded.row_groups.is_empty());
+        assert!(!loaded.meta.row_groups.is_empty());
     }
 
     #[test]
@@ -1271,7 +1049,7 @@ mod tests {
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let loaded = read_volume_from_disk(&path).unwrap();
 
-        assert_eq!(loaded.row_count, 2);
+        assert_eq!(loaded.meta.row_count, 2);
         // Timestamp nanosecond precision
         if let Value::Timestamp(loaded_ts) = loaded.columns[0].get_value(0) {
             assert_eq!(loaded_ts.timestamp_nanos_opt(), ts.timestamp_nanos_opt());

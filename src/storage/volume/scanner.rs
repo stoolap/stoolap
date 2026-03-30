@@ -173,8 +173,10 @@ impl VolumeScanner {
             project_cols
         };
         let is_full_projection = Self::compute_is_full_projection(&project, volume.columns.len());
+        // Stamp with current global eviction epoch so the volume ages correctly.
+        volume.mark_accessed();
         let mut s = Self {
-            end_idx: volume.row_count,
+            end_idx: volume.meta.row_count,
             volume,
             project_cols: project,
             is_full_projection,
@@ -224,6 +226,7 @@ impl VolumeScanner {
             project_cols
         };
         let is_full_projection = Self::compute_is_full_projection(&project, volume.columns.len());
+        volume.mark_accessed();
         let mut s = Self {
             volume,
             project_cols: project,
@@ -293,17 +296,22 @@ impl VolumeScanner {
         Self {
             volume: Arc::new(FrozenVolume {
                 columns: super::writer::LazyColumns::empty(),
-                zone_maps: Vec::new(),
-                bloom_filters: Vec::new(),
-                stats: super::stats::VolumeAggregateStats::new(0),
-                row_count: 0,
-                column_names: Vec::new(),
-                column_types: Vec::new(),
-                row_ids: Vec::new(),
-                sorted_columns: Vec::new(),
-                column_name_map: ahash::AHashMap::new(),
-                unique_indices: parking_lot::RwLock::new(rustc_hash::FxHashMap::default()),
-                row_groups: Vec::new(),
+                meta: Arc::new(super::writer::VolumeMeta {
+                    zone_maps: Vec::new(),
+                    bloom_filters: Vec::new(),
+                    stats: super::stats::VolumeAggregateStats::new(0),
+                    row_count: 0,
+                    column_names: Vec::new(),
+                    column_types: Vec::new(),
+                    row_ids: Vec::new(),
+                    sorted_columns: Vec::new(),
+                    column_name_map: ahash::AHashMap::new(),
+                    row_groups: Vec::new(),
+                }),
+                unique_indices: std::sync::Arc::new(parking_lot::RwLock::new(
+                    rustc_hash::FxHashMap::default(),
+                )),
+                last_access_epoch: std::sync::atomic::AtomicU64::new(0),
             }),
             project_cols: Vec::new(),
             is_full_projection: true,
@@ -516,9 +524,10 @@ impl VolumeScanner {
         // Pre-compute row group skip decisions from per-group zone maps.
         // For each group, if ANY comparison's zone map says "no match",
         // the entire group can be skipped.
-        if !self.volume.row_groups.is_empty() && !comparisons.is_empty() {
+        if !self.volume.meta.row_groups.is_empty() && !comparisons.is_empty() {
             let skips: Vec<bool> = self
                 .volume
+                .meta
                 .row_groups
                 .iter()
                 .map(|rg| {
@@ -694,7 +703,7 @@ impl VolumeScanner {
                 return true;
             }
         }
-        let rid = self.volume.row_ids[idx];
+        let rid = self.volume.meta.row_ids[idx];
         if let Some(ref ts) = self.committed_tombstones {
             if let Some(&commit_seq) = ts.get(&rid) {
                 if self.snapshot_seq.is_none_or(|ss| commit_seq <= ss) {
@@ -879,7 +888,7 @@ impl Scanner for VolumeScanner {
                     continue;
                 }
 
-                self.current_rid = self.volume.row_ids[idx];
+                self.current_rid = self.volume.meta.row_ids[idx];
                 self.has_current = true;
                 return true;
             }
@@ -932,7 +941,7 @@ impl Scanner for VolumeScanner {
                 continue;
             }
 
-            self.current_rid = self.volume.row_ids[idx];
+            self.current_rid = self.volume.meta.row_ids[idx];
             self.has_current = true;
             self.current_idx += 1;
             return true;

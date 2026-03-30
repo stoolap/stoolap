@@ -102,8 +102,10 @@ pub struct WindowFunctionInfo {
     pub name: String,
     /// Arguments to the function (for LEAD, LAG, NTILE)
     pub arguments: Vec<Expression>,
-    /// Partition by columns
+    /// Partition by column names (simple identifiers only, for fast-path lookups)
     pub partition_by: Vec<String>,
+    /// Original PARTITION BY expressions (includes function calls, complex exprs)
+    pub partition_by_exprs: Vec<Expression>,
     /// Order by expressions
     pub order_by: Vec<OrderByExpression>,
     /// Window frame specification (e.g., ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
@@ -127,9 +129,11 @@ pub enum SelectItemSource {
     /// Window function name - stored in lowercase for O(1) lookup in window_value_map
     WindowFunction(String),
     Expression(Expression),
-    /// Expression containing a window function - needs special handling
-    /// Stores (expression, synthetic_column_name_for_window_func)
-    ExpressionWithWindow(Expression, String),
+    /// Expression containing one or more window functions.
+    /// Stores (expression, list_of_window_function_names_lowercase).
+    /// Each Window node in the expression is replaced with a placeholder identifier
+    /// referencing the corresponding name at the same index.
+    ExpressionWithWindow(Expression, Vec<String>),
 }
 
 /// Pre-sorted state for window function optimization
@@ -215,6 +219,8 @@ impl ColumnarOrderByValues {
 pub struct WindowPreGroupedState {
     /// Pre-built partition map: partition key -> row indices
     pub partition_map: FxHashMap<PartitionKey, Vec<usize>>,
+    /// The column name (lowercase) that the partition map was built from
+    pub partition_column: String,
 }
 
 impl Executor {
@@ -302,27 +308,28 @@ impl Executor {
         }
 
         // OPTIMIZATION: LIMIT pushdown for PARTITION BY queries
-        // If there's a LIMIT and PARTITION BY, we can process partitions one at a time
-        // and stop early once we have enough rows (like SQLite does)
-        if let Some(limit_expr) = &stmt.limit {
-            // Check if we have PARTITION BY (not just ORDER BY)
-            let has_partition_by = window_functions
-                .iter()
-                .any(|wf| !wf.partition_by.is_empty());
+        // Only safe when there is no top-level ORDER BY (otherwise the sort must see all
+        // rows before LIMIT can be applied) and when all window functions share the same
+        // PARTITION BY so one partition map can serve them all.
+        if stmt.order_by.is_empty() {
+            if let Some(limit_expr) = &stmt.limit {
+                let has_partition_by = window_functions
+                    .iter()
+                    .any(|wf| !wf.partition_by_exprs.is_empty());
 
-            if has_partition_by {
-                // Try to evaluate the LIMIT expression
-                if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
-                    let limit_val = lit.value;
-                    if limit_val > 0 {
-                        return self.execute_select_with_window_functions_streaming(
-                            stmt,
-                            ctx,
-                            base_rows,
-                            base_columns,
-                            &window_functions,
-                            limit_val as usize,
-                        );
+                if has_partition_by && Self::all_partitions_match(&window_functions) {
+                    if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
+                        let limit_val = lit.value;
+                        if limit_val > 0 {
+                            return self.execute_select_with_window_functions_streaming(
+                                stmt,
+                                ctx,
+                                base_rows,
+                                base_columns,
+                                &window_functions,
+                                limit_val as usize,
+                            );
+                        }
                     }
                 }
             }
@@ -419,9 +426,11 @@ impl Executor {
         let transformed_items: Vec<_> = select_items
             .iter()
             .map(|item| match &item.source {
-                SelectItemSource::ExpressionWithWindow(expr, wf_name) => {
-                    let transformed = Self::replace_window_with_identifier(expr, wf_name);
-                    (item, Some(transformed), Some(wf_name.clone()))
+                SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
+                    let mut counter = 0;
+                    let transformed =
+                        Self::replace_windows_with_identifiers(expr, wf_names, &mut counter);
+                    (item, Some(transformed), Some(wf_names.clone()))
                 }
                 _ => (item, None, None),
             })
@@ -430,11 +439,13 @@ impl Executor {
         // Build extended columns (base_columns + synthetic window columns)
         let mut extended_columns = base_columns.to_vec();
         let mut added_wf_names: Vec<String> = Vec::new();
-        for (_, _, wf_name_opt) in &transformed_items {
-            if let Some(wf_name) = wf_name_opt {
-                if !added_wf_names.contains(wf_name) {
-                    extended_columns.push(wf_name.clone());
-                    added_wf_names.push(wf_name.clone());
+        for (_, _, wf_names_opt) in &transformed_items {
+            if let Some(wf_names) = wf_names_opt {
+                for wf_name in wf_names {
+                    if !added_wf_names.contains(wf_name) {
+                        extended_columns.push(wf_name.clone());
+                        added_wf_names.push(wf_name.clone());
+                    }
                 }
             }
         }
@@ -606,149 +617,205 @@ impl Executor {
         window_functions: &[WindowFunctionInfo],
         limit: usize,
     ) -> Result<Box<dyn QueryResult>> {
-        // Get the first window function with PARTITION BY (for partitioning logic)
-        let wf_info = window_functions
+        // Use the first window function with PARTITION BY for partitioning
+        let primary_wf = window_functions
             .iter()
-            .find(|wf| !wf.partition_by.is_empty())
+            .find(|wf| !wf.partition_by_exprs.is_empty())
             .unwrap(); // Safe: we checked has_partition_by before calling this
 
         // Build column index map
         let col_index_map = build_column_index_map(base_columns);
 
-        // Get window function from registry
-        let window_func = self
-            .function_registry
-            .get_window(&wf_info.name)
-            .ok_or_else(|| {
-                Error::NotSupported(format!("Unknown window function: {}", wf_info.name))
-            })?;
-
-        // Build partition map: group rows by partition key
-        let partition_indices: SmallVec<[Option<usize>; 4]> = wf_info
-            .partition_by
-            .iter()
-            .map(|part_col| {
-                let lower = part_col.to_lowercase();
-                col_index_map.get(&lower).copied().or_else(|| {
-                    if let Some(dot_pos) = lower.rfind('.') {
-                        col_index_map.get(&lower[dot_pos + 1..]).copied()
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
-
-        let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
-        for (i, (_, row)) in base_rows.iter().enumerate() {
-            let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
-            for idx_opt in &partition_indices {
-                let value = if let Some(&idx) = idx_opt.as_ref() {
-                    row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
-                } else {
-                    Value::null_unknown()
-                };
-                key.push(value);
-            }
-            partitions.entry(key).or_default().push(i);
-        }
+        // Build partition map from the primary window function
+        let partitions =
+            Self::build_partition_map(primary_wf, base_rows, base_columns, &col_index_map, ctx)?;
 
         // Build result columns from SELECT list
         let select_items = self.parse_select_list_for_window(stmt, base_columns, window_functions);
         let result_columns: Vec<String> =
             select_items.iter().map(|i| i.output_name.clone()).collect();
 
-        // Precompute ORDER BY values once for all rows
-        let precomputed_order_by = if !wf_info.order_by.is_empty() {
-            Some(self.precompute_order_by_values(
-                &wf_info.order_by,
-                base_rows,
-                base_columns,
-                &col_index_map,
-                ctx,
-            ))
-        } else {
-            None
-        };
+        // Precompute ORDER BY values once for each unique ORDER BY clause
+        let mut order_by_cache: Vec<(String, ColumnarOrderByValues)> = Vec::new();
+        for wf in window_functions {
+            if !wf.order_by.is_empty() {
+                let cache_key = Self::order_by_cache_key(&wf.order_by);
+                let already_cached = order_by_cache.iter().any(|(key, _)| key == &cache_key);
+                if !already_cached {
+                    let precomputed = self.precompute_order_by_values(
+                        &wf.order_by,
+                        base_rows,
+                        base_columns,
+                        &col_index_map,
+                        ctx,
+                    );
+                    order_by_cache.push((cache_key, precomputed));
+                }
+            }
+        }
+
+        // Resolve window functions from registry
+        let resolved_wfs: Vec<_> = window_functions
+            .iter()
+            .map(|wf| {
+                let is_agg = self.function_registry.is_aggregate(&wf.name);
+                let func = if is_agg {
+                    None
+                } else {
+                    self.function_registry.get_window(&wf.name)
+                };
+                (wf, func, is_agg)
+            })
+            .collect();
+
+        // Precompute aggregate window functions once over all rows (not per partition)
+        let mut precomputed_agg: StringMap<Vec<Value>> = StringMap::new();
+        for (wf, _, is_agg) in &resolved_wfs {
+            if *is_agg {
+                let cache_key = Self::order_by_cache_key(&wf.order_by);
+                let precomputed_order_by = order_by_cache
+                    .iter()
+                    .find(|(key, _)| key == &cache_key)
+                    .map(|(_, v)| v);
+                let agg_results = self.compute_aggregate_window_function(
+                    wf,
+                    base_rows,
+                    base_columns,
+                    &col_index_map,
+                    ctx,
+                    None,
+                    precomputed_order_by,
+                )?;
+                precomputed_agg.insert(wf.column_name.to_lowercase(), agg_results);
+            }
+        }
 
         // Process partitions one at a time, stopping when we have enough rows
         let mut result_rows = RowVec::with_capacity(limit);
         let mut result_row_id = 0i64;
 
-        // Convert to vec for sequential processing
         let partitions_vec: Vec<_> = partitions.into_iter().collect();
 
         for (_partition_key, row_indices) in partitions_vec {
             if result_rows.len() >= limit {
-                break; // Early exit: we have enough rows
+                break;
             }
 
-            // Compute window function for this partition
-            let (partition_results, sorted_indices) = self.compute_window_for_partition(
-                &*window_func,
-                wf_info,
-                base_rows,
-                row_indices,
-                precomputed_order_by.as_ref(),
-                base_columns,
-                &col_index_map,
-                ctx,
-                false,
-            )?;
+            // Compute window functions for this partition.
+            let mut window_value_map: StringMap<Vec<Value>> = StringMap::new();
 
-            // Pre-allocate ext_values buffer for extended expressions
+            for (wf, win_func_opt, is_agg) in &resolved_wfs {
+                if *is_agg {
+                    // Slice precomputed aggregate results for this partition
+                    let key = wf.column_name.to_lowercase();
+                    if let Some(all_results) = precomputed_agg.get(&key) {
+                        let partition_vals: Vec<Value> = row_indices
+                            .iter()
+                            .map(|&i| all_results[i].clone())
+                            .collect();
+                        window_value_map.insert(key, partition_vals);
+                    }
+                } else if let Some(win_func) = win_func_opt {
+                    let cache_key = Self::order_by_cache_key(&wf.order_by);
+                    let precomputed_order_by = order_by_cache
+                        .iter()
+                        .find(|(key, _)| key == &cache_key)
+                        .map(|(_, v)| v);
+                    let (sorted_values, sorted_indices) = self.compute_window_for_partition(
+                        win_func.as_ref(),
+                        wf,
+                        base_rows,
+                        row_indices.clone(),
+                        precomputed_order_by,
+                        base_columns,
+                        &col_index_map,
+                        ctx,
+                        false,
+                    )?;
+                    // Remap: sorted_values[pos] corresponds to row sorted_indices[pos].
+                    // Build a vec indexed by position within row_indices using an O(n) index map.
+                    let orig_to_local: FxHashMap<usize, usize> = row_indices
+                        .iter()
+                        .enumerate()
+                        .map(|(local, &orig)| (orig, local))
+                        .collect();
+                    let mut by_orig = vec![NULL_VALUE; row_indices.len()];
+                    for (pos, &orig_idx) in sorted_indices.iter().enumerate() {
+                        if let Some(&local) = orig_to_local.get(&orig_idx) {
+                            by_orig[local] = sorted_values[pos].clone();
+                        }
+                    }
+                    window_value_map.insert(wf.column_name.to_lowercase(), by_orig);
+                }
+            }
+
+            // Precompile expression evaluators once per partition (not per row)
+            enum CompiledItem<'a> {
+                BaseColumn(usize),
+                WindowFunction(&'a str),
+                Expression(ExpressionEval),
+                ExpressionWithWindow(ExpressionEval, Vec<&'a str>),
+            }
+            let num_items = select_items.len();
+            let mut compiled_items: Vec<CompiledItem<'_>> = Vec::with_capacity(num_items);
+            for item in &select_items {
+                compiled_items.push(match &item.source {
+                    SelectItemSource::BaseColumn(idx) => CompiledItem::BaseColumn(*idx),
+                    SelectItemSource::WindowFunction(name) => {
+                        CompiledItem::WindowFunction(name.as_str())
+                    }
+                    SelectItemSource::Expression(expr) => {
+                        CompiledItem::Expression(ExpressionEval::compile(expr, base_columns)?)
+                    }
+                    SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
+                        let mut counter = 0;
+                        let transformed =
+                            Self::replace_windows_with_identifiers(expr, wf_names, &mut counter);
+                        let mut ext_columns = base_columns.to_vec();
+                        for wf_name in wf_names {
+                            ext_columns.push(wf_name.clone());
+                        }
+                        let eval = ExpressionEval::compile(&transformed, &ext_columns)?;
+                        let name_refs: Vec<&str> = wf_names.iter().map(|s| s.as_str()).collect();
+                        CompiledItem::ExpressionWithWindow(eval, name_refs)
+                    }
+                });
+            }
+
             let ext_capacity = base_rows.first().map_or(0, |r| r.1.len()) + 1;
             let mut ext_values: CompactVec<Value> = CompactVec::with_capacity(ext_capacity);
-            let num_items = select_items.len();
 
-            // Build result rows in sorted order (within this partition)
-            for (sorted_pos, &orig_idx) in sorted_indices.iter().enumerate() {
+            // Output rows in partition order (row_indices order)
+            for (local_pos, &orig_idx) in row_indices.iter().enumerate() {
                 if result_rows.len() >= limit {
-                    break; // Early exit within partition
+                    break;
                 }
 
                 let base_row = &base_rows[orig_idx].1;
-                let window_value = &partition_results[sorted_pos];
-
-                // Build values vec for output row
                 let mut values: CompactVec<Value> = CompactVec::with_capacity(num_items);
 
-                // Build output row
-                for item in &select_items {
-                    let value = match &item.source {
-                        SelectItemSource::BaseColumn(col_idx) => {
+                for ci in &mut compiled_items {
+                    let value = match ci {
+                        CompiledItem::BaseColumn(col_idx) => {
                             base_row.get(*col_idx).cloned().unwrap_or(NULL_VALUE)
                         }
-                        SelectItemSource::WindowFunction(_) => window_value.clone(),
-                        SelectItemSource::Expression(expr) => {
-                            // Evaluate expression
-                            if let Ok(mut eval) = ExpressionEval::compile(expr, base_columns) {
-                                eval.eval(base_row)
-                                    .unwrap_or_else(|_| Value::null_unknown())
-                            } else {
-                                NULL_VALUE
-                            }
-                        }
-                        SelectItemSource::ExpressionWithWindow(expr, _wf_name) => {
-                            // For expressions with window functions, we need to substitute
-                            // the window function value
-                            let transformed =
-                                Self::replace_window_with_identifier(expr, &item.output_name);
-                            let mut ext_columns = base_columns.to_vec();
-                            ext_columns.push(item.output_name.clone());
-                            // Reuse ext_values buffer
+                        CompiledItem::WindowFunction(wf_name_lower) => window_value_map
+                            .get(*wf_name_lower)
+                            .and_then(|vals| vals.get(local_pos).cloned())
+                            .unwrap_or(NULL_VALUE),
+                        CompiledItem::Expression(eval) => eval.eval(base_row)?,
+                        CompiledItem::ExpressionWithWindow(eval, wf_name_refs) => {
                             ext_values.clear();
                             ext_values.extend(base_row.iter().cloned());
-                            ext_values.push(window_value.clone());
-                            let ext_row = Row::from_compact_vec(ext_values.clone());
-                            if let Ok(mut eval) =
-                                ExpressionEval::compile(&transformed, &ext_columns)
-                            {
-                                eval.eval(&ext_row)
-                                    .unwrap_or_else(|_| Value::null_unknown())
-                            } else {
-                                NULL_VALUE
+                            for wf_name in wf_name_refs.iter() {
+                                let wf_value = window_value_map
+                                    .get(*wf_name)
+                                    .and_then(|vals| vals.get(local_pos).cloned())
+                                    .unwrap_or(NULL_VALUE);
+                                ext_values.push(wf_value);
                             }
+                            let ext_row = Row::from_compact_vec(ext_values.clone());
+                            eval.eval(&ext_row)?
                         }
                     };
                     values.push(value);
@@ -781,22 +848,22 @@ impl Executor {
             ));
         }
 
-        // Get the first window function with PARTITION BY
-        let wf_info = window_functions
-            .iter()
-            .find(|wf| !wf.partition_by.is_empty())
-            .ok_or_else(|| Error::internal("No PARTITION BY window function found"))?;
-
         // Build column index map
         let col_index_map = build_column_index_map(base_columns);
 
-        // Get window function from registry
-        let window_func = self
-            .function_registry
-            .get_window(&wf_info.name)
-            .ok_or_else(|| {
-                Error::NotSupported(format!("Unknown window function: {}", wf_info.name))
-            })?;
+        // Resolve window functions from registry
+        let resolved_wfs: Vec<_> = window_functions
+            .iter()
+            .map(|wf| {
+                let is_agg = self.function_registry.is_aggregate(&wf.name);
+                let func = if is_agg {
+                    None
+                } else {
+                    self.function_registry.get_window(&wf.name)
+                };
+                (wf, func, is_agg)
+            })
+            .collect();
 
         // Build result columns from SELECT list
         let select_items = self.parse_select_list_for_window(stmt, base_columns, &window_functions);
@@ -815,7 +882,7 @@ impl Executor {
 
         for partition_value in partition_values {
             if result_rows.len() >= limit {
-                break; // Early exit: we have enough rows
+                break;
             }
 
             // Fetch rows for this partition only (KEY OPTIMIZATION!)
@@ -829,88 +896,140 @@ impl Executor {
                 continue;
             }
 
-            // Precompute ORDER BY values for this partition
-            let precomputed_order_by = if !wf_info.order_by.is_empty() {
-                Some(self.precompute_order_by_values(
-                    &wf_info.order_by,
-                    &partition_rows,
-                    base_columns,
-                    &col_index_map,
-                    ctx,
-                ))
-            } else {
-                None
-            };
+            // Precompute ORDER BY values for each unique ORDER BY clause
+            let mut order_by_cache: Vec<(String, ColumnarOrderByValues)> = Vec::new();
+            for wf in &window_functions {
+                if !wf.order_by.is_empty() {
+                    let cache_key = Self::order_by_cache_key(&wf.order_by);
+                    let already_cached = order_by_cache.iter().any(|(key, _)| key == &cache_key);
+                    if !already_cached {
+                        let precomputed = self.precompute_order_by_values(
+                            &wf.order_by,
+                            &partition_rows,
+                            base_columns,
+                            &col_index_map,
+                            ctx,
+                        );
+                        order_by_cache.push((cache_key, precomputed));
+                    }
+                }
+            }
 
-            // Compute window function for this partition
+            // Compute ALL window functions for this partition.
+            // Values are stored keyed by local position within row_indices.
             let row_indices: Vec<usize> = (0..partition_rows.len()).collect();
-            let (partition_results, sorted_indices) = self.compute_window_for_partition(
-                &*window_func,
-                wf_info,
-                &partition_rows,
-                row_indices,
-                precomputed_order_by.as_ref(),
-                base_columns,
-                &col_index_map,
-                ctx,
-                false,
-            )?;
+            let mut window_value_map: StringMap<Vec<Value>> = StringMap::new();
 
-            // Build result rows in sorted order (within this partition)
-            for (sorted_pos, &row_idx) in sorted_indices.iter().enumerate() {
+            for (wf, win_func_opt, is_agg) in &resolved_wfs {
+                let cache_key = Self::order_by_cache_key(&wf.order_by);
+                let precomputed_order_by = order_by_cache
+                    .iter()
+                    .find(|(key, _)| key == &cache_key)
+                    .map(|(_, v)| v);
+
+                if *is_agg {
+                    let agg_results = self.compute_aggregate_window_function(
+                        wf,
+                        &partition_rows,
+                        base_columns,
+                        &col_index_map,
+                        ctx,
+                        None,
+                        precomputed_order_by,
+                    )?;
+                    // agg_results is already indexed by local row index
+                    window_value_map.insert(wf.column_name.to_lowercase(), agg_results);
+                } else if let Some(win_func) = win_func_opt {
+                    let (sorted_values, sorted_indices) = self.compute_window_for_partition(
+                        win_func.as_ref(),
+                        wf,
+                        &partition_rows,
+                        row_indices.clone(),
+                        precomputed_order_by,
+                        base_columns,
+                        &col_index_map,
+                        ctx,
+                        false,
+                    )?;
+                    // Remap from sorted order to local row order
+                    let mut by_local = vec![NULL_VALUE; row_indices.len()];
+                    for (pos, &local_idx) in sorted_indices.iter().enumerate() {
+                        by_local[local_idx] = sorted_values[pos].clone();
+                    }
+                    window_value_map.insert(wf.column_name.to_lowercase(), by_local);
+                }
+            }
+
+            // Precompile expression evaluators once per partition (not per row)
+            enum CompiledItemLazy<'a> {
+                BaseColumn(usize),
+                WindowFunction(&'a str),
+                Expression(ExpressionEval),
+                ExpressionWithWindow(ExpressionEval, Vec<&'a str>),
+            }
+            let num_items = select_items.len();
+            let mut compiled_items: Vec<CompiledItemLazy<'_>> = Vec::with_capacity(num_items);
+            for item in &select_items {
+                compiled_items.push(match &item.source {
+                    SelectItemSource::BaseColumn(idx) => CompiledItemLazy::BaseColumn(*idx),
+                    SelectItemSource::WindowFunction(name) => {
+                        CompiledItemLazy::WindowFunction(name.as_str())
+                    }
+                    SelectItemSource::Expression(expr) => {
+                        CompiledItemLazy::Expression(ExpressionEval::compile(expr, base_columns)?)
+                    }
+                    SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
+                        let mut counter = 0;
+                        let transformed =
+                            Self::replace_windows_with_identifiers(expr, wf_names, &mut counter);
+                        let mut ext_columns = base_columns.to_vec();
+                        for wf_name in wf_names {
+                            ext_columns.push(wf_name.clone());
+                        }
+                        let eval = ExpressionEval::compile(&transformed, &ext_columns)?;
+                        let name_refs: Vec<&str> = wf_names.iter().map(|s| s.as_str()).collect();
+                        CompiledItemLazy::ExpressionWithWindow(eval, name_refs)
+                    }
+                });
+            }
+
+            let mut ext_values: CompactVec<Value> =
+                CompactVec::with_capacity(partition_rows.first().map_or(0, |r| r.1.len()) + 1);
+
+            // Output rows in partition order
+            for (local_pos, &row_idx) in row_indices.iter().enumerate() {
                 if result_rows.len() >= limit {
-                    break; // Early exit within partition
+                    break;
                 }
 
                 let (_, base_row) = &partition_rows[row_idx];
-                let window_value = &partition_results[sorted_pos];
+                let mut values: CompactVec<Value> = CompactVec::with_capacity(num_items);
 
-                // Build output row
-                let mut values: CompactVec<Value> = CompactVec::with_capacity(select_items.len());
-                for item in &select_items {
-                    match &item.source {
-                        SelectItemSource::BaseColumn(col_idx) => {
-                            values.push(
-                                base_row
-                                    .get(*col_idx)
-                                    .cloned()
-                                    .unwrap_or_else(Value::null_unknown),
-                            );
+                for ci in &mut compiled_items {
+                    let val = match ci {
+                        CompiledItemLazy::BaseColumn(col_idx) => {
+                            base_row.get(*col_idx).cloned().unwrap_or(NULL_VALUE)
                         }
-                        SelectItemSource::WindowFunction(_) => {
-                            values.push(window_value.clone());
-                        }
-                        SelectItemSource::Expression(expr) => {
-                            if let Ok(mut eval) = ExpressionEval::compile(expr, base_columns) {
-                                let val = eval
-                                    .eval(base_row)
-                                    .unwrap_or_else(|_| Value::null_unknown());
-                                values.push(val);
-                            } else {
-                                values.push(Value::null_unknown());
+                        CompiledItemLazy::WindowFunction(wf_name_lower) => window_value_map
+                            .get(*wf_name_lower)
+                            .and_then(|vals| vals.get(local_pos).cloned())
+                            .unwrap_or(NULL_VALUE),
+                        CompiledItemLazy::Expression(eval) => eval.eval(base_row)?,
+                        CompiledItemLazy::ExpressionWithWindow(eval, wf_name_refs) => {
+                            ext_values.clear();
+                            ext_values.extend(base_row.iter().cloned());
+                            for wf_name in wf_name_refs.iter() {
+                                let wf_value = window_value_map
+                                    .get(*wf_name)
+                                    .and_then(|vals| vals.get(local_pos).cloned())
+                                    .unwrap_or(NULL_VALUE);
+                                ext_values.push(wf_value);
                             }
+                            let ext_row = Row::from_compact_vec(ext_values.clone());
+                            eval.eval(&ext_row)?
                         }
-                        SelectItemSource::ExpressionWithWindow(expr, _wf_name) => {
-                            let transformed =
-                                Self::replace_window_with_identifier(expr, &item.output_name);
-                            let mut ext_columns = base_columns.to_vec();
-                            ext_columns.push(item.output_name.clone());
-                            let mut ext_values: CompactVec<Value> =
-                                base_row.iter().cloned().collect();
-                            ext_values.push(window_value.clone());
-                            let ext_row = Row::from_compact_vec(ext_values);
-                            if let Ok(mut eval) =
-                                ExpressionEval::compile(&transformed, &ext_columns)
-                            {
-                                let val = eval
-                                    .eval(&ext_row)
-                                    .unwrap_or_else(|_| Value::null_unknown());
-                                values.push(val);
-                            } else {
-                                values.push(Value::null_unknown());
-                            }
-                        }
-                    }
+                    };
+                    values.push(val);
                 }
                 result_rows.push((result_row_id, Row::from_compact_vec(values)));
                 result_row_id += 1;
@@ -973,35 +1092,48 @@ impl Executor {
                                 ),
                             });
                         }
-                    } else if Self::find_window_in_expression(aliased.expression.as_ref()).is_some()
-                    {
-                        // Expression containing a window function
-                        // Use the column_name from window_functions for consistency with window_value_map key
-                        let wf_name = if wf_idx < window_functions.len() {
-                            window_functions[wf_idx].column_name.clone()
-                        } else {
-                            format!("__wf_{}", wf_idx)
-                        };
-                        items.push(SelectItem {
-                            output_name: aliased.alias.value.to_string(),
-                            source: SelectItemSource::ExpressionWithWindow(
-                                aliased.expression.as_ref().clone(),
-                                wf_name.to_lowercase(),
-                            ),
-                        });
-                        wf_idx += 1;
-                    } else if let Expression::FunctionCall(_) = aliased.expression.as_ref() {
-                        // Aliased function call - check if it's an aggregate that's already in base_columns
-                        // This happens when window functions are combined with GROUP BY aggregation
-                        // The aggregate result is stored under the alias name (e.g., "total" for SUM(val) as total)
-                        let alias_lower = aliased.alias.value_lower.as_str();
-                        if let Some(&idx) = col_index_map.get(alias_lower) {
+                    } else {
+                        // Collect all embedded window functions
+                        let mut embedded_windows = Vec::new();
+                        Self::collect_all_windows_in_expression(
+                            aliased.expression.as_ref(),
+                            &mut embedded_windows,
+                        );
+                        if !embedded_windows.is_empty() {
+                            let mut wf_names = Vec::with_capacity(embedded_windows.len());
+                            for _ in &embedded_windows {
+                                let name = if wf_idx < window_functions.len() {
+                                    window_functions[wf_idx].column_name.to_lowercase()
+                                } else {
+                                    format!("__wf_{}", wf_idx)
+                                };
+                                wf_names.push(name);
+                                wf_idx += 1;
+                            }
                             items.push(SelectItem {
                                 output_name: aliased.alias.value.to_string(),
-                                source: SelectItemSource::BaseColumn(idx),
+                                source: SelectItemSource::ExpressionWithWindow(
+                                    aliased.expression.as_ref().clone(),
+                                    wf_names,
+                                ),
                             });
+                        } else if let Expression::FunctionCall(_) = aliased.expression.as_ref() {
+                            // Aliased function call - check if it's an aggregate that's already in base_columns
+                            let alias_lower = aliased.alias.value_lower.as_str();
+                            if let Some(&idx) = col_index_map.get(alias_lower) {
+                                items.push(SelectItem {
+                                    output_name: aliased.alias.value.to_string(),
+                                    source: SelectItemSource::BaseColumn(idx),
+                                });
+                            } else {
+                                items.push(SelectItem {
+                                    output_name: aliased.alias.value.to_string(),
+                                    source: SelectItemSource::Expression(
+                                        aliased.expression.as_ref().clone(),
+                                    ),
+                                });
+                            }
                         } else {
-                            // Not found by alias, try expression evaluation
                             items.push(SelectItem {
                                 output_name: aliased.alias.value.to_string(),
                                 source: SelectItemSource::Expression(
@@ -1009,14 +1141,6 @@ impl Executor {
                                 ),
                             });
                         }
-                    } else {
-                        // Other aliased expression
-                        items.push(SelectItem {
-                            output_name: aliased.alias.value.to_string(),
-                            source: SelectItemSource::Expression(
-                                aliased.expression.as_ref().clone(),
-                            ),
-                        });
                     }
                 }
                 Expression::Identifier(id) => {
@@ -1084,54 +1208,78 @@ impl Executor {
                     }
                 }
                 Expression::FunctionCall(func) => {
-                    // Check if this is an aggregate function that's already in base columns
-                    // This happens when window functions are combined with GROUP BY aggregation
-                    // OPTIMIZATION: func.function is already uppercase from parsing
-                    let func_col_name = if func.arguments.is_empty()
-                        || matches!(func.arguments.first(), Some(Expression::Star(_)))
-                    {
-                        format!("{}(*)", func.function)
-                    } else if func.arguments.len() == 1 {
-                        if let Expression::Identifier(id) = &func.arguments[0] {
-                            format!("{}({})", func.function, id.value)
-                        } else {
-                            format!("{}(expr)", func.function)
+                    // First check for embedded window functions (e.g., ABS(ROW_NUMBER() OVER (...)))
+                    let mut embedded_windows = Vec::new();
+                    Self::collect_all_windows_in_expression(col_expr, &mut embedded_windows);
+                    if !embedded_windows.is_empty() {
+                        let mut wf_names = Vec::with_capacity(embedded_windows.len());
+                        for _ in &embedded_windows {
+                            let name = if wf_idx < window_functions.len() {
+                                window_functions[wf_idx].column_name.to_lowercase()
+                            } else {
+                                format!("__wf_{}", wf_idx)
+                            };
+                            wf_names.push(name);
+                            wf_idx += 1;
                         }
-                    } else {
-                        format!("{}(...)", func.function)
-                    };
-
-                    // Try to find the function result in base columns
-                    if let Some(&idx) = col_index_map.get(&func_col_name.to_lowercase()) {
-                        items.push(SelectItem {
-                            output_name: func_col_name,
-                            source: SelectItemSource::BaseColumn(idx),
-                        });
-                    } else {
-                        // Fallback to expression evaluation
-                        items.push(SelectItem {
-                            output_name: format!("expr_{}", items.len()),
-                            source: SelectItemSource::Expression(col_expr.clone()),
-                        });
-                    }
-                }
-                _ => {
-                    // Other expressions - check for embedded window functions
-                    if Self::find_window_in_expression(col_expr).is_some() {
-                        // Use the column_name from window_functions for consistency with window_value_map key
-                        let wf_name = if wf_idx < window_functions.len() {
-                            window_functions[wf_idx].column_name.clone()
-                        } else {
-                            format!("__wf_{}", wf_idx)
-                        };
                         items.push(SelectItem {
                             output_name: format!("expr_{}", items.len()),
                             source: SelectItemSource::ExpressionWithWindow(
                                 col_expr.clone(),
-                                wf_name.to_lowercase(),
+                                wf_names,
                             ),
                         });
-                        wf_idx += 1;
+                    } else {
+                        // Check if this is an aggregate function already in base columns
+                        let func_col_name = if func.arguments.is_empty()
+                            || matches!(func.arguments.first(), Some(Expression::Star(_)))
+                        {
+                            format!("{}(*)", func.function)
+                        } else if func.arguments.len() == 1 {
+                            if let Expression::Identifier(id) = &func.arguments[0] {
+                                format!("{}({})", func.function, id.value)
+                            } else {
+                                format!("{}(expr)", func.function)
+                            }
+                        } else {
+                            format!("{}(...)", func.function)
+                        };
+
+                        if let Some(&idx) = col_index_map.get(&func_col_name.to_lowercase()) {
+                            items.push(SelectItem {
+                                output_name: func_col_name,
+                                source: SelectItemSource::BaseColumn(idx),
+                            });
+                        } else {
+                            items.push(SelectItem {
+                                output_name: format!("expr_{}", items.len()),
+                                source: SelectItemSource::Expression(col_expr.clone()),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    // Other expressions - collect all embedded window functions
+                    let mut embedded_windows = Vec::new();
+                    Self::collect_all_windows_in_expression(col_expr, &mut embedded_windows);
+                    if !embedded_windows.is_empty() {
+                        let mut wf_names = Vec::with_capacity(embedded_windows.len());
+                        for _ in &embedded_windows {
+                            let name = if wf_idx < window_functions.len() {
+                                window_functions[wf_idx].column_name.to_lowercase()
+                            } else {
+                                format!("__wf_{}", wf_idx)
+                            };
+                            wf_names.push(name);
+                            wf_idx += 1;
+                        }
+                        items.push(SelectItem {
+                            output_name: format!("expr_{}", items.len()),
+                            source: SelectItemSource::ExpressionWithWindow(
+                                col_expr.clone(),
+                                wf_names,
+                            ),
+                        });
                     } else {
                         items.push(SelectItem {
                             output_name: format!("expr_{}", items.len()),
@@ -1145,8 +1293,8 @@ impl Executor {
         items
     }
 
-    /// Parse window functions from SELECT list
-    /// This also detects window functions nested inside expressions (like val - LAG(...))
+    /// Parse window functions from SELECT list.
+    /// Collects ALL window functions, including multiple ones nested in a single expression.
     fn parse_window_functions(
         &self,
         stmt: &SelectStatement,
@@ -1169,24 +1317,29 @@ impl Executor {
                             self.extract_window_function_info(window_expr, &stmt.window_defs)?;
                         wf_info.column_name = aliased.alias.value.to_string();
                         window_functions.push(wf_info);
-                    } else if let Some(window_expr) =
-                        Self::find_window_in_expression(aliased.expression.as_ref())
-                    {
-                        // Expression containing window function (e.g., val - LAG(...) AS diff)
-                        // Generate synthetic name: __wf_<col_idx>
-                        let mut wf_info =
-                            self.extract_window_function_info(window_expr, &stmt.window_defs)?;
-                        wf_info.column_name = format!("__wf_{}", col_idx);
-                        window_functions.push(wf_info);
+                    } else {
+                        // Collect ALL window functions in the expression
+                        let mut windows = Vec::new();
+                        Self::collect_all_windows_in_expression(
+                            aliased.expression.as_ref(),
+                            &mut windows,
+                        );
+                        for (i, window_expr) in windows.into_iter().enumerate() {
+                            let mut wf_info =
+                                self.extract_window_function_info(window_expr, &stmt.window_defs)?;
+                            wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
+                            window_functions.push(wf_info);
+                        }
                     }
                     col_idx += 1;
                 }
                 _ => {
-                    // Check for window function inside other expressions
-                    if let Some(window_expr) = Self::find_window_in_expression(col_expr) {
+                    let mut windows = Vec::new();
+                    Self::collect_all_windows_in_expression(col_expr, &mut windows);
+                    for (i, window_expr) in windows.into_iter().enumerate() {
                         let mut wf_info =
                             self.extract_window_function_info(window_expr, &stmt.window_defs)?;
-                        wf_info.column_name = format!("__wf_{}", col_idx);
+                        wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
                         window_functions.push(wf_info);
                     }
                     col_idx += 1;
@@ -1199,67 +1352,119 @@ impl Executor {
 
     /// Recursively find a window expression inside an expression
     /// Returns the first Window expression found, if any
-    fn find_window_in_expression(expr: &Expression) -> Option<&WindowExpression> {
+    /// Collect all window expressions found anywhere in an expression tree (depth-first order).
+    fn collect_all_windows_in_expression<'a>(
+        expr: &'a Expression,
+        out: &mut Vec<&'a WindowExpression>,
+    ) {
         match expr {
-            Expression::Window(w) => Some(w),
-            Expression::Infix(infix) => Self::find_window_in_expression(&infix.left)
-                .or_else(|| Self::find_window_in_expression(&infix.right)),
-            Expression::Prefix(prefix) => Self::find_window_in_expression(&prefix.right),
+            Expression::Window(w) => out.push(w),
+            Expression::Infix(infix) => {
+                Self::collect_all_windows_in_expression(&infix.left, out);
+                Self::collect_all_windows_in_expression(&infix.right, out);
+            }
+            Expression::Prefix(prefix) => {
+                Self::collect_all_windows_in_expression(&prefix.right, out);
+            }
             Expression::FunctionCall(f) => {
                 for arg in &f.arguments {
-                    if let Some(w) = Self::find_window_in_expression(arg) {
-                        return Some(w);
-                    }
+                    Self::collect_all_windows_in_expression(arg, out);
                 }
-                None
             }
-            Expression::Aliased(a) => Self::find_window_in_expression(&a.expression),
+            Expression::Aliased(a) => {
+                Self::collect_all_windows_in_expression(&a.expression, out);
+            }
+            Expression::Cast(cast) => {
+                Self::collect_all_windows_in_expression(&cast.expr, out);
+            }
+            Expression::Distinct(d) => {
+                Self::collect_all_windows_in_expression(&d.expr, out);
+            }
             Expression::Case(c) => {
+                if let Some(v) = &c.value {
+                    Self::collect_all_windows_in_expression(v, out);
+                }
                 for clause in &c.when_clauses {
-                    if let Some(w) = Self::find_window_in_expression(&clause.condition) {
-                        return Some(w);
-                    }
-                    if let Some(w) = Self::find_window_in_expression(&clause.then_result) {
-                        return Some(w);
-                    }
+                    Self::collect_all_windows_in_expression(&clause.condition, out);
+                    Self::collect_all_windows_in_expression(&clause.then_result, out);
                 }
                 if let Some(else_val) = &c.else_value {
-                    if let Some(w) = Self::find_window_in_expression(else_val) {
-                        return Some(w);
-                    }
+                    Self::collect_all_windows_in_expression(else_val, out);
                 }
-                None
             }
-            Expression::Cast(cast) => Self::find_window_in_expression(&cast.expr),
-            _ => None,
+            Expression::Between(b) => {
+                Self::collect_all_windows_in_expression(&b.expr, out);
+                Self::collect_all_windows_in_expression(&b.lower, out);
+                Self::collect_all_windows_in_expression(&b.upper, out);
+            }
+            Expression::In(i) => {
+                Self::collect_all_windows_in_expression(&i.left, out);
+                Self::collect_all_windows_in_expression(&i.right, out);
+            }
+            Expression::Like(l) => {
+                Self::collect_all_windows_in_expression(&l.left, out);
+                Self::collect_all_windows_in_expression(&l.pattern, out);
+                if let Some(esc) = &l.escape {
+                    Self::collect_all_windows_in_expression(esc, out);
+                }
+            }
+            Expression::List(l) => {
+                for elem in &l.elements {
+                    Self::collect_all_windows_in_expression(elem, out);
+                }
+            }
+            Expression::ExpressionList(l) => {
+                for elem in &l.expressions {
+                    Self::collect_all_windows_in_expression(elem, out);
+                }
+            }
+            _ => {}
         }
     }
 
-    /// Replace window expressions in an expression tree with identifier references
-    /// This transforms `val - LAG(...) OVER (...)` into `val - __wf_N` where __wf_N
-    /// contains the pre-computed window function value
-    fn replace_window_with_identifier(expr: &Expression, wf_name: &str) -> Expression {
+    /// Replace window expressions in an expression tree with identifier references.
+    /// Each Window node is replaced with a unique placeholder from `wf_names` in
+    /// depth-first order (matching `collect_all_windows_in_expression`).
+    fn replace_windows_with_identifiers(
+        expr: &Expression,
+        wf_names: &[String],
+        counter: &mut usize,
+    ) -> Expression {
         use crate::parser::token::{Position, Token, TokenType};
 
         match expr {
             Expression::Window(_) => {
-                // Replace window expression with a simple identifier
-                let dummy_token =
-                    Token::new(TokenType::Identifier, wf_name, Position::new(0, 0, 0));
-                Expression::Identifier(Identifier::new(dummy_token, wf_name.to_string()))
+                let name = wf_names
+                    .get(*counter)
+                    .map_or("__wf_unknown", |s| s.as_str());
+                *counter += 1;
+                let dummy_token = Token::new(TokenType::Identifier, name, Position::new(0, 0, 0));
+                Expression::Identifier(Identifier::new(dummy_token, name.to_string()))
             }
             Expression::Infix(infix) => Expression::Infix(InfixExpression {
                 token: infix.token.clone(),
-                left: Box::new(Self::replace_window_with_identifier(&infix.left, wf_name)),
+                left: Box::new(Self::replace_windows_with_identifiers(
+                    &infix.left,
+                    wf_names,
+                    counter,
+                )),
                 operator: infix.operator.clone(),
                 op_type: infix.op_type,
-                right: Box::new(Self::replace_window_with_identifier(&infix.right, wf_name)),
+                right: Box::new(Self::replace_windows_with_identifiers(
+                    &infix.right,
+                    wf_names,
+                    counter,
+                )),
             }),
             Expression::Prefix(prefix) => Expression::Prefix(PrefixExpression {
                 token: prefix.token.clone(),
                 operator: prefix.operator.clone(),
                 op_type: prefix.op_type,
-                right: Box::new(Self::replace_window_with_identifier(&prefix.right, wf_name)),
+                right: Box::new(Self::replace_windows_with_identifiers(
+                    &prefix.right,
+                    wf_names,
+                    counter,
+                )),
             }),
             Expression::FunctionCall(f) => Expression::FunctionCall(Box::new(FunctionCall {
                 token: f.token.clone(),
@@ -1267,7 +1472,7 @@ impl Executor {
                 arguments: f
                     .arguments
                     .iter()
-                    .map(|a| Self::replace_window_with_identifier(a, wf_name))
+                    .map(|a| Self::replace_windows_with_identifiers(a, wf_names, counter))
                     .collect(),
                 is_distinct: f.is_distinct,
                 order_by: f.order_by.clone(),
@@ -1275,33 +1480,50 @@ impl Executor {
             })),
             Expression::Aliased(a) => Expression::Aliased(AliasedExpression {
                 token: a.token.clone(),
-                expression: Box::new(Self::replace_window_with_identifier(&a.expression, wf_name)),
+                expression: Box::new(Self::replace_windows_with_identifiers(
+                    &a.expression,
+                    wf_names,
+                    counter,
+                )),
                 alias: a.alias.clone(),
             }),
             Expression::Cast(cast) => Expression::Cast(CastExpression {
                 token: cast.token.clone(),
-                expr: Box::new(Self::replace_window_with_identifier(&cast.expr, wf_name)),
+                expr: Box::new(Self::replace_windows_with_identifiers(
+                    &cast.expr, wf_names, counter,
+                )),
                 type_name: cast.type_name.clone(),
             }),
+            Expression::Distinct(d) => Expression::Distinct(DistinctExpression {
+                token: d.token.clone(),
+                expr: Box::new(Self::replace_windows_with_identifiers(
+                    &d.expr, wf_names, counter,
+                )),
+            }),
             Expression::Case(case) => {
-                // Process window functions inside CASE expressions
-                let new_value = case
-                    .value
-                    .as_ref()
-                    .map(|v| Box::new(Self::replace_window_with_identifier(v, wf_name)));
+                let new_value = case.value.as_ref().map(|v| {
+                    Box::new(Self::replace_windows_with_identifiers(v, wf_names, counter))
+                });
                 let new_whens: Vec<WhenClause> = case
                     .when_clauses
                     .iter()
                     .map(|w| WhenClause {
                         token: w.token.clone(),
-                        condition: Self::replace_window_with_identifier(&w.condition, wf_name),
-                        then_result: Self::replace_window_with_identifier(&w.then_result, wf_name),
+                        condition: Self::replace_windows_with_identifiers(
+                            &w.condition,
+                            wf_names,
+                            counter,
+                        ),
+                        then_result: Self::replace_windows_with_identifiers(
+                            &w.then_result,
+                            wf_names,
+                            counter,
+                        ),
                     })
                     .collect();
-                let new_else = case
-                    .else_value
-                    .as_ref()
-                    .map(|e| Box::new(Self::replace_window_with_identifier(e, wf_name)));
+                let new_else = case.else_value.as_ref().map(|e| {
+                    Box::new(Self::replace_windows_with_identifiers(e, wf_names, counter))
+                });
                 Expression::Case(Box::new(CaseExpression {
                     token: case.token.clone(),
                     value: new_value,
@@ -1309,6 +1531,58 @@ impl Executor {
                     else_value: new_else,
                 }))
             }
+            Expression::Between(b) => Expression::Between(BetweenExpression {
+                token: b.token.clone(),
+                expr: Box::new(Self::replace_windows_with_identifiers(
+                    &b.expr, wf_names, counter,
+                )),
+                lower: Box::new(Self::replace_windows_with_identifiers(
+                    &b.lower, wf_names, counter,
+                )),
+                upper: Box::new(Self::replace_windows_with_identifiers(
+                    &b.upper, wf_names, counter,
+                )),
+                not: b.not,
+            }),
+            Expression::In(i) => Expression::In(InExpression {
+                token: i.token.clone(),
+                left: Box::new(Self::replace_windows_with_identifiers(
+                    &i.left, wf_names, counter,
+                )),
+                right: Box::new(Self::replace_windows_with_identifiers(
+                    &i.right, wf_names, counter,
+                )),
+                not: i.not,
+            }),
+            Expression::Like(l) => Expression::Like(LikeExpression {
+                token: l.token.clone(),
+                left: Box::new(Self::replace_windows_with_identifiers(
+                    &l.left, wf_names, counter,
+                )),
+                pattern: Box::new(Self::replace_windows_with_identifiers(
+                    &l.pattern, wf_names, counter,
+                )),
+                operator: l.operator.clone(),
+                escape: l.escape.as_ref().map(|e| {
+                    Box::new(Self::replace_windows_with_identifiers(e, wf_names, counter))
+                }),
+            }),
+            Expression::List(l) => Expression::List(Box::new(ListExpression {
+                token: l.token.clone(),
+                elements: l
+                    .elements
+                    .iter()
+                    .map(|e| Self::replace_windows_with_identifiers(e, wf_names, counter))
+                    .collect(),
+            })),
+            Expression::ExpressionList(l) => Expression::ExpressionList(Box::new(ExpressionList {
+                token: l.token.clone(),
+                expressions: l
+                    .expressions
+                    .iter()
+                    .map(|e| Self::replace_windows_with_identifiers(e, wf_names, counter))
+                    .collect(),
+            })),
             _ => expr.clone(),
         }
     }
@@ -1343,7 +1617,7 @@ impl Executor {
             )
         };
 
-        // Extract partition by column names
+        // Extract partition by column names (identifiers only, for fast-path)
         // For qualified identifiers (e.g., l.grp), keep the full qualified name
         // to properly match columns from JOINs
         let partition_by: Vec<String> = partition_by_exprs
@@ -1351,7 +1625,6 @@ impl Executor {
             .filter_map(|e| match e {
                 Expression::Identifier(id) => Some(id.value.to_string()),
                 Expression::QualifiedIdentifier(qid) => {
-                    // Keep the full qualified name for JOIN cases
                     Some(format!("{}.{}", qid.qualifier.value, qid.name.value))
                 }
                 _ => None,
@@ -1366,6 +1639,7 @@ impl Executor {
             name: func.function.to_string(),
             arguments: func.arguments.clone(),
             partition_by,
+            partition_by_exprs: partition_by_exprs.to_vec(),
             order_by,
             frame,
             column_name,
@@ -1387,6 +1661,110 @@ impl Executor {
             let _ = write!(key, "{}", ob);
         }
         key
+    }
+
+    /// Check that ALL window functions share the exact same PARTITION BY clause.
+    /// Returns false if any window function is unpartitioned (global) or uses a
+    /// different partition scheme, because the streaming path builds only one
+    /// partition map and computes per-partition subsets.
+    fn all_partitions_match(window_functions: &[WindowFunctionInfo]) -> bool {
+        use std::fmt::Write;
+        let mut canonical: Option<String> = None;
+        for wf in window_functions {
+            // A global (unpartitioned) window must see all rows, so
+            // per-partition streaming is unsafe.
+            if wf.partition_by_exprs.is_empty() {
+                return false;
+            }
+            let mut key = String::with_capacity(64);
+            for (i, expr) in wf.partition_by_exprs.iter().enumerate() {
+                if i > 0 {
+                    key.push(',');
+                }
+                let _ = write!(key, "{}", expr);
+            }
+            match &canonical {
+                None => canonical = Some(key),
+                Some(c) if c != &key => return false,
+                _ => {}
+            }
+        }
+        canonical.is_some()
+    }
+
+    /// Build partition map from PARTITION BY expressions.
+    /// Handles both simple column references (fast path) and complex expressions like
+    /// function calls (e.g., TIME_TRUNC('30m', timestamp)) via MultiExpressionEval.
+    fn build_partition_map(
+        wf_info: &WindowFunctionInfo,
+        rows: &[(i64, Row)],
+        columns: &[String],
+        col_index_map: &StringMap<usize>,
+        ctx: &ExecutionContext,
+    ) -> Result<FxHashMap<PartitionKey, Vec<usize>>> {
+        let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
+
+        // Check if any PARTITION BY expression is complex (not a simple column reference)
+        let has_complex_expr = wf_info.partition_by_exprs.iter().any(|e| {
+            !matches!(
+                e,
+                Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
+            )
+        });
+
+        if has_complex_expr && !wf_info.partition_by_exprs.is_empty() {
+            // Complex path: use MultiExpressionEval to evaluate expressions per row
+            let agg_aliases: Vec<(String, usize)> =
+                col_index_map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+
+            let eval = MultiExpressionEval::compile_with_aliases(
+                &wf_info.partition_by_exprs,
+                columns,
+                &agg_aliases,
+            )
+            .map_err(|e| {
+                Error::internal(format!("Failed to compile PARTITION BY expression: {}", e))
+            })?;
+            let mut eval = eval.with_context(ctx);
+            for (i, (_, row)) in rows.iter().enumerate() {
+                let values = eval.eval_all(row).map_err(|e| {
+                    Error::internal(format!("Failed to evaluate PARTITION BY expression: {}", e))
+                })?;
+                let key: PartitionKey = SmallVec::from_vec(values);
+                partitions.entry(key).or_default().push(i);
+            }
+        } else {
+            // Fast path: simple column references
+            let partition_indices: SmallVec<[Option<usize>; 4]> = wf_info
+                .partition_by
+                .iter()
+                .map(|part_col| {
+                    let lower = part_col.to_lowercase();
+                    col_index_map.get(&lower).copied().or_else(|| {
+                        if let Some(dot_pos) = lower.rfind('.') {
+                            col_index_map.get(&lower[dot_pos + 1..]).copied()
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+
+            for (i, (_, row)) in rows.iter().enumerate() {
+                let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
+                for idx_opt in &partition_indices {
+                    let value = if let Some(&idx) = idx_opt.as_ref() {
+                        row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
+                    } else {
+                        Value::null_unknown()
+                    };
+                    key.push(value);
+                }
+                partitions.entry(key).or_default().push(i);
+            }
+        }
+
+        Ok(partitions)
     }
 
     /// Compute window function values for all rows
@@ -1447,7 +1825,7 @@ impl Executor {
         };
 
         // If there's no partitioning, treat all rows as one partition
-        if wf_info.partition_by.is_empty() {
+        if wf_info.partition_by_exprs.is_empty() {
             // Pre-allocate results array and use direct-writing variant
             let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
             let row_indices: Vec<usize> = (0..rows.len()).collect();
@@ -1467,54 +1845,19 @@ impl Executor {
             return Ok(results);
         }
 
-        // OPTIMIZATION: ORDER BY values are now precomputed in the cache
-        // This is critical - precompute_order_by_values was being called for ALL rows
-        // inside each partition, causing O(n × p) work instead of O(n).
-        // The precomputed_order_by is already retrieved from the cache above
-
         // Group rows by partition key
         // OPTIMIZATION: Use pre-grouped partitions from index if available (avoids O(n) hashing)
-        // OPTIMIZATION: Use SmallVec for partition keys to avoid heap allocation
-        // for common cases (up to 4 partition columns)
-        // OPTIMIZATION: Use FxHashMap for fastest hash table operations with trusted keys
-        let partitions: FxHashMap<PartitionKey, Vec<usize>> = if let Some(pg) = pre_grouped {
-            // Use pre-grouped partitions from index - no hashing needed!
+        // Only valid when this WF partitions by the exact same single simple column that
+        // the planner used to build the pre-grouped map.
+        let partitions: FxHashMap<PartitionKey, Vec<usize>> = if let Some(pg) =
+            pre_grouped.filter(|pg| {
+                wf_info.partition_by.len() == 1
+                    && wf_info.partition_by.len() == wf_info.partition_by_exprs.len()
+                    && wf_info.partition_by[0].to_lowercase() == pg.partition_column
+            }) {
             pg.partition_map.clone()
         } else {
-            // Build partition map by hashing (default path)
-            let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
-
-            // OPTIMIZATION: Pre-compute partition column indices to avoid to_lowercase() per row
-            // Try both qualified (e.g., "l.grp") and unqualified (e.g., "grp") names
-            let partition_indices: SmallVec<[Option<usize>; 4]> = wf_info
-                .partition_by
-                .iter()
-                .map(|part_col| {
-                    let lower = part_col.to_lowercase();
-                    col_index_map.get(&lower).copied().or_else(|| {
-                        // If qualified name not found, try unqualified (last part after dot)
-                        if let Some(dot_pos) = lower.rfind('.') {
-                            col_index_map.get(&lower[dot_pos + 1..]).copied()
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect();
-
-            for (i, (_, row)) in rows.iter().enumerate() {
-                let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
-                for idx_opt in &partition_indices {
-                    let value = if let Some(&idx) = idx_opt.as_ref() {
-                        row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
-                    } else {
-                        Value::null_unknown()
-                    };
-                    key.push(value);
-                }
-                partitions.entry(key).or_default().push(i);
-            }
-            partitions
+            Self::build_partition_map(wf_info, rows, columns, col_index_map, ctx)?
         };
 
         // Compute window function for each partition
@@ -2905,27 +3248,7 @@ impl Executor {
             vec![]
         };
 
-        // Pre-compute partition column indices
-        // OPTIMIZATION: Use SmallVec to avoid heap allocation for common cases
-        // Try both qualified (e.g., "l.grp") and unqualified (e.g., "grp") names
-        let partition_indices: SmallVec<[Option<usize>; 4]> = wf_info
-            .partition_by
-            .iter()
-            .map(|part_col| {
-                let lower = part_col.to_lowercase();
-                col_index_map.get(&lower).copied().or_else(|| {
-                    // If qualified name not found, try unqualified (last part after dot)
-                    if let Some(dot_pos) = lower.rfind('.') {
-                        col_index_map.get(&lower[dot_pos + 1..]).copied()
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
-
         // Use precomputed ORDER BY values from cache if available
-        // OPTIMIZATION: This avoids redundant computation when multiple window functions share ORDER BY
         let empty_order_by = ColumnarOrderByValues {
             columns: vec![],
             ascending: vec![],
@@ -2934,27 +3257,12 @@ impl Executor {
         let order_by_values: &ColumnarOrderByValues = cached_order_by.unwrap_or(&empty_order_by);
 
         // Group rows by partition key
-        // OPTIMIZATION: Use SmallVec for partition keys to avoid heap allocation
-        // OPTIMIZATION: Use FxHashMap for fastest hash table operations with trusted keys
-        let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
-
-        for (i, (_, row)) in rows.iter().enumerate() {
-            let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
-            for idx_opt in &partition_indices {
-                let value = if let Some(&idx) = idx_opt.as_ref() {
-                    row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
-                } else {
-                    Value::null_unknown()
-                };
-                key.push(value);
-            }
-            partitions.entry(key).or_default().push(i);
-        }
+        let partitions = Self::build_partition_map(wf_info, rows, columns, col_index_map, ctx)?;
 
         // Check if we can skip sorting (index optimization)
         // Only applies when there's no PARTITION BY (single partition)
         let skip_sorting =
-            wf_info.partition_by.is_empty() && self.check_rows_presorted(wf_info, pre_sorted);
+            wf_info.partition_by_exprs.is_empty() && self.check_rows_presorted(wf_info, pre_sorted);
 
         // Compute aggregate for each partition
         // OPTIMIZATION: Use Option<Value> with vec![None; n] - None is just a discriminant
@@ -3501,6 +3809,7 @@ mod tests {
             name: "ROW_NUMBER".to_string(),
             arguments: vec![],
             partition_by: vec!["dept".to_string()],
+            partition_by_exprs: vec![],
             order_by: vec![],
             frame: None,
             column_name: "rn".to_string(),
