@@ -311,7 +311,7 @@ impl Executor {
         // Only safe when there is no top-level ORDER BY (otherwise the sort must see all
         // rows before LIMIT can be applied) and when all window functions share the same
         // PARTITION BY so one partition map can serve them all.
-        if stmt.order_by.is_empty() {
+        if stmt.order_by.is_empty() && stmt.offset.is_none() {
             if let Some(limit_expr) = &stmt.limit {
                 let has_partition_by = window_functions
                     .iter()
@@ -2002,6 +2002,13 @@ impl Executor {
         let mut results = Vec::with_capacity(row_indices.len());
         let partition_len = row_indices.len();
 
+        // Precompute peer group ends for RANGE frame semantics
+        let peer_group_ends = if !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+            Self::precompute_peer_group_ends(&row_indices, order_by_values)
+        } else {
+            vec![partition_len; partition_len]
+        };
+
         for (i, &row_idx) in row_indices.iter().enumerate() {
             // Handle special functions
             let value = match wf_info.name.as_str() {
@@ -2021,8 +2028,13 @@ impl Executor {
                 "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
                 "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     // Compute frame bounds for navigation functions
+                    let peer_end = if i < peer_group_ends.len() {
+                        peer_group_ends[i]
+                    } else {
+                        partition_len
+                    };
                     let (frame_start, frame_end) =
-                        self.compute_simple_frame_bounds(wf_info, i, partition_len);
+                        self.compute_simple_frame_bounds(wf_info, i, partition_len, peer_end);
 
                     // MEMORY OPTIMIZATION: Access values directly via indices
                     match wf_info.name.as_str() {
@@ -2119,6 +2131,13 @@ impl Executor {
 
         let partition_len = row_indices.len();
 
+        // Precompute peer group ends for RANGE frame semantics
+        let peer_group_ends = if !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+            Self::precompute_peer_group_ends(&row_indices, order_by_values)
+        } else {
+            vec![partition_len; partition_len]
+        };
+
         // Compute and write directly to results array
         for (i, &row_idx) in row_indices.iter().enumerate() {
             let value = match wf_info.name.as_str() {
@@ -2135,8 +2154,13 @@ impl Executor {
                 "NTILE" => self.compute_ntile(wf_info, partition_len, i, ctx)?,
                 "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
                 "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
+                    let peer_end = if i < peer_group_ends.len() {
+                        peer_group_ends[i]
+                    } else {
+                        partition_len
+                    };
                     let (frame_start, frame_end) =
-                        self.compute_simple_frame_bounds(wf_info, i, partition_len);
+                        self.compute_simple_frame_bounds(wf_info, i, partition_len, peer_end);
                     match wf_info.name.as_str() {
                         "FIRST_VALUE" => self.compute_first_value_indexed(
                             all_rows,
@@ -2232,6 +2256,13 @@ impl Executor {
 
         let partition_len = row_indices.len();
 
+        // Precompute peer group ends for RANGE frame semantics
+        let peer_group_ends = if !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+            Self::precompute_peer_group_ends(&row_indices, order_by_values)
+        } else {
+            vec![partition_len; partition_len]
+        };
+
         // Compute and write directly using ParallelVec
         for (i, &row_idx) in row_indices.iter().enumerate() {
             let value = match wf_info.name.as_str() {
@@ -2248,8 +2279,13 @@ impl Executor {
                 "NTILE" => self.compute_ntile(wf_info, partition_len, i, ctx)?,
                 "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
                 "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
+                    let peer_end = if i < peer_group_ends.len() {
+                        peer_group_ends[i]
+                    } else {
+                        partition_len
+                    };
                     let (frame_start, frame_end) =
-                        self.compute_simple_frame_bounds(wf_info, i, partition_len);
+                        self.compute_simple_frame_bounds(wf_info, i, partition_len, peer_end);
                     match wf_info.name.as_str() {
                         "FIRST_VALUE" => self.compute_first_value_indexed(
                             all_rows,
@@ -2326,6 +2362,30 @@ impl Executor {
         }
 
         result
+    }
+
+    /// Precompute peer group end positions for RANGE frame semantics.
+    /// Returns a vec where `result[i]` is the exclusive end of position i's peer group.
+    fn precompute_peer_group_ends(
+        sorted_indices: &[usize],
+        order_by: &ColumnarOrderByValues,
+    ) -> Vec<usize> {
+        let n = sorted_indices.len();
+        if n == 0 {
+            return vec![];
+        }
+        let mut ends = vec![n; n];
+        let mut group_start = 0;
+        for i in 1..n {
+            if !order_by.rows_equal(sorted_indices[i - 1], sorted_indices[i]) {
+                for end in ends.iter_mut().take(i).skip(group_start) {
+                    *end = i;
+                }
+                group_start = i;
+            }
+        }
+        // Last group already has ends[j] = n from initialization
+        ends
     }
 
     /// Compute LEAD or LAG using index-based access (no cloning)
@@ -2617,13 +2677,15 @@ impl Executor {
         }
     }
 
-    /// Compute simple ROWS-based frame bounds for navigation functions
-    /// Returns (start, end) where end is exclusive
+    /// Compute frame bounds for navigation functions (FIRST_VALUE, LAST_VALUE, NTH_VALUE).
+    /// `peer_group_end` is the exclusive end of the current row's peer group (for RANGE semantics).
+    /// Returns (start, end) where end is exclusive.
     fn compute_simple_frame_bounds(
         &self,
         wf_info: &WindowFunctionInfo,
         current_row: usize,
         partition_len: usize,
+        peer_group_end: usize,
     ) -> (usize, usize) {
         if let Some(ref frame) = wf_info.frame {
             // Only handle ROWS frames for now (not RANGE)
@@ -2687,8 +2749,9 @@ impl Executor {
                 // No ORDER BY - entire partition
                 (0, partition_len)
             } else {
-                // Has ORDER BY - default frame is UNBOUNDED PRECEDING to CURRENT ROW
-                (0, current_row + 1)
+                // Has ORDER BY - default frame is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                // SQL standard: peer rows (same ORDER BY value) share the same frame end
+                (0, peer_group_end)
             }
         }
     }
@@ -3321,144 +3384,66 @@ impl Executor {
                         Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name))
                     })?;
 
-                for (i, &row_idx) in row_indices.iter().enumerate() {
-                    // Reset aggregate state for new frame computation
-                    agg_func.reset();
+                // Check if we can use O(n) incremental accumulation instead of O(n²) reset.
+                // Safe when: frame start is UNBOUNDED PRECEDING (frame only grows),
+                // frame end is not PRECEDING (which would make end < current row),
+                // and no DISTINCT (distinct requires full set tracking).
+                let can_incremental = wf_info.frame.as_ref().is_none_or(|f| {
+                    let start_ok = matches!(f.start, WindowFrameBound::UnboundedPreceding);
+                    let end_ok = f.end.as_ref().is_none_or(|e| {
+                        !matches!(
+                            e,
+                            WindowFrameBound::Preceding(_) | WindowFrameBound::UnboundedPreceding
+                        )
+                    });
+                    start_ok && end_ok
+                });
 
-                    // Compute frame bounds based on frame specification
-                    let (frame_start, frame_end) = if let Some(ref frame) = wf_info.frame {
-                        let is_range = matches!(frame.unit, WindowFrameUnit::Range);
-
-                        // For RANGE frames with numeric offsets, we need value-based comparison
-                        // Get the current row's ORDER BY value for RANGE calculations
-                        let current_order_value = if is_range && !order_by_values.is_empty() {
-                            order_by_values.get_first(row_idx).cloned()
-                        } else {
-                            None
-                        };
-
-                        // Helper to convert value to f64 for range comparisons
-                        let value_to_f64 = |v: &Value| -> Option<f64> {
-                            match v {
-                                Value::Integer(i) => Some(*i as f64),
-                                Value::Float(f) => Some(*f),
-                                _ => None,
-                            }
-                        };
-
-                        // Calculate start bound
-                        let start = match &frame.start {
-                            WindowFrameBound::UnboundedPreceding => 0,
-                            WindowFrameBound::CurrentRow => {
-                                if is_range {
-                                    // For RANGE, start of peer group (O(1) lookup)
-                                    peer_groups[i].0
-                                } else {
-                                    i
-                                }
-                            }
-                            WindowFrameBound::Preceding(expr) => {
-                                if is_range {
-                                    // RANGE PRECEDING: find first row where value >= current - offset
-                                    if let (Some(curr_val), Expression::IntegerLiteral(lit)) =
-                                        (&current_order_value, expr.as_ref())
-                                    {
-                                        if let Some(curr_f64) = value_to_f64(curr_val) {
-                                            let lower_bound = curr_f64 - lit.value as f64;
-                                            // Linear scan from start to find first row in range
-                                            let mut start_idx = 0;
-                                            for (j, &idx) in row_indices.iter().enumerate() {
-                                                if let Some(row_val) = order_by_values
-                                                    .get_first(idx)
-                                                    .and_then(value_to_f64)
-                                                {
-                                                    if row_val >= lower_bound {
-                                                        start_idx = j;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            start_idx
+                if can_incremental && !wf_info.is_distinct {
+                    // O(n) incremental path: frame start is always 0, only end grows.
+                    // Accumulate new values as frame_end advances, never reset.
+                    let mut prev_end = 0usize;
+                    for (i, &row_idx) in row_indices.iter().enumerate() {
+                        let frame_end = if let Some(ref frame) = wf_info.frame {
+                            let is_range = matches!(frame.unit, WindowFrameUnit::Range);
+                            if let Some(ref end_bound) = frame.end {
+                                match end_bound {
+                                    WindowFrameBound::UnboundedFollowing => partition_len,
+                                    WindowFrameBound::CurrentRow => {
+                                        if is_range {
+                                            peer_groups[i].1
                                         } else {
-                                            0
+                                            i + 1
                                         }
-                                    } else {
-                                        0
                                     }
-                                } else {
-                                    // ROWS PRECEDING: simple row offset
-                                    if let Expression::IntegerLiteral(lit) = expr.as_ref() {
-                                        i.saturating_sub(lit.value as usize)
-                                    } else {
-                                        0
-                                    }
-                                }
-                            }
-                            WindowFrameBound::Following(expr) => {
-                                if is_range {
-                                    // RANGE FOLLOWING as start: find first row where value >= current + offset
-                                    if let (Some(curr_val), Expression::IntegerLiteral(lit)) =
-                                        (&current_order_value, expr.as_ref())
-                                    {
-                                        if let Some(curr_f64) = value_to_f64(curr_val) {
-                                            let lower_bound = curr_f64 + lit.value as f64;
-                                            let mut start_idx = partition_len;
-                                            for (j, &idx) in row_indices.iter().enumerate() {
-                                                if let Some(row_val) = order_by_values
-                                                    .get_first(idx)
-                                                    .and_then(value_to_f64)
-                                                {
-                                                    if row_val >= lower_bound {
-                                                        start_idx = j;
-                                                        break;
+                                    WindowFrameBound::Following(expr) => {
+                                        if is_range {
+                                            if let (
+                                                Some(curr_f64),
+                                                Expression::IntegerLiteral(lit),
+                                            ) = (
+                                                order_by_values.get_first(row_idx).and_then(|v| {
+                                                    match v {
+                                                        Value::Integer(i) => Some(*i as f64),
+                                                        Value::Float(f) => Some(*f),
+                                                        _ => None,
                                                     }
-                                                }
-                                            }
-                                            start_idx
-                                        } else {
-                                            i
-                                        }
-                                    } else {
-                                        i
-                                    }
-                                } else if let Expression::IntegerLiteral(lit) = expr.as_ref() {
-                                    (i + lit.value as usize).min(partition_len - 1)
-                                } else {
-                                    i
-                                }
-                            }
-                            WindowFrameBound::UnboundedFollowing => partition_len - 1,
-                        };
-
-                        // Calculate end bound
-                        let end = if let Some(ref end_bound) = frame.end {
-                            match end_bound {
-                                WindowFrameBound::UnboundedFollowing => partition_len,
-                                WindowFrameBound::CurrentRow => {
-                                    if is_range {
-                                        // For RANGE, end of peer group (O(1) lookup)
-                                        peer_groups[i].1
-                                    } else {
-                                        i + 1
-                                    }
-                                }
-                                WindowFrameBound::Following(expr) => {
-                                    if is_range {
-                                        // RANGE FOLLOWING: find last row where value <= current + offset
-                                        if let (Some(curr_val), Expression::IntegerLiteral(lit)) =
-                                            (&current_order_value, expr.as_ref())
-                                        {
-                                            if let Some(curr_f64) = value_to_f64(curr_val) {
-                                                let upper_bound = curr_f64 + lit.value as f64;
-                                                // Scan from end backwards to find last row in range
+                                                }),
+                                                expr.as_ref(),
+                                            ) {
+                                                let upper = curr_f64 + lit.value as f64;
                                                 let mut end_idx = 0;
                                                 for (j, &idx) in row_indices.iter().enumerate() {
-                                                    if let Some(row_val) = order_by_values
+                                                    if let Some(rv) = order_by_values
                                                         .get_first(idx)
-                                                        .and_then(value_to_f64)
+                                                        .and_then(|v| match v {
+                                                            Value::Integer(i) => Some(*i as f64),
+                                                            Value::Float(f) => Some(*f),
+                                                            _ => None,
+                                                        })
                                                     {
-                                                        if row_val <= upper_bound {
-                                                            end_idx = j + 1; // exclusive end
+                                                        if rv <= upper {
+                                                            end_idx = j + 1;
                                                         }
                                                     }
                                                 }
@@ -3466,85 +3451,292 @@ impl Executor {
                                             } else {
                                                 partition_len
                                             }
+                                        } else if let Expression::IntegerLiteral(lit) =
+                                            expr.as_ref()
+                                        {
+                                            (i + lit.value as usize + 1).min(partition_len)
                                         } else {
                                             partition_len
                                         }
-                                    } else if let Expression::IntegerLiteral(lit) = expr.as_ref() {
-                                        (i + lit.value as usize + 1).min(partition_len)
-                                    } else {
+                                    }
+                                    _ => {
+                                        // PRECEDING / UNBOUNDED PRECEDING end bounds are excluded
+                                        // by the can_incremental guard above. This branch is
+                                        // unreachable but kept as a safe fallback.
                                         partition_len
+                                    }
+                                }
+                            } else {
+                                // No explicit end: default CURRENT ROW
+                                if is_range {
+                                    peer_groups[i].1
+                                } else {
+                                    i + 1
+                                }
+                            }
+                        } else {
+                            // Default frame: RANGE UNBOUNDED PRECEDING TO CURRENT ROW
+                            peer_groups[i].1
+                        };
+
+                        // Accumulate only the new values since prev_end
+                        for j in prev_end..frame_end {
+                            let value = if let Some(col_idx) = arg_col_idx {
+                                rows[row_indices[j]]
+                                    .1
+                                    .get(col_idx)
+                                    .cloned()
+                                    .unwrap_or_else(Value::null_unknown)
+                            } else if has_expression_arg {
+                                expression_values[row_indices[j]].clone()
+                            } else {
+                                Value::Integer(1)
+                            };
+                            agg_func.accumulate(&value, false);
+                        }
+                        if frame_end > prev_end {
+                            prev_end = frame_end;
+                        }
+                        results[row_idx] = Some(agg_func.result());
+                    }
+                } else {
+                    for (i, &row_idx) in row_indices.iter().enumerate() {
+                        // Reset aggregate state for new frame computation
+                        agg_func.reset();
+
+                        // Compute frame bounds based on frame specification
+                        let (frame_start, frame_end) = if let Some(ref frame) = wf_info.frame {
+                            let is_range = matches!(frame.unit, WindowFrameUnit::Range);
+
+                            // For RANGE frames with numeric offsets, we need value-based comparison
+                            // Get the current row's ORDER BY value for RANGE calculations
+                            let current_order_value = if is_range && !order_by_values.is_empty() {
+                                order_by_values.get_first(row_idx).cloned()
+                            } else {
+                                None
+                            };
+
+                            // Helper to convert value to f64 for range comparisons
+                            let value_to_f64 = |v: &Value| -> Option<f64> {
+                                match v {
+                                    Value::Integer(i) => Some(*i as f64),
+                                    Value::Float(f) => Some(*f),
+                                    _ => None,
+                                }
+                            };
+
+                            // Calculate start bound
+                            let start = match &frame.start {
+                                WindowFrameBound::UnboundedPreceding => 0,
+                                WindowFrameBound::CurrentRow => {
+                                    if is_range {
+                                        // For RANGE, start of peer group (O(1) lookup)
+                                        peer_groups[i].0
+                                    } else {
+                                        i
                                     }
                                 }
                                 WindowFrameBound::Preceding(expr) => {
                                     if is_range {
-                                        // RANGE PRECEDING as end: find last row where value <= current - offset
+                                        // RANGE PRECEDING: find first row where value >= current - offset
                                         if let (Some(curr_val), Expression::IntegerLiteral(lit)) =
                                             (&current_order_value, expr.as_ref())
                                         {
                                             if let Some(curr_f64) = value_to_f64(curr_val) {
-                                                let upper_bound = curr_f64 - lit.value as f64;
-                                                let mut end_idx = 0;
+                                                let lower_bound = curr_f64 - lit.value as f64;
+                                                // Linear scan from start to find first row in range
+                                                let mut start_idx = 0;
                                                 for (j, &idx) in row_indices.iter().enumerate() {
                                                     if let Some(row_val) = order_by_values
                                                         .get_first(idx)
                                                         .and_then(value_to_f64)
                                                     {
-                                                        if row_val <= upper_bound {
-                                                            end_idx = j + 1;
+                                                        if row_val >= lower_bound {
+                                                            start_idx = j;
+                                                            break;
                                                         }
                                                     }
                                                 }
-                                                end_idx
+                                                start_idx
                                             } else {
-                                                i + 1
+                                                0
                                             }
+                                        } else {
+                                            0
+                                        }
+                                    } else {
+                                        // ROWS PRECEDING: simple row offset
+                                        if let Expression::IntegerLiteral(lit) = expr.as_ref() {
+                                            i.saturating_sub(lit.value as usize)
+                                        } else {
+                                            0
+                                        }
+                                    }
+                                }
+                                WindowFrameBound::Following(expr) => {
+                                    if is_range {
+                                        // RANGE FOLLOWING as start: find first row where value >= current + offset
+                                        if let (Some(curr_val), Expression::IntegerLiteral(lit)) =
+                                            (&current_order_value, expr.as_ref())
+                                        {
+                                            if let Some(curr_f64) = value_to_f64(curr_val) {
+                                                let lower_bound = curr_f64 + lit.value as f64;
+                                                let mut start_idx = partition_len;
+                                                for (j, &idx) in row_indices.iter().enumerate() {
+                                                    if let Some(row_val) = order_by_values
+                                                        .get_first(idx)
+                                                        .and_then(value_to_f64)
+                                                    {
+                                                        if row_val >= lower_bound {
+                                                            start_idx = j;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                start_idx
+                                            } else {
+                                                i
+                                            }
+                                        } else {
+                                            i
+                                        }
+                                    } else if let Expression::IntegerLiteral(lit) = expr.as_ref() {
+                                        (i + lit.value as usize).min(partition_len - 1)
+                                    } else {
+                                        i
+                                    }
+                                }
+                                WindowFrameBound::UnboundedFollowing => partition_len - 1,
+                            };
+
+                            // Calculate end bound
+                            let end = if let Some(ref end_bound) = frame.end {
+                                match end_bound {
+                                    WindowFrameBound::UnboundedFollowing => partition_len,
+                                    WindowFrameBound::CurrentRow => {
+                                        if is_range {
+                                            // For RANGE, end of peer group (O(1) lookup)
+                                            peer_groups[i].1
                                         } else {
                                             i + 1
                                         }
-                                    } else if let Expression::IntegerLiteral(lit) = expr.as_ref() {
-                                        (i + 1).saturating_sub(lit.value as usize)
-                                    } else {
-                                        i + 1
                                     }
+                                    WindowFrameBound::Following(expr) => {
+                                        if is_range {
+                                            // RANGE FOLLOWING: find last row where value <= current + offset
+                                            if let (
+                                                Some(curr_val),
+                                                Expression::IntegerLiteral(lit),
+                                            ) = (&current_order_value, expr.as_ref())
+                                            {
+                                                if let Some(curr_f64) = value_to_f64(curr_val) {
+                                                    let upper_bound = curr_f64 + lit.value as f64;
+                                                    // Scan from end backwards to find last row in range
+                                                    let mut end_idx = 0;
+                                                    for (j, &idx) in row_indices.iter().enumerate()
+                                                    {
+                                                        if let Some(row_val) = order_by_values
+                                                            .get_first(idx)
+                                                            .and_then(value_to_f64)
+                                                        {
+                                                            if row_val <= upper_bound {
+                                                                end_idx = j + 1;
+                                                                // exclusive end
+                                                            }
+                                                        }
+                                                    }
+                                                    end_idx
+                                                } else {
+                                                    partition_len
+                                                }
+                                            } else {
+                                                partition_len
+                                            }
+                                        } else if let Expression::IntegerLiteral(lit) =
+                                            expr.as_ref()
+                                        {
+                                            (i + lit.value as usize + 1).min(partition_len)
+                                        } else {
+                                            partition_len
+                                        }
+                                    }
+                                    WindowFrameBound::Preceding(expr) => {
+                                        if is_range {
+                                            // RANGE PRECEDING as end: find last row where value <= current - offset
+                                            if let (
+                                                Some(curr_val),
+                                                Expression::IntegerLiteral(lit),
+                                            ) = (&current_order_value, expr.as_ref())
+                                            {
+                                                if let Some(curr_f64) = value_to_f64(curr_val) {
+                                                    let upper_bound = curr_f64 - lit.value as f64;
+                                                    let mut end_idx = 0;
+                                                    for (j, &idx) in row_indices.iter().enumerate()
+                                                    {
+                                                        if let Some(row_val) = order_by_values
+                                                            .get_first(idx)
+                                                            .and_then(value_to_f64)
+                                                        {
+                                                            if row_val <= upper_bound {
+                                                                end_idx = j + 1;
+                                                            }
+                                                        }
+                                                    }
+                                                    end_idx
+                                                } else {
+                                                    i + 1
+                                                }
+                                            } else {
+                                                i + 1
+                                            }
+                                        } else if let Expression::IntegerLiteral(lit) =
+                                            expr.as_ref()
+                                        {
+                                            (i + 1).saturating_sub(lit.value as usize)
+                                        } else {
+                                            i + 1
+                                        }
+                                    }
+                                    WindowFrameBound::UnboundedPreceding => 0,
                                 }
-                                WindowFrameBound::UnboundedPreceding => 0,
-                            }
-                        } else {
-                            // No end bound specified, SQL standard says implicit end is CURRENT ROW
-                            // For ROWS: current row index + 1 (exclusive)
-                            // For RANGE: end of current peer group
-                            if is_range {
-                                peer_groups[i].1
                             } else {
-                                i + 1
-                            }
-                        };
+                                // No end bound specified, SQL standard says implicit end is CURRENT ROW
+                                // For ROWS: current row index + 1 (exclusive)
+                                // For RANGE: end of current peer group
+                                if is_range {
+                                    peer_groups[i].1
+                                } else {
+                                    i + 1
+                                }
+                            };
 
-                        (start, end)
-                    } else {
-                        // Default frame: UNBOUNDED PRECEDING to CURRENT ROW
-                        (0, i + 1)
-                    };
-
-                    // Accumulate values within the frame
-                    for &idx in &row_indices[frame_start..frame_end] {
-                        let value = if let Some(col_idx) = arg_col_idx {
-                            rows[idx]
-                                .1
-                                .get(col_idx)
-                                .cloned()
-                                .unwrap_or_else(Value::null_unknown)
-                        } else if has_expression_arg {
-                            // Expression argument (e.g., val * 2) - use pre-computed value
-                            expression_values[idx].clone()
+                            (start, end)
                         } else {
-                            // COUNT(*) counts all rows
-                            Value::Integer(1)
+                            // Default frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                            // SQL standard: peer rows (same ORDER BY value) share the same frame end
+                            (0, peer_groups[i].1)
                         };
-                        agg_func.accumulate(&value, wf_info.is_distinct);
+
+                        // Accumulate values within the frame
+                        for &idx in &row_indices[frame_start..frame_end] {
+                            let value = if let Some(col_idx) = arg_col_idx {
+                                rows[idx]
+                                    .1
+                                    .get(col_idx)
+                                    .cloned()
+                                    .unwrap_or_else(Value::null_unknown)
+                            } else if has_expression_arg {
+                                // Expression argument (e.g., val * 2) - use pre-computed value
+                                expression_values[idx].clone()
+                            } else {
+                                // COUNT(*) counts all rows
+                                Value::Integer(1)
+                            };
+                            agg_func.accumulate(&value, wf_info.is_distinct);
+                        }
+                        results[row_idx] = Some(agg_func.result());
                     }
-                    results[row_idx] = Some(agg_func.result());
-                }
+                } // end of else (non-incremental path)
             } else {
                 // Without ORDER BY, compute aggregate over entire partition
                 let mut agg_func = self

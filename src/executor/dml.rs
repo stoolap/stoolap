@@ -1946,6 +1946,33 @@ impl Executor {
                         .collect()
                 };
 
+            // Pre-compile CHECK constraints for columns being updated (once, not per row)
+            let compiled_check_exprs: Vec<(usize, String, String, SharedProgram)> =
+                compiled_updates
+                    .iter()
+                    .filter_map(|(idx, _dt, _, _)| {
+                        schema.columns[*idx].check_expr.as_ref().and_then(|expr| {
+                            let col_name = schema.columns[*idx].name.clone();
+                            let expr_text = expr.clone();
+                            compile_expression(
+                                &crate::parser::parse_sql(&format!("SELECT {}", expr))
+                                    .ok()?
+                                    .into_iter()
+                                    .next()
+                                    .and_then(|s| match s {
+                                        crate::parser::ast::Statement::Select(sel) => {
+                                            sel.columns.into_iter().next()
+                                        }
+                                        _ => None,
+                                    })?,
+                                &column_names,
+                            )
+                            .ok()
+                            .map(|program| (*idx, col_name, expr_text, program))
+                        })
+                    })
+                    .collect();
+
             // Create VM once and reuse for all rows
             let mut vm = ExprVM::new();
             // Extract params before the closure so they can be captured
@@ -2008,6 +2035,25 @@ impl Executor {
 
                 for (idx, new_value) in updates_to_apply {
                     let _ = row.set(idx, new_value);
+                }
+
+                // Validate CHECK constraints on updated columns (precompiled, no per-row parsing)
+                if changed && !compiled_check_exprs.is_empty() {
+                    let check_ctx = ExecuteContext::new(&row)
+                        .with_params(params)
+                        .with_named_params(named_params);
+                    for (_col_idx, col_name, expr_text, check_program) in &compiled_check_exprs {
+                        match vm.execute_cow(check_program, &check_ctx) {
+                            Ok(Value::Boolean(false)) => {
+                                return Err(Error::CheckConstraintViolation {
+                                    column: col_name.clone(),
+                                    expression: expr_text.clone(),
+                                });
+                            }
+                            Ok(Value::Null(_)) | Err(_) => {}
+                            Ok(_) => {} // Non-boolean truthy values pass (e.g., CHECK(value))
+                        }
+                    }
                 }
 
                 // Collect FK values for post-update validation

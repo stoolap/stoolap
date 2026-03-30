@@ -186,9 +186,11 @@ impl PersistenceConfig {
         self
     }
 
-    /// Builder method to set checkpoint interval
+    /// Builder method to set checkpoint interval.
+    /// A value of 0 disables periodic checkpoints (data stays in hot buffer).
+    /// Non-zero values are clamped to a minimum of 5 seconds.
     pub fn with_checkpoint_interval(mut self, seconds: u32) -> Self {
-        self.checkpoint_interval = seconds;
+        self.checkpoint_interval = if seconds == 0 { 0 } else { seconds.max(5) };
         self
     }
 

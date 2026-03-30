@@ -574,6 +574,22 @@ impl Executor {
             return None;
         }
 
+        // Bail if any column being updated has a CHECK constraint
+        // CHECK validation requires expression evaluation — fall back to normal path
+        {
+            let col_map = schema.column_index_map();
+            for col_name in stmt.updates.keys() {
+                let col_lower = col_name.to_lowercase();
+                if let Some(&idx) = col_map.get(col_lower.as_str()) {
+                    if schema.columns[idx].check_expr.is_some() {
+                        *compiled_guard =
+                            CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                        return None;
+                    }
+                }
+            }
+        }
+
         // Extract PK value source
         let (pk_value, pk_source) =
             match self.extract_pk_equality_value(where_clause, pk_column, ctx) {

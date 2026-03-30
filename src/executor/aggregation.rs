@@ -4271,7 +4271,23 @@ impl Executor {
             vec![None; aggregations.len()]
         };
 
-        let mut expr_vm = if has_expr_group_by || has_agg_expression {
+        // Pre-compile FILTER expressions for aggregate functions
+        let has_filters = aggregations.iter().any(|a| a.filter.is_some());
+        let compiled_filters: Vec<Option<SharedProgram>> = if has_filters {
+            aggregations
+                .iter()
+                .map(|agg| {
+                    agg.filter
+                        .as_ref()
+                        .map(|f| compile_expression(f, columns))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![None; aggregations.len()]
+        };
+
+        let mut expr_vm = if has_expr_group_by || has_agg_expression || has_filters {
             Some(ExprVM::new())
         } else {
             None
@@ -4313,6 +4329,18 @@ impl Executor {
 
                     for (i, agg) in aggregations.iter().enumerate() {
                         if let Some(ref mut func) = agg_funcs[i] {
+                            // Check FILTER clause first - skip row if filter is false
+                            if let Some(ref filter_program) = compiled_filters[i] {
+                                if let Some(ref mut vm) = expr_vm {
+                                    match vm.execute_cow(filter_program, &exec_ctx) {
+                                        Ok(Value::Boolean(true)) => {}
+                                        _ => continue,
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            }
+
                             if let Some(ref expr_program) = compiled_agg_expressions[i] {
                                 if let Some(ref mut vm) = expr_vm {
                                     if let Ok(val) = vm.execute_cow(expr_program, &exec_ctx) {
@@ -4471,6 +4499,18 @@ impl Executor {
 
                             for (i, agg) in aggregations.iter().enumerate() {
                                 if let Some(ref mut func) = agg_funcs[i] {
+                                    // Check FILTER clause first - skip row if filter is false
+                                    if let Some(ref filter_program) = compiled_filters[i] {
+                                        if let Some(ref mut vm) = expr_vm {
+                                            match vm.execute_cow(filter_program, &exec_ctx) {
+                                                Ok(Value::Boolean(true)) => {}
+                                                _ => continue,
+                                            }
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+
                                     if let Some(ref expr_program) = compiled_agg_expressions[i] {
                                         if let Some(ref mut vm) = expr_vm {
                                             if let Ok(val) = vm.execute_cow(expr_program, &exec_ctx)
