@@ -1005,8 +1005,8 @@ impl Table for SegmentedTable {
         let mut count = self.hot.update(where_expr, setter)?;
 
         // Update matching segment rows.
-        // Build skip set from hot row_ids + tombstones, then iterate volumes newest-first.
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        // Lazy: prune on zone maps/bloom filters first, load cold on demand.
+        let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
         let has_int_pk = self
             .hot
             .schema()
@@ -1022,8 +1022,34 @@ impl Table for SegmentedTable {
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
         let schema_clone = self.hot.schema().clone();
 
+        // Zone-map / bloom pruning from WHERE clause.
+        let comparisons = where_expr
+            .map(|e| e.collect_comparisons())
+            .unwrap_or_default();
+        let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+
         for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
+
+            // Prune volume by zone maps and bloom filters.
+            let (should_skip, _, _) = Self::prune_volume(vol, &comparisons, &bloom_hashes);
+            if should_skip {
+                continue;
+            }
+
+            // Load cold volume on demand after pruning.
+            let loaded;
+            let vol = if vol.is_cold() {
+                loaded = match self.segment_mgr.ensure_volume(*seg_id) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                &loaded
+            } else {
+                vol.mark_accessed();
+                vol
+            };
+
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema_clone);
 
             for i in 0..vol.meta.row_count {
@@ -1259,7 +1285,8 @@ impl Table for SegmentedTable {
 
         // Build hot_skip from hot row_ids + pending tombstones.
         // Committed tombstones are kept as a shared Arc (no clone).
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        // Lazy: prune on zone maps/bloom filters first, load cold on demand.
+        let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
@@ -1292,12 +1319,38 @@ impl Table for SegmentedTable {
             }
         });
 
+        // Zone-map / bloom pruning from WHERE clause.
+        let comparisons = where_expr
+            .map(|e| e.collect_comparisons())
+            .unwrap_or_default();
+        let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+
         let mut deleted_cold_ids: Vec<i64> = Vec::new();
         // Reusable row for WHERE evaluation — avoids Vec/Arc allocation per row.
         // The CompactVec capacity is set once, then clear+push reuses the buffer.
         let mut reusable_row = Row::with_capacity(schema_clone.columns.len());
         for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
+
+            // Prune volume by zone maps and bloom filters.
+            let (should_skip, _, _) = Self::prune_volume(vol, &comparisons, &bloom_hashes);
+            if should_skip {
+                continue;
+            }
+
+            // Load cold volume on demand after pruning.
+            let loaded;
+            let vol = if vol.is_cold() {
+                loaded = match self.segment_mgr.ensure_volume(*seg_id) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                &loaded
+            } else {
+                vol.mark_accessed();
+                vol
+            };
+
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema_clone);
 
             for i in 0..vol.meta.row_count {

@@ -1030,6 +1030,37 @@ pub struct VolumeMeta {
     pub row_groups: Vec<super::column::RowGroupMeta>,
 }
 
+impl VolumeMeta {
+    /// Estimate the in-memory size of this metadata in bytes.
+    pub fn memory_size(&self) -> usize {
+        let mut size = 0usize;
+        // row_ids: Vec<i64>
+        size += self.row_ids.len() * 8;
+        // zone_maps: 2 Values (16 bytes each) + 2 u32 per column
+        size += self.zone_maps.len() * (16 + 16 + 8);
+        // bloom_filters: Vec<u64> bitsets
+        for bf in &self.bloom_filters {
+            size += bf.memory_size();
+        }
+        // stats: 16 bytes base + per-column (i128 + f64 + u64 + 2 Values + u64)
+        size += 16 + self.stats.columns.len() * (16 + 8 + 8 + 16 + 16 + 8);
+        // column_names
+        for name in &self.column_names {
+            size += name.len() + 24;
+        }
+        // column_types + sorted_columns
+        size += self.column_types.len() * 2;
+        size += self.sorted_columns.len();
+        // column_name_map: ~72 bytes per entry (SmartString + usize + hash overhead)
+        size += self.column_name_map.len() * 72;
+        // row_groups: per group has start/end u32 + Vec<ZoneMap>
+        for rg in &self.row_groups {
+            size += 8 + rg.zone_maps.len() * (16 + 16 + 8);
+        }
+        size
+    }
+}
+
 /// A frozen volume ready for queries.
 ///
 /// This is the in-memory representation. Serialization to/from disk
@@ -1850,9 +1881,9 @@ impl FrozenVolume {
     }
 
     /// Estimate the in-memory size of this volume in bytes.
-    /// Only counts loaded (decompressed) columns + compressed store.
+    /// Counts metadata + compressed store + loaded (decompressed) columns.
     pub fn memory_size(&self) -> usize {
-        self.columns.memory_size() + self.meta.row_ids.len() * 8
+        self.meta.memory_size() + self.columns.memory_size()
     }
 
     /// Mark this volume as recently accessed. Stores u64::MAX as a sentinel

@@ -2112,6 +2112,32 @@ impl MVCCEngine {
         self.open.load(Ordering::Acquire)
     }
 
+    /// Per-table, per-volume statistics for PRAGMA VOLUME_STATS.
+    /// Returns (table_name, segment_id, tier, row_count, memory_bytes, idle_cycles, tombstones).
+    pub fn volume_stats(&self) -> Vec<(String, u64, &'static str, usize, usize, u64, usize)> {
+        let mgrs = self.segment_managers.read().unwrap();
+        let mut result = Vec::new();
+        let mut table_names: Vec<&String> = mgrs.keys().collect();
+        table_names.sort();
+        for table_name in table_names {
+            if let Some(mgr) = mgrs.get(table_name) {
+                let tombstone_count = mgr.tombstone_count();
+                for (seg_id, tier, row_count, mem, idle) in mgr.volume_stats() {
+                    result.push((
+                        table_name.clone(),
+                        seg_id,
+                        tier,
+                        row_count,
+                        mem,
+                        idle,
+                        tombstone_count,
+                    ));
+                }
+            }
+        }
+        result
+    }
+
     /// Returns the database path
     pub fn get_path(&self) -> &str {
         &self.path

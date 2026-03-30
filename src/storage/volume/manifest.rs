@@ -539,8 +539,14 @@ fn compute_visibility_bitmaps(
             };
         }
     }
-    // Clear but keep allocation for reuse on next seal/compact.
-    reusable_seen.clear();
+    // Shrink if capacity far exceeds what was needed. After compaction
+    // merges volumes, the total row count drops but the set stays at its
+    // high-water mark. Replace with a right-sized set to free the excess.
+    if reusable_seen.capacity() > total * 2 + 1024 {
+        *reusable_seen = rustc_hash::FxHashSet::with_capacity_and_hasher(total, Default::default());
+    } else {
+        reusable_seen.clear();
+    }
 }
 
 /// Per-table segment manager.
@@ -1209,6 +1215,11 @@ impl SegmentManager {
         self.manifest.read().segments.len()
     }
 
+    /// Get the number of committed tombstones.
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.read().len()
+    }
+
     /// Get the maximum row_count across all segments.
     pub fn max_segment_row_count(&self) -> usize {
         let manifest = self.manifest.read();
@@ -1218,6 +1229,42 @@ impl SegmentManager {
             .map(|s| s.row_count)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Per-volume statistics for PRAGMA VOLUME_STATS.
+    /// Returns (segment_id, tier, row_count, memory_bytes, idle_cycles) for each volume.
+    pub fn volume_stats(&self) -> Vec<(u64, &'static str, usize, usize, u64)> {
+        let current_epoch = self
+            .current_eviction_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let manifest = self.manifest.read();
+        let segments = self.segments.read();
+        let mut stats = Vec::with_capacity(manifest.segments.len());
+        for meta in &manifest.segments {
+            let seg_id = meta.segment_id;
+            if let Some(cs) = segments.get(&seg_id) {
+                let vol = &cs.volume;
+                let tier = if vol.columns.is_eager() {
+                    "hot"
+                } else if vol.columns.has_compressed_store() {
+                    "warm"
+                } else {
+                    "cold"
+                };
+                let row_count = vol.meta.row_ids.len();
+                let memory_bytes = vol.memory_size();
+                let last_epoch = vol
+                    .last_access_epoch
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let idle_cycles = if last_epoch == u64::MAX || current_epoch == 0 {
+                    0
+                } else {
+                    current_epoch.saturating_sub(last_epoch)
+                };
+                stats.push((seg_id, tier, row_count, memory_bytes, idle_cycles));
+            }
+        }
+        stats
     }
 
     /// Evict idle volumes to save memory. Three-tier transitions:

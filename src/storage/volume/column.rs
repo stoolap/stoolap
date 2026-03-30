@@ -578,6 +578,11 @@ pub struct ColumnBloomFilter {
 }
 
 impl ColumnBloomFilter {
+    /// Estimate in-memory size of this bloom filter in bytes.
+    pub fn memory_size(&self) -> usize {
+        self.bits.len() * 8 + 8
+    }
+
     /// Create a bloom filter sized for the expected number of elements.
     /// Uses ~10 bits per element with 3 hash functions (~1.7% false positive rate).
     pub fn new(expected_elements: usize) -> Self {

@@ -8126,6 +8126,43 @@ impl Executor {
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
             }
+            "VOLUME_STATS" => {
+                if stmt.value.is_some() {
+                    return Err(Error::internal(
+                        "PRAGMA VOLUME_STATS does not accept values",
+                    ));
+                }
+
+                let columns = vec![
+                    "table_name".to_string(),
+                    "segment_id".to_string(),
+                    "tier".to_string(),
+                    "row_count".to_string(),
+                    "memory_bytes".to_string(),
+                    "idle_cycles".to_string(),
+                    "tombstones".to_string(),
+                ];
+
+                let stats = self.engine.volume_stats();
+                let mut rows = RowVec::with_capacity(stats.len());
+                for (i, (table, seg_id, tier, row_count, mem, idle, ts)) in
+                    stats.into_iter().enumerate()
+                {
+                    rows.push((
+                        i as i64,
+                        Row::from_values(vec![
+                            Value::text(&table),
+                            Value::Integer(seg_id as i64),
+                            Value::text(tier),
+                            Value::Integer(row_count as i64),
+                            Value::Integer(mem as i64),
+                            Value::Integer(idle as i64),
+                            Value::Integer(ts as i64),
+                        ]),
+                    ));
+                }
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
             "VACUUM" => {
                 if stmt.value.is_some() {
                     return Err(Error::internal("PRAGMA VACUUM does not accept values"));

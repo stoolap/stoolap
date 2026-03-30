@@ -238,3 +238,38 @@ fn test_pragma_multiple_settings() {
         .expect("Failed to read wal_flush_trigger");
     assert_eq!(wal_trigger, 500);
 }
+
+/// Test PRAGMA VOLUME_STATS returns correct columns and data
+#[test]
+fn test_pragma_volume_stats_empty() {
+    let db = Database::open("memory://pragma_vs_empty").expect("Failed to create database");
+
+    // No tables: should return zero rows
+    let rows: Vec<_> = db
+        .query("PRAGMA VOLUME_STATS", ())
+        .expect("volume_stats")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect");
+    assert!(rows.is_empty(), "Expected no rows for empty database");
+}
+
+/// Test PRAGMA VOLUME_STATS with data (in-memory, no sealing)
+#[test]
+fn test_pragma_volume_stats_with_table() {
+    let db = Database::open("memory://pragma_vs_table").expect("Failed to create database");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())
+        .expect("create");
+    db.execute("INSERT INTO t VALUES (1, 'a')", ())
+        .expect("insert");
+
+    // In-memory mode: no volumes sealed, should return zero rows
+    let rows: Vec<_> = db
+        .query("PRAGMA VOLUME_STATS", ())
+        .expect("volume_stats")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect");
+    assert!(
+        rows.is_empty(),
+        "In-memory tables have no volumes before checkpoint"
+    );
+}
