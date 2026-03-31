@@ -8051,54 +8051,35 @@ impl Executor {
                 let config = self.engine.config();
                 let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
-                if let Some(ref value) = stmt.value {
-                    let new_value = self.extract_pragma_int_value(value)?;
-                    let mut new_config = config.clone();
-                    new_config.persistence.sync_mode = match new_value {
-                        0 => crate::storage::SyncMode::None,
-                        1 => crate::storage::SyncMode::Normal,
-                        2 => crate::storage::SyncMode::Full,
-                        _ => {
-                            return Err(Error::internal(
-                                "sync_mode must be 0 (none), 1 (normal), or 2 (full)",
-                            ))
-                        }
-                    };
-                    self.engine.update_engine_config(new_config)?;
-                    let mut rows = RowVec::with_capacity(1);
-                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
-                    Ok(Box::new(ExecutorResult::new(columns, rows)))
-                } else {
-                    let mut rows = RowVec::with_capacity(1);
-                    rows.push((
-                        0,
-                        Row::from_values(vec![Value::Integer(config.persistence.sync_mode as i64)]),
+                if stmt.value.is_some() {
+                    return Err(Error::NotSupported(
+                        "sync_mode cannot be changed at runtime. Set it in the connection string: file:///path?sync_mode=none|normal|full".to_string(),
                     ));
-                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![Value::Integer(config.persistence.sync_mode as i64)]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
             "WAL_FLUSH_TRIGGER" => {
                 let config = self.engine.config();
                 let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
-                if let Some(ref value) = stmt.value {
-                    let new_value = self.extract_pragma_int_value(value)?;
-                    let mut new_config = config.clone();
-                    new_config.persistence.wal_flush_trigger = new_value as usize;
-                    self.engine.update_engine_config(new_config)?;
-                    let mut rows = RowVec::with_capacity(1);
-                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
-                    Ok(Box::new(ExecutorResult::new(columns, rows)))
-                } else {
-                    let mut rows = RowVec::with_capacity(1);
-                    rows.push((
-                        0,
-                        Row::from_values(vec![Value::Integer(
-                            config.persistence.wal_flush_trigger as i64,
-                        )]),
+                if stmt.value.is_some() {
+                    return Err(Error::NotSupported(
+                        "wal_flush_trigger cannot be changed at runtime. Set it in the connection string: file:///path?wal_flush_trigger=N".to_string(),
                     ));
-                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![Value::Integer(
+                        config.persistence.wal_flush_trigger as i64,
+                    )]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
             "KEEP_SNAPSHOTS" => {
                 let config = self.engine.config();

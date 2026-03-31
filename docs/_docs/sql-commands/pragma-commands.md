@@ -36,15 +36,16 @@ Stoolap currently supports the following PRAGMA commands:
 | PRAGMA | Description | Default |
 |--------|-------------|---------|
 | `checkpoint_interval` | Seconds between automatic checkpoints | 60 |
-| `sync_mode` | WAL sync mode (0=None, 1=Normal, 2=Full) | 1 |
 | `compact_threshold` | Sub-target volumes per table before merging | 4 |
 | `keep_snapshots` | Backup snapshots to retain per table | 3 |
-| `wal_flush_trigger` | Buffer size in bytes before WAL flush | 32768 |
 | `target_volume_rows` | Target rows per cold volume (compaction split boundary) | 1048576 |
 | `snapshot` | Create a full backup snapshot | - |
 | `restore` | Restore database from a backup snapshot | - |
 | `checkpoint` | Run checkpoint cycle (seal + compact + WAL truncate) | - |
 | `vacuum` | Manual cleanup of deleted rows and index compaction | - |
+| `sync_mode` | Read current WAL sync mode (read-only, set via DSN) | 1 |
+| `wal_flush_trigger` | Read current WAL flush trigger (read-only, set via DSN) | 32768 |
+| `volume_stats` | Show per-volume storage statistics | - |
 
 #### checkpoint_interval
 
@@ -58,19 +59,21 @@ PRAGMA checkpoint_interval;       -- read current value
 PRAGMA snapshot_interval = 60;
 ```
 
-#### sync_mode
+#### sync_mode (read-only)
 
-Controls the synchronization mode for the Write-Ahead Log (WAL). Default: 1 (Normal).
+Returns the current WAL synchronization mode. This setting can only be configured via the connection string and takes effect at database open time.
 
 ```sql
-PRAGMA sync_mode = 1;
-PRAGMA sync_mode;               -- read current value
+PRAGMA sync_mode;               -- read current value (0=none, 1=normal, 2=full)
 ```
 
-Supported values:
-- 0: No sync (fastest, but risks data loss on power failure)
-- 1: Normal sync (balances performance and durability)
-- 2: Full sync (maximum durability, slowest performance)
+To change sync_mode, set it in the connection string:
+
+```
+file:///path/to/db?sync_mode=none
+file:///path/to/db?sync_mode=normal
+file:///path/to/db?sync_mode=full
+```
 
 #### compact_threshold
 
@@ -83,13 +86,18 @@ PRAGMA compact_threshold;          -- read current value
 
 Note: `compact_threshold` and `keep_snapshots` are separate settings. `compact_threshold` controls cold volume compaction. `keep_snapshots` controls backup snapshot file retention.
 
-#### wal_flush_trigger
+#### wal_flush_trigger (read-only)
 
-Controls the buffer size in bytes before the WAL is flushed to disk. Default: 32768.
+Returns the current WAL flush trigger (buffer size in bytes before flush). This setting can only be configured via the connection string.
 
 ```sql
-PRAGMA wal_flush_trigger = 1000;
 PRAGMA wal_flush_trigger;       -- read current value
+```
+
+To change wal_flush_trigger, set it in the connection string:
+
+```
+file:///path/to/db?wal_flush_trigger=65536
 ```
 
 #### keep_snapshots
@@ -225,7 +233,7 @@ PRAGMA vacuum;
 All PRAGMA values can also be set via the connection string:
 
 ```
-file:///path/to/db?checkpoint_interval=60&compact_threshold=4&keep_snapshots=3&sync_mode=1
+file:///path/to/db?checkpoint_interval=60&compact_threshold=4&keep_snapshots=3&sync_mode=normal
 ```
 
 Legacy parameter names are accepted for backward compatibility:
